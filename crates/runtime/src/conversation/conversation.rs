@@ -3958,6 +3958,10 @@ struct ConversationProviderResourceHandles {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelStepResult {
+    /// Present only for the dedicated, nonterminal, zero-tool user-input
+    /// interpretation purpose. Err retains the real step/usage but grants no adoption.
+    pub(crate) input_interpretation:
+        Option<Result<harness_contract::input_disposition::ModelInputDispositionBatch, String>>,
     pub intent: ModelStepIntent,
     pub assistant_message: ConversationMessage,
     /// Runtime-authored results for individual provider tool calls rejected

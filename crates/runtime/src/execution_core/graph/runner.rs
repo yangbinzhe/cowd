@@ -518,20 +518,21 @@ impl ExecutionGraphRunner {
         &self,
         graph: ExecutionGraph,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
-        self.register_continuation(graph, None).await
+        self.register_continuation(graph, None, None).await
     }
 
     pub(crate) async fn register_continuation(
         &self,
         graph: ExecutionGraph,
         actor: Option<harness_contract::agent_action::AgentActorBinding>,
+        source_goal_cut: Option<crate::ExpectedStreamRevision>,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
         self.ensure_mutation_allowed()?;
         validate_execution_graph(&graph)?;
         self.registry.validate_graph(&graph)?;
         match self
             .commit_service
-            .register_continuation_graph_async(graph, actor)
+            .register_continuation_graph_async(graph, actor, source_goal_cut)
             .await
         {
             Ok(receipt) => Ok(receipt.graph),

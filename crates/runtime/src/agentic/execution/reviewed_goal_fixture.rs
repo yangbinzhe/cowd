@@ -468,6 +468,7 @@ pub(super) enum DelegatedEffectCase {
     Review,
     PendingReview,
     Withdraw,
+    GoalClosed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

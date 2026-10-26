@@ -827,6 +827,7 @@ fn create_open_retirement_goal(services: &RuntimeServices, actor: &AgentActorBin
     services
         .goal_store()
         .create(GoalContract {
+            input_contract: None,
             id: "goal:root-agentic-execution".into(),
             session_id: actor.session_id.clone(),
             objective: actor.objective_summary.clone(),

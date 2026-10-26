@@ -8,10 +8,35 @@ use harness_contract::{agent_action::AgentActorBinding, execution_graph::Executi
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 
+/// One original Goal read shared by Host preparation and the registration
+/// transaction. Business quantities do not replace the frozen actor grant.
+pub(crate) fn read_continuation_goal(
+    store: &Arc<RuntimeEventStore>,
+    source: &crate::AgenticProgramProjection,
+) -> Result<Option<crate::execution_core::GoalProjection>, String> {
+    let goal = source
+        .root_execution_id
+        .as_ref()
+        .map(|root| {
+            crate::execution_core::GoalStore::new(Arc::clone(store))
+                .projection(&format!("goal:{root}"))
+        })
+        .transpose()?
+        .flatten();
+    if let Some(goal) = &goal {
+        crate::execution_core::goal::assessment::assess_bound_goal_projection(source, Some(goal))
+            .map_err(|error| error.to_string())?;
+    } else {
+        source.validate_team_quantity_contract()?;
+    }
+    Ok(goal)
+}
+
 pub(crate) fn prepare(
     store: &Arc<RuntimeEventStore>,
     graph: &ExecutionGraph,
     actor: &AgentActorBinding,
+    source_goal_cut: Option<&crate::ExpectedStreamRevision>,
 ) -> Result<(Vec<RuntimeTransactionEventInput>, BTreeMap<String, u64>), String> {
     let binding = graph
         .continuation_binding
@@ -50,7 +75,19 @@ pub(crate) fn prepare(
     let source = crate::AgentActionService::new(Arc::clone(store))
         .project(source_id)
         .map_err(|e| e.to_string())?;
-    source.validate_team_quantity_contract()?;
+    let goal = read_continuation_goal(store, &source)?;
+    let goal_cut = source
+        .root_execution_id
+        .as_ref()
+        .map(|root| crate::ExpectedStreamRevision {
+            stream_id: format!("goal:goal:{root}"),
+            expected_revision: goal.as_ref().map_or(0, |goal| goal.stream_revision),
+        });
+    if source_goal_cut.is_some_and(|cut| Some(cut) != goal_cut.as_ref())
+        || (goal.is_some() && source_goal_cut.is_none())
+    {
+        return Err("continuation original Goal source cut changed or missing".into());
+    }
     let source_stream = format!("agentic-program:{source_id}");
     let cursor = store
         .list_stream_page_desc(&source_stream, 1, 0)?
@@ -79,6 +116,14 @@ pub(crate) fn prepare(
         );
     }
     let mut expected = crate::session_continuation::stopped_source_revisions(store, &source)?;
+    if let Some(cut) = goal_cut {
+        if expected
+            .insert(cut.stream_id, cut.expected_revision)
+            .is_some_and(|previous| previous != cut.expected_revision)
+        {
+            return Err("continuation original Goal source cut conflicts".into());
+        }
+    }
     expected.insert(source_stream, source.revision);
     let target_stream = format!("agentic-program:{}", actor.program_id);
     expected.insert(target_stream.clone(), 0);
@@ -258,7 +303,53 @@ mod tests {
         store: &Arc<RuntimeEventStore>,
         commits: &crate::ExecutionCommitService,
     ) -> (AgentActorBinding, String) {
-        let root = actor("old-turn", "old-root");
+        source_with_revised_quantity(store, commits, false)
+    }
+
+    fn source_with_revised_quantity(
+        store: &Arc<RuntimeEventStore>,
+        commits: &crate::ExecutionCommitService,
+        revised: bool,
+    ) -> (AgentActorBinding, String) {
+        let mut root = actor("old-turn", "old-root");
+        if revised {
+            root.required_team_count = 0;
+            root.exact_team_count = Some(0);
+            let goal: harness_contract::goal::GoalContract = serde_json::from_value(json!({
+                "id":"goal:old-root","session_id":root.session_id,"objective":root.objective_summary,
+                "criteria":[{"id":"user-intent","statement":"Use the current authenticated Team constraint","status":"open"}],
+                "phase":"execution","completion":"open","revision":1,"user_sequence":1,
+                "spec_revision":1,"spec_digest":"original-team0","scope":"user_objective",
+                "user_intent_criterion_id":"user-intent","source_intent_ref":"session_input_application:original-team0",
+                "execution_binding":{"objective_id":root.objective_id,"session_id":root.session_id,"turn_id":root.turn_id,
+                    "root_execution_id":"old-root","agentic_program_id":root.program_id},
+                "input_contract":{"version":2,"principal_id":"session:continuation-session","session_id":root.session_id,
+                    "turn_id":root.turn_id,"source_ref":"session_input_application:original-team0","input_revision":1,
+                    "content_sha256":"a".repeat(64),"commitments":[{"kind":"team_count","minimum":0,"maximum":0,"source":{"start":0,"end":4}}]}
+            })).unwrap();
+            let goals = crate::execution_core::GoalStore::new(Arc::clone(store));
+            goals.create(goal).unwrap();
+            goals
+                .revise(
+                    "goal:old-root",
+                    1,
+                    2,
+                    "accepted Team0 to Team1 user business revision",
+                    |goal| {
+                        let input = goal.input_contract.as_mut().unwrap();
+                        input.input_revision = 2;
+                        input.source_ref = "session_input_application:accepted-team1".into();
+                        input.commitments =
+                            vec![harness_contract::goal::GoalInputCommitment::TeamCount {
+                                minimum: 1,
+                                maximum: Some(1),
+                                source: harness_contract::goal::GoalInputSpan { start: 0, end: 4 },
+                            }];
+                        vec!["input_contract".into()]
+                    },
+                )
+                .unwrap();
+        }
         commits
             .register_graph(graph("old-root", "old-turn"))
             .unwrap();
@@ -360,6 +451,165 @@ mod tests {
     }
 
     #[test]
+    fn accepted_team_zero_to_one_continues_without_rewriting_frozen_actor() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let commits = crate::ExecutionCommitService::new(Arc::clone(&store));
+        let (old, _) = source_with_revised_quantity(&store, &commits, true);
+        let actions = crate::AgentActionService::new(Arc::clone(&store));
+        let before = actions.project(&old.program_id).unwrap();
+        assert_eq!(
+            (
+                before.required_team_count,
+                before.exact_team_count,
+                before.teams.len()
+            ),
+            (0, Some(0), 1)
+        );
+        stop(&commits, &store, "old-root");
+        let (candidate, revision) = crate::session_continuation::latest_same_session_candidate(
+            &store,
+            &old.session_id,
+            "next-turn",
+        )
+        .unwrap()
+        .unwrap();
+        let binding = crate::session_continuation::compile_continuation_binding(
+            &candidate,
+            "current-user-ingress",
+            revision,
+            ContinuationAuthorization::Authorized,
+            7,
+        )
+        .unwrap();
+        let mut next = graph("next-root", "next-turn");
+        next.continuation_binding = Some(binding);
+        let mut target = actor("next-turn", "next-root");
+        target.required_team_count = 0;
+        target.exact_team_count = Some(0);
+        let cut = |revision| crate::ExpectedStreamRevision {
+            stream_id: "goal:goal:old-root".into(),
+            expected_revision: revision,
+        };
+        let baseline = prepare(&store, &next, &target, Some(&cut(2))).unwrap();
+        assert_eq!(baseline.1.get("goal:goal:old-root"), Some(&2));
+        let mut changed_actor = target.clone();
+        changed_actor.required_team_count = 1;
+        changed_actor.exact_team_count = Some(1);
+        assert!(
+            prepare(&store, &next, &changed_actor, Some(&cut(2)))
+                .unwrap_err()
+                .contains("continuation source changed or identity mismatched"),
+            "business quantities must not rewrite frozen ingress/grant metadata"
+        );
+        let goals = crate::execution_core::GoalStore::new(Arc::clone(&store));
+        let original_binding = goals
+            .get("goal:old-root")
+            .unwrap()
+            .unwrap()
+            .execution_binding
+            .unwrap();
+        goals
+            .revise(
+                "goal:old-root",
+                2,
+                3,
+                "one foreign Goal binding fault",
+                |goal| {
+                    goal.execution_binding.as_mut().unwrap().agentic_program_id =
+                        "foreign-program".into();
+                    vec!["execution_binding".into()]
+                },
+            )
+            .unwrap();
+        assert!(prepare(&store, &next, &target, Some(&cut(3)))
+            .unwrap_err()
+            .contains("assessment identity"));
+        assert!(actions
+            .project_if_exists(&target.program_id)
+            .unwrap()
+            .is_none());
+        goals
+            .revise(
+                "goal:old-root",
+                3,
+                4,
+                "restore original Goal binding",
+                |goal| {
+                    goal.execution_binding = Some(original_binding);
+                    vec!["execution_binding".into()]
+                },
+            )
+            .unwrap();
+        let (domain_events, mut expected) = prepare(&store, &next, &target, Some(&cut(4))).unwrap();
+        // The original graph append supplies output-stream fences in addition
+        // to prepare's readset. This direct domain-transaction witness supplies
+        // the same fresh successor output fence, without rebasing Goal4.
+        assert!(expected.insert("continuation-cas".into(), 0).is_none());
+        goals
+            .revise(
+                "goal:old-root",
+                4,
+                5,
+                "concurrent original Goal business revision",
+                |goal| {
+                    goal.constraints.push("still preserve accepted work".into());
+                    vec!["constraints".into()]
+                },
+            )
+            .unwrap();
+        let rejected = store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: "continuation-goal-only-stale-cut".into(),
+            expected_streams: expected
+                .into_iter()
+                .map(
+                    |(stream_id, expected_revision)| crate::ExpectedStreamRevision {
+                        stream_id,
+                        expected_revision,
+                    },
+                )
+                .collect(),
+            events: domain_events,
+        });
+        assert!(
+            matches!(rejected,Err(crate::RuntimeEventStoreError::StaleRevision{ref stream_id,expected:4,actual:5}) if stream_id=="goal:goal:old-root"),
+            "{rejected:?}"
+        );
+        assert!(actions
+            .project_if_exists(&target.program_id)
+            .unwrap()
+            .is_none());
+        assert!(
+            store
+                .event_by_idempotency_key(
+                    "continuation-cas",
+                    &format!("program-successor:{}", old.program_id)
+                )
+                .unwrap()
+                .is_none(),
+            "stale Goal must not partially reserve the unique successor"
+        );
+        assert!(prepare(&store, &next, &target, Some(&cut(4)))
+            .unwrap_err()
+            .contains("Goal source cut changed"));
+        let outcome =
+            commits.register_graph_with_continuation(next, Some(target.clone()), Some(cut(5)));
+        assert!(outcome.is_ok(),"a current accepted Team1 contract must survive original continuation without rewriting old actor: {:?}",outcome.err());
+        let after = actions.project(&target.program_id).unwrap();
+        assert_eq!(
+            (
+                after.required_team_count,
+                after.exact_team_count,
+                after.teams.len()
+            ),
+            (0, Some(0), 1)
+        );
+        assert_eq!(
+            actions.project(&old.program_id).unwrap().revision,
+            before.revision
+        );
+    }
+
+    #[test]
     fn unfinished_continuation_is_atomic_fenced_and_recoverable() {
         let store = Arc::new(RuntimeEventStore::for_test());
         let commits = crate::ExecutionCommitService::new(Arc::clone(&store));
@@ -403,7 +653,7 @@ mod tests {
         changed_quantity.exact_team_count = Some(changed_quantity.required_team_count);
         assert!(
             commits
-                .register_graph_with_continuation(next.clone(), Some(changed_quantity))
+                .register_graph_with_continuation(next.clone(), Some(changed_quantity), None)
                 .is_err(),
             "continuation cannot turn the original minimum into an exact ceiling"
         );
@@ -414,7 +664,7 @@ mod tests {
             "rejected continuation must leave no target Program"
         );
         let receipt = commits
-            .register_graph_with_continuation(next.clone(), Some(current.clone()))
+            .register_graph_with_continuation(next.clone(), Some(current.clone()), None)
             .unwrap();
         let cold = crate::AgentActionService::new(Arc::clone(&store));
         let inherited = cold.project(&current.program_id).unwrap();
@@ -446,7 +696,7 @@ mod tests {
         assert_eq!(seed.transaction_id, planned.transaction_id);
         assert_eq!(seed.commit_cursor, planned.commit_cursor);
         assert!(matches!(
-            commits.register_graph_with_continuation(next, Some(current)),
+            commits.register_graph_with_continuation(next, Some(current), None),
             Err(crate::execution_core::graph::ExecutionCommitError::AlreadyAppliedSame { .. })
         ));
         let mut rival = graph("rival-root", "rival-turn");
@@ -460,11 +710,9 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(
-            commits
-                .register_graph_with_continuation(rival, Some(actor("rival-turn", "rival-root")))
-                .is_err()
-        );
+        assert!(commits
+            .register_graph_with_continuation(rival, Some(actor("rival-turn", "rival-root")), None)
+            .is_err());
         assert!(store.list_stream("rival-root").unwrap().is_empty());
     }
 
@@ -518,11 +766,9 @@ mod tests {
                 payload: json!({}),
             })
             .unwrap();
-        assert!(
-            commits
-                .register_graph_with_continuation(next, Some(actor("new-turn", "new-root")))
-                .is_err()
-        );
+        assert!(commits
+            .register_graph_with_continuation(next, Some(actor("new-turn", "new-root")), None)
+            .is_err());
         assert!(store.list_stream("new-root").unwrap().is_empty());
     }
     #[test]
@@ -684,7 +930,7 @@ mod tests {
         );
         let current = actor("new-turn", "new-root");
         commits
-            .register_graph_with_continuation(next, Some(current.clone()))
+            .register_graph_with_continuation(next, Some(current.clone()), None)
             .unwrap();
         let dispatched = services
             .recover_agentic_programs_on_startup()

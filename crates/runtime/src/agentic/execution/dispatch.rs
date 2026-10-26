@@ -1349,11 +1349,37 @@ impl RuntimeServices {
             AGENTIC_RECOVERY_OWNER.to_string(), async move {
                 let _flight = flight;
                 let Some(services) = weak.upgrade() else { return; };
-                if let Err(error) = services.recover_agentic_program_task(
+                #[cfg(test)]
+                let observe = |stage: &str, result: Option<&Result<Vec<AgenticDispatchReceipt>, String>>| {
+                    if expected.status != AgenticTaskStatus::CancelRequested { return; }
+                    let state = services.agent_action_service().project_snapshot(&worker_program)
+                        .map(|projection| serde_json::json!({
+                            "revision":projection.revision,"status":projection.status,
+                            "task":projection.tasks.get(&worker_task).map(|task| serde_json::json!({
+                                "status":task.status,"active_attempts":task.active_attempts,
+                                "claim_execution_id":task.claim_execution_id,"pending_retirement":task.pending_retirement,
+                            })),
+                        })).unwrap_or_else(|error|serde_json::json!({"read_error":error.to_string()}));
+                    let outcome = result.map(|result| match result {
+                        Ok(receipts) => serde_json::json!({"ok":true,"receipt_count":receipts.len()}),
+                        Err(error) => serde_json::json!({"ok":false,"error":error}),
+                    });
+                    eprintln!("R285_RETIREMENT_WORKER {}",serde_json::json!({
+                        "stage":stage,"program":worker_program,"task":worker_task,"attempt":worker_attempt,
+                        "expected_status":expected.status,"expected_active_attempts":expected.active_attempts,
+                        "state":state,"result":outcome,
+                    }));
+                };
+                #[cfg(test)]
+                observe("entered",None);
+                let result = services.recover_agentic_program_task(
                     &worker_program, &worker_task,
                     (!worker_attempt.is_empty()).then_some(worker_attempt.as_str()),
                     Some(&expected), &BTreeSet::new(),
-                ).await {
+                ).await;
+                #[cfg(test)]
+                observe("returned",Some(&result));
+                if let Err(error) = result {
                     tracing::warn!(program_id = %worker_program, task_ref = %worker_task,
                         attempt = %worker_attempt, %error, "durable Agentic recovery remains pending");
                 }

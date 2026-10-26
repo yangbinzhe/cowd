@@ -1557,6 +1557,26 @@ impl UnifiedSessionStore {
         .await
     }
 
+    /// Pending receipt evidence only; never redeliver consumed user messages.
+    pub async fn pending_session_input_applications(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        after: Option<(usize, String)>,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
+        let session_id = session_id.to_string();
+        self.execute_read(move |backend| {
+            backend.pending_session_input_applications(
+                &session_id,
+                session_generation,
+                after,
+                limit,
+            )
+        })
+        .await
+    }
+
     pub async fn session_runtime_outbox_for_session(
         &self,
         session_id: &str,

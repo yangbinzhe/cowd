@@ -354,6 +354,8 @@ pub fn input_application_receipt_is_atomic_and_recoverable(
     let input_ids = vec![first.input_id.clone(), second.input_id.clone()];
     let prepared = SessionInputApplicationReceipt {
         disposition_id: "disposition-contract".to_string(),
+        prepared_application: None,
+        cancellation: None,
         leader_input_id: first.input_id.clone(),
         input_ids: input_ids.clone(),
         action: InputDispositionAction::AddRequiredTask,
@@ -477,6 +479,8 @@ pub fn input_application_receipt_is_atomic_and_recoverable(
     let replacement_ids = vec![replacement.input_id.clone()];
     let mut replacement_receipt = SessionInputApplicationReceipt {
         disposition_id: "disposition-replacement".to_string(),
+        prepared_application: None,
+        cancellation: None,
         leader_input_id: replacement.input_id.clone(),
         input_ids: replacement_ids.clone(),
         action: InputDispositionAction::ReplaceCurrentTask,
@@ -551,6 +555,8 @@ pub fn input_application_receipt_is_atomic_and_recoverable(
     let dispatch_ids = vec![dispatch.input_id.clone()];
     let mut dispatch_receipt = SessionInputApplicationReceipt {
         disposition_id: "disposition-new-session".to_string(),
+        prepared_application: None,
+        cancellation: None,
         leader_input_id: dispatch.input_id.clone(),
         input_ids: dispatch_ids.clone(),
         action: InputDispositionAction::DispatchSession,

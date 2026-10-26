@@ -392,6 +392,7 @@ async fn real_blocked_a_survives_restart_and_b_binds_exact_source_before_outbox_
     first
         .goal_store()
         .create(GoalContract {
+            input_contract: None,
             id: goal_id.clone(),
             session_id: session_id.into(),
             objective: actor.objective_summary.clone(),

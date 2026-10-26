@@ -214,6 +214,19 @@ async fn outcome_append_failure_leaves_packed_attempt_unknown() {
 
     #[async_trait::async_trait]
     impl crate::SessionRuntimeJournalPort for FailOutcomePort {
+        async fn commit_input_application_receipt(
+            &self,
+            input_ids: &[String],
+            expected_revisions: &[u64],
+            receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+            now_ms: u64,
+        ) -> Result<Vec<crate::RuntimeSessionInputRecord>, session::SessionError> {
+            let _ = (input_ids, expected_revisions, receipt, now_ms);
+            Err(session::SessionError::Store(
+                "fixture has no input application owner".into(),
+            ))
+        }
+
         async fn authorize_requested_cancellation(
             &self,
             _request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
@@ -4516,6 +4529,19 @@ async fn compaction_raw_journal_failure_retains_original_window() {
     struct RejectRawJournal;
     #[async_trait::async_trait]
     impl crate::SessionRuntimeJournalPort for RejectRawJournal {
+        async fn commit_input_application_receipt(
+            &self,
+            input_ids: &[String],
+            expected_revisions: &[u64],
+            receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+            now_ms: u64,
+        ) -> Result<Vec<crate::RuntimeSessionInputRecord>, session::SessionError> {
+            let _ = (input_ids, expected_revisions, receipt, now_ms);
+            Err(session::SessionError::Store(
+                "fixture has no input application owner".into(),
+            ))
+        }
+
         async fn authorize_requested_cancellation(
             &self,
             _request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
@@ -4756,6 +4782,18 @@ mod r1_native_real_wire {
 
     #[async_trait::async_trait]
     impl crate::SessionRuntimeJournalPort for FallibleSessionJournal {
+        async fn commit_input_application_receipt(
+            &self,
+            input_ids: &[String],
+            expected_revisions: &[u64],
+            receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+            now_ms: u64,
+        ) -> Result<Vec<crate::RuntimeSessionInputRecord>, session::SessionError> {
+            self.inner
+                .commit_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+                .await
+        }
+
         async fn authorize_requested_cancellation(
             &self,
             request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,

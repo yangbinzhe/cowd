@@ -1109,8 +1109,10 @@ where
         admission_plan
             .tasks
             .retain(|task| !replays.contains_key(&task.tool_call_id));
-        let decision =
-            self.retarget_active_turn_strategy_for_governed_plan(&admission_plan, calls)?;
+        let decision = self
+            .active_turn_strategy()
+            .map(|state| state.decision)
+            .ok_or_else(|| RuntimeError::new("tool batch has no admitted turn identity"))?;
         self.tool_executor.bind_execution_decision(decision.clone());
         let mut validation = admission_plan.validate_against_execution_decision(&decision);
         if validation.allowed {
@@ -2733,7 +2735,12 @@ where
 
     pub(crate) fn active_repetition_scope(&self) -> crate::repetition_guard::RepetitionScope {
         self.runtime_event_store.as_ref().map_or_else(
-            || crate::repetition_guard::RepetitionScope::turn(self.session_id(), &self.active_turn_id()),
+            || {
+                crate::repetition_guard::RepetitionScope::turn(
+                    self.session_id(),
+                    &self.active_turn_id(),
+                )
+            },
             |store| store.repetition_scope(self.session_id(), &self.active_turn_id()),
         )
     }

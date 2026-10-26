@@ -1477,7 +1477,30 @@ impl SessionService {
 
     pub(crate) async fn admit_input(
         &self,
+        envelope: SessionInputEnvelope,
+    ) -> Result<crate::runtime_service::SessionInputAdmission, String> {
+        self.admit_input_with_user_source(envelope, None).await
+    }
+
+    /// Only the route that has authenticated the principal and checked Session
+    /// writer admission supplies this source. Generic/Agent ingress cannot
+    /// manufacture it through envelope metadata or source_kind.
+    pub(crate) async fn admit_authenticated_user_input(
+        &self,
+        envelope: SessionInputEnvelope,
+        principal_id: &str,
+    ) -> Result<crate::runtime_service::SessionInputAdmission, String> {
+        if principal_id.trim().is_empty() {
+            return Err("authenticated input requires its original principal".into());
+        }
+        self.admit_input_with_user_source(envelope, Some(principal_id))
+            .await
+    }
+
+    async fn admit_input_with_user_source(
+        &self,
         mut envelope: SessionInputEnvelope,
+        principal_id: Option<&str>,
     ) -> Result<crate::runtime_service::SessionInputAdmission, String> {
         self.ensure_accepting()?;
         let runtime = self.runtime()?;
@@ -1497,6 +1520,7 @@ impl SessionService {
                 envelope.session_id, admission.generation
             ));
         }
+        bind_input_user_source(&mut envelope, principal_id, admission.generation)?;
         if envelope.task_route_hint.is_none() {
             let record = self
                 .stored_session(&envelope.session_id)
@@ -1744,7 +1768,12 @@ impl SessionService {
             )
             .await
             .map_err(|error| error.to_string())?;
-        if current.status.holds_claim() {
+        let application_cancel_requested = cancelled.application_receipt.as_ref()
+            .and_then(|receipt| receipt.cancellation.as_ref())
+            .is_some_and(|cancel| cancel.state == harness_contract::input_disposition::InputApplicationCancellationState::Requested);
+        // Reservation cancellation is durable work even when the outbox claim
+        // was already consumed; signalling it is not proof of physical exit.
+        if current.status.holds_claim() || application_cancel_requested {
             self.runtime()?
                 .cancel_active_session(session_id, "durable Session input cancelled");
         }
@@ -1805,6 +1834,18 @@ impl SessionService {
             runtime.project_durable_session_receipt(session_id, receipt.clone());
         }
         Ok(receipt)
+    }
+
+    pub(crate) async fn pending_session_input_applications(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        after: Option<(usize, String)>,
+        limit: usize,
+    ) -> Result<Vec<session::SessionRuntimeOutboxRecord>, session::SessionError> {
+        self.kernel()
+            .pending_session_input_applications(session_id, session_generation, after, limit)
+            .await
     }
 
     pub(crate) async fn runtime_input_by_input_id(
@@ -2223,8 +2264,9 @@ impl SessionService {
                 .ensure_session_recovery_admitted(session_id)
                 .map_err(|error| SessionError::InvalidArgument(error.to_string()))?;
         }
+        let sanitized = strip_runtime_input_user_source(request)?;
         self.kernel()
-            .append_runtime_ingress(session_id, role, content_json, created_at_ms, request)
+            .append_runtime_ingress(session_id, role, content_json, created_at_ms, &sanitized)
             .await
     }
 
@@ -3307,6 +3349,79 @@ fn created_at_from_millis(created_at_ms: u64) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
+fn strip_input_user_source_metadata(metadata: &mut serde_json::Value) -> bool {
+    metadata.as_object_mut().is_some_and(|object| {
+        object
+            .remove(harness_contract::turn::SESSION_INPUT_USER_SOURCE_KEY)
+            .is_some()
+    })
+}
+
+fn strip_runtime_input_user_source(
+    request: &SessionRuntimeOutboxRequest,
+) -> Result<std::borrow::Cow<'_, SessionRuntimeOutboxRequest>, SessionError> {
+    let Some(json) = request.classification_json.as_deref() else {
+        return Ok(std::borrow::Cow::Borrowed(request));
+    };
+    // Nonclassification/legacy JSON remains data; it cannot deserialize as an
+    // authenticated source. Only a reserved origin requires rewriting.
+    let Ok(mut classification) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Ok(std::borrow::Cow::Borrowed(request));
+    };
+    if !classification
+        .get_mut("metadata")
+        .is_some_and(strip_input_user_source_metadata)
+    {
+        return Ok(std::borrow::Cow::Borrowed(request));
+    }
+    let mut sanitized = request.clone();
+    sanitized.classification_json = Some(
+        serde_json::to_string(&classification)
+            .map_err(|error| SessionError::InvalidArgument(error.to_string()))?,
+    );
+    Ok(std::borrow::Cow::Owned(sanitized))
+}
+
+fn bind_input_user_source(
+    envelope: &mut SessionInputEnvelope,
+    principal_id: Option<&str>,
+    generation: u64,
+) -> Result<(), String> {
+    use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
+    // Strip reserved origin at the common admission boundary, even for an
+    // internal caller that copied a real input's metadata.
+    strip_input_user_source_metadata(&mut envelope.metadata);
+    if let Some(principal_id) = principal_id {
+        if principal_id.trim().is_empty() {
+            return Err("authenticated input requires its original principal".into());
+        }
+        let source = SessionInputUserSource {
+            principal_id: principal_id.to_string(),
+            session_id: envelope.session_id.clone(),
+            input_id: envelope.input_id.to_string(),
+            request_id: envelope.idempotency_key.clone(),
+            message_id: envelope
+                .source_message_id
+                .clone()
+                .unwrap_or_else(|| envelope.input_id.to_string()),
+            session_generation: generation,
+            content_sha256: {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(envelope.content.as_bytes()))
+            },
+        };
+        let metadata = envelope
+            .metadata
+            .as_object_mut()
+            .ok_or_else(|| "authenticated input metadata must be an object".to_string())?;
+        metadata.insert(
+            SESSION_INPUT_USER_SOURCE_KEY.into(),
+            serde_json::to_value(source).map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(())
+}
+
 fn receipt_from_durable_input(record: &SessionRuntimeOutboxRecord) -> SessionInputReceipt {
     let classification = classification_from_durable_input(record);
     SessionInputReceipt {
@@ -3317,9 +3432,18 @@ fn receipt_from_durable_input(record: &SessionRuntimeOutboxRecord) -> SessionInp
         relation_proposal: classification
             .as_ref()
             .and_then(|item| item.relation_proposal.clone()),
-        reason: classification
-            .as_ref()
-            .map(|item| item.reason.clone())
+        reason: record.application_receipt.as_ref()
+            .and_then(|receipt| receipt.cancellation.as_ref())
+            .map(|cancel| InputRoutingReason::new(
+                match cancel.state {
+                    harness_contract::input_disposition::InputApplicationCancellationState::Requested => "application_cancel_requested",
+                    harness_contract::input_disposition::InputApplicationCancellationState::Settled => "application_cancel_settled",
+                },
+                match cancel.state {
+                    harness_contract::input_disposition::InputApplicationCancellationState::Requested => "Input application cancellation requested; original execution settlement remains pending",
+                    harness_contract::input_disposition::InputApplicationCancellationState::Settled => "Original execution cancellation settled; previously applied Goal facts remain recorded",
+                }, 10_000))
+            .or_else(|| classification.as_ref().map(|item| item.reason.clone()))
             .or_else(|| {
                 record.last_error.as_ref().map(|error| {
                     InputRoutingReason::new("durable_transition", error.clone(), 10_000)
@@ -3464,6 +3588,112 @@ mod tests {
     use super::*;
     use crate::active_session::ActiveSessionDirectory;
     use crate::services::session_service::presence::SessionPresenceLedger;
+
+    #[test]
+    fn authenticated_input_source_overwrites_spoofed_metadata_and_generic_ingress_strips_it() {
+        use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
+        let mut input = SessionInputEnvelope::text("source-session", harness_contract::turn::InputSourceKind::Api, "do not write a file")
+            .with_source_message_id("source-message")
+            .with_idempotency_key("source-request")
+            .with_metadata(serde_json::json!({SESSION_INPUT_USER_SOURCE_KEY:{"principal_id":"foreign"},"runtime_options":{"keep":true}}));
+        bind_input_user_source(&mut input, Some("actual-principal"), 7).unwrap();
+        let source: SessionInputUserSource =
+            serde_json::from_value(input.metadata[SESSION_INPUT_USER_SOURCE_KEY].clone()).unwrap();
+        assert_eq!(source.principal_id, "actual-principal");
+        assert_eq!(source.session_id, "source-session");
+        assert_eq!(source.message_id, "source-message");
+        assert_eq!(source.request_id, "source-request");
+        assert_eq!(source.input_id, input.input_id.to_string());
+        assert_eq!(source.session_generation, 7);
+        assert_eq!(
+            source.content_sha256,
+            "a9d3fee39f4852babf975a9a61d8fe9b7f3af4c2a2dd281ae41b40ae4d8e905e"
+        );
+        assert_eq!(input.content, "do not write a file");
+        assert_eq!(input.metadata["runtime_options"]["keep"], true);
+        bind_input_user_source(&mut input, None, 7).unwrap();
+        assert!(input.metadata.get(SESSION_INPUT_USER_SOURCE_KEY).is_none());
+        assert_eq!(input.metadata["runtime_options"]["keep"], true);
+    }
+
+    #[test]
+    fn raw_runtime_ingress_cannot_forge_authenticated_user_origin() {
+        use harness_contract::turn::SESSION_INPUT_USER_SOURCE_KEY;
+        let metadata = serde_json::json!({"runtime_options":{"keep":true},
+            "cowd_authenticated_input_source":{"principal_id":"invented-principal"}});
+        assert!(metadata.get(SESSION_INPUT_USER_SOURCE_KEY).is_some());
+        let request = SessionRuntimeOutboxRequest {
+            input_id: "agent-input".into(),
+            request_id: "agent-request".into(),
+            turn_id: "agent-turn".into(),
+            message_id: "agent-message".into(),
+            session_generation: 7,
+            decision: InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: Some(
+                serde_json::json!({"metadata":metadata,"source_kind":"api","reason":"agent data"})
+                    .to_string(),
+            ),
+            task_route_hint: None,
+            created_at_ms: 10,
+            runtime_options_json: None,
+        };
+        let sanitized = strip_runtime_input_user_source(&request).unwrap();
+        let classification: serde_json::Value =
+            serde_json::from_str(sanitized.classification_json.as_deref().unwrap()).unwrap();
+        assert!(classification["metadata"]
+            .get(SESSION_INPUT_USER_SOURCE_KEY)
+            .is_none());
+        assert_eq!(classification["metadata"]["runtime_options"]["keep"], true);
+        assert_eq!(classification["reason"], "agent data");
+        assert_eq!(sanitized.input_id, request.input_id);
+        assert_eq!(sanitized.session_generation, request.session_generation);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(
+                request.classification_json.as_deref().unwrap()
+            )
+            .unwrap()["metadata"]
+                .get(SESSION_INPUT_USER_SOURCE_KEY)
+                .is_some(),
+            "sanitizing one generic admission must not mutate an original authenticated record"
+        );
+        assert!(matches!(
+            strip_runtime_input_user_source(&sanitized).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn application_cancel_response_reports_pending_without_claiming_goal_was_undone() {
+        let row: SessionRuntimeOutboxRecord = serde_json::from_value(serde_json::json!({
+            "input_id":"input-1", "request_id":"request-1", "turn_id":"turn-1",
+            "message_id":"user-1", "session_id":"session-1", "sequence":7,
+            "session_generation":3, "decision":"spawn_subtask", "status":"completed",
+            "attempts":1,"next_attempt_at_ms":0,"revision":4,"created_at_ms":1,"updated_at_ms":4,
+            "application_receipt":{
+                "disposition_id":"original", "leader_input_id":"input-1","input_ids":["input-1"],
+                "action":"add_required_task","relation":"new_task","state":"applied",
+                "objective":"original work","required":true,"attempts":1,"summary":"applied",
+                "task_ids":["task-1"],"execution_ids":["execution-1"],"revision":3,"updated_at_ms":4,
+                "cancellation":{"actor":"user","reason":"stop","requested_at_ms":4,"state":"requested"}
+            }
+        })).unwrap();
+        row.application_receipt
+            .as_ref()
+            .unwrap()
+            .validate_shape()
+            .unwrap();
+        let response = receipt_from_durable_input(&row);
+        assert_ne!(response.status, SessionInputStatus::Cancelled);
+        assert_eq!(
+            response.reason.unwrap().code,
+            "application_cancel_requested"
+        );
+        assert_eq!(
+            inbox_item_from_durable_input(&row).application_receipt,
+            row.application_receipt
+        );
+    }
 
     fn focus_record(metadata: serde_json::Value) -> SessionRecord {
         SessionRecord {

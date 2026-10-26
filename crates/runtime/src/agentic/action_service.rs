@@ -24,7 +24,9 @@ mod delegation;
 #[cfg(test)]
 mod native_effect_history_tests;
 
-use authorization::{validate_transition, validate_transition_with_admission_contexts};
+#[cfg(test)]
+use authorization::validate_transition;
+use authorization::validate_transition_with_admission_contexts;
 
 /// Immutable claim identities at the original conclusion cut. Only an exact
 /// renewal of one of these claims is neutral to that conclusion.
@@ -256,6 +258,14 @@ pub(crate) fn with_conclusion_append_hook<Output>(
 }
 
 impl AgentActionService {
+    #[cfg(test)]
+    pub(crate) fn with_team_quantity_commit_hook_for_test<Output>(
+        hook: impl FnOnce(&AppendTransactionRequest) + 'static,
+        commit: impl FnOnce() -> Output,
+    ) -> Output {
+        with_conclusion_append_hook(hook, commit)
+    }
+
     /// Append one barrier disposition record. It goes on its own stream so it never
     /// advances the semantic Program revision, and its scope is deliberately not
     /// `Program`: the resolver lane's interest is `agentic.action_applied`, and a
@@ -1306,8 +1316,7 @@ impl AgentActionService {
             .ok_or("runtime retirement Program binding missing")?;
         let focus_matches = match (&binding.focus, input.mode) {
             (AgenticExecutionFocus::TaskExecute { task_ref }, AgentAttemptMode::Execute) => {
-                task_ref == &input.task_ref
-                    && retirement_execute_claim_matches(task, attempt)
+                task_ref == &input.task_ref && retirement_execute_claim_matches(task, attempt)
             }
             (AgenticExecutionFocus::TaskReview { task_ref }, AgentAttemptMode::Review) => {
                 task_ref == &input.task_ref && task.review_generation == attempt.generation
@@ -2007,14 +2016,15 @@ impl AgentActionService {
         }
         let stream_id = program_stream(&envelope.actor.program_id);
         let mut streams = vec![stream_id.clone()];
-        if matches!(&envelope.action, AgentAction::TaskPublish(input) if !input.obligation_refs.is_empty())
+        if matches!(&envelope.action, AgentAction::TeamCreate(_))
+            || matches!(&envelope.action, AgentAction::TaskPublish(input) if !input.obligation_refs.is_empty())
         {
             if let Some(root) = &envelope.actor.root_execution_id {
                 streams.push(format!("goal:goal:{root}"));
             }
         }
         self.store.with_stream_locks(&streams, || {
-            self.apply_locked(envelope, &stream_id, None, None)
+            self.apply_locked(envelope, &stream_id, None, None, &[])
         })
     }
 
@@ -2030,11 +2040,31 @@ impl AgentActionService {
         goal_event: RuntimeTransactionEventInput,
         verification: Option<&ObjectiveReviewVerification>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        self.apply_with_goal_event_sources(
+            envelope,
+            goal_stream_id,
+            expected_goal_stream_revision,
+            goal_event,
+            verification,
+            &[],
+        )
+    }
+
+    pub(crate) fn apply_with_goal_event_sources(
+        &self,
+        envelope: &AgentActionEnvelope,
+        goal_stream_id: String,
+        expected_goal_stream_revision: u64,
+        goal_event: RuntimeTransactionEventInput,
+        verification: Option<&ObjectiveReviewVerification>,
+        extra_sources: &[ExpectedStreamRevision],
+    ) -> Result<AgentActionObservation, AgentActionServiceError> {
         if let Err(error) = envelope.validate() {
             return Ok(rejected(envelope, 0, "invalid_action", &error.to_string()));
         }
         let program_stream_id = program_stream(&envelope.actor.program_id);
         let mut streams = vec![program_stream_id.clone(), goal_stream_id.clone()];
+        streams.extend(extra_sources.iter().map(|s| s.stream_id.clone()));
         streams.extend(
             verification
                 .and_then(|proof| proof.input_set.as_ref())
@@ -2062,6 +2092,7 @@ impl AgentActionService {
                 &program_stream_id,
                 Some((goal_stream_id, expected_goal_stream_revision, goal_event)),
                 verification,
+                extra_sources,
             )
         })
     }
@@ -2133,7 +2164,7 @@ impl AgentActionService {
             streams.extend(verification.effect_source_refs.iter().cloned());
         }
         self.store.with_stream_locks(&streams, || {
-            self.apply_locked(envelope, &stream_id, None, Some(verification))
+            self.apply_locked(envelope, &stream_id, None, Some(verification), &[])
         })
     }
 
@@ -2143,6 +2174,7 @@ impl AgentActionService {
         stream_id: &str,
         goal_event: Option<(String, u64, RuntimeTransactionEventInput)>,
         verification: Option<&ObjectiveReviewVerification>,
+        extra_sources: &[ExpectedStreamRevision],
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         self.ensure_recovery_session_admitted(&envelope.actor.session_id)?;
         if let Some(replay) = self.replay_if_applied(envelope)? {
@@ -2563,19 +2595,52 @@ impl AgentActionService {
                 ));
             }
         };
-        let transition = match (completion_context.as_ref(), retirement_context.as_ref()) {
-            (None, None) => {
-                validate_transition(&projection, envelope, now_ms(), self.graphs.as_ref())
+        let mut quantity_source = None;
+        let mut current_team_bounds = None;
+        if matches!(envelope.action, AgentAction::TeamCreate(_)) {
+            if let Some(root) = envelope.actor.root_execution_id.as_deref() {
+                let goal_id = format!("goal:{root}");
+                let goal_stream = format!("goal:{goal_id}");
+                let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
+                    .projection(&goal_id)
+                    .map_err(AgentActionServiceError::Corrupt)?;
+                quantity_source = Some(ExpectedStreamRevision {
+                    stream_id: goal_stream,
+                    expected_revision: goal.as_ref().map_or(0, |goal| goal.stream_revision),
+                });
+                if let Some(goal) = goal {
+                    current_team_bounds =
+                        crate::execution_core::goal::current_goal_team_bounds(&goal.goal);
+                    if current_team_bounds.is_some() {
+                        let bound = goal.goal.execution_binding.as_ref().is_some_and(|binding| {
+                            binding.root_execution_id == root
+                                && binding.session_id == envelope.actor.session_id
+                                && goal.goal.session_id == envelope.actor.session_id
+                                && binding.turn_id == envelope.actor.turn_id
+                                && binding.agentic_program_id == envelope.actor.program_id
+                                && binding.objective_id == envelope.actor.objective_id
+                        });
+                        if !bound {
+                            return Ok(rejected(
+                                envelope,
+                                projection.revision,
+                                "current_goal_binding_mismatch",
+                                "current business quantities belong to another Goal binding",
+                            ));
+                        }
+                    }
+                }
             }
-            (completion, retirement) => validate_transition_with_admission_contexts(
-                &projection,
-                envelope,
-                now_ms(),
-                self.graphs.as_ref(),
-                completion,
-                retirement,
-            ),
-        };
+        }
+        let transition = validate_transition_with_admission_contexts(
+            &projection,
+            envelope,
+            now_ms(),
+            self.graphs.as_ref(),
+            completion_context.as_ref(),
+            retirement_context.as_ref(),
+            current_team_bounds,
+        );
         if let Some((code, message)) = transition {
             if matches!(
                 code,
@@ -2797,6 +2862,8 @@ impl AgentActionService {
             stream_id: stream_id.to_string(),
             expected_revision: projection.revision,
         }];
+        expected_streams.extend(extra_sources.iter().cloned());
+        expected_streams.extend(quantity_source);
         expected_streams.extend(policy_sources);
         expected_streams.extend(
             retirement_context
@@ -2843,15 +2910,24 @@ impl AgentActionService {
                 expected_revision,
             })
             .collect();
-        self.store
-            .append_transaction_locked(AppendTransactionRequest {
-                transaction_id: format!(
-                    "agent-action:{}:{}",
-                    envelope.actor.program_id, envelope.action_id
-                ),
-                expected_streams,
-                events,
-            })?;
+        let transaction = AppendTransactionRequest {
+            transaction_id: format!(
+                "agent-action:{}:{}",
+                envelope.actor.program_id, envelope.action_id
+            ),
+            expected_streams,
+            events,
+        };
+        #[cfg(test)]
+        if matches!(envelope.action, AgentAction::TeamCreate(_)) {
+            CONCLUSION_APPEND_HOOK.with(|slot| {
+                let hook = slot.borrow_mut().take();
+                if let Some(hook) = hook {
+                    hook(&transaction);
+                }
+            });
+        }
+        self.store.append_transaction_locked(transaction)?;
         // S1: task success/rework is measured at the commit boundary (after the
         // replay guard and the durable append), never in the replayable
         // projection fold, so replays and rebuilds cannot inflate the counts.
@@ -2859,7 +2935,9 @@ impl AgentActionService {
             match input.decision {
                 harness_contract::agent_action::TaskReviewDecision::Accept => {
                     crate::repetition_guard::clear_failure_breakers(
-                        &self.store.repetition_scope(&envelope.actor.session_id, &envelope.actor.turn_id),
+                        &self
+                            .store
+                            .repetition_scope(&envelope.actor.session_id, &envelope.actor.turn_id),
                     );
                     crate::execution_core::performance::observe_count("agentic_task_accepted", 1);
                 }
@@ -3591,11 +3669,18 @@ impl AgentActionService {
                     required_results.extend(obligation.artifact_refs.iter().cloned());
                 }
                 super::review_evidence::validate_review_coverage(
-                    &prepared.goal, projection, review, &required_results,
-                    &prepared.goal.evidence_refs, &snapshot,
-                ).map_err(|error| AgentActionServiceError::Corrupt(
-                    format!("required review {condition}: {error}"),
-                ))?;
+                    &prepared.goal,
+                    projection,
+                    review,
+                    &required_results,
+                    &prepared.goal.evidence_refs,
+                    &snapshot,
+                )
+                .map_err(|error| {
+                    AgentActionServiceError::Corrupt(format!(
+                        "required review {condition}: {error}"
+                    ))
+                })?;
                 for source in snapshot.sources {
                     current_sources
                         .pin(ExpectedStreamRevision {
@@ -4712,7 +4797,9 @@ fn inspected_observation(
         let state_token = serde_json::to_string(&answer).unwrap_or_default();
         let inspection_scope = envelope.actor.execution_id.as_deref().map_or_else(
             || store.repetition_scope(&envelope.actor.session_id, &envelope.actor.turn_id),
-            |execution_id| store.repetition_execution_scope(&envelope.actor.session_id, execution_id),
+            |execution_id| {
+                store.repetition_execution_scope(&envelope.actor.session_id, execution_id)
+            },
         );
         if crate::repetition_guard::record_unchanged_inspection(
             &inspection_scope,

@@ -26,6 +26,13 @@ pub trait ScopedNodeBackend: Send + Sync {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError>;
+    /// Read only an already known original durable outcome; never execute.
+    async fn recover_known_outcome(
+        &self,
+        _ticket: &NodeExecutionTicket,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        Ok(None)
+    }
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         Ok(())
     }
@@ -448,6 +455,22 @@ impl NodeExecutor for ScopedNodeExecutor {
             idempotency_key: context.node.idempotency_key,
             payload_ref: context.node.payload_ref,
         })
+    }
+
+    async fn recover_known_outcome(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        if ticket.executor_kind != self.kind {
+            return Err(NodeExecutorError::Recover {
+                node_id: ticket.node_id.clone(),
+                reason: "known outcome executor kind mismatch".into(),
+            });
+        }
+        let Some(backend) = self.resolve(ticket) else {
+            return Ok(None);
+        };
+        backend.recover_known_outcome(ticket).await
     }
 
     async fn poll_or_await(

@@ -33,9 +33,7 @@ use session::{
 use session::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 #[cfg(test)]
 use storage::PostgresConnectionConfig;
-use storage::{
-    PostgresConnection, PostgresExecutor, PostgresMigrationSpec, PostgresTransaction,
-};
+use storage::{PostgresConnection, PostgresExecutor, PostgresMigrationSpec, PostgresTransaction};
 
 const SESSION_DOMAIN: &str = "session";
 
@@ -2895,6 +2893,16 @@ impl session::SessionStoreBackend for PostgresSessionStore {
     ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.session_runtime_outbox_for_turn_relation(a, b, c)
     }
+    fn pending_session_input_applications(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        after: Option<(usize, String)>,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
+        self.pending_session_input_applications(session_id, session_generation, after, limit)
+    }
+
     fn session_runtime_outbox_for_session(
         &self,
         a: &str,

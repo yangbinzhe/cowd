@@ -358,6 +358,24 @@ impl InputRoutingReason {
     }
 }
 
+/// Reserved server-origin classification key. A model/body value alone is not
+/// evidence: Runtime must read the original durable record and match its IDs.
+pub const SESSION_INPUT_USER_SOURCE_KEY: &str = "cowd_authenticated_input_source";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInputUserSource {
+    pub principal_id: String,
+    pub session_id: String,
+    pub input_id: String,
+    pub request_id: String,
+    pub message_id: String,
+    pub session_generation: u64,
+    /// Integrity of the received input body, never semantic approval. An old
+    /// absent value is readable data and cannot authorize a new Goal revision.
+    #[serde(default)]
+    pub content_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInputEnvelope {
     pub input_id: SessionInputId,

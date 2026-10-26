@@ -1924,6 +1924,7 @@ where
         Ok(state.decision)
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(super) fn retarget_active_turn_strategy_for_tool_requirements(
         &self,
         selected_candidate: harness_contract::strategy::ExecutionCandidateKind,
@@ -1994,6 +1995,7 @@ where
     /// plan. Conversation and execution-graph routes call this same method so
     /// a graph node cannot validate a later write against an earlier
     /// evidence-only strategy snapshot.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn retarget_active_turn_strategy_for_governed_plan(
         &self,
         plan: &GovernedToolPlan,

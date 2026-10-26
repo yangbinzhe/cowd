@@ -34,7 +34,7 @@ pub(super) fn validate_transition_with_completion_context(
     completion: Option<&crate::agentic::review_evidence::CompletionAdmissionContext>,
 ) -> Option<(&'static str, String)> {
     validate_transition_with_admission_contexts(
-        projection, envelope, now_ms, graphs, completion, None,
+        projection, envelope, now_ms, graphs, completion, None, None,
     )
 }
 
@@ -45,6 +45,7 @@ pub(super) fn validate_transition_with_admission_contexts(
     graphs: Option<&crate::ExecutionGraphStateStore>,
     completion: Option<&crate::agentic::review_evidence::CompletionAdmissionContext>,
     retirement: Option<&super::RuntimeRetirementAdmission>,
+    current_team_bounds: Option<(u8, Option<u8>)>,
 ) -> Option<(&'static str, String)> {
     let retiring = retirement.is_some_and(|context| context.covers(projection, envelope));
     if projection.status == crate::agentic::program::AgenticProgramStatus::CompletionRequested
@@ -76,11 +77,16 @@ pub(super) fn validate_transition_with_admission_contexts(
     match &envelope.action {
         AgentAction::StateInspect(_) => None,
         AgentAction::TeamCreate(_) => {
-            if let Err(reason) = projection.validate_team_quantity_contract() {
-                return Some(("team_quantity_unknown", reason));
-            }
-            // Minimums leave additional Teams free; exact zero forbids the first.
-            if let Some(ceiling) = projection.exact_team_count {
+            let ceiling = if let Some((_, maximum)) = current_team_bounds {
+                maximum
+            } else {
+                if let Err(reason) = projection.validate_team_quantity_contract() {
+                    return Some(("team_quantity_unknown", reason));
+                }
+                projection.exact_team_count
+            };
+            // Business quantity is independent of the role/grant checks below.
+            if let Some(ceiling) = ceiling {
                 if projection.teams.len() >= usize::from(ceiling) {
                     return Some((
                         "team_ceiling_reached",
@@ -1185,6 +1191,7 @@ mod reclaim_discipline_tests {
                     &projection,
                     &request,
                     10_000,
+                    None,
                     None,
                     None,
                     None

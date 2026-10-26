@@ -254,7 +254,7 @@ fn telemetry_wall_speed_uses_wall_duration() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn high_risk_mutation_creates_real_checkpoint_before_dispatch() {
+async fn concrete_mutation_creates_real_checkpoint_before_dispatch() {
     use harness_contract::core::{
         ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, TaskRisk,
     };
@@ -285,7 +285,11 @@ async fn high_risk_mutation_creates_real_checkpoint_before_dispatch() {
         input: r#"{"path":"src/lib.rs","content":"x"}"#.to_string(),
         depends_on: Vec::new(),
     }];
-    let plan = crate::governed_tool_plan::GovernedToolPlan::from_requests(&requests);
+    let mut plan = crate::governed_tool_plan::GovernedToolPlan::from_requests(&requests);
+    // Approval belongs to the registered effect, not the predicted risk.
+    plan.tasks[0].effect.approval_class = harness_contract::tool::ToolApprovalClass::User;
+    plan.tasks[0].invocation.effect.approval_class =
+        harness_contract::tool::ToolApprovalClass::User;
     let mut decision =
         crate::execution_core::build_runtime_execution_decision("实现并修改这个文件", None);
     decision.strategy.pattern = ExecutionPattern::Execute;

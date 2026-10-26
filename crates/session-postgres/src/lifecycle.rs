@@ -788,7 +788,8 @@ impl PostgresSessionStore {
             .map_err(storage_error)?;
         connection
             .query(
-                "SELECT manifest.session_id, manifest.durable_cursor,
+                &format!(
+                    "SELECT manifest.session_id, manifest.durable_cursor,
                         manifest.event_cursor, manifest.history_revision,
                         manifest.transcript_messages, manifest.transcript_bytes,
                         manifest.latest_checkpoint_sequence,
@@ -809,9 +810,17 @@ impl PostgresSessionStore {
                         manifest.in_flight_turn
                         OR manifest.pending_approval
                         OR manifest.mission_agent_team_continuation
+                        OR EXISTS (
+                            SELECT 1 FROM session_runtime_outbox AS application
+                            WHERE application.session_id=manifest.session_id
+                              AND application.session_generation=record.input_generation
+                              AND ({})
+                        )
                     )
                   ORDER BY manifest.last_activity_ms DESC, manifest.session_id ASC
                   LIMIT $1 OFFSET $2",
+                    super::ingress::APPLICATION_PENDING_SQL
+                ),
                 &[&limit, &offset],
             )
             .map_err(postgres_error)?

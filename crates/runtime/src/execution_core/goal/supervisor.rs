@@ -5,7 +5,9 @@
 //! revision when the plan has a recoverable gap, and commits exactly one
 //! Objective terminal through `GoalStore`.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
+
+use sha2::{Digest, Sha256};
 
 use harness_contract::goal::{
     GoalCompletion, ObjectiveDiagnostic, ObjectiveObligation, ObjectiveObligationState,
@@ -23,6 +25,12 @@ pub enum ObjectiveReconcileDecision {
         diagnostics: Vec<ObjectiveDiagnostic>,
     },
     Terminal(harness_contract::goal::GoalContract),
+}
+
+pub(crate) struct PreparedTurnConclusion {
+    pub completion: GoalCompletion,
+    pub event: crate::RuntimeTransactionEventInput,
+    pub source_revisions: BTreeMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -158,10 +166,198 @@ impl ObjectiveSupervisor {
         Ok(ObjectiveReconcileDecision::Terminal(completed))
     }
 
-    /// Build the only production terminal event used by a user-facing turn.
-    /// The event remains attached to the caller's graph transaction; the
-    /// supervisor is the authority that permits the terminal transition.
-    pub fn terminal_event(
+    /// Prepare an ordinary-turn conclusion from the original committed model
+    /// attempt and Goal receipt contract. This function never appends. The
+    /// caller attaches its event and read set to the original Graph commit.
+    pub(crate) fn prepare_turn_conclusion(
+        &self,
+        goal_id: &str,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+        reason: String,
+        terminal_fence: String,
+    ) -> Result<PreparedTurnConclusion, String> {
+        use harness_contract::execution_graph::{ExecutionNodeKind, ExecutionNodeStatus};
+        let source = self.goals.projection(goal_id)?.ok_or("turn Goal missing")?;
+        let goal = &source.goal;
+        let binding = goal
+            .execution_binding
+            .as_ref()
+            .ok_or("turn Goal binding missing")?;
+        if binding.root_execution_id != ticket.graph_id || binding.session_id != goal.session_id {
+            return Err("turn Goal/Graph binding mismatch".into());
+        }
+        let graph = crate::execution_core::graph::ExecutionGraphStateStore::new(Arc::clone(
+            &self.goals.event_store,
+        ))
+        .load(&ticket.graph_id)
+        .map_err(|error| error.to_string())?;
+        if graph.lineage.as_ref().is_none_or(|lineage| {
+            lineage.session_id != binding.session_id || lineage.turn_id != binding.turn_id
+        }) {
+            return Err("turn Goal/Session lineage mismatch".into());
+        }
+        let latest = graph.nodes.iter().rev().find(|node| {
+            node.kind == ExecutionNodeKind::InlineModel && graph.node_results.contains_key(&node.id)
+        });
+        let mut completion = GoalCompletion::Partial;
+        if let Some(node) = latest {
+            let result = &graph.node_results[&node.id];
+            completion = match result.status {
+                ExecutionNodeStatus::Cancelled => GoalCompletion::Cancelled,
+                ExecutionNodeStatus::Failed => GoalCompletion::Failed,
+                ExecutionNodeStatus::Blocked => GoalCompletion::Blocked,
+                _ => GoalCompletion::Partial,
+            };
+            if result.status == ExecutionNodeStatus::Completed && result.failure.is_none() {
+                if let Some(encoded) = result
+                    .result_ref
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("assistant_json:"))
+                {
+                    let answer: String =
+                        serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+                    let attempt = *graph
+                        .recovery_cursor
+                        .node_attempts
+                        .get(&node.id)
+                        .ok_or("turn candidate attempt missing")?;
+                    let key = super::turn_candidate_key(&graph.id, &node.id, attempt);
+                    if let Some(record) = self
+                        .goals
+                        .event_store
+                        .event_by_idempotency_key(&super::stream_id(goal_id), &key)
+                        .map_err(|error| error.to_string())?
+                    {
+                        let candidate: super::GoalTurnCandidate =
+                            serde_json::from_value(record.payload["answer_candidate"].clone())
+                                .map_err(|error| error.to_string())?;
+                        let expected = super::GoalTurnCandidate {
+                            goal_id: goal.id.clone(),
+                            spec_revision: goal.spec_revision,
+                            spec_digest: goal.spec_digest.clone(),
+                            source_ref: goal
+                                .source_intent_ref
+                                .clone()
+                                .ok_or("turn candidate source missing")?,
+                            graph_id: graph.id.clone(),
+                            node_id: node.id.clone(),
+                            attempt,
+                            answer_sha256: format!("{:x}", Sha256::digest(answer.as_bytes())),
+                        };
+                        if record.kind != "goal.observation"
+                            || candidate != expected
+                            || attempt == 0
+                        {
+                            return Err("turn candidate source/attempt mismatch".into());
+                        }
+                        // The original model-step owner may have rejected this
+                        // candidate and co-committed a typed business Block with
+                        // its Graph transition. Preserve that fact through the
+                        // Goal reader instead of trusting Host's in-memory enum
+                        // or classifying its human-readable reason.
+                        let intervention_key =
+                            format!("{}:goal-intervention", node.idempotency_key);
+                        let blocked = if let Some(intervention_record) = self
+                            .goals
+                            .event_store
+                            .event_by_idempotency_key(&super::stream_id(goal_id), &intervention_key)
+                            .map_err(|error| error.to_string())?
+                        {
+                            let intervention: harness_contract::goal::RuntimeIntervention =
+                                serde_json::from_value(
+                                    intervention_record.payload["intervention"].clone(),
+                                )
+                                .map_err(|error| error.to_string())?;
+                            let trace: harness_contract::goal::RuntimeInterventionTrace =
+                                serde_json::from_value(
+                                    intervention_record.payload["intervention_trace"].clone(),
+                                )
+                                .map_err(|error| error.to_string())?;
+                            let observed: harness_contract::goal::RuntimeObservation =
+                                serde_json::from_value(
+                                    self.goals.event_store.resolve_observation_record(&record)?,
+                                )
+                                .map_err(|error| error.to_string())?;
+                            let original = &intervention_record.payload["goal"];
+                            if intervention_record.kind != "goal.intervention"
+                                || intervention_record.actor.as_deref()
+                                    != Some("runtime.intervention_policy")
+                                || intervention_record.sequence > source.stream_revision
+                                || record.sequence > source.stream_revision
+                                || original["id"] != goal.id
+                                || original["spec_revision"] != goal.spec_revision
+                                || original["spec_digest"] != goal.spec_digest
+                                || original["source_intent_ref"]
+                                    != serde_json::to_value(&goal.source_intent_ref)
+                                        .map_err(|error| error.to_string())?
+                                || original["execution_binding"]
+                                    != serde_json::to_value(binding)
+                                        .map_err(|error| error.to_string())?
+                                || intervention.goal_id != goal.id
+                                || trace.identity != observed.identity
+                                || observed.source != "runtime.model_step"
+                                || trace.identity.goal_id != goal.id
+                                || trace.identity.session_id != binding.session_id
+                                || trace.identity.turn_id.as_deref()
+                                    != Some(binding.turn_id.as_str())
+                                || trace.identity.graph_id != graph.id
+                                || trace.identity.node_id.as_deref() != Some(node.id.as_str())
+                                || trace.trigger_observation_keys
+                                    != vec![observed.idempotency_fingerprint()]
+                            {
+                                return Err("turn_block_intervention_binding_mismatch".into());
+                            }
+                            intervention.kind
+                                == harness_contract::goal::RuntimeInterventionKind::Block
+                        } else {
+                            false
+                        };
+                        if !blocked
+                            && !answer.trim().is_empty()
+                            && self.goals.turn_writes_satisfied(&source, resolver)?
+                        {
+                            completion = GoalCompletion::Satisfied;
+                        }
+                    }
+                }
+            }
+        }
+        let mut event = self.goals.terminal_event(
+            goal_id,
+            completion,
+            vec![format!("execution_graph:{}", graph.id)],
+            reason,
+            terminal_fence,
+        )?;
+        // The existing terminal writer may reload. The prepared source and
+        // final payload must still denote the same specification; the Graph
+        // transaction also fences the exact original journal head below.
+        if event.event.payload["goal"]["spec_digest"] != goal.spec_digest
+            || event.event.payload["goal"]["revision"] != goal.revision.saturating_add(1)
+        {
+            return Err("turn Goal changed while preparing terminal".into());
+        }
+        event.event.payload["goal_source"] = serde_json::json!({
+            "stream_id": super::stream_id(goal_id), "sequence": source.stream_revision,
+            "goal_revision": goal.revision, "spec_digest": goal.spec_digest,
+            "source_intent_ref": goal.source_intent_ref,
+        });
+        Ok(PreparedTurnConclusion {
+            completion,
+            event,
+            source_revisions: BTreeMap::from([
+                (super::stream_id(goal_id), source.stream_revision),
+                (format!("agentic-program:{}", binding.agentic_program_id), 0),
+                (graph.id, graph.revision),
+            ]),
+        })
+    }
+
+    /// Legacy direct-event test seam. Production ordinary turns use the
+    /// prepared source/attempt path; Programs own their checked transaction.
+    #[cfg(test)]
+    fn terminal_event(
         &self,
         goal_id: &str,
         completion: GoalCompletion,
@@ -194,6 +390,7 @@ mod tests {
 
     fn goal() -> GoalContract {
         GoalContract {
+            input_contract: None,
             id: "objective-supervisor-test".to_string(),
             session_id: "session".to_string(),
             objective: "test objective".to_string(),

@@ -137,6 +137,19 @@ pub struct ModelInputDispositionSessionTarget {
     pub target_ref: Option<String>,
 }
 
+/// Current business requirements interpreted from Runtime-labelled real user
+/// inputs. This contains no permission, execution identity, revision or grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelGoalBusinessRevision {
+    pub commitments: Vec<crate::goal::GoalInputCommitment>,
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub retired_criteria: Vec<String>,
+    #[serde(default)]
+    pub retired_obligations: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModelInputDispositionDecision {
@@ -151,6 +164,8 @@ pub struct ModelInputDispositionDecision {
     #[schemars(range(min = 0, max = 10000))]
     pub confidence_basis_points: u16,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_revision: Option<ModelGoalBusinessRevision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_plan: Option<ModelInputDispositionGraphPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +183,40 @@ pub struct ModelInputDispositionBatch {
 }
 
 impl ModelInputDispositionBatch {
+    /// Called only for the internal nonterminal interpretation purpose. A
+    /// normal final answer is never passed here by the Provider owner.
+    pub fn decode_business_proposal(text: &str, slots: usize) -> Result<Self, String> {
+        if text.len() > 64 * 1024 {
+            return Err("input business proposal exceeds bounded response".into());
+        }
+        let batch: Self =
+            serde_json::from_str(text).map_err(|e| format!("input business proposal JSON: {e}"))?;
+        batch.validate_slots(slots)?;
+        if batch.decisions.len() != 1 {
+            return Err(
+                "one current Goal revision must cover the complete input checkpoint".into(),
+            );
+        }
+        for decision in &batch.decisions {
+            if decision.graph_plan.is_some() || decision.session_target.is_some() {
+                return Err(
+                    "business interpretation cannot carry graph or Session lifecycle plans".into(),
+                );
+            }
+            match decision.action {
+                InputDispositionAction::AmendCurrentTurn
+                    if decision.business_revision.is_some() => {}
+                InputDispositionAction::ProgressOrControl | InputDispositionAction::Clarify
+                    if decision.business_revision.is_none() => {}
+                _ => return Err(
+                    "interpretation requires a finite business revision, progress or clarification"
+                        .into(),
+                ),
+            }
+        }
+        Ok(batch)
+    }
+
     pub fn validate_slots(&self, available_slots: usize) -> Result<(), String> {
         if available_slots == 0 {
             return Err("input disposition has no available Runtime slots".to_string());
@@ -443,9 +492,88 @@ impl InputApplicationState {
     }
 }
 
+/// Immutable Runtime-prepared application. References identify original evidence;
+/// neither a digest nor the presence of this value grants tool permissions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedInputApplication {
+    pub artifact_ref: String,
+    pub artifact_sha256: String,
+    pub session_id: String,
+    pub session_generation: u64,
+    pub turn_id: String,
+    pub goal_id: String,
+    pub goal_revision: u64,
+    pub goal_spec_digest: String,
+    pub graph_id: String,
+    pub graph_revision: u64,
+    pub node_id: String,
+    pub attempt_id: String,
+    pub source_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_cut: Option<(String, u64)>,
+}
+
+impl PreparedInputApplication {
+    fn validate(&self) -> Result<(), String> {
+        let identity = [
+            &self.artifact_ref,
+            &self.session_id,
+            &self.turn_id,
+            &self.goal_id,
+            &self.graph_id,
+            &self.node_id,
+            &self.attempt_id,
+        ];
+        let digests = [
+            &self.artifact_sha256,
+            &self.goal_spec_digest,
+            &self.source_digest,
+        ];
+        if identity
+            .iter()
+            .any(|v| v.trim().is_empty() || v.len() > 2048)
+            || digests
+                .iter()
+                .any(|v| v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()))
+            || self
+                .program_cut
+                .as_ref()
+                .is_some_and(|(id, _)| id.trim().is_empty())
+        {
+            return Err(
+                "prepared application requires original identity, cuts and digest references"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputApplicationCancellationState {
+    Requested,
+    Settled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputApplicationCancellation {
+    pub actor: String,
+    pub reason: String,
+    pub requested_at_ms: u64,
+    pub state: InputApplicationCancellationState,
+    /// Original exact execution/closure evidence, not proof that Goal was undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_ref: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInputApplicationReceipt {
     pub disposition_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_application: Option<PreparedInputApplication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<InputApplicationCancellation>,
     pub leader_input_id: String,
     pub input_ids: Vec<String>,
     pub action: InputDispositionAction,
@@ -476,7 +604,50 @@ pub struct SessionInputApplicationReceipt {
 }
 
 impl SessionInputApplicationReceipt {
+    /// Pending application and pending cancellation are separate obligations.
+    /// Applied history without a cancellation request is not recovery work.
+    #[must_use]
+    pub fn requires_recovery(&self) -> bool {
+        matches!(
+            self.state,
+            InputApplicationState::Prepared | InputApplicationState::Materializing
+        ) || self
+            .cancellation
+            .as_ref()
+            .is_some_and(|c| c.state == InputApplicationCancellationState::Requested)
+    }
+
     pub fn validate_shape(&self) -> Result<(), String> {
+        if let Some(prepared) = &self.prepared_application {
+            prepared.validate()?;
+        }
+        if self.action == InputDispositionAction::AmendCurrentTurn
+            && matches!(
+                self.state,
+                InputApplicationState::Materializing | InputApplicationState::Applied
+            )
+            && self.prepared_application.is_none()
+        {
+            return Err(
+                "business amendment reservation requires an immutable prepared application".into(),
+            );
+        }
+        if let Some(cancel) = &self.cancellation {
+            if cancel.actor.trim().is_empty()
+                || cancel.actor.len() > 2048
+                || cancel.reason.trim().is_empty()
+                || cancel.reason.len() > 4096
+                || (cancel.state == InputApplicationCancellationState::Settled
+                    && cancel
+                        .settlement_ref
+                        .as_ref()
+                        .is_none_or(|v| v.trim().is_empty()))
+                || (cancel.state == InputApplicationCancellationState::Requested
+                    && cancel.settlement_ref.is_some())
+            {
+                return Err("application cancellation requires an original request and exact settlement reference".into());
+            }
+        }
         if self.disposition_id.trim().is_empty()
             || self.leader_input_id.trim().is_empty()
             || self.input_ids.is_empty()
@@ -573,7 +744,9 @@ impl SessionInputApplicationReceipt {
     #[must_use]
     pub fn can_follow(&self, previous: Option<&Self>) -> bool {
         let Some(previous) = previous else {
-            return self.state == InputApplicationState::Prepared && self.revision == 0;
+            return self.state == InputApplicationState::Prepared
+                && self.revision == 0
+                && self.cancellation.is_none();
         };
         if self.disposition_id != previous.disposition_id
             || self.input_ids != previous.input_ids
@@ -582,8 +755,13 @@ impl SessionInputApplicationReceipt {
             || self.relation != previous.relation
             || self.objective != previous.objective
             || self.required != previous.required
+            || self.prepared_application != previous.prepared_application
+            || !self.preserves_cancellation(previous)
             || self.revision != previous.revision.saturating_add(1)
         {
+            return false;
+        }
+        if previous.cancellation.is_some() && self.state == InputApplicationState::Prepared {
             return false;
         }
         let attempts_valid = self.attempts == previous.attempts
@@ -611,7 +789,31 @@ impl SessionInputApplicationReceipt {
                 InputApplicationState::Failed,
                 InputApplicationState::Prepared
             )
-        )
+        ) || (previous.state == self.state
+            && previous
+                .cancellation
+                .as_ref()
+                .is_some_and(|c| c.state == InputApplicationCancellationState::Requested)
+            && self
+                .cancellation
+                .as_ref()
+                .is_some_and(|c| c.state == InputApplicationCancellationState::Settled))
+    }
+
+    fn preserves_cancellation(&self, previous: &Self) -> bool {
+        match (&previous.cancellation, &self.cancellation) {
+            (None, None) => true,
+            (Some(before), Some(after)) => {
+                before.actor == after.actor
+                    && before.reason == after.reason
+                    && before.requested_at_ms == after.requested_at_ms
+                    && (before == after
+                        || (before.state == InputApplicationCancellationState::Requested
+                            && after.state == InputApplicationCancellationState::Settled))
+            }
+            // Only the persistence cancellation method may create a request.
+            _ => false,
+        }
     }
 }
 
@@ -627,6 +829,7 @@ mod tests {
             objective: "implement the requested work".to_string(),
             required: true,
             confidence_basis_points: 9_000,
+            business_revision: None,
             reason: "the input is independent work".to_string(),
             graph_plan: None,
             session_target: None,
@@ -848,6 +1051,8 @@ mod tests {
     fn receipt(state: InputApplicationState, revision: u64) -> SessionInputApplicationReceipt {
         SessionInputApplicationReceipt {
             disposition_id: "disposition-a".to_string(),
+            prepared_application: None,
+            cancellation: None,
             leader_input_id: "input-a".to_string(),
             input_ids: vec!["input-a".to_string()],
             action: InputDispositionAction::AddRequiredTask,
@@ -867,6 +1072,47 @@ mod tests {
             revision,
             updated_at_ms: revision,
         }
+    }
+
+    #[test]
+    fn application_cancellation_is_monotonic_and_never_authorizes_a_retry() {
+        let mut pending = receipt(InputApplicationState::Materializing, 1);
+        pending.cancellation = Some(InputApplicationCancellation {
+            actor: "user-a".into(),
+            reason: "stop".into(),
+            requested_at_ms: 10,
+            state: InputApplicationCancellationState::Requested,
+            settlement_ref: None,
+        });
+        let mut next = pending.clone();
+        next.state = InputApplicationState::Applied;
+        next.task_ids = vec!["task-a".into()];
+        next.execution_ids = vec!["graph-a".into()];
+        next.revision += 1;
+        assert!(next.can_follow(Some(&pending)));
+        next.cancellation = None;
+        assert!(
+            !next.can_follow(Some(&pending)),
+            "a completed application cannot lose the cancel request"
+        );
+        next = pending.clone();
+        next.state = InputApplicationState::Failed;
+        next.revision += 1;
+        assert!(next.can_follow(Some(&pending)));
+        let mut retry = next.clone();
+        retry.state = InputApplicationState::Prepared;
+        retry.attempts += 1;
+        retry.revision += 1;
+        assert!(
+            !retry.can_follow(Some(&next)),
+            "cancelled application cannot obtain a fresh retry"
+        );
+        let mut invented = receipt(InputApplicationState::Prepared, 0);
+        invented.cancellation = pending.cancellation.clone();
+        assert!(
+            !invented.can_follow(None),
+            "only the original cancellation owner creates requests"
+        );
     }
 
     #[test]

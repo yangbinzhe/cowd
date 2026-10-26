@@ -115,6 +115,111 @@ pub fn checkpoint_context_items(
         .collect()
 }
 
+/// Load only the labelled original durable inputs. No role in model context can
+/// create this frame; the authenticated producer metadata and original body
+/// must agree with the Session record returned by the original query port.
+pub(crate) async fn authenticated_goal_inputs(
+    services: &crate::RuntimeServices,
+    binding: &harness_contract::goal::GoalExecutionBinding,
+    request_id: Option<&str>,
+    input_ids: &[String],
+) -> Result<Option<crate::execution_core::goal::UserGoalInputFrame>, String> {
+    use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
+    let Some(query) = services.session_query_port() else {
+        return Ok(None);
+    };
+    let mut records = Vec::new();
+    if let Some(request) = request_id {
+        if let Some(record) = query
+            .runtime_input(request)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            records.push(record);
+        }
+    }
+    for id in input_ids {
+        let record = query
+            .runtime_input_by_input_id(id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("labelled user input missing durable source")?;
+        if !records.iter().any(|r| r.input_id == record.input_id) {
+            records.push(record);
+        }
+    }
+    let mut inputs = Vec::new();
+    for record in records {
+        if record
+            .application_receipt
+            .as_ref()
+            .is_some_and(|r| r.state.is_terminal())
+        {
+            continue;
+        }
+        let classification: serde_json::Value = record
+            .classification_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let Some(origin) = classification["metadata"].get(SESSION_INPUT_USER_SOURCE_KEY) else {
+            continue;
+        };
+        let source: SessionInputUserSource =
+            serde_json::from_value(origin.clone()).map_err(|e| e.to_string())?;
+        // Old admitted tasks remain runnable as the frozen baseline; missing
+        // source integrity does not create a fresh revision capability.
+        if source.content_sha256.is_empty() {
+            continue;
+        }
+        let history = query
+            .history_reader()
+            .ok_or("authenticated Goal input needs original Session history reader")?;
+        let message = history
+            .message_by_stable_id(&binding.session_id, &record.message_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("authenticated Goal input message missing")?;
+        if message.role != "user" || message.session_id != binding.session_id {
+            return Err("authenticated Goal input role/Session mismatch".into());
+        }
+        let blocks: serde_json::Value =
+            serde_json::from_str(&message.content_json).map_err(|e| e.to_string())?;
+        let blocks = blocks
+            .as_array()
+            .ok_or("authenticated Goal input body is not original block array")?;
+        if blocks.len() != 1 || blocks[0]["type"] != "text" {
+            return Err("authenticated Goal input body shape changed".into());
+        }
+        let content = blocks[0]["text"]
+            .as_str()
+            .ok_or("authenticated Goal input text missing")?
+            .to_string();
+        inputs.push((record, source, content));
+    }
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    inputs.sort_by(|a, b| (a.0.sequence, &a.0.input_id).cmp(&(b.0.sequence, &b.0.input_id)));
+    let admission = query
+        .input_admission(&binding.session_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("user Goal Session admission missing")?;
+    if !admission.open
+        || inputs
+            .iter()
+            .any(|(r, _, _)| r.session_generation != admission.generation)
+    {
+        return Err("user Goal source Session generation is no longer admitted".into());
+    }
+    let frame = crate::execution_core::goal::UserGoalInputFrame { inputs };
+    frame.validate(binding)?;
+    Ok(Some(frame))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{checkpoint_context_items, checkpoint_guidance};

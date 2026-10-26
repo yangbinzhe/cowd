@@ -4,6 +4,7 @@
 //! no scheduler, model loop, or Gateway dependency; interventions remain
 //! proposals until RuntimeExecutionSupervisor applies them at a checkpoint.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,343 @@ use crate::{
     RuntimeEventScope, RuntimeEventStore,
 };
 
+/// Record the identity of the current admitted input and its unresolved path
+/// proposals. A parser's output proves neither intent nor permission. The
+/// original AI planning/Goal refinement route must resolve those proposals;
+/// lack of a preselected filename is never an admission failure here.
+pub(crate) fn compile_goal_input_contract(
+    binding: &harness_contract::goal::GoalExecutionBinding,
+    source_ref: &str,
+    input_revision: u64,
+    input: &str,
+    scope_proposals: &[String],
+) -> Result<harness_contract::goal::GoalInputContract, String> {
+    if source_ref.trim().is_empty()
+        || input_revision == 0
+        || binding.session_id.is_empty()
+        || binding.turn_id.is_empty()
+    {
+        return Err("goal_input_identity_incomplete".into());
+    }
+    Ok(harness_contract::goal::GoalInputContract {
+        version: 1,
+        principal_id: format!("session:{}", binding.session_id),
+        session_id: binding.session_id.clone(),
+        turn_id: binding.turn_id.clone(),
+        source_ref: source_ref.into(),
+        input_revision,
+        content_sha256: format!("{:x}", sha2::Sha256::digest(input.as_bytes())),
+        commitments: Vec::new(),
+        proposed_workspace_scopes: scope_proposals.to_vec(),
+    })
+}
+
+pub(crate) fn goal_workspace_write_scopes(goal: &GoalContract) -> Vec<String> {
+    goal.input_contract
+        .as_ref()
+        .map(|contract| {
+            contract
+                .commitments
+                .iter()
+                .filter_map(|item| match item {
+                    harness_contract::goal::GoalInputCommitment::WorkspaceWrite {
+                        path, ..
+                    } => Some(
+                        path.as_ref()
+                            .map(|path| format!("write:{path}"))
+                            .unwrap_or_default(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Restrict an otherwise authorized invocation by the current accepted
+/// business contract. This cannot grant a tool or workspace permission.
+/// Registered descriptor targets, not model argument text, prove disjointness.
+/// Current accepted business quantities, never a role or delegation grant.
+/// None retains the original frozen contract for legacy, unauthenticated input.
+pub(crate) fn current_goal_team_bounds(goal: &GoalContract) -> Option<(u8, Option<u8>)> {
+    goal.input_contract
+        .as_ref()
+        .filter(|contract| contract.version == 2)
+        .map(|contract| contract.team_bounds().unwrap_or((0, None)))
+}
+
+pub(crate) fn goal_tool_effect_rejection(
+    goal: &GoalContract,
+    effect: &harness_contract::tool::ToolEffectDescriptor,
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+) -> Option<&'static str> {
+    use harness_contract::{
+        goal::GoalInputCommitment,
+        policy::{PermissionOperation, PermissionResource},
+    };
+    let contract = goal.input_contract.as_ref()?;
+    if contract.forbids_tools() {
+        return Some("current Goal prohibits tool calls");
+    }
+    if effect.required_permission == harness_contract::tool::ToolPermissionMode::ReadOnly {
+        return None;
+    }
+    for commitment in &contract.commitments {
+        let GoalInputCommitment::ForbidWorkspaceWrite { path, .. } = commitment else {
+            continue;
+        };
+        let Some(forbidden) = path else {
+            return Some("current Goal prohibits workspace mutation");
+        };
+        let Ok(forbidden) = resolver.resolve_planned_file(forbidden) else {
+            return Some("current Goal forbidden path cannot be resolved");
+        };
+        // A process/system/unknown scope cannot prove that it leaves the
+        // prohibited object untouched. In particular shell text is not proof.
+        if effect.spawns_process
+            || effect.mutates_packages
+            || effect.mutates_system
+            || effect.scopes.is_empty()
+        {
+            return Some("current Goal requires disjoint workspace effects");
+        }
+        for scope in &effect.scopes {
+            if scope.operation == PermissionOperation::Read {
+                continue;
+            }
+            if scope.resource != PermissionResource::File {
+                return Some("current Goal requires disjoint workspace effects");
+            }
+            let Some(target) = scope.target.as_deref() else {
+                return Some("current Goal requires exact workspace targets");
+            };
+            let Ok(target) = resolver.resolve_planned_file(target) else {
+                return Some("current Goal effect target cannot be resolved");
+            };
+            let a = std::path::Path::new(&forbidden.workspace_relative_path);
+            let b = std::path::Path::new(&target.workspace_relative_path);
+            if a.starts_with(b) || b.starts_with(a) {
+                return Some("current Goal prohibits mutation of this workspace object");
+            }
+        }
+    }
+    None
+}
+
+/// Match required business artifacts against Runtime-authorized write receipts.
+/// Prediction and model text never satisfy an effect obligation. This pure
+/// predicate belongs to Goal; callers may collect evidence but not redefine it.
+pub(crate) fn write_obligation_satisfied(
+    required_write_for_completion: bool,
+    required_scopes: &[String],
+    observed_evidence: &[harness_contract::context::ObservedEvidence],
+    unscoped_committed_write: bool,
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+) -> bool {
+    if !required_write_for_completion {
+        return true;
+    }
+    if required_scopes.is_empty() {
+        return unscoped_committed_write
+            || observed_evidence.iter().any(|evidence| {
+                matches!(
+                    &evidence.target,
+                    harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                        if scope.access_mode
+                            == harness_contract::context::WorkspaceAccessMode::Write
+                )
+            });
+    }
+    required_scopes.iter().all(|required| {
+        if required.is_empty() {
+            return write_obligation_satisfied(
+                true,
+                &[],
+                observed_evidence,
+                unscoped_committed_write,
+                resolver,
+            );
+        }
+        let required = resolver.compile_obligation_or_unresolved(required);
+        observed_evidence
+            .iter()
+            .any(|observed| crate::path_identity::observed_evidence_satisfies(&required, observed))
+    })
+}
+
+/// Source binding for an answer already committed by a successful model
+/// attempt. This is observation metadata in the original Goal journal, not a
+/// second result store or a claim of semantic correctness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GoalTurnCandidate {
+    pub goal_id: String,
+    pub spec_revision: u64,
+    pub spec_digest: String,
+    pub source_ref: String,
+    pub graph_id: String,
+    pub node_id: String,
+    pub attempt: u32,
+    pub answer_sha256: String,
+}
+
+fn turn_candidate_key(graph: &str, node: &str, attempt: u32) -> String {
+    format!("goal-final-candidate:{graph}:{node}:{attempt}")
+}
+
+impl GoalStore {
+    pub(crate) fn turn_candidate_event_at(
+        &self,
+        source: &GoalProjection,
+        observation: &RuntimeObservation,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        answer: &str,
+    ) -> Result<RuntimeTransactionEventInput, String> {
+        if answer.trim().is_empty()
+            || ticket.attempt == 0
+            || observation.identity.graph_id != ticket.graph_id
+            || observation.identity.node_id.as_deref() != Some(ticket.node_id.as_str())
+        {
+            return Err("goal_final_candidate_identity_or_payload_missing".into());
+        }
+        let goal = &source.goal;
+        let binding = goal
+            .execution_binding
+            .as_ref()
+            .ok_or("goal_final_candidate_binding_missing")?;
+        if binding.root_execution_id != ticket.graph_id
+            || binding.session_id != observation.identity.session_id
+            || observation.identity.turn_id.as_deref() != Some(binding.turn_id.as_str())
+        {
+            return Err("goal_final_candidate_crosses_input_binding".into());
+        }
+        let candidate = GoalTurnCandidate {
+            goal_id: goal.id.clone(),
+            spec_revision: goal.spec_revision,
+            spec_digest: goal.spec_digest.clone(),
+            source_ref: goal
+                .source_intent_ref
+                .clone()
+                .ok_or("goal_final_candidate_source_missing")?,
+            graph_id: ticket.graph_id.clone(),
+            node_id: ticket.node_id.clone(),
+            attempt: ticket.attempt,
+            answer_sha256: format!("{:x}", sha2::Sha256::digest(answer.as_bytes())),
+        };
+        let mut event = self.observation_event_at(
+            source,
+            observation,
+            turn_candidate_key(&ticket.graph_id, &ticket.node_id, ticket.attempt),
+        )?;
+        let value = serde_json::to_value(candidate).map_err(|error| error.to_string())?;
+        if event
+            .event
+            .payload
+            .get("answer_candidate")
+            .is_some_and(|original| original != &value)
+        {
+            return Err("goal_final_candidate_idempotency_conflict".into());
+        }
+        event.event.payload["answer_candidate"] = value;
+        Ok(event)
+    }
+
+    /// Read only genuine observation bodies from this exact specification.
+    /// Each page is bounded and the cut is fixed; there is no eight-event
+    /// exception or full-stream materialisation. Prior-revision receipts
+    /// cannot satisfy a newly admitted artifact contract.
+    pub(crate) fn turn_writes_satisfied(
+        &self,
+        source: &GoalProjection,
+        resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+    ) -> Result<bool, String> {
+        self.turn_writes_satisfied_with_pending(source, resolver, &[])
+    }
+
+    fn turn_writes_satisfied_with_pending(
+        &self,
+        source: &GoalProjection,
+        resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+        pending: &[harness_contract::context::ObservedEvidence],
+    ) -> Result<bool, String> {
+        let scopes = goal_workspace_write_scopes(&source.goal);
+        if scopes.is_empty() {
+            return Ok(true);
+        }
+        // Current ToolHost facts have not yet entered the original Graph
+        // transaction. They are evaluated here, against the same pinned spec,
+        // and the caller must commit their observation with this source cut.
+        let mut covered = scopes
+            .iter()
+            .map(|scope| {
+                write_obligation_satisfied(
+                    true,
+                    if scope.is_empty() {
+                        &[]
+                    } else {
+                        std::slice::from_ref(scope)
+                    },
+                    pending,
+                    false,
+                    resolver,
+                )
+            })
+            .collect::<Vec<_>>();
+        if covered.iter().all(|value| *value) {
+            return Ok(true);
+        }
+        let mut cursor = 0;
+        while cursor < source.stream_revision {
+            let page = self.event_store.list_stream_after(
+                &stream_id(&source.goal.id),
+                cursor,
+                source.stream_revision,
+                100,
+                1024 * 1024,
+            )?;
+            if page.is_empty() {
+                return Err("goal_effect_observation_tail_gap".into());
+            }
+            for event in page {
+                if event.sequence != cursor + 1 {
+                    return Err("goal_effect_observation_tail_gap".into());
+                }
+                cursor = event.sequence;
+                if event.kind != "goal.observation"
+                    || event.payload["goal_source"]["spec_digest"] != source.goal.spec_digest
+                {
+                    continue;
+                }
+                let body = self.event_store.resolve_observation_record(&event)?;
+                let observation: RuntimeObservation =
+                    serde_json::from_value(body).map_err(|error| error.to_string())?;
+                if observation.goal_id() != source.goal.id
+                    || observation.identity.session_id != source.goal.session_id
+                {
+                    return Err("goal_effect_observation_identity_mismatch".into());
+                }
+                for (index, scope) in scopes.iter().enumerate() {
+                    covered[index] |= write_obligation_satisfied(
+                        true,
+                        if scope.is_empty() {
+                            &[]
+                        } else {
+                            std::slice::from_ref(scope)
+                        },
+                        &observation.observed_evidence,
+                        false,
+                        resolver,
+                    );
+                }
+                if covered.iter().all(|covered| *covered) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// The original native Goal review identity, shared by its writer and reader.
 pub(crate) fn objective_review_record_id(
     goal_id: &str,
@@ -42,6 +380,25 @@ pub(crate) fn objective_review_record_id(
         "objective_review:{:x}",
         sha2::Sha256::digest(format!("{goal_id}|{action_id}|{criterion}").as_bytes())
     )
+}
+
+/// Transient decisions of the existing Goal owner, never another writer.
+#[derive(Debug)]
+pub(crate) enum GoalWriteDisposition {
+    Satisfied,
+    Pending,
+    Recover(PreparedGoalMutation),
+    Blocked(RuntimeIntervention),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GoalWriteCheckpoint {
+    FinalAnswer,
+    ToolProgress {
+        bounded_role: bool,
+        saturated: bool,
+        write_attempted: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -253,11 +610,706 @@ impl GoalProgressReducer {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PreparedGoalMutation {
     pub stream_id: String,
     pub expected_stream_revision: u64,
     pub event: RuntimeTransactionEventInput,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PreparedUserGoalApplication {
+    pub(crate) frame: crate::execution_core::goal::UserGoalInputFrame,
+    pub(crate) goal: GoalContract,
+    pub(crate) goal_stream_revision: u64,
+    pub(crate) proposal: harness_contract::input_disposition::ModelInputDispositionBatch,
+    pub(crate) mutation: Option<crate::execution_core::goal::PreparedGoalMutation>,
+    pub(crate) ticket: crate::execution_core::NodeExecutionTicket,
+    pub(crate) graph_revision: u64,
+    pub(crate) program_cut: Option<(String, u64)>,
+    // The original prepared outcome, never regenerated from a later Host view.
+    pub(crate) continuation: crate::execution_core::ExecutionGraphReplan,
+    pub(crate) finished_at_ms: u64,
+    pub(crate) transcript_prefix: (u64, String),
+    pub(crate) root_control_team_count: Option<u8>,
+    pub(crate) usage: harness_contract::execution_graph::ExecutionUsage,
+    pub(crate) provider_message: serde_json::Value,
+    pub(crate) provider_usage: model_protocol::usage::TokenUsage,
+}
+
+pub(crate) fn user_application_clock() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+pub(crate) async fn read_user_goal_application(
+    services: &crate::RuntimeServices,
+    receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+) -> Result<PreparedUserGoalApplication, String> {
+    use sha2::Digest;
+    let identity = receipt
+        .prepared_application
+        .as_ref()
+        .ok_or("user application prepared reference missing")?;
+    let artifact = services
+        .artifact_store()
+        .resolve(&identity.artifact_ref)
+        .map_err(|e| e.to_string())?;
+    if artifact.bytes > 2 * 1024 * 1024
+        || artifact.sha256 != format!("sha256:{}", identity.artifact_sha256)
+    {
+        return Err("user application artifact identity/budget mismatch".into());
+    }
+    let body = services
+        .artifact_store()
+        .read(&artifact, &format!("session:{}", identity.session_id), None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if format!("{:x}", sha2::Sha256::digest(&body)) != identity.artifact_sha256 {
+        return Err("user application artifact digest mismatch".into());
+    }
+    let prepared: PreparedUserGoalApplication =
+        serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    let binding = prepared
+        .goal
+        .execution_binding
+        .as_ref()
+        .ok_or("user application Goal binding missing")?;
+    prepared.frame.validate(binding)?;
+    if binding.session_id != identity.session_id
+        || binding.turn_id != identity.turn_id
+        || binding.root_execution_id != prepared.ticket.graph_id
+        || prepared
+            .frame
+            .inputs
+            .iter()
+            .any(|(r, _, _)| r.session_generation != identity.session_generation)
+        || prepared.mutation.as_ref().is_some_and(|m| {
+            m.stream_id != stream_id(&prepared.goal.id)
+                || m.expected_stream_revision != prepared.goal_stream_revision
+                || m.event.event.payload["user_input_application"]["source_digest"]
+                    != identity.source_digest
+        })
+        || prepared.goal.id != identity.goal_id
+        || prepared.goal.revision != identity.goal_revision
+        || prepared.goal.spec_digest != identity.goal_spec_digest
+        || prepared.ticket.graph_id != identity.graph_id
+        || prepared.ticket.node_id != identity.node_id
+        || prepared.ticket.attempt.to_string() != identity.attempt_id
+        || prepared.graph_revision != identity.graph_revision
+        || prepared.program_cut != identity.program_cut
+        || prepared.frame.digest()? != identity.source_digest
+        || prepared
+            .frame
+            .inputs
+            .iter()
+            .map(|(r, _, _)| r.input_id.clone())
+            .collect::<Vec<_>>()
+            != receipt.input_ids
+    {
+        return Err("user application prepared content crosses source/attempt".into());
+    }
+    Ok(prepared)
+}
+
+pub(crate) fn user_goal_application_committed(
+    services: &crate::RuntimeServices,
+    prepared: &PreparedUserGoalApplication,
+    artifact_ref: &str,
+) -> Result<bool, String> {
+    Ok(user_goal_application_committed_sources(services, prepared, artifact_ref)?.is_some())
+}
+
+pub(crate) fn user_goal_application_committed_sources(
+    services: &crate::RuntimeServices,
+    prepared: &PreparedUserGoalApplication,
+    artifact_ref: &str,
+) -> Result<Option<BTreeMap<String, u64>>, String> {
+    if let Some(mutation) = &prepared.mutation {
+        let committed = services
+            .event_store()
+            .event_by_idempotency_key(
+                &mutation.stream_id,
+                mutation
+                    .event
+                    .idempotency_key
+                    .as_deref()
+                    .ok_or("user application key missing")?,
+            )
+            .map_err(|e| e.to_string())?;
+        if let Some(event) = committed {
+            if event.payload != mutation.event.event.payload {
+                return Err("user application Goal replay conflicts with frozen proposal".into());
+            }
+            let goal_cut = services
+                .event_store()
+                .transaction_stream_revision_exact(&event.transaction_id, &mutation.stream_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("user application original Goal transaction cut missing")?;
+            if goal_cut.expected_revision != mutation.expected_stream_revision
+                || goal_cut.committed_revision != event.sequence
+            {
+                return Err("user application original Goal transaction cut mismatch".into());
+            }
+            let mut sources =
+                BTreeMap::from([(mutation.stream_id.clone(), goal_cut.committed_revision)]);
+            if let Some((program, expected)) = &prepared.program_cut {
+                let stream = format!("agentic-program:{program}");
+                let cut = services
+                    .event_store()
+                    .transaction_stream_revision_exact(&event.transaction_id, &stream)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("user application original Program transaction cut missing")?;
+                if cut.expected_revision != *expected || cut.committed_revision <= *expected {
+                    return Err("user application original Program transaction cut mismatch".into());
+                }
+                sources.insert(stream, cut.committed_revision);
+            }
+            return Ok(Some(sources));
+        }
+        return Ok(None);
+    }
+    let graph = services
+        .graph_state_store()
+        .load(&prepared.ticket.graph_id)
+        .map_err(|e| e.to_string())?;
+    let committed = graph
+        .recovery_cursor
+        .node_attempts
+        .get(&prepared.ticket.node_id)
+        == Some(&prepared.ticket.attempt)
+        && graph
+            .node_results
+            .get(&prepared.ticket.node_id)
+            .is_some_and(|r| {
+                r.status == harness_contract::execution_graph::ExecutionNodeStatus::Completed
+                    && r.failure.is_none()
+                    && r.result_ref.as_deref()
+                        == Some(format!("user_input_application:{artifact_ref}").as_str())
+            });
+    Ok(committed
+        .then(|| BTreeMap::from([(stream_id(&prepared.goal.id), prepared.goal_stream_revision)])))
+}
+
+pub(crate) async fn finish_user_goal_application(
+    services: &crate::RuntimeServices,
+    prepared: &PreparedUserGoalApplication,
+) -> Result<(), String> {
+    use harness_contract::input_disposition::InputApplicationState;
+    let query = services
+        .session_query_port()
+        .ok_or("user application Session query missing")?;
+    let journal = services
+        .session_journal_port()
+        .ok_or("user application Session journal missing")?;
+    let mut rows = Vec::new();
+    for (input, _, _) in &prepared.frame.inputs {
+        rows.push(
+            query
+                .runtime_input_by_input_id(&input.input_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("user application input disappeared")?,
+        );
+    }
+    let mut receipt = rows[0]
+        .application_receipt
+        .clone()
+        .ok_or("user application reservation disappeared")?;
+    let checked = read_user_goal_application(services, &receipt).await?;
+    if checked.frame.digest()? != prepared.frame.digest()?
+        || checked.proposal != prepared.proposal
+        || rows
+            .iter()
+            .any(|r| r.application_receipt.as_ref() != Some(&receipt))
+    {
+        return Err("user application batch reservation changed".into());
+    }
+    if !user_goal_application_committed(
+        services,
+        prepared,
+        &receipt
+            .prepared_application
+            .as_ref()
+            .ok_or("user input artifact missing")?
+            .artifact_ref,
+    )? {
+        return Err("user application has no exact original commit".into());
+    }
+    if receipt.state == InputApplicationState::Applied {
+        return Ok(());
+    }
+    if receipt.state != InputApplicationState::Materializing {
+        return Err("user application was not reserved".into());
+    }
+    receipt.state = InputApplicationState::Applied;
+    receipt.revision += 1;
+    receipt.updated_at_ms = user_application_clock();
+    // Preserve an intervening durable cancellation request. It is not evidence
+    // that the Goal commit was undone, or that execution has physically exited.
+    journal
+        .commit_input_application_receipt(
+            &receipt.input_ids,
+            &rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
+            &receipt,
+            receipt.updated_at_ms,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Recover receipt facts in the original settled lane. This never asks a model,
+/// rebases a proposal, commits Goal, or synthesizes a physical exit.
+pub(crate) async fn reconcile_user_goal_applications(
+    services: &crate::RuntimeServices,
+    root_graph_id: &str,
+) -> Result<(), String> {
+    use harness_contract::input_disposition::{
+        InputApplicationCancellationState, InputApplicationState,
+    };
+    let graph = services
+        .graph_state_store()
+        .load(root_graph_id)
+        .map_err(|e| e.to_string())?;
+    let Some(lineage) = &graph.lineage else {
+        return Ok(());
+    };
+    let Some(query) = services.session_query_port() else {
+        return Ok(());
+    };
+    let Some(admission) = query
+        .input_admission(&lineage.session_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let mut after = None;
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        let page = query
+            .pending_session_input_applications(
+                &lineage.session_id,
+                admission.generation,
+                after.clone(),
+                32,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if page.is_empty() {
+            break;
+        }
+        for row in &page {
+            let Some(receipt) = row.application_receipt.as_ref() else {
+                continue;
+            };
+            let Some(identity) = receipt.prepared_application.as_ref() else {
+                continue;
+            };
+            if identity.graph_id != root_graph_id || !seen.insert(receipt.disposition_id.clone()) {
+                continue;
+            }
+            let prepared = read_user_goal_application(services, receipt).await?;
+            let applied =
+                user_goal_application_committed(services, &prepared, &identity.artifact_ref)?;
+            if applied {
+                finish_user_goal_application(services, &prepared).await?;
+            }
+            if !receipt
+                .cancellation
+                .as_ref()
+                .is_some_and(|c| c.state == InputApplicationCancellationState::Requested)
+            {
+                continue;
+            }
+            services
+                .cancel_execution_tree(root_graph_id, "original user-input cancellation requested")
+                .await
+                .map_err(|e| e.to_string())?;
+            // Traverse the original durable lineage, including children of a
+            // terminal parent, and use the canonical closure reader for every
+            // admitted binding. No status-only or timeout-based settlement.
+            let mut pending = std::collections::VecDeque::from([root_graph_id.to_string()]);
+            let mut visited = std::collections::BTreeSet::new();
+            let mut closed_sources = Vec::new();
+            while let Some(id) = pending.pop_front() {
+                if !visited.insert(id.clone()) {
+                    continue;
+                }
+                let current = services
+                    .graph_state_store()
+                    .load(&id)
+                    .map_err(|e| e.to_string())?;
+                for link in services
+                    .graph_state_store()
+                    .child_links(&id)
+                    .map_err(|e| e.to_string())?
+                {
+                    pending.push_back(link.child_execution_id);
+                }
+                if !current.nodes.iter().all(|n| {
+                    current
+                        .node_statuses
+                        .get(&n.id)
+                        .is_some_and(|s| s.is_terminal())
+                }) {
+                    return Err("user application cancellation still has live Graph work".into());
+                }
+                let mut cursor = 0;
+                while cursor < current.revision {
+                    let (next, starts) = services
+                        .graph_state_store()
+                        .binding_starts_page(&id, cursor, current.revision)
+                        .map_err(|e| e.to_string())?;
+                    if next <= cursor {
+                        return Err("user application binding closure read did not advance".into());
+                    }
+                    for (node, binding, start) in starts {
+                        if !services
+                            .graph_state_store()
+                            .binding_lease_closure(&current, &node, &binding, start)
+                            .map_err(|e| e.to_string())?
+                        {
+                            return Err(
+                                "user application cancellation physical closure is pending".into(),
+                            );
+                        }
+                        closed_sources.push(serde_json::json!({"graph":id,"head":current.revision,"node":node,"binding":binding,"start":start}));
+                    }
+                    cursor = next;
+                }
+            }
+            // The original Graph CAS can no longer accept the frozen proposal.
+            // Re-read Goal AFTER that fence: a commit that won before cancel
+            // must be recorded as Applied, not mislabeled as not applied.
+            let current = services
+                .graph_state_store()
+                .load(root_graph_id)
+                .map_err(|e| e.to_string())?;
+            if current.revision <= prepared.graph_revision {
+                return Err("user application original Graph cut is not fenced".into());
+            }
+            let actual =
+                user_goal_application_committed(services, &prepared, &identity.artifact_ref)?;
+            if actual {
+                finish_user_goal_application(services, &prepared).await?;
+            }
+            let mut rows = Vec::new();
+            for id in &receipt.input_ids {
+                rows.push(
+                    query
+                        .runtime_input_by_input_id(id)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .ok_or("user application cancel input missing")?,
+                );
+            }
+            let mut next = rows[0]
+                .application_receipt
+                .clone()
+                .ok_or("user application cancel reservation missing")?;
+            if rows
+                .iter()
+                .any(|r| r.application_receipt.as_ref() != Some(&next))
+            {
+                return Err("user application cancel batch conflict".into());
+            }
+            if next
+                .cancellation
+                .as_ref()
+                .is_some_and(|c| c.state == InputApplicationCancellationState::Settled)
+            {
+                continue;
+            }
+            if !actual {
+                next.state = InputApplicationState::Failed;
+                next.error =
+                    Some("user_goal_not_applied_original_graph_cut_physically_closed".into());
+            }
+            let request = next
+                .cancellation
+                .as_mut()
+                .ok_or("user application cancel request disappeared")?;
+            request.state = InputApplicationCancellationState::Settled;
+            request.settlement_ref = Some(format!(
+                "graph-binding-closure:{}:{:x}",
+                root_graph_id,
+                sha2::Sha256::digest(
+                    serde_json::to_vec(&closed_sources).map_err(|e| e.to_string())?
+                )
+            ));
+            next.revision += 1;
+            next.updated_at_ms = user_application_clock();
+            services
+                .session_journal_port()
+                .ok_or("user application cancellation journal missing")?
+                .commit_input_application_receipt(
+                    &next.input_ids,
+                    &rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
+                    &next,
+                    next.updated_at_ms,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let last = page.last().unwrap();
+        let next = (last.sequence, last.input_id.clone());
+        if after.as_ref().is_some_and(|old| old >= &next) {
+            return Err("user application recovery cursor did not advance".into());
+        }
+        after = Some(next);
+        if page.len() < 32 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Frozen originals read through the Session query/history owner, never model
+/// JSON. Receipt revisions may advance while these immutable source IDs stay fixed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct UserGoalInputFrame {
+    pub(crate) inputs: Vec<(
+        crate::session_runtime_port::RuntimeSessionInputRecord,
+        harness_contract::turn::SessionInputUserSource,
+        String,
+    )>,
+}
+
+impl UserGoalInputFrame {
+    pub(crate) fn validate(
+        &self,
+        binding: &harness_contract::goal::GoalExecutionBinding,
+    ) -> Result<(), String> {
+        use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
+        if self.inputs.is_empty() || self.inputs.len() > 32 {
+            return Err("user Goal source count outside 1..=32".into());
+        }
+        let principal = &self.inputs[0].1.principal_id;
+        let generation = self.inputs[0].0.session_generation;
+        let mut ids = std::collections::BTreeSet::new();
+        for (record, source, content) in &self.inputs {
+            let classification: serde_json::Value = serde_json::from_str(
+                record
+                    .classification_json
+                    .as_deref()
+                    .ok_or("user Goal source missing classification")?,
+            )
+            .map_err(|e| e.to_string())?;
+            let persisted: SessionInputUserSource = serde_json::from_value(
+                classification["metadata"][SESSION_INPUT_USER_SOURCE_KEY].clone(),
+            )
+            .map_err(|_| "user Goal source missing authenticated origin")?;
+            if &persisted != source
+                || source.principal_id.is_empty()
+                || &source.principal_id != principal
+                || source.session_id != binding.session_id
+                || record.session_id != binding.session_id
+                || source.input_id != record.input_id
+                || source.request_id != record.request_id
+                || source.message_id != record.message_id
+                || source.session_generation != record.session_generation
+                || source.session_generation != generation
+                || source.content_sha256
+                    != format!("{:x}", sha2::Sha256::digest(content.as_bytes()))
+                || record.target_turn_id.as_deref().unwrap_or(&record.turn_id) != binding.turn_id
+                || !ids.insert(&record.input_id)
+                || matches!(
+                    record.status,
+                    crate::session_runtime_port::RuntimeSessionInputStatus::Cancelled
+                        | crate::session_runtime_port::RuntimeSessionInputStatus::Expired
+                        | crate::session_runtime_port::RuntimeSessionInputStatus::RejectedPolicy
+                        | crate::session_runtime_port::RuntimeSessionInputStatus::RejectedDuplicate
+                        | crate::session_runtime_port::RuntimeSessionInputStatus::Failed
+                )
+            {
+                return Err("user Goal source identity mismatch".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn digest(&self) -> Result<String, String> {
+        // Do not include mutable row/receipt revision in the adoption identity.
+        let immutable = self.inputs.iter().map(|(record, source, _)|
+            serde_json::json!({"source":source,"sequence":record.sequence})).collect::<Vec<_>>();
+        Ok(format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&immutable).map_err(|e| e.to_string())?)
+        ))
+    }
+}
+
+impl GoalStore {
+    /// Prepare only. The original Graph or Program transaction commits this
+    /// event with the frozen read set; this method cannot independently append.
+    pub(crate) fn prepare_user_input_revision(
+        &self,
+        original: &GoalProjection,
+        frame: &UserGoalInputFrame,
+        proposal: &harness_contract::input_disposition::ModelInputDispositionBatch,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+    ) -> Result<PreparedGoalMutation, String> {
+        use harness_contract::input_disposition::InputDispositionAction;
+        let binding = original
+            .goal
+            .execution_binding
+            .as_ref()
+            .ok_or("user Goal binding missing")?;
+        frame.validate(binding)?;
+        if binding.root_execution_id != ticket.graph_id || ticket.attempt == 0 {
+            return Err("user Goal proposal crosses Graph attempt".into());
+        }
+        // Reuse the same strict finite validator for persisted proposals.
+        let checked = harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(
+            &serde_json::to_string(proposal).map_err(|e|e.to_string())?, frame.inputs.len())?;
+        let decision = &checked.decisions[0];
+        if decision.action != InputDispositionAction::AmendCurrentTurn {
+            return Err("user Goal amendment expected".into());
+        }
+        let business = decision
+            .business_revision
+            .as_ref()
+            .ok_or("user Goal business revision missing")?;
+        let anchor = original
+            .goal
+            .user_intent_criterion_id
+            .as_deref()
+            .ok_or("user Goal intent anchor missing")?;
+        if business
+            .retired_criteria
+            .iter()
+            .any(|id| id == anchor || !original.goal.criteria.iter().any(|c| &c.id == id))
+            || business.retired_obligations.iter().any(|id| {
+                !original
+                    .goal
+                    .obligations
+                    .iter()
+                    .any(|o| &o.obligation_id == id)
+            })
+        {
+            return Err(
+                "user Goal revision references foreign or immutable criterion/obligation".into(),
+            );
+        }
+        let content_bytes = frame
+            .inputs
+            .iter()
+            .map(|(_, _, text)| text.len())
+            .sum::<usize>();
+        for commitment in &business.commitments {
+            use harness_contract::goal::GoalInputCommitment::*;
+            let span = match commitment {
+                WorkspaceWrite { source, .. }
+                | ForbidWorkspaceWrite { source, .. }
+                | ForbidTools { source }
+                | TeamCount { source, .. } => source,
+            };
+            if span.start > span.end || span.end > content_bytes {
+                return Err("user Goal proposal citation outside supplied source".into());
+            }
+            match commitment {
+                WorkspaceWrite {
+                    path: Some(path), ..
+                }
+                | ForbidWorkspaceWrite {
+                    path: Some(path), ..
+                } if path.trim().is_empty() => {
+                    return Err(
+                        "user Goal business path must be nonempty or autonomous null".into(),
+                    )
+                }
+                TeamCount {
+                    minimum,
+                    maximum: Some(maximum),
+                    ..
+                } if maximum < minimum => return Err("user Goal team maximum below minimum".into()),
+                _ => {}
+            }
+        }
+        let source_ref = format!("session_input_application:{}", frame.digest()?);
+        let principal = frame.inputs[0].1.principal_id.clone();
+        let first = &frame.inputs[0].0;
+        let contract = harness_contract::goal::GoalInputContract {
+            version: 2,
+            principal_id: principal,
+            session_id: binding.session_id.clone(),
+            turn_id: binding.turn_id.clone(),
+            source_ref: source_ref.clone(),
+            input_revision: first.sequence.saturating_add(1) as u64,
+            content_sha256: frame.digest()?,
+            commitments: business.commitments.clone(),
+            proposed_workspace_scopes: vec![],
+        };
+        let (_, _, mut event) = self.revision_event(
+            &original.goal.id,
+            original.goal.revision,
+            original.goal.user_sequence.saturating_add(1),
+            "authenticated_user_input_revision",
+            |goal| {
+                goal.objective = decision.objective.clone();
+                goal.criteria
+                    .retain(|c| !business.retired_criteria.contains(&c.id));
+                for criterion in &mut goal.criteria {
+                    if criterion.id == anchor {
+                        criterion.statement = decision.objective.clone();
+                        criterion.statement_ref = None;
+                        criterion.source_refs.push(source_ref.clone());
+                    }
+                    criterion.status = AcceptanceStatus::Open;
+                }
+                goal.obligations
+                    .retain(|o| !business.retired_obligations.contains(&o.obligation_id));
+                goal.constraints = business.constraints.clone();
+                goal.input_contract = Some(contract.clone());
+                goal.participation_requirement = contract
+                    .team_bounds()
+                    .filter(|(min, _)| *min > 0)
+                    .map(|(minimum_team_count, _)| {
+                        harness_contract::goal::ParticipationRequirement {
+                            minimum_team_count,
+                            source_ref: source_ref.clone(),
+                        }
+                    });
+                goal.spec_revision = goal.spec_revision.saturating_add(1);
+                goal.spec_digest = goal_spec_digest(goal);
+                goal.waiting = None;
+                goal.recovery = None;
+                goal.terminal = None;
+                goal.completion = GoalCompletion::Open;
+                vec![
+                    "objective".into(),
+                    "criteria".into(),
+                    "obligations".into(),
+                    "constraints".into(),
+                    "input_contract".into(),
+                    "spec_digest".into(),
+                ]
+            },
+        )?;
+        event.event.payload["goal_source"] = serde_json::json!({
+            "stream_id":stream_id(&original.goal.id),"sequence":original.stream_revision,
+            "goal_revision":original.goal.revision,"spec_revision":original.goal.spec_revision,
+            "spec_digest":original.goal.spec_digest,"source_intent_ref":original.goal.source_intent_ref,
+        });
+        event.event.payload["input_application_ticket"] = serde_json::json!(ticket);
+        event.idempotency_key = Some(format!(
+            "goal-user-input:{}:{}",
+            original.goal.id,
+            frame.digest()?
+        ));
+        event.event.payload["user_input_application"] = serde_json::json!({"source_digest":frame.digest()?,"sources":frame.inputs.iter().map(|(_,source,_)|source).collect::<Vec<_>>(),"proposal":proposal});
+        Ok(PreparedGoalMutation {
+            stream_id: stream_id(&original.goal.id),
+            expected_stream_revision: original.stream_revision,
+            event,
+        })
+    }
 }
 
 /// Whether a recorded ObjectiveReview has retired the `completion_gap` that
@@ -688,7 +1740,7 @@ impl GoalStore {
 }
 
 pub(crate) fn goal_spec_digest(goal: &GoalContract) -> String {
-    let canonical = serde_json::json!({
+    let mut canonical = serde_json::json!({
         "source_intent_ref": goal.source_intent_ref,
         "criteria": goal.criteria.iter().map(|criterion| serde_json::json!({
             "id":criterion.id,"statement":criterion.statement,"statement_ref":criterion.statement_ref,
@@ -703,6 +1755,10 @@ pub(crate) fn goal_spec_digest(goal: &GoalContract) -> String {
             "evidence_requirement":obligation.evidence_requirement,
         })).collect::<Vec<_>>(),
     });
+    // Historical absent-field digests retain their exact original encoding.
+    if let Some(contract) = &goal.input_contract {
+        canonical["input_contract"] = serde_json::json!(contract);
+    }
     format!(
         "{:x}",
         sha2::Sha256::digest(canonical.to_string().as_bytes())
@@ -1252,6 +2308,166 @@ impl GoalStore {
         Ok(Some(updated))
     }
 
+    /// Decide from the original specification and typed effects. Task focus is
+    /// a separate admitted contract; root work never falls back to predictions.
+    /// The returned source cut fences even a satisfied/exhausted decision.
+    pub(crate) fn assess_write_checkpoint(
+        &self,
+        source: &GoalProjection,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+        checkpoint: GoalWriteCheckpoint,
+        task_focus: Option<(
+            &[String],
+            &[harness_contract::context::ObservedEvidence],
+            bool,
+        )>,
+        pending: &[harness_contract::context::ObservedEvidence],
+    ) -> Result<
+        (
+            GoalWriteDisposition,
+            crate::runtime_event_store::ExpectedStreamRevision,
+        ),
+        String,
+    > {
+        let binding = source
+            .goal
+            .execution_binding
+            .as_ref()
+            .ok_or("write recovery binding missing")?;
+        if binding.root_execution_id != ticket.graph_id || ticket.attempt == 0 {
+            return Err("write recovery Graph binding mismatch".into());
+        }
+        let cut = crate::runtime_event_store::ExpectedStreamRevision {
+            stream_id: stream_id(&source.goal.id),
+            expected_revision: source.stream_revision,
+        };
+        let satisfied = if let Some((scopes, evidence, unscoped)) = task_focus {
+            write_obligation_satisfied(!scopes.is_empty(), scopes, evidence, unscoped, resolver)
+        } else {
+            self.turn_writes_satisfied_with_pending(source, resolver, pending)?
+        };
+        if satisfied {
+            return Ok((GoalWriteDisposition::Satisfied, cut));
+        }
+        if let GoalWriteCheckpoint::ToolProgress {
+            bounded_role,
+            saturated,
+            write_attempted,
+        } = checkpoint
+        {
+            if bounded_role
+                || !saturated
+                || write_attempted
+                || source
+                    .goal
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.attempts != 0)
+            {
+                return Ok((GoalWriteDisposition::Pending, cut));
+            }
+        }
+        let key = format!(
+            "goal-write-recovery:{}:{}",
+            source.goal.spec_digest, ticket.idempotency_key
+        );
+        if source
+            .goal
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.idempotency_key == key)
+        {
+            return Ok((GoalWriteDisposition::Pending, cut));
+        }
+        if let Some(recovery) = self.prepare_write_recovery(source, ticket)? {
+            return Ok((GoalWriteDisposition::Recover(recovery), cut));
+        }
+        if matches!(checkpoint, GoalWriteCheckpoint::ToolProgress { .. }) {
+            return Ok((GoalWriteDisposition::Pending, cut));
+        }
+        let intervention = RuntimeIntervention {
+            goal_id: source.goal.id.clone(), kind: harness_contract::goal::RuntimeInterventionKind::Block,
+            reason: "The current Goal workspace artifact remains unproven after its bounded recovery budget".into(),
+            evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+            expected_graph_revision: None,
+        };
+        Ok((GoalWriteDisposition::Blocked(intervention), cut))
+    }
+
+    /// Prepare the existing durable recovery reservation for the original
+    /// Graph transaction. A Host retry counter is not a second business owner.
+    fn prepare_write_recovery(
+        &self,
+        source: &GoalProjection,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+    ) -> Result<Option<PreparedGoalMutation>, String> {
+        let binding = source
+            .goal
+            .execution_binding
+            .as_ref()
+            .ok_or("write recovery binding missing")?;
+        if binding.root_execution_id != ticket.graph_id || ticket.attempt == 0 {
+            return Err("write recovery Graph binding mismatch".into());
+        }
+        let key = format!(
+            "goal-write-recovery:{}:{}",
+            source.goal.spec_digest, ticket.idempotency_key
+        );
+        if source.goal.recovery.as_ref().is_some_and(|recovery| {
+            recovery.idempotency_key == key
+                || recovery.attempts >= recovery.budget
+                || matches!(
+                    recovery.status,
+                    ObjectiveRecoveryStatus::Exhausted | ObjectiveRecoveryStatus::Failed
+                )
+        }) {
+            return Ok(None);
+        }
+        let attempt = source
+            .goal
+            .recovery
+            .as_ref()
+            .map_or(1, |recovery| recovery.attempts.saturating_add(1));
+        if attempt > 2 {
+            return Ok(None);
+        }
+        let event_key = key.clone();
+        let (_, _, mut event) = self.revision_event(
+            &source.goal.id,
+            source.goal.revision,
+            source.goal.user_sequence.saturating_add(1),
+            "objective_recovery_reservation",
+            |goal| {
+                goal.recovery = Some(ObjectiveRecoveryState {
+                    source_revision: source.stream_revision,
+                    attempts: attempt,
+                    budget: 2,
+                    status: ObjectiveRecoveryStatus::Pending,
+                    idempotency_key: key,
+                    mutation_id: None,
+                    source_obligation_id: Some(format!("goal-write:{}", source.goal.spec_digest)),
+                    last_diagnostic: Some(
+                        "current Goal workspace write has no committed receipt".into(),
+                    ),
+                });
+                vec!["recovery".into()]
+            },
+        )?;
+        if event.event.payload["goal"]["spec_digest"] != source.goal.spec_digest {
+            return Err("write recovery specification changed".into());
+        }
+        // Concurrent user revisions may claim the same next Goal revision.
+        // The original stream CAS, not a shared revision-number event key,
+        // decides the winner. Replay stays bound to this original attempt.
+        event.idempotency_key = Some(event_key);
+        Ok(Some(PreparedGoalMutation {
+            stream_id: stream_id(&source.goal.id),
+            expected_stream_revision: source.stream_revision,
+            event,
+        }))
+    }
+
     /// Claim the physical graph mutation phase. The mutation id is durable so
     /// a crash can safely resume the same patch instead of creating another
     /// Team instance.
@@ -1577,9 +2793,6 @@ impl GoalStore {
         goal: &GoalContract,
         completion: GoalCompletion,
     ) -> Result<(), String> {
-        if completion != GoalCompletion::Satisfied {
-            return Ok(());
-        }
         if let Some(binding) = &goal.execution_binding {
             let program = crate::AgentActionService::new(Arc::clone(&self.event_store))
                 .project_if_exists(&binding.agentic_program_id)
@@ -1591,7 +2804,7 @@ impl GoalStore {
                 );
             }
         }
-        if goal.participation_requirement.is_some() {
+        if completion == GoalCompletion::Satisfied && goal.participation_requirement.is_some() {
             return Err("original_participation_requires_program_conclusion: no bound Program contribution evidence".into());
         }
         Ok(())
@@ -2285,6 +3498,33 @@ fn validate_goal(goal: &GoalContract) -> Result<(), String> {
             "goal requires a non-zero semantic specification revision and digest".to_string(),
         );
     }
+    if let Some(contract) = &goal.input_contract {
+        let binding = goal
+            .execution_binding
+            .as_ref()
+            .ok_or("goal_input_missing_binding")?;
+        if !matches!(contract.version, 1 | 2)
+            || contract.input_revision == 0
+            || contract.session_id != goal.session_id
+            || contract.session_id != binding.session_id
+            || contract.turn_id != binding.turn_id
+            || contract.principal_id.trim().is_empty()
+            || (contract.version == 1
+                && (contract.principal_id != format!("session:{}", binding.session_id)
+                    || Some(contract.source_ref.as_str()) != goal.source_intent_ref.as_deref()))
+            || (contract.version == 2
+                && !contract
+                    .source_ref
+                    .starts_with("session_input_application:"))
+            || contract.content_sha256.len() != 64
+            || !contract
+                .content_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("goal_input_source_binding_mismatch".into());
+        }
+    }
     if goal.scope == harness_contract::goal::GoalScope::UserObjective {
         let source_intent = goal
             .source_intent_ref
@@ -2350,6 +3590,64 @@ fn validate_goal(goal: &GoalContract) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    fn input_binding() -> harness_contract::goal::GoalExecutionBinding {
+        harness_contract::goal::GoalExecutionBinding {
+            objective_id: "objective:s:t".into(),
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            root_execution_id: "g".into(),
+            agentic_program_id: "p".into(),
+        }
+    }
+
+    #[test]
+    fn unresolved_scope_proposals_cannot_authorize_or_deny_an_input() {
+        let binding = input_binding();
+        for (input, proposals) in [
+            (
+                "Create a summary file; choose a suitable filename yourself.",
+                vec![],
+            ),
+            (
+                "不要修改src/a.rs；请修改src/b.rs",
+                vec!["write:src/a.rs".into(), "write:src/b.rs".into()],
+            ),
+            ("Read out.md", vec!["write:out.md".into()]),
+            (
+                "The quoted command is write out.md",
+                vec!["write:out.md".into()],
+            ),
+        ] {
+            let contract = super::compile_goal_input_contract(
+                &binding,
+                "session_message:m",
+                1,
+                input,
+                &proposals,
+            )
+            .unwrap();
+            assert!(
+                contract.commitments.is_empty(),
+                "identity and parser output cannot create semantic authority"
+            );
+            assert_eq!(contract.proposed_workspace_scopes, proposals);
+            assert_eq!(contract.source_ref, "session_message:m");
+            assert_eq!(contract.principal_id, "session:s");
+        }
+    }
+
+    #[test]
+    fn historical_absent_input_contract_does_not_appear_in_encoded_goal() {
+        let previous = goal();
+        let encoded = serde_json::to_value(&previous).unwrap();
+        assert!(encoded.get("input_contract").is_none());
+        let decoded: harness_contract::goal::GoalContract =
+            serde_json::from_value(encoded.clone()).unwrap();
+        assert!(decoded.input_contract.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    }
+
     use super::*;
     use harness_contract::{
         core::MeasureProvenance,
@@ -2362,6 +3660,7 @@ mod tests {
 
     fn goal() -> GoalContract {
         GoalContract {
+            input_contract: None,
             id: "goal-test".to_string(),
             session_id: "session-test".to_string(),
             objective: "complete governed work".to_string(),
@@ -2395,6 +3694,1400 @@ mod tests {
             revision: 1,
             user_sequence: 1,
             reviews: Vec::new(),
+        }
+    }
+
+    fn authenticated_revision_fixture() -> (
+        Arc<RuntimeEventStore>,
+        GoalStore,
+        GoalProjection,
+        UserGoalInputFrame,
+        crate::execution_core::NodeExecutionTicket,
+    ) {
+        use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
+        let events = Arc::new(RuntimeEventStore::for_test());
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+            ExecutionNodeStatus,
+        };
+        let commits = crate::ExecutionCommitService::new(events.clone());
+        let mut graph = ExecutionGraph::new("user revision fixture");
+        graph.id = "user-revision-graph".into();
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: "session-test".into(),
+            turn_id: "user-turn".into(),
+            root_task_id: "user-task".into(),
+            task_id: "user-task".into(),
+            generation: 1,
+        });
+        let node = ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "{}");
+        graph.nodes.push(node.clone());
+        graph = commits.register_graph(graph).unwrap().graph;
+        graph = commits
+            .transition_node(&graph, &node.id, ExecutionNodeStatus::Ready, None, vec![])
+            .unwrap()
+            .graph;
+        let ticket = crate::execution_core::NodeExecutionTicket {
+            graph_id: graph.id.clone(),
+            node_id: node.id.clone(),
+            executor_kind: node.executor_kind.clone(),
+            service_class: graph.service_class,
+            attempt: 1,
+            idempotency_key: node.idempotency_key.clone(),
+            payload_ref: node.payload_ref.clone(),
+        };
+        let binding = crate::execution_core::graph::ExecutionNodeBinding {
+            executor_kind: ticket.executor_kind.clone(),
+            ticket_idempotency_key: ticket.idempotency_key.clone(),
+            attempt: 1,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        let graph = commits
+            .bind_and_start_nodes(
+                &graph,
+                std::collections::BTreeMap::from([(node.id.clone(), binding)]),
+                vec![ticket.clone()],
+            )
+            .unwrap()
+            .graph;
+        let goals = GoalStore::new(events.clone());
+        let mut original = goal();
+        original.scope = harness_contract::goal::GoalScope::UserObjective;
+        original.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
+            objective_id: "user-objective".into(),
+            session_id: original.session_id.clone(),
+            turn_id: "user-turn".into(),
+            root_execution_id: graph.id.clone(),
+            agentic_program_id: "user-program".into(),
+        });
+        goals.create(original).unwrap();
+        let source = goals.projection("goal-test").unwrap().unwrap();
+        let text = "请直接解释结果，不再生成报告文件。";
+        let origin = SessionInputUserSource {
+            principal_id: "real-user-7".into(),
+            session_id: "session-test".into(),
+            input_id: "user-input".into(),
+            request_id: "user-request".into(),
+            message_id: "user-message".into(),
+            session_generation: 1,
+            content_sha256: format!("{:x}", sha2::Sha256::digest(text.as_bytes())),
+        };
+        let classification=serde_json::json!({"source_kind":"user","metadata":{SESSION_INPUT_USER_SOURCE_KEY:origin}}).to_string();
+        let record:crate::session_runtime_port::RuntimeSessionInputRecord=serde_json::from_value(serde_json::json!({
+            "input_id":"user-input","request_id":"user-request","turn_id":"user-turn","message_id":"user-message","session_id":"session-test",
+            "sequence":4,"session_generation":1,"decision":"start_new_turn","classification_json":classification,"status":"running",
+            "runtime_commit_cursor":null,"attempts":1,"next_attempt_at_ms":0,"claim_owner":"original-owner","claim_token":"claim",
+            "claim_expires_at_ms":1000,"revision":3,"created_at_ms":1,"updated_at_ms":2
+        })).unwrap();
+        (
+            events,
+            goals,
+            source,
+            UserGoalInputFrame {
+                inputs: vec![(record, origin, text.into())],
+            },
+            ticket,
+        )
+    }
+
+    fn current_write_goal_fixture() -> (
+        Arc<RuntimeEventStore>,
+        GoalStore,
+        GoalProjection,
+        crate::execution_core::NodeExecutionTicket,
+    ) {
+        use harness_contract::goal::{GoalInputCommitment, GoalInputContract, GoalInputSpan};
+        let (events, goals, original, _, ticket) = authenticated_revision_fixture();
+        goals
+            .revise(
+                "goal-test",
+                original.goal.revision,
+                original.goal.user_sequence + 1,
+                "literal current business contract",
+                |goal| {
+                    goal.input_contract = Some(GoalInputContract {
+                        version: 2,
+                        principal_id: "literal-user".into(),
+                        session_id: "session-test".into(),
+                        turn_id: "user-turn".into(),
+                        source_ref: "session_input_application:literal".into(),
+                        input_revision: 1,
+                        content_sha256: "a".repeat(64),
+                        commitments: vec![GoalInputCommitment::WorkspaceWrite {
+                            path: Some("report.txt".into()),
+                            source: GoalInputSpan { start: 0, end: 1 },
+                        }],
+                        proposed_workspace_scopes: vec![],
+                    });
+                    goal.spec_revision += 1;
+                    goal.spec_digest = goal_spec_digest(goal);
+                    vec!["input_contract".into()]
+                },
+            )
+            .unwrap();
+        let source = goals.projection("goal-test").unwrap().unwrap();
+        (events, goals, source, ticket)
+    }
+
+    #[test]
+    fn goal_owns_write_checkpoint_effect_budget_and_exhaustion_without_host_verdicts() {
+        let (_, goals, source, ticket) = current_write_goal_fixture();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("report.txt"), "report").unwrap();
+        std::fs::write(workspace.path().join("other.txt"), "other").unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let assess =
+            |source: &GoalProjection,
+             checkpoint,
+             pending: &[harness_contract::context::ObservedEvidence]| {
+                goals
+                    .assess_write_checkpoint(source, &ticket, &resolver, checkpoint, None, pending)
+                    .unwrap()
+            };
+        assert!(matches!(
+            assess(&source, GoalWriteCheckpoint::FinalAnswer, &[]).0,
+            GoalWriteDisposition::Recover(_)
+        ));
+        assert!(
+            goals.get("goal-test").unwrap().unwrap().recovery.is_none(),
+            "decision never consumes budget independently"
+        );
+        let correct = resolver
+            .observe_tool_scope(
+                "edit",
+                "write:report.txt",
+                Some(&format!("{:x}", sha2::Sha256::digest(b"report"))),
+                7,
+            )
+            .unwrap();
+        let wrong = resolver
+            .observe_tool_scope(
+                "edit",
+                "write:other.txt",
+                Some(&format!("{:x}", sha2::Sha256::digest(b"other"))),
+                8,
+            )
+            .unwrap();
+        assert!(matches!(
+            assess(
+                &source,
+                GoalWriteCheckpoint::FinalAnswer,
+                std::slice::from_ref(&correct)
+            )
+            .0,
+            GoalWriteDisposition::Satisfied
+        ));
+        assert!(matches!(
+            assess(
+                &source,
+                GoalWriteCheckpoint::FinalAnswer,
+                std::slice::from_ref(&wrong)
+            )
+            .0,
+            GoalWriteDisposition::Recover(_)
+        ));
+        let focus = vec!["write:other.txt".to_string()];
+        assert!(
+            matches!(
+                goals
+                    .assess_write_checkpoint(
+                        &source,
+                        &ticket,
+                        &resolver,
+                        GoalWriteCheckpoint::FinalAnswer,
+                        Some((&focus, std::slice::from_ref(&wrong), false)),
+                        &[]
+                    )
+                    .unwrap()
+                    .0,
+                GoalWriteDisposition::Satisfied
+            ),
+            "a legitimate Task focus is not a request for a duplicate root write"
+        );
+        for checkpoint in [
+            GoalWriteCheckpoint::ToolProgress {
+                bounded_role: true,
+                saturated: true,
+                write_attempted: false,
+            },
+            GoalWriteCheckpoint::ToolProgress {
+                bounded_role: false,
+                saturated: false,
+                write_attempted: false,
+            },
+            GoalWriteCheckpoint::ToolProgress {
+                bounded_role: false,
+                saturated: true,
+                write_attempted: true,
+            },
+        ] {
+            assert!(matches!(
+                assess(&source, checkpoint, &[]).0,
+                GoalWriteDisposition::Pending
+            ));
+        }
+        assert!(matches!(
+            assess(
+                &source,
+                GoalWriteCheckpoint::ToolProgress {
+                    bounded_role: false,
+                    saturated: true,
+                    write_attempted: false
+                },
+                &[]
+            )
+            .0,
+            GoalWriteDisposition::Recover(_)
+        ));
+        let key = format!(
+            "goal-write-recovery:{}:{}",
+            source.goal.spec_digest, ticket.idempotency_key
+        );
+        goals
+            .revise(
+                "goal-test",
+                source.goal.revision,
+                source.goal.user_sequence + 1,
+                "committed original recovery",
+                |goal| {
+                    goal.recovery = Some(ObjectiveRecoveryState {
+                        source_revision: source.stream_revision,
+                        attempts: 1,
+                        budget: 2,
+                        status: ObjectiveRecoveryStatus::Pending,
+                        idempotency_key: key.clone(),
+                        mutation_id: None,
+                        source_obligation_id: Some("literal-original-write".into()),
+                        last_diagnostic: None,
+                    });
+                    vec!["recovery".into()]
+                },
+            )
+            .unwrap();
+        let replay = goals.projection("goal-test").unwrap().unwrap();
+        assert!(
+            matches!(
+                assess(&replay, GoalWriteCheckpoint::FinalAnswer, &[]).0,
+                GoalWriteDisposition::Pending
+            ),
+            "same ticket cannot consume or invent another decision"
+        );
+        goals
+            .revise(
+                "goal-test",
+                replay.goal.revision,
+                replay.goal.user_sequence + 1,
+                "original exhausted budget",
+                |goal| {
+                    let recovery = goal.recovery.as_mut().unwrap();
+                    recovery.idempotency_key = "another-completed-attempt".into();
+                    recovery.attempts = 2;
+                    recovery.status = ObjectiveRecoveryStatus::Exhausted;
+                    vec!["recovery".into()]
+                },
+            )
+            .unwrap();
+        let exhausted = goals.projection("goal-test").unwrap().unwrap();
+        let (decision, cut) = assess(&exhausted, GoalWriteCheckpoint::FinalAnswer, &[]);
+        assert_eq!(cut.expected_revision, exhausted.stream_revision);
+        assert!(
+            matches!(decision, GoalWriteDisposition::Blocked(ref intervention)
+            if intervention.kind == harness_contract::goal::RuntimeInterventionKind::Block && intervention.goal_id == "goal-test")
+        );
+        assert!(matches!(
+            assess(
+                &exhausted,
+                GoalWriteCheckpoint::ToolProgress {
+                    bounded_role: false,
+                    saturated: true,
+                    write_attempted: false
+                },
+                &[]
+            )
+            .0,
+            GoalWriteDisposition::Pending
+        ));
+        assert!(
+            matches!(
+                assess(&exhausted, GoalWriteCheckpoint::FinalAnswer, &[correct]).0,
+                GoalWriteDisposition::Satisfied
+            ),
+            "actual correct effect wins over an obsolete recovery state"
+        );
+        let mut foreign = ticket.clone();
+        foreign.graph_id = "foreign".into();
+        assert!(goals
+            .assess_write_checkpoint(
+                &source,
+                &foreign,
+                &resolver,
+                GoalWriteCheckpoint::FinalAnswer,
+                None,
+                &[]
+            )
+            .is_err());
+        // Persist a real current-spec observation, then revise only the required
+        // object. Its old Goal source cannot satisfy the new specification.
+        let (_, revised_goals, revised_source, revised_ticket) = current_write_goal_fixture();
+        let mut observed = observation(99);
+        observed.identity.graph_id = revised_ticket.graph_id.clone();
+        observed.identity.turn_id = Some("user-turn".into());
+        observed.identity.node_id = Some(revised_ticket.node_id.clone());
+        observed.observed_evidence = vec![resolver
+            .observe_tool_scope(
+                "edit",
+                "write:report.txt",
+                Some(&format!("{:x}", sha2::Sha256::digest(b"report"))),
+                9,
+            )
+            .unwrap()];
+        revised_goals.record_observation(observed).unwrap();
+        let with_receipt = revised_goals.projection("goal-test").unwrap().unwrap();
+        assert!(matches!(
+            revised_goals
+                .assess_write_checkpoint(
+                    &with_receipt,
+                    &revised_ticket,
+                    &resolver,
+                    GoalWriteCheckpoint::FinalAnswer,
+                    None,
+                    &[]
+                )
+                .unwrap()
+                .0,
+            GoalWriteDisposition::Satisfied
+        ));
+        revised_goals
+            .revise(
+                "goal-test",
+                with_receipt.goal.revision,
+                with_receipt.goal.user_sequence + 1,
+                "new object contract",
+                |goal| {
+                    if let harness_contract::goal::GoalInputCommitment::WorkspaceWrite {
+                        path,
+                        ..
+                    } = &mut goal.input_contract.as_mut().unwrap().commitments[0]
+                    {
+                        *path = Some("other.txt".into());
+                    }
+                    goal.spec_revision += 1;
+                    goal.spec_digest = goal_spec_digest(goal);
+                    vec!["input_contract".into()]
+                },
+            )
+            .unwrap();
+        let new_spec = revised_goals.projection("goal-test").unwrap().unwrap();
+        assert_ne!(new_spec.goal.spec_digest, revised_source.goal.spec_digest);
+        assert!(
+            matches!(
+                revised_goals
+                    .assess_write_checkpoint(
+                        &new_spec,
+                        &revised_ticket,
+                        &resolver,
+                        GoalWriteCheckpoint::FinalAnswer,
+                        None,
+                        &[]
+                    )
+                    .unwrap()
+                    .0,
+                GoalWriteDisposition::Recover(_)
+            ),
+            "old-spec receipt must not satisfy the revised target"
+        );
+        let (_, empty_goals, empty, _, empty_ticket) = authenticated_revision_fixture();
+        assert!(matches!(
+            empty_goals
+                .assess_write_checkpoint(
+                    &empty,
+                    &empty_ticket,
+                    &resolver,
+                    GoalWriteCheckpoint::FinalAnswer,
+                    None,
+                    &[]
+                )
+                .unwrap()
+                .0,
+            GoalWriteDisposition::Satisfied
+        ));
+    }
+
+    #[test]
+    fn current_goal_write_recovery_is_prepared_and_graph_atomic_with_a_stale_source_rejection() {
+        use harness_contract::execution_graph::{
+            ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
+        };
+        let (events, goals, source, ticket) = current_write_goal_fixture();
+        let workspace = tempfile::tempdir().unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let (decision, _) = goals
+            .assess_write_checkpoint(
+                &source,
+                &ticket,
+                &resolver,
+                GoalWriteCheckpoint::FinalAnswer,
+                None,
+                &[],
+            )
+            .unwrap();
+        let GoalWriteDisposition::Recover(prepared) = decision else {
+            panic!("literal missing write must prepare recovery")
+        };
+        assert!(
+            goals.get("goal-test").unwrap().unwrap().recovery.is_none(),
+            "prepare cannot append"
+        );
+        let mut foreign = ticket.clone();
+        foreign.graph_id = "foreign".into();
+        assert_eq!(
+            goals.prepare_write_recovery(&source, &foreign).unwrap_err(),
+            "write recovery Graph binding mismatch"
+        );
+        let graph = crate::ExecutionGraphStateStore::new(events.clone())
+            .load(&ticket.graph_id)
+            .unwrap();
+        goals
+            .revise(
+                "goal-test",
+                source.goal.revision,
+                source.goal.user_sequence + 1,
+                "concurrent user revision",
+                |goal| {
+                    goal.constraints.push("new constraint".into());
+                    vec!["constraints".into()]
+                },
+            )
+            .unwrap();
+        let mut outcome = crate::execution_core::NodeExecutionOutcome::new(ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some("recovery".into()),
+            summary: None,
+            wait_class: None,
+            evidence_refs: vec![],
+            failure: None,
+            usage: ExecutionUsage::default(),
+            finished_at_ms: 1,
+        });
+        outcome
+            .source_revisions
+            .insert(prepared.stream_id, prepared.expected_stream_revision);
+        outcome.domain_events.push(prepared.event);
+        let committer = crate::ExecutionCommitService::new(events.clone());
+        let sources = committer
+            .execution_outcome_sources(&graph, &ticket, &outcome)
+            .unwrap();
+        let rejected = committer.transition_execution_outcome(&graph, &ticket, &outcome, &sources);
+        let error = rejected
+            .err()
+            .expect("a changed Goal must reject the original reservation");
+        assert!(
+            matches!(error,crate::execution_core::graph::ExecutionCommitError::EventStore(
+            crate::RuntimeEventStoreError::StaleRevision {ref stream_id, expected, actual})
+            if stream_id == "goal:goal-test" && expected == source.stream_revision && actual == source.stream_revision + 1),
+            "{error}"
+        );
+        assert!(goals.get("goal-test").unwrap().unwrap().recovery.is_none());
+        assert_eq!(
+            crate::ExecutionGraphStateStore::new(events)
+                .load(&graph.id)
+                .unwrap()
+                .revision,
+            graph.revision
+        );
+
+        let (events, goals, source, ticket) = current_write_goal_fixture();
+        let workspace = tempfile::tempdir().unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let (decision, _) = goals
+            .assess_write_checkpoint(
+                &source,
+                &ticket,
+                &resolver,
+                GoalWriteCheckpoint::FinalAnswer,
+                None,
+                &[],
+            )
+            .unwrap();
+        let GoalWriteDisposition::Recover(prepared) = decision else {
+            panic!("literal missing write must prepare recovery")
+        };
+        let graph = crate::ExecutionGraphStateStore::new(events.clone())
+            .load(&ticket.graph_id)
+            .unwrap();
+        let mut outcome = crate::execution_core::NodeExecutionOutcome::new(ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some("recovery".into()),
+            summary: None,
+            wait_class: None,
+            evidence_refs: vec![],
+            failure: None,
+            usage: ExecutionUsage::default(),
+            finished_at_ms: 1,
+        });
+        outcome
+            .source_revisions
+            .insert(prepared.stream_id, prepared.expected_stream_revision);
+        outcome.domain_events.push(prepared.event);
+        let committer = crate::ExecutionCommitService::new(events);
+        let sources = committer
+            .execution_outcome_sources(&graph, &ticket, &outcome)
+            .unwrap();
+        committer
+            .transition_execution_outcome(&graph, &ticket, &outcome, &sources)
+            .unwrap();
+        let current = goals.projection("goal-test").unwrap().unwrap();
+        assert_eq!(current.goal.recovery.as_ref().unwrap().attempts, 1);
+        assert_eq!(
+            current.goal.recovery.as_ref().unwrap().source_obligation_id,
+            Some(format!("goal-write:{}", source.goal.spec_digest))
+        );
+        assert!(
+            goals
+                .prepare_write_recovery(&current, &ticket)
+                .unwrap()
+                .is_none(),
+            "original attempt cannot spend twice"
+        );
+    }
+
+    #[test]
+    fn current_goal_constraints_keep_object_a_immutable_and_allow_disjoint_object_b() {
+        use harness_contract::{
+            goal::{GoalInputCommitment, GoalInputContract, GoalInputSpan},
+            policy::{PermissionOperation, PermissionResource, PermissionScope},
+            tool::{
+                ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+                ToolPermissionMode,
+            },
+        };
+        let (_, _, source, _, _) = authenticated_revision_fixture();
+        let mut current = source.goal;
+        current.input_contract = Some(GoalInputContract {
+            version: 2,
+            principal_id: "user".into(),
+            session_id: current.session_id.clone(),
+            turn_id: "user-turn".into(),
+            source_ref: "session_input_application:actual".into(),
+            input_revision: 1,
+            content_sha256: "a".repeat(64),
+            proposed_workspace_scopes: vec![],
+            commitments: vec![GoalInputCommitment::ForbidWorkspaceWrite {
+                path: Some("a.txt".into()),
+                source: GoalInputSpan { start: 0, end: 3 },
+            }],
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .unwrap();
+        let mut effect = ToolEffectDescriptor {
+            tool_id: "edit".into(),
+            descriptor_hash: "registered".into(),
+            effect_kind: ToolEffectKind::Write,
+            idempotency: ToolIdempotency::IdempotentWithKey,
+            scopes: vec![PermissionScope {
+                resource: PermissionResource::File,
+                operation: PermissionOperation::Write,
+                target: Some("b.txt".into()),
+            }],
+            required_permission: ToolPermissionMode::WorkspaceWrite,
+            approval_class: ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        };
+        assert_eq!(
+            goal_tool_effect_rejection(&current, &effect, &resolver),
+            None
+        );
+        effect.scopes[0].target = Some("./a.txt".into());
+        assert_eq!(
+            goal_tool_effect_rejection(&current, &effect, &resolver),
+            Some("current Goal prohibits mutation of this workspace object")
+        );
+        effect.scopes[0].target = None;
+        assert_eq!(
+            goal_tool_effect_rejection(&current, &effect, &resolver),
+            Some("current Goal requires exact workspace targets")
+        );
+        effect.scopes[0].target = Some("b.txt".into());
+        effect.spawns_process = true;
+        assert_eq!(
+            goal_tool_effect_rejection(&current, &effect, &resolver),
+            Some("current Goal requires disjoint workspace effects")
+        );
+        current.input_contract.as_mut().unwrap().commitments.push(
+            GoalInputCommitment::ForbidTools {
+                source: GoalInputSpan { start: 0, end: 3 },
+            },
+        );
+        effect.required_permission = ToolPermissionMode::ReadOnly;
+        assert_eq!(
+            goal_tool_effect_rejection(&current, &effect, &resolver),
+            Some("current Goal prohibits tool calls")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_user_revision_program_transaction_fences_program_graph_and_foreign_source(
+    ) {
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionEnvelope, AgentActionStatus, AgentActorBinding, AgentActorKind,
+            TeamCreateInput,
+        };
+        for case in ["apply", "stale_program", "stale_graph", "foreign_source"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let (events, goals, source, mut frame, ticket) = authenticated_revision_fixture();
+            let services = crate::RuntimeServices::test_builder(workspace.path(), workspace.path())
+                .runtime_event_store(events.clone())
+                .build()
+                .unwrap();
+            let actor = AgentActorBinding {
+                objective_id: "user-objective".into(),
+                program_id: "user-program".into(),
+                session_id: "session-test".into(),
+                turn_id: "user-turn".into(),
+                root_execution_id: Some(ticket.graph_id.clone()),
+                required_team_count: 1,
+                exact_team_count: None,
+                objective_summary: "original Program objective".into(),
+                model_lease: "controlled-unit".into(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: vec![],
+                actor_id: "original-root".into(),
+                kind: AgentActorKind::Root,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            };
+            let create = |id: &str| AgentActionEnvelope {
+                action_id: id.into(),
+                actor: actor.clone(),
+                expected_revision: None,
+                action: AgentAction::TeamCreate(TeamCreateInput {
+                    name: id.into(),
+                    mission: "original bounded work".into(),
+                    objective: None,
+                }),
+            };
+            let created = services
+                .agent_action_service()
+                .apply(&create("original-team"))
+                .unwrap();
+            assert_eq!(created.status, AgentActionStatus::Applied);
+            let program = services
+                .agent_action_service()
+                .project("user-program")
+                .unwrap();
+            let graph = services.graph_state_store().load(&ticket.graph_id).unwrap();
+            let proposal=harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(USER_REVISION_PROPOSAL,1).unwrap();
+            let prepared = goals
+                .prepare_user_input_revision(&source, &frame, &proposal, &ticket)
+                .unwrap();
+            let artifact = services
+                .artifact_store()
+                .write_bytes(
+                    harness_contract::context::ArtifactWriteDescriptor {
+                        media_type: "application/json".into(),
+                        visibility_scope: "session:session-test".into(),
+                        expected_bytes: Some(USER_REVISION_PROPOSAL.len() as u64),
+                        original_name: None,
+                    },
+                    USER_REVISION_PROPOSAL.as_bytes(),
+                )
+                .await
+                .unwrap();
+            match case {
+                "stale_program" => {
+                    assert_eq!(
+                        services
+                            .agent_action_service()
+                            .apply(&create("concurrent-team"))
+                            .unwrap()
+                            .status,
+                        AgentActionStatus::Applied
+                    );
+                }
+                "stale_graph" => {
+                    services
+                        .commit_service()
+                        .replan(
+                            &graph,
+                            vec![harness_contract::execution_graph::ExecutionNodeSpec::new(
+                                harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
+                                "inline_model",
+                                "concurrent required work",
+                            )],
+                            vec![],
+                            "concurrent graph change".into(),
+                        )
+                        .unwrap();
+                }
+                "foreign_source" => {
+                    frame.inputs[0].1.principal_id = "foreign-user".into();
+                }
+                _ => {}
+            }
+            let before_program = services
+                .agent_action_service()
+                .project("user-program")
+                .unwrap();
+            let before_graph = services.graph_state_store().load(&ticket.graph_id).unwrap();
+            let result = services.commit_user_input_goal_revision(
+                &source.goal,
+                &frame,
+                &prepared,
+                program.revision,
+                graph.revision,
+                &artifact.selector,
+            );
+            if case == "apply" {
+                result.unwrap();
+                let current = goals.get("goal-test").unwrap().unwrap();
+                assert_eq!(current.revision, 2);
+                assert_eq!(
+                    current.objective,
+                    "Explain the result directly without generating a report file"
+                );
+                assert_eq!(
+                    current.source_intent_ref,
+                    Some("session_message:test".into())
+                );
+                assert_eq!(
+                    services
+                        .graph_state_store()
+                        .load(&ticket.graph_id)
+                        .unwrap()
+                        .revision,
+                    graph.revision,
+                    "Program transaction must not replay Goal through Graph"
+                );
+                let applied_program = services
+                    .agent_action_service()
+                    .project("user-program")
+                    .unwrap();
+                assert_eq!(applied_program.revision, program.revision + 1);
+                assert_eq!(
+                    applied_program.objective_summary, "original Program objective",
+                    "frozen actor identity is not rewritten from business text"
+                );
+                services
+                    .commit_user_input_goal_revision(
+                        &source.goal,
+                        &frame,
+                        &prepared,
+                        program.revision,
+                        graph.revision,
+                        &artifact.selector,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    goals.get("goal-test").unwrap().unwrap().revision,
+                    2,
+                    "original action replay is exactly once"
+                );
+            } else {
+                let reason =
+                    result.expect_err("changed authenticated inputs must not partially adopt");
+                match case {
+                    "stale_program" => assert!(reason.contains("stale_revision"), "{reason}"),
+                    "stale_graph" => assert!(
+                        reason.contains(&ticket.graph_id) && reason.contains("revision"),
+                        "{reason}"
+                    ),
+                    "foreign_source" => {
+                        assert!(reason == "user Goal source identity mismatch", "{reason}")
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(goals.get("goal-test").unwrap().unwrap(), source.goal);
+                assert_eq!(
+                    services
+                        .agent_action_service()
+                        .project("user-program")
+                        .unwrap(),
+                    before_program
+                );
+                assert_eq!(
+                    services.graph_state_store().load(&ticket.graph_id).unwrap(),
+                    before_graph
+                );
+            }
+            services.shutdown_maintenance().await;
+            assert_eq!(services.shutdown_execution().await.forced_aborts, 0);
+        }
+    }
+
+    const USER_REVISION_PROPOSAL: &str = r#"{"decisions":[{"input_slots":[0],"action":"amend_current_turn","relation":"supplement","objective":"Explain the result directly without generating a report file","required":true,"confidence_basis_points":1,"reason":"The user changed the requested deliverable","business_revision":{"commitments":[],"constraints":[],"retired_criteria":[],"retired_obligations":[]}}]}"#;
+
+    #[tokio::test]
+    async fn authenticated_model_proposal_reaches_the_original_goal_graph_transaction() {
+        use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, ModelStepIntent};
+        use futures::Stream;
+        use harness_contract::execution_graph::{
+            ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
+        };
+        use std::pin::Pin;
+        struct ProposalApi {
+            empty_tools: bool,
+            requests: Arc<std::sync::Mutex<Vec<bool>>>,
+        }
+        impl ApiClient for ProposalApi {
+            fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+                Some(if self.empty_tools {
+                    vec![]
+                } else {
+                    vec![crate::ProviderToolDefinition {
+                        name: "read_file".into(),
+                        description: None,
+                        input_schema: serde_json::json!({"type":"object"}),
+                    }]
+                })
+            }
+            fn configure_tool_exposure(
+                &mut self,
+                p: harness_contract::tool::ToolExposureProjection,
+            ) {
+                self.empty_tools = p.bootstrap_ids.is_empty() && p.active_ids.is_empty();
+            }
+            fn stream(
+                &mut self,
+                _: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, crate::RuntimeError>> + Send + '_>>
+            {
+                self.requests.lock().unwrap().push(self.empty_tools);
+                Box::pin(futures::stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta(USER_REVISION_PROPOSAL.into())),
+                    Ok(AssistantEvent::Usage(model_protocol::usage::TokenUsage {
+                        input_tokens: 17,
+                        output_tokens: 23,
+                        ..Default::default()
+                    })),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            }
+        }
+        let requests = Arc::new(std::sync::Mutex::new(vec![]));
+        let mut runtime = crate::ConversationRuntime::new(
+            crate::Session::new(),
+            ProposalApi {
+                empty_tools: false,
+                requests: requests.clone(),
+            },
+            crate::StaticToolExecutor::new().register("read_file", |_| {
+                panic!("interpretation must never execute an external tool")
+            }),
+            crate::PermissionPolicy::new(harness_contract::policy::PermissionMode::ReadOnly),
+            vec!["system".into()],
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime.set_active_model("controlled-local-unit");
+        runtime
+            .begin_turn_strategy("user-turn", "explain the result")
+            .unwrap();
+        let step = runtime
+            .execute_user_input_interpretation(
+                "explain the result",
+                true,
+                false,
+                1,
+                "input_slot0 is the original authenticated user revision",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![true],
+            "the real Provider request must have an empty tool exposure"
+        );
+        assert!(
+            !step.text_only_response,
+            "interpretation is not terminal synthesis"
+        );
+        assert_eq!(step.usage.input_tokens, 17);
+        assert_eq!(step.usage.output_tokens, 23);
+        assert!(step.early_tool_receipts.is_empty());
+        let proposal = step.input_interpretation.unwrap().unwrap();
+        let (events, goals, source, frame, ticket) = authenticated_revision_fixture();
+        let mutation = goals
+            .prepare_user_input_revision(&source, &frame, &proposal, &ticket)
+            .unwrap();
+        assert_eq!(
+            goals.get("goal-test").unwrap().unwrap(),
+            source.goal,
+            "preparation may not write Goal"
+        );
+        let graph = crate::ExecutionGraphStateStore::new(events.clone())
+            .load(&ticket.graph_id)
+            .unwrap();
+        crate::ExecutionCommitService::new(events.clone())
+            .transition_node(
+                &graph,
+                &ticket.node_id,
+                ExecutionNodeStatus::Completed,
+                Some(ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Completed,
+                    result_ref: Some("controlled-interpreted-input".into()),
+                    summary: None,
+                    wait_class: None,
+                    evidence_refs: vec![],
+                    failure: None,
+                    usage: ExecutionUsage {
+                        input_tokens: 17,
+                        output_tokens: 23,
+                        provider_usage_observed: Some(true),
+                        ..Default::default()
+                    },
+                    finished_at_ms: 3,
+                }),
+                vec![mutation.event],
+            )
+            .unwrap();
+        let current = goals.get("goal-test").unwrap().unwrap();
+        assert_eq!(
+            current.objective,
+            "Explain the result directly without generating a report file"
+        );
+        assert_eq!(
+            current.criteria[0].statement,
+            "Explain the result directly without generating a report file"
+        );
+        assert_eq!(current.user_intent_criterion_id, Some("checked".into()));
+        assert_eq!(
+            current.source_intent_ref,
+            Some("session_message:test".into()),
+            "original user source history remains"
+        );
+        assert_eq!(current.spec_revision, 2);
+        assert_eq!(current.completion, GoalCompletion::Open);
+        assert_eq!(current.input_contract.unwrap().principal_id, "real-user-7");
+        let ordinary = runtime
+            .execute_model_step("ordinary final JSON document", false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ordinary.intent,
+            ModelStepIntent::FinalAnswer { .. }
+        ));
+        assert!(
+            ordinary.input_interpretation.is_none(),
+            "identical final-answer JSON is not a semantic adoption purpose"
+        );
+    }
+
+    #[test]
+    fn authenticated_user_revision_rejects_foreign_source_and_stale_goal_without_partial_commit() {
+        let proposal=harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(USER_REVISION_PROPOSAL,1).unwrap();
+        let (events, goals, source, frame, ticket) = authenticated_revision_fixture();
+        let mut foreign = frame.clone();
+        foreign.inputs[0].1.session_id = "foreign-session".into();
+        assert_eq!(
+            goals
+                .prepare_user_input_revision(&source, &foreign, &proposal, &ticket)
+                .unwrap_err(),
+            "user Goal source identity mismatch"
+        );
+        assert_eq!(goals.get("goal-test").unwrap().unwrap(), source.goal);
+        let mutation = goals
+            .prepare_user_input_revision(&source, &frame, &proposal, &ticket)
+            .unwrap();
+        let graph = crate::ExecutionGraphStateStore::new(events.clone())
+            .load(&ticket.graph_id)
+            .unwrap();
+        goals
+            .revise(
+                "goal-test",
+                1,
+                2,
+                "concurrent legitimate user revision",
+                |goal| {
+                    goal.objective = "newer actual objective".into();
+                    vec!["objective".into()]
+                },
+            )
+            .unwrap();
+        let result = crate::ExecutionCommitService::new(events.clone()).transition_node(
+            &graph,
+            &ticket.node_id,
+            harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+            None,
+            vec![mutation.event],
+        );
+        assert!(
+            matches!(
+                result,
+                Err(
+                    crate::execution_core::graph::ExecutionCommitError::EventStore(
+                        crate::RuntimeEventStoreError::StaleRevision { .. }
+                    )
+                )
+            ),
+            "{:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(
+            crate::ExecutionGraphStateStore::new(events)
+                .load(&ticket.graph_id)
+                .unwrap()
+                .revision,
+            graph.revision
+        );
+        assert_eq!(
+            goals.get("goal-test").unwrap().unwrap().objective,
+            "newer actual objective"
+        );
+    }
+
+    #[test]
+    fn ordinary_turn_candidate_and_goal_source_are_fenced_by_the_original_graph_transaction() {
+        use crate::execution_core::{
+            ExecutionCommitService, ExecutionGraphStateStore, NodeExecutionTicket,
+        };
+        use harness_contract::execution_graph::{
+            ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+        };
+        for (stale_source, block_trigger) in [
+            (false, None),
+            (true, None),
+            (false, Some(false)),
+            (false, Some(true)),
+        ] {
+            let events = Arc::new(RuntimeEventStore::for_test());
+            let commits = ExecutionCommitService::new(events.clone());
+            crate::test_support::register_running_root(
+                events.clone(),
+                &crate::CowdExecutionContext {
+                    execution_id: "graph".into(),
+                    session_id: "session-test".into(),
+                    turn_id: "turn".into(),
+                },
+            );
+            let states = ExecutionGraphStateStore::new(events.clone());
+            let graph = states.load("graph").unwrap();
+            let model = graph.nodes[0].clone();
+            let ticket = NodeExecutionTicket {
+                graph_id: "graph".into(),
+                node_id: model.id.clone(),
+                executor_kind: model.executor_kind.clone(),
+                service_class: graph.service_class,
+                attempt: 1,
+                idempotency_key: model.idempotency_key.clone(),
+                payload_ref: model.payload_ref.clone(),
+            };
+            let goals = Arc::new(GoalStore::new(events.clone()));
+            let mut original = goal();
+            original.scope = harness_contract::goal::GoalScope::UserObjective;
+            original.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
+                objective_id: "objective".into(),
+                session_id: "session-test".into(),
+                turn_id: "turn".into(),
+                root_execution_id: "graph".into(),
+                agentic_program_id: "program".into(),
+            });
+            original.criteria[0].required_evidence = vec!["execution_graph:graph".into()];
+            goals.create(original).unwrap();
+            let source = goals.projection("goal-test").unwrap().unwrap();
+            let mut observed = observation(1);
+            observed.kind = RuntimeObservationKind::GraphProgress;
+            observed.source = "runtime.model_step".into();
+            observed.identity.node_id = Some(model.id.clone());
+            let candidate = goals
+                .turn_candidate_event_at(&source, &observed, &ticket, "actual answer")
+                .unwrap();
+            let mut domain_events = vec![candidate];
+            if let Some(foreign_trigger) = block_trigger {
+                let mut trigger = observed.clone();
+                if foreign_trigger {
+                    trigger.identity.session_id = "foreign-session".into();
+                }
+                domain_events.push(
+                    goals
+                        .intervention_event(
+                            &harness_contract::goal::RuntimeIntervention {
+                                goal_id: "goal-test".into(),
+                                kind: harness_contract::goal::RuntimeInterventionKind::Block,
+                                reason: "original business decision".into(),
+                                evidence_refs: vec![format!("execution_node:{}", model.id)],
+                                expected_graph_revision: None,
+                            },
+                            &[trigger],
+                            format!("{}:goal-intervention", model.idempotency_key),
+                        )
+                        .unwrap(),
+                );
+            }
+            let synth = ExecutionNodeSpec::new(
+                ExecutionNodeKind::Synthesize,
+                "synthesize",
+                "unit terminal",
+            );
+            let synth_id = synth.id.clone();
+            let result = harness_contract::execution_graph::ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some("assistant_json:\"actual answer\"".into()),
+                summary: None,
+                wait_class: None,
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: harness_contract::execution_graph::ExecutionUsage::default(),
+                finished_at_ms: 1,
+            };
+            let graph = commits
+                .transition_node_with_replan(
+                    &graph,
+                    &model.id,
+                    result,
+                    domain_events,
+                    vec![synth],
+                    vec![],
+                    "unit model result".into(),
+                    true,
+                )
+                .unwrap()
+                .graph;
+            let graph = commits
+                .transition_node(&graph, &synth_id, ExecutionNodeStatus::Ready, None, vec![])
+                .unwrap()
+                .graph;
+            let synth = graph.nodes.iter().find(|node| node.id == synth_id).unwrap();
+            let terminal_ticket = NodeExecutionTicket {
+                graph_id: graph.id.clone(),
+                node_id: synth_id.clone(),
+                executor_kind: synth.executor_kind.clone(),
+                service_class: graph.service_class,
+                attempt: 1,
+                idempotency_key: synth.idempotency_key.clone(),
+                payload_ref: synth.payload_ref.clone(),
+            };
+            let graph = commits
+                .bind_and_start_node(
+                    &graph,
+                    &synth_id,
+                    crate::execution_core::graph::ExecutionNodeBinding {
+                        executor_kind: terminal_ticket.executor_kind.clone(),
+                        ticket_idempotency_key: terminal_ticket.idempotency_key.clone(),
+                        attempt: 1,
+                        resource_lease_refs: vec![],
+                        scope_lease_ref: None,
+                        worktree_lease_ref: None,
+                    },
+                )
+                .unwrap()
+                .graph;
+            let root = tempfile::tempdir().unwrap();
+            let resolver =
+                crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+            let prepared = ObjectiveSupervisor::new(goals.clone()).prepare_turn_conclusion(
+                "goal-test",
+                &terminal_ticket,
+                &resolver,
+                "unit conclusion".into(),
+                "unit-fence".into(),
+            );
+            if block_trigger == Some(true) {
+                assert!(
+                    matches!(prepared, Err(ref reason) if reason == "turn_block_intervention_binding_mismatch"),
+                    "a foreign trigger cannot be borrowed for this candidate"
+                );
+                assert_eq!(
+                    goals.get("goal-test").unwrap().unwrap().completion,
+                    GoalCompletion::Open
+                );
+                continue;
+            }
+            let prepared = prepared.unwrap();
+            let expected_completion = if block_trigger == Some(false) {
+                GoalCompletion::Partial
+            } else {
+                GoalCompletion::Satisfied
+            };
+            assert_eq!(
+                prepared.completion, expected_completion,
+                "the original committed Block must survive an answer candidate"
+            );
+            assert_eq!(
+                goals.get("goal-test").unwrap().unwrap().completion,
+                GoalCompletion::Open,
+                "preparation must not independently write Goal"
+            );
+            if stale_source {
+                goals
+                    .revise("goal-test", 1, 2, "actual user revision", |goal| {
+                        goal.spec_revision = 2;
+                        goal.spec_digest = "new-specification".into();
+                        goal.source_intent_ref = Some("session_message:replacement".into());
+                        vec![
+                            "spec_revision".into(),
+                            "spec_digest".into(),
+                            "source_intent_ref".into(),
+                        ]
+                    })
+                    .unwrap();
+            }
+            let result = harness_contract::execution_graph::ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some("unit-final".into()),
+                summary: None,
+                wait_class: None,
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: harness_contract::execution_graph::ExecutionUsage::default(),
+                finished_at_ms: 2,
+            };
+            let committed = commits.transition_node(
+                &graph,
+                &synth_id,
+                ExecutionNodeStatus::Completed,
+                Some(result),
+                vec![prepared.event],
+            );
+            if stale_source {
+                assert!(
+                    matches!(
+                        committed,
+                        Err(
+                            crate::execution_core::graph::ExecutionCommitError::EventStore(
+                                crate::RuntimeEventStoreError::StaleRevision { .. }
+                            )
+                        )
+                    ),
+                    "stale original Goal source must reject the checked Graph transaction"
+                );
+                assert_eq!(states.load("graph").unwrap().revision, graph.revision);
+                assert_eq!(
+                    goals.get("goal-test").unwrap().unwrap().completion,
+                    GoalCompletion::Open
+                );
+                let rejected = ObjectiveSupervisor::new(goals.clone()).prepare_turn_conclusion(
+                    "goal-test",
+                    &terminal_ticket,
+                    &resolver,
+                    "stale candidate".into(),
+                    "new-fence".into(),
+                );
+                assert!(
+                    matches!(rejected, Err(ref error) if error == "turn candidate source/attempt mismatch")
+                );
+            } else {
+                let receipt = committed.unwrap();
+                assert_eq!(
+                    receipt.graph.node_statuses[&synth_id],
+                    ExecutionNodeStatus::Completed
+                );
+                assert_eq!(
+                    goals.get("goal-test").unwrap().unwrap().completion,
+                    expected_completion
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_program_owns_every_business_conclusion_not_only_success() {
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, TeamCreateInput,
+        };
+        for completion in [
+            GoalCompletion::Satisfied,
+            GoalCompletion::Partial,
+            GoalCompletion::Blocked,
+            GoalCompletion::Failed,
+            GoalCompletion::Cancelled,
+        ] {
+            let events = Arc::new(RuntimeEventStore::for_test());
+            let actions = crate::AgentActionService::new(events.clone());
+            let actor = AgentActorBinding {
+                objective_id: "objective-1".into(),
+                program_id: "program-1".into(),
+                session_id: "session-1".into(),
+                turn_id: "turn-1".into(),
+                root_execution_id: Some("root-execution-1".into()),
+                required_team_count: 0,
+                exact_team_count: None,
+                objective_summary: "original Program business".into(),
+                model_lease: "test".into(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: vec![],
+                actor_id: "root-1".into(),
+                kind: AgentActorKind::Root,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            };
+            actions
+                .apply(&AgentActionEnvelope {
+                    action_id: "create-original-team".into(),
+                    actor: actor.clone(),
+                    expected_revision: None,
+                    action: AgentAction::TeamCreate(TeamCreateInput {
+                        name: "original team".into(),
+                        mission: "bounded work".into(),
+                        objective: None,
+                    }),
+                })
+                .unwrap();
+            let original_program = actions.project("program-1").unwrap();
+            assert_eq!(
+                original_program.teams.len(),
+                1,
+                "the original producer must establish a real Program before testing refusal"
+            );
+            let goals = GoalStore::new(events.clone());
+            let mut original = goal();
+            original.id = "goal:root-execution-1".into();
+            original.session_id = "session-1".into();
+            original.criteria[0].status = AcceptanceStatus::Satisfied;
+            original.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
+                objective_id: actor.objective_id,
+                session_id: actor.session_id,
+                turn_id: actor.turn_id,
+                root_execution_id: "root-execution-1".into(),
+                agentic_program_id: actor.program_id,
+            });
+            goals.create(original).unwrap();
+            let before = events
+                .stream_revision("goal:goal:root-execution-1")
+                .unwrap();
+            let refused = goals.terminal_event(
+                "goal:root-execution-1",
+                completion,
+                vec![],
+                "Host proposal".into(),
+                "forged-host-terminal".into(),
+            );
+            assert!(
+                matches!(refused, Err(ref reason) if reason == "program_terminal_authority: use the atomic Program conclusion for this Goal")
+            );
+            assert_eq!(
+                events
+                    .stream_revision("goal:goal:root-execution-1")
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                goals
+                    .get("goal:root-execution-1")
+                    .unwrap()
+                    .unwrap()
+                    .completion,
+                GoalCompletion::Open
+            );
+            assert_eq!(
+                actions.project("program-1").unwrap().revision,
+                original_program.revision
+            );
         }
     }
 

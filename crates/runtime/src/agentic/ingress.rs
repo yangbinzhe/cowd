@@ -140,6 +140,84 @@ fn runtime_supervisor_actor(
 }
 
 impl RuntimeServices {
+    /// Private authenticated-user cause. Public model ObjectiveUpdate still
+    /// takes prepare_agentic_objective_action and cannot replace user_intent.
+    pub(crate) fn commit_user_input_goal_revision(
+        &self,
+        original: &harness_contract::goal::GoalContract,
+        frame: &crate::execution_core::goal::UserGoalInputFrame,
+        prepared: &crate::execution_core::goal::PreparedGoalMutation,
+        program_revision: u64,
+        graph_revision: u64,
+        artifact_ref: &str,
+    ) -> Result<(), String> {
+        use harness_contract::agent_action::{ObjectiveUpdateInput, ObjectiveUpdateOperation};
+        let binding = original
+            .execution_binding
+            .as_ref()
+            .ok_or("user Goal binding missing")?;
+        frame.validate(binding)?;
+        let program = self
+            .agent_action_service()
+            .project_if_exists(&binding.agentic_program_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("user Goal Program missing")?;
+        if program.session_id != binding.session_id
+            || program.turn_id != binding.turn_id
+            || program.root_execution_id.as_deref() != Some(binding.root_execution_id.as_str())
+        {
+            return Err("user Goal Program lineage mismatch".into());
+        }
+        let envelope = AgentActionEnvelope {
+            action_id: format!("user-goal:{}:{}", original.id, frame.digest()?),
+            actor: AgentActorBinding {
+                objective_id: program.objective_id.clone(),
+                program_id: program.program_id.clone(),
+                session_id: program.session_id.clone(),
+                turn_id: program.turn_id.clone(),
+                root_execution_id: program.root_execution_id.clone(),
+                required_team_count: program.required_team_count,
+                exact_team_count: program.exact_team_count,
+                objective_summary: program.objective_summary.clone(),
+                model_lease: program.model_lease.clone(),
+                permission_ceiling: Some(program.permission_ceiling),
+                resource_scopes: program.resource_scopes.clone(),
+                actor_id: format!("{}:root", program.program_id),
+                kind: AgentActorKind::Root,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+            expected_revision: Some(program_revision),
+            action: AgentAction::ObjectiveUpdate(ObjectiveUpdateInput {
+                criterion_ref: original.user_intent_criterion_id.clone(),
+                operation: ObjectiveUpdateOperation::Replace,
+                statement_ref: Some(artifact_ref.into()),
+                source_refs: vec![artifact_ref.into()],
+                reason_ref: Some(artifact_ref.into()),
+                evidence_requirements: vec![],
+            }),
+        };
+        let result = self
+            .agent_action_service()
+            .apply_with_goal_event_sources(
+                &envelope,
+                prepared.stream_id.clone(),
+                prepared.expected_stream_revision,
+                prepared.event.clone(),
+                None,
+                &[crate::runtime_event_store::ExpectedStreamRevision {
+                    stream_id: binding.root_execution_id.clone(),
+                    expected_revision: graph_revision,
+                }],
+            )
+            .map_err(|e| e.to_string())?;
+        if result.status != AgentActionStatus::Applied {
+            return Err(format!("user Goal Program rejected: {:?}", result));
+        }
+        Ok(())
+    }
+
     /// Validate evidence selectors in the authenticated actor scope. This is
     /// intentionally an async preflight: storage reads happen before the
     /// ActionService acquires the Program stream lock.
@@ -429,7 +507,9 @@ impl RuntimeServices {
                         &program,
                         &results,
                         match &envelope.action {
-                            AgentAction::ObjectiveReview(input) => Some(input.criterion_ref.as_str()),
+                            AgentAction::ObjectiveReview(input) => {
+                                Some(input.criterion_ref.as_str())
+                            }
                             _ => None,
                         },
                         match &envelope.action {

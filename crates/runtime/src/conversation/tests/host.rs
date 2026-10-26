@@ -726,9 +726,11 @@ async fn n1_host_attachment_recovers_original_graph_without_registering_replacem
     let graph = n1_host_admission_graph("original Host graph");
     let id = graph.id.clone();
     let (registered, recovering) =
-        super::attach_conversation_graph(&services, graph, None, true, || installed.set(true))
-            .await
-            .unwrap();
+        super::attach_conversation_graph(&services, graph, None, None, true, || {
+            installed.set(true)
+        })
+        .await
+        .unwrap();
     assert!(!recovering);
     assert!(installed.get());
     assert_eq!(registered.id, id);
@@ -737,9 +739,11 @@ async fn n1_host_attachment_recovers_original_graph_without_registering_replacem
     proposed.objective = "replacement must not overwrite durable work".into();
     installed.set(false);
     let (recovered, recovering) =
-        super::attach_conversation_graph(&services, proposed, None, true, || installed.set(true))
-            .await
-            .unwrap();
+        super::attach_conversation_graph(&services, proposed, None, None, true, || {
+            installed.set(true)
+        })
+        .await
+        .unwrap();
     assert!(recovering);
     assert!(installed.get());
     assert_eq!(recovered.id, id);
@@ -790,7 +794,7 @@ async fn n1_host_attachment_rejects_actual_corrupt_read_before_resolver_or_regis
         Err(crate::execution_core::graph::ExecutionStateStoreError::Corrupt { .. })
     ));
     let before = services.event_store().durable_commit_cursor().unwrap();
-    let result = super::attach_conversation_graph(&services, graph, None, true, || {
+    let result = super::attach_conversation_graph(&services, graph, None, None, true, || {
         panic!("a failed source read must not install resolvers or register a graph")
     })
     .await;
@@ -810,6 +814,7 @@ async fn n1_host_attachment_rejects_foreign_root_before_recovery_mutation() {
         &services,
         n1_host_admission_graph("bound original root"),
         None,
+        None,
         true,
         || {},
     )
@@ -818,7 +823,7 @@ async fn n1_host_attachment_rejects_foreign_root_before_recovery_mutation() {
     let before = services.event_store().durable_commit_cursor().unwrap();
     let mut foreign = registered.clone();
     foreign.lineage.as_mut().unwrap().session_id = "another-session".into();
-    let result = super::attach_conversation_graph(&services, foreign, None, true, || {
+    let result = super::attach_conversation_graph(&services, foreign, None, None, true, || {
         panic!("foreign root identity must be rejected before resolver installation or recovery")
     })
     .await;

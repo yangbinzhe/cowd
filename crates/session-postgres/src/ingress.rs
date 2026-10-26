@@ -1,6 +1,24 @@
 //! Ingress operations for the PostgresSessionStore adapter.
 
 use super::*;
+use harness_contract::input_disposition::InputApplicationState;
+
+// Read projection of the original receipt state. Both required discovery and
+// cursor pages use this predicate; it grants no replay/application authority.
+pub(super) const APPLICATION_PENDING_SQL: &str = "application.application_receipt_json IS NOT NULL AND (
+    (application.application_receipt_json::jsonb->>'state' = 'prepared' AND application.status <> 'cancelled')
+    OR application.application_receipt_json::jsonb->>'state' = 'materializing'
+    OR application.application_receipt_json::jsonb->'cancellation'->>'state' = 'requested'
+    OR (application.application_receipt_json::jsonb->>'state' = 'applied'
+        AND application.application_receipt_json::jsonb->'prepared_application' IS NOT NULL
+        AND application.application_receipt_json::jsonb->'prepared_application' <> 'null'::jsonb
+        AND EXISTS (SELECT 1 FROM session_runtime_outbox AS original_root
+            WHERE original_root.session_id=application.session_id
+              AND original_root.session_generation=application.session_generation
+              AND original_root.turn_id=application.application_receipt_json::jsonb->'prepared_application'->>'turn_id'
+              AND original_root.decision IN ('start_new_turn','interrupt_and_replan')
+              AND original_root.status NOT IN ('rejected_duplicate','rejected_policy','completed','supplemented','failed','cancelled','expired')))
+)";
 
 impl PostgresSessionStore {
     pub fn append_message_with_runtime_outbox(
@@ -859,21 +877,173 @@ impl PostgresSessionStore {
         reason: &str,
         now_ms: u64,
     ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
-        if actor.trim().is_empty() || reason.trim().is_empty() {
+        if actor.trim().is_empty()
+            || actor.len() > 2048
+            || reason.trim().is_empty()
+            || reason.len() > 4096
+        {
             return Err(session::SessionError::Store(
                 "session input cancellation requires actor and reason".to_string(),
             ));
         }
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
-        let current = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+        // Discovery takes no row lock. Lock the entire discovered application in
+        // the same order as receipt commits, then authenticate discovery again.
+        let discovered: Option<String> = transaction
+            .query_opt(
+                "SELECT application_receipt_json FROM session_runtime_outbox WHERE input_id=$1",
+                &[&input_id],
+            )
+            .map_err(postgres_error)?
+            .ok_or_else(|| {
+                session::SessionError::Store(format!("session input `{input_id}` not found"))
+            })?
+            .get(0);
+        let discovered: Option<
+            harness_contract::input_disposition::SessionInputApplicationReceipt,
+        > = discovered
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|e| session::SessionError::Store(e.to_string()))
+            })
+            .transpose()?;
+        let mut ids = discovered
+            .as_ref()
+            .map_or_else(|| vec![input_id.to_string()], |r| r.input_ids.clone());
+        ids.sort();
+        if ids.is_empty()
+            || !ids.iter().any(|id| id == input_id)
+            || ids.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(session::SessionError::InvalidArgument(
+                "invalid application cancellation input set".into(),
+            ));
+        }
+        let mut locked = Vec::with_capacity(ids.len());
+        for id in &ids {
+            locked.push(runtime_outbox_by_input_id_for_update(&mut transaction, id)?);
+        }
+        let current = locked
+            .iter()
+            .find(|row| row.input_id == input_id)
+            .expect("locked requested input")
+            .clone();
         if current.session_generation != session_generation
             || current.revision != expected_revision
-            || current.status.is_terminal()
+            || locked.iter().any(|row| {
+                row.session_id != current.session_id
+                    || row.session_generation != session_generation
+                    || row.application_receipt != discovered
+            })
         {
+            return Err(session::SessionError::StaleExecutionFence(format!(
+                "session input `{input_id}` application changed during cancellation"
+            )));
+        }
+        if let Some(mut receipt) = discovered.filter(|receipt| {
+            matches!(
+                receipt.state,
+                harness_contract::input_disposition::InputApplicationState::Materializing
+                    | harness_contract::input_disposition::InputApplicationState::Applied
+            )
+        }) {
+            use harness_contract::input_disposition::{
+                InputApplicationCancellation, InputApplicationCancellationState,
+            };
+            if receipt.cancellation.is_none() {
+                receipt.cancellation = Some(InputApplicationCancellation {
+                    actor: actor.to_string(),
+                    reason: reason.to_string(),
+                    requested_at_ms: now_ms,
+                    state: InputApplicationCancellationState::Requested,
+                    settlement_ref: None,
+                });
+                receipt.revision = receipt.revision.checked_add(1).ok_or_else(|| {
+                    session::SessionError::InvalidArgument("application revision overflow".into())
+                })?;
+                receipt.updated_at_ms = now_ms;
+                // Old receipts remain readable; a cancellation cannot create new
+                // business authority or rewrite the immutable prepared artifact.
+                let json = serde_json::to_string(&receipt)
+                    .map_err(|e| session::SessionError::Store(e.to_string()))?;
+                for before in &locked {
+                    let changed = transaction
+                        .execute(
+                            "UPDATE session_runtime_outbox SET application_receipt_json=$1,
+                            updated_at_ms=$2,revision=revision+1 WHERE input_id=$3 AND revision=$4",
+                            &[
+                                &json,
+                                &to_u64_i64(now_ms, "runtime clock")?,
+                                &before.input_id,
+                                &to_u64_i64(before.revision, "runtime revision")?,
+                            ],
+                        )
+                        .map_err(postgres_error)?;
+                    if changed != 1 {
+                        return Err(session::SessionError::StaleExecutionFence(
+                            "application cancellation changed under lock".into(),
+                        ));
+                    }
+                }
+            }
+            let updated = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+            transaction.commit().map_err(postgres_error)?;
+            return Ok(updated);
+        }
+        let cancellable_prepared = current.application_receipt.as_ref().is_some_and(|r| {
+            r.state == harness_contract::input_disposition::InputApplicationState::Prepared
+        }) && matches!(
+            current.status,
+            SessionRuntimeInputStatus::Completed | SessionRuntimeInputStatus::Supplemented
+        );
+        if current.status.is_terminal() && !cancellable_prepared {
             return Err(session::SessionError::Store(format!(
                 "session input `{input_id}` cannot be cancelled at generation {session_generation} revision {expected_revision}"
             )));
+        }
+        // Prepared has not won the application reservation. Cancel and its
+        // Failed application fact commit under the same original group locks.
+        // This does not infer anything about a Materializing/Applied attempt.
+        let cancelled_receipt_json = current
+            .application_receipt
+            .as_ref()
+            .filter(|receipt| {
+                receipt.state
+                    == harness_contract::input_disposition::InputApplicationState::Prepared
+            })
+            .map(|receipt| {
+                let mut failed = receipt.clone();
+                failed.state = harness_contract::input_disposition::InputApplicationState::Failed;
+                failed.error = Some("input_cancelled_before_application_reservation".into());
+                failed.revision = failed.revision.checked_add(1).ok_or_else(|| {
+                    session::SessionError::InvalidArgument("application revision overflow".into())
+                })?;
+                failed.updated_at_ms = now_ms;
+                serde_json::to_string(&failed)
+                    .map_err(|e| session::SessionError::Store(e.to_string()))
+            })
+            .transpose()?;
+        if let Some(json) = &cancelled_receipt_json {
+            for peer in locked.iter().filter(|row| row.input_id != input_id) {
+                let changed = transaction
+                    .execute(
+                        "UPDATE session_runtime_outbox SET application_receipt_json=$1,
+                        updated_at_ms=$2,revision=revision+1 WHERE input_id=$3 AND revision=$4",
+                        &[
+                            json,
+                            &to_u64_i64(now_ms, "runtime clock")?,
+                            &peer.input_id,
+                            &to_u64_i64(peer.revision, "runtime revision")?,
+                        ],
+                    )
+                    .map_err(postgres_error)?;
+                if changed != 1 {
+                    return Err(session::SessionError::StaleExecutionFence(
+                        "prepared application group changed during cancellation".into(),
+                    ));
+                }
+            }
         }
         let changed = transaction
             .execute(
@@ -881,15 +1051,19 @@ impl PostgresSessionStore {
                 SET status='cancelled',claim_owner=NULL,claim_token=NULL,
                     claim_fence_epoch=NULL,
                     claim_expires_at_ms=NULL,last_error=$1,terminal_at_ms=$2,
+                    application_receipt_json=COALESCE($7,application_receipt_json),
                     updated_at_ms=$2,revision=revision+1
               WHERE input_id=$3 AND session_generation=$4 AND revision=$5
-                AND status NOT IN ('rejected_duplicate','rejected_policy','completed','supplemented','failed','cancelled','expired')",
+                AND (status NOT IN ('rejected_duplicate','rejected_policy','completed','supplemented','failed','cancelled','expired')
+                     OR ($6 AND status IN ('completed','supplemented')))",
                 &[
                     &reason,
                     &to_u64_i64(now_ms, "runtime clock")?,
                     &input_id,
                     &to_u64_i64(session_generation, "session generation")?,
                     &to_u64_i64(expected_revision, "runtime revision")?,
+                    &cancellable_prepared,
+                    &cancelled_receipt_json,
                 ],
             )
             .map_err(postgres_error)?;
@@ -1063,13 +1237,51 @@ impl PostgresSessionStore {
         }
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
-        let mut current = Vec::with_capacity(input_ids.len());
-        for (input_id, expected_revision) in input_ids.iter().zip(expected_revisions) {
+        let expected = input_ids
+            .iter()
+            .zip(expected_revisions)
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut locked = std::collections::BTreeMap::new();
+        for (input_id, expected_revision) in expected {
             let record = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+            if matches!(
+                receipt.state,
+                InputApplicationState::Prepared | InputApplicationState::Materializing
+            ) {
+                require_input_admission_tx(
+                    &mut transaction,
+                    &record.session_id,
+                    record.session_generation,
+                )?;
+            }
             if record.revision != *expected_revision {
                 return Err(session::SessionError::StaleExecutionFence(format!(
                     "session input `{input_id}` revision {} does not match {expected_revision}",
                     record.revision
+                )));
+            }
+            let settling_reserved_cancel = record.status == SessionRuntimeInputStatus::Cancelled
+                && matches!(receipt.action,harness_contract::input_disposition::InputDispositionAction::AmendCurrentTurn
+                    |harness_contract::input_disposition::InputDispositionAction::ProgressOrControl
+                    |harness_contract::input_disposition::InputDispositionAction::Clarify)
+                && matches!(receipt.state, InputApplicationState::Applied | InputApplicationState::Failed)
+                && record.application_receipt.as_ref().is_some_and(|previous|
+                    previous.prepared_application.is_some()
+                    && matches!(previous.state,InputApplicationState::Materializing|InputApplicationState::Applied)
+                    && previous.cancellation.is_some());
+            if (!settling_reserved_cancel
+                && matches!(
+                    record.status,
+                    SessionRuntimeInputStatus::Cancelled
+                        | SessionRuntimeInputStatus::Expired
+                        | SessionRuntimeInputStatus::RejectedDuplicate
+                        | SessionRuntimeInputStatus::RejectedPolicy
+                        | SessionRuntimeInputStatus::Failed
+                ))
+                || (record.status.is_terminal() && record.application_receipt.is_none())
+            {
+                return Err(session::SessionError::StaleExecutionFence(format!(
+                    "session input `{input_id}` terminal status forbids application"
                 )));
             }
             if !receipt.can_follow(record.application_receipt.as_ref()) {
@@ -1077,7 +1289,31 @@ impl PostgresSessionStore {
                     "application receipt transition is invalid for input `{input_id}`"
                 )));
             }
-            current.push(record);
+            if let Some(prepared) = &receipt.prepared_application {
+                if prepared.session_id != record.session_id
+                    || prepared.session_generation != record.session_generation
+                    || prepared.turn_id
+                        != record.target_turn_id.as_deref().unwrap_or(&record.turn_id)
+                {
+                    return Err(session::SessionError::StaleExecutionFence(
+                        "prepared application source target mismatch".into(),
+                    ));
+                }
+            }
+            locked.insert(input_id.clone(), record);
+        }
+        // Keep caller order for the public result, never for lock acquisition.
+        let current = input_ids
+            .iter()
+            .map(|id| locked.remove(id).expect("locked input"))
+            .collect::<Vec<_>>();
+        if current.iter().any(|row| {
+            row.application_receipt != current[0].application_receipt
+                || row.session_generation != current[0].session_generation
+        }) {
+            return Err(session::SessionError::StaleExecutionFence(
+                "application batch identity changed".into(),
+            ));
         }
         let leader = current
             .iter()
@@ -1356,6 +1592,47 @@ impl PostgresSessionStore {
             .map_err(postgres_error)?
             .map(|row| row_to_runtime_outbox(&row))
             .transpose()
+    }
+
+    pub fn pending_session_input_applications(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        after: Option<(usize, String)>,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
+        if !(1..=128).contains(&limit) {
+            return Err(session::SessionError::InvalidArgument(
+                "application page limit must be within 1..=128".into(),
+            ));
+        }
+        let (sequence, input_id) = match after {
+            Some((sequence, id)) if !id.trim().is_empty() => {
+                (to_i64(sequence, "application cursor")?, id)
+            }
+            Some(_) => {
+                return Err(session::SessionError::InvalidArgument(
+                    "application cursor requires its input identity".into(),
+                ))
+            }
+            None => (-1, String::new()),
+        };
+        self.query_runtime_outbox(
+            &format!("SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                session_generation,decision,target_turn_id,classification_json,task_route_hint_json,status,
+                runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,
+                terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
+                FROM session_runtime_outbox AS application
+                WHERE session_id=$1 AND session_generation=$2
+                  AND EXISTS (SELECT 1 FROM session_records
+                    WHERE session_id=$1 AND input_generation=$2 AND status='active')
+                  AND (sequence,input_id) > ($3,$4)
+                  AND ({APPLICATION_PENDING_SQL})
+                ORDER BY sequence ASC,input_id ASC LIMIT $5"),
+            &[&session_id, &to_u64_i64(session_generation, "application generation")?,
+              &sequence, &input_id, &to_i64(limit, "application page limit")?],
+        )
     }
 
     pub fn session_runtime_outbox_for_session(

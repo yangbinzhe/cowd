@@ -3920,6 +3920,7 @@ mod tests {
         services
             .goal_store()
             .create(GoalContract {
+                input_contract: None,
                 id: format!("goal:{execution_id}"),
                 session_id: "session-agentic-projection".to_string(),
                 objective: "Produce an evidence-backed manufacturing report".to_string(),
@@ -4702,6 +4703,7 @@ mod tests {
             services
                 .goal_store()
                 .create(GoalContract {
+                    input_contract: None,
                     id: id.clone(),
                     session_id: session_id.to_string(),
                     objective: format!("objective for {session_id}"),

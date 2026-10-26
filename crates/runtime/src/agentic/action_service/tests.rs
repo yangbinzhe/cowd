@@ -4139,6 +4139,7 @@ fn a_satisfied_review_retires_the_gap_it_was_sent_to_close() {
     // the `completion_gap` the last reopen wrote.
     goals
         .create(GoalContract {
+            input_contract: None,
             id: "goal:root-execution-1".to_string(),
             session_id: "session-1".to_string(),
             objective: "test objective".to_string(),

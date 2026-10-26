@@ -331,6 +331,14 @@ pub trait SessionRuntimeQueryPort: Send + Sync {
         input_id: &str,
     ) -> Result<Option<RuntimeSessionInputRecord>, SessionError>;
 
+    async fn pending_session_input_applications(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        after: Option<(usize, String)>,
+        limit: usize,
+    ) -> Result<Vec<RuntimeSessionInputRecord>, SessionError>;
+
     async fn input_admission(
         &self,
         session_id: &str,
@@ -350,14 +358,6 @@ pub trait SessionRuntimeApplicationPort: Send + Sync {
         &self,
         request: &RuntimeSessionTargetRequest,
     ) -> Result<RuntimeSessionTargetResolution, SessionError>;
-
-    async fn commit_input_application_receipt(
-        &self,
-        input_ids: &[String],
-        expected_revisions: &[u64],
-        receipt: &SessionInputApplicationReceipt,
-        now_ms: u64,
-    ) -> Result<Vec<RuntimeSessionInputRecord>, SessionError>;
 }
 
 #[async_trait]
@@ -418,6 +418,14 @@ impl RuntimeSessionClaimEventAppend {
 
 #[async_trait]
 pub trait SessionRuntimeJournalPort: Send + Sync {
+    async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<RuntimeSessionInputRecord>, SessionError>;
+
     async fn authorize_requested_cancellation(
         &self,
         request: &RuntimeSessionCancellationAuthorizationRequest,
@@ -505,6 +513,19 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
             .get_session_runtime_outbox_by_input_id(input_id)
             .await
             .map(|record| record.map(to_runtime_input_record))
+    }
+
+    async fn pending_session_input_applications(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        after: Option<(usize, String)>,
+        limit: usize,
+    ) -> Result<Vec<RuntimeSessionInputRecord>, SessionError> {
+        self.store
+            .pending_session_input_applications(session_id, session_generation, after, limit)
+            .await
+            .map(|rows| rows.into_iter().map(to_runtime_input_record).collect())
     }
 
     async fn input_admission(
@@ -619,19 +640,6 @@ impl SessionRuntimeApplicationPort for TestSessionPortAdapter {
             )),
         }
     }
-
-    async fn commit_input_application_receipt(
-        &self,
-        input_ids: &[String],
-        expected_revisions: &[u64],
-        receipt: &SessionInputApplicationReceipt,
-        now_ms: u64,
-    ) -> Result<Vec<RuntimeSessionInputRecord>, SessionError> {
-        self.store
-            .set_session_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
-            .await
-            .map(|records| records.into_iter().map(to_runtime_input_record).collect())
-    }
 }
 
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -662,6 +670,19 @@ impl SessionRuntimeIngressPort for TestSessionPortAdapter {
 #[cfg(any(test, feature = "test-fixtures"))]
 #[async_trait]
 impl SessionRuntimeJournalPort for TestSessionPortAdapter {
+    async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<RuntimeSessionInputRecord>, SessionError> {
+        self.store
+            .set_session_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+            .await
+            .map(|records| records.into_iter().map(to_runtime_input_record).collect())
+    }
+
     async fn authorize_requested_cancellation(
         &self,
         request: &RuntimeSessionCancellationAuthorizationRequest,

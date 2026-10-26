@@ -61,7 +61,17 @@ pub fn applied_input_projection(
     Option<String>,
     Option<u64>,
 )> {
-    if receipt.state != InputApplicationState::Applied {
+    // A prepared user-business revision records Goal adoption; it does not
+    // reroute the input or complete its execution. In particular the initial
+    // root must keep Running and its original claim until terminal ACK.
+    if receipt.state != InputApplicationState::Applied
+        || (matches!(
+            receipt.action,
+            InputDispositionAction::AmendCurrentTurn
+                | InputDispositionAction::ProgressOrControl
+                | InputDispositionAction::Clarify
+        ) && receipt.prepared_application.is_some())
+    {
         return None;
     }
     Some(match receipt.action {

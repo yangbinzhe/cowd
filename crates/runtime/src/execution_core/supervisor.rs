@@ -932,8 +932,11 @@ impl RuntimeExecutionSupervisor {
         &self,
         graph: ExecutionGraph,
         actor: Option<harness_contract::agent_action::AgentActorBinding>,
+        source_goal_cut: Option<crate::ExpectedStreamRevision>,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
-        self.runner.register_continuation(graph, actor).await
+        self.runner
+            .register_continuation(graph, actor, source_goal_cut)
+            .await
     }
 
     pub(crate) async fn confirm_cancelled_bound_child_never_admitted(

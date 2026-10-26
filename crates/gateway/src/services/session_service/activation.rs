@@ -1224,8 +1224,63 @@ impl SessionActivationCoordinator {
                 return summary;
             }
         };
+        // A bounded first receipt page answers eligibility; it does not read
+        // transcript bodies or redeliver consumed input. The original Runtime
+        // owner subsequently consumes the same durable pages through QueryPort.
+        let application_results = stream::iter(manifests.iter().filter(|manifest| {
+            records.get(&manifest.session_id).is_some_and(|record| {
+                !is_terminal_session_status(&record.status) && !is_internal_context_record(record)
+            })
+        }))
+        .map(|manifest| async move {
+            let result = async {
+                let admission = self
+                    .repository
+                    .session_input_admission(&manifest.session_id)
+                    .await?
+                    .ok_or_else(|| {
+                        session::SessionError::Store("recovery input admission missing".into())
+                    })?;
+                let pending = self
+                    .repository
+                    .pending_session_input_applications(
+                        &manifest.session_id,
+                        admission.generation,
+                        None,
+                        1,
+                    )
+                    .await?;
+                Ok::<bool, session::SessionError>(!pending.is_empty())
+            }
+            .await;
+            (manifest.session_id.clone(), result)
+        })
+        .buffer_unordered(self.recovery.hydrate_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        let mut application_sessions = BTreeSet::new();
+        let mut application_failures = BTreeSet::new();
+        for (session_id, result) in application_results {
+            match result {
+                Ok(true) => {
+                    application_sessions.insert(session_id);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    summary.failed += 1;
+                    summary.failed_session_ids.insert(session_id.clone());
+                    summary.failures.push(format!(
+                        "{session_id}: application recovery discovery failed: {error}"
+                    ));
+                    application_failures.insert(session_id);
+                }
+            }
+        }
         let mut runtime_manifests = Vec::new();
         for manifest in &mut manifests {
+            if application_failures.contains(&manifest.session_id) {
+                continue;
+            }
             let record = match records.remove(&manifest.session_id) {
                 Some(record) => record,
                 None => {
@@ -1314,6 +1369,7 @@ impl SessionActivationCoordinator {
                 && !manifest.in_flight_turn
                 && !manifest.mission_agent_team_continuation
                 && !structured_sessions.contains(&manifest.session_id)
+                && !application_sessions.contains(&manifest.session_id)
             {
                 summary.required += 1;
                 summary.metadata_only += 1;
@@ -1352,6 +1408,7 @@ impl SessionActivationCoordinator {
             if manifest.in_flight_turn
                 || manifest.mission_agent_team_continuation
                 || structured_sessions.contains(&manifest.session_id)
+                || application_sessions.contains(&manifest.session_id)
             {
                 summary.required += 1;
                 required.push(manifest);
@@ -1401,14 +1458,25 @@ impl SessionActivationCoordinator {
             .into_iter()
             .chain(selected_attached)
             .chain(selected_recent);
+        let application_sessions = &application_sessions;
         let results = stream::iter(selected)
             .map(|manifest| async move {
                 let was_active = self.runtime.has_active_session(&manifest.session_id);
                 let request =
                     EnsureSessionRequest::new(&manifest.session_id, None, SessionSource::Internal);
-                let result = self
+                let mut result = self
                     .activate(request, SessionActivationIntent::ExistingOnly)
                     .await;
+                if result.is_ok() && application_sessions.contains(&manifest.session_id) {
+                    if let Err(error) = self
+                        .runtime
+                        .runtime_services()
+                        .recover_user_input_applications(&manifest.session_id)
+                        .await
+                    {
+                        result = Err(format!("original user-input application recovery: {error}"));
+                    }
+                }
                 (manifest.session_id, was_active, result)
             })
             .buffer_unordered(self.recovery.hydrate_concurrency)
@@ -1602,7 +1670,23 @@ mod tests {
         Arc<ActiveSessionDirectory>,
         Arc<SessionWorkingSetManager>,
     ) {
-        let store = Arc::new(crate::pg_test_support::session_store());
+        test_manager_on_store(
+            runtime_max_active_sessions,
+            manager_max_active_sessions,
+            Arc::new(crate::pg_test_support::session_store()),
+        )
+    }
+
+    fn test_manager_on_store(
+        runtime_max_active_sessions: usize,
+        manager_max_active_sessions: usize,
+        store: Arc<session::UnifiedSessionStore>,
+    ) -> (
+        Arc<SessionActivationCoordinator>,
+        Arc<session::UnifiedSessionStore>,
+        Arc<ActiveSessionDirectory>,
+        Arc<SessionWorkingSetManager>,
+    ) {
         let active = Arc::new(ActiveSessionDirectory::with_max_sessions(
             runtime_max_active_sessions,
         ));
@@ -1661,6 +1745,186 @@ mod tests {
             active,
             resource_lifecycle,
         )
+    }
+
+    #[tokio::test]
+    async fn cold_recovery_discovers_consumed_application_without_replaying_user_input() {
+        let (old, store, old_active, old_lifecycle) = test_manager(8);
+        for id in ["pending-application", "approval-only", "unrelated"] {
+            store
+                .create_session(&SessionRecord {
+                    session_id: id.into(),
+                    platform: "test".into(),
+                    chat_id: id.into(),
+                    user_id: Some("user".into()),
+                    model: Some("test-model".into()),
+                    created_at: "2026-10-26T00:00:00Z".into(),
+                    last_activity: "2026-10-26T00:00:00Z".into(),
+                    message_count: 0,
+                    reset_policy: "never".into(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    status: "active".into(),
+                })
+                .await
+                .unwrap();
+        }
+        let input = store
+            .append_ingress_with_runtime_outbox(
+                "pending-application",
+                "user",
+                Some(r#"[{"type":"text","text":"original received update"}]"#),
+                100,
+                &session::SessionRuntimeOutboxRequest {
+                    input_id: "pending-input".into(),
+                    request_id: "pending-request".into(),
+                    turn_id: "pending-turn".into(),
+                    message_id: "pending-message".into(),
+                    session_generation: 1,
+                    decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                    target_turn_id: None,
+                    classification_json: None,
+                    task_route_hint: None,
+                    created_at_ms: 100,
+                    runtime_options_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("worker", 101, 1000, 1, &[])
+            .await
+            .unwrap()
+            .remove(0);
+        let token = claimed.claim_token.as_ref().unwrap();
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &input.request_id,
+                "worker",
+                1,
+                token,
+                claimed.revision,
+                102,
+            )
+            .await
+            .unwrap();
+        let prepared = serde_json::from_value(serde_json::json!({
+            "disposition_id":"pending-disposition", "leader_input_id":"pending-input", "input_ids":["pending-input"],
+            "action":"progress_or_control", "relation":"progress", "state":"prepared",
+            "objective":"process original received update", "required":false, "attempts":1,
+            "summary":"prepared before original crash", "revision":0, "updated_at_ms":103
+        })).unwrap();
+        let prepared_row = store
+            .set_session_input_application_receipt(
+                std::slice::from_ref(&input.input_id),
+                &[running.revision],
+                &prepared,
+                103,
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        let consumed = store
+            .ack_session_runtime_outbox(
+                &input.request_id,
+                "worker",
+                1,
+                token,
+                prepared_row.revision,
+                session::SessionRuntimeInputStatus::Completed,
+                42,
+                104,
+            )
+            .await
+            .unwrap();
+        for id in ["pending-application", "approval-only"] {
+            let manifest = store
+                .set_session_recovery_signal(id, SessionRecoverySignal::PendingApproval, true, 105)
+                .await
+                .unwrap();
+            assert!(
+                !manifest.in_flight_turn,
+                "terminal Turn must not masquerade as in-flight work"
+            );
+        }
+        assert!(old_active.list().is_empty());
+        let weak_runtime = Arc::downgrade(&old.runtime.runtime_services());
+        drop(old);
+        drop(old_active);
+        drop(old_lifecycle);
+        assert!(
+            weak_runtime.upgrade().is_none(),
+            "old Runtime must be destroyed, not reused for recovery"
+        );
+        let (cold, _, active, _) = test_manager_on_store(8, 8, store.clone());
+        assert!(active.list().is_empty());
+        for id in ["pending-application", "approval-only"] {
+            let source = runtime::ApprovalSource {
+                kind: runtime::ApprovalSourceKind::Session,
+                session_id: Some(id.into()),
+                agent_id: None,
+                team_id: None,
+                mission_id: None,
+                resource_ref: None,
+                review_ref: None,
+                application: None,
+            };
+            cold.runtime
+                .runtime_services()
+                .approval_queue()
+                .submit(runtime::SubmitGlobalApprovalRequest {
+                    context: harness_contract::policy::ApprovalContext::owned(
+                        &source,
+                        "write",
+                        "workspace:approval",
+                    ),
+                    source,
+                    action: "write".into(),
+                    summary: "independent approval still pending".into(),
+                    risk: harness_contract::core::TaskRisk::High,
+                    domain: harness_contract::policy::ApprovalDomain::Execution,
+                    blocks_execution: true,
+                    evidence_refs: Vec::new(),
+                    timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+                })
+                .unwrap();
+        }
+        let summary = cold.recover_required_sessions().await;
+        assert_eq!(summary.failed, 0, "{:?}", summary.failures);
+        assert_eq!(
+            summary.recovered, 1,
+            "pending application bypasses approval-only metadata shortcut"
+        );
+        assert!(active.get("pending-application").is_some());
+        assert_eq!(
+            summary.metadata_only, 1,
+            "approval-only keeps its original metadata path"
+        );
+        assert!(active.get("approval-only").is_none());
+        assert!(active.get("unrelated").is_none());
+        assert!(cold.runtime.running_session_execution_indices().is_empty());
+        assert!(cold
+            .runtime
+            .session_input_runtime_state("pending-application")
+            .active_turn_id
+            .is_none());
+        assert_eq!(
+            store
+                .get_session_runtime_outbox_by_input_id("pending-input")
+                .await
+                .unwrap()
+                .unwrap(),
+            consumed,
+            "discovery/hydration must not consume, reclassify or dispatch the old input"
+        );
+        let again = cold.recover_required_sessions().await;
+        assert_eq!(again.failed, 0, "{:?}", again.failures);
+        assert_eq!(again.recovered, 0);
+        assert_eq!(again.already_active, 1);
+        assert_eq!(active.list().len(), 1);
+        assert!(cold.runtime.running_session_execution_indices().is_empty());
+        // This is cold discovery/carrier evidence, not Goal/attempt settlement C3/C4/C6.
     }
 
     #[tokio::test]

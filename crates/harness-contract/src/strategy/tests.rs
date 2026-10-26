@@ -197,7 +197,7 @@ fn observed_mutation_tool_batch_adds_permission_and_guardrails() {
 }
 
 #[test]
-fn parallel_read_batch_preserves_critical_risk_gates_with_execute_pattern() {
+fn parallel_read_advice_is_not_retargeted_to_satisfy_predicted_gates() {
     let mut decision = decide_strategy(
         &StrategyInput::from_prompt("审查关键架构风险").with_risk_override(TaskRisk::Critical),
     );
@@ -211,14 +211,11 @@ fn parallel_read_batch_preserves_critical_risk_gates_with_execute_pattern() {
         )
         .expect("parallel reads must preserve the admitted critical-risk gates");
 
-    assert_eq!(decision.pattern, ExecutionPattern::Execute);
+    assert_eq!(decision.pattern, ExecutionPattern::Explore);
     assert!(decision.uses_modifier(ExecutionModifier::Parallel));
-    assert!(decision.uses_gate(ExecutionPolicyGate::Risk));
-    assert!(decision.uses_gate(ExecutionPolicyGate::Approval));
-    assert!(decision
-        .reasons
-        .iter()
-        .any(|reason| reason.contains("required policy gates")));
+    assert!(decision.understanding.risk == TaskRisk::Critical);
+    // Approval and checkpoint authority is checked from each actual effect
+    // by Runtime; this planning choice grants neither.
 }
 
 fn with_proven_team_benefit(prompt: &str) -> StrategyInput {

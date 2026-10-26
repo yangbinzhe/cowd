@@ -295,7 +295,15 @@
         .graph_state_store()
         .load(&valid_parent.execution_id)
         .unwrap();
-    probe_worker.finish_readonly_control().await;
+    match delegated_case {
+        #[cfg(test)]
+        DelegatedEffectCase::GoalClosed => {
+            // The Goal-only witness uses the existing withdrawal/physical
+            // owner; the original transport replay assertion stays separate.
+            probe_worker.withdraw_and_require_retirement_709().await;
+        }
+        _ => probe_worker.finish_readonly_control().await,
+    }
     assert!(confirmed_run_exit_with_retry(
         negative_services.event_store(),
         &probe_worker.packet
@@ -855,7 +863,73 @@
     } else {
         None
     };
-    if delegated_case == DelegatedEffectCase::Withdraw {
+    #[cfg(test)]
+    if delegated_case == DelegatedEffectCase::GoalClosed {
+        use harness_contract::goal::{GoalContract, GoalCompletion, GoalExecutionBinding, AcceptanceCriterion, AcceptanceStatus};
+        let goal_id = "goal:root-agentic-execution";
+        services.goal_store().create(GoalContract {
+            input_contract: None, id: goal_id.into(), session_id: "session-dispatch".into(),
+            objective: "Fence a real delegated writer with the original Goal".into(),
+            criteria: vec![AcceptanceCriterion { id: "original-user-intent".into(), statement: "Write only while the original Goal is Open".into(),
+                statement_ref: None, source_refs: vec![], required_evidence: vec![], status: AcceptanceStatus::Open, waiver: None }],
+            constraints: vec![], phase: "execution".into(), evidence_refs: vec![], unresolved: vec![], blockers: vec![],
+            scope: Default::default(), user_intent_criterion_id: Some("original-user-intent".into()),
+            source_intent_ref: Some("session_message:dispatch".into()),
+            execution_binding: Some(GoalExecutionBinding { objective_id: fixture_objective_id.clone(),
+                session_id: "session-dispatch".into(), turn_id: "turn-dispatch".into(),
+                root_execution_id: "root-agentic-execution".into(), agentic_program_id: fixture_program_id.clone() }),
+            spec_revision: 1, spec_digest: "bound-goal-original".into(), review_refs: vec![], reviews: vec![],
+            waiting: None, participation_requirement: None, obligations: vec![], recovery: None, terminal: None,
+            completion: GoalCompletion::Open, revision: 1, user_sequence: 1,
+        }).unwrap();
+        let gate = Arc::new(ReviewWriteHold::default());
+        read_host.held_write.set(Arc::clone(&gate)).unwrap();
+        let admitted_writer = Arc::clone(writer.as_ref().unwrap());
+        let pending = tokio::spawn(async move {
+            admitted_writer.execute_tool("goal-open-admitted-write", "edit",
+                r#"{"path":"review-effect.txt","content":"an original admitted write completes after Goal closure"}"#).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified()).await.unwrap();
+        let admitted_request = read_host.calls.lock().unwrap().last().unwrap().clone();
+        let original_sources = services.commit_service().bound_tool_sources_for_test(&admitted_request).unwrap();
+        assert!(original_sources.iter().any(|cut| cut.stream_id == format!("goal:{goal_id}") && cut.expected_revision == 1),
+            "ordinary real bound writer must carry the actual root Goal cut into the original intent readset");
+        let program_before = action_service.project(fixture_program_id.as_str()).unwrap();
+        let graph_before = services.graph_state_store().load(packet.graph_id()).unwrap();
+        let calls_before = read_host.calls.lock().unwrap().len();
+        let index = format!("execution-agent-receipts:{}:{}:{}",packet.graph_id(),packet.node_id(),packet.attempt);
+        let index_before = services.event_store().stream_revision(&index).unwrap();
+        services.goal_store().revise(goal_id,1,2,"original Goal is blocked",|goal|{
+            goal.completion = GoalCompletion::Blocked; goal.blockers.push("original business stop".into()); vec!["completion".into(),"blockers".into()]
+        }).unwrap();
+        assert_eq!(action_service.project(fixture_program_id.as_str()).unwrap().revision,program_before.revision);
+        assert_eq!(services.graph_state_store().load(packet.graph_id()).unwrap().revision,graph_before.revision);
+        gate.release.notify_one();
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(10),pending).await.unwrap().unwrap();
+        assert!(settled.is_ok(),"the original already-admitted write must settle its true receipt: {settled:?}");
+        let bytes_before = std::fs::read(services.workspace_root().join("review-effect.txt")).unwrap();
+        assert_eq!(bytes_before,b"an original admitted write completes after Goal closure",
+            "the original admitted write must really land despite the later Goal change");
+        // The real Process protocol is serial. Only after the admitted call
+        // returns can it submit the next distinct Step/call. Goal stays Blocked.
+        let error = writer.as_ref().unwrap().execute_tool("goal-closed-fresh-write", "edit",
+            r#"{"path":"review-effect.txt","content":"a blocked Goal must not authorize this new write"}"#).await.unwrap_err();
+        assert!(error.contains("Goal is no longer open"),"{error}");
+        let (_,_,raced_goal_event) = services.goal_store().revision_event(goal_id,2,3,"stale captured bound source",|goal|{
+            goal.constraints.push("must never partially commit".into()); vec!["constraints".into()]
+        }).unwrap();
+        let stale = services.event_store().append_transaction(crate::AppendTransactionRequest {
+            transaction_id: "bound-goal-stale-source".into(), expected_streams: original_sources,
+            events: vec![raced_goal_event],
+        });
+        assert!(matches!(stale,Err(crate::RuntimeEventStoreError::StaleRevision { ref stream_id, expected:1,actual:2 }) if stream_id==&format!("goal:{goal_id}")),"{stale:?}");
+        assert_eq!(services.goal_store().projection(goal_id).unwrap().unwrap().stream_revision,2,
+            "stale original source must not partially publish even an original Goal event");
+        assert_eq!(read_host.calls.lock().unwrap().len(),calls_before,"fresh call must not enter ToolHost");
+        assert_eq!(std::fs::read(services.workspace_root().join("review-effect.txt")).unwrap(),bytes_before);
+        assert_eq!(services.event_store().stream_revision(&index).unwrap(),index_before+1,"only the original admitted receipt is published");
+    }
+    if matches!(delegated_case, DelegatedEffectCase::Withdraw | DelegatedEffectCase::GoalClosed) {
         let withdraw = bind_root(root(
             "withdraw-live-producer",
             AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
@@ -909,7 +983,11 @@
         assert_eq!(
             std::fs::read_to_string(services.workspace_root().join("review-effect.txt"))
                 .unwrap(),
-            delegated_write_content
+            if delegated_case == DelegatedEffectCase::GoalClosed {
+                "an original admitted write completes after Goal closure"
+            } else {
+                delegated_write_content
+            }
         );
         services
             .dispatch_agentic_followups(

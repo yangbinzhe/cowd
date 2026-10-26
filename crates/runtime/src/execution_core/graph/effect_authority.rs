@@ -94,6 +94,14 @@ impl ExecutionCommitService {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn bound_tool_sources_for_test(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+        self.tool_effect_authority(request)
+    }
+
     pub(super) fn tool_effect_authority(
         &self,
         request: &crate::RuntimeToolExecutionRequest,
@@ -292,6 +300,33 @@ impl ExecutionCommitService {
             stream_id: format!("agentic-program:{}", program.program_id),
             expected_revision: program.revision,
         });
+        if let Some(root_execution_id) = program.root_execution_id.as_deref() {
+            if root_execution_id.trim().is_empty() {
+                return Err(denied("Task Program Root execution binding is empty"));
+            }
+            let (_, goal_source) = self.fresh_root_goal_source(
+                &crate::CowdExecutionContext {
+                    execution_id: root_execution_id.to_string(),
+                    session_id: program.session_id.clone(),
+                    turn_id: program.turn_id.clone(),
+                },
+                Some(&program.program_id),
+                refused,
+            )?;
+            if let Some(previous) = sources
+                .iter()
+                .find(|source| source.stream_id == goal_source.stream_id)
+            {
+                if previous.expected_revision != goal_source.expected_revision {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "tool_effect_authority source unavailable: conflicting Goal source revisions"
+                            .into(),
+                    ));
+                }
+            } else {
+                sources.push(goal_source);
+            }
+        }
         Ok(sources)
     }
 }
@@ -642,6 +677,69 @@ mod collaboration_control_711_tests {
 }
 
 impl ExecutionCommitService {
+    /// One Goal reader for fresh Root and bound business effects. This does
+    /// not grant tool permissions and is never used for admitted settlement.
+    fn fresh_root_goal_source(
+        &self,
+        context: &crate::CowdExecutionContext,
+        expected_program: Option<&str>,
+        refused: &dyn Fn(&str),
+    ) -> Result<(String, ExpectedStreamRevision), ExecutionCommitError> {
+        let denied = |reason: &str| {
+            let message = format!("root_effect_authority: {reason}");
+            refused(&message);
+            ExecutionCommitError::InvalidCommand(message)
+        };
+        let goal_id = format!("goal:{}", context.execution_id);
+        let goal_stream = format!("goal:{goal_id}");
+        let projection = crate::execution_core::GoalStore::new(Arc::clone(&self.event_store))
+            .projection(&goal_id)
+            .map_err(|error| {
+                ExecutionCommitError::InvalidCommand(format!(
+                    "root_effect_authority source unavailable: {error}"
+                ))
+            })?;
+        let program_id = if let Some(projection) = &projection {
+            let goal = &projection.goal;
+            let binding = goal
+                .execution_binding
+                .as_ref()
+                .ok_or_else(|| denied("Goal has no immutable execution binding"))?;
+            if binding.root_execution_id != context.execution_id
+                || binding.session_id != context.session_id
+                || binding.turn_id != context.turn_id
+                || goal.completion != harness_contract::goal::GoalCompletion::Open
+                || goal.terminal.is_some()
+            {
+                return Err(denied("Goal is no longer open for this Root execution"));
+            }
+            if expected_program
+                .is_some_and(|program| program != binding.agentic_program_id.as_str())
+            {
+                return Err(denied(
+                    "Goal Program does not match the original Task Program",
+                ));
+            }
+            binding.agentic_program_id.clone()
+        } else {
+            expected_program.map(str::to_string).unwrap_or_else(|| {
+                harness_contract::agent_action::program_id_for_objective(
+                    &harness_contract::agent_action::root_objective_id(
+                        &context.session_id,
+                        &context.turn_id,
+                    ),
+                )
+            })
+        };
+        Ok((
+            program_id,
+            ExpectedStreamRevision {
+                stream_id: goal_stream,
+                expected_revision: projection.as_ref().map_or(0, |goal| goal.stream_revision),
+            },
+        ))
+    }
+
     /// Reads the original Root graph, Goal and Program. Callers may preflight
     /// with this method, but fresh effect admission also checks these revisions
     /// under ordered locks in the original intent transaction.
@@ -687,44 +785,14 @@ impl ExecutionCommitService {
         {
             return Err(denied("Root graph is not running in this Session/turn"));
         }
-        let goal_id = format!("goal:{}", context.execution_id);
-        let goal_stream = format!("goal:{goal_id}");
-        let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.event_store))
-            .projection(&goal_id)
-            .map_err(unavailable)?;
+        let (program_id, goal_source) = self.fresh_root_goal_source(context, None, refused)?;
         let mut sources = vec![
             ExpectedStreamRevision {
                 stream_id: graph.id.clone(),
                 expected_revision: graph.revision,
             },
-            ExpectedStreamRevision {
-                stream_id: goal_stream,
-                expected_revision: goal.as_ref().map_or(0, |goal| goal.stream_revision),
-            },
+            goal_source,
         ];
-        let program_id = if let Some(projection) = &goal {
-            let goal = &projection.goal;
-            let binding = goal
-                .execution_binding
-                .as_ref()
-                .ok_or_else(|| denied("Goal has no immutable execution binding"))?;
-            if binding.root_execution_id != context.execution_id
-                || binding.session_id != context.session_id
-                || binding.turn_id != context.turn_id
-                || goal.completion != harness_contract::goal::GoalCompletion::Open
-                || goal.terminal.is_some()
-            {
-                return Err(denied("Goal is no longer open for this Root execution"));
-            }
-            binding.agentic_program_id.clone()
-        } else {
-            harness_contract::agent_action::program_id_for_objective(
-                &harness_contract::agent_action::root_objective_id(
-                    &context.session_id,
-                    &context.turn_id,
-                ),
-            )
-        };
         let program = self
             .effect_authority_actions
             .project_if_exists(&program_id)
@@ -745,5 +813,122 @@ impl ExecutionCommitService {
             expected_revision: program.as_ref().map_or(0, |program| program.revision),
         });
         Ok(sources)
+    }
+}
+
+#[cfg(test)]
+mod current_bound_goal_tests {
+
+    #[tokio::test]
+    async fn rootless_original_program_claim_keeps_ordinary_authority() {
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionEnvelope, AgentActionStatus, TaskClaimInput,
+        };
+        let fixture = crate::agentic::coordination::tests::fixture_with_process_task(
+            crate::ProcessJsonlSpec::new("command:rootless-authority", "not-executed.py", vec![]),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let graph = fixture
+                    .services
+                    .graph_state_store()
+                    .load(fixture.packet.graph_id())
+                    .unwrap();
+                let status = graph.node_statuses[fixture.packet.node_id()];
+                if status == harness_contract::execution_graph::ExecutionNodeStatus::Running {
+                    break;
+                }
+                assert!(
+                    !status.is_terminal(),
+                    "original independent runner ended before claim: {status:?}"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original Runner must start the independent claimed Task");
+        let actor = crate::agentic::coordination::tests::actor(&fixture).await;
+        assert!(actor.root_execution_id.is_none());
+        let claimed = fixture
+            .services
+            .submit_agent_action(&AgentActionEnvelope {
+                action_id: "rootless-original-claim".into(),
+                actor,
+                expected_revision: None,
+                action: AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: fixture.task_ref.clone(),
+                    reason: None,
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(claimed.status, AgentActionStatus::Applied, "{claimed:?}");
+        let program = fixture
+            .services
+            .agent_action_service()
+            .project("coord-program")
+            .unwrap();
+        assert!(
+            program.root_execution_id.is_none(),
+            "original ingress creates the independent domain"
+        );
+        assert_eq!(
+            program.tasks[&fixture.task_ref]
+                .claim_execution_id
+                .as_deref(),
+            Some(fixture.packet.graph_id())
+        );
+        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: "rootless-source-reader".into(),
+                tool_name: "edit".into(),
+                depends_on: vec![],
+                input: r#"{"path":"proof.txt","content":"not dispatched"}"#.into(),
+            },
+        );
+        request.session_id = Some(fixture.packet.session_id().into());
+        request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: fixture.packet.graph_id().into(),
+                node_id: fixture.packet.node_id().into(),
+            });
+        request.parent_execution_attempt = Some(fixture.packet.attempt);
+        let sources = fixture
+            .services
+            .commit_service()
+            .tool_effect_authority(&request)
+            .unwrap();
+        assert_eq!(
+            sources.len(),
+            2,
+            "only the actual Graph and original independent Program; no fabricated root"
+        );
+        assert!(sources
+            .iter()
+            .any(|cut| cut.stream_id == fixture.packet.graph_id()));
+        assert!(sources
+            .iter()
+            .any(|cut| cut.stream_id == "agentic-program:coord-program"
+                && cut.expected_revision == program.revision));
+        request.parent_execution_attempt = Some(fixture.packet.attempt + 1);
+        assert!(fixture
+            .services
+            .commit_service()
+            .tool_effect_authority(&request)
+            .is_err());
+        request.parent_execution_attempt = Some(fixture.packet.attempt);
+        request.session_id = Some("foreign".into());
+        assert!(fixture
+            .services
+            .commit_service()
+            .tool_effect_authority(&request)
+            .is_err());
+        assert!(
+            !fixture.workspace.path().join("proof.txt").exists(),
+            "reader is not a ToolHost execution"
+        );
+        fixture.services.shutdown_maintenance().await;
+        fixture.services.shutdown_execution().await;
     }
 }

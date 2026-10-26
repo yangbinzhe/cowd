@@ -92,6 +92,15 @@ impl<'a> ExecutionGraphRecovery<'a> {
                                 self.registry,
                             )
                             .await?
+                            && !self
+                                .commit_service
+                                .recover_running_known_outcome(
+                                    &graph,
+                                    &node_id,
+                                    &binding,
+                                    self.registry,
+                                )
+                                .await?
                         {
                             return Err(ExecutionRecoveryError::LeaseReconciliation(format!(
                                 "{graph_id}/{node_id}/{}: original outcome is not durably committed; provider/Host state unknown; no reexecute or Ready admission",

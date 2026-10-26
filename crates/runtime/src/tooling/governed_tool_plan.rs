@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
+#[cfg(test)]
 use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
 #[cfg(test)]
 use harness_contract::policy::PermissionScope;
@@ -19,7 +20,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::execution_core::{RuntimeCompileTarget, RuntimeExecutionDecision};
+#[cfg(test)]
+use crate::execution_core::RuntimeCompileTarget;
+use crate::execution_core::RuntimeExecutionDecision;
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::ToolSafetyCategory;
 use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef};
@@ -809,84 +812,45 @@ impl ValidatedGovernedToolDag {
         }
     }
 
+    /// Prepare concrete-effect safeguards. The decision supplies only the
+    /// trace lease: predicted topology, confidence, risk and modifiers neither
+    /// authorize nor refuse a tool. Each invocation still needs its original
+    /// current-policy authorization and resource admission at dispatch.
     #[must_use]
     pub fn validate_against_execution_decision(
         &self,
         decision: &RuntimeExecutionDecision,
     ) -> GovernedToolPolicyValidationReport {
-        let mut findings = Vec::new();
-        if !decision.executable {
-            findings.push("execution_decision_not_executable".to_string());
-            return GovernedToolPolicyValidationReport {
-                allowed: false,
-                findings,
-                lease_id: decision.lease.lease_id.clone(),
-                requires_approval: false,
-                requires_checkpoint: false,
-                checkpoint_created: false,
-            };
-        }
+        use harness_contract::tool::ToolApprovalClass;
 
-        let governed_tasks = self
+        let mut findings = Vec::new();
+        let mut requires_approval = false;
+        let mut requires_checkpoint = false;
+        for task in self
             .tasks
             .iter()
             .filter(|task| !uses_inner_runtime_validator(&task.tool_name))
-            .collect::<Vec<_>>();
-        let has_network = governed_tasks
-            .iter()
-            .any(|task| task.safety_category == ToolSafetyCategory::Network);
-        let has_mutation = governed_tasks.iter().any(|task| is_mutation(task));
-        let high_or_critical = matches!(decision.risk(), TaskRisk::High | TaskRisk::Critical);
-        let requires_approval =
-            has_mutation && decision.gates().contains(&ExecutionPolicyGate::Approval);
-        let requires_checkpoint = has_mutation
-            && high_or_critical
-            && decision
-                .modifiers()
-                .contains(&ExecutionModifier::WithCheckpoint);
-
-        if governed_tasks.iter().any(|task| {
-            !compile_target_allows_category(decision.compile_target, task.safety_category)
-        }) {
-            push_finding(&mut findings, "tool_category_not_allowed_by_compile_target");
-        }
-
-        if has_network
-            && !decision
-                .modifiers()
-                .contains(&ExecutionModifier::WithExternalResearch)
         {
-            push_finding(&mut findings, "network_requires_with_external_research");
+            let effect = &task.invocation.effect;
+            if task.effect != *effect {
+                push_finding(&mut findings, "prepared_effect_identity_mismatch");
+            }
+            // Unknown effects remain conservative. A favourable strategy can
+            // never turn them into reads or suppress an actual approval.
+            requires_approval |= effect.approval_class != ToolApprovalClass::None
+                || effect.effect_kind == ToolEffectKind::Unknown;
+            requires_checkpoint |= matches!(
+                effect.effect_kind,
+                ToolEffectKind::Write
+                    | ToolEffectKind::Process
+                    | ToolEffectKind::Package
+                    | ToolEffectKind::System
+                    | ToolEffectKind::Destructive
+                    | ToolEffectKind::Unknown
+            ) || effect.spawns_process
+                || effect.mutates_packages
+                || effect.mutates_system;
         }
-
-        if decision.compile_target == RuntimeCompileTarget::ExecutionGraph && has_mutation {
-            if !decision.gates().contains(&ExecutionPolicyGate::Permission) {
-                push_finding(&mut findings, "mutation_requires_permission_gate");
-            }
-            if !decision
-                .modifiers()
-                .contains(&ExecutionModifier::WithGuardrails)
-            {
-                push_finding(&mut findings, "mutation_requires_with_guardrails");
-            }
-
-            if high_or_critical && !decision.gates().contains(&ExecutionPolicyGate::Risk) {
-                push_finding(&mut findings, "high_risk_mutation_requires_risk_gate");
-            }
-            if decision.risk() == TaskRisk::Critical
-                && !decision.gates().contains(&ExecutionPolicyGate::Approval)
-            {
-                push_finding(&mut findings, "critical_mutation_requires_approval");
-            }
-            if high_or_critical
-                && !decision
-                    .modifiers()
-                    .contains(&ExecutionModifier::WithCheckpoint)
-            {
-                push_finding(&mut findings, "high_risk_mutation_requires_with_checkpoint");
-            }
-        }
-
         GovernedToolPolicyValidationReport {
             allowed: findings.is_empty(),
             findings,
@@ -936,27 +900,6 @@ impl ValidatedGovernedToolDag {
             .collect();
         event
     }
-}
-
-fn compile_target_allows_category(
-    compile_target: RuntimeCompileTarget,
-    category: ToolSafetyCategory,
-) -> bool {
-    match compile_target {
-        RuntimeCompileTarget::InlineModel => category == ToolSafetyCategory::ReadOnly,
-        RuntimeCompileTarget::EvidenceGraph => matches!(
-            category,
-            ToolSafetyCategory::ReadOnly | ToolSafetyCategory::Network
-        ),
-        RuntimeCompileTarget::ExecutionGraph => true,
-    }
-}
-
-fn is_mutation(task: &GovernedToolPlanTask) -> bool {
-    matches!(
-        task.safety_category,
-        ToolSafetyCategory::WriteLocal | ToolSafetyCategory::Destructive
-    )
 }
 
 fn uses_inner_runtime_validator(tool_name: &str) -> bool {
@@ -2571,178 +2514,83 @@ mod tests {
     }
 
     #[test]
-    fn compile_targets_enforce_normal_tool_categories() {
-        let read_plan =
-            GovernedToolPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
-        let network_plan =
-            GovernedToolPlan::from_requests(&[request("network-1", "web_search", Vec::new())]);
-        let write_plan = GovernedToolPlan::from_requests(&[request_with_input(
-            "write-1",
-            "edit",
-            r#"{"path":"src/lib.rs","content":"x"}"#,
-            Vec::new(),
-        )]);
-
-        let inline = execution_decision(
+    fn prediction_cannot_refuse_concrete_read_network_or_write_effects() {
+        let plans = [
+            GovernedToolPlan::from_requests(&[request("read", "read_file", Vec::new())]),
+            GovernedToolPlan::from_requests(&[request("network", "web_search", Vec::new())]),
+            GovernedToolPlan::from_requests(&[request_with_input(
+                "write",
+                "edit",
+                r#"{"path":"src/lib.rs","content":"x"}"#,
+                Vec::new(),
+            )]),
+        ];
+        for target in [
             RuntimeCompileTarget::InlineModel,
-            TaskRisk::Low,
-            &[ExecutionModifier::WithExternalResearch],
-            &[],
-        );
-        assert!(
-            read_plan
-                .validate_against_execution_decision(&inline)
-                .allowed
-        );
-        assert_eq!(
-            network_plan
-                .validate_against_execution_decision(&inline)
-                .findings,
-            vec!["tool_category_not_allowed_by_compile_target"]
-        );
-
-        let evidence = execution_decision(
             RuntimeCompileTarget::EvidenceGraph,
-            TaskRisk::Low,
-            &[ExecutionModifier::WithExternalResearch],
-            &[],
-        );
-        assert!(
-            read_plan
-                .validate_against_execution_decision(&evidence)
-                .allowed
-        );
-        assert!(
-            network_plan
-                .validate_against_execution_decision(&evidence)
-                .allowed
-        );
-        assert_eq!(
-            write_plan
-                .validate_against_execution_decision(&evidence)
-                .findings,
-            vec!["tool_category_not_allowed_by_compile_target"]
-        );
-
-        let execution = execution_decision(
             RuntimeCompileTarget::ExecutionGraph,
-            TaskRisk::Medium,
-            &[ExecutionModifier::WithGuardrails],
-            &[ExecutionPolicyGate::Permission],
-        );
-        assert!(
-            write_plan
-                .validate_against_execution_decision(&execution)
-                .allowed
-        );
-        let approved_delivery = execution_decision(
-            RuntimeCompileTarget::ExecutionGraph,
-            TaskRisk::Medium,
-            &[ExecutionModifier::WithGuardrails],
-            &[
-                ExecutionPolicyGate::Permission,
-                ExecutionPolicyGate::Approval,
-            ],
-        );
-        let approved_delivery_report =
-            write_plan.validate_against_execution_decision(&approved_delivery);
-        assert!(approved_delivery_report.allowed);
-        assert!(approved_delivery_report.requires_approval);
+        ] {
+            for risk in [TaskRisk::Low, TaskRisk::Critical] {
+                let mut decision = execution_decision(target, risk, &[], &[]);
+                decision.executable = false;
+                for plan in &plans {
+                    let report = plan.validate_against_execution_decision(&decision);
+                    assert!(report.allowed, "{report:?}");
+                    assert!(report.findings.is_empty());
+                    assert_eq!(report.lease_id, "lease-test");
+                }
+                assert!(
+                    !plans[0]
+                        .validate_against_execution_decision(&decision)
+                        .requires_checkpoint
+                );
+                assert!(
+                    plans[2]
+                        .validate_against_execution_decision(&decision)
+                        .requires_checkpoint
+                );
+            }
+        }
     }
 
     #[test]
-    fn execution_graph_mutation_requires_typed_gates_and_modifiers() {
-        let plan = GovernedToolPlan::from_requests(&[request_with_input(
-            "write-1",
-            "edit",
-            r#"{"path":"src/lib.rs","content":"x"}"#,
-            Vec::new(),
-        )]);
-
-        let medium = execution_decision(
-            RuntimeCompileTarget::ExecutionGraph,
-            TaskRisk::Medium,
-            &[],
-            &[],
-        );
-        assert_eq!(
-            plan.validate_against_execution_decision(&medium).findings,
-            vec![
-                "mutation_requires_permission_gate",
-                "mutation_requires_with_guardrails",
-            ]
-        );
-
-        let high = execution_decision(
-            RuntimeCompileTarget::ExecutionGraph,
-            TaskRisk::High,
-            &[ExecutionModifier::WithGuardrails],
-            &[ExecutionPolicyGate::Permission],
-        );
-        assert_eq!(
-            plan.validate_against_execution_decision(&high).findings,
-            vec![
-                "high_risk_mutation_requires_risk_gate",
-                "high_risk_mutation_requires_with_checkpoint",
-            ]
-        );
-
-        let critical = execution_decision(
-            RuntimeCompileTarget::ExecutionGraph,
-            TaskRisk::Critical,
-            &[
-                ExecutionModifier::WithGuardrails,
-                ExecutionModifier::WithCheckpoint,
-            ],
-            &[ExecutionPolicyGate::Permission, ExecutionPolicyGate::Risk],
-        );
-        assert_eq!(
-            plan.validate_against_execution_decision(&critical).findings,
-            vec!["critical_mutation_requires_approval"]
-        );
-
-        let fully_gated = execution_decision(
-            RuntimeCompileTarget::ExecutionGraph,
-            TaskRisk::Critical,
-            &[
-                ExecutionModifier::WithGuardrails,
-                ExecutionModifier::WithCheckpoint,
-            ],
-            &[
-                ExecutionPolicyGate::Permission,
-                ExecutionPolicyGate::Risk,
-                ExecutionPolicyGate::Approval,
-            ],
-        );
-        assert!(
-            plan.validate_against_execution_decision(&fully_gated)
-                .allowed
-        );
-    }
-
-    #[test]
-    fn network_tools_require_external_research_modifier() {
-        let plan =
-            GovernedToolPlan::from_requests(&[request("network-1", "web_search", Vec::new())]);
-        let without_research =
-            execution_decision(RuntimeCompileTarget::EvidenceGraph, TaskRisk::Low, &[], &[]);
-
-        assert_eq!(
-            plan.validate_against_execution_decision(&without_research)
-                .findings,
-            vec!["network_requires_with_external_research"]
-        );
-
-        let with_research = execution_decision(
-            RuntimeCompileTarget::EvidenceGraph,
-            TaskRisk::Low,
-            &[ExecutionModifier::WithExternalResearch],
-            &[],
-        );
-        assert!(
-            plan.validate_against_execution_decision(&with_research)
-                .allowed
-        );
+    fn concrete_unknown_and_destructive_effects_keep_safeguards_without_strategy_gates() {
+        for kind in [
+            ToolEffectKind::Unknown,
+            ToolEffectKind::Destructive,
+            ToolEffectKind::Process,
+        ] {
+            let compiled = GovernedToolCompiler.compile(
+                &std::env::current_dir().unwrap(),
+                &[request("effect", "registered-effect", Vec::new())],
+                |name, input| {
+                    let mut effect = fixture_effect(name, input);
+                    effect.effect_kind = kind;
+                    effect.approval_class = harness_contract::tool::ToolApprovalClass::User;
+                    Some((effect, 1, "registered-set".to_string()))
+                },
+            );
+            if kind == ToolEffectKind::Unknown {
+                assert!(
+                    matches!(compiled, Err(GovernedToolCompileError::InvalidNormalizedScope { ref scope, .. }) if scope == "unknown")
+                );
+                continue;
+            }
+            let plan = compiled.unwrap();
+            let decision =
+                execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
+            let report = plan.validate_against_execution_decision(&decision);
+            assert!(report.allowed);
+            assert!(report.requires_checkpoint);
+            assert!(report.requires_approval);
+            // Preparing safeguards is not a fabricated checkpoint or grant.
+            assert!(!report.checkpoint_created);
+            let mut corrupt = plan.clone();
+            corrupt.tasks[0].effect.effect_kind = ToolEffectKind::Read;
+            let refused = corrupt.validate_against_execution_decision(&decision);
+            assert!(!refused.allowed);
+            assert_eq!(refused.findings, ["prepared_effect_identity_mismatch"]);
+        }
     }
 
     #[test]
@@ -2814,11 +2662,10 @@ mod tests {
             &[],
             &[],
         );
-        assert!(
-            !plan
-                .validate_against_execution_decision(&evidence_only)
-                .allowed
-        );
+        let evidence_report = plan.validate_against_execution_decision(&evidence_only);
+        assert!(evidence_report.allowed);
+        assert!(evidence_report.requires_approval);
+        assert!(evidence_report.requires_checkpoint);
 
         let approved_delivery = execution_decision(
             RuntimeCompileTarget::ExecutionGraph,
@@ -2939,20 +2786,15 @@ mod tests {
     }
 
     #[test]
-    fn non_executable_decision_is_rejected_with_serializable_lease_report() {
+    fn speculative_non_executable_decision_does_not_deny_an_authorizable_read() {
         let plan = GovernedToolPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
         let mut decision =
             execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
         decision.executable = false;
-
         let report = plan.validate_against_execution_decision(&decision);
-        let wire = serde_json::to_value(&report).expect("validation report serializes");
-
-        assert!(!report.allowed);
-        assert_eq!(report.findings, vec!["execution_decision_not_executable"]);
-        assert_eq!(report.lease_id, "lease-test");
-        assert_eq!(wire["allowed"], false);
-        assert_eq!(wire["findings"][0], "execution_decision_not_executable");
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(wire["allowed"], true);
+        assert_eq!(wire["findings"], serde_json::json!([]));
         assert_eq!(wire["lease_id"], "lease-test");
     }
 

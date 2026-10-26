@@ -2,6 +2,618 @@
 
 use super::*;
 
+use crate::execution_core::goal::{
+    finish_user_goal_application, read_user_goal_application, user_application_clock,
+    user_goal_application_committed, user_goal_application_committed_sources, GoalWriteCheckpoint,
+    GoalWriteDisposition, PreparedUserGoalApplication,
+};
+
+impl<C: ApiClient + Send + Sync + 'static, T: ToolExecutor> TurnModelStepBackend<C, T> {
+    async fn resume_user_input_application(
+        &self,
+        ticket: &NodeExecutionTicket,
+        known_only: bool,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        use harness_contract::input_disposition::InputApplicationState;
+        let fail = |reason: String| NodeExecutorError::Recover {
+            node_id: ticket.node_id.clone(),
+            reason,
+        };
+        let (session, turn, owns_root) = {
+            let state = self.state.lock().await;
+            (
+                state.session_id.clone(),
+                state.turn_id.clone(),
+                state.execution_role.owns_root_presentation(),
+            )
+        };
+        if !owns_root {
+            return Ok(None);
+        }
+        let Some(query) = self.services.session_query_port() else {
+            return Ok(None);
+        };
+        let Some(admission) = query
+            .input_admission(&session)
+            .await
+            .map_err(|e| fail(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut after = None;
+        loop {
+            let page = query
+                .pending_session_input_applications(
+                    &session,
+                    admission.generation,
+                    after.clone(),
+                    32,
+                )
+                .await
+                .map_err(|e| fail(e.to_string()))?;
+            if page.is_empty() {
+                return Ok(None);
+            }
+            for row in &page {
+                let Some(receipt) = row.application_receipt.as_ref() else {
+                    continue;
+                };
+                let Some(identity) = receipt.prepared_application.as_ref() else {
+                    continue;
+                };
+                if identity.graph_id != ticket.graph_id
+                    || identity.turn_id != turn
+                    || identity.node_id != ticket.node_id
+                {
+                    continue;
+                }
+                let prepared = read_user_goal_application(self.services.as_ref(), receipt)
+                    .await
+                    .map_err(fail)?;
+                if prepared.ticket != *ticket {
+                    return Err(fail(
+                        "prepared user input cannot borrow another original attempt".into(),
+                    ));
+                }
+                let committed_sources = user_goal_application_committed_sources(
+                    self.services.as_ref(),
+                    &prepared,
+                    &identity.artifact_ref,
+                )
+                .map_err(fail)?;
+                let applied = committed_sources.is_some();
+                if known_only && (!applied || receipt.cancellation.is_some()) {
+                    return Ok(None);
+                }
+                if applied && !known_only {
+                    finish_user_goal_application(self.services.as_ref(), &prepared)
+                        .await
+                        .map_err(fail)?;
+                }
+                if receipt.cancellation.is_some() {
+                    // The original settled lane owns physical closure and final
+                    // cancellation receipt. Do not wait for this node's own exit.
+                    self.services
+                        .cancel_execution_tree(
+                            &ticket.graph_id,
+                            "durable user input cancellation recovered",
+                        )
+                        .await
+                        .map_err(|e| fail(e.to_string()))?;
+                    self.services.notify_agentic_followups();
+                    return Err(fail("user input cancellation is requested; original physical settlement remains pending".into()));
+                }
+                let current = self
+                    .services
+                    .graph_state_store()
+                    .load(&ticket.graph_id)
+                    .map_err(|e| fail(e.to_string()))?;
+                let original_result = current
+                    .node_results
+                    .get(&prepared.ticket.node_id)
+                    .and_then(|r| r.result_ref.as_deref());
+                if applied
+                    && original_result
+                        == Some(
+                            format!("user_input_application:{}", identity.artifact_ref).as_str(),
+                        )
+                {
+                    continue;
+                }
+                let mut outcome = NodeExecutionOutcome::new(completed_result(
+                    Some(format!("user_input_application:{}", identity.artifact_ref)),
+                    prepared.usage.clone(),
+                ));
+                outcome.result.finished_at_ms = prepared.finished_at_ms;
+                outcome.replan = Some(prepared.continuation.clone());
+                // A committed Goal fact is not authority to rebase the original
+                // Graph outcome onto a newer graph cut.
+                outcome
+                    .source_revisions
+                    .insert(ticket.graph_id.clone(), prepared.graph_revision);
+                if !applied {
+                    let source = self
+                        .services
+                        .goal_store()
+                        .projection(&prepared.goal.id)
+                        .map_err(fail)?
+                        .ok_or_else(|| fail("prepared user Goal disappeared".into()))?;
+                    if current.revision != prepared.graph_revision
+                        || *ticket != prepared.ticket
+                        || source.stream_revision != prepared.goal_stream_revision
+                        || source.goal.spec_digest != prepared.goal.spec_digest
+                    {
+                        // Neither cut may be refreshed. The monotonically moved
+                        // original read set fences every outstanding old commit.
+                        if user_goal_application_committed(
+                            self.services.as_ref(),
+                            &prepared,
+                            &identity.artifact_ref,
+                        )
+                        .map_err(fail)?
+                        {
+                            return Err(fail("user input committed during stale-cut check; retain original fact for replay".into()));
+                        }
+                        let mut rows = Vec::new();
+                        for id in &receipt.input_ids {
+                            rows.push(
+                                query
+                                    .runtime_input_by_input_id(id)
+                                    .await
+                                    .map_err(|e| fail(e.to_string()))?
+                                    .ok_or_else(|| fail("prepared input disappeared".into()))?,
+                            );
+                        }
+                        let mut rejected = rows[0]
+                            .application_receipt
+                            .clone()
+                            .ok_or_else(|| fail("prepared receipt missing".into()))?;
+                        if rows
+                            .iter()
+                            .any(|r| r.application_receipt.as_ref() != Some(&rejected))
+                        {
+                            return Err(fail("prepared input batch changed".into()));
+                        }
+                        rejected.state = InputApplicationState::Failed;
+                        rejected.error = Some("prepared_user_goal_source_cut_stale".into());
+                        rejected.revision += 1;
+                        rejected.updated_at_ms = user_application_clock();
+                        self.services
+                            .session_journal_port()
+                            .ok_or_else(|| fail("prepared input journal missing".into()))?
+                            .commit_input_application_receipt(
+                                &rejected.input_ids,
+                                &rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
+                                &rejected,
+                                rejected.updated_at_ms,
+                            )
+                            .await
+                            .map_err(|e| fail(e.to_string()))?;
+                        return Err(fail("prepared user Goal source cut is stale; no Goal write or second interpretation".into()));
+                    }
+                    let mut rows = Vec::new();
+                    for id in &receipt.input_ids {
+                        rows.push(
+                            query
+                                .runtime_input_by_input_id(id)
+                                .await
+                                .map_err(|e| fail(e.to_string()))?
+                                .ok_or_else(|| fail("prepared input disappeared".into()))?,
+                        );
+                    }
+                    let mut reserved = rows[0]
+                        .application_receipt
+                        .clone()
+                        .ok_or_else(|| fail("prepared receipt missing".into()))?;
+                    if rows
+                        .iter()
+                        .any(|r| r.application_receipt.as_ref() != Some(&reserved))
+                    {
+                        return Err(fail("prepared input reservation changed".into()));
+                    }
+                    if reserved.state == InputApplicationState::Prepared {
+                        reserved.state = InputApplicationState::Materializing;
+                        reserved.revision += 1;
+                        reserved.updated_at_ms = user_application_clock();
+                        self.services
+                            .session_journal_port()
+                            .ok_or_else(|| fail("prepared input journal missing".into()))?
+                            .commit_input_application_receipt(
+                                &reserved.input_ids,
+                                &rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
+                                &reserved,
+                                reserved.updated_at_ms,
+                            )
+                            .await
+                            .map_err(|e| fail(e.to_string()))?;
+                    }
+                    if let Some(mutation) = &prepared.mutation {
+                        if let Some((_, revision)) = prepared.program_cut {
+                            self.services
+                                .commit_user_input_goal_revision(
+                                    &prepared.goal,
+                                    &prepared.frame,
+                                    mutation,
+                                    revision,
+                                    prepared.graph_revision,
+                                    &identity.artifact_ref,
+                                )
+                                .map_err(fail)?;
+                        } else {
+                            outcome
+                                .source_revisions
+                                .insert(ticket.graph_id.clone(), prepared.graph_revision);
+                            outcome.source_revisions.insert(
+                                mutation.stream_id.clone(),
+                                mutation.expected_stream_revision,
+                            );
+                            outcome.domain_events.push(mutation.event.clone());
+                        }
+                    } else {
+                        outcome
+                            .source_revisions
+                            .insert(ticket.graph_id.clone(), prepared.graph_revision);
+                        outcome.source_revisions.insert(
+                            format!("goal:{}", prepared.goal.id),
+                            prepared.goal_stream_revision,
+                        );
+                    }
+                }
+                if let Some(sources) = committed_sources {
+                    // Exact cuts from the original committed transaction, never
+                    // an assumed +1 or a refreshed current head.
+                    outcome.source_revisions.extend(sources);
+                }
+                if known_only {
+                    let commits = self.services.commit_service().clone();
+                    let original = ticket.clone();
+                    let session = session.clone();
+                    let turn = turn.clone();
+                    let (count, digest) = prepared.transcript_prefix.clone();
+                    let required = prepared.root_control_team_count;
+                    let event = tokio::task::spawn_blocking(move || {
+                        commits.prepare_host_transcript(
+                            &original,
+                            &session,
+                            &turn,
+                            count,
+                            digest,
+                            vec![],
+                            required,
+                        )
+                    })
+                    .await
+                    .map_err(|error| fail(error.to_string()))?
+                    .map_err(|error| fail(error.to_string()))?;
+                    crate::ExecutionCommitService::attach_host_transcript(&mut outcome, event)
+                        .map_err(|error| fail(error.to_string()))?;
+                } else {
+                    self.state.lock().await.first_model_step = false;
+                }
+                return Ok(Some(outcome));
+            }
+            let last = page.last().unwrap();
+            let next = (last.sequence, last.input_id.clone());
+            if after.as_ref().is_some_and(|old| old >= &next) {
+                return Err(fail("pending input replay cursor did not advance".into()));
+            }
+            after = Some(next);
+            if page.len() < 32 {
+                return Ok(None);
+            }
+        }
+    }
+
+    async fn accept_user_input_interpretation(
+        &self,
+        ticket: &NodeExecutionTicket,
+        goal: crate::execution_core::goal::GoalProjection,
+        frame: crate::execution_core::goal::UserGoalInputFrame,
+        graph_revision: u64,
+        program_cut: Option<(String, u64)>,
+        step: crate::conversation::ModelStepResult,
+        consumed: &[crate::SessionInputRecord],
+    ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        use harness_contract::input_disposition::*;
+        let fail = |reason: String| NodeExecutorError::Poll {
+            node_id: ticket.node_id.clone(),
+            reason,
+        };
+        let usage = ExecutionUsage {
+            model: step.model.clone(),
+            provider_usage_observed: Some(step.assistant_message.usage.is_some()),
+            input_tokens: step.usage.input_tokens.into(),
+            output_tokens: step.usage.output_tokens.into(),
+            cache_creation_input_tokens: step.usage.cache_creation_input_tokens.into(),
+            cache_read_input_tokens: step.usage.cache_read_input_tokens.into(),
+            cached_tokens: step.usage.cache_read_input_tokens.into(),
+            duration_ms: step.wall_duration_ms,
+            ..Default::default()
+        };
+        {
+            let mut state = self.state.lock().await;
+            state.iterations = state.iterations.saturating_add(1);
+            state.record_root_model_usage(RootModelUsageDelta {
+                usage: step.usage,
+                model: step.model.clone(),
+                models_used: step.models_used.clone(),
+                first_token_latency_ms: step.first_token_latency_ms,
+                active_stream_duration_ms: step.active_stream_duration_ms,
+                wall_duration_ms: step.wall_duration_ms,
+                output_chars: 0,
+                output_chunks: 1,
+                cache_dimensions_known: step.assistant_message.usage.is_some(),
+            });
+            for record in consumed {
+                if !state
+                    .pending_disposition_inputs
+                    .iter()
+                    .any(|r| r.envelope.input_id == record.envelope.input_id)
+                {
+                    state.pending_disposition_inputs.push(record.clone());
+                }
+            }
+        }
+        // Every new input not in the fixed request cut invalidates the proposal,
+        // including one first consumed at the Provider request checkpoint.
+        let unseen = consumed.iter().any(|r| {
+            !frame
+                .inputs
+                .iter()
+                .any(|(i, _, _)| i.input_id == r.envelope.input_id.as_str())
+        });
+        let proposal = step
+            .input_interpretation
+            .clone()
+            .ok_or_else(|| fail("input interpretation purpose missing".into()))?;
+        let proposal = if unseen {
+            Err("new input arrived beyond the frozen interpretation cut".into())
+        } else {
+            proposal
+        };
+        let mut outcome = NodeExecutionOutcome::new(completed_result(None, usage.clone()))
+            .with_replan(ExecutionGraphReplan {
+                nodes: vec![dynamic_node(
+                    ticket,
+                    self.state.lock().await.iterations,
+                    "user-input-continuation",
+                    ExecutionNodeKind::InlineModel,
+                    "inline_model",
+                    "inline_model",
+                )],
+                edges: vec![],
+                reason: "user-input interpretation continues original Goal execution".into(),
+                framework_authored: true,
+            });
+        outcome.replan.as_mut().unwrap().edges =
+            dynamic_edges(&ticket.node_id, &outcome.replan.as_ref().unwrap().nodes);
+        let proposal = match proposal {
+            Ok(proposal) => proposal,
+            Err(reason) => {
+                let mut state = self.state.lock().await;
+                state.last_verified_progress = false;
+                state.consecutive_unverified_model_steps =
+                    state.consecutive_unverified_model_steps.saturating_add(1);
+                let mut item=ContextItem::new(format!("user-input-proposal-rejected:{}",ticket.node_id),ContextSourceKind::Task,ContextRole::Instruction,
+                    format!("The internal business proposal was not adopted: {reason}. Reconsider the same authenticated inputs; do not emit tools in the interpretation step."));
+                item.authority = ContextAuthority::System;
+                item.visibility = ContextVisibility::Private;
+                state.pending_next_model_context.push(item);
+                return Ok(outcome);
+            }
+        };
+        let decision = &proposal.decisions[0];
+        let mutation = if decision.action == InputDispositionAction::AmendCurrentTurn {
+            Some(
+                self.services
+                    .goal_store()
+                    .prepare_user_input_revision(&goal, &frame, &proposal, ticket)
+                    .map_err(fail)?,
+            )
+        } else {
+            None
+        };
+        // Capture the original transcript prefix with the proposal. A cold
+        // result replay must not bind itself to a later Session prefix.
+        let snapshot = self.runtime.lock().await.session_snapshot().await;
+        if snapshot.session_id != goal.goal.session_id {
+            return Err(fail("prepared user transcript Session mismatch".into()));
+        }
+        let prefix = snapshot.materialize_messages();
+        let transcript_prefix = (
+            prefix.len() as u64,
+            host_message_prefix_digest(&prefix).map_err(fail)?,
+        );
+        let root_control_team_count = self
+            .state
+            .lock()
+            .await
+            .pending_root_control_plane_requirement;
+        let prepared = PreparedUserGoalApplication {
+            frame,
+            goal_stream_revision: goal.stream_revision,
+            goal: goal.goal,
+            proposal,
+            mutation,
+            ticket: ticket.clone(),
+            graph_revision,
+            program_cut,
+            continuation: outcome
+                .replan
+                .clone()
+                .ok_or_else(|| fail("prepared input continuation missing".into()))?,
+            finished_at_ms: outcome.result.finished_at_ms,
+            transcript_prefix,
+            root_control_team_count,
+            usage,
+            provider_message: host_message_value(&step.assistant_message),
+            provider_usage: step.usage,
+        };
+        let bytes = serde_json::to_vec(&prepared).map_err(|e| fail(e.to_string()))?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err(fail(
+                "user application artifact exceeds bounded contract".into(),
+            ));
+        }
+        let session_id = prepared.goal.session_id.clone();
+        let artifact = self
+            .services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "application/json".into(),
+                    visibility_scope: format!("session:{session_id}"),
+                    expected_bytes: Some(bytes.len() as u64),
+                    original_name: None,
+                },
+                &bytes,
+            )
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        {
+            let query = self
+                .services
+                .session_query_port()
+                .ok_or_else(|| fail("user application query missing".into()))?;
+            let journal = self
+                .services
+                .session_journal_port()
+                .ok_or_else(|| fail("user application journal missing".into()))?;
+            let mut rows = Vec::new();
+            for (source, _, _) in &prepared.frame.inputs {
+                let current = query
+                    .runtime_input_by_input_id(&source.input_id)
+                    .await
+                    .map_err(|e| fail(e.to_string()))?
+                    .ok_or_else(|| fail("user input vanished before reservation".into()))?;
+                if current.revision != source.revision {
+                    return Err(fail(
+                        "user application original input revision is stale".into(),
+                    ));
+                }
+                rows.push(current);
+            }
+            let binding = prepared
+                .goal
+                .execution_binding
+                .as_ref()
+                .ok_or_else(|| fail("user Goal binding missing".into()))?;
+            let ids = rows.iter().map(|r| r.input_id.clone()).collect::<Vec<_>>();
+            let identity = PreparedInputApplication {
+                artifact_ref: artifact.selector.clone(),
+                artifact_sha256: format!("{:x}", sha2::Sha256::digest(&bytes)),
+                session_id: session_id.clone(),
+                session_generation: rows[0].session_generation,
+                turn_id: binding.turn_id.clone(),
+                goal_id: prepared.goal.id.clone(),
+                goal_revision: prepared.goal.revision,
+                goal_spec_digest: prepared.goal.spec_digest.clone(),
+                graph_id: ticket.graph_id.clone(),
+                graph_revision,
+                node_id: ticket.node_id.clone(),
+                attempt_id: ticket.attempt.to_string(),
+                source_digest: prepared.frame.digest().map_err(fail)?,
+                program_cut: prepared.program_cut.clone(),
+            };
+            let mut receipt = SessionInputApplicationReceipt {
+                disposition_id: format!(
+                    "user-goal:{}:{}",
+                    prepared.goal.id, identity.source_digest
+                ),
+                prepared_application: Some(identity),
+                cancellation: None,
+                leader_input_id: ids[0].clone(),
+                input_ids: ids,
+                action: prepared.proposal.decisions[0].action,
+                relation: prepared.proposal.decisions[0].relation,
+                state: InputApplicationState::Prepared,
+                objective: prepared.proposal.decisions[0].objective.clone(),
+                required: true,
+                attempts: 1,
+                summary: if prepared.mutation.is_some() {
+                    "authenticated user Goal revision"
+                } else {
+                    "authenticated user input observation without Goal revision"
+                }
+                .into(),
+                task_ids: vec![],
+                team_ids: vec![],
+                agent_ids: vec![],
+                execution_ids: vec![],
+                target_session_id: None,
+                target_session_created: false,
+                error: None,
+                revision: 0,
+                updated_at_ms: user_application_clock(),
+            };
+            rows = journal
+                .commit_input_application_receipt(
+                    &receipt.input_ids,
+                    &rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
+                    &receipt,
+                    receipt.updated_at_ms,
+                )
+                .await
+                .map_err(|e| fail(e.to_string()))?;
+            receipt.state = InputApplicationState::Materializing;
+            receipt.revision += 1;
+            receipt.updated_at_ms = user_application_clock();
+            journal
+                .commit_input_application_receipt(
+                    &receipt.input_ids,
+                    &rows.iter().map(|r| r.revision).collect::<Vec<_>>(),
+                    &receipt,
+                    receipt.updated_at_ms,
+                )
+                .await
+                .map_err(|e| fail(e.to_string()))?;
+            if let Some(mutation) = &prepared.mutation {
+                if let Some((_, revision)) = prepared.program_cut {
+                    self.services
+                        .commit_user_input_goal_revision(
+                            &prepared.goal,
+                            &prepared.frame,
+                            mutation,
+                            revision,
+                            graph_revision,
+                            &artifact.selector,
+                        )
+                        .map_err(fail)?;
+                } else {
+                    outcome
+                        .source_revisions
+                        .insert(ticket.graph_id.clone(), graph_revision);
+                    outcome.source_revisions.insert(
+                        mutation.stream_id.clone(),
+                        mutation.expected_stream_revision,
+                    );
+                    outcome.domain_events.push(mutation.event.clone());
+                }
+            } else {
+                outcome
+                    .source_revisions
+                    .insert(ticket.graph_id.clone(), graph_revision);
+                outcome.source_revisions.insert(
+                    format!("goal:{}", prepared.goal.id),
+                    prepared.goal_stream_revision,
+                );
+            }
+        }
+        outcome.result.result_ref = Some(format!("user_input_application:{}", artifact.selector));
+        // No internal proposal JSON enters the public assistant transcript.
+        let mut state = self.state.lock().await;
+        state.last_verified_progress = true;
+        state.pending_disposition_inputs.retain(|r| {
+            !prepared
+                .frame
+                .inputs
+                .iter()
+                .any(|(i, _, _)| i.input_id == r.envelope.input_id.as_str())
+        });
+        Ok(outcome)
+    }
+}
+
 fn host_message_value(message: &ConversationMessage) -> serde_json::Value {
     serde_json::json!({"role":message.role.role_str(),"blocks":message.blocks,"usage":message.usage})
 }
@@ -638,6 +1250,13 @@ where
         }
     }
 
+    async fn recover_known_outcome(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        self.resume_user_input_application(ticket, true).await
+    }
+
     async fn execute(
         &self,
         ticket: &NodeExecutionTicket,
@@ -649,6 +1268,7 @@ where
             });
         }
         let result = async {
+        if let Some(outcome)=self.resume_user_input_application(ticket, false).await? {return Ok(outcome);}
         if self.state.lock().await.terminal_override.is_some() {
             return Ok(precommitted_terminal_outcome(ticket));
         }
@@ -882,16 +1502,17 @@ where
                 framework_authored: true,
             }));
         }
+        let write_goal_id = self.state.lock().await.goal_id.clone();
+        let write_goal_source = self.services.goal_store().projection(&write_goal_id)
+            .map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?
+            .ok_or_else(|| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "current Goal missing".into() })?;
+        let required_workspace_write_scopes = {
+            let state = self.state.lock().await;
+            current_turn_write_scopes(&write_goal_source.goal, state.execution_role.is_delegated_leaf(), &state.focus_acceptance_scopes, state.task_understanding.as_ref().is_some_and(|understanding|understanding.requires_write))
+        };
+        let required_write_for_completion = !required_workspace_write_scopes.is_empty();
         let (root_requires_action_channel, required_effects_pending, operator_forbids_tool_use) = {
             let state = self.state.lock().await;
-            let understanding =
-                state
-                    .task_understanding
-                    .as_ref()
-                    .ok_or_else(|| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason: "model step has no admitted input constraint owner".to_string(),
-                    })?;
             let program_status = if state.execution_role.owns_root_presentation() {
                 let objective_id = harness_contract::agent_action::root_objective_id(
                     &state.session_id,
@@ -914,15 +1535,16 @@ where
                 root_program_requires_action_channel(state.execution_role, program_status),
                 state.execution_role.is_delegated_leaf()
                     && (!state.focus_acceptance_pending_scopes.is_empty()
-                        || (state.required_write_for_completion
+                        || (required_write_for_completion
                             && !write_obligation_satisfied(
-                                state.required_write_for_completion,
-                                &state.required_workspace_write_scopes,
+                                required_write_for_completion,
+                                &required_workspace_write_scopes,
                                 &state.committed_workspace_observed_evidence,
                                 state.committed_workspace_write_observed,
                                 self.services.path_identity_resolver(),
                             ))),
-                understanding.forbids_tool_use,
+                current_turn_forbids_tools(&write_goal_source.goal,
+                    state.task_understanding.as_ref().is_some_and(|understanding|understanding.forbids_tool_use)),
             )
         };
         let action_channel_required = root_requires_action_channel || required_effects_pending;
@@ -1342,6 +1964,31 @@ where
                     reason: format!("prepare working context: {reason}"),
                 })?
         };
+        let (user_goal_id,user_request,user_ids,owns_user_goal)={
+            let state=self.state.lock().await;
+            (state.goal_id.clone(),state.ingress.as_ref().map(|r|r.request_id.clone()),
+                state.pending_disposition_inputs.iter().map(|r|r.envelope.input_id.to_string()).collect::<Vec<_>>(),state.execution_role.owns_root_presentation())
+        };
+        let user_goal_source=self.services.goal_store().projection(&user_goal_id)
+            .map_err(|reason|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason})?
+            .ok_or_else(||NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:"user Goal source missing".into()})?;
+        let user_frame=if owns_user_goal {
+            if let Some(binding)=user_goal_source.goal.execution_binding.as_ref() {
+                crate::turn_inbox::authenticated_goal_inputs(self.services.as_ref(),binding,user_request.as_deref(),&user_ids).await
+                    .map_err(|reason|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason})?
+            } else {None}
+        } else {None};
+        let user_graph_revision=self.services.graph_state_store().load(&ticket.graph_id)
+            .map_err(|e|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:e.to_string()})?.revision;
+        let user_program_cut=if let Some(binding)=user_goal_source.goal.execution_binding.as_ref() {
+            self.services.agent_action_service().project_if_exists(&binding.agentic_program_id)
+                .map_err(|e|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:e.to_string()})?
+                .map(|p|(p.program_id,p.revision))
+        } else {None};
+        let user_framing=user_frame.as_ref().map(|frame|serde_json::json!({
+            "current_goal":user_goal_source.goal,
+            "inputs":frame.inputs.iter().enumerate().map(|(slot,(_,_,text))|serde_json::json!({"input_slot":slot,"text":text})).collect::<Vec<_>>()
+        }).to_string());
         let mut runtime = self.runtime.lock().await;
         let mut replayed_agent_inputs = Vec::new();
         if let Some(packet) = delegated_input_task_packet(self.services.as_ref(), ticket) {
@@ -1382,16 +2029,11 @@ where
             {
                 None
             } else {
-                state.collaboration_obligation.as_ref().map(|obligation| {
-                    (
-                        obligation.required_team_count(),
-                        state
-                            .task_understanding
-                            .as_ref()
-                            .map(|value| value.required_workspace_evidence_scopes.clone())
-                            .unwrap_or_default(),
-                    )
-                })
+                let count = current_turn_required_team_execution_count(
+                    &user_goal_source.goal, state.collaboration_obligation.as_ref(),
+                    false, state.evaluation_judge_only,
+                );
+                (count > 0).then(|| (u8::try_from(count).unwrap_or(u8::MAX), required_workspace_write_scopes.clone()))
             }
         };
         let control_plane_priority = next_model_control_plane_priority(
@@ -1624,7 +2266,16 @@ where
                     })
                 })
             };
-        let result = if clean_terminal_synthesis {
+        let model_goal_id = self.state.lock().await.goal_id.clone();
+        let model_goal_source = self.services.goal_store().projection(&model_goal_id)
+            .map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?
+            .ok_or_else(|| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "model Goal source missing".into() })?;
+        if write_goal_source.stream_revision != model_goal_source.stream_revision {
+            return Err(NodeExecutorError::Poll {node_id:ticket.node_id.clone(),reason:"Goal changed before Provider request".into()});
+        }
+        let result = if let (Some(frame),Some(framing))=(&user_frame,&user_framing) {
+            model_runtime.execute_user_input_interpretation(&content,first_step,provider_retry_fenced,frame.inputs.len(),framing).await
+        } else if clean_terminal_synthesis {
             model_runtime
                 .execute_clean_terminal_synthesis(
                     &content,
@@ -1678,6 +2329,12 @@ where
         let cache_dimensions_known = runtime.turn_cache_dimensions_known();
         let cowd_bus = runtime.cowd_bus().cloned();
         drop(runtime);
+        if result.as_ref().ok().is_some_and(|step|step.input_interpretation.is_some()) {
+            let step=result.map_err(|e|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:e.to_string()})?;
+            return self.accept_user_input_interpretation(ticket,user_goal_source,
+                user_frame.ok_or_else(||NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:"interpretation has no authenticated frame".into()})?,
+                user_graph_revision,user_program_cut,step,&consumed_inputs).await;
+        }
         match result {
             Ok(step) => {
                 if topic_selected {
@@ -1864,9 +2521,9 @@ where
                 if input_update_applied {
                     // The provider candidate did not observe these durable inputs.
                     // Preserve usage telemetry, but force a fresh semantic model step
-                    // with the updates as ordinary authoritative context. The model
-                    // can then amend work incrementally through Agent Actions; no
-                    // separate graph-shaped routing contract exists.
+                    // with new data context. Only authenticated original inputs
+                    // enter the dedicated business-interpretation checkpoint;
+                    // context absorption cannot alter the current Goal contract.
                     state.assistant_messages.pop();
                     state.pending_transcript.remove(&ticket.node_id);
                     state.pending_disposition_inputs.clear();
@@ -1876,22 +2533,6 @@ where
                     for record in &pending_disposition_inputs {
                         state.content.push_str("\n\nApplied running-Turn input:\n");
                         state.content.push_str(&record.envelope.content);
-                        let supplemental = harness_contract::strategy::understand(
-                            &harness_contract::strategy::StrategyInput::from_prompt(
-                                &record.envelope.content,
-                            ),
-                        );
-                        if let Some(authority) = state.task_understanding.as_mut() {
-                            authority.required_team_count = authority
-                                .required_team_count
-                                .max(supplemental.required_team_count);
-                            authority.forbids_tool_use |= supplemental.forbids_tool_use;
-                            authority.requires_write |= supplemental.requires_write;
-                            authority.requires_external_facts |=
-                                supplemental.requires_external_facts;
-                        } else {
-                            state.task_understanding = Some(supplemental);
-                        }
                     }
                     state.pending_next_model_context.extend(
                         crate::turn_inbox::checkpoint_context_items(
@@ -2161,6 +2802,8 @@ where
                 // stale proposal previously encouraged a completed protocol
                 // synthesis role to continue exploring.
                 let mut model_intervention = None;
+                let mut write_recovery = None;
+                let mut write_goal_cut = None;
                 let mut next_model_context = None;
                 let next = match intent {
                     ModelStepIntent::FinalAnswer { text } => 'final_answer: {
@@ -2205,7 +2848,8 @@ where
                             )];
                         }
                         let required_team_executions =
-                            required_team_execution_count_for_execution_context(
+                            current_turn_required_team_execution_count(
+                                &user_goal_source.goal,
                                 state.collaboration_obligation.as_ref(),
                                 state.execution_role.is_delegated_leaf(),
                                 state.evaluation_judge_only,
@@ -2325,11 +2969,11 @@ where
                                         .count();
                                     let mut outstanding: Vec<String> = Vec::new();
                                     if program.teams.len()
-                                        < usize::from(program.required_team_count)
+                                        < required_team_executions
                                     {
                                         outstanding.push("team".to_string());
                                     }
-                                    if published == 0 && program.required_team_count > 0 {
+                                    if published == 0 && required_team_executions > 0 {
                                         outstanding.push("publish_task".to_string());
                                     }
                                     if claimed < published {
@@ -2407,50 +3051,52 @@ where
                         // workspace write. Rechecking only root-local write
                         // receipts here creates a second owner and causes
                         // post-terminal no-op edits/model rounds.
-                        let successful_write_observed = root_delivery_write_satisfied(
-                            agentic_program.as_ref().is_some_and(|program| {
-                                program.status == crate::AgenticProgramStatus::Verified
-                            }),
-                            state.required_write_for_completion,
-                            &state.required_workspace_write_scopes,
-                            &state.committed_workspace_observed_evidence,
+                        let task_focus = state.execution_role.is_delegated_leaf().then_some((
+                            required_workspace_write_scopes.as_slice(),
+                            state.committed_workspace_observed_evidence.as_slice(),
                             state.committed_workspace_write_observed,
-                            self.services.path_identity_resolver(),
-                        );
-                        let missing_write =
-                            state.required_write_for_completion && !successful_write_observed;
-                        // Delegated Agent output is an internal Team artifact. It may use the
-                        // most effective working language because the root turn owns the final,
-                        // user-visible synthesis and its language contract.
-                        let missing_language = response_language_mismatch_for_role(
-                            &state.content,
-                            &text,
-                            state.execution_role.is_delegated_leaf(),
-                        );
-                        let acceptance_disposition = root_acceptance_disposition(
-                            missing_write,
-                            missing_language,
-                            state.root_write_replans,
+                        ));
+                        let (write_decision, cut) = self.services.goal_store().assess_write_checkpoint(
+                            &write_goal_source, ticket, self.services.path_identity_resolver(),
+                            GoalWriteCheckpoint::FinalAnswer, task_focus, &[],
+                        ).map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?;
+                        write_goal_cut = Some(cut);
+                        let blocked = match write_decision {
+                            GoalWriteDisposition::Recover(recovery) => { write_recovery = Some(recovery); None }
+                            GoalWriteDisposition::Blocked(intervention) => Some(intervention),
+                            GoalWriteDisposition::Satisfied | GoalWriteDisposition::Pending => None,
+                        };
+                        // Business exhaustion is decided by Goal. A presentation
+                        // language correction cannot turn it into another write retry.
+                        if let Some(intervention) = blocked {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            model_intervention = Some(intervention);
+                            let mut node = dynamic_node(ticket, state.iterations,
+                                "goal-write-gap-synthesize", ExecutionNodeKind::Synthesize,
+                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                "inline_model");
+                            node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                            break 'final_answer vec![node];
+                        }
+                        let recover_write = write_recovery.is_some();
+                        let recover_language = should_recover_response_language(
+                            response_language_mismatch_for_role(&state.content, &text,
+                                state.execution_role.is_delegated_leaf()),
                             state.root_language_replan_attempted,
                         );
-                        if let RootAcceptanceDisposition::Replan {
-                            write: recover_write,
-                            language: recover_language,
-                        } = acceptance_disposition
-                        {
+                        if recover_write || recover_language {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
                             let mut missing = Vec::new();
                             if recover_write {
-                                state.root_write_replans =
-                                    state.root_write_replans.saturating_add(1);
-                                if state.required_workspace_write_scopes.is_empty() {
+                                if required_workspace_write_scopes.is_empty() {
                                     missing
                                         .push("a committed workspace artifact write".to_string());
                                 } else {
                                     missing.push(format!(
                                         "a committed workspace artifact write to the exact target(s) [{}]",
-                                        state.required_workspace_write_scopes.join(", ")
+                                        required_workspace_write_scopes.join(", ")
                                     ));
                                 }
                                 state.force_tool_allowlist_next_model = None;
@@ -2519,42 +3165,6 @@ where
                                 "inline_model",
                                 "inline_model",
                             )];
-                        }
-                        // Presentation quality must not invalidate completed business work.
-                        // After one language rewrite attempt, preserve a usable verified answer
-                        // in any language. Missing required writes remain a hard blocker because
-                        // the requested business artifact still does not exist.
-                        if acceptance_disposition == RootAcceptanceDisposition::BlockMissingWrite {
-                            state.assistant_messages.pop();
-                            state.pending_transcript.remove(&ticket.node_id);
-                            let reason = format!(
-                                "Execution blocked because the required workspace artifact remained incomplete after bounded recovery: write_required={}, write_satisfied={}",
-                                state.required_write_for_completion,
-                                !missing_write,
-                            );
-                            state.terminal_override =
-                                Some((GoalCompletion::Partial, reason.clone()));
-                            model_intervention =
-                                Some(harness_contract::goal::RuntimeIntervention {
-                                    goal_id: state.goal_id.clone(),
-                                    kind: RuntimeInterventionKind::Block,
-                                    reason,
-                                    evidence_refs: vec![format!(
-                                        "execution_node:{}",
-                                        ticket.node_id
-                                    )],
-                                    expected_graph_revision: None,
-                                });
-                            let mut node = dynamic_node(
-                                ticket,
-                                state.iterations,
-                                "root-acceptance-block-synthesize",
-                                ExecutionNodeKind::Synthesize,
-                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
-                                "inline_model",
-                            );
-                            node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
-                            break 'final_answer vec![node];
                         }
                         let normalized = normalize_terminal_answer_with_evidence(
                             &text,
@@ -3153,6 +3763,7 @@ where
                             let (intervention, next) = evaluation_scope_rejection_outcome(
                                 ticket,
                                 &mut state,
+                                &required_workspace_write_scopes,
                                 &violation,
                                 self.services.workspace_root(),
                                 self.services.path_identity_resolver(),
@@ -3242,8 +3853,47 @@ where
                             })?,
                     );
                 }
+                // The candidate is metadata on this attempt's original Goal
+                // observation, not a second append of the same observation.
+                let goal_observation_event = if let Some(encoded) = outcome
+                    .result
+                    .result_ref
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("assistant_json:"))
+                {
+                    if model_goal_source.goal.revision != observation_source.goal.revision
+                        || model_goal_source.goal.spec_digest != observation_source.goal.spec_digest
+                    {
+                        return Err(NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason: "final model candidate saw a stale Goal revision".into(),
+                        });
+                    }
+                    let answer: String = serde_json::from_str(encoded).map_err(|error| {
+                        NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    self.services.goal_store().turn_candidate_event_at(
+                        &observation_source,
+                        &observation,
+                        ticket,
+                        &answer,
+                    )
+                } else {
+                    self.services.goal_store().observation_event_at(
+                        &observation_source,
+                        &observation,
+                        format!("{}:goal-observation", ticket.idempotency_key),
+                    )
+                }
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason,
+                })?;
+                outcome.domain_events.push(goal_observation_event);
                 for (suffix, observation) in [
-                    ("goal-observation", &observation),
                     ("strategy-observation", &strategy_observation),
                     ("provider-observation", &provider_observation),
                     ("context-observation", &context_observation),
@@ -3276,6 +3926,13 @@ where
                                 reason,
                             })?,
                     );
+                }
+                if let Some(cut) = write_goal_cut {
+                    outcome.source_revisions.insert(cut.stream_id, cut.expected_revision);
+                }
+                if let Some(recovery) = write_recovery {
+                    outcome.source_revisions.insert(recovery.stream_id, recovery.expected_stream_revision);
+                    outcome.domain_events.push(recovery.event);
                 }
                 Ok(outcome)
             }
@@ -3830,6 +4487,56 @@ where
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        let graph = self
+            .services
+            .graph_state_store()
+            .load(&ticket.graph_id)
+            .map_err(|e| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: e.to_string(),
+            })?;
+        if let Some(selector) = graph
+            .node_results
+            .get(&ticket.node_id)
+            .and_then(|r| r.result_ref.as_deref())
+            .and_then(|r| r.strip_prefix("user_input_application:"))
+        {
+            let artifact = self
+                .services
+                .artifact_store()
+                .resolve(selector)
+                .map_err(|e| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: e.to_string(),
+                })?;
+            if artifact.bytes > 2 * 1024 * 1024 {
+                return Err(NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: "user application artifact exceeds read budget".into(),
+                });
+            }
+            let session = self.state.lock().await.session_id.clone();
+            let bytes = self
+                .services
+                .artifact_store()
+                .read(&artifact, &format!("session:{session}"), None)
+                .await
+                .map_err(|e| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: e.to_string(),
+                })?;
+            let prepared: PreparedUserGoalApplication =
+                serde_json::from_slice(&bytes).map_err(|e| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: e.to_string(),
+                })?;
+            finish_user_goal_application(self.services.as_ref(), &prepared)
+                .await
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason,
+                })?;
+        }
         tracing::debug!(node_id = %ticket.node_id, "publishing committed model transcript");
         let (session_id, turn_id, required_control_plane_team_count) =
             publish_host_transcript(&self.runtime, &self.services, ticket).await?;
@@ -4047,24 +4754,46 @@ pub(super) fn owed_action_context(
     framing: &serde_json::Value,
     advertised: Option<&BTreeSet<String>>,
 ) -> serde_json::Value {
-    let rungs = framing["remaining"].as_array().into_iter().flatten()
-        .filter(|entry| entry["actionability"] != "blocked"
-            && entry["actionability"] != "requires_explicit_independent_actor")
+    let rungs = framing["remaining"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry["actionability"] != "blocked"
+                && entry["actionability"] != "requires_explicit_independent_actor"
+        })
         .filter_map(|entry| entry["step"].as_str().map(str::to_string))
         .collect::<Vec<_>>();
-    let advisory_routes = framing["remaining"].as_array().into_iter().flatten()
-        .filter(|entry| entry["publication_route"].is_object() || entry["optional_route"].is_object())
-        .map(|entry| serde_json::json!({
-            "step":entry["step"],
-            "publication_route":entry["publication_route"],
-            "optional_route":entry["optional_route"],
-        })).collect::<Vec<_>>();
-    let candidates = mandatory_action_tool_ids(false, &rungs);
-    let candidate_tools = candidates.iter().filter(|tool| advertised.is_some_and(|names| names.contains(*tool)))
-        .cloned().collect::<Vec<_>>();
-    let reads = ["read_ref", "state_inspect", "read_file", "evidence_retrieve"].into_iter()
-        .filter(|tool| advertised.is_some_and(|names| names.contains(*tool)))
+    let advisory_routes = framing["remaining"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry["publication_route"].is_object() || entry["optional_route"].is_object()
+        })
+        .map(|entry| {
+            serde_json::json!({
+                "step":entry["step"],
+                "publication_route":entry["publication_route"],
+                "optional_route":entry["optional_route"],
+            })
+        })
         .collect::<Vec<_>>();
+    let candidates = mandatory_action_tool_ids(false, &rungs);
+    let candidate_tools = candidates
+        .iter()
+        .filter(|tool| advertised.is_some_and(|names| names.contains(*tool)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let reads = [
+        "read_ref",
+        "state_inspect",
+        "read_file",
+        "evidence_retrieve",
+    ]
+    .into_iter()
+    .filter(|tool| advertised.is_some_and(|names| names.contains(*tool)))
+    .collect::<Vec<_>>();
     serde_json::json!({
         "program_source":framing["program_source"],
         "goal":framing["goal"],
@@ -4605,7 +5334,11 @@ fn execution_health_identity(
     };
     let identity = match &evidence.target {
         EvidenceTargetIdentity::Workspace { scope } => {
-            let digest = scope.path.observed_revision_or_digest.as_deref().filter(|digest| !digest.is_empty())?;
+            let digest = scope
+                .path
+                .observed_revision_or_digest
+                .as_deref()
+                .filter(|digest| !digest.is_empty())?;
             if scope.access_mode == WorkspaceAccessMode::Write
                 && matches!(&evidence.workspace_prior_state,
                     Some(WorkspacePriorState::Existing { sha256 })
@@ -4613,34 +5346,72 @@ fn execution_health_identity(
             {
                 return None;
             }
-            serde_json::json!(["workspace", scope.path.workspace_id, scope.path.repository_id,
-                scope.path.workspace_relative_path, scope.path.repository_relative_path,
-                scope.path.object_kind, digest])
+            serde_json::json!([
+                "workspace",
+                scope.path.workspace_id,
+                scope.path.repository_id,
+                scope.path.workspace_relative_path,
+                scope.path.repository_relative_path,
+                scope.path.object_kind,
+                digest
+            ])
         }
         EvidenceTargetIdentity::ToolExecution { execution } => {
-            let ToolExecutionTerminal::Settled { exit_code: Some(0), signal: None, closure,
-                stop_reason: ToolExecutionStopReason::CommandExit } = &execution.terminal
-            else { return None; };
+            let ToolExecutionTerminal::Settled {
+                exit_code: Some(0),
+                signal: None,
+                closure,
+                stop_reason: ToolExecutionStopReason::CommandExit,
+            } = &execution.terminal
+            else {
+                return None;
+            };
             if !execution.capture_complete || !closure.all_children_reaped || !closure.init_reaped {
                 return None;
             }
-            let inputs = execution.admission.inputs.iter()
-                .map(|input| (&input.relative_path, &input.sha256, input.bytes)).collect::<Vec<_>>();
-            serde_json::json!(["process", execution.admission.code_sha256, inputs,
-                execution.stdout_sha256, execution.stderr_sha256,
-                execution.stdout_bytes, execution.stderr_bytes])
+            let inputs = execution
+                .admission
+                .inputs
+                .iter()
+                .map(|input| (&input.relative_path, &input.sha256, input.bytes))
+                .collect::<Vec<_>>();
+            serde_json::json!([
+                "process",
+                execution.admission.code_sha256,
+                inputs,
+                execution.stdout_sha256,
+                execution.stderr_sha256,
+                execution.stdout_bytes,
+                execution.stderr_bytes
+            ])
         }
         EvidenceTargetIdentity::LocalNetwork { operation } => {
-            if !operation.host_joined || !operation.coverage_complete || operation.operations.is_empty() {
+            if !operation.host_joined
+                || !operation.coverage_complete
+                || operation.operations.is_empty()
+            {
                 return None;
             }
             let mut operations = Vec::new();
             for observed in &operation.operations {
-                let LocalNetworkTerminal::BodyDone { status, body_bytes, body_sha256 } = &observed.terminal
-                else { return None; };
-                if !(200..300).contains(status) { return None; }
-                operations.push(serde_json::json!([observed.endpoint, observed.input_sha256,
-                    status, body_bytes, body_sha256]));
+                let LocalNetworkTerminal::BodyDone {
+                    status,
+                    body_bytes,
+                    body_sha256,
+                } = &observed.terminal
+                else {
+                    return None;
+                };
+                if !(200..300).contains(status) {
+                    return None;
+                }
+                operations.push(serde_json::json!([
+                    observed.endpoint,
+                    observed.input_sha256,
+                    status,
+                    body_bytes,
+                    body_sha256
+                ]));
             }
             serde_json::json!(["network", operations])
         }
@@ -4654,11 +5425,21 @@ fn fresh_execution_health_progress(
     current: &[harness_contract::context::ObservedEvidence],
     new_observed_fingerprints: &BTreeSet<String>,
 ) -> bool {
-    let known = prior.iter().filter_map(execution_health_identity).collect::<BTreeSet<_>>();
-    current.iter().filter(|evidence| {
-        evidence.provenance == harness_contract::context::ObservedEvidenceProvenance::FreshExecution
-            && new_observed_fingerprints.contains(&crate::path_identity::observed_evidence_fingerprint(evidence))
-    }).filter_map(execution_health_identity).any(|identity| !known.contains(&identity))
+    let known = prior
+        .iter()
+        .filter_map(execution_health_identity)
+        .collect::<BTreeSet<_>>();
+    current
+        .iter()
+        .filter(|evidence| {
+            evidence.provenance
+                == harness_contract::context::ObservedEvidenceProvenance::FreshExecution
+                && new_observed_fingerprints.contains(
+                    &crate::path_identity::observed_evidence_fingerprint(evidence),
+                )
+        })
+        .filter_map(execution_health_identity)
+        .any(|identity| !known.contains(&identity))
 }
 
 fn execution_progress_advanced(
@@ -4667,32 +5448,67 @@ fn execution_progress_advanced(
     typed_closure: bool,
     fresh_execution_health: bool,
 ) -> bool {
-    after.convergence_started = after.convergence_started || before.convergence_started
-        || before.completion_requested || before.verdict_bound || before.objective_reviews > 0
-        || after.completion_requested || after.verdict_bound || after.objective_reviews > 0
+    after.convergence_started = after.convergence_started
+        || before.convergence_started
+        || before.completion_requested
+        || before.verdict_bound
+        || before.objective_reviews > 0
+        || after.completion_requested
+        || after.verdict_bound
+        || after.objective_reviews > 0
         || typed_closure;
     objective_milestone_advanced(before, after)
         || (!after.convergence_started && fresh_execution_health)
 }
 
-fn next_acquisition_stall_streak(previous: usize, failed: usize, stale: bool, verified_progress: bool) -> usize {
-    if failed == 0 && stale && !verified_progress { previous.saturating_add(1) } else { 0 }
+fn next_acquisition_stall_streak(
+    previous: usize,
+    failed: usize,
+    stale: bool,
+    verified_progress: bool,
+) -> usize {
+    if failed == 0 && stale && !verified_progress {
+        previous.saturating_add(1)
+    } else {
+        0
+    }
 }
 
-fn forced_terminal_presentation_allowed(framing: &serde_json::Value, delegated_bounded_complete: bool) -> bool {
-    delegated_bounded_complete || (framing["exit_ready"].as_bool() == Some(true)
-        && framing.get("blocked").is_none_or(serde_json::Value::is_null)
-        && framing["remaining"].as_array().is_some_and(|remaining| remaining.is_empty()))
+fn forced_terminal_presentation_allowed(
+    framing: &serde_json::Value,
+    delegated_bounded_complete: bool,
+) -> bool {
+    delegated_bounded_complete
+        || (framing["exit_ready"].as_bool() == Some(true)
+            && framing
+                .get("blocked")
+                .is_none_or(serde_json::Value::is_null)
+            && framing["remaining"]
+                .as_array()
+                .is_some_and(|remaining| remaining.is_empty()))
 }
 
-fn effective_text_only_request(heuristic: bool, terminal_ready: bool, refusal: bool, action_required: bool) -> bool {
+fn effective_text_only_request(
+    heuristic: bool,
+    terminal_ready: bool,
+    refusal: bool,
+    action_required: bool,
+) -> bool {
     ((heuristic && terminal_ready) || refusal) && !action_required
 }
 
-fn acquisition_saturation_intervention(terminal_ready: bool, streak: usize, limit: usize) -> RuntimeInterventionKind {
-    if terminal_ready { RuntimeInterventionKind::Synthesize }
-    else if streak > limit { RuntimeInterventionKind::Block }
-    else { RuntimeInterventionKind::Replan }
+fn acquisition_saturation_intervention(
+    terminal_ready: bool,
+    streak: usize,
+    limit: usize,
+) -> RuntimeInterventionKind {
+    if terminal_ready {
+        RuntimeInterventionKind::Synthesize
+    } else if streak > limit {
+        RuntimeInterventionKind::Block
+    } else {
+        RuntimeInterventionKind::Replan
+    }
 }
 
 #[cfg(test)]
@@ -4701,17 +5517,26 @@ mod own865_host_saturation_tests {
 
     #[test]
     fn healthy_edit_then_two_reads_does_not_repeat_873_premature_synthesis() {
-        use harness_contract::context::{EvidenceTargetIdentity, WorkspaceAccessMode, WorkspacePriorState};
+        use harness_contract::context::{
+            EvidenceTargetIdentity, WorkspaceAccessMode, WorkspacePriorState,
+        };
         let prior = super::own865_execution_health_tests::workspace(&"1".repeat(64));
         let mut edit = super::own865_execution_health_tests::workspace(&"2".repeat(64));
         if let EvidenceTargetIdentity::Workspace { scope } = &mut edit.target {
             scope.access_mode = WorkspaceAccessMode::Write;
         }
-        edit.workspace_prior_state = Some(WorkspacePriorState::Existing { sha256: "1".repeat(64) });
+        edit.workspace_prior_state = Some(WorkspacePriorState::Existing {
+            sha256: "1".repeat(64),
+        });
         let fresh = crate::path_identity::fresh_novel_observed_evidence_fingerprints(
-            std::slice::from_ref(&prior), std::slice::from_ref(&edit));
+            std::slice::from_ref(&prior),
+            std::slice::from_ref(&edit),
+        );
         let fresh_health = fresh_execution_health_progress(
-            std::slice::from_ref(&prior), std::slice::from_ref(&edit), &fresh);
+            std::slice::from_ref(&prior),
+            std::slice::from_ref(&edit),
+            &fresh,
+        );
         assert!(fresh_health);
         let before = ObjectiveMilestones::default();
         let mut after = before.clone();
@@ -4732,20 +5557,31 @@ mod own865_host_saturation_tests {
             "program_source":{"status":"absent"}});
         assert!(!forced_terminal_presentation_allowed(&framing, false));
         let limit = evidence_saturation_limit(false);
-        assert_eq!(acquisition_saturation_intervention(false, limit, limit), RuntimeInterventionKind::Replan);
-        assert_eq!(acquisition_saturation_intervention(false, limit + 1, limit), RuntimeInterventionKind::Block);
+        assert_eq!(
+            acquisition_saturation_intervention(false, limit, limit),
+            RuntimeInterventionKind::Replan
+        );
+        assert_eq!(
+            acquisition_saturation_intervention(false, limit + 1, limit),
+            RuntimeInterventionKind::Block
+        );
         let mut streak = limit;
         streak = next_acquisition_stall_streak(streak, 0, true, false);
         assert_eq!(streak, limit + 1);
-        assert!(!forced_terminal_presentation_allowed(&framing, false),
-            "a provider replan or an absent-schema attempted call is not terminal proof");
+        assert!(
+            !forced_terminal_presentation_allowed(&framing, false),
+            "a provider replan or an absent-schema attempted call is not terminal proof"
+        );
     }
 
     #[test]
     fn genuine_terminal_and_delegated_completion_allow_text_not_pending_debt() {
         let ready = serde_json::json!({"exit_ready":true,"remaining":[]});
         assert!(forced_terminal_presentation_allowed(&ready, false));
-        assert_eq!(acquisition_saturation_intervention(true, 3, 3), RuntimeInterventionKind::Synthesize);
+        assert_eq!(
+            acquisition_saturation_intervention(true, 3, 3),
+            RuntimeInterventionKind::Synthesize
+        );
         let debt = serde_json::json!({"exit_ready":true,"remaining":["review"]});
         assert!(!forced_terminal_presentation_allowed(&debt, false));
         let unknown = serde_json::json!({"exit_ready":false,"remaining":[]});
@@ -4755,9 +5591,14 @@ mod own865_host_saturation_tests {
 
     #[test]
     fn closure_churn_does_not_renew_acquisition_health() {
-        let before = ObjectiveMilestones { convergence_started:true, ..Default::default() };
+        let before = ObjectiveMilestones {
+            convergence_started: true,
+            ..Default::default()
+        };
         let mut after = before.clone();
-        assert!(!execution_progress_advanced(&before, &mut after, true, true));
+        assert!(!execution_progress_advanced(
+            &before, &mut after, true, true
+        ));
         assert_eq!(next_acquisition_stall_streak(2, 0, true, false), 3);
         assert_eq!(next_acquisition_stall_streak(2, 1, true, false), 0);
     }
@@ -4777,9 +5618,14 @@ mod own865_host_saturation_tests {
         let mut replay = original.clone();
         replay.observed_at_sequence += 1;
         let fresh = crate::path_identity::fresh_novel_observed_evidence_fingerprints(
-            std::slice::from_ref(&original), std::slice::from_ref(&replay));
-        assert!(!fresh_execution_health_progress(std::slice::from_ref(&original),
-            std::slice::from_ref(&replay), &fresh));
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&replay),
+        );
+        assert!(!fresh_execution_health_progress(
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&replay),
+            &fresh
+        ));
         assert_eq!(next_acquisition_stall_streak(2, 0, true, false), 3);
     }
 }
@@ -5419,27 +6265,35 @@ mod own865_execution_health_tests {
     use super::*;
     use harness_contract::context::{
         ArtifactRef, EvidenceCoverageKind, EvidenceDurability, EvidenceTargetIdentity,
-        ObservedEvidence, ObservedEvidenceProvenance, ToolExecutionAdmission,
-        ToolExecutionBinding, ToolExecutionFact, ToolExecutionInput, ToolExecutionStopReason,
-        ToolExecutionTerminal, ToolProcessClosure, WorkspaceAccessMode, WorkspaceObjectKind,
-        WorkspacePathIdentity, WorkspacePriorState, WorkspaceScopeIdentity,
+        ObservedEvidence, ObservedEvidenceProvenance, ToolExecutionAdmission, ToolExecutionBinding,
+        ToolExecutionFact, ToolExecutionInput, ToolExecutionStopReason, ToolExecutionTerminal,
+        ToolProcessClosure, WorkspaceAccessMode, WorkspaceObjectKind, WorkspacePathIdentity,
+        WorkspacePriorState, WorkspaceScopeIdentity,
     };
 
     pub(super) fn workspace(digest: &str) -> ObservedEvidence {
         ObservedEvidence {
             obligation_id: String::new(),
-            target: EvidenceTargetIdentity::Workspace { scope: WorkspaceScopeIdentity {
-                access_mode: WorkspaceAccessMode::Read, coverage: EvidenceCoverageKind::ExactContent,
-                path: WorkspacePathIdentity {
-                    workspace_id: "health-workspace".into(), repository_id: "health-repository".into(),
-                    workspace_relative_path: "project/src/main.rs".into(),
-                    repository_relative_path: "src/main.rs".into(), object_kind: WorkspaceObjectKind::File,
-                    observed_revision_or_digest: Some(digest.into()),
+            target: EvidenceTargetIdentity::Workspace {
+                scope: WorkspaceScopeIdentity {
+                    access_mode: WorkspaceAccessMode::Read,
+                    coverage: EvidenceCoverageKind::ExactContent,
+                    path: WorkspacePathIdentity {
+                        workspace_id: "health-workspace".into(),
+                        repository_id: "health-repository".into(),
+                        workspace_relative_path: "project/src/main.rs".into(),
+                        repository_relative_path: "src/main.rs".into(),
+                        object_kind: WorkspaceObjectKind::File,
+                        observed_revision_or_digest: Some(digest.into()),
+                    },
                 },
-            }},
-            observed_at_sequence: 1, tool_name: "read_file".into(),
+            },
+            observed_at_sequence: 1,
+            tool_name: "read_file".into(),
             provenance: ObservedEvidenceProvenance::FreshExecution,
-            evidence_ref: None, model_observation: None, workspace_prior_state: None,
+            evidence_ref: None,
+            model_observation: None,
+            workspace_prior_state: None,
         }
     }
 
@@ -5447,49 +6301,77 @@ mod own865_execution_health_tests {
         let mut evidence = workspace("unused");
         evidence.tool_name = "execute_code".into();
         let artifact = ArtifactRef {
-            selector: "artifact://health-original".into(), sha256: "sha256:".to_string() + &"1".repeat(64),
-            bytes: 1, media_type: "application/json".into(),
-            durability: EvidenceDurability::Durable, visibility_scope: "session:health".into(),
+            selector: "artifact://health-original".into(),
+            sha256: "sha256:".to_string() + &"1".repeat(64),
+            bytes: 1,
+            media_type: "application/json".into(),
+            durability: EvidenceDurability::Durable,
+            visibility_scope: "session:health".into(),
         };
-        evidence.target = EvidenceTargetIdentity::ToolExecution { execution: ToolExecutionFact {
-            version: 1,
-            admission: ToolExecutionAdmission {
-                version: 1, binding: ToolExecutionBinding {
-                    call_key: "health-call-1".into(), tool_use_id: "health-tool-1".into(),
-                    input_sha256: "2".repeat(64), descriptor_sha256: "3".repeat(64),
-                    authority_sha256: "4".repeat(64),
+        evidence.target = EvidenceTargetIdentity::ToolExecution {
+            execution: ToolExecutionFact {
+                version: 1,
+                admission: ToolExecutionAdmission {
+                    version: 1,
+                    binding: ToolExecutionBinding {
+                        call_key: "health-call-1".into(),
+                        tool_use_id: "health-tool-1".into(),
+                        input_sha256: "2".repeat(64),
+                        descriptor_sha256: "3".repeat(64),
+                        authority_sha256: "4".repeat(64),
+                    },
+                    code_sha256: "5".repeat(64),
+                    inputs: vec![ToolExecutionInput {
+                        relative_path: "src/main.rs".into(),
+                        sha256: "6".repeat(64),
+                        bytes: 1,
+                        device: 1,
+                        inode: 1,
+                        mtime_ns: 1,
+                        ctime_ns: 1,
+                    }],
+                    source_bundle: artifact.clone(),
                 },
-                code_sha256: "5".repeat(64),
-                inputs: vec![ToolExecutionInput {
-                    relative_path: "src/main.rs".into(), sha256: "6".repeat(64), bytes: 1,
-                    device: 1, inode: 1, mtime_ns: 1, ctime_ns: 1,
-                }],
-                source_bundle: artifact.clone(),
-            },
-            terminal: ToolExecutionTerminal::Settled {
-                exit_code: Some(0), signal: None, stop_reason: ToolExecutionStopReason::CommandExit,
-                closure: ToolProcessClosure {
-                    backend: "test-original".into(), namespace_inode: 1, init_host_pid: 1,
-                    init_start_ticks: 1, all_children_reaped: true, init_reaped: true,
-                    kernel_hardening_applied: true, network_disabled: true, project_read_only: true,
-                    status_channel_protected: true,
+                terminal: ToolExecutionTerminal::Settled {
+                    exit_code: Some(0),
+                    signal: None,
+                    stop_reason: ToolExecutionStopReason::CommandExit,
+                    closure: ToolProcessClosure {
+                        backend: "test-original".into(),
+                        namespace_inode: 1,
+                        init_host_pid: 1,
+                        init_start_ticks: 1,
+                        all_children_reaped: true,
+                        init_reaped: true,
+                        kernel_hardening_applied: true,
+                        network_disabled: true,
+                        project_read_only: true,
+                        status_channel_protected: true,
+                    },
                 },
+                body: artifact,
+                stdout_sha256: "7".repeat(64),
+                stderr_sha256: "8".repeat(64),
+                stdout_bytes: 1,
+                stderr_bytes: 0,
+                capture_complete: true,
             },
-            body: artifact, stdout_sha256: "7".repeat(64), stderr_sha256: "8".repeat(64),
-            stdout_bytes: 1, stderr_bytes: 0, capture_complete: true,
-        }};
+        };
         evidence
     }
 
     fn health(prior: &[ObservedEvidence], current: &[ObservedEvidence]) -> bool {
-        let fresh = crate::path_identity::fresh_novel_observed_evidence_fingerprints(prior, current);
+        let fresh =
+            crate::path_identity::fresh_novel_observed_evidence_fingerprints(prior, current);
         fresh_execution_health_progress(prior, current, &fresh)
     }
 
     #[test]
     fn ordinary_programming_health_continues_beyond_original_model_step_threshold() {
         let lease = crate::execution_core::SafetyFusePolicy::derive(
-            128_000, harness_contract::core::TaskComplexity::Moderate, None,
+            128_000,
+            harness_contract::core::TaskComplexity::Moderate,
+            None,
         );
         let mut previous = ObjectiveMilestones::default();
         let mut prior = Vec::new();
@@ -5498,12 +6380,17 @@ mod own865_execution_health_tests {
             let observed = workspace(&format!("{step:064x}"));
             let mut current = ObjectiveMilestones::default();
             let progress = execution_progress_advanced(
-                &previous, &mut current, false, health(&prior, std::slice::from_ref(&observed)),
+                &previous,
+                &mut current,
+                false,
+                health(&prior, std::slice::from_ref(&observed)),
             );
             assert!(progress);
             streak = next_unverified_model_step_streak(streak, progress);
-            assert!(matches!(crate::execution_core::SafetyFusePolicy::evaluate(&lease, streak, progress),
-                crate::execution_core::SafetyFuseDecision::Continue));
+            assert!(matches!(
+                crate::execution_core::SafetyFusePolicy::evaluate(&lease, streak, progress),
+                crate::execution_core::SafetyFuseDecision::Continue
+            ));
             assert!(!current.convergence_started);
             previous = current;
             prior.push(observed);
@@ -5516,14 +6403,19 @@ mod own865_execution_health_tests {
         let original = workspace(&"1".repeat(64));
         let mut duplicate = original.clone();
         duplicate.observed_at_sequence += 1;
-        assert!(!health(std::slice::from_ref(&original), std::slice::from_ref(&duplicate)));
+        assert!(!health(
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&duplicate)
+        ));
         duplicate.provenance = ObservedEvidenceProvenance::RetainedReplay;
         assert!(!health(&[], std::slice::from_ref(&duplicate)));
         let mut unchanged_write = original.clone();
         if let EvidenceTargetIdentity::Workspace { scope } = &mut unchanged_write.target {
             scope.access_mode = WorkspaceAccessMode::Write;
         }
-        unchanged_write.workspace_prior_state = Some(WorkspacePriorState::Existing { sha256: "1".repeat(64) });
+        unchanged_write.workspace_prior_state = Some(WorkspacePriorState::Existing {
+            sha256: "1".repeat(64),
+        });
         assert!(!health(&[], std::slice::from_ref(&unchanged_write)));
         assert!(!health(&[], &[]));
     }
@@ -5543,23 +6435,34 @@ mod own865_execution_health_tests {
                 closure.init_host_pid += 1;
             }
         }
-        assert!(!health(std::slice::from_ref(&original), std::slice::from_ref(&duplicate)));
+        assert!(!health(
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&duplicate)
+        ));
         if let EvidenceTargetIdentity::ToolExecution { execution } = &mut duplicate.target {
             execution.stdout_sha256 = "9".repeat(64);
         }
-        assert!(health(std::slice::from_ref(&original), std::slice::from_ref(&duplicate)));
+        assert!(health(
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&duplicate)
+        ));
         if let EvidenceTargetIdentity::ToolExecution { execution } = &mut duplicate.target {
             if let ToolExecutionTerminal::Settled { exit_code, .. } = &mut execution.terminal {
                 *exit_code = Some(1);
             }
         }
-        assert!(!health(std::slice::from_ref(&original), std::slice::from_ref(&duplicate)));
+        assert!(!health(
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&duplicate)
+        ));
     }
 
     #[test]
     fn actual_typed_convergence_latches_and_304_step_churn_still_fuses() {
         let lease = crate::execution_core::SafetyFusePolicy::derive(
-            128_000, harness_contract::core::TaskComplexity::Moderate, None,
+            128_000,
+            harness_contract::core::TaskComplexity::Moderate,
+            None,
         );
         let mut previous = ObjectiveMilestones::default();
         let mut streak = 0;
@@ -5571,25 +6474,51 @@ mod own865_execution_health_tests {
             streak = next_unverified_model_step_streak(streak, progress);
             previous = current;
         }
-        assert!(matches!(crate::execution_core::SafetyFusePolicy::evaluate(&lease, streak, false),
-            crate::execution_core::SafetyFuseDecision::Block { .. }));
+        assert!(matches!(
+            crate::execution_core::SafetyFusePolicy::evaluate(&lease, streak, false),
+            crate::execution_core::SafetyFuseDecision::Block { .. }
+        ));
         let mut requested = previous.clone();
         requested.completion_requested = true;
-        assert!(execution_progress_advanced(&previous, &mut requested, false, false));
+        assert!(execution_progress_advanced(
+            &previous,
+            &mut requested,
+            false,
+            false
+        ));
         assert_eq!(next_unverified_model_step_streak(streak, true), 0);
         previous = requested.clone();
-        assert!(!execution_progress_advanced(&previous, &mut requested, false, true));
+        assert!(!execution_progress_advanced(
+            &previous,
+            &mut requested,
+            false,
+            true
+        ));
     }
 
     #[test]
     fn completion_request_and_verdict_restrict_health_without_program_title_or_host_flags() {
         for mut current in [
-            ObjectiveMilestones { completion_requested: true, ..Default::default() },
-            ObjectiveMilestones { verdict_bound: true, ..Default::default() },
-            ObjectiveMilestones { objective_reviews: 1, ..Default::default() },
+            ObjectiveMilestones {
+                completion_requested: true,
+                ..Default::default()
+            },
+            ObjectiveMilestones {
+                verdict_bound: true,
+                ..Default::default()
+            },
+            ObjectiveMilestones {
+                objective_reviews: 1,
+                ..Default::default()
+            },
         ] {
             let before = current.clone();
-            assert!(!execution_progress_advanced(&before, &mut current, false, true));
+            assert!(!execution_progress_advanced(
+                &before,
+                &mut current,
+                false,
+                true
+            ));
             assert!(current.convergence_started);
         }
     }
@@ -5604,10 +6533,20 @@ mod own865_execution_health_tests {
             minimum_team_count: 1,
             exact_team_count: None,
         };
-        assert!(!collaboration_budget_elapsed(Some(&obligation), false,
-            std::time::Duration::from_secs(100), Some(std::time::Duration::from_secs(1)), made_progress));
-        assert!(collaboration_budget_elapsed(Some(&obligation), false,
-            std::time::Duration::from_secs(100), Some(std::time::Duration::from_secs(1)), stored_progress));
+        assert!(!collaboration_budget_elapsed(
+            Some(&obligation),
+            false,
+            std::time::Duration::from_secs(100),
+            Some(std::time::Duration::from_secs(1)),
+            made_progress
+        ));
+        assert!(collaboration_budget_elapsed(
+            Some(&obligation),
+            false,
+            std::time::Duration::from_secs(100),
+            Some(std::time::Duration::from_secs(1)),
+            stored_progress
+        ));
     }
 }
 
@@ -6759,6 +7698,32 @@ where
             .await?;
             return Ok(outcome);
         }
+        let write_goal_id = self.state.lock().await.goal_id.clone();
+        let write_goal_source = self
+            .services
+            .goal_store()
+            .projection(&write_goal_id)
+            .map_err(|reason| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason,
+            })?
+            .ok_or_else(|| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "current Goal missing".into(),
+            })?;
+        let required_workspace_write_scopes = {
+            let state = self.state.lock().await;
+            current_turn_write_scopes(
+                &write_goal_source.goal,
+                state.execution_role.is_delegated_leaf(),
+                &state.focus_acceptance_scopes,
+                state
+                    .task_understanding
+                    .as_ref()
+                    .is_some_and(|understanding| understanding.requires_write),
+            )
+        };
+        let required_write_for_completion = !required_workspace_write_scopes.is_empty();
         let (prompter, iteration, session_id, model_lease, delegated_agent_role) = {
             let state = self.state.lock().await;
             (
@@ -7024,21 +7989,17 @@ where
                     .iter()
                     .map(|invocation| (invocation.invocation_id.clone(), invocation.clone()))
                     .collect::<std::collections::HashMap<_, _>>();
-                // `requires_write` is a planning prediction, not a negative
-                // authorization grant. A false negative must not turn a
-                // user-requested artifact or a model-selected, otherwise
-                // authorized effect into a permanent capability gap. Only an
-                // explicit read-only user constraint is an effect-boundary
-                // deny, which keeps the boundary universal for future tools
-                // without reducing agent autonomy to a keyword classifier.
-                let task_explicitly_forbids_workspace_write =
-                    runtime.active_turn_strategy().is_some_and(|strategy| {
-                        strategy
-                            .decision
-                            .strategy
-                            .understanding
-                            .forbids_workspace_write
-                    });
+                let legacy_forbids_write = runtime.active_turn_strategy().is_some_and(|strategy| {
+                    strategy
+                        .decision
+                        .strategy
+                        .understanding
+                        .forbids_workspace_write
+                });
+                let forbids_write = current_turn_forbids_workspace_write(
+                    &write_goal_source.goal,
+                    legacy_forbids_write,
+                );
                 let mut governed_compilation = crate::GovernedToolCompiler
                     .compile_prepared_partial(
                         self.services.workspace_root(),
@@ -7051,32 +8012,13 @@ where
                         crate::step_snapshot::bind_plan_calls(plan, &calls);
                     }
                 }
-                let execution_decision = match governed_compilation
-                    .as_ref()
-                    .ok()
-                    .and_then(|compilation| compilation.plan.as_ref())
-                {
-                    Some(plan) => {
-                        let mut admission_plan = plan.clone();
-                        admission_plan
-                            .tasks
-                            .retain(|task| !receipt_invocations.contains_key(&task.tool_call_id));
-                        runtime.retarget_active_turn_strategy_for_governed_plan(
-                            &admission_plan,
-                            &calls,
-                        )
-                    }
-                    None => runtime
-                        .active_turn_strategy()
-                        .map(|strategy| strategy.decision)
-                        .ok_or_else(|| {
-                            RuntimeError::new("tool batch has no admitted strategy decision")
-                        }),
-                }
-                .map_err(|error| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: error.to_string(),
-                })?;
+                let execution_decision = runtime
+                    .active_turn_strategy()
+                    .map(|strategy| strategy.decision)
+                    .ok_or_else(|| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: "tool batch has no admitted turn identity".to_string(),
+                    })?;
                 let mut auths = std::collections::HashMap::new();
                 let mut gaps = std::collections::HashMap::new();
                 for call in &calls {
@@ -7088,16 +8030,17 @@ where
                         .find(|invocation| invocation.invocation_id == call.id)
                     {
                         let descriptor = invocation.effect.clone();
-                        if workspace_mutation_is_objectively_forbidden(
-                            task_explicitly_forbids_workspace_write,
-                            descriptor.required_permission,
-                        ) {
+                        let objective_refusal = crate::execution_core::goal::goal_tool_effect_rejection(
+                            &write_goal_source.goal, &descriptor, self.services.path_identity_resolver(),
+                        ).or_else(||workspace_mutation_is_objectively_forbidden(forbids_write,descriptor.required_permission)
+                            .then_some("original admitted user constraint prohibits workspace mutation"));
+                        if let Some(reason) = objective_refusal {
                             gaps.insert(
                                 call.id.clone(),
                                 synthetic_capability_gap(
                                     &descriptor,
                                     runtime.active_permission_mode(),
-                                    "the active user task explicitly prohibits workspace mutation; Runtime rejects mutating tool effects even under a full-trust session profile".to_string(),
+                                    reason.to_string(),
                                 ),
                             );
                             continue;
@@ -7170,9 +8113,13 @@ where
                 let runtime = self.runtime.lock().await;
                 if let Ok(compilation) = &governed_compilation {
                     if let Some(plan) = &compilation.plan {
-                        runtime.record_governed_tool_plan(plan).map_err(|error| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason: format!("persist original governed tool plan before execution: {error}"),
+                        runtime.record_governed_tool_plan(plan).map_err(|error| {
+                            NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason: format!(
+                                    "persist original governed tool plan before execution: {error}"
+                                ),
+                            }
                         })?;
                     }
                 }
@@ -7474,7 +8421,7 @@ where
                     durable_workspace_mutation_sequences,
                     &state.workspace_mutation_effect_sequences,
                 ),
-                state.required_workspace_write_scopes.clone(),
+                required_workspace_write_scopes.clone(),
             )
         };
         let verified_postcondition_writes = verified_workspace_postcondition_write_evidence(
@@ -7493,9 +8440,12 @@ where
                 &prior_observed_evidence,
                 &successful_observed_evidence,
             );
-        let fresh_execution_health = !successful_call_ids.is_empty() && fresh_execution_health_progress(
-            &prior_observed_evidence, &successful_observed_evidence, &new_observed_fingerprints,
-        );
+        let fresh_execution_health = !successful_call_ids.is_empty()
+            && fresh_execution_health_progress(
+                &prior_observed_evidence,
+                &successful_observed_evidence,
+                &new_observed_fingerprints,
+            );
         let successful_resource_scope_keys = successful_observed_evidence
             .iter()
             .map(crate::path_identity::observed_scope_key)
@@ -7814,7 +8764,10 @@ where
             executed_failures(
                 failed,
                 &calls,
-                &self.services.event_store().repetition_scope(&session_id, &turn_id),
+                &self
+                    .services
+                    .event_store()
+                    .repetition_scope(&session_id, &turn_id),
             ),
             false,
         );
@@ -7825,14 +8778,18 @@ where
         );
         let mut acquisition_milestones = current_objective_milestones.clone();
         let verified_batch_progress = execution_progress_advanced(
-            &state.previous_objective_milestones, &mut acquisition_milestones,
-            state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty()
+            &state.previous_objective_milestones,
+            &mut acquisition_milestones,
+            state.completion_gap_outstanding
+                || !state.outstanding_closure_rungs.is_empty()
                 || bounded_evidence_role,
             fresh_execution_health,
         );
         state.consecutive_low_novelty_batches = next_acquisition_stall_streak(
-            state.consecutive_low_novelty_batches, failed,
-            low_novelty || scope_saturated || evidence_saturated, verified_batch_progress,
+            state.consecutive_low_novelty_batches,
+            failed,
+            low_novelty || scope_saturated || evidence_saturated,
+            verified_batch_progress,
         );
         // ---- Loop-breaker and targeted runaway caps (nudge-first) ----------
         // A batch that repeats the same tool set, canonical arguments AND the
@@ -7867,8 +8824,10 @@ where
         // Diagnose only. The model keeps the decision; it is told the one fact it
         // was missing - that the call has been made before and produced this
         // result - and where the same bytes can be had without another call.
-        let repeat_turn =
-            self.services.event_store().repetition_scope(&state.session_id, &state.turn_id);
+        let repeat_turn = self
+            .services
+            .event_store()
+            .repetition_scope(&state.session_id, &state.turn_id);
         let repeated_calls = record_repeated_calls(&repeat_turn, &calls, &successful_call_ids);
         if let Some((tool, count)) = repeated_calls.first() {
             let repeated_tools = repeated_calls
@@ -7992,27 +8951,37 @@ where
             state.pending_next_model_context.push(item);
         }
         let batch_terminal_framing = crate::host::scope_turn_framing_for_role(
-            crate::host::agentic_turn_framing(self.services.as_ref(), &state.session_id,
-                &state.turn_id, state.iterations, state.tool_results.len(),
-                state.started_at.elapsed().as_millis()), state.execution_role);
+            crate::host::agentic_turn_framing(
+                self.services.as_ref(),
+                &state.session_id,
+                &state.turn_id,
+                state.iterations,
+                state.tool_results.len(),
+                state.started_at.elapsed().as_millis(),
+            ),
+            state.execution_role,
+        );
         let batch_forced_terminal_ready = forced_terminal_presentation_allowed(
             &batch_terminal_framing,
-            state.execution_role.is_delegated_leaf() && focus_acceptance_met
-                && delegated_protocol_for_batch.as_ref().is_none_or(DelegatedAgenticProtocolState::is_terminal),
+            state.execution_role.is_delegated_leaf()
+                && focus_acceptance_met
+                && delegated_protocol_for_batch
+                    .as_ref()
+                    .is_none_or(DelegatedAgenticProtocolState::is_terminal),
         );
         let acquisition_stall_streak = state.consecutive_low_novelty_batches;
         let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
         let repeated_evidence_saturation = state.consecutive_low_novelty_batches
             >= evidence_saturation_limit(bounded_evidence_role);
         let successful_write_observed = write_obligation_satisfied(
-            state.required_write_for_completion,
-            &state.required_workspace_write_scopes,
+            required_write_for_completion,
+            &required_workspace_write_scopes,
             &state.committed_workspace_observed_evidence,
             state.committed_workspace_write_observed,
             self.services.path_identity_resolver(),
         );
         let required_effects_pending = !focus_acceptance_pending_scopes.is_empty()
-            || (state.required_write_for_completion && !successful_write_observed);
+            || (required_write_for_completion && !successful_write_observed);
         let pending_delegated_action = pending_delegated_action_is_ready(
             delegated_protocol_for_batch.as_ref(),
             repeated_evidence_saturation,
@@ -8022,10 +8991,10 @@ where
             |protocol| {
                 protocol.terminal_action_ids().any(|tool| {
                     !crate::repetition_guard::cause_blocked_for_tool(
-                        &self.services.event_store().repetition_scope(
-                            &state.session_id,
-                            &state.turn_id,
-                        ),
+                        &self
+                            .services
+                            .event_store()
+                            .repetition_scope(&state.session_id, &state.turn_id),
                         tool,
                     )
                 })
@@ -8094,7 +9063,8 @@ where
             &focus_acceptance_scopes,
             self.services.workspace_root(),
         );
-        let focus_synthesis_ready = batch_forced_terminal_ready && !pending_delegated_action
+        let focus_synthesis_ready = batch_forced_terminal_ready
+            && !pending_delegated_action
             && delegated_protocol_after_batch.is_none()
             && should_force_focus_synthesis(
                 focus_acceptance_met,
@@ -8103,24 +9073,47 @@ where
                 has_retained_focus_terminal_candidate,
                 exact_workspace_evidence,
             );
-        let required_write_recovery = should_recover_missing_required_write(
-            state.required_write_for_completion,
-            bounded_evidence_role,
-            repeated_evidence_saturation,
-            &state.write_attempt_paths,
-            successful_write_observed,
-            state.required_write_replans,
-        );
+        let task_focus = state.execution_role.is_delegated_leaf().then_some((
+            required_workspace_write_scopes.as_slice(),
+            state.committed_workspace_observed_evidence.as_slice(),
+            state.committed_workspace_write_observed,
+        ));
+        let (write_decision, write_goal_cut) = self
+            .services
+            .goal_store()
+            .assess_write_checkpoint(
+                &write_goal_source,
+                ticket,
+                self.services.path_identity_resolver(),
+                GoalWriteCheckpoint::ToolProgress {
+                    bounded_role: bounded_evidence_role,
+                    saturated: repeated_evidence_saturation,
+                    write_attempted: !state.write_attempt_paths.is_empty(),
+                },
+                task_focus,
+                &successful_observed_evidence,
+            )
+            .map_err(|reason| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason,
+            })?;
+        let write_recovery = match write_decision {
+            GoalWriteDisposition::Recover(recovery) => Some(recovery),
+            GoalWriteDisposition::Satisfied | GoalWriteDisposition::Pending => None,
+            GoalWriteDisposition::Blocked(_) => {
+                unreachable!("tool progress never declares business exhaustion")
+            }
+        };
+        let required_write_recovery = write_recovery.is_some();
+        if required_write_recovery {
+            state.consecutive_low_novelty_batches = 0;
+        }
         let authorized_write_scopes = state
             .evaluation_resource_scopes
             .iter()
             .filter(|scope| scope.starts_with("write:"))
             .cloned()
             .collect::<Vec<_>>();
-        if required_write_recovery {
-            state.required_write_replans = state.required_write_replans.saturating_add(1);
-            state.consecutive_low_novelty_batches = 0;
-        }
         let has_successful_tool_evidence = state.successful_tool_calls > 0;
         let cold_start_failure_replan_available = super::cold_start_tool_failure_replan_available(
             has_successful_tool_evidence,
@@ -8201,7 +9194,8 @@ where
         state.last_verified_progress = execution_progress_advanced(
             &state.previous_objective_milestones,
             &mut current_objective_milestones,
-            state.completion_gap_outstanding || !state.outstanding_closure_rungs.is_empty()
+            state.completion_gap_outstanding
+                || !state.outstanding_closure_rungs.is_empty()
                 || pending_delegated_action,
             fresh_execution_health,
         );
@@ -8345,7 +9339,8 @@ where
         }
         let goal_id = state.goal_id.clone();
         drop(state);
-        if !pending_delegated_action && batch_forced_terminal_ready
+        if !pending_delegated_action
+            && batch_forced_terminal_ready
             && (focus_synthesis_ready
                 || (repeated_evidence_saturation
                     && !focus_acceptance_pending
@@ -8494,14 +9489,21 @@ where
         // same claimed work in a fresh graph. Preserve all model-led research
         // until this exact boundary, then require only the irreducible durable
         // closure action instead of synthesizing text.
-        if !batch_forced_terminal_ready && intervention.as_ref()
-            .is_some_and(|value| value.kind == RuntimeInterventionKind::Synthesize)
+        if !batch_forced_terminal_ready
+            && intervention
+                .as_ref()
+                .is_some_and(|value| value.kind == RuntimeInterventionKind::Synthesize)
         {
             if let Some(value) = intervention.as_mut() {
                 value.kind = if repeated_evidence_saturation {
-                    acquisition_saturation_intervention(false, acquisition_stall_streak,
-                        evidence_saturation_limit(bounded_evidence_role))
-                } else { RuntimeInterventionKind::Block };
+                    acquisition_saturation_intervention(
+                        false,
+                        acquisition_stall_streak,
+                        evidence_saturation_limit(bounded_evidence_role),
+                    )
+                } else {
+                    RuntimeInterventionKind::Block
+                };
                 value.reason = "Terminal completion is not verified. Retain governed actions for a bounded replan; unchanged acquisition or exhausted failure recovery must stop honestly partial, not assert that required evidence is complete.".into();
             }
         }
@@ -8509,7 +9511,10 @@ where
             && protocol_closure_can_be_required(
                 delegated_protocol_for_batch.as_ref(),
                 intervention.as_ref(),
-                &self.services.event_store().repetition_scope(&session_id, &turn_id),
+                &self
+                    .services
+                    .event_store()
+                    .repetition_scope(&session_id, &turn_id),
             );
         if protocol_closure_required {
             let protocol = delegated_protocol_for_batch
@@ -8723,6 +9728,16 @@ where
                         reason,
                     })?,
             );
+        }
+        outcome
+            .source_revisions
+            .insert(write_goal_cut.stream_id, write_goal_cut.expected_revision);
+
+        if let Some(recovery) = write_recovery {
+            outcome
+                .source_revisions
+                .insert(recovery.stream_id, recovery.expected_stream_revision);
+            outcome.domain_events.push(recovery.event);
         }
         if !continue_with_tool_batch || orchestration_terminal_summary.is_some() {
             let mut replan_nodes = vec![next];
@@ -9707,13 +10722,12 @@ mod closed_host_continuity_475_tests {
             identical_action_streak: 0,
             per_turn_tool_counts: BTreeMap::new(),
             write_attempt_paths: Vec::new(),
-            required_write_for_completion: false,
-            required_workspace_write_scopes: Vec::new(),
+
             committed_workspace_write_observed: false,
             committed_workspace_write_scopes: BTreeSet::new(),
             committed_workspace_observed_evidence: Vec::new(),
             workspace_mutation_effect_sequences: BTreeSet::new(),
-            required_write_replans: 0,
+
             max_tool_concurrency_observed: 0,
             parallel_tool_batches: 0,
             early_tool_receipts: BTreeMap::new(),
@@ -9722,7 +10736,7 @@ mod closed_host_continuity_475_tests {
             evaluation_judge_only: false,
             collaboration_started: false,
             pending_root_control_plane_requirement: None,
-            root_write_replans: 0,
+
             root_language_replan_attempted: false,
             pending_terminal_artifact: None,
             pending_controlled_recovery_claim_fingerprints: Vec::new(),

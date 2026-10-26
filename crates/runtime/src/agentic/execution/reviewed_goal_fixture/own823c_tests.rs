@@ -122,6 +122,7 @@ async fn root_delivery_review_case(file: bool) {
     assert!(registered_program.teams.is_empty() && registered_program.tasks.is_empty());
     assert_eq!(registered_program.artifacts[&result_ref].content_ref, selector);
     services.goal_store().create(GoalContract {
+        input_contract: None,
         id: "goal:root-agentic-execution".into(), session_id: "session-dispatch".into(),
         objective: "dispatch objective".into(), criteria: vec![AcceptanceCriterion {
             id: "reviewed-delivery".into(), statement: "Deliver the requested existing content with independent verification".into(),

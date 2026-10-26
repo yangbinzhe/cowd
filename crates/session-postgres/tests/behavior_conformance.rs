@@ -2388,3 +2388,1070 @@ fn recovery_manifest_tracks_transcript_outbox_and_external_signals() {
         1
     );
 }
+
+// C1/C2 exercise the original persistence owner, not a mocked preflight query.
+fn claim_application_receipt(
+    input_id: &str,
+    state: &str,
+    revision: u64,
+) -> harness_contract::input_disposition::SessionInputApplicationReceipt {
+    serde_json::from_value(serde_json::json!({
+        "disposition_id":"claim-disposition", "leader_input_id":input_id,
+        "input_ids":[input_id], "action":"amend_current_turn", "relation":"supplement",
+        "state":state, "objective":"apply the received user revision", "required":true,
+        "attempts":1, "summary":"original input application", "revision":revision,
+        "updated_at_ms":100,
+        "prepared_application": {
+            "artifact_ref":"artifact:claim-prepared", "artifact_sha256":"a".repeat(64),
+            "session_id":"claim-session", "session_generation":1,
+            "turn_id":format!("turn-{}", input_id.strip_prefix("input-").unwrap()),
+            "goal_id":"claim-goal", "goal_revision":3, "goal_spec_digest":"b".repeat(64),
+            "graph_id":"claim-graph", "graph_revision":4,
+            "node_id":"claim-node", "attempt_id":"claim-attempt",
+            "source_digest":"c".repeat(64)
+        }
+    }))
+    .unwrap()
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn applied_user_revision_preserves_the_original_root_terminal_ack() {
+    assert_prepared_business_preserves_original_root_ack(
+        harness_contract::input_disposition::InputDispositionAction::AmendCurrentTurn,
+        false,
+        false,
+    );
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn prepared_progress_and_clarification_preserve_the_original_root_terminal_ack() {
+    use harness_contract::input_disposition::InputDispositionAction;
+    for action in [
+        InputDispositionAction::ProgressOrControl,
+        InputDispositionAction::Clarify,
+    ] {
+        assert_prepared_business_preserves_original_root_ack(action, false, false);
+    }
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn original_reserved_business_receipt_can_settle_after_terminal_cancel_but_fresh_cannot() {
+    assert_prepared_business_preserves_original_root_ack(
+        harness_contract::input_disposition::InputDispositionAction::AmendCurrentTurn,
+        true,
+        false,
+    );
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn applied_prepared_cause_remains_recoverable_until_root_ack_without_replaying_a_completed_root() {
+    assert_prepared_business_preserves_original_root_ack(
+        harness_contract::input_disposition::InputDispositionAction::AmendCurrentTurn,
+        false,
+        true,
+    );
+}
+
+fn assert_prepared_business_preserves_original_root_ack(
+    action: harness_contract::input_disposition::InputDispositionAction,
+    terminal_cancel: bool,
+    require_applied_pending: bool,
+) {
+    use harness_contract::input_disposition::{
+        InputApplicationState, InputDispositionAction, InputWorkRelation,
+    };
+    let (_fixture, store) = make_store();
+    store.create_session(&make_record("claim-session")).unwrap();
+    let input = store
+        .append_ingress_with_runtime_outbox(
+            "claim-session",
+            "user",
+            Some(r#"[{"type":"text","text":"revise the current business objective"}]"#),
+            100,
+            &ingress_request(
+                "adopt-root",
+                1,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                100,
+            ),
+        )
+        .unwrap();
+    let claimed = store
+        .claim_session_runtime_outbox("original-root-owner", 101, 10_000, 1, &[])
+        .unwrap()
+        .remove(0);
+    let token = claimed.claim_token.as_ref().unwrap();
+    let running = store
+        .mark_session_runtime_outbox_running(
+            &input.request_id,
+            "original-root-owner",
+            1,
+            token,
+            claimed.revision,
+            102,
+        )
+        .unwrap();
+    let mut receipt = claim_application_receipt(&input.input_id, "prepared", 0);
+    receipt.action = action;
+    if action == InputDispositionAction::ProgressOrControl {
+        receipt.relation = InputWorkRelation::Progress;
+    }
+    let mut foreign = receipt.clone();
+    foreign.prepared_application.as_mut().unwrap().session_id = "foreign-session".into();
+    let rejected = store.set_session_input_application_receipt(
+        std::slice::from_ref(&input.input_id),
+        &[running.revision],
+        &foreign,
+        103,
+    );
+    assert!(
+        matches!(rejected, Err(session::SessionError::StaleExecutionFence(ref reason))
+        if reason == "prepared application source target mismatch")
+    );
+    assert_eq!(
+        store
+            .get_session_runtime_outbox(&input.request_id)
+            .unwrap()
+            .unwrap(),
+        running,
+        "a foreign prepared source must leave the real root input untouched"
+    );
+    let mut row = running.clone();
+    for (state, revision) in [
+        (InputApplicationState::Prepared, 0),
+        (InputApplicationState::Materializing, 1),
+        (InputApplicationState::Applied, 2),
+    ] {
+        if terminal_cancel && state == InputApplicationState::Applied {
+            break;
+        }
+        receipt.state = state;
+        receipt.revision = revision;
+        row = store
+            .set_session_input_application_receipt(
+                std::slice::from_ref(&input.input_id),
+                &[row.revision],
+                &receipt,
+                103 + revision,
+            )
+            .unwrap()
+            .remove(0);
+    }
+    if terminal_cancel {
+        let requested = store
+            .cancel_session_runtime_outbox(
+                &input.input_id,
+                1,
+                row.revision,
+                "user",
+                "cancel the original root",
+                106,
+            )
+            .unwrap();
+        assert_eq!(
+            requested.status,
+            SessionRuntimeInputStatus::Running,
+            "reservation cannot pretend cancellation is settled"
+        );
+        let cancelled = store
+            .ack_session_runtime_outbox(
+                &input.request_id,
+                "original-root-owner",
+                1,
+                token,
+                requested.revision,
+                SessionRuntimeInputStatus::Cancelled,
+                42,
+                107,
+            )
+            .unwrap();
+        assert_eq!(cancelled.status, SessionRuntimeInputStatus::Cancelled);
+        let mut applied = cancelled.application_receipt.clone().unwrap();
+        applied.state = InputApplicationState::Applied;
+        applied.revision += 1;
+        let mut wrong = applied.clone();
+        wrong.prepared_application.as_mut().unwrap().graph_revision += 1;
+        let refused = store.set_session_input_application_receipt(
+            std::slice::from_ref(&input.input_id),
+            &[cancelled.revision],
+            &wrong,
+            108,
+        );
+        assert!(
+            matches!(refused,Err(session::SessionError::InvalidArgument(ref reason)) if reason.contains("application receipt transition is invalid"))
+        );
+        assert_eq!(
+            store
+                .get_session_runtime_outbox(&input.request_id)
+                .unwrap()
+                .unwrap(),
+            cancelled,
+            "foreign prepared identity cannot borrow the cancelled reservation"
+        );
+        let settled = store
+            .set_session_input_application_receipt(
+                std::slice::from_ref(&input.input_id),
+                &[cancelled.revision],
+                &applied,
+                109,
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            settled.status,
+            SessionRuntimeInputStatus::Cancelled,
+            "recording an admitted fact cannot reopen the root"
+        );
+        assert_eq!(settled.decision, InputRoutingDecision::StartNewTurn);
+        assert_eq!(settled.application_receipt.as_ref(), Some(&applied));
+        assert!(settled
+            .application_receipt
+            .as_ref()
+            .unwrap()
+            .cancellation
+            .is_some());
+        let mut fresh = claim_application_receipt(&input.input_id, "prepared", 0);
+        fresh.disposition_id = "fresh-after-cancel".into();
+        let refused = store.set_session_input_application_receipt(
+            std::slice::from_ref(&input.input_id),
+            &[settled.revision],
+            &fresh,
+            110,
+        );
+        assert!(
+            matches!(refused,Err(session::SessionError::StaleExecutionFence(ref reason)) if reason.contains("terminal status forbids application"))
+        );
+        assert_eq!(
+            store
+                .get_session_runtime_outbox(&input.request_id)
+                .unwrap()
+                .unwrap(),
+            settled
+        );
+        return;
+    }
+    if require_applied_pending {
+        let pending = store
+            .pending_session_input_applications("claim-session", 1, None, 1)
+            .unwrap();
+        assert_eq!(pending.iter().map(|row|row.input_id.as_str()).collect::<Vec<_>>(),vec![input.input_id.as_str()],
+            "Applied is a Goal fact, not proof that the original root Graph/transcript/ACK has finished");
+        assert_eq!(
+            store
+                .list_required_session_recovery_manifests(0, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    // Business adoption and the root execution's terminal publication are
+    // different facts. Use the original ACK owner with the actual new revision.
+    let acknowledged = store.ack_session_runtime_outbox(
+        &input.request_id,
+        "original-root-owner",
+        1,
+        token,
+        row.revision,
+        SessionRuntimeInputStatus::Completed,
+        42,
+        110,
+    );
+    assert!(acknowledged.is_ok(),
+        "Applied business input must not steal the original root ACK: status={:?}, decision={:?}, error={:?}",
+        row.status, row.decision, acknowledged.as_ref().err());
+    let acknowledged = acknowledged.unwrap();
+    assert_eq!(acknowledged.status, SessionRuntimeInputStatus::Completed);
+    assert_eq!(acknowledged.decision, InputRoutingDecision::StartNewTurn);
+    assert_eq!(acknowledged.runtime_commit_cursor, Some(42));
+    assert_eq!(acknowledged.application_receipt.as_ref(), Some(&receipt));
+    assert!(acknowledged.claim_token.is_none());
+    if require_applied_pending {
+        assert!(store.pending_session_input_applications("claim-session",1,None,1).unwrap().is_empty(),
+            "a completed root cannot become a new input merely because its immutable application receipt remains");
+        assert!(store
+            .list_required_session_recovery_manifests(0, 1)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn application_cancel_first_rejects_adoption_even_at_latest_revision() {
+    let (_fixture, store) = make_store();
+    store.create_session(&make_record("claim-session")).unwrap();
+    let input = store
+        .append_ingress_with_runtime_outbox(
+            "claim-session",
+            "user",
+            Some(r#"[{"type":"text","text":"revise"}]"#),
+            100,
+            &ingress_request(
+                "claim-first",
+                1,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                100,
+            ),
+        )
+        .unwrap();
+    let cancelled = store
+        .cancel_session_runtime_outbox(
+            &input.input_id,
+            1,
+            input.revision,
+            "user",
+            "withdraw input",
+            101,
+        )
+        .unwrap();
+    let result = store.set_session_input_application_receipt(
+        std::slice::from_ref(&input.input_id),
+        &[cancelled.revision],
+        &claim_application_receipt(&input.input_id, "prepared", 0),
+        102,
+    );
+    assert!(
+        result.is_err(),
+        "cancelled input must not acquire an application receipt at its latest revision"
+    );
+    assert_eq!(
+        store
+            .get_session_runtime_outbox_by_input_id(&input.input_id)
+            .unwrap()
+            .unwrap(),
+        cancelled
+    );
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn application_reservation_first_preserves_pending_cancel_instead_of_cancelled() {
+    let (_fixture, store) = make_store();
+    store.create_session(&make_record("claim-session")).unwrap();
+    let input = store
+        .append_ingress_with_runtime_outbox(
+            "claim-session",
+            "user",
+            Some(r#"[{"type":"text","text":"revise"}]"#),
+            100,
+            &ingress_request(
+                "reservation-first",
+                1,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                100,
+            ),
+        )
+        .unwrap();
+    let prepared = store
+        .set_session_input_application_receipt(
+            std::slice::from_ref(&input.input_id),
+            &[input.revision],
+            &claim_application_receipt(&input.input_id, "prepared", 0),
+            101,
+        )
+        .unwrap()
+        .remove(0);
+    let reserved = store
+        .set_session_input_application_receipt(
+            std::slice::from_ref(&input.input_id),
+            &[prepared.revision],
+            &claim_application_receipt(&input.input_id, "materializing", 1),
+            102,
+        )
+        .unwrap()
+        .remove(0);
+    let cancelled = store
+        .cancel_session_runtime_outbox(
+            &input.input_id,
+            1,
+            reserved.revision,
+            "user",
+            "withdraw input",
+            103,
+        )
+        .unwrap();
+    assert_ne!(cancelled.status, SessionRuntimeInputStatus::Cancelled,
+        "an accepted reservation must remain pending until original application/execution settlement");
+    let receipt = serde_json::to_value(cancelled.application_receipt.as_ref().unwrap()).unwrap();
+    assert_eq!(receipt["state"], "materializing");
+    assert_eq!(receipt["cancellation"]["state"], "requested");
+    assert_eq!(receipt["cancellation"]["actor"], "user");
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn application_batch_cancel_is_atomic_and_cannot_be_erased_by_receipt_commit() {
+    use harness_contract::input_disposition::InputApplicationState;
+    let (_fixture, store) = make_store();
+    store.create_session(&make_record("claim-session")).unwrap();
+    let mut inputs = Vec::new();
+    for id in ["batch-a", "batch-b"] {
+        inputs.push(
+            store
+                .append_ingress_with_runtime_outbox(
+                    "claim-session",
+                    "user",
+                    Some(r#"[{"type":"text","text":"revise"}]"#),
+                    100,
+                    &ingress_request(
+                        id,
+                        1,
+                        InputRoutingDecision::SupplementCurrentTurn,
+                        Some("turn-batch-a"),
+                        100,
+                    ),
+                )
+                .unwrap(),
+        );
+    }
+    let ids = inputs
+        .iter()
+        .rev()
+        .map(|r| r.input_id.clone())
+        .collect::<Vec<_>>();
+    let mut receipt = claim_application_receipt(&inputs[0].input_id, "prepared", 0);
+    receipt.input_ids = inputs.iter().map(|r| r.input_id.clone()).collect();
+    let prepared = store
+        .set_session_input_application_receipt(
+            &ids,
+            &inputs.iter().rev().map(|r| r.revision).collect::<Vec<_>>(),
+            &receipt,
+            101,
+        )
+        .unwrap();
+    assert_eq!(
+        prepared.iter().map(|r| &r.input_id).collect::<Vec<_>>(),
+        ids.iter().collect::<Vec<_>>()
+    );
+    receipt.state = InputApplicationState::Materializing;
+    receipt.revision = 1;
+    let reserved = store
+        .set_session_input_application_receipt(
+            &ids,
+            &prepared.iter().map(|r| r.revision).collect::<Vec<_>>(),
+            &receipt,
+            102,
+        )
+        .unwrap();
+    let cancelled = store
+        .cancel_session_runtime_outbox(
+            &inputs[1].input_id,
+            1,
+            reserved[0].revision,
+            "user",
+            "stop this application",
+            103,
+        )
+        .unwrap();
+    let rows = ids
+        .iter()
+        .map(|id| {
+            store
+                .get_session_runtime_outbox_by_input_id(id)
+                .unwrap()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows[0].application_receipt, rows[1].application_receipt);
+    assert_eq!(rows[0].application_receipt, cancelled.application_receipt);
+    assert!(rows
+        .iter()
+        .all(|r| r.status != SessionRuntimeInputStatus::Cancelled));
+    let revisions = rows.iter().map(|r| r.revision).collect::<Vec<_>>();
+    receipt.state = InputApplicationState::Applied;
+    receipt.revision = cancelled.application_receipt.as_ref().unwrap().revision + 1;
+    assert!(
+        store
+            .set_session_input_application_receipt(&ids, &revisions, &receipt, 104)
+            .is_err(),
+        "a latest row revision cannot erase an independent cancellation request"
+    );
+    let mut applied = cancelled.application_receipt.unwrap();
+    applied.state = InputApplicationState::Applied;
+    applied.revision += 1;
+    let mut foreign = applied.clone();
+    foreign
+        .prepared_application
+        .as_mut()
+        .unwrap()
+        .graph_revision += 1;
+    assert!(store
+        .set_session_input_application_receipt(&ids, &revisions, &foreign, 104)
+        .is_err());
+    let committed = store
+        .set_session_input_application_receipt(&ids, &revisions, &applied, 104)
+        .unwrap();
+    assert!(committed
+        .iter()
+        .all(|r| r.application_receipt.as_ref() == Some(&applied)));
+    assert!(committed.iter().all(|r| r
+        .application_receipt
+        .as_ref()
+        .unwrap()
+        .cancellation
+        .is_some()));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn application_member_cancel_before_reservation_rejects_the_entire_batch() {
+    let (_fixture, store) = make_store();
+    store.create_session(&make_record("claim-session")).unwrap();
+    let mut inputs = Vec::new();
+    for id in ["batch-a", "batch-b"] {
+        inputs.push(
+            store
+                .append_ingress_with_runtime_outbox(
+                    "claim-session",
+                    "user",
+                    Some(r#"[{"type":"text","text":"revise"}]"#),
+                    100,
+                    &ingress_request(
+                        id,
+                        1,
+                        InputRoutingDecision::SupplementCurrentTurn,
+                        Some("turn-batch-a"),
+                        100,
+                    ),
+                )
+                .unwrap(),
+        );
+    }
+    let ids = inputs
+        .iter()
+        .map(|r| r.input_id.clone())
+        .collect::<Vec<_>>();
+    let mut receipt = claim_application_receipt(&inputs[0].input_id, "prepared", 0);
+    receipt.input_ids = ids.clone();
+    let prepared = store
+        .set_session_input_application_receipt(
+            &ids,
+            &inputs.iter().map(|r| r.revision).collect::<Vec<_>>(),
+            &receipt,
+            101,
+        )
+        .unwrap();
+    let cancelled = store
+        .cancel_session_runtime_outbox(
+            &ids[1],
+            1,
+            prepared[1].revision,
+            "user",
+            "withdraw one member",
+            102,
+        )
+        .unwrap();
+    let peer_after_cancel = store
+        .get_session_runtime_outbox_by_input_id(&ids[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer_after_cancel.status, prepared[0].status);
+    assert_eq!(
+        peer_after_cancel
+            .application_receipt
+            .as_ref()
+            .unwrap()
+            .state,
+        harness_contract::input_disposition::InputApplicationState::Failed
+    );
+    assert_eq!(peer_after_cancel.application_receipt, cancelled.application_receipt,
+        "the original Prepared group fails atomically; no peer retains a phantom Prepared obligation");
+    receipt.state = harness_contract::input_disposition::InputApplicationState::Materializing;
+    receipt.revision = 1;
+    assert!(store
+        .set_session_input_application_receipt(
+            &ids,
+            &[peer_after_cancel.revision, cancelled.revision],
+            &receipt,
+            103,
+        )
+        .is_err());
+    assert_eq!(
+        store
+            .get_session_runtime_outbox_by_input_id(&ids[0])
+            .unwrap()
+            .unwrap(),
+        peer_after_cancel
+    );
+    assert_eq!(
+        store
+            .get_session_runtime_outbox_by_input_id(&ids[1])
+            .unwrap()
+            .unwrap(),
+        cancelled
+    );
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn application_cancel_and_reservation_share_the_real_row_lock_linearization() {
+    use std::sync::{Arc, Barrier};
+    let (fixture, store) = make_store();
+    store.create_session(&make_record("claim-session")).unwrap();
+    let input = store
+        .append_ingress_with_runtime_outbox(
+            "claim-session",
+            "user",
+            Some(r#"[{"type":"text","text":"revise"}]"#),
+            100,
+            &ingress_request("race", 1, InputRoutingDecision::StartNewTurn, None, 100),
+        )
+        .unwrap();
+    let prepared = store
+        .set_session_input_application_receipt(
+            std::slice::from_ref(&input.input_id),
+            &[input.revision],
+            &claim_application_receipt(&input.input_id, "prepared", 0),
+            101,
+        )
+        .unwrap()
+        .remove(0);
+    let other_store = PostgresSessionStore::new(fixture.reconnect()).unwrap();
+    let gate = Arc::new(Barrier::new(2));
+    let other_gate = gate.clone();
+    let id = input.input_id.clone();
+    let revision = prepared.revision;
+    let handle = std::thread::spawn(move || {
+        other_gate.wait();
+        other_store.cancel_session_runtime_outbox(
+            &id,
+            1,
+            revision,
+            "user",
+            "concurrent withdrawal",
+            103,
+        )
+    });
+    gate.wait();
+    let reserved = store.set_session_input_application_receipt(
+        std::slice::from_ref(&input.input_id),
+        &[revision],
+        &claim_application_receipt(&input.input_id, "materializing", 1),
+        102,
+    );
+    let cancelled = handle.join().unwrap();
+    assert_ne!(
+        reserved.is_ok(),
+        cancelled.is_ok(),
+        "exactly one same-revision transition must win"
+    );
+    let current = store
+        .get_session_runtime_outbox_by_input_id(&input.input_id)
+        .unwrap()
+        .unwrap();
+    match (reserved, cancelled) {
+        (Ok(_), Err(_)) => {
+            assert_ne!(current.status, SessionRuntimeInputStatus::Cancelled);
+            let pending = store
+                .cancel_session_runtime_outbox(
+                    &input.input_id,
+                    1,
+                    current.revision,
+                    "user",
+                    "concurrent withdrawal",
+                    104,
+                )
+                .unwrap();
+            assert_ne!(pending.status, SessionRuntimeInputStatus::Cancelled);
+            assert!(pending.application_receipt.unwrap().cancellation.is_some());
+        }
+        (Err(_), Ok(_)) => {
+            assert_eq!(current.status, SessionRuntimeInputStatus::Cancelled);
+            assert!(store
+                .set_session_input_application_receipt(
+                    std::slice::from_ref(&input.input_id),
+                    &[current.revision],
+                    &claim_application_receipt(&input.input_id, "materializing", 1),
+                    104,
+                )
+                .is_err());
+        }
+        _ => unreachable!("one winner"),
+    }
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn pending_application_pages_recover_deep_consumed_history_and_keep_source_cas() {
+    use harness_contract::input_disposition::{
+        InputApplicationCancellationState, InputApplicationState,
+    };
+    let (fixture, store) = make_store();
+    store.create_session(&make_record("claim-session")).unwrap();
+    let mut pending_ids = Vec::new();
+    for (id, final_state, cancellation) in [
+        ("pending-prepared", InputApplicationState::Prepared, "none"),
+        (
+            "pending-materializing",
+            InputApplicationState::Materializing,
+            "none",
+        ),
+        (
+            "pending-applied-cancel",
+            InputApplicationState::Applied,
+            "requested",
+        ),
+        ("history-applied", InputApplicationState::Applied, "none"),
+        ("history-settled", InputApplicationState::Applied, "settled"),
+    ] {
+        let input = store
+            .append_ingress_with_runtime_outbox(
+                "claim-session",
+                "user",
+                Some(r#"[{"type":"text","text":"original input"}]"#),
+                100,
+                &ingress_request(id, 1, InputRoutingDecision::StartNewTurn, None, 100),
+            )
+            .unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("worker", 101, 1_000, 1, &[])
+            .unwrap()
+            .remove(0);
+        assert_eq!(claimed.input_id, input.input_id);
+        let token = claimed.claim_token.as_ref().unwrap();
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &input.request_id,
+                "worker",
+                1,
+                token,
+                claimed.revision,
+                102,
+            )
+            .unwrap();
+        let mut receipt = claim_application_receipt(&input.input_id, "prepared", 0);
+        // This fixture tests the original receipt's query eligibility, not Goal
+        // adoption or a fabricated execution/closure. Progress has no business delta.
+        receipt.action =
+            harness_contract::input_disposition::InputDispositionAction::ProgressOrControl;
+        receipt.relation = harness_contract::input_disposition::InputWorkRelation::Progress;
+        let mut row = store
+            .set_session_input_application_receipt(
+                std::slice::from_ref(&input.input_id),
+                &[running.revision],
+                &receipt,
+                103,
+            )
+            .unwrap()
+            .remove(0);
+        if final_state != InputApplicationState::Prepared {
+            receipt.state = InputApplicationState::Materializing;
+            receipt.revision += 1;
+            row = store
+                .set_session_input_application_receipt(
+                    std::slice::from_ref(&input.input_id),
+                    &[row.revision],
+                    &receipt,
+                    104,
+                )
+                .unwrap()
+                .remove(0);
+        }
+        row = store
+            .ack_session_runtime_outbox(
+                &input.request_id,
+                "worker",
+                1,
+                token,
+                row.revision,
+                SessionRuntimeInputStatus::Completed,
+                42,
+                105,
+            )
+            .unwrap();
+        if final_state == InputApplicationState::Applied {
+            receipt.state = InputApplicationState::Applied;
+            receipt.revision += 1;
+            row = store
+                .set_session_input_application_receipt(
+                    std::slice::from_ref(&input.input_id),
+                    &[row.revision],
+                    &receipt,
+                    106,
+                )
+                .unwrap()
+                .remove(0);
+        }
+        if cancellation != "none" {
+            row = store
+                .cancel_session_runtime_outbox(
+                    &input.input_id,
+                    1,
+                    row.revision,
+                    "user",
+                    "stop original execution",
+                    107,
+                )
+                .unwrap();
+        }
+        if cancellation == "settled" {
+            let mut settled = row.application_receipt.clone().unwrap();
+            let cancel = settled.cancellation.as_mut().unwrap();
+            cancel.state = InputApplicationCancellationState::Settled;
+            cancel.settlement_ref = Some("query-fixture:original-settlement-reference".into());
+            settled.revision += 1;
+            row = store
+                .set_session_input_application_receipt(
+                    std::slice::from_ref(&input.input_id),
+                    &[row.revision],
+                    &settled,
+                    108,
+                )
+                .unwrap()
+                .remove(0);
+        }
+        assert_eq!(row.status, SessionRuntimeInputStatus::Completed);
+        if id.starts_with("pending-") {
+            pending_ids.push(input.input_id);
+        }
+    }
+    // Historical nonpending rows only. No Goal/Graph projection is changed by
+    // this bulk history fixture; the application records above used real APIs.
+    let executor = fixture.reconnect();
+    let mut connection = executor.checkout_critical().unwrap();
+    connection.batch_execute("INSERT INTO session_messages(stable_message_id,session_id,sequence,role,content_json,blocks_count,created_at_ms)
+        SELECT 'older-window-message-'||n,'claim-session',1000+n,'user','[]',0,20000+n
+        FROM generate_series(0,599) n;
+        INSERT INTO session_runtime_outbox(request_id,turn_id,message_id,session_id,sequence,status,next_attempt_at_ms,
+            created_at_ms,updated_at_ms,input_id,session_generation,decision)
+        SELECT 'older-window-request-'||n,'older-window-turn-'||n,'older-window-message-'||n,'claim-session',1000+n,
+            'completed',0,20000+n,20000+n,'older-window-input-'||n,1,'start_new_turn'
+        FROM generate_series(0,599) n;").unwrap();
+    drop(connection);
+    assert_eq!(
+        store
+            .session_runtime_outbox_for_session("claim-session", 500)
+            .unwrap()
+            .len(),
+        500
+    );
+    assert!(store
+        .session_runtime_outbox_for_session("claim-session", 500)
+        .unwrap()
+        .iter()
+        .all(|r| !pending_ids.contains(&r.input_id)));
+    assert!(
+        !store
+            .get_session_recovery_manifest("claim-session")
+            .unwrap()
+            .unwrap()
+            .in_flight_turn
+    );
+    drop(store);
+    let reopened = PostgresSessionStore::new(fixture.reconnect()).unwrap();
+    let required = reopened
+        .list_required_session_recovery_manifests(0, 10)
+        .unwrap();
+    assert_eq!(
+        required
+            .iter()
+            .map(|r| r.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claim-session"]
+    );
+    assert!(reopened
+        .pending_session_input_applications("foreign-session", 1, None, 1)
+        .unwrap()
+        .is_empty());
+    assert!(reopened
+        .pending_session_input_applications("claim-session", 2, None, 1)
+        .unwrap()
+        .is_empty());
+    assert!(reopened
+        .pending_session_input_applications("claim-session", 1, None, 129)
+        .is_err());
+    let first = reopened
+        .pending_session_input_applications("claim-session", 1, None, 1)
+        .unwrap()
+        .remove(0);
+    assert_eq!(first.input_id, pending_ids[0]);
+    assert_eq!(first.status, SessionRuntimeInputStatus::Completed);
+    let cancelled = reopened
+        .cancel_session_runtime_outbox(
+            &first.input_id,
+            1,
+            first.revision,
+            "user",
+            "cancel between pages",
+            1,
+        )
+        .unwrap();
+    assert_eq!(cancelled.status, SessionRuntimeInputStatus::Cancelled);
+    let mut stale = first.application_receipt.clone().unwrap();
+    stale.state = InputApplicationState::Materializing;
+    stale.revision += 1;
+    assert!(matches!(
+        reopened.set_session_input_application_receipt(
+            std::slice::from_ref(&first.input_id),
+            &[first.revision],
+            &stale,
+            110,
+        ),
+        Err(SessionError::StaleExecutionFence(_))
+    ));
+    let mut seen = vec![first.input_id.clone()];
+    let mut cursor = Some((first.sequence, first.input_id));
+    for _ in 0..4 {
+        let page = reopened
+            .pending_session_input_applications("claim-session", 1, cursor.clone(), 1)
+            .unwrap();
+        let Some(row) = page.first() else { break };
+        assert_eq!(row.status, SessionRuntimeInputStatus::Completed);
+        cursor = Some((row.sequence, row.input_id.clone()));
+        seen.push(row.input_id.clone());
+    }
+    assert_eq!(
+        seen, pending_ids,
+        "stable immutable cursor, independent of timestamp mutation"
+    );
+    let mut record = reopened.get_session("claim-session").unwrap().unwrap();
+    record.status = "completed".into();
+    reopened.update_session(&record).unwrap();
+    assert!(reopened
+        .list_required_session_recovery_manifests(0, 10)
+        .unwrap()
+        .is_empty());
+    assert!(
+        reopened
+            .pending_session_input_applications("claim-session", 1, None, 1)
+            .unwrap()
+            .is_empty(),
+        "finished Session is not reopened for a terminal Turn's pending evidence"
+    );
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn cancelled_prepared_application_is_not_cold_pending_from_none_cursor() {
+    let (fixture, store) = make_store();
+    store.create_session(&make_record("claim-session")).unwrap();
+    let input = store
+        .append_ingress_with_runtime_outbox(
+            "claim-session",
+            "user",
+            Some(r#"[{"type":"text","text":"withdraw before adoption"}]"#),
+            100,
+            &ingress_request(
+                "cancelled-prepared",
+                1,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                100,
+            ),
+        )
+        .unwrap();
+    let prepared = store
+        .set_session_input_application_receipt(
+            std::slice::from_ref(&input.input_id),
+            &[input.revision],
+            &claim_application_receipt(&input.input_id, "prepared", 0),
+            101,
+        )
+        .unwrap()
+        .remove(0);
+    let cancelled = store
+        .cancel_session_runtime_outbox(
+            &input.input_id,
+            1,
+            prepared.revision,
+            "user",
+            "cancel before reservation",
+            102,
+        )
+        .unwrap();
+    assert_eq!(cancelled.status, SessionRuntimeInputStatus::Cancelled);
+    let manifest = store
+        .get_session_recovery_manifest("claim-session")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !manifest.in_flight_turn
+            && !manifest.pending_approval
+            && !manifest.mission_agent_team_continuation
+    );
+    assert_eq!(
+        store.get_session("claim-session").unwrap().unwrap().status,
+        "active"
+    );
+    let pending = store
+        .pending_session_input_applications("claim-session", 1, None, 1)
+        .unwrap();
+    let required = store
+        .list_required_session_recovery_manifests(0, 1)
+        .unwrap();
+    assert!(pending.is_empty() && required.is_empty(),
+        "active Session cold None read must exclude cancelled-only Prepared: pending={}, required={}", pending.len(), required.len());
+    assert_eq!(
+        cancelled.application_receipt.as_ref().unwrap().state,
+        harness_contract::input_disposition::InputApplicationState::Failed
+    );
+    // Reconstruct exactly the pre-fix persisted receipt for read compatibility.
+    // This changes no Goal/Graph state and is not a fabricated execution exit.
+    let executor = fixture.reconnect();
+    let mut connection = executor.checkout_critical().unwrap();
+    let legacy = prepared.application_receipt.as_ref().unwrap().clone();
+    connection
+        .execute(
+            "UPDATE session_runtime_outbox SET application_receipt_json=$1 WHERE input_id=$2",
+            &[&serde_json::to_string(&legacy).unwrap(), &input.input_id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        store
+            .pending_session_input_applications("claim-session", 1, None, 1)
+            .unwrap()
+            .is_empty(),
+        "legacy Cancelled+Prepared must obey the same query eligibility"
+    );
+    assert!(store
+        .list_required_session_recovery_manifests(0, 1)
+        .unwrap()
+        .is_empty());
+    for state in [
+        harness_contract::input_disposition::InputApplicationState::Materializing,
+        harness_contract::input_disposition::InputApplicationState::Applied,
+    ] {
+        let mut unknown_exit = legacy.clone();
+        unknown_exit.state = state;
+        unknown_exit.cancellation = Some(harness_contract::input_disposition::InputApplicationCancellation {
+            actor: "user".into(), reason: "original execution still needs settlement".into(),
+            requested_at_ms: 103, state: harness_contract::input_disposition::InputApplicationCancellationState::Requested,
+            settlement_ref: None,
+        });
+        unknown_exit.validate_shape().unwrap();
+        let mut connection = executor.checkout_critical().unwrap();
+        connection
+            .execute(
+                "UPDATE session_runtime_outbox SET application_receipt_json=$1 WHERE input_id=$2",
+                &[
+                    &serde_json::to_string(&unknown_exit).unwrap(),
+                    &input.input_id,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            store
+                .pending_session_input_applications("claim-session", 1, None, 1)
+                .unwrap()
+                .len(),
+            1,
+            "a status-only terminal filter cannot hide a real Requested obligation"
+        );
+        assert_eq!(
+            store
+                .list_required_session_recovery_manifests(0, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}

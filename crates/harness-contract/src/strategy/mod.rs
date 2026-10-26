@@ -1667,12 +1667,6 @@ impl StrategyDecision {
         pattern: ExecutionPattern,
         reason: impl Into<String>,
     ) -> Result<(), String> {
-        if !pattern_supports_required_gates(pattern, &self.understanding) {
-            return Err(format!(
-                "pattern `{}` cannot preserve the required policy gates",
-                pattern.as_str()
-            ));
-        }
         self.pattern = pattern;
         normalize_modifiers(pattern, &mut self.modifiers);
         self.gates = policy_gates_for(pattern, &self.understanding);
@@ -1700,19 +1694,8 @@ impl StrategyDecision {
         self.understanding.requires_write |= requires_write;
         self.understanding.requests_parallelism |= requests_parallelism;
         let reason = reason.into();
-        let effective_pattern = if pattern_supports_required_gates(pattern, &self.understanding) {
-            pattern
-        } else {
-            ExecutionPattern::Execute
-        };
+        let effective_pattern = pattern;
         self.retarget(effective_pattern, reason)?;
-        if effective_pattern != pattern {
-            self.reasons.push(format!(
-                "tool requirements requested `{}` but retained `{}` so required policy gates remain enforceable",
-                pattern.as_str(),
-                effective_pattern.as_str()
-            ));
-        }
 
         for modifier in [
             requires_external_facts.then_some(ExecutionModifier::WithExternalResearch),
@@ -1950,13 +1933,6 @@ impl StrategyRouter {
                 "explicit Team override retained despite no measured duration advantage or paired quality proof; surface must show the cost warning"
                     .to_string(),
             );
-        }
-        if !pattern_supports_required_gates(pattern, &understanding) {
-            reasons.push(format!(
-                "{} cannot represent the required policy gates; using execute",
-                pattern.as_str()
-            ));
-            pattern = ExecutionPattern::Execute;
         }
         let mut confidence = confidence_for(&understanding, pattern);
         if let Some(experience) = &input.experience {
@@ -2960,31 +2936,13 @@ fn policy_gates_for(
         .collect()
 }
 
-fn pattern_supports_required_gates(
-    pattern: ExecutionPattern,
-    understanding: &TaskUnderstanding,
-) -> bool {
-    ExecutionPolicyGate::ALL.iter().copied().all(|gate| {
-        !gate.is_required_for(understanding.risk, understanding.requires_write)
-            || pattern.supports_gate(gate)
-    })
-}
-
-fn proposal_is_executable(proposal: &StrategyProposal, understanding: &TaskUnderstanding) -> bool {
-    if proposal.confidence < 40 {
-        return false;
-    }
-    if understanding.risk == TaskRisk::Critical && proposal.pattern == ExecutionPattern::Direct {
-        return false;
-    }
-    if understanding.requires_write && proposal.pattern == ExecutionPattern::Direct {
-        return false;
-    }
+fn proposal_is_executable(proposal: &StrategyProposal, _understanding: &TaskUnderstanding) -> bool {
+    // A proposal is advice. Concrete tool authorization, checkpointing and
+    // resource admission do not depend on its predicted mode or confidence.
     proposal
         .modifiers
         .iter()
         .all(|modifier| proposal.pattern.supports_modifier(*modifier))
-        && pattern_supports_required_gates(proposal.pattern, understanding)
 }
 
 fn estimate_collaboration_lift(

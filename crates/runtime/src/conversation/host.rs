@@ -1,3 +1,4 @@
+use crate::execution_core::goal::write_obligation_satisfied;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -563,6 +564,12 @@ fn inherit_continuation_goal(goal: &mut GoalContract, original: &GoalContract, r
             }
         }
     }
+    goal.input_contract = original.input_contract.clone();
+    if let (Some(input), Some(binding)) = (&mut goal.input_contract, &goal.execution_binding) {
+        // Existing authorized same-Session continuation carries business intent,
+        // not a new tool grant or a newly fabricated input receipt.
+        input.turn_id = binding.turn_id.clone();
+    }
     goal.constraints = original.constraints.clone();
     goal.source_intent_ref = original.source_intent_ref.clone();
     goal.user_intent_criterion_id = original.user_intent_criterion_id.clone();
@@ -579,6 +586,9 @@ fn inherit_continuation_goal(goal: &mut GoalContract, original: &GoalContract, r
             obligation.state = harness_contract::goal::ObjectiveObligationState::Open;
         }
         obligation.verifier_decision = None;
+    }
+    if goal.input_contract.is_some() {
+        goal.spec_digest = crate::execution_core::goal::goal_spec_digest(goal);
     }
 }
 
@@ -607,6 +617,48 @@ fn continuation_goal_retains_original_intent_and_requires_fresh_verification() {
         .required_evidence
         .contains(&"execution_graph:next".into()));
     assert_eq!(original.criteria[0].status, AcceptanceStatus::Satisfied);
+}
+
+#[cfg(test)]
+#[test]
+fn continuation_goal_keeps_current_team_contract_with_new_turn_and_original_source() {
+    let original: GoalContract = serde_json::from_value(serde_json::json!({
+        "id":"goal:old-root","session_id":"session","objective":"Use one Team",
+        "criteria":[{"id":"user-intent","statement":"Use one Team","status":"open"}],
+        "phase":"execution","completion":"open","revision":2,"user_sequence":2,
+        "spec_revision":2,"spec_digest":"source-current-team1","scope":"user_objective",
+        "user_intent_criterion_id":"user-intent","source_intent_ref":"session_input_application:original",
+        "execution_binding":{"objective_id":"old-objective","session_id":"session","turn_id":"old-turn",
+            "root_execution_id":"old-root","agentic_program_id":"old-program"},
+        "input_contract":{"version":2,"principal_id":"session:session","session_id":"session","turn_id":"old-turn",
+            "source_ref":"session_input_application:accepted-team1","input_revision":2,"content_sha256":"a".repeat(64),
+            "commitments":[{"kind":"team_count","minimum":1,"maximum":1,"source":{"start":0,"end":4}}]}
+    })).unwrap();
+    let mut current = original.clone();
+    current.id = "goal:next-root".into();
+    let binding = current.execution_binding.as_mut().unwrap();
+    binding.turn_id = "next-turn".into();
+    binding.root_execution_id = "next-root".into();
+    binding.objective_id = "next-objective".into();
+    binding.agentic_program_id = "next-program".into();
+    inherit_continuation_goal(&mut current, &original, "next-root");
+    let input = current.input_contract.as_ref().unwrap();
+    assert_eq!(input.turn_id, "next-turn");
+    assert_eq!(input.principal_id, "session:session");
+    assert_eq!(input.source_ref, "session_input_application:accepted-team1");
+    assert_eq!(input.input_revision, 2);
+    assert_eq!(input.team_bounds(), Some((1, Some(1))));
+    assert_eq!(
+        current_turn_required_team_execution_count(&current, None, false, false),
+        1
+    );
+    assert_eq!(
+        original.input_contract.as_ref().unwrap().turn_id,
+        "old-turn"
+    );
+    let goals =
+        crate::execution_core::GoalStore::new(Arc::new(crate::RuntimeEventStore::for_test()));
+    goals.create(current).unwrap();
 }
 
 fn continuation_context_item(binding: &CollaborationContinuationBinding) -> ContextItem {
@@ -1054,13 +1106,13 @@ where
             identical_action_streak: 0,
             per_turn_tool_counts: BTreeMap::new(),
             write_attempt_paths: Vec::new(),
-            required_write_for_completion: false,
-            required_workspace_write_scopes: Vec::new(),
+
+
             committed_workspace_write_observed: false,
             committed_workspace_write_scopes: BTreeSet::new(),
             committed_workspace_observed_evidence: Vec::new(),
             workspace_mutation_effect_sequences: BTreeSet::new(),
-            required_write_replans: 0,
+
             max_tool_concurrency_observed: 0,
             parallel_tool_batches: 0,
             early_tool_receipts: BTreeMap::new(),
@@ -1074,7 +1126,7 @@ where
                 .is_some_and(|control| control.provider_constraint == "judge"),
             collaboration_started: false,
             pending_root_control_plane_requirement: None,
-            root_write_replans: 0,
+
             root_language_replan_attempted: false,
             pending_terminal_artifact: None,
             pending_controlled_recovery_claim_fingerprints: Vec::new(),
@@ -1287,21 +1339,31 @@ where
             .map(|id| services.agent_action_service().project(id).map_err(|e| RuntimeError::new(e.to_string())))
             .transpose()?
             .filter(|source| source.status != crate::AgenticProgramStatus::Verified);
+        let continuation_goal = continuation_source.as_ref().map(|source| {
+            crate::agentic::continuation::read_continuation_goal(services.event_store(), source)
+                .map_err(RuntimeError::new)?
+                .ok_or_else(|| RuntimeError::new("unfinished continuation requires the original Goal contract"))
+        }).transpose()?;
+        let continuation_goal_cut = continuation_goal.as_ref().map(|goal| crate::ExpectedStreamRevision {
+            stream_id: format!("goal:{}", goal.goal.id), expected_revision: goal.stream_revision,
+        });
         let continuation_actor = if let Some(source) = continuation_source.as_ref() {
             resolved_objective = source.objective_summary.clone();
             graph.objective = resolved_objective.clone();
             let mut turn_state = state.lock().await;
             // Unknown historical minima must not resurrect inferred topology.
             // Versioned explicit minima and exact/prohibited bounds survive unchanged.
-            source.validate_team_quantity_contract().map_err(RuntimeError::new)?;
-            let continued_required_team_count = source.required_team_count;
-            if continued_required_team_count > 0 {
-                turn_state.collaboration_obligation = Some(harness_contract::strategy::CollaborationExecutionObligation {
+            let current_bounds = continuation_goal.as_ref().and_then(|goal|
+                crate::execution_core::goal::current_goal_team_bounds(&goal.goal));
+            let (continued_required_team_count, maximum) = current_bounds
+                .unwrap_or((source.required_team_count, source.exact_team_count));
+            turn_state.collaboration_obligation = (continued_required_team_count > 0).then_some(
+                harness_contract::strategy::CollaborationExecutionObligation {
                     team_count_contract_version: 1,
                     minimum_team_count: continued_required_team_count,
-                    exact_team_count: source.exact_team_count,
-                });
-            }
+                    exact_team_count: maximum.filter(|maximum| *maximum == continued_required_team_count),
+                }
+            );
             let mut item = ContextItem::new(
                 format!("continuation-gaps:{}", graph.id), ContextSourceKind::Task, ContextRole::Instruction,
                 format!("Continue the original objective: {}. The current Program inherits the prior tasks, artifacts and discussions with stable identities. Inspect those facts before acting; preserve accepted contributions, reconcile blocked effects and execute only remaining gaps. A new completion request and original-objective verification are required.", resolved_objective),
@@ -1319,7 +1381,7 @@ where
             Some(harness_contract::agent_action::AgentActorBinding {
                 program_id: harness_contract::agent_action::program_id_for_objective(&objective_id), objective_id,
                 session_id: session_id.clone(), turn_id: turn_ref.clone(), root_execution_id: Some(graph.id.clone()),
-                required_team_count: continued_required_team_count, objective_summary: source.objective_summary.clone(),
+                required_team_count: source.required_team_count, objective_summary: source.objective_summary.clone(),
                 exact_team_count: source.exact_team_count,
                 model_lease: runtime.lock().await.current_model().unwrap_or("default").to_string(),
                 permission_ceiling: Some(policy.permission_mode),
@@ -1330,6 +1392,7 @@ where
         } else { None };
         let goal_id = format!("goal:{}", graph.id);
         let mut goal = GoalContract {
+                input_contract: None,
                 id: goal_id.clone(),
                 session_id: session_id.clone(),
                 objective: resolved_objective.clone(),
@@ -1395,10 +1458,9 @@ where
                 reviews: Vec::new(),
             };
         if let Some(source) = continuation_source.as_ref() {
-            let source_goal_id = format!("goal:{}", source.root_execution_id.as_deref().unwrap_or_default());
-            let original = services.goal_store().projection(&source_goal_id).map_err(RuntimeError::new)?
-                .ok_or_else(|| RuntimeError::new("unfinished continuation requires the original Goal contract"))?.goal;
-            inherit_continuation_goal(&mut goal, &original, &graph.id);
+            let original = &continuation_goal.as_ref()
+                .expect("continuation source was read and bound above").goal;
+            inherit_continuation_goal(&mut goal, original, &graph.id);
             // Older Goals omitted a user constraint that their frozen Program
             // still enforced. Adopt it only in this newly authorized Goal,
             // retaining its original source and explicitly versioning the spec.
@@ -1412,9 +1474,23 @@ where
                 goal.spec_digest = crate::execution_core::goal::goal_spec_digest(&goal);
             }
         } else {
+            if execution_role.owns_root_presentation() {
+                goal.input_contract = Some(prepare_goal_input_for_turn(
+                    &goal, services.workspace_root(), content,
+                    ingress.as_ref().map_or(1, |value| value.input_sequence.max(1)),
+                )?);
+            }
             goal.spec_digest = crate::execution_core::goal::goal_spec_digest(&goal);
         }
-        services.goal_store().create(goal).map_err(RuntimeError::new)?;
+        let prepared_goal_spec = continuation_goal.as_ref().map(|_| (
+            crate::execution_core::goal::goal_spec_digest(&goal), goal.input_contract.clone(),
+        ));
+        let goal = services.goal_store().create(goal).map_err(RuntimeError::new)?;
+        if prepared_goal_spec.is_some_and(|(spec, input)|
+            spec != crate::execution_core::goal::goal_spec_digest(&goal) || input != goal.input_contract)
+        {
+            return Err(RuntimeError::new("continuation target Goal differs from the prepared source"));
+        }
         // Objective recovery now belongs to the Agentic Program supervisor.
         // A new turn may consume a prior typed continuation, but it must not
         // reactivate the retired graph/template coordinator.
@@ -1476,16 +1552,7 @@ where
                         as u8
                 })
                 .unwrap_or_default();
-            turn_state.required_write_for_completion = required_write_for_turn(
-                strategy.decision.strategy.understanding.requires_write,
-                turn_state.bounded_evidence_role,
-                &turn_state.focus_acceptance_scopes,
-            );
-            turn_state.required_workspace_write_scopes = required_workspace_write_scopes_for_turn(
-                services.workspace_root(),
-                content,
-                &resolved_objective,
-            );
+
         }
         {
             let runtime = runtime.lock().await;
@@ -1530,7 +1597,7 @@ where
             .await
             .restore_controlled_recovery_claims_for_turn(&session_id, &turn_ref, &graph_id)?;
         let (mut registered, recovering) = attach_conversation_graph(
-            services.as_ref(), graph, continuation_actor,
+            services.as_ref(), graph, continuation_actor, continuation_goal_cut,
             execution_role == TurnExecutionRole::RootTurn && ingress.is_none(),
             || {
             services
@@ -2655,6 +2722,22 @@ fn team_phase_satisfies_parent_goal(
         && verified_team_executions >= required_team_executions.max(1)
 }
 
+fn current_turn_required_team_execution_count(
+    goal: &GoalContract,
+    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
+    delegated_agent_role: bool,
+    evaluation_judge_only: bool,
+) -> usize {
+    if delegated_agent_role || evaluation_judge_only {
+        return 0;
+    }
+    crate::execution_core::goal::current_goal_team_bounds(goal)
+        .map(|(minimum, _)| usize::from(minimum))
+        .unwrap_or_else(|| {
+            required_team_execution_count_for_execution_context(obligation, false, false)
+        })
+}
+
 fn required_team_execution_count_for_execution_context(
     obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
     delegated_agent_role: bool,
@@ -2802,10 +2885,24 @@ pub(super) fn agentic_turn_framing(
     let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
     match services.agent_action_service().project_if_exists(&program_id) {
         Ok(Some(program)) => {
-            let mut view = match crate::execution_core::goal::assessment::read_bound_goal_assessment(
+            let assessment = crate::execution_core::goal::assessment::read_bound_goal_assessment(
                 services.event_store(),
                 &program,
-            ) {
+            );
+            let required_teams = match &assessment {
+                Ok(crate::execution_core::goal::assessment::BoundGoalAssessment::Bound {
+                    goal,
+                    ..
+                }) => Some(
+                    crate::execution_core::goal::current_goal_team_bounds(&goal.goal)
+                        .map_or(program.required_team_count, |(minimum, _)| minimum),
+                ),
+                Ok(crate::execution_core::goal::assessment::BoundGoalAssessment::NotApplicable) => {
+                    Some(program.required_team_count)
+                }
+                Err(_) => None,
+            };
+            let mut view = match assessment {
                 Ok(assessment) => assessment.view(&program),
                 Err(error) => crate::execution_core::goal::assessment::unknown_completion_view(
                     &program,
@@ -2826,7 +2923,7 @@ pub(super) fn agentic_turn_framing(
                 object.insert(
                     "capacity".to_string(),
                     serde_json::json!({
-                        "required_teams": program.required_team_count,
+                        "required_teams": required_teams,
                         "teams": program.teams.len(),
                         "agents": program.agents.len(),
                         "active_teams": program
@@ -3667,13 +3764,6 @@ fn response_language_mismatch_for_role(
     !delegated_agent_role && response_language_mismatch(objective, response)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RootAcceptanceDisposition {
-    Accept,
-    Replan { write: bool, language: bool },
-    BlockMissingWrite,
-}
-
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExhaustedTeamLeaseDisposition {
@@ -3693,51 +3783,74 @@ fn exhausted_team_lease_disposition(
     }
 }
 
-fn write_obligation_satisfied(
-    required_write_for_completion: bool,
-    required_scopes: &[String],
-    observed_evidence: &[harness_contract::context::ObservedEvidence],
-    unscoped_committed_write: bool,
-    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
-) -> bool {
-    if !required_write_for_completion {
-        return true;
-    }
-    if required_scopes.is_empty() {
-        return unscoped_committed_write
-            || observed_evidence.iter().any(|evidence| {
-                matches!(
-                    &evidence.target,
-                    harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
-                        if scope.access_mode
-                            == harness_contract::context::WorkspaceAccessMode::Write
-                )
-            });
-    }
-    required_scopes.iter().all(|required| {
-        let required = resolver.compile_obligation_or_unresolved(required);
-        observed_evidence
+fn current_turn_write_scopes(
+    goal: &harness_contract::goal::GoalContract,
+    delegated_leaf: bool,
+    focus_scopes: &[String],
+    legacy_requires_write: bool,
+) -> Vec<String> {
+    if delegated_leaf {
+        return focus_scopes
             .iter()
-            .any(|observed| crate::path_identity::observed_evidence_satisfies(&required, observed))
-    })
+            .filter(|scope| scope.starts_with("write:"))
+            .cloned()
+            .collect();
+    }
+    let scopes = crate::execution_core::goal::goal_workspace_write_scopes(goal);
+    if goal
+        .input_contract
+        .as_ref()
+        .is_some_and(|contract| contract.version == 2)
+        || !scopes.is_empty()
+        || !legacy_requires_write
+    {
+        return scopes;
+    }
+    // Legacy records lack authenticated revision rights. Preserve their
+    // original admitted baseline until a real source-backed contract replaces
+    // it; this adapter cannot grant tools or amend the Goal from plain context.
+    let exact = goal
+        .input_contract
+        .as_ref()
+        .map(|contract| {
+            contract
+                .proposed_workspace_scopes
+                .iter()
+                .filter(|scope| scope.starts_with("write:"))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if exact.is_empty() {
+        vec![String::new()]
+    } else {
+        exact
+    }
 }
 
-fn root_delivery_write_satisfied(
-    verified_agentic_program: bool,
-    required_write_for_completion: bool,
-    required_scopes: &[String],
-    observed_evidence: &[harness_contract::context::ObservedEvidence],
-    unscoped_committed_write: bool,
-    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+fn current_turn_forbids_tools(goal: &harness_contract::goal::GoalContract, legacy: bool) -> bool {
+    goal.input_contract
+        .as_ref()
+        .is_some_and(|contract| contract.forbids_tools())
+        || (legacy
+            && goal
+                .input_contract
+                .as_ref()
+                .is_none_or(|contract| contract.version != 2))
+}
+
+fn current_turn_forbids_workspace_write(
+    goal: &harness_contract::goal::GoalContract,
+    legacy: bool,
 ) -> bool {
-    verified_agentic_program
-        || write_obligation_satisfied(
-            required_write_for_completion,
-            required_scopes,
-            observed_evidence,
-            unscoped_committed_write,
-            resolver,
-        )
+    goal.input_contract
+        .as_ref()
+        .is_some_and(|contract| contract.forbids_workspace_write())
+        || (legacy
+            && goal
+                .input_contract
+                .as_ref()
+                .is_none_or(|contract| contract.version != 2))
 }
 
 /// Durable observation-reference prefix for a successful Runtime-authorized
@@ -3978,26 +4091,8 @@ mod write_obligation_probe {
     }
 }
 
-fn root_acceptance_disposition(
-    missing_write: bool,
-    missing_language: bool,
-    write_replans: u8,
-    language_replan_attempted: bool,
-) -> RootAcceptanceDisposition {
-    // The first write replan secures a concrete mutation. A second bounded
-    // replan may correct a successful write to the wrong explicit target.
-    let recover_write = missing_write && write_replans < 2;
-    let recover_language = missing_language && !language_replan_attempted;
-    if recover_write || recover_language {
-        RootAcceptanceDisposition::Replan {
-            write: recover_write,
-            language: recover_language,
-        }
-    } else if missing_write {
-        RootAcceptanceDisposition::BlockMissingWrite
-    } else {
-        RootAcceptanceDisposition::Accept
-    }
+fn should_recover_response_language(mismatch: bool, rewrite_attempted: bool) -> bool {
+    mismatch && !rewrite_attempted
 }
 
 fn is_cjk_character(character: char) -> bool {
@@ -4565,10 +4660,6 @@ struct TurnGraphState {
     /// targeted runaway-tool caps (`COWD_TOOL_CAP_*`).
     per_turn_tool_counts: BTreeMap<String, usize>,
     write_attempt_paths: Vec<String>,
-    required_write_for_completion: bool,
-    /// Exact workspace write obligations parsed from the user objective. When
-    /// present, an unrelated successful mutation must not satisfy delivery.
-    required_workspace_write_scopes: Vec<String>,
     /// Set only by a successful concrete workspace mutation. Authorization
     /// scopes and orchestration proposals describe capability, not evidence.
     committed_workspace_write_observed: bool,
@@ -4583,7 +4674,6 @@ struct TurnGraphState {
     /// Runtime-authored cursor in the turn state preserves the causal edge
     /// without trusting model claims or weakening the persisted boundary.
     workspace_mutation_effect_sequences: BTreeSet<u64>,
-    required_write_replans: u8,
     max_tool_concurrency_observed: usize,
     parallel_tool_batches: usize,
     early_tool_receipts: BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>,
@@ -4594,7 +4684,6 @@ struct TurnGraphState {
     /// A root collaboration requirement becomes durable with the next model
     /// node commit, before any proposal receipt can be consumed.
     pending_root_control_plane_requirement: Option<u8>,
-    root_write_replans: u8,
     root_language_replan_attempted: bool,
     pending_terminal_artifact: Option<PendingTerminalArtifact>,
     /// Claims are staged by Synthesize and released only from `after_commit`,
@@ -4854,6 +4943,75 @@ fn model_context_for_step(
         }
     }
     pending
+}
+
+/// The input-proposal boundary used by actual Host admission before Goal
+/// creation. It never converts failure to guess a path into turn rejection.
+fn prepare_goal_input_for_turn(
+    goal: &GoalContract,
+    workspace: &Path,
+    content: &str,
+    input_revision: u64,
+) -> Result<harness_contract::goal::GoalInputContract, RuntimeError> {
+    let scopes = required_workspace_write_scopes_for_turn(workspace, content, content);
+    crate::execution_core::goal::compile_goal_input_contract(
+        goal.execution_binding
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("Goal input binding absent"))?,
+        goal.source_intent_ref
+            .as_deref()
+            .ok_or_else(|| RuntimeError::new("Goal input source absent"))?,
+        input_revision,
+        content,
+        &scopes,
+    )
+    .map_err(RuntimeError::new)
+}
+
+#[cfg(test)]
+#[test]
+fn host_admission_keeps_autonomous_filename_and_distinct_object_proposals_unresolved() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir(workspace.path().join("src")).unwrap();
+    std::fs::write(workspace.path().join("src/a.rs"), "a").unwrap();
+    std::fs::write(workspace.path().join("src/b.rs"), "b").unwrap();
+    for input in [
+        "Create a summary file; choose a suitable filename yourself.",
+        "不要修改src/a.rs；请修改src/b.rs",
+    ] {
+        let goals =
+            crate::execution_core::GoalStore::new(Arc::new(crate::RuntimeEventStore::for_test()));
+        let mut goal: GoalContract = serde_json::from_value(serde_json::json!({
+            "id":"goal:host-input", "session_id":"host-session", "objective":input,
+            "criteria":[{"id":"user_intent", "statement":input, "source_refs":["session_message:host-message"], "required_evidence":[], "status":"open"}],
+            "phase":"execution", "completion":"open", "revision":1, "user_sequence":1,
+            "scope":"user_objective", "source_intent_ref":"session_message:host-message",
+            "user_intent_criterion_id":"user_intent", "spec_revision":1, "spec_digest":"host-source-spec",
+            "execution_binding":{"objective_id":"host-objective","session_id":"host-session","turn_id":"host-turn", "root_execution_id":"host-graph", "agentic_program_id":"host-program"}
+        })).unwrap();
+        goal.input_contract =
+            Some(prepare_goal_input_for_turn(&goal, workspace.path(), input, 1).unwrap());
+        let proposal = goal.input_contract.as_ref().unwrap();
+        assert!(
+            proposal.commitments.is_empty(),
+            "path guesses cannot make global denies or write commitments"
+        );
+        assert!(!proposal.forbids_workspace_write());
+        assert_eq!(proposal.principal_id, "session:host-session");
+        assert_eq!(proposal.source_ref, "session_message:host-message");
+        // Source identity remains enforced by the original durable Goal owner.
+        // This is not a claim of model completion or semantic authorization.
+        let mut forged = goal.clone();
+        forged.input_contract.as_mut().unwrap().principal_id = "session:foreign".into();
+        assert!(
+            matches!(goals.create(forged), Err(ref reason) if reason == "goal_input_source_binding_mismatch")
+        );
+        assert!(goals.get(&goal.id).unwrap().is_none());
+        let admitted = goals.create(goal).unwrap();
+        assert_eq!(admitted.completion, GoalCompletion::Open);
+        assert_eq!(admitted.objective, input);
+        assert!(admitted.input_contract.unwrap().commitments.is_empty());
+    }
 }
 
 fn required_workspace_write_scopes_for_turn(
@@ -7103,6 +7261,7 @@ async fn attach_conversation_graph(
     services: &crate::RuntimeServices,
     graph: harness_contract::execution_graph::ExecutionGraph,
     actor: Option<harness_contract::agent_action::AgentActorBinding>,
+    source_goal_cut: Option<crate::ExpectedStreamRevision>,
     require_direct_root_identity: bool,
     install_resolvers: impl FnOnce(),
 ) -> Result<(harness_contract::execution_graph::ExecutionGraph, bool), RuntimeError> {
@@ -7133,7 +7292,7 @@ async fn attach_conversation_graph(
     } else {
         services
             .execution_supervisor()
-            .register_continuation_graph(graph, actor)
+            .register_continuation_graph(graph, actor, source_goal_cut)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?
     };

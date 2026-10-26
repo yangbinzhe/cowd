@@ -330,6 +330,7 @@ mod tests {
 
     fn goal() -> GoalContract {
         GoalContract {
+            input_contract: None,
             id: "goal".to_string(),
             session_id: "session".to_string(),
             objective: "produce a verified result".to_string(),

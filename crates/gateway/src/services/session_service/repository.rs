@@ -515,6 +515,18 @@ impl SessionRepository {
             .await
     }
 
+    pub(crate) async fn pending_session_input_applications(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        after: Option<(usize, String)>,
+        limit: usize,
+    ) -> Result<Vec<SessionRuntimeOutboxRecord>, SessionError> {
+        self.durable_store()?
+            .pending_session_input_applications(session_id, session_generation, after, limit)
+            .await
+    }
+
     pub(crate) async fn runtime_inputs(
         &self,
         session_id: &str,

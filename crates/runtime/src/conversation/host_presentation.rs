@@ -1894,6 +1894,39 @@ where
             .as_ref()
             .map(|(completion, _)| *completion)
             .unwrap_or(GoalCompletion::Satisfied);
+        // An ordinary turn gets its business verdict from the Goal owner,
+        // not from a Host-requested completion enum. Program conclusions keep
+        // their independent checked Goal/Program transaction below.
+        let goal_binding = self
+            .services
+            .goal_store()
+            .get(&goal_id)?
+            .and_then(|goal| goal.execution_binding)
+            .ok_or("Synthesize Goal binding missing")?;
+        let has_program = self
+            .services
+            .agent_action_service()
+            .project_if_exists(&goal_binding.agentic_program_id)
+            .map_err(|error| error.to_string())?
+            .is_some();
+        let ordinary_conclusion = if !has_program {
+            Some(
+                self.services
+                    .objective_supervisor()
+                    .prepare_turn_conclusion(
+                        &goal_id,
+                        ticket,
+                        self.services.path_identity_resolver(),
+                        "terminal_synthesis".into(),
+                        format!("{}:goal-complete", ticket.idempotency_key),
+                    )?,
+            )
+        } else {
+            None
+        };
+        if let Some(prepared) = ordinary_conclusion.as_ref() {
+            completion = prepared.completion;
+        }
         let mut envelope = projection.delivery_envelope.clone().unwrap_or_else(|| {
             terminal_delivery_envelope(
                 &projection,
@@ -1903,7 +1936,7 @@ where
                 &ticket.node_id,
             )
         });
-        if terminal_override.is_none() {
+        if terminal_override.is_none() && ordinary_conclusion.is_none() {
             completion = match envelope.delivery_status {
                 harness_contract::outcome::DeliveryStatus::Satisfied => GoalCompletion::Satisfied,
                 harness_contract::outcome::DeliveryStatus::Partial
@@ -2336,6 +2369,9 @@ where
             &goal_id,
         )?;
         outcome = inherit_synthesize_sources(outcome, &source_revisions)?;
+        if let Some(prepared) = ordinary_conclusion.as_ref() {
+            outcome = inherit_synthesize_sources(outcome, &prepared.source_revisions)?;
+        }
         if reconcile_agentic {
             // A success presentation while a real completion gap remains means the
             // root finished too early. Do not fail the turn: return the root to
@@ -2589,19 +2625,13 @@ where
             &goal_id,
             completion,
         )?;
-        if !terminal_owned {
-            outcome.domain_events.push(
-                self.services
-                    .objective_supervisor()
-                    .terminal_event(
-                        &goal_id,
-                        completion,
-                        vec![format!("execution_graph:{}", ticket.graph_id)],
-                        "terminal_synthesis".to_string(),
-                        format!("{}:goal-complete", ticket.idempotency_key),
-                    )
-                    .map_err(|error| format!("goal completion cannot commit: {error}"))?,
-            );
+        if let Some(prepared) = ordinary_conclusion {
+            if terminal_owned {
+                return Err("ordinary Goal terminal owner changed before Graph commit".into());
+            }
+            outcome.domain_events.push(prepared.event);
+        } else if !terminal_owned {
+            return Err("Program-bound Goal requires its original authoritative conclusion before presentation".into());
         }
         let recovery_scope = format!("turn:{turn_id}");
         let controlled_recovery_claim_fingerprints = self
@@ -4740,22 +4770,7 @@ pub(super) fn should_force_focus_synthesis(
     !required_scopes.is_empty() && (exact_workspace_evidence || repeated_evidence_saturation)
 }
 
-pub(super) fn should_recover_missing_required_write(
-    required_write_for_completion: bool,
-    bounded_evidence_role: bool,
-    repeated_evidence_saturation: bool,
-    write_attempt_paths: &[String],
-    successful_write_observed: bool,
-    required_write_replans: u8,
-) -> bool {
-    required_write_for_completion
-        && !bounded_evidence_role
-        && repeated_evidence_saturation
-        && write_attempt_paths.is_empty()
-        && !successful_write_observed
-        && required_write_replans == 0
-}
-
+#[cfg(test)]
 pub(super) fn required_write_for_turn(
     strategy_requires_write: bool,
     bounded_evidence_role: bool,
@@ -5348,6 +5363,7 @@ pub(super) fn focus_action_rejection_outcome(
 pub(super) fn evaluation_scope_rejection_outcome(
     ticket: &NodeExecutionTicket,
     state: &mut TurnGraphState,
+    required_workspace_write_scopes: &[String],
     violation: &str,
     workspace_root: &std::path::Path,
     path_identity_resolver: &crate::path_identity::WorkspacePathIdentityResolver,
@@ -5417,7 +5433,7 @@ pub(super) fn evaluation_scope_rejection_outcome(
     if required_write_final_replan_allowed(
         state.evaluation_scope_rejections,
         violation,
-        state.required_write_for_completion,
+        !required_workspace_write_scopes.is_empty(),
         &state.write_attempt_paths,
     ) {
         state.force_tool_allowlist_next_model = None;
@@ -5449,10 +5465,10 @@ pub(super) fn evaluation_scope_rejection_outcome(
     if post_write_exact_read_recovery_allowed(
         state.evaluation_scope_rejections,
         violation,
-        state.required_write_for_completion,
+        !required_workspace_write_scopes.is_empty(),
         write_obligation_satisfied(
-            state.required_write_for_completion,
-            &state.required_workspace_write_scopes,
+            !required_workspace_write_scopes.is_empty(),
+            required_workspace_write_scopes,
             &state.committed_workspace_observed_evidence,
             state.committed_workspace_write_observed,
             path_identity_resolver,

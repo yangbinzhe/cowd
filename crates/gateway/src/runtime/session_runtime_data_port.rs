@@ -135,6 +135,19 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
             .map(|record| record.map(to_runtime_input_record))
     }
 
+    async fn pending_session_input_applications(
+        &self,
+        session_id: &str,
+        session_generation: u64,
+        after: Option<(usize, String)>,
+        limit: usize,
+    ) -> Result<Vec<runtime::RuntimeSessionInputRecord>, session::SessionError> {
+        self.service()?
+            .pending_session_input_applications(session_id, session_generation, after, limit)
+            .await
+            .map(|rows| rows.into_iter().map(to_runtime_input_record).collect())
+    }
+
     async fn input_admission(
         &self,
         session_id: &str,
@@ -195,10 +208,12 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
                     continue;
                 };
                 if recorded == evidence_id {
-                    return Ok(runtime::context_evidence::raw::access_from_persisted_payload(
-                        evidence_id,
-                        &event.payload,
-                    ));
+                    return Ok(
+                        runtime::context_evidence::raw::access_from_persisted_payload(
+                            evidence_id,
+                            &event.payload,
+                        ),
+                    );
                 }
                 if recorded.starts_with(evidence_id) {
                     if prefix_match.is_some() {
@@ -214,11 +229,10 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
                     if stem_match.is_some() {
                         stem_ambiguous = true;
                     } else {
-                        stem_match =
-                            runtime::context_evidence::raw::access_from_persisted_payload(
-                                recorded,
-                                &event.payload,
-                            );
+                        stem_match = runtime::context_evidence::raw::access_from_persisted_payload(
+                            recorded,
+                            &event.payload,
+                        );
                     }
                 }
             }
@@ -261,19 +275,6 @@ impl runtime::SessionRuntimeApplicationPort for GatewaySessionRuntimePort {
             .await
             .map_err(session::SessionError::Other)
     }
-
-    async fn commit_input_application_receipt(
-        &self,
-        input_ids: &[String],
-        expected_revisions: &[u64],
-        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
-        now_ms: u64,
-    ) -> Result<Vec<runtime::RuntimeSessionInputRecord>, session::SessionError> {
-        self.service()?
-            .commit_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
-            .await
-            .map(|records| records.into_iter().map(to_runtime_input_record).collect())
-    }
 }
 
 #[async_trait]
@@ -308,6 +309,19 @@ impl runtime::SessionRuntimeIngressPort for GatewaySessionRuntimePort {
 
 #[async_trait]
 impl runtime::SessionRuntimeJournalPort for GatewaySessionRuntimePort {
+    async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<runtime::RuntimeSessionInputRecord>, session::SessionError> {
+        self.service()?
+            .commit_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+            .await
+            .map(|records| records.into_iter().map(to_runtime_input_record).collect())
+    }
+
     async fn authorize_requested_cancellation(
         &self,
         request: &runtime::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,

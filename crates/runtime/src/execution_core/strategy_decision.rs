@@ -3,8 +3,8 @@ use harness_contract::core::{
     TaskRisk,
 };
 use harness_contract::strategy::{
-    CollaborationExecutionObligation, CollaborationLiftEstimate, ExecutionCandidateKind,
-    StrategyDecision, StrategyInput, StrategyResourceSnapshot, decide_strategy,
+    decide_strategy, CollaborationExecutionObligation, CollaborationLiftEstimate,
+    ExecutionCandidateKind, StrategyDecision, StrategyInput, StrategyResourceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -187,7 +187,7 @@ impl RuntimeExecutionDecision {
         self.strategy.understanding.complexity
     }
 
-    /// The topology class this decision licenses. Derived, not stored, so it
+    /// The topology class this decision suggests. Derived, not stored, so it
     /// always agrees with the frozen pattern/obligation it is computed from.
     #[must_use]
     pub fn execution_mode(&self) -> ExecutionMode {
@@ -383,6 +383,7 @@ impl TurnStrategyDecisionState {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn revise_for_tool_requirements(
         &mut self,
         selected_candidate: ExecutionCandidateKind,

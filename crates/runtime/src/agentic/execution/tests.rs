@@ -2098,6 +2098,11 @@ async fn delegated_writer_withdrawal_fences_new_effects_before_process_cancellat
     exercise_reviewed_goal_delivery(false, false, DelegatedEffectCase::Withdraw).await;
 }
 
+#[tokio::test]
+async fn delegated_writer_goal_only_closure_fences_fresh_effects_but_settles_admitted() {
+    exercise_reviewed_goal_delivery(false, false, DelegatedEffectCase::GoalClosed).await;
+}
+
 async fn exercise_reviewed_goal_delivery(
     with_disclosure: bool,
     with_effect: bool,
@@ -3849,6 +3854,7 @@ async fn exercise_low_risk_root_review(local_effect: bool, external_decision: bo
     services
         .goal_store()
         .create(GoalContract {
+            input_contract: None,
             id: "goal:root-agentic-execution".into(),
             session_id: "session-dispatch".into(),
             objective: "dispatch objective".into(),

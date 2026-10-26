@@ -122,13 +122,12 @@ fn r1_branch_state(session_id: &str, goal_id: &str) -> TurnGraphState {
         identical_action_streak: 0,
         per_turn_tool_counts: BTreeMap::new(),
         write_attempt_paths: Vec::new(),
-        required_write_for_completion: false,
-        required_workspace_write_scopes: Vec::new(),
+
         committed_workspace_write_observed: false,
         committed_workspace_write_scopes: BTreeSet::new(),
         committed_workspace_observed_evidence: Vec::new(),
         workspace_mutation_effect_sequences: BTreeSet::new(),
-        required_write_replans: 0,
+
         max_tool_concurrency_observed: 0,
         parallel_tool_batches: 0,
         early_tool_receipts: BTreeMap::new(),
@@ -137,7 +136,7 @@ fn r1_branch_state(session_id: &str, goal_id: &str) -> TurnGraphState {
         evaluation_judge_only: false,
         collaboration_started: false,
         pending_root_control_plane_requirement: None,
-        root_write_replans: 0,
+
         root_language_replan_attempted: false,
         pending_terminal_artifact: None,
         pending_controlled_recovery_claim_fingerprints: Vec::new(),
@@ -7374,14 +7373,10 @@ fn explicit_artifact_path_requires_a_matching_write_receipt() {
         false,
         &resolver,
     ));
-    assert!(root_delivery_write_satisfied(
-            true,
-            true,
-            &required,
-            &wrong,
-            false,
-            &resolver,
-        ), "a reviewed, Objective-verified Agentic delivery must not be re-vetoed by root-local write accounting");
+    // A Program status is no substitute for the current Goal's exact receipt.
+    assert!(!write_obligation_satisfied(
+        true, &required, &wrong, false, &resolver
+    ));
 }
 
 #[test]
@@ -7412,31 +7407,12 @@ fn root_response_language_gate_only_rejects_missing_user_language() {
         "The final report is complete.",
         false,
     ));
-    assert_eq!(
-        root_acceptance_disposition(false, true, 0, false),
-        RootAcceptanceDisposition::Replan {
-            write: false,
-            language: true,
-        }
+    assert!(should_recover_response_language(true, false));
+    assert!(
+        !should_recover_response_language(true, true),
+        "exhausted presentation rewrite cannot invalidate completed work"
     );
-    assert_eq!(
-        root_acceptance_disposition(false, true, 0, true),
-        RootAcceptanceDisposition::Accept,
-        "an exhausted language rewrite must preserve completed business work"
-    );
-    assert_eq!(
-        root_acceptance_disposition(true, false, 2, false),
-        RootAcceptanceDisposition::BlockMissingWrite,
-        "a missing required artifact remains a business-level blocker"
-    );
-    assert_eq!(
-        root_acceptance_disposition(true, false, 1, false),
-        RootAcceptanceDisposition::Replan {
-            write: true,
-            language: false,
-        },
-        "one bounded correction must remain when the first write targeted the wrong path"
-    );
+    assert!(!should_recover_response_language(false, false));
 }
 
 #[test]
@@ -7759,22 +7735,8 @@ fn negated_enumeration_does_not_replan_a_numeric_root_answer() {
     let required = required_write_for_turn(understanding.requires_write, false, &[]);
     assert!(!required);
     assert!(!response_language_mismatch_for_role(prompt, "56", false));
-    assert_eq!(
-        root_acceptance_disposition(required, false, 0, false),
-        RootAcceptanceDisposition::Accept
-    );
+    assert!(!should_recover_response_language(false, false));
     assert!(required_write_for_turn(true, false, &[]));
-    assert_eq!(
-        root_acceptance_disposition(true, false, 0, false),
-        RootAcceptanceDisposition::Replan {
-            write: true,
-            language: false
-        }
-    );
-    assert_eq!(
-        root_acceptance_disposition(true, false, 2, false),
-        RootAcceptanceDisposition::BlockMissingWrite
-    );
 }
 
 #[test]

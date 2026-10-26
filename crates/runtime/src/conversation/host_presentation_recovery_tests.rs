@@ -2525,6 +2525,18 @@ struct RejectOnceContextJournal {
 
 #[async_trait::async_trait]
 impl crate::SessionRuntimeJournalPort for RejectOnceContextJournal {
+    async fn commit_input_application_receipt(
+        &self,
+        input_ids: &[String],
+        expected_revisions: &[u64],
+        receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+        now_ms: u64,
+    ) -> Result<Vec<crate::RuntimeSessionInputRecord>, session::SessionError> {
+        self.inner
+            .commit_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+            .await
+    }
+
     async fn authorize_requested_cancellation(
         &self,
         request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
@@ -3883,13 +3895,12 @@ fn publication_state(session_id: &str, goal_id: &str) -> TurnGraphState {
         identical_action_streak: 0,
         per_turn_tool_counts: BTreeMap::new(),
         write_attempt_paths: Vec::new(),
-        required_write_for_completion: false,
-        required_workspace_write_scopes: Vec::new(),
+
         committed_workspace_write_observed: false,
         committed_workspace_write_scopes: BTreeSet::new(),
         committed_workspace_observed_evidence: Vec::new(),
         workspace_mutation_effect_sequences: BTreeSet::new(),
-        required_write_replans: 0,
+
         max_tool_concurrency_observed: 0,
         parallel_tool_batches: 0,
         early_tool_receipts: BTreeMap::new(),
@@ -3898,7 +3909,7 @@ fn publication_state(session_id: &str, goal_id: &str) -> TurnGraphState {
         evaluation_judge_only: false,
         collaboration_started: false,
         pending_root_control_plane_requirement: None,
-        root_write_replans: 0,
+
         root_language_replan_attempted: false,
         pending_terminal_artifact: None,
         pending_controlled_recovery_claim_fingerprints: Vec::new(),

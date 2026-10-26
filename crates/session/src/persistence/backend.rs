@@ -121,6 +121,7 @@ macro_rules! session_store_backend_contract {
             (get_session_runtime_outbox, (request_id: &str), Result<Option<SessionRuntimeOutboxRecord>>),
             (get_session_runtime_outbox_by_input_id, (input_id: &str), Result<Option<SessionRuntimeOutboxRecord>>),
             (session_runtime_outbox_for_turn_relation, (session_id: &str, session_generation: u64, turn_id: &str), Result<Vec<SessionRuntimeOutboxRecord>>),
+            (pending_session_input_applications, (session_id: &str, session_generation: u64, after: Option<(usize, String)>, limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
             (session_runtime_outbox_for_session, (session_id: &str, limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
             (session_runtime_outbox_for_sessions, (session_ids: &[String], per_session_limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
             (active_session_runtime_outbox, (limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),

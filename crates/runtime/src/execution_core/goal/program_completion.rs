@@ -567,6 +567,7 @@ mod tests {
             },
         );
         let goal = harness_contract::goal::GoalContract {
+            input_contract: None,
             id: "goal:test".to_string(),
             session_id: "session-test".to_string(),
             objective: "objective".to_string(),
@@ -662,6 +663,7 @@ mod tests {
                 },
             );
             let goal = harness_contract::goal::GoalContract {
+                input_contract: None,
                 id: "goal:test".to_string(),
                 session_id: "session-test".to_string(),
                 objective: "objective".to_string(),
@@ -717,6 +719,7 @@ mod tests {
     fn without_a_recorded_review_nothing_is_excluded() {
         let program = crate::AgenticProgramProjection::empty("program", "objective");
         let goal = harness_contract::goal::GoalContract {
+            input_contract: None,
             id: "goal:test".to_string(),
             session_id: "session-test".to_string(),
             objective: "objective".to_string(),
@@ -771,6 +774,7 @@ mod tests {
     #[test]
     fn a_reviews_own_evidence_counts_toward_the_completion_gate() {
         let goal = harness_contract::goal::GoalContract {
+            input_contract: None,
             id: "goal:test".to_string(),
             session_id: "session-test".to_string(),
             objective: "objective".to_string(),
@@ -928,6 +932,7 @@ mod tests {
         }
         goals
             .create(GoalContract {
+                input_contract: None,
                 id: "goal:root-completion".into(),
                 session_id: actor.session_id.clone(),
                 objective: actor.objective_summary.clone(),
@@ -1177,6 +1182,7 @@ mod tests {
             .unwrap();
         goals
             .create(GoalContract {
+                input_contract: None,
                 id: "goal:root-completion".into(),
                 session_id: actor.session_id.clone(),
                 objective: actor.objective_summary.clone(),

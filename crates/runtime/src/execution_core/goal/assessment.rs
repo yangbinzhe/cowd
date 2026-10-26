@@ -181,10 +181,12 @@ impl AssessmentSourceFrame {
         program: &AgenticProgramProjection,
         projection: &GoalProjection,
     ) -> Result<Self, AssessmentReadError> {
-        program
-            .validate_team_quantity_contract()
-            .map_err(AssessmentReadError::Source)?;
         let goal = &projection.goal;
+        if !team_quantity_valid(program, super::current_goal_team_bounds(goal)) {
+            return Err(AssessmentReadError::Source(
+                "Team quantity is inconsistent with its current business contract".into(),
+            ));
+        }
         let root = program
             .root_execution_id
             .as_ref()
@@ -306,6 +308,7 @@ mod tests {
             unresolved: vec![],
         });
         let goal = GoalContract {
+            input_contract: None,
             id: "goal:root".into(),
             session_id: "session".into(),
             objective: "deliver".into(),
@@ -549,10 +552,31 @@ pub(crate) enum CompletionTerminalAction {
     RequestObjectiveCompletion { result_artifact_refs: Vec<String> },
 }
 
+fn team_quantity_valid(
+    program: &AgenticProgramProjection,
+    current: Option<(u8, Option<u8>)>,
+) -> bool {
+    current.map_or_else(
+        || program.validate_team_quantity_contract().is_ok(),
+        |(minimum, maximum)| {
+            maximum.is_none_or(|maximum| {
+                maximum >= minimum && program.teams.len() <= usize::from(maximum)
+            })
+        },
+    )
+}
+
 pub(crate) fn root_agentic_terminal_action(
     program: &crate::AgenticProgramProjection,
 ) -> Option<CompletionTerminalAction> {
-    if program.validate_team_quantity_contract().is_err() {
+    root_agentic_terminal_action_with_quantity(program, None)
+}
+
+fn root_agentic_terminal_action_with_quantity(
+    program: &AgenticProgramProjection,
+    current: Option<(u8, Option<u8>)>,
+) -> Option<CompletionTerminalAction> {
+    if !team_quantity_valid(program, current) {
         return None;
     }
     if !matches!(
@@ -730,9 +754,11 @@ fn render_completion_view(
         "blocked":blocked,
         "suggestions":["Topology is optional unless required by the bound user participation contract. Completion remains a governed request, not a count-derived verdict."],
         "team_quantity": {
-            "minimum":program.required_team_count, "exact":program.exact_team_count,
-            "provenance_version":program.team_count_contract_version,
-            "valid":program.validate_team_quantity_contract().is_ok()
+            "minimum":facts.required_teams,
+            "maximum":facts.maximum_teams,
+            "exact":facts.exact_teams,
+            "provenance_version":facts.quantity_provenance,
+            "valid":facts.quantity_valid
         },
         "completion_gap": completion_gap,
         "facts": {
@@ -794,6 +820,10 @@ enum ClosureBlock {
 struct CompletionFacts {
     teams: usize,
     required_teams: usize,
+    maximum_teams: Option<u8>,
+    exact_teams: Option<u8>,
+    quantity_provenance: u8,
+    quantity_valid: bool,
     published: usize,
     claimed: usize,
     reviewed: usize,
@@ -815,6 +845,14 @@ pub(crate) struct CompletionAssessment {
 
 impl CompletionAssessment {
     pub(crate) fn for_program(program: &AgenticProgramProjection, gap: Option<&str>) -> Self {
+        Self::for_quantity(program, gap, None)
+    }
+
+    fn for_quantity(
+        program: &AgenticProgramProjection,
+        gap: Option<&str>,
+        current: Option<(u8, Option<u8>)>,
+    ) -> Self {
         use crate::AgenticTaskStatus as Status;
         let active = program
             .tasks
@@ -823,7 +861,19 @@ impl CompletionAssessment {
             .collect::<Vec<_>>();
         let facts = CompletionFacts {
             teams: program.teams.len(),
-            required_teams: usize::from(program.required_team_count),
+            required_teams: usize::from(
+                current.map_or(program.required_team_count, |(minimum, _)| minimum),
+            ),
+            maximum_teams: current.map_or(program.exact_team_count, |(_, maximum)| maximum),
+            exact_teams: current.map_or(program.exact_team_count, |(minimum, maximum)| {
+                maximum.filter(|maximum| *maximum == minimum)
+            }),
+            quantity_provenance: if current.is_some() {
+                2
+            } else {
+                program.team_count_contract_version
+            },
+            quantity_valid: team_quantity_valid(program, current),
             published: program.tasks.len(),
             claimed: program
                 .tasks
@@ -873,7 +923,7 @@ impl CompletionAssessment {
         if !facts.issue_blockers.is_empty() {
             remaining.push(ClosureStep::ClassifyIssues);
         }
-        let blocked = if program.validate_team_quantity_contract().is_err() {
+        let blocked = if !facts.quantity_valid {
             Some(ClosureBlock::TeamQuantityUnknown)
         } else if facts.pending > 0 {
             Some(ClosureBlock::TasksNotAccepted)
@@ -937,7 +987,8 @@ impl CompletionAssessment {
         goal: &harness_contract::goal::GoalContract,
         gap: Option<&str>,
     ) -> Self {
-        let mut assessment = Self::for_program(program, gap);
+        let mut assessment =
+            Self::for_quantity(program, gap, super::current_goal_team_bounds(goal));
         assessment.required_obligation_refs = goal
             .obligations
             .iter()
@@ -1145,7 +1196,13 @@ impl BoundGoalAssessment {
         if !self.admits_terminal_suggestion(program) {
             return None;
         }
-        root_agentic_terminal_action(program)
+        let Self::Bound { goal, .. } = self else {
+            return None;
+        };
+        root_agentic_terminal_action_with_quantity(
+            program,
+            super::current_goal_team_bounds(&goal.goal),
+        )
     }
 
     pub(crate) fn view(&self, program: &AgenticProgramProjection) -> serde_json::Value {

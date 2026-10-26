@@ -665,7 +665,14 @@ mod r1_rejected_batch_regressions {
                 }
             }
         }
-        let mut decision =
+        // The retired Strategy denial case now exercises a real prepared
+        // effect disagreement. Original Step/call and all raw/compaction
+        // negative oracles below remain unchanged.
+        if matches!(case, BatchCase::Strategy) {
+            let plan = compilation.as_mut().unwrap().plan.as_mut().unwrap();
+            plan.tasks[0].effect.effect_kind = harness_contract::tool::ToolEffectKind::Write;
+        }
+        let decision =
             crate::execution_core::build_runtime_execution_decision("read existing files", None);
         let expected_plan = match case {
             BatchCase::InvalidTaskId => {
@@ -697,13 +704,12 @@ mod r1_rejected_batch_regressions {
                     assert_eq!(plan.tasks.len(), calls.len());
                 }
                 if matches!(case, BatchCase::Strategy) {
-                    decision.executable = false;
                     let validation = plan.validate_against_execution_decision(&decision);
                     assert!(!validation.allowed);
                     assert!(validation
                         .findings
                         .iter()
-                        .any(|finding| finding == "execution_decision_not_executable"));
+                        .any(|finding| finding == "prepared_effect_identity_mismatch"));
                 } else {
                     assert!(plan.validate_against_execution_decision(&decision).allowed);
                 }
@@ -913,7 +919,7 @@ mod r1_rejected_batch_regressions {
             };
             if matches!(case, BatchCase::Strategy) {
                 assert!(raw_output.contains("runtime strategy lease"));
-                assert!(raw_output.contains("execution_decision_not_executable"));
+                assert!(raw_output.contains("prepared_effect_identity_mismatch"));
             }
             assert!(matches!(
                 compacted[index].blocks.as_slice(),
@@ -2470,4 +2476,1355 @@ fn directory_focus_scope_accepts_only_safe_descendant_receipts() {
             .target,
         harness_contract::context::EvidenceTargetIdentity::UnavailableWorkspace { .. }
     ));
+}
+
+/// Original Host -> PG reservation -> Graph/Goal commit. On the second runtime
+/// only the normal startup gate drives the receipt replay; the test never calls
+/// a business retry/reconcile method or restarts the APP/model.
+#[tokio::test]
+async fn authenticated_host_goal_commit_recovers_receipt_in_a_fresh_runtime_without_provider_replay(
+) {
+    authenticated_host_application_window(HostInputFaultWindow::AfterCommitRestart).await;
+}
+
+#[tokio::test]
+async fn authenticated_host_cancel_before_goal_commit_settles_only_after_original_binding_exit() {
+    authenticated_host_application_window(HostInputFaultWindow::BeforeCommitCancel).await;
+}
+
+#[tokio::test]
+async fn authenticated_host_cancel_after_goal_commit_keeps_applied_until_original_binding_exit() {
+    authenticated_host_application_window(HostInputFaultWindow::AfterCommitCancel).await;
+}
+
+#[tokio::test]
+async fn authenticated_host_progress_replays_without_goal_mutation_or_a_second_provider() {
+    authenticated_host_application_window(HostInputFaultWindow::ProgressRestart).await;
+}
+
+#[tokio::test]
+async fn authenticated_host_program_commit_replays_only_its_original_attempt_and_graph_cut() {
+    authenticated_host_application_window(HostInputFaultWindow::ProgramCommitReplay).await;
+}
+
+#[tokio::test]
+async fn authenticated_host_program_commit_cold_start_restores_only_the_original_graph_outcome() {
+    authenticated_host_application_window(HostInputFaultWindow::ProgramCommitCold).await;
+}
+
+#[tokio::test]
+async fn authenticated_host_team_zero_to_one_revision_reaches_original_team_create() {
+    authenticated_host_application_window(HostInputFaultWindow::TeamRevision).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostInputFaultWindow {
+    AfterCommitRestart,
+    BeforeCommitCancel,
+    AfterCommitCancel,
+    ProgressRestart,
+    ProgramCommitReplay,
+    ProgramCommitCold,
+    TeamRevision,
+}
+
+async fn authenticated_host_application_window(window: HostInputFaultWindow) {
+    let cancel_window = matches!(
+        window,
+        HostInputFaultWindow::BeforeCommitCancel | HostInputFaultWindow::AfterCommitCancel
+    );
+    let progress_input = window == HostInputFaultWindow::ProgressRestart;
+    let team_revision = window == HostInputFaultWindow::TeamRevision;
+    let cancel_before_commit = window == HostInputFaultWindow::BeforeCommitCancel;
+    let program_window = matches!(
+        window,
+        HostInputFaultWindow::ProgramCommitReplay | HostInputFaultWindow::ProgramCommitCold
+    );
+    let cold_program = window == HostInputFaultWindow::ProgramCommitCold;
+    use crate::execution_core::graph::executors::ScopedNodeBackend;
+    use harness_contract::input_disposition::InputApplicationState;
+    use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
+    use sha2::Digest;
+    let root_path = tempfile::tempdir().unwrap().keep();
+    eprintln!("user_goal_fixture_root={}", root_path.display());
+    let root = root_path.as_path();
+    let store = Arc::new(crate::test_support::session_store());
+    let session_id = format!("user-goal-host-{}", uuid::Uuid::new_v4());
+    store
+        .create_session(&session::SessionRecord {
+            session_id: session_id.clone(),
+            platform: "unit".into(),
+            chat_id: session_id.clone(),
+            user_id: Some("user-7".into()),
+            model: None,
+            created_at: "2026-10-26T00:00:00Z".into(),
+            last_activity: "2026-10-26T00:00:00Z".into(),
+            message_count: 0,
+            reset_policy: "never".into(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            status: "active".into(),
+        })
+        .await
+        .unwrap();
+    let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store.clone());
+    let events = Arc::new(crate::RuntimeEventStore::for_test());
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(
+        root.join("artifacts"),
+    ));
+    let services = crate::RuntimeServices::test_builder(root, root)
+        .runtime_event_store(events.clone())
+        .artifact_store(artifacts.clone())
+        .session_ports(ports.clone(), ports.clone(), ports.clone(), ports.clone())
+        .build()
+        .unwrap();
+    let mut original_owner = None;
+    let (graph, ticket) = if cold_program {
+        use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage};
+        let mut planned = ExecutionGraph::new("answer directly");
+        planned.lineage = Some(ExecutionGraphLineage {
+            session_id: session_id.clone(),
+            turn_id: "r1-branch-turn".into(),
+            root_task_id: "r1-task".into(),
+            task_id: "r1-task".into(),
+            generation: 1,
+        });
+        let node = ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "{}");
+        planned.nodes.push(node.clone());
+        let planned = services
+            .commit_service()
+            .register_graph(planned)
+            .unwrap()
+            .graph;
+        let ready = services
+            .commit_service()
+            .transition_node(&planned, &node.id, ExecutionNodeStatus::Ready, None, vec![])
+            .unwrap()
+            .graph;
+        let ticket = NodeExecutionTicket {
+            graph_id: ready.id.clone(),
+            node_id: node.id.clone(),
+            executor_kind: node.executor_kind.clone(),
+            service_class: ready.service_class,
+            attempt: 1,
+            idempotency_key: node.idempotency_key.clone(),
+            payload_ref: node.payload_ref.clone(),
+        };
+        let binding = crate::execution_core::graph::ExecutionNodeBinding {
+            executor_kind: ticket.executor_kind.clone(),
+            ticket_idempotency_key: ticket.idempotency_key.clone(),
+            attempt: 1,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        let key =
+            crate::ExecutionCommitService::binding_owner_key_for_test(&ready, &node.id, &binding);
+        original_owner = Some(
+            services
+                .scope_locks()
+                .acquire_binding_owner(&key, || {
+                    services
+                        .commit_service()
+                        .validate_unadmitted_binding_start(&ready, &node, &ticket)
+                        .map_err(|error| error.to_string())
+                })
+                .unwrap(),
+        );
+        let running = services
+            .commit_service()
+            .bind_and_start_nodes(
+                &ready,
+                std::collections::BTreeMap::from([(node.id, binding)]),
+                vec![ticket.clone()],
+            )
+            .unwrap()
+            .graph;
+        services.record_live_execution(&session_id, running.id.clone(), "r1-branch-turn".into());
+        (running, ticket)
+    } else if cancel_window {
+        use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage};
+        services
+            .recover_execution_graphs_on_startup()
+            .await
+            .unwrap();
+        services.release_recovered_producers().await.unwrap();
+        let mut graph = ExecutionGraph::new("answer directly");
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: session_id.clone(),
+            turn_id: "r1-branch-turn".into(),
+            root_task_id: "r1-task".into(),
+            task_id: "r1-task".into(),
+            generation: 1,
+        });
+        let node = ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "{}");
+        graph.nodes.push(node.clone());
+        let graph = services
+            .commit_service()
+            .register_graph(graph)
+            .unwrap()
+            .graph;
+        services.record_live_execution(&session_id, graph.id.clone(), "r1-branch-turn".into());
+        let ticket = NodeExecutionTicket {
+            graph_id: graph.id.clone(),
+            node_id: node.id,
+            executor_kind: node.executor_kind,
+            service_class: graph.service_class,
+            attempt: 1,
+            idempotency_key: node.idempotency_key,
+            payload_ref: node.payload_ref,
+        };
+        (graph, ticket)
+    } else {
+        r1_branch_graph(
+            &services,
+            &session_id,
+            vec![],
+            ExecutionNodeKind::InlineModel,
+        )
+    };
+    let goal_id = format!("goal:{}", graph.id);
+    let goal:GoalContract=serde_json::from_value(serde_json::json!({
+        "id":goal_id,"session_id":session_id,"objective":"Write a report file",
+        "criteria":[{"id":"user_intent","statement":"Write a report file","status":"open"}],
+        "phase":"execution","spec_revision":1,"spec_digest":"b".repeat(64),"scope":"user_objective","completion":"open","revision":1,"user_sequence":1,
+        "user_intent_criterion_id":"user_intent","source_intent_ref":"session_message:host-message",
+        "execution_binding":{"objective_id":"host-objective","session_id":session_id,"turn_id":"r1-branch-turn","root_execution_id":graph.id,"agentic_program_id":"host-program"}
+    })).unwrap();
+    services.goal_store().create(goal).unwrap();
+    if program_window {
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionEnvelope, AgentActionStatus, AgentActorBinding, AgentActorKind,
+            TeamCreateInput,
+        };
+        let actor = AgentActorBinding {
+            objective_id: "host-objective".into(),
+            program_id: "host-program".into(),
+            session_id: session_id.clone(),
+            turn_id: "r1-branch-turn".into(),
+            root_execution_id: Some(graph.id.clone()),
+            required_team_count: 1,
+            exact_team_count: None,
+            objective_summary: "original Program objective".into(),
+            model_lease: "controlled-unit".into(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: vec![],
+            actor_id: "original-root".into(),
+            kind: AgentActorKind::Root,
+            execution_id: None,
+            team_id: None,
+            agent_id: None,
+        };
+        let created = services
+            .agent_action_service()
+            .apply(&AgentActionEnvelope {
+                action_id: "host-original-team".into(),
+                actor,
+                expected_revision: None,
+                action: AgentAction::TeamCreate(TeamCreateInput {
+                    name: "original-team".into(),
+                    mission: "original bounded work".into(),
+                    objective: None,
+                }),
+            })
+            .unwrap();
+        assert_eq!(created.status, AgentActionStatus::Applied);
+        assert_eq!(
+            services
+                .agent_action_service()
+                .project("host-program")
+                .unwrap()
+                .revision,
+            2,
+            "one Program opened record plus the original TeamCreate action"
+        );
+    }
+    let team_action = |id: &str| {
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, TeamCreateInput,
+        };
+        AgentActionEnvelope {
+            action_id: id.into(),
+            expected_revision: None,
+            actor: AgentActorBinding {
+                objective_id: "host-objective".into(),
+                program_id: "host-program".into(),
+                session_id: session_id.clone(),
+                turn_id: "r1-branch-turn".into(),
+                root_execution_id: Some(graph.id.clone()),
+                required_team_count: 0,
+                exact_team_count: Some(0),
+                objective_summary: "original no-Team objective".into(),
+                model_lease: "controlled-unit".into(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: vec![],
+                actor_id: "original-root".into(),
+                kind: AgentActorKind::Root,
+                execution_id: None,
+                team_id: None,
+                agent_id: None,
+            },
+            action: AgentAction::TeamCreate(TeamCreateInput {
+                name: id.into(),
+                mission: "explain through one real Team".into(),
+                objective: None,
+            }),
+        }
+    };
+    if team_revision {
+        let denied = services
+            .agent_action_service()
+            .apply(&team_action("before-revision"))
+            .unwrap();
+        assert_eq!(
+            denied.status,
+            harness_contract::agent_action::AgentActionStatus::Rejected
+        );
+        assert_eq!(denied.error.unwrap().code, "team_ceiling_reached");
+    }
+    let text = if team_revision {
+        "Use one Team to explain the result directly."
+    } else if progress_input {
+        "Please continue as planned; this is a progress check."
+    } else {
+        "Do not generate the report file; explain the result directly."
+    };
+    let origin = SessionInputUserSource {
+        principal_id: "user-7".into(),
+        session_id: session_id.clone(),
+        input_id: "host-input".into(),
+        request_id: "host-request".into(),
+        message_id: "host-message".into(),
+        session_generation: 1,
+        content_sha256: format!("{:x}", sha2::Sha256::digest(text.as_bytes())),
+    };
+    let now = crate::execution_core::goal::user_application_clock();
+    let input = store
+        .append_ingress_with_runtime_outbox(
+            &session_id,
+            "user",
+            Some(&serde_json::json!([{"type":"text","text":text}]).to_string()),
+            now,
+            &session::SessionRuntimeOutboxRequest {
+                input_id: "host-input".into(),
+                request_id: "host-request".into(),
+                turn_id: "r1-branch-turn".into(),
+                message_id: "host-message".into(),
+                session_generation: 1,
+                decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                target_turn_id: None,
+                classification_json: Some(
+                    serde_json::json!({"metadata":{SESSION_INPUT_USER_SOURCE_KEY:origin}})
+                        .to_string(),
+                ),
+                task_route_hint: None,
+                created_at_ms: now,
+                runtime_options_json: None,
+            },
+        )
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_session_runtime_outbox("host-original-owner", now, 600_000, 1, &[])
+        .await
+        .unwrap()
+        .remove(0);
+    let running = store
+        .mark_session_runtime_outbox_running(
+            &input.request_id,
+            "host-original-owner",
+            1,
+            claimed.claim_token.as_ref().unwrap(),
+            claimed.revision,
+            now,
+        )
+        .await
+        .unwrap();
+    struct UserProposalApi(Arc<AtomicUsize>, bool, bool);
+    impl ApiClient for UserProposalApi {
+        fn stream(
+            &mut self,
+            _: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if self.2 {
+                return Box::pin(stream::iter(vec![Ok(AssistantEvent::TextDelta(r#"{"decisions":[{"input_slots":[0],"action":"amend_current_turn","relation":"supplement","objective":"Use one Team to explain the result directly","confidence_basis_points":1,"reason":"The user now requests one Team","business_revision":{"commitments":[{"kind":"team_count","minimum":1,"maximum":1,"source":{"start":0,"end":12}}],"constraints":[],"retired_criteria":[],"retired_obligations":[]}}]}"#.into())),Ok(AssistantEvent::Usage(model_protocol::usage::TokenUsage{input_tokens:31,output_tokens:19,..Default::default()})),Ok(AssistantEvent::MessageStop)]));
+            }
+            if self.1 {
+                return Box::pin(stream::iter(vec![Ok(AssistantEvent::TextDelta(r#"{"decisions":[{"input_slots":[0],"action":"progress_or_control","relation":"progress","objective":"Continue the original Goal unchanged","confidence_basis_points":1,"reason":"The user requested a progress check without amending the business request"}]}"#.into())),Ok(AssistantEvent::Usage(model_protocol::usage::TokenUsage{input_tokens:31,output_tokens:19,..Default::default()})),Ok(AssistantEvent::MessageStop)]));
+            }
+            Box::pin(stream::iter(vec![Ok(AssistantEvent::TextDelta(r#"{"decisions":[{"input_slots":[0],"action":"amend_current_turn","relation":"supplement","objective":"Explain the result directly without creating the report file","confidence_basis_points":1,"reason":"The user changed the requested deliverable","business_revision":{"commitments":[],"constraints":[],"retired_criteria":[],"retired_obligations":[]}}]}"#.into())),
+                Ok(AssistantEvent::Usage(model_protocol::usage::TokenUsage{input_tokens:31,output_tokens:19,..Default::default()})),Ok(AssistantEvent::MessageStop)]))
+        }
+    }
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let mut session = Session::new();
+    session.session_id = session_id.clone();
+    let (runtime, mut state, scope) = r1_observation_branch_runtime(
+        session,
+        UserProposalApi(provider_calls.clone(), progress_input, team_revision),
+        &services,
+        &graph,
+        &goal_id,
+    );
+    state.content = text.into();
+    state.ingress = Some(TurnIngressRef {
+        request_id: running.request_id.clone(),
+        turn_id: running.turn_id.clone(),
+        message_id: running.message_id.clone(),
+        session_id: session_id.clone(),
+        primary_task_id: "r1-task".into(),
+        root_task_id: "r1-task".into(),
+        session_generation: 1,
+        input_sequence: running.sequence as u64,
+        claim_owner: "host-original-owner".into(),
+        claim_token: running.claim_token.clone().unwrap(),
+        claim_revision: running.claim_fence_epoch.unwrap(),
+        handoff_id: None,
+    });
+    let state = Arc::new(tokio::sync::Mutex::new(state));
+    let backend = TurnModelStepBackend {
+        ticket: ticket.clone(),
+        stop: crate::CancellationToken::new(),
+        runtime,
+        state: state.clone(),
+        services: services.clone(),
+    };
+    if cancel_window {
+        use crate::execution_core::graph::executors::{
+            ScopedNodeBackend, ScopedNodeBackendResolver,
+        };
+        use harness_contract::input_disposition::InputApplicationCancellationState;
+        struct HeldHost {
+            inner: Arc<dyn ScopedNodeBackend>,
+            before_commit: bool,
+            ticket: NodeExecutionTicket,
+            entered: tokio::sync::Notify,
+            stopped: crate::CancellationToken,
+            allow_exit: crate::CancellationToken,
+            exited: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl ScopedNodeBackend for HeldHost {
+            fn retains_physical_execution(&self) -> bool {
+                true
+            }
+            fn request_stop(&self, ticket: &NodeExecutionTicket) {
+                if ticket == &self.ticket {
+                    self.inner.request_stop(ticket);
+                    self.stopped.cancel();
+                }
+            }
+            async fn execute(
+                &self,
+                ticket: &NodeExecutionTicket,
+            ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+                let outcome = self.inner.execute(ticket).await?;
+                if !self.before_commit {
+                    return Ok(outcome);
+                }
+                self.entered.notify_one();
+                self.stopped.cancelled().await;
+                self.allow_exit.cancelled().await;
+                self.exited.store(true, Ordering::SeqCst);
+                Err(NodeExecutorError::Cancel {
+                    node_id: ticket.node_id.clone(),
+                    reason: "original user cancellation before Goal commit".into(),
+                })
+            }
+            async fn after_commit(
+                &self,
+                ticket: &NodeExecutionTicket,
+            ) -> Result<(), NodeExecutorError> {
+                if !self.before_commit {
+                    self.entered.notify_one();
+                    self.allow_exit.cancelled().await;
+                    self.inner.after_commit(ticket).await?;
+                    self.exited.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+
+        struct HostResolver {
+            ticket: NodeExecutionTicket,
+            backend: std::sync::Weak<HeldHost>,
+        }
+        impl ScopedNodeBackendResolver for HostResolver {
+            fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+                (ticket == &self.ticket)
+                    .then(|| self.backend.upgrade())
+                    .flatten()
+                    .map(|backend| backend as Arc<dyn ScopedNodeBackend>)
+            }
+        }
+        let held = Arc::new(HeldHost {
+            inner: Arc::new(backend),
+            before_commit: cancel_before_commit,
+            ticket: ticket.clone(),
+            entered: tokio::sync::Notify::new(),
+            stopped: crate::CancellationToken::new(),
+            allow_exit: crate::CancellationToken::new(),
+            exited: std::sync::atomic::AtomicBool::new(false),
+        });
+        services
+            .model_step_executor()
+            .install_resolver(Arc::new(HostResolver {
+                ticket: ticket.clone(),
+                backend: Arc::downgrade(&held),
+            }));
+        services
+            .execution_supervisor()
+            .admit_registered(&graph.id)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), held.entered.notified())
+            .await
+            .expect("production Host must prepare before cancellation");
+        if !cancel_before_commit {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let row = store
+                        .get_session_runtime_outbox("host-request")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if row
+                        .application_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.state == InputApplicationState::Applied)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("commit-first witness must observe original Applied before user cancellation");
+        }
+        let reserved = store
+            .get_session_runtime_outbox("host-request")
+            .await
+            .unwrap()
+            .unwrap();
+        if cancel_before_commit {
+            assert_eq!(
+                reserved.application_receipt.as_ref().unwrap().state,
+                InputApplicationState::Materializing
+            );
+        } else {
+            assert_eq!(
+                services
+                    .goal_store()
+                    .get(&goal_id)
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                2
+            );
+            assert_eq!(
+                reserved.application_receipt.as_ref().unwrap().state,
+                InputApplicationState::Applied
+            );
+        }
+        if cancel_before_commit {
+            assert!(held.inner.recover_known_outcome(&ticket).await.unwrap().is_none(),
+                "only a prepared artifact with no committed business application is not a known cold outcome");
+            assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                services
+                    .goal_store()
+                    .get(&goal_id)
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                1
+            );
+        }
+        let cancelled = store
+            .cancel_session_runtime_outbox(
+                "host-input",
+                1,
+                reserved.revision,
+                "user-7",
+                "withdraw the pending revision",
+                crate::execution_core::goal::user_application_clock(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled
+                .application_receipt
+                .as_ref()
+                .unwrap()
+                .cancellation
+                .as_ref()
+                .unwrap()
+                .state,
+            InputApplicationCancellationState::Requested
+        );
+        let cancel_services = services.clone();
+        let graph_id = graph.id.clone();
+        let cancelling = tokio::spawn(async move {
+            cancel_services
+                .cancel_execution_tree(&graph_id, "original user cancellation")
+                .await
+        });
+        if cancel_before_commit {
+            tokio::time::timeout(std::time::Duration::from_secs(10), held.stopped.cancelled())
+                .await
+                .expect("original cancel must reach exact held backend");
+        }
+        assert!(!held.exited.load(Ordering::SeqCst));
+        let before_exit = store
+            .get_session_runtime_outbox("host-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before_exit
+                .application_receipt
+                .as_ref()
+                .unwrap()
+                .cancellation
+                .as_ref()
+                .unwrap()
+                .state,
+            InputApplicationCancellationState::Requested,
+            "no physical exit means no settled receipt"
+        );
+        assert_eq!(
+            services
+                .goal_store()
+                .get(&goal_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            if cancel_before_commit { 1 } else { 2 }
+        );
+        let not_closed = services.graph_state_store().load(&graph.id).unwrap();
+        let (_, starts) = services
+            .graph_state_store()
+            .binding_starts_page(&not_closed.id, 0, not_closed.revision)
+            .unwrap();
+        let (node, original, start) = starts
+            .into_iter()
+            .find(|(node, _, _)| node == &ticket.node_id)
+            .expect("real original binding start");
+        assert!(
+            !services
+                .graph_state_store()
+                .binding_lease_closure(&not_closed, &node, &original, start)
+                .unwrap(),
+            "blocked physical callback cannot certify its own closure"
+        );
+        held.allow_exit.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), cancelling)
+            .await
+            .expect("bounded original cancel")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let current = store
+                    .get_session_runtime_outbox("host-request")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if current
+                    .application_receipt
+                    .as_ref()
+                    .unwrap()
+                    .cancellation
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    == InputApplicationCancellationState::Settled
+                {
+                    assert_eq!(
+                        current.application_receipt.as_ref().unwrap().state,
+                        if cancel_before_commit {
+                            InputApplicationState::Failed
+                        } else {
+                            InputApplicationState::Applied
+                        }
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original automatic lane must settle after exact physical closure");
+        assert!(held.exited.load(Ordering::SeqCst));
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            1,
+            "cancel recovery must not reinterpret user input"
+        );
+        let closed = services.graph_state_store().load(&graph.id).unwrap();
+        let mut after = 0;
+        let mut matched = 0;
+        while after < closed.revision {
+            let (next, starts) = services
+                .graph_state_store()
+                .binding_starts_page(&closed.id, after, closed.revision)
+                .unwrap();
+            assert!(next > after);
+            for (node, binding, start) in starts {
+                if node == ticket.node_id && binding.attempt == ticket.attempt {
+                    assert!(services
+                        .graph_state_store()
+                        .binding_lease_closure(&closed, &node, &binding, start)
+                        .unwrap());
+                    matched += 1;
+                }
+            }
+            after = next;
+        }
+        assert_eq!(matched, 1, "the original binding must really close once");
+        assert_eq!(
+            services
+                .goal_store()
+                .get(&goal_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            if cancel_before_commit { 1 } else { 2 },
+            "cancellation cannot erase an already committed Goal revision"
+        );
+        let weak = Arc::downgrade(&services);
+        drop(held);
+        drop(state);
+        drop(scope);
+        services.shutdown_maintenance().await;
+        assert_eq!(services.shutdown_execution().await.forced_aborts, 0);
+        drop(services);
+        assert!(
+            weak.upgrade().is_none(),
+            "test resolver must not retain a second Runtime owner after physical cleanup"
+        );
+        std::fs::remove_dir_all(&root_path).unwrap();
+        return;
+    }
+    let outcome = backend.execute(&ticket).await.unwrap();
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.result.usage.input_tokens, 31);
+    assert_eq!(outcome.result.usage.output_tokens, 19);
+    assert!(!outcome
+        .result
+        .result_ref
+        .as_deref()
+        .unwrap()
+        .starts_with("assistant_json:"));
+    assert!(
+        state.lock().await.assistant_messages.is_empty(),
+        "internal JSON cannot publish an assistant answer"
+    );
+    let reserved = store
+        .get_session_runtime_outbox("host-request")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reserved.application_receipt.as_ref().unwrap().state,
+        InputApplicationState::Materializing
+    );
+    assert_eq!(reserved.status, session::SessionRuntimeInputStatus::Running);
+    assert_eq!(
+        services
+            .goal_store()
+            .get(&goal_id)
+            .unwrap()
+            .unwrap()
+            .objective,
+        if program_window {
+            "Explain the result directly without creating the report file"
+        } else {
+            "Write a report file"
+        }
+    );
+    let frozen = crate::execution_core::goal::read_user_goal_application(
+        services.as_ref(),
+        reserved.application_receipt.as_ref().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        Some(&frozen.continuation),
+        outcome.replan.as_ref(),
+        "the artifact must freeze the complete original continuation before reservation"
+    );
+    // Each negative starts from the independently successful original carrier.
+    let mut wrong_digest = reserved.application_receipt.as_ref().unwrap().clone();
+    wrong_digest
+        .prepared_application
+        .as_mut()
+        .unwrap()
+        .artifact_sha256 = "0".repeat(64);
+    let denied =
+        crate::execution_core::goal::read_user_goal_application(services.as_ref(), &wrong_digest)
+            .await
+            .err()
+            .expect("tampered digest cannot authorize recovery");
+    assert_eq!(denied, "user application artifact identity/budget mismatch");
+    let mut foreign = reserved.application_receipt.as_ref().unwrap().clone();
+    foreign.prepared_application.as_mut().unwrap().turn_id = "foreign-turn".into();
+    let denied =
+        crate::execution_core::goal::read_user_goal_application(services.as_ref(), &foreign)
+            .await
+            .err()
+            .expect("foreign turn cannot borrow the original artifact");
+    assert_eq!(
+        denied,
+        "user application prepared content crosses source/attempt"
+    );
+
+    // Legacy/malformed artifacts cannot invent a new continuation on recovery.
+    let mut incomplete = serde_json::to_value(&frozen).unwrap();
+    incomplete.as_object_mut().unwrap().remove("continuation");
+    assert!(
+        serde_json::from_value::<crate::execution_core::goal::PreparedUserGoalApplication>(
+            incomplete
+        )
+        .is_err()
+    );
+    if window == HostInputFaultWindow::ProgramCommitReplay {
+        assert_eq!(
+            services
+                .goal_store()
+                .get(&goal_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+        assert!(
+            services
+                .graph_state_store()
+                .load(&graph.id)
+                .unwrap()
+                .node_results
+                .get(&ticket.node_id)
+                .is_none(),
+            "the original Program/Goal transaction does not imply its Graph outcome committed"
+        );
+        let mut foreign = ticket.clone();
+        foreign.attempt += 1;
+        let rejected = backend.execute(&foreign).await;
+        assert!(
+            matches!(rejected,Err(NodeExecutorError::Recover{reason,..}) if reason=="prepared user input cannot borrow another original attempt")
+        );
+        let replay = backend
+            .execute(&ticket)
+            .await
+            .expect("original Applied source remains visible before root ACK");
+        assert_eq!(replay.replan, outcome.replan);
+        assert_eq!(replay.result, outcome.result);
+        assert_eq!(
+            replay.source_revisions.get(&graph.id),
+            Some(&graph.revision)
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            services
+                .goal_store()
+                .get(&goal_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+        // A genuine concurrent Graph change must still reject the original
+        // replay, even though the user's Goal fact is already committed.
+        let current = services.graph_state_store().load(&graph.id).unwrap();
+        let moved = services
+            .commit_service()
+            .replan(
+                &current,
+                vec![ExecutionNodeSpec::new(
+                    ExecutionNodeKind::InlineModel,
+                    "inline_model",
+                    "concurrent required work",
+                )],
+                vec![],
+                "concurrent graph change".into(),
+            )
+            .unwrap()
+            .graph;
+        let rejected = services
+            .commit_service()
+            .execution_outcome_sources(&moved, &ticket, &replay)
+            .unwrap_err();
+        assert!(
+            matches!(rejected,crate::execution_core::graph::ExecutionCommitError::InvalidCommand(reason) if reason=="outcome Graph source conflicts with original Graph CAS")
+        );
+        assert_eq!(
+            services
+                .goal_store()
+                .get(&goal_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+        drop(backend);
+        drop(state);
+        drop(scope);
+        services.shutdown_maintenance().await;
+        assert_eq!(services.shutdown_execution().await.forced_aborts, 0);
+        drop(services);
+        std::fs::remove_dir_all(&root_path).unwrap();
+        return;
+    }
+    if cold_program {
+        let current = services.graph_state_store().load(&graph.id).unwrap();
+        let binding = services
+            .graph_state_store()
+            .current_binding(&current, &ticket.node_id, ticket.attempt)
+            .unwrap();
+        let key = crate::ExecutionCommitService::binding_owner_key_for_test(
+            &current,
+            &ticket.node_id,
+            &binding,
+        );
+        assert!(
+            services
+                .scope_locks()
+                .try_recover_binding_owner(&key)
+                .unwrap()
+                .is_none(),
+            "a live old owner cannot be replaced even with an Applied Goal fact"
+        );
+        let known = backend
+            .recover_known_outcome(&ticket)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(known.result, outcome.result);
+        assert_eq!(known.replan, outcome.replan);
+        assert_eq!(
+            store
+                .get_session_runtime_outbox("host-request")
+                .await
+                .unwrap()
+                .unwrap()
+                .application_receipt
+                .unwrap()
+                .state,
+            InputApplicationState::Materializing,
+            "known-only query must not settle the original receipt before its Graph callback"
+        );
+    }
+    if !cold_program {
+        let sources = services
+            .commit_service()
+            .execution_outcome_sources(&graph, &ticket, &outcome)
+            .unwrap();
+        services
+            .commit_service()
+            .transition_execution_outcome(&graph, &ticket, &outcome, &sources)
+            .unwrap();
+    } else {
+        assert!(services
+            .graph_state_store()
+            .load(&graph.id)
+            .unwrap()
+            .node_results
+            .get(&ticket.node_id)
+            .is_none());
+        assert!(matches!(services.commit_service().inspect_execution_effect(&ticket).unwrap(),crate::execution_core::graph::ExecutionEffectState::Uncertain),
+            "Goal commit is not an effect receipt; only the later original atomic Graph commit may publish that receipt");
+    }
+    assert_eq!(
+        services
+            .goal_store()
+            .get(&goal_id)
+            .unwrap()
+            .unwrap()
+            .objective,
+        if team_revision {
+            "Use one Team to explain the result directly"
+        } else if progress_input {
+            "Write a report file"
+        } else {
+            "Explain the result directly without creating the report file"
+        }
+    );
+    assert_eq!(
+        store
+            .get_session_runtime_outbox("host-request")
+            .await
+            .unwrap()
+            .unwrap()
+            .application_receipt
+            .unwrap()
+            .state,
+        InputApplicationState::Materializing,
+        "fault window: Goal committed, original Session Applied result still missing"
+    );
+    if team_revision {
+        let current = services.goal_store().get(&goal_id).unwrap().unwrap();
+        assert_eq!(
+            current.input_contract.as_ref().unwrap().team_bounds(),
+            Some((1, Some(1)))
+        );
+        let mut foreign = team_action("foreign-session");
+        foreign.actor.session_id = "foreign-session".into();
+        let denied = services.agent_action_service().apply(&foreign).unwrap();
+        assert_eq!(denied.error.unwrap().code, "current_goal_binding_mismatch");
+        assert!(services
+            .agent_action_service()
+            .project_if_exists("host-program")
+            .unwrap()
+            .is_none());
+        let writer = services.clone();
+        let changed_goal = goal_id.clone();
+        let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = hit.clone();
+        let rejected = crate::AgentActionService::with_team_quantity_commit_hook_for_test(
+            move |_| {
+                observed.store(true, Ordering::SeqCst);
+                let (_, _, event) = writer
+                    .goal_store()
+                    .revision_event(
+                        &changed_goal,
+                        2,
+                        3,
+                        "concurrent original Goal revision",
+                        |goal| {
+                            goal.constraints.push("a concurrent user constraint".into());
+                            vec!["constraints".into()]
+                        },
+                    )
+                    .unwrap();
+                // Independent storage-writer interleaving: use the original
+                // Goal producer and backend transaction, bypassing only this
+                // process's already-held ordered source lock (not its CAS).
+                writer
+                    .event_store()
+                    .inject_content_transaction_fault(crate::AppendTransactionRequest {
+                        transaction_id: "team-quantity-concurrent-goal".into(),
+                        expected_streams: vec![crate::ExpectedStreamRevision {
+                            stream_id: event.event.stream_id.clone(),
+                            expected_revision: 2,
+                        }],
+                        events: vec![event],
+                    })
+                    .unwrap();
+            },
+            || {
+                services
+                    .agent_action_service()
+                    .apply(&team_action("stale-goal"))
+            },
+        );
+        assert!(
+            hit.load(Ordering::SeqCst),
+            "real TeamCreate must reach its actual transaction boundary"
+        );
+        assert!(
+            matches!(rejected,Err(crate::agentic::AgentActionServiceError::Store(crate::RuntimeEventStoreError::StaleRevision{ref stream_id,expected:2,actual:3})) if stream_id==&format!("goal:{goal_id}")),
+            "{rejected:?}"
+        );
+        assert!(
+            services
+                .agent_action_service()
+                .project_if_exists("host-program")
+                .unwrap()
+                .is_none(),
+            "Goal race cannot partially create the Program/Team"
+        );
+        let mut ungranted = team_action("ungranted-agent");
+        ungranted.actor.kind = harness_contract::agent_action::AgentActorKind::Agent;
+        ungranted.actor.agent_id = Some("ungranted-agent".into());
+        ungranted.actor.team_id = Some("ungranted-team".into());
+        ungranted.actor.execution_id = Some("ungranted-execution".into());
+        let denied = services.agent_action_service().apply(&ungranted).unwrap();
+        assert_eq!(denied.error.unwrap().code, "team_create_not_delegated");
+        let allowed = services
+            .agent_action_service()
+            .apply(&team_action("after-revision"))
+            .unwrap();
+        assert_eq!(allowed.status,harness_contract::agent_action::AgentActionStatus::Applied,
+            "the same actor/grant must consume the current authenticated Team1 business constraint: {:?}",allowed.error);
+        let replay = services
+            .agent_action_service()
+            .apply(&team_action("after-revision"))
+            .unwrap();
+        assert_eq!(
+            replay.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let program = services
+            .agent_action_service()
+            .project("host-program")
+            .unwrap();
+        assert_eq!(program.teams.len(), 1);
+        assert_eq!(
+            program.required_team_count, 0,
+            "frozen actor metadata is not rewritten"
+        );
+        assert_eq!(program.exact_team_count, Some(0));
+        let current = services.goal_store().get(&goal_id).unwrap().unwrap();
+        assert_eq!(
+            current_turn_required_team_execution_count(&current, None, false, false),
+            1
+        );
+        assert_eq!(
+            current_turn_required_team_execution_count(&current, None, false, true),
+            0
+        );
+        assert_eq!(
+            current_turn_required_team_execution_count(&current, None, true, false),
+            0
+        );
+        let view = crate::execution_core::goal::assessment::read_bound_goal_assessment(
+            services.event_store(),
+            &program,
+        )
+        .unwrap()
+        .view(&program);
+        assert_eq!(view["facts"]["required_teams"], 1);
+        assert_eq!(view["team_quantity"]["minimum"], 1);
+        assert_eq!(view["team_quantity"]["maximum"], 1);
+        assert_eq!(view["team_quantity"]["exact"], 1);
+        let mut obsolete = services.goal_store().projection(&goal_id).unwrap().unwrap();
+        obsolete.goal.input_contract.as_mut().unwrap().commitments =
+            vec![harness_contract::goal::GoalInputCommitment::TeamCount {
+                minimum: 0,
+                maximum: Some(0),
+                source: harness_contract::goal::GoalInputSpan { start: 0, end: 12 },
+            }];
+        assert!(
+            crate::execution_core::goal::assessment::assess_bound_goal_projection(
+                &program,
+                Some(&obsolete)
+            )
+            .is_err(),
+            "actual Teams above the current ceiling must still fail closed"
+        );
+        assert!(replay.duplicate);
+        let too_many = services
+            .agent_action_service()
+            .apply(&team_action("second-team"))
+            .unwrap();
+        assert_eq!(too_many.error.unwrap().code, "team_ceiling_reached");
+        assert_eq!(
+            services
+                .agent_action_service()
+                .project("host-program")
+                .unwrap()
+                .teams
+                .len(),
+            1
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        drop(backend);
+        drop(state);
+        drop(scope);
+        services.shutdown_maintenance().await;
+        assert_eq!(services.shutdown_execution().await.forced_aborts, 0);
+        drop(services);
+        std::fs::remove_dir_all(&root_path).unwrap();
+        return;
+    }
+    // Simulated process boundary: preserve only the original durable ports and
+    // artifact owner; drop every old Runtime/Host/backend and prove it by Weak.
+    let weak = Arc::downgrade(&services);
+    drop(backend);
+    drop(state);
+    drop(scope);
+    services.shutdown_maintenance().await;
+    let shutdown = services.shutdown_execution().await;
+    assert_eq!(shutdown.forced_aborts, 0);
+    drop(services);
+    assert!(
+        weak.upgrade().is_none(),
+        "old Runtime must not do recovery work"
+    );
+    drop(original_owner); // Old physical Host future has returned; release only its real owner lock.
+
+    let fresh_ports = crate::session_runtime_port::TestSessionPortAdapter::new(store.clone());
+    let fresh = crate::RuntimeServices::test_builder(root, root)
+        .runtime_event_store(events)
+        .artifact_store(artifacts)
+        .session_ports(
+            fresh_ports.clone(),
+            fresh_ports.clone(),
+            fresh_ports.clone(),
+            fresh_ports,
+        )
+        .build()
+        .unwrap();
+    let rebound = if cold_program {
+        let mut session = crate::session::Session::new();
+        session.session_id = session_id.clone();
+        let current = fresh.graph_state_store().load(&graph.id).unwrap();
+        fresh.record_live_execution(&session_id, current.id.clone(), "r1-branch-turn".into());
+        let (runtime, state, scope) = r1_observation_branch_runtime(
+            session,
+            UserProposalApi(provider_calls.clone(), false, false),
+            &fresh,
+            &current,
+            &goal_id,
+        );
+        let backend = Arc::new(TurnModelStepBackend {
+            runtime,
+            state: Arc::new(tokio::sync::Mutex::new(state)),
+            services: fresh.clone(),
+            stop: crate::CancellationToken::new(),
+            ticket: ticket.clone(),
+        });
+        struct ColdHostResolver<C: ApiClient + Send + Sync + 'static, T: ToolExecutor> {
+            ticket: NodeExecutionTicket,
+            backend: std::sync::Weak<TurnModelStepBackend<C, T>>,
+        }
+        impl<C: ApiClient + Send + Sync + 'static, T: ToolExecutor + 'static>
+            crate::execution_core::graph::executors::ScopedNodeBackendResolver
+            for ColdHostResolver<C, T>
+        {
+            fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+                (ticket == &self.ticket)
+                    .then(|| self.backend.upgrade())
+                    .flatten()
+                    .map(|backend| backend as Arc<dyn ScopedNodeBackend>)
+            }
+        }
+        fresh
+            .model_step_executor()
+            .install_resolver(Arc::new(ColdHostResolver {
+                ticket: ticket.clone(),
+                backend: Arc::downgrade(&backend),
+            }));
+        Some((backend, scope))
+    } else {
+        None
+    };
+    fresh.recover_execution_graphs_on_startup().await.unwrap();
+    fresh.release_recovered_producers().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let current = store
+                .get_session_runtime_outbox("host-request")
+                .await
+                .unwrap()
+                .unwrap();
+            if current
+                .application_receipt
+                .as_ref()
+                .is_some_and(|r| r.state == InputApplicationState::Applied)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original automatic settled lane must replay the exact committed receipt");
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        1,
+        "no second interpretation/provider or APP start after rebuilding Runtime"
+    );
+    assert_eq!(
+        fresh.goal_store().get(&goal_id).unwrap().unwrap().revision,
+        if progress_input { 1 } else { 2 },
+        "replay cannot repeat or manufacture Goal adoption"
+    );
+    if cold_program {
+        tokio::time::timeout(std::time::Duration::from_secs(10),async {
+            loop {
+                let restored=fresh.graph_state_store().load(&graph.id).unwrap();
+                if let Some(result)=restored.node_results.get(&ticket.node_id) {
+                    let (_,starts)=fresh.graph_state_store().binding_starts_page(&graph.id,0,restored.revision).unwrap();
+                    if let Some((node,binding,start))=starts.into_iter().find(|(node,binding,_)|node==&ticket.node_id && binding.attempt==ticket.attempt) {
+                        if fresh.graph_state_store().binding_lease_closure(&restored,&node,&binding,start).unwrap() {
+                            assert_eq!(result,&outcome.result);
+                            assert_eq!(restored.nodes.iter().filter(|node|frozen.continuation.nodes.iter().any(|expected|expected==*node)).count(),frozen.continuation.nodes.len());
+                            assert!(matches!(fresh.commit_service().inspect_execution_effect(&ticket).unwrap(),crate::execution_core::graph::ExecutionEffectState::Completed(_)));
+                            break;
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("only the original startup/recovery owner may restore Graph/effect then physical closure");
+        assert_eq!(
+            fresh.goal_store().get(&goal_id).unwrap().unwrap().revision,
+            2
+        );
+        let original_program = fresh
+            .agent_action_service()
+            .project("host-program")
+            .unwrap();
+        assert_eq!(
+            original_program.revision, 3,
+            "one Program opened record, one TeamCreate and one user revision only"
+        );
+        assert_eq!(
+            original_program.objective_summary,
+            "original Program objective"
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    }
+    drop(rebound);
+    fresh.shutdown_maintenance().await;
+    assert_eq!(fresh.shutdown_execution().await.forced_aborts, 0);
+    drop(fresh);
+    std::fs::remove_dir_all(&root_path).unwrap();
+}
+
+#[test]
+fn accepted_goal_replaces_legacy_predictions_but_missing_source_keeps_its_original_baseline() {
+    use harness_contract::goal::{GoalInputCommitment, GoalInputContract, GoalInputSpan};
+    let mut goal: GoalContract = serde_json::from_value(serde_json::json!({
+        "id":"goal:current","session_id":"session","objective":"current instruction",
+        "criteria":[{"id":"intent","statement":"current instruction","status":"open"}],
+        "phase":"execution","spec_revision":2,"spec_digest":"a".repeat(64),"scope":"user_objective",
+        "completion":"open","revision":2,"user_sequence":2
+    }))
+    .unwrap();
+    goal.input_contract = Some(GoalInputContract {
+        version: 1,
+        principal_id: "session:session".into(),
+        session_id: "session".into(),
+        turn_id: "turn".into(),
+        source_ref: "original-source".into(),
+        input_revision: 1,
+        content_sha256: "b".repeat(64),
+        commitments: vec![],
+        proposed_workspace_scopes: vec!["write:old-report.txt".into()],
+    });
+    assert_eq!(
+        current_turn_write_scopes(&goal, false, &[], true),
+        vec!["write:old-report.txt"]
+    );
+    assert!(current_turn_forbids_tools(&goal, true));
+    assert!(current_turn_forbids_workspace_write(&goal, true));
+    goal.input_contract.as_mut().unwrap().version = 2;
+    assert!(
+        current_turn_write_scopes(&goal, false, &[], true).is_empty(),
+        "an authenticated revision may withdraw the old artifact obligation"
+    );
+    assert!(
+        !current_turn_forbids_tools(&goal, true),
+        "the old prediction cannot override an accepted revision"
+    );
+    assert!(!current_turn_forbids_workspace_write(&goal, true));
+    goal.input_contract.as_mut().unwrap().commitments = vec![GoalInputCommitment::WorkspaceWrite {
+        path: None,
+        source: GoalInputSpan { start: 0, end: 3 },
+    }];
+    assert_eq!(
+        current_turn_write_scopes(&goal, false, &[], false),
+        vec![String::new()],
+        "user-selected naming remains autonomous"
+    );
+    assert_eq!(
+        current_turn_write_scopes(&goal, true, &["write:delegated.txt".into()], false),
+        vec!["write:delegated.txt"],
+        "a delegated exact scope is a separate existing contract"
+    );
 }

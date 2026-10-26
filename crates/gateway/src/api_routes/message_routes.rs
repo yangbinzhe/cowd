@@ -594,7 +594,7 @@ async fn send_message(
         envelope = envelope.with_task_route_hint(task_route_hint);
     }
     let admission = session_service
-        .admit_input(envelope)
+        .admit_authenticated_user_input(envelope, &principal.0.claims().principal_id)
         .await
         .map_err(|error| {
             (

@@ -2,6 +2,7 @@
     services
         .goal_store()
         .create(GoalContract {
+            input_contract: None,
             id: "goal:root-agentic-execution".into(),
             session_id: "session-dispatch".into(),
             objective: {

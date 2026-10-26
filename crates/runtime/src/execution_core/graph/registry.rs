@@ -165,6 +165,16 @@ pub trait NodeExecutor: Send + Sync {
     /// either committed or definitively failed. Implementations must not
     /// mutate durable graph state from this callback.
     fn cancellation_finalized(&self, _ticket: &NodeExecutionTicket) {}
+    /// Query an authenticated, already durable outcome of this exact attempt.
+    /// Must not start work, invoke a Provider, or re-interpret business input.
+    /// The recovery owner still commits through the original source fences and
+    /// independently proves physical/callback closure. Unknown stays unknown.
+    async fn recover_known_outcome(
+        &self,
+        _ticket: &NodeExecutionTicket,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        Ok(None)
+    }
     async fn recover(
         &self,
         ticket: &NodeExecutionTicket,

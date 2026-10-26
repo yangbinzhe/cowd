@@ -4627,6 +4627,86 @@ impl RuntimeServices {
         self.hot_state.reconfigure(config)?;
         Ok(self.hot_state.health())
     }
+    /// Recover original user-input receipt facts after Session hydration. This
+    /// never consumes a historical input as a fresh model request.
+    pub async fn recover_user_input_applications(&self, session_id: &str) -> Result<usize, String> {
+        let Some(query) = self.session_query_port() else {
+            return Ok(0);
+        };
+        let Some(admission) = query
+            .input_admission(session_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(0);
+        };
+        let mut after = None;
+        let mut graphs = BTreeSet::new();
+        loop {
+            let page = query
+                .pending_session_input_applications(
+                    session_id,
+                    admission.generation,
+                    after.clone(),
+                    32,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if page.is_empty() {
+                break;
+            }
+            for row in &page {
+                let Some(receipt) = &row.application_receipt else {
+                    continue;
+                };
+                let Some(identity) = &receipt.prepared_application else {
+                    continue;
+                };
+                let known_goal = self
+                    .event_store()
+                    .event_by_idempotency_key(
+                        &format!("goal:{}", identity.goal_id),
+                        &format!(
+                            "goal-user-input:{}:{}",
+                            identity.goal_id, identity.source_digest
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                let known_graph_result = self
+                    .graph_state_store()
+                    .load(&identity.graph_id)
+                    .ok()
+                    .is_some_and(|graph| {
+                        graph
+                            .node_results
+                            .get(&identity.node_id)
+                            .and_then(|r| r.result_ref.as_deref())
+                            == Some(
+                                format!("user_input_application:{}", identity.artifact_ref)
+                                    .as_str(),
+                            )
+                    });
+                if known_goal || known_graph_result || receipt.cancellation.is_some() {
+                    graphs.insert(identity.graph_id.clone());
+                }
+            }
+            let last = page.last().unwrap();
+            let next = (last.sequence, last.input_id.clone());
+            if after.as_ref().is_some_and(|old| old >= &next) {
+                return Err("user application discovery cursor did not advance".into());
+            }
+            after = Some(next);
+            if page.len() < 32 {
+                break;
+            }
+        }
+        for graph in &graphs {
+            super::goal::reconcile_user_goal_applications(self, graph).await?;
+        }
+        Ok(graphs.len())
+    }
+
     pub fn commit_service(&self) -> &ExecutionCommitService {
         &self.commit_service
     }
@@ -5901,6 +5981,11 @@ fn agentic_program_wait_resolution_lane(
 
 fn agentic_settled_graph_resolution_interest() -> crate::RuntimeProjectionInterest {
     crate::RuntimeProjectionInterest::new([
+        crate::RuntimeProjectionEventInterest::new(RuntimeEventScope::Goal, "goal.revised"),
+        crate::RuntimeProjectionEventInterest::new(
+            RuntimeEventScope::ExecutionGraph,
+            "execution_graph.recovered",
+        ),
         crate::RuntimeProjectionEventInterest::new(
             RuntimeEventScope::Program,
             "agentic.action_applied",
@@ -5966,6 +6051,17 @@ fn agentic_settled_graph_resolution_lane(
                 let mut touched_graphs = BTreeSet::new();
                 for batch in &page.batches {
                     for event in &batch.events {
+                        if event.scope == RuntimeEventScope::ExecutionGraph {
+                            touched_graphs.insert(event.stream_id.clone());
+                        }
+                        if let Some(id) = event
+                            .payload
+                            .get("input_application_ticket")
+                            .and_then(|t| t.get("graph_id"))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            touched_graphs.insert(id.to_string());
+                        }
                         if let Some(graph_id) = event
                             .payload
                             .get("graph_id")
@@ -6009,6 +6105,12 @@ fn agentic_settled_graph_resolution_lane(
                 // linked Agent children so either event order closes the barrier.
                 let mut exit_errors = managed_errors;
                 for graph_id in &touched_graphs {
+                    if let Err(error) =
+                        super::goal::reconcile_user_goal_applications(services.as_ref(), graph_id)
+                            .await
+                    {
+                        exit_errors.push(error);
+                    }
                     crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                     graph_id,
                     &actions,
@@ -7407,6 +7509,18 @@ mod requested_cancellation_unknown_recovery_tests {
 
     #[async_trait::async_trait]
     impl crate::SessionRuntimeJournalPort for FaultJournal {
+        async fn commit_input_application_receipt(
+            &self,
+            input_ids: &[String],
+            expected_revisions: &[u64],
+            receipt: &harness_contract::input_disposition::SessionInputApplicationReceipt,
+            now_ms: u64,
+        ) -> Result<Vec<crate::RuntimeSessionInputRecord>, session::SessionError> {
+            self.inner
+                .commit_input_application_receipt(input_ids, expected_revisions, receipt, now_ms)
+                .await
+        }
+
         async fn authorize_requested_cancellation(
             &self,
             request: &RuntimeSessionCancellationAuthorizationRequest,

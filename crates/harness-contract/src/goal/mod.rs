@@ -431,8 +431,91 @@ pub struct ObjectiveTerminal {
     pub committed_at_ms: u64,
 }
 
+/// Runtime-compiled commitments from one authenticated input revision. This
+/// is part of the Goal specification, never a model-supplied permission grant.
+/// Missing historical contracts remain absent and cannot authorize new work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalInputContract {
+    pub version: u32,
+    pub principal_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub source_ref: String,
+    pub input_revision: u64,
+    pub content_sha256: String,
+    pub commitments: Vec<GoalInputCommitment>,
+    /// Unresolved parser proposals are never permissions or acceptance facts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_workspace_scopes: Vec<String>,
+}
+
+impl GoalInputContract {
+    #[must_use]
+    pub fn forbids_workspace_write(&self) -> bool {
+        self.commitments.iter().any(|item| {
+            matches!(
+                item,
+                GoalInputCommitment::ForbidWorkspaceWrite { path: None, .. }
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn forbids_tools(&self) -> bool {
+        self.commitments
+            .iter()
+            .any(|item| matches!(item, GoalInputCommitment::ForbidTools { .. }))
+    }
+
+    #[must_use]
+    pub fn team_bounds(&self) -> Option<(u8, Option<u8>)> {
+        self.commitments.iter().find_map(|item| match item {
+            GoalInputCommitment::TeamCount {
+                minimum, maximum, ..
+            } => Some((*minimum, *maximum)),
+            _ => None,
+        })
+    }
+}
+
+/// Byte offsets into the exact authenticated input. A span is evidence for a
+/// compiler decision, not evidence that a model-proposed command was approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GoalInputSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GoalInputCommitment {
+    WorkspaceWrite {
+        #[serde(default)]
+        path: Option<String>,
+        source: GoalInputSpan,
+    },
+    ForbidWorkspaceWrite {
+        #[serde(default)]
+        path: Option<String>,
+        source: GoalInputSpan,
+    },
+    ForbidTools {
+        source: GoalInputSpan,
+    },
+    TeamCount {
+        minimum: u8,
+        maximum: Option<u8>,
+        source: GoalInputSpan,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalContract {
+    /// None is an old frozen specification, not an implicit source grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_contract: Option<GoalInputContract>,
     pub id: String,
     pub session_id: String,
     pub objective: String,
@@ -1039,6 +1122,7 @@ mod tests {
     #[test]
     fn goal_contract_roundtrips_revisioned_acceptance() {
         let contract = GoalContract {
+            input_contract: None,
             id: "goal-1".into(),
             session_id: "session-1".into(),
             objective: "finish the governed task".into(),

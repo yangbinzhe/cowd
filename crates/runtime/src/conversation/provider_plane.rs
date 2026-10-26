@@ -36,16 +36,18 @@ const PROACTIVE_COMPACTION_PERCENT: usize = 90;
 
 fn closure_goal_binding(goal: &harness_contract::goal::GoalContract) -> Option<serde_json::Value> {
     let binding = goal.execution_binding.as_ref()?;
-    Some(serde_json::json!({"program_ref":binding.agentic_program_id,"goal":{
-        "status":"known","goal_ref":goal.id,"spec_revision":goal.spec_revision,"spec_digest":goal.spec_digest,
-        "completion":goal.completion,"user_intent_criterion_ref":goal.user_intent_criterion_id,
-        "source_intent_ref":goal.source_intent_ref,"participation_requirement":goal.participation_requirement,
-        "criteria":goal.criteria.iter().map(|criterion| serde_json::json!({
-            "criterion_ref":criterion.id,"status":format!("{:?}",criterion.status).to_lowercase()
-        })).collect::<Vec<_>>(),
-        "required_obligations":goal.obligations.iter().filter(|obligation| obligation.required).collect::<Vec<_>>(),
-        "blockers":goal.blockers,"unresolved":goal.unresolved,"waiting":goal.waiting,
-    }}))
+    Some(
+        serde_json::json!({"program_ref":binding.agentic_program_id,"goal":{
+            "status":"known","goal_ref":goal.id,"spec_revision":goal.spec_revision,"spec_digest":goal.spec_digest,
+            "completion":goal.completion,"user_intent_criterion_ref":goal.user_intent_criterion_id,
+            "source_intent_ref":goal.source_intent_ref,"participation_requirement":goal.participation_requirement,
+            "criteria":goal.criteria.iter().map(|criterion| serde_json::json!({
+                "criterion_ref":criterion.id,"status":format!("{:?}",criterion.status).to_lowercase()
+            })).collect::<Vec<_>>(),
+            "required_obligations":goal.obligations.iter().filter(|obligation| obligation.required).collect::<Vec<_>>(),
+            "blockers":goal.blockers,"unresolved":goal.unresolved,"waiting":goal.waiting,
+        }}),
+    )
 }
 
 fn final_closure_tool_projection(
@@ -55,7 +57,12 @@ fn final_closure_tool_projection(
     discoverable: &BTreeSet<String>,
     inventory: ProviderContextInventory,
 ) -> serde_json::Value {
-    let callable = schemas.map(|names| names.intersection(exposed).cloned().collect::<BTreeSet<_>>());
+    let callable = schemas.map(|names| {
+        names
+            .intersection(exposed)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    });
     let rungs = framing["remaining"].as_array().into_iter().flatten().map(|entry| {
         let step = entry["step"].as_str().unwrap_or("unknown");
         let mutations = crate::host::closure_mutation_tool_ids(&[step.to_string()]);
@@ -77,9 +84,15 @@ fn final_closure_tool_projection(
         serde_json::json!({"step":step,"state_actionability":entry["actionability"],"tools":tools,
             "mapping_status":if mutations.is_empty() {"unknown"} else {"canonical"}})
     }).collect::<Vec<_>>();
-    let prerequisite_reads = ["read_ref", "state_inspect", "read_file", "evidence_retrieve"].into_iter()
-        .filter(|tool| callable.as_ref().is_some_and(|names| names.contains(*tool)))
-        .collect::<Vec<_>>();
+    let prerequisite_reads = [
+        "read_ref",
+        "state_inspect",
+        "read_file",
+        "evidence_retrieve",
+    ]
+    .into_iter()
+    .filter(|tool| callable.as_ref().is_some_and(|names| names.contains(*tool)))
+    .collect::<Vec<_>>();
     serde_json::json!({
         "tool_inventory_status":if schemas.is_some() {"final_adapter_post_crop"} else {"unknown"},
         "schema_ids":schemas,
@@ -108,10 +121,18 @@ fn bind_final_closure_tool_context(
             || item.role != ContextRole::Instruction || item.visibility != ContextVisibility::Private {
             continue;
         }
-        let Some(suffix) = item.id.strip_prefix("goal-state:") else { continue };
-        let Some(raw) = item.content.strip_prefix("#GoalState ") else { continue };
-        let Ok(mut framing) = serde_json::from_str::<serde_json::Value>(raw) else { continue };
-        if !framing.is_object() { continue; }
+        let Some(suffix) = item.id.strip_prefix("goal-state:") else {
+            continue;
+        };
+        let Some(raw) = item.content.strip_prefix("#GoalState ") else {
+            continue;
+        };
+        let Ok(mut framing) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if !framing.is_object() {
+            continue;
+        }
         let binding_known = framing["program_source"]["program_ref"].is_string()
             && framing["program_source"]["revision"].is_number()
             && framing["goal"]["status"] == "known"
@@ -120,8 +141,11 @@ fn bind_final_closure_tool_context(
             && framing["goal"]["spec_digest"].is_string()
             && expected_binding.is_some_and(|expected| {
                 expected["program_ref"] == framing["program_source"]["program_ref"]
-                    && expected["goal"].as_object().is_some_and(|fields| fields.iter()
-                        .all(|(key, value)| framing["goal"].get(key) == Some(value)))
+                    && expected["goal"].as_object().is_some_and(|fields| {
+                        fields
+                            .iter()
+                            .all(|(key, value)| framing["goal"].get(key) == Some(value))
+                    })
             });
         let mut projection = final_closure_tool_projection(&framing, schemas, exposed, discoverable, inventory);
         projection["state_binding_status"] = serde_json::json!(if binding_known {"bound_packet"} else {"unknown"});
@@ -133,12 +157,20 @@ fn bind_final_closure_tool_context(
         item.token_estimate = ContextItem::new("estimate", item.source, item.role, item.content.clone()).token_estimate;
     }
     let supports_required_choice = |framing: &serde_json::Value, known: bool| {
-        framing["execution_role"] == "DelegatedLeaf" || (known && framing["blocked"].is_null()
-            && framing["final_tool_context"]["rungs"].as_array().into_iter().flatten().any(|rung| {
-                (rung["state_actionability"].is_null() || rung["state_actionability"] == "actionable")
-                    && rung["tools"].as_array().into_iter().flatten()
-                        .any(|tool| tool["status"] == "callable_schema_actor_grant_unverified")
-            }))
+        framing["execution_role"] == "DelegatedLeaf"
+            || (known
+                && framing["blocked"].is_null()
+                && framing["final_tool_context"]["rungs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|rung| {
+                        (rung["state_actionability"].is_null()
+                            || rung["state_actionability"] == "actionable")
+                            && rung["tools"].as_array().into_iter().flatten().any(|tool| {
+                                tool["status"] == "callable_schema_actor_grant_unverified"
+                            })
+                    }))
     };
     let mut permits_required_choice = goals.values().all(|(framing, known)| supports_required_choice(framing, *known));
     for item in items.iter_mut() {
@@ -146,15 +178,28 @@ fn bind_final_closure_tool_context(
             || item.role != ContextRole::TaskState || item.visibility != ContextVisibility::Private {
             continue;
         }
-        let Some(suffix) = item.id.strip_prefix("owed-action:") else { continue };
+        let Some(suffix) = item.id.strip_prefix("owed-action:") else {
+            continue;
+        };
         let parsed = serde_json::from_str::<serde_json::Value>(&item.content).ok();
-        let pair = goals.get(suffix).filter(|(framing, known)| *known && parsed.as_ref().is_some_and(|owed| {
-            owed["program_source"] == framing["program_source"] && owed["goal"] == framing["goal"]
-                && owed["remaining"] == framing["remaining"] && owed["blocked"] == framing["blocked"]
-        }));
-        let mut projection = parsed.filter(serde_json::Value::is_object)
+        let pair = goals.get(suffix).filter(|(framing, known)| {
+            *known
+                && parsed.as_ref().is_some_and(|owed| {
+                    owed["program_source"] == framing["program_source"]
+                        && owed["goal"] == framing["goal"]
+                        && owed["remaining"] == framing["remaining"]
+                        && owed["blocked"] == framing["blocked"]
+                })
+        });
+        let mut projection = parsed
+            .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::json!({"original_packet":item.content}));
-        for key in ["candidate_mutations", "prerequisite_reads", "tool_inventory_status", "final_wire_inventory"] {
+        for key in [
+            "candidate_mutations",
+            "prerequisite_reads",
+            "tool_inventory_status",
+            "final_wire_inventory",
+        ] {
             projection.as_object_mut().expect("owed object").remove(key);
         }
         match pair {
@@ -179,7 +224,6 @@ fn bind_final_closure_tool_context(
     }
     permits_required_choice
 }
-
 
 /// PLAN D1b: turn the liveness verdicts the stream guard recorded into at most one
 /// non-forcing push-forward nudge for the next request.
@@ -1490,6 +1534,7 @@ where
                 }
                 return Ok((
                     ModelStepResult {
+                        input_interpretation: None,
                         intent: classify_model_step_intent(text, calls),
                         assistant_message: ConversationMessage {
                             role: crate::session::MessageRole::Assistant,
@@ -1753,7 +1798,6 @@ where
                 },
             };
 
-
             Some(lease)
         } else {
             None
@@ -1873,6 +1917,53 @@ where
         provider_retry_fenced: bool,
         explicitly_forbids_tool_use: bool,
     ) -> Result<ModelStepResult, RuntimeError> {
+        self.execute_model_step_for_purpose(
+            user_input,
+            first_step,
+            early_dispatcher,
+            provider_retry_fenced,
+            explicitly_forbids_tool_use,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_user_input_interpretation(
+        &mut self,
+        user_input: &str,
+        first_step: bool,
+        provider_retry_fenced: bool,
+        slots: usize,
+        framing: &str,
+    ) -> Result<ModelStepResult, RuntimeError> {
+        let mut step = self
+            .execute_model_step_for_purpose(
+                user_input,
+                first_step,
+                None,
+                provider_retry_fenced,
+                false,
+                Some((slots, framing)),
+            )
+            .await?;
+        step.input_interpretation = Some(match &step.intent {
+            ModelStepIntent::FinalAnswer { text }
+                if step.early_tool_receipts.is_empty() && step.preflight_tool_results.is_empty() =>
+                harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(text, slots),
+            _ => Err("input interpretation emitted execution instead of a business proposal".into()),
+        });
+        Ok(step)
+    }
+
+    pub(crate) async fn execute_model_step_for_purpose(
+        &mut self,
+        user_input: &str,
+        first_step: bool,
+        early_dispatcher: Option<Arc<dyn EarlyToolDispatcher>>,
+        provider_retry_fenced: bool,
+        explicitly_forbids_tool_use: bool,
+        interpretation: Option<(usize, &str)>,
+    ) -> Result<ModelStepResult, RuntimeError> {
         let clock_stamp = self.turn_step_clock();
         if self.cancellation_token.is_cancelled() {
             return Err(RuntimeError::new(
@@ -1912,14 +2003,16 @@ where
             .active_turn_strategy()
             .map(|state| state.decision)
             .ok_or_else(|| RuntimeError::new("turn strategy was not admitted"))?;
-        if !decision.executable {
+        if interpretation.is_none() && !decision.executable {
             return Err(RuntimeError::new(format!(
                 "runtime strategy is not executable: {}",
                 decision.blocked_reasons.join("; ")
             )));
         }
 
-        let text_only_response = self.next_model_text_only.swap(false, Ordering::SeqCst);
+        let requested_text_only = self.next_model_text_only.swap(false, Ordering::SeqCst);
+        let text_only_response = interpretation.is_none() && requested_text_only;
+        let interpretation_only = interpretation.is_some();
         let one_shot_tool_allowlist = self
             .next_model_tool_allowlist
             .lock()
@@ -1941,19 +2034,21 @@ where
         // user-forbidden tool boundary must therefore carry an explicit empty
         // activation ceiling instead of treating hidden schemas as eligible
         // deferred calls.
-        let tool_activation_ceiling = if text_only_response || explicitly_forbids_tool_use {
-            Some(BTreeSet::new())
-        } else {
-            one_shot_tool_allowlist.clone()
-        };
-        let discovery_activation_notice = if text_only_response || explicitly_forbids_tool_use {
-            None
-        } else {
-            self.next_model_tool_activation_notice
-                .lock()
-                .ok()
-                .and_then(|notice| notice.clone())
-        };
+        let tool_activation_ceiling =
+            if text_only_response || explicitly_forbids_tool_use || interpretation_only {
+                Some(BTreeSet::new())
+            } else {
+                one_shot_tool_allowlist.clone()
+            };
+        let discovery_activation_notice =
+            if text_only_response || explicitly_forbids_tool_use || interpretation_only {
+                None
+            } else {
+                self.next_model_tool_activation_notice
+                    .lock()
+                    .ok()
+                    .and_then(|notice| notice.clone())
+            };
         let discovery = self.discover_tools_with_metrics();
         let available_tools = discovery
             .descriptors
@@ -2068,39 +2163,43 @@ where
         }
         let one_shot_tool_overlay =
             one_shot_tool_allowlist.is_some() || discovery_activation_notice.is_some();
-        let mut exposure = if text_only_response || explicitly_forbids_tool_use {
-            ToolExposureState {
-                catalog_revision: exposure.catalog_revision,
-                bootstrap: Default::default(),
-                active: Default::default(),
-                deferred: available_tools.iter().cloned().collect(),
-                reason: if text_only_response {
-                    "governed low-novelty checkpoint requires a text-only conclusion".to_string()
-                } else {
-                    "user explicitly prohibited tool calls for this request".to_string()
-                },
-                revision: exposure.revision.saturating_add(1),
-                fallback_full: false,
-            }
-        } else if let Some(allowlist) = one_shot_tool_allowlist {
-            let eligible_tools = exposure
-                .bootstrap
-                .iter()
-                .chain(exposure.active.iter())
-                .chain(exposure.deferred.iter())
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let active = eligible_tools
-                .iter()
-                .filter(|tool_id| allowlist.contains(*tool_id))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let deferred = available_tools
-                .iter()
-                .filter(|tool_id| !active.contains(*tool_id))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            ToolExposureState {
+        let mut exposure =
+            if text_only_response || explicitly_forbids_tool_use || interpretation_only {
+                ToolExposureState {
+                    catalog_revision: exposure.catalog_revision,
+                    bootstrap: Default::default(),
+                    active: Default::default(),
+                    deferred: available_tools.iter().cloned().collect(),
+                    reason: if interpretation_only {
+                        "nonterminal user-input interpretation has no executable tools".into()
+                    } else if text_only_response {
+                        "governed low-novelty checkpoint requires a text-only conclusion"
+                            .to_string()
+                    } else {
+                        "user explicitly prohibited tool calls for this request".to_string()
+                    },
+                    revision: exposure.revision.saturating_add(1),
+                    fallback_full: false,
+                }
+            } else if let Some(allowlist) = one_shot_tool_allowlist {
+                let eligible_tools = exposure
+                    .bootstrap
+                    .iter()
+                    .chain(exposure.active.iter())
+                    .chain(exposure.deferred.iter())
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let active = eligible_tools
+                    .iter()
+                    .filter(|tool_id| allowlist.contains(*tool_id))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let deferred = available_tools
+                    .iter()
+                    .filter(|tool_id| !active.contains(*tool_id))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                ToolExposureState {
                 catalog_revision: exposure.catalog_revision,
                 bootstrap: Default::default(),
                 active,
@@ -2127,7 +2226,11 @@ where
         // A text-only checkpoint is a one-request overlay. Keep the normal
         // catalog state for discovery/projection, while still sending an
         // explicit empty schema set for this provider request.
-        if !text_only_response && !explicitly_forbids_tool_use && !one_shot_tool_overlay {
+        if !text_only_response
+            && !explicitly_forbids_tool_use
+            && !interpretation_only
+            && !one_shot_tool_overlay
+        {
             if let Ok(mut state) = self.tool_exposure_state.lock() {
                 *state = Some(exposure.clone());
             }
@@ -2146,8 +2249,12 @@ where
         let final_tool_ids = self.api_client.step_tool_definitions().map(|definitions| {
             definitions.into_iter().map(|definition| definition.name).collect::<BTreeSet<_>>()
         });
-        let final_callable_ids = final_tool_ids.as_ref().map(|schemas| schemas.intersection(&exposed_tool_ids)
-            .cloned().collect::<BTreeSet<_>>());
+        let final_callable_ids = final_tool_ids.as_ref().map(|schemas| {
+            schemas
+                .intersection(&exposed_tool_ids)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        });
         let mut tool_choice_required = one_shot_tool_required
             && final_callable_ids.as_ref().is_some_and(|names| !names.is_empty())
             && one_shot_required_tool_name.as_ref().is_none_or(|name| {
@@ -2186,14 +2293,32 @@ where
         // applies each model's hard cap, schema and history. If preflight
         // compacts the transcript, this snapshot is rebuilt before dispatch.
         let mut one_shot_context_items = self.take_next_model_context_items();
-        let execution_at_binding = self.cowd_bus.as_ref().and_then(|bus| bus.current_execution_context());
-        let current_goal_binding = self.active_step_goal(execution_at_binding.as_ref())?
-            .as_ref().and_then(closure_goal_binding);
-        let discoverable = exposure.deferred.iter()
-            .filter(|tool| tool_activation_ceiling.as_ref().is_none_or(|ceiling| ceiling.contains(*tool)))
-            .cloned().collect::<BTreeSet<_>>();
-        if !bind_final_closure_tool_context(&mut one_shot_context_items, final_tool_ids.as_ref(),
-            &exposed_tool_ids, &discoverable, inventory, current_goal_binding.as_ref()) {
+        let execution_at_binding = self
+            .cowd_bus
+            .as_ref()
+            .and_then(|bus| bus.current_execution_context());
+        let current_goal_binding = self
+            .active_step_goal(execution_at_binding.as_ref())?
+            .as_ref()
+            .and_then(closure_goal_binding);
+        let discoverable = exposure
+            .deferred
+            .iter()
+            .filter(|tool| {
+                tool_activation_ceiling
+                    .as_ref()
+                    .is_none_or(|ceiling| ceiling.contains(*tool))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !bind_final_closure_tool_context(
+            &mut one_shot_context_items,
+            final_tool_ids.as_ref(),
+            &exposed_tool_ids,
+            &discoverable,
+            inventory,
+            current_goal_binding.as_ref(),
+        ) {
             tool_choice_required = false;
             tool_choice_required_tool_name = None;
         }
@@ -2247,6 +2372,11 @@ where
                 prompt.push_runtime_context(format!(
                     "## Tool discovery handoff\nThis is the immediate automatic continuation of the same user turn. tool_search already completed successfully and is intentionally unavailable for this request. Newly activated native function schemas: [{}]. Continue the original task now by invoking the relevant activated schema directly when evidence or action is still required. Do not ask the user to resend the request and do not claim that a new user turn is needed.",
                     activated_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            if let Some((_, framing)) = interpretation {
+                prompt.push_runtime_context(format!(
+                    "## Internal user-input interpretation (NOT a final response)\nInterpret the Runtime-labelled authenticated user inputs against the current Goal. Return exactly one strict JSON ModelInputDispositionBatch, no markdown or tools. Cover every input_slot once. Use amend_current_turn/supplement with business_revision containing the complete CURRENT commitments and constraints, plus retired_criteria/retired_obligations (only known refs); objective is the new full current business objective. Retain still-effective requirements; remove only those the user changed. Use progress_or_control/progress without business_revision for observation-only input, or clarify without business_revision for genuine ambiguity. Never emit graph_plan, session_target, permissions or execution identities. Commitment kinds: workspace_write (path string or null for autonomous filename), forbid_workspace_write (path string for an object or null for all writes), forbid_tools, team_count (minimum, maximum null unless exact); each has source byte span start/end in the supplied source text (citation only, not permission). Ordinary business interpretation changes no tool authorization.\n{framing}"
                 ));
             }
             if text_only_response {
@@ -2929,7 +3059,7 @@ where
                         // a runtime that simply registers no tools still benefits from
                         // being told which tools exist, and one that was asked for text
                         // does not.
-                        if text_only_response {
+                        if text_only_response || interpretation_only {
                             return Err(RuntimeError::with_provider_failure_metadata(
                                 format!(
                                     "tool_protocol_violation: provider emitted a tool call during a request that exposed no tool schemas: [{}]. Produce a normal visible final answer instead.",
@@ -3017,6 +3147,7 @@ where
                             TurnInputCheckpoint::AfterProviderResponse,
                         );
                         return Ok(ModelStepResult {
+                            input_interpretation: None,
                             intent: ModelStepIntent::Replan {
                                 reason: replan_reason,
                             },
@@ -3197,6 +3328,7 @@ where
                     TurnInputCheckpoint::AfterProviderResponse,
                 );
                 return Ok(ModelStepResult {
+                    input_interpretation: None,
                     intent: ModelStepIntent::Replan {
                         reason: format!(
                             "Runtime refused every tool call in that response: {error}. \
@@ -3310,13 +3442,17 @@ where
                 requested_tool_call_count,
             );
             let classified = classify_model_step_intent(text, calls);
-            let intent = apply_explicit_team_requirement(
-                self.explicit_team_escalation,
-                user_input,
-                first_step,
-                &decision,
-                classified,
-            );
+            let intent = if interpretation_only {
+                classified
+            } else {
+                apply_explicit_team_requirement(
+                    self.explicit_team_escalation,
+                    user_input,
+                    first_step,
+                    &decision,
+                    classified,
+                )
+            };
             let effective_model = effective_model.or(Some(model));
             if let Some(model) = effective_model.as_ref() {
                 if !models_tried.contains(model) {
@@ -3327,6 +3463,7 @@ where
                 TurnInputCheckpoint::AfterProviderResponse,
             );
             return Ok(ModelStepResult {
+                input_interpretation: None,
                 intent,
                 assistant_message,
                 preflight_tool_results,
@@ -3476,17 +3613,30 @@ mod final_closure_tool_context_tests {
             "goal":{"status":"known","goal_ref":"goal:one","spec_revision":2,"spec_digest":"digest"},
             "remaining":[{"step":"register_delivery"}],"blocked":null,"exit_ready":false,
         });
-        let mut goal = ContextItem::new("goal-state:node:1", ContextSourceKind::Task,
-            ContextRole::Instruction, format!("#GoalState {framing}"));
+        let mut goal = ContextItem::new(
+            "goal-state:node:1",
+            ContextSourceKind::Task,
+            ContextRole::Instruction,
+            format!("#GoalState {framing}"),
+        );
         goal.authority = ContextAuthority::System;
-        let mut owed = ContextItem::new("owed-action:node:1", ContextSourceKind::Task,
-            ContextRole::TaskState, framing.to_string());
+        let mut owed = ContextItem::new(
+            "owed-action:node:1",
+            ContextSourceKind::Task,
+            ContextRole::TaskState,
+            framing.to_string(),
+        );
         owed.authority = ContextAuthority::Tool;
         vec![goal, owed]
     }
 
     fn value(item: &ContextItem) -> serde_json::Value {
-        serde_json::from_str(item.content.strip_prefix("#GoalState ").unwrap_or(&item.content)).unwrap()
+        serde_json::from_str(
+            item.content
+                .strip_prefix("#GoalState ")
+                .unwrap_or(&item.content),
+        )
+        .unwrap()
     }
 
     fn bind_final_closure_tool_context(
@@ -3495,7 +3645,14 @@ mod final_closure_tool_context_tests {
     ) -> bool {
         let expected = value(&packets()[0]);
         let binding = serde_json::json!({"program_ref":expected["program_source"]["program_ref"],"goal":expected["goal"]});
-        super::bind_final_closure_tool_context(items, schemas, exposed, discoverable, inventory, Some(&binding))
+        super::bind_final_closure_tool_context(
+            items,
+            schemas,
+            exposed,
+            discoverable,
+            inventory,
+            Some(&binding),
+        )
     }
 
     #[test]
@@ -3541,15 +3698,34 @@ mod final_closure_tool_context_tests {
             }
             items[1].content = owed.to_string();
             if mode == "unknown_goal" {
-                super::bind_final_closure_tool_context(&mut items, Some(&actual), &actual,
-                    &names(&[]), ProviderContextInventory::default(), None);
+                super::bind_final_closure_tool_context(
+                    &mut items,
+                    Some(&actual),
+                    &actual,
+                    &names(&[]),
+                    ProviderContextInventory::default(),
+                    None,
+                );
             } else {
-                bind_final_closure_tool_context(&mut items, Some(&actual), &actual,
-                    &names(&[]), ProviderContextInventory::default());
+                bind_final_closure_tool_context(
+                    &mut items,
+                    Some(&actual),
+                    &actual,
+                    &names(&[]),
+                    ProviderContextInventory::default(),
+                );
             }
             let result = value(&items[1]);
-            for key in ["program_source", "goal", "remaining", "blocked", "exit_ready",
-                "budget", "progress", "advisory_routes"] {
+            for key in [
+                "program_source",
+                "goal",
+                "remaining",
+                "blocked",
+                "exit_ready",
+                "budget",
+                "progress",
+                "advisory_routes",
+            ] {
                 assert_eq!(result[key], owed[key], "{mode}: {key}");
             }
         }

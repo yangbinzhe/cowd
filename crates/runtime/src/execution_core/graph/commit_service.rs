@@ -26,10 +26,10 @@ use super::state_store::ExecutionGraphStateStore;
 
 #[path = "commit_pipeline.rs"]
 mod commit_pipeline;
-#[path = "local_network.rs"]
-mod local_network;
 #[path = "effect_authority.rs"]
 mod effect_authority;
+#[path = "local_network.rs"]
+mod local_network;
 #[path = "tool_receipt_query.rs"]
 mod tool_receipt_query;
 pub(crate) use commit_pipeline::execution_lineage_stream_id;
@@ -114,15 +114,15 @@ pub(crate) enum ProcessTerminalAuthority<'a> {
     HostProcess(&'a serde_json::Value),
 }
 
-
 #[cfg(any(test, feature = "test-fixtures"))]
 type ReceiptCommitCallback = Box<dyn FnOnce() + Send + 'static>;
 
 #[cfg(any(test, feature = "test-fixtures"))]
-type ReceiptCommitProbes = Arc<std::sync::Mutex<BTreeMap<
-    (String, String),
-    (Arc<std::sync::atomic::AtomicBool>, ReceiptCommitCallback),
->>>;
+type ReceiptCommitProbes = Arc<
+    std::sync::Mutex<
+        BTreeMap<(String, String), (Arc<std::sync::atomic::AtomicBool>, ReceiptCommitCallback)>,
+    >,
+>;
 
 #[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) struct ReceiptCommitProbe {
@@ -138,17 +138,32 @@ impl ReceiptCommitProbe {
         request: &crate::RuntimeToolExecutionRequest,
         callback: impl FnOnce() + Send + 'static,
     ) -> Self {
-        let key = (delegated_agent_receipt_stream_id(request).unwrap(),
-            request.idempotency_key.clone());
+        let key = (
+            delegated_agent_receipt_stream_id(request).unwrap(),
+            request.idempotency_key.clone(),
+        );
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed = fired.clone();
         let mut pending = probes.lock().unwrap();
-        assert!(!pending.contains_key(&key), "duplicate original receipt probe");
-        pending.insert(key.clone(), (fired.clone(), Box::new(move || {
-            callback();
-            completed.store(true, std::sync::atomic::Ordering::Release);
-        })));
-        Self { key, probes: probes.clone(), fired }
+        assert!(
+            !pending.contains_key(&key),
+            "duplicate original receipt probe"
+        );
+        pending.insert(
+            key.clone(),
+            (
+                fired.clone(),
+                Box::new(move || {
+                    callback();
+                    completed.store(true, std::sync::atomic::Ordering::Release);
+                }),
+            ),
+        );
+        Self {
+            key,
+            probes: probes.clone(),
+            fired,
+        }
     }
 
     pub(crate) fn require_fired(&self) {
@@ -172,7 +187,9 @@ fn probe_committed_tool_effect(
     probes: &ReceiptCommitProbes,
     request: &crate::RuntimeToolExecutionRequest,
 ) {
-    let Some(stream) = delegated_agent_receipt_stream_id(request) else { return };
+    let Some(stream) = delegated_agent_receipt_stream_id(request) else {
+        return;
+    };
     let key = (stream, request.idempotency_key.clone());
     let callback = probes.lock().unwrap().remove(&key);
     if let Some((_, callback)) = callback {
@@ -3250,14 +3267,18 @@ impl ExecutionCommitService {
     pub(crate) fn exact_delegated_receipt_sequence(
         &self, request: &crate::RuntimeToolExecutionRequest,
     ) -> Result<u64, ExecutionCommitError> {
-        let invalid = || ExecutionCommitError::InvalidCommand(
-            "original effect/Step receipt identity mismatch".into());
+        let invalid = || {
+            ExecutionCommitError::InvalidCommand(
+                "original effect/Step receipt identity mismatch".into(),
+            )
+        };
         let parent = request.parent_execution.as_ref().ok_or_else(invalid)?;
         let attempt = request.parent_execution_attempt.ok_or_else(invalid)?;
         let stream = delegated_agent_receipt_stream_id(request).ok_or_else(invalid)?;
-        let index = self.event_store.event_by_idempotency_key(
-            &stream, &delegated_agent_receipt_key(request),
-        )?.ok_or_else(invalid)?;
+        let index = self
+            .event_store
+            .event_by_idempotency_key(&stream, &delegated_agent_receipt_key(request))?
+            .ok_or_else(invalid)?;
         self.load_delegated_agent_tool_receipts(&parent.execution_id, &parent.node_id, attempt)?;
         if request.step_binding.as_ref().is_some_and(|binding|
             binding.effect_idempotency_key() != request.idempotency_key)
@@ -3285,9 +3306,15 @@ impl ExecutionCommitService {
             || primary.refs != index.refs
             || primary.payload["replay"] != receipt_replay_contract(request)?
             || primary.payload["outcome"] != index.payload["outcome"]
-            || index.payload["authorized_scopes"] != serde_json::to_value(&request.authorized_scopes)?
-            || index.payload["effect_scope"] != serde_json::to_value(
-                request.authorization.as_ref().map(|authorization| &authorization.scope))?
+            || index.payload["authorized_scopes"]
+                != serde_json::to_value(&request.authorized_scopes)?
+            || index.payload["effect_scope"]
+                != serde_json::to_value(
+                    request
+                        .authorization
+                        .as_ref()
+                        .map(|authorization| &authorization.scope),
+                )?
         {
             return Err(invalid());
         }
@@ -3490,7 +3517,9 @@ impl ExecutionCommitService {
                 request.authorization, bounded_tool_effect_outcome(outcome)]);
             if let Some(previous) = staged.insert(request.idempotency_key.clone(), identity.clone()) {
                 if previous != identity {
-                    return Err(ExecutionCommitError::InvalidCommand("read wave original effect collision".into()));
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "read wave original effect collision".into(),
+                    ));
                 }
                 continue;
             }
@@ -3581,22 +3610,26 @@ impl ExecutionCommitService {
                 })
             })
             .flatten();
-            let mut read_payload = local_network::receipt_payload(&self.event_store, request, json!({
-                "effect":effect,
-                "root_effect_context":root_intent.map(|intent| &intent.payload["root_effect_context"]),
-                "root_effect_owner":root_intent.map(|intent| &intent.payload["root_effect_owner"]),
-                "idempotency_key": request.idempotency_key,
-                "tool_use_id": request.tool_use_id,
-                "tool_name": request.tool_name,
-                "replay": receipt_replay_contract(request)?,
-                "input_sha256": format!("sha256:{:x}", Sha256::digest(request.input.as_bytes())),
-                "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
-                "outcome": bounded_tool_effect_outcome(outcome),
-                "resolved_effect_scope":scope,
-                "read_acquisition_v1": acquisition,
-                "process_admission_ref": closure.map(|_| format!("{}:process-admission", request.idempotency_key)),
-                "process_closure": closure.cloned(),
-            }))?;
+            let mut read_payload = local_network::receipt_payload(
+                &self.event_store,
+                request,
+                json!({
+                    "effect":effect,
+                    "root_effect_context":root_intent.map(|intent| &intent.payload["root_effect_context"]),
+                    "root_effect_owner":root_intent.map(|intent| &intent.payload["root_effect_owner"]),
+                    "idempotency_key": request.idempotency_key,
+                    "tool_use_id": request.tool_use_id,
+                    "tool_name": request.tool_name,
+                    "replay": receipt_replay_contract(request)?,
+                    "input_sha256": format!("sha256:{:x}", Sha256::digest(request.input.as_bytes())),
+                    "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
+                    "outcome": bounded_tool_effect_outcome(outcome),
+                    "resolved_effect_scope":scope,
+                    "read_acquisition_v1": acquisition,
+                    "process_admission_ref": closure.map(|_| format!("{}:process-admission", request.idempotency_key)),
+                    "process_closure": closure.cloned(),
+                }),
+            )?;
             if acquisition.is_some() {
                 read_payload["original_input"] = json!(request.input);
             }
@@ -3607,8 +3640,10 @@ impl ExecutionCommitService {
                     kind: "execution.read.receipt".to_string(),
                     status: Some("completed".to_string()),
                     actor: Some("governed_tool".to_string()),
-                    refs: root_owner.as_ref().map_or_else(|| tool_effect_refs(request),
-                        |(owner, attempt)| root_effect_receipt_refs(request, owner, *attempt)),
+                    refs: root_owner.as_ref().map_or_else(
+                        || tool_effect_refs(request),
+                        |(owner, attempt)| root_effect_receipt_refs(request, owner, *attempt),
+                    ),
                     payload: read_payload,
                 },
                 idempotency_key: Some(receipt_key.clone()),
@@ -3674,10 +3709,14 @@ impl ExecutionCommitService {
                 events,
             });
         if let Err(error) = appended {
-            if receipts.iter().all(|(request, _)| self.event_store.event_by_idempotency_key(
-                &format!("execution-effect:{}", request.idempotency_key),
-                &format!("{}:read-receipt", request.idempotency_key),
-            ).is_ok_and(|receipt| receipt.is_some())) {
+            if receipts.iter().all(|(request, _)| {
+                self.event_store
+                    .event_by_idempotency_key(
+                        &format!("execution-effect:{}", request.idempotency_key),
+                        &format!("{}:read-receipt", request.idempotency_key),
+                    )
+                    .is_ok_and(|receipt| receipt.is_some())
+            }) {
                 return self.commit_readonly_tool_receipts_once(receipts, scope, root_intent, None);
             }
             return Err(error.into());
@@ -4292,34 +4331,35 @@ impl ExecutionCommitService {
             Self::validate_bound_effect_scope(effect, scope)?;
         }
         let revision = self.event_store.stream_revision(&stream_id)?;
-        self.event_store.append_transaction(AppendTransactionRequest {
-            transaction_id: key.clone(),
-            expected_streams: vec![ExpectedStreamRevision {
-                stream_id: stream_id.clone(),
-                expected_revision: revision,
-            }],
-            events: vec![RuntimeTransactionEventInput {
-                event: RuntimeEventInput {
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: key.clone(),
+                expected_streams: vec![ExpectedStreamRevision {
                     stream_id: stream_id.clone(),
-                    scope: RuntimeEventScope::ExecutionNode,
-                    kind: "execution.read.intent".into(),
-                    status: Some("inflight".into()),
-                    actor: Some("governed_tool".into()),
-                    refs: tool_effect_refs(request),
-                    payload: json!({
-                        "idempotency_key": request.idempotency_key,
-                        "tool_use_id": request.tool_use_id,
-                        "tool_name": request.tool_name,
-                        "effect": effect,
-                        "resolved_effect_scope": scope,
-                        "replay": receipt_replay_contract(request)?,
-                        "process_class": true,
-                    }),
-                },
-                idempotency_key: Some(key),
-                schema_version: 1,
-            }],
-        })?;
+                    expected_revision: revision,
+                }],
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream_id.clone(),
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: "execution.read.intent".into(),
+                        status: Some("inflight".into()),
+                        actor: Some("governed_tool".into()),
+                        refs: tool_effect_refs(request),
+                        payload: json!({
+                            "idempotency_key": request.idempotency_key,
+                            "tool_use_id": request.tool_use_id,
+                            "tool_name": request.tool_name,
+                            "effect": effect,
+                            "resolved_effect_scope": scope,
+                            "replay": receipt_replay_contract(request)?,
+                            "process_class": true,
+                        }),
+                    },
+                    idempotency_key: Some(key),
+                    schema_version: 1,
+                }],
+            })?;
         Ok(())
     }
 
@@ -4364,9 +4404,12 @@ impl ExecutionCommitService {
             let published = existing
                 .payload
                 .get("admission")
-                .and_then(|value| serde_json::from_value::<
-                    harness_contract::context::ToolExecutionAdmission,
-                >(value.clone()).ok())
+                .and_then(|value| {
+                    serde_json::from_value::<harness_contract::context::ToolExecutionAdmission>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
                 .ok_or_else(|| invalid("published host process admission is unreadable".into()))?;
             let admitted = json!({
                 "call_key": published.binding.call_key,
@@ -4502,7 +4545,9 @@ impl ExecutionCommitService {
         let intent = self
             .event_store
             .event_by_idempotency_key(&stream_id, &intent_key)?
-            .ok_or_else(|| invalid("host process read closure requires original read intent".into()))?;
+            .ok_or_else(|| {
+                invalid("host process read closure requires original read intent".into())
+            })?;
         // A root read keeps the original root owner: the receipt is settled
         // against the same owner that admitted the read.
         let root_intent = match root {
@@ -5827,12 +5872,7 @@ impl ExecutionCommitService {
     ) -> Result<(), ExecutionCommitError> {
         Self::reject_public_process_facts(outcome, false)?;
         local_network::validate_outcome(request, effect, outcome)?;
-        self.commit_tool_effect_trusted(
-            request,
-            effect,
-            outcome,
-            ProcessTerminalAuthority::Absent,
-        )
+        self.commit_tool_effect_trusted(request, effect, outcome, ProcessTerminalAuthority::Absent)
     }
 
     /// The honest shape of a Runtime-minted host process terminal.
@@ -6053,24 +6093,28 @@ impl ExecutionCommitService {
                     || tool_effect_refs(request),
                     |(_, owner, attempt)| root_effect_receipt_refs(request, owner, *attempt),
                 ),
-                payload: local_network::receipt_payload(&self.event_store, request, json!({
-                    "root_effect_context":intent.payload["root_effect_context"],
-                    "root_effect_owner":intent.payload["root_effect_owner"],
-                    "effect":effect,
-                    "idempotency_key": request.idempotency_key,
-                    "tool_name": request.tool_name,
-                    "replay": receipt_replay_contract(request)?,
-                    "input_sha256": format!(
-                        "sha256:{:x}",
-                        Sha256::digest(request.input.as_bytes())
-                    ),
-                    "descriptor_hash": effect.descriptor_hash,
-                    "outcome": bounded_tool_effect_outcome(outcome),
-                    "process_admission_ref": matches!(authority,
-                        ProcessTerminalAuthority::BoundedProcess(_) | ProcessTerminalAuthority::HostProcess(_))
-                        .then(|| format!("{}:process-admission", request.idempotency_key)),
-                    "resolved_effect_scope":intent.payload["resolved_effect_scope"],
-                }))?,
+                payload: local_network::receipt_payload(
+                    &self.event_store,
+                    request,
+                    json!({
+                        "root_effect_context":intent.payload["root_effect_context"],
+                        "root_effect_owner":intent.payload["root_effect_owner"],
+                        "effect":effect,
+                        "idempotency_key": request.idempotency_key,
+                        "tool_name": request.tool_name,
+                        "replay": receipt_replay_contract(request)?,
+                        "input_sha256": format!(
+                            "sha256:{:x}",
+                            Sha256::digest(request.input.as_bytes())
+                        ),
+                        "descriptor_hash": effect.descriptor_hash,
+                        "outcome": bounded_tool_effect_outcome(outcome),
+                        "process_admission_ref": matches!(authority,
+                            ProcessTerminalAuthority::BoundedProcess(_) | ProcessTerminalAuthority::HostProcess(_))
+                            .then(|| format!("{}:process-admission", request.idempotency_key)),
+                        "resolved_effect_scope":intent.payload["resolved_effect_scope"],
+                    }),
+                )?,
             },
             idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
             schema_version: 1,
@@ -6279,13 +6323,14 @@ impl ExecutionCommitService {
         &self,
         graph: ExecutionGraph,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
-        self.register_graph_with_continuation(graph, None)
+        self.register_graph_with_continuation(graph, None, None)
     }
 
     pub(crate) fn register_graph_with_continuation(
         &self,
         mut graph: ExecutionGraph,
         continuation_actor: Option<harness_contract::agent_action::AgentActorBinding>,
+        source_goal_cut: Option<ExpectedStreamRevision>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         graph.revision = 1;
         graph.node_statuses.clear();
@@ -6358,9 +6403,13 @@ impl ExecutionCommitService {
         }
         let (seed_event, continuation_revisions) = match continuation_actor.as_ref() {
             Some(actor) => {
-                let (event, revisions) =
-                    crate::agentic::continuation::prepare(&self.event_store, &graph, actor)
-                        .map_err(ExecutionCommitError::InvalidCommand)?;
+                let (event, revisions) = crate::agentic::continuation::prepare(
+                    &self.event_store,
+                    &graph,
+                    actor,
+                    source_goal_cut.as_ref(),
+                )
+                .map_err(ExecutionCommitError::InvalidCommand)?;
                 (event, revisions)
             }
             None => {
@@ -6501,11 +6550,14 @@ impl ExecutionCommitService {
         &self,
         graph: ExecutionGraph,
         actor: Option<harness_contract::agent_action::AgentActorBinding>,
+        source_goal_cut: Option<ExpectedStreamRevision>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let service = self.clone();
-        tokio::task::spawn_blocking(move || service.register_graph_with_continuation(graph, actor))
-            .await
-            .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
+        tokio::task::spawn_blocking(move || {
+            service.register_graph_with_continuation(graph, actor, source_goal_cut)
+        })
+        .await
+        .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
     }
 
     #[cfg(test)]
@@ -9381,7 +9433,9 @@ impl ExecutionCommitService {
             || creation.sequence != 1
             || creation.commit_cursor <= parent_start.1
         {
-            return Err(invalid("delegated Host cannot borrow a later parent attempt"));
+            return Err(invalid(
+                "delegated Host cannot borrow a later parent attempt",
+            ));
         }
         if packet != original_packet
             || ticket.payload_ref != original.payload_ref
@@ -9649,8 +9703,16 @@ impl ExecutionCommitService {
                     serde_json::from_value(primary.payload["effect"].clone())?;
                 let outcome: crate::RuntimeToolExecutionOutcome =
                     serde_json::from_value(primary.payload["outcome"].clone())?;
-                if let Some(issuer_source) = self.validate_stored_local_network_receipt(&primary, &effect)? {
-                    merge_outcome_source_revisions(&mut primary_sources, &BTreeMap::from([(issuer_source.stream_id, issuer_source.expected_revision)]))?;
+                if let Some(issuer_source) =
+                    self.validate_stored_local_network_receipt(&primary, &effect)?
+                {
+                    merge_outcome_source_revisions(
+                        &mut primary_sources,
+                        &BTreeMap::from([(
+                            issuer_source.stream_id,
+                            issuer_source.expected_revision,
+                        )]),
+                    )?;
                 }
                 if let Some(request) = bound.as_ref().filter(|request| {
                     read && request.idempotency_key == key
@@ -9785,18 +9847,69 @@ impl ExecutionCommitService {
             stream_id: stream,
             expected_revision: head,
         }];
-        sources.extend(primary_sources.iter().map(|(stream_id, expected_revision)| ExpectedStreamRevision {
-            stream_id:stream_id.clone(),expected_revision:*expected_revision,
-        }));
+        sources.extend(
+            primary_sources
+                .iter()
+                .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: *expected_revision,
+                }),
+        );
         if let Some((_, _, _, _, parent_sources)) = delegated {
             sources.extend(parent_sources);
         }
         let mut merged_sources = BTreeMap::new();
         for source in &sources {
-            merge_outcome_source_revisions(&mut merged_sources, &BTreeMap::from([(source.stream_id.clone(), source.expected_revision)]))?;
+            merge_outcome_source_revisions(
+                &mut merged_sources,
+                &BTreeMap::from([(source.stream_id.clone(), source.expected_revision)]),
+            )?;
         }
-        let sources = merged_sources.into_iter().map(|(stream_id,expected_revision)| ExpectedStreamRevision {stream_id,expected_revision}).collect::<Vec<_>>();
+        let sources = merged_sources
+            .into_iter()
+            .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                stream_id,
+                expected_revision,
+            })
+            .collect::<Vec<_>>();
         Ok(Some(sources))
+    }
+
+    pub(super) async fn recover_running_known_outcome(
+        &self,
+        graph: &ExecutionGraph,
+        node: &str,
+        binding: &ExecutionNodeBinding,
+        registry: &super::registry::NodeExecutorRegistry,
+    ) -> Result<bool, ExecutionCommitError> {
+        let invalid = |reason: String| ExecutionCommitError::InvalidCommand(reason);
+        let store = ExecutionGraphStateStore::new(Arc::clone(&self.event_store));
+        let (ticket, spec) = store
+            .binding_start_ticket(graph, node, binding)
+            .map_err(|error| invalid(error.to_string()))?;
+        // No change to Agent, Native, tool or other executor recovery policies.
+        if spec.kind != ExecutionNodeKind::InlineModel || ticket.executor_kind != "inline_model" {
+            return Ok(false);
+        }
+        let Some(executor) = registry.get(&ticket.executor_kind) else {
+            return Ok(false);
+        };
+        executor
+            .validate(&spec)
+            .map_err(|error| invalid(error.to_string()))?;
+        let Some(outcome) = executor
+            .recover_known_outcome(&ticket)
+            .await
+            .map_err(|error| invalid(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        // This boundary publishes the known original result through the same
+        // Graph/NodeEffect transaction as hot execution. It does not infer an
+        // effect receipt or physical exit from an Applied business receipt.
+        let sources = self.execution_outcome_sources(graph, &ticket, &outcome)?;
+        self.transition_execution_outcome(graph, &ticket, &outcome, &sources)?;
+        Ok(true)
     }
 
     pub(super) async fn recover_running_bound_tool_batch(
@@ -10033,9 +10146,18 @@ impl ExecutionCommitService {
         let recovered = agent_tool::agent_tool_outcome_at(&outcome, primary.created_at_ms)?;
         let mut merged_sources = BTreeMap::new();
         for source in &sources {
-            merge_outcome_source_revisions(&mut merged_sources, &BTreeMap::from([(source.stream_id.clone(), source.expected_revision)]))?;
+            merge_outcome_source_revisions(
+                &mut merged_sources,
+                &BTreeMap::from([(source.stream_id.clone(), source.expected_revision)]),
+            )?;
         }
-        let sources = merged_sources.into_iter().map(|(stream_id,expected_revision)| ExpectedStreamRevision {stream_id,expected_revision}).collect::<Vec<_>>();
+        let sources = merged_sources
+            .into_iter()
+            .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                stream_id,
+                expected_revision,
+            })
+            .collect::<Vec<_>>();
         let expected = sources
             .iter()
             .map(|source| (source.stream_id.clone(), source.expected_revision))
@@ -10066,10 +10188,7 @@ impl ExecutionCommitService {
         node: &str,
         binding: &ExecutionNodeBinding,
     ) -> serde_json::Value {
-        fn bounded(
-            value: serde_json::Value,
-            remaining: &mut usize,
-        ) -> serde_json::Value {
+        fn bounded(value: serde_json::Value, remaining: &mut usize) -> serde_json::Value {
             let bytes = serde_json::to_vec(&value).unwrap_or_default();
             if bytes.len() > *remaining {
                 return json!({
@@ -10087,17 +10206,21 @@ impl ExecutionCommitService {
         ) -> serde_json::Value {
             let stream = format!("agent:{}", packet.agent_id());
             let before = store.stream_revision(&stream);
-            let records = ["agent.run_admitted", "agent.backend_admitted", "agent.local_exit"]
-                .into_iter()
-                .map(|kind| {
-                    let key = format!("{kind}:{}", packet.run_id());
-                    let record = store.event_by_idempotency_key(&stream, &key);
-                    json!({
-                        "key":key, "record":record.as_ref().ok(),
-                        "error":record.as_ref().err().map(ToString::to_string),
-                    })
+            let records = [
+                "agent.run_admitted",
+                "agent.backend_admitted",
+                "agent.local_exit",
+            ]
+            .into_iter()
+            .map(|kind| {
+                let key = format!("{kind}:{}", packet.run_id());
+                let record = store.event_by_idempotency_key(&stream, &key);
+                json!({
+                    "key":key, "record":record.as_ref().ok(),
+                    "error":record.as_ref().err().map(ToString::to_string),
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
             json!({
                 "packet":packet, "stream":stream, "records":records,
                 "head_before":before.as_ref().ok(),
@@ -10148,11 +10271,14 @@ impl ExecutionCommitService {
                     graph.id, node, binding.attempt,
                 ));
             }
-            identity = bounded(json!({
-                "ticket": ticket,
-                "spec": spec,
-                "bound_decode_error": bound.as_ref().err().map(ToString::to_string),
-            }), &mut remaining);
+            identity = bounded(
+                json!({
+                    "ticket": ticket,
+                    "spec": spec,
+                    "bound_decode_error": bound.as_ref().err().map(ToString::to_string),
+                }),
+                &mut remaining,
+            );
             if spec.kind == ExecutionNodeKind::AgentTask {
                 if let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(&ticket.payload_ref) {
                     streams.insert(format!("agent:{}", packet.agent_id()));
@@ -10165,9 +10291,9 @@ impl ExecutionCommitService {
         for stream in streams.into_iter().take(8) {
             let head = self.event_store.stream_revision(&stream);
             let records = match head.as_ref() {
-                Ok(head) => self.event_store.list_stream_after(
-                    &stream, 0, *head, 32, 64 * 1024,
-                ),
+                Ok(head) => self
+                    .event_store
+                    .list_stream_after(&stream, 0, *head, 32, 64 * 1024),
                 Err(error) => {
                     snapshots.push(json!({"stream": stream, "error": error.to_string()}));
                     continue;
@@ -10184,12 +10310,15 @@ impl ExecutionCommitService {
                             let primary = self.event_store.event_by_idempotency_key(
                                 &primary_stream, &format!("{key}:{suffix}"),
                             );
-                            snapshots.push(bounded(json!({
-                                "stream": primary_stream,
-                                "key": format!("{key}:{suffix}"),
-                                "record": primary.as_ref().ok(),
-                                "error": primary.as_ref().err().map(ToString::to_string),
-                            }), &mut remaining));
+                            snapshots.push(bounded(
+                                json!({
+                                    "stream": primary_stream,
+                                    "key": format!("{key}:{suffix}"),
+                                    "record": primary.as_ref().ok(),
+                                    "error": primary.as_ref().err().map(ToString::to_string),
+                                }),
+                                &mut remaining,
+                            ));
                         }
                     }
                     json!({
@@ -10200,11 +10329,14 @@ impl ExecutionCommitService {
                 }
                 Err(error) => json!({"error": error.to_string()}),
             };
-            snapshots.push(bounded(json!({
-                "stream": stream,
-                "page": records,
-                "head_after": self.event_store.stream_revision(&stream).ok(),
-            }), &mut remaining));
+            snapshots.push(bounded(
+                json!({
+                    "stream": stream,
+                    "page": records,
+                    "head_after": self.event_store.stream_revision(&stream).ok(),
+                }),
+                &mut remaining,
+            ));
         }
         let snapshot = json!({
             "schema": "Own834.physical_closure.v1",
@@ -10543,6 +10675,15 @@ impl ExecutionCommitService {
     }
 
     #[cfg(test)]
+    pub(crate) fn binding_owner_key_for_test(
+        graph: &ExecutionGraph,
+        node: &str,
+        binding: &ExecutionNodeBinding,
+    ) -> String {
+        super::events::ExecutionBindingLeaseClosure::fence_key(graph, node, binding)
+    }
+
+    #[cfg(test)]
     pub(crate) fn commit_observed_binding_closure_for_test(
         &self,
         graph: &ExecutionGraph,
@@ -10738,6 +10879,87 @@ impl ExecutionCommitService {
             ));
         }
         for event in &domain_events {
+            if event.event.kind == "goal.revised"
+                && event.event.payload.get("user_input_application").is_some()
+            {
+                let source = &event.event.payload["goal_source"];
+                let goal = &event.event.payload["goal"];
+                let ticket = &event.event.payload["input_application_ticket"];
+                let lineage = graph.lineage.as_ref().ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(
+                        "user Goal requires original Graph lineage".into(),
+                    )
+                })?;
+                let revision = source["sequence"].as_u64().ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand("user Goal source cut missing".into())
+                })?;
+                if source["stream_id"] != event.event.stream_id
+                    || source["goal_revision"]
+                        .as_u64()
+                        .map(|r| r.saturating_add(1))
+                        != goal["revision"].as_u64()
+                    || source["spec_revision"]
+                        .as_u64()
+                        .map(|r| r.saturating_add(1))
+                        != goal["spec_revision"].as_u64()
+                    || source["source_intent_ref"] != goal["source_intent_ref"]
+                    || goal["execution_binding"]["root_execution_id"] != graph.id
+                    || goal["execution_binding"]["session_id"] != lineage.session_id
+                    || goal["execution_binding"]["turn_id"] != lineage.turn_id
+                    || ticket["graph_id"] != graph.id
+                    || ticket["attempt"].as_u64().is_none_or(|a| a == 0)
+                    || !graph.nodes.iter().any(|n| ticket["node_id"] == n.id)
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "user Goal source/spec/Graph binding mismatch".into(),
+                    ));
+                }
+                if observation_sources
+                    .insert(event.event.stream_id.clone(), revision)
+                    .is_some_and(|old| old != revision)
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "user Goal source conflicts with original read set".into(),
+                    ));
+                }
+            }
+            if event.event.kind == "goal.completed"
+                && event.event.payload.get("goal_source").is_some()
+            {
+                let source = &event.event.payload["goal_source"];
+                let goal = &event.event.payload["goal"];
+                let lineage = graph.lineage.as_ref().ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(
+                        "ordinary Goal requires original Graph lineage".into(),
+                    )
+                })?;
+                let revision = source["sequence"].as_u64().ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand("ordinary Goal source cut missing".into())
+                })?;
+                let prior_revision = source["goal_revision"].as_u64().ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand("ordinary Goal revision missing".into())
+                })?;
+                if source["stream_id"] != event.event.stream_id
+                    || goal["revision"] != prior_revision.saturating_add(1)
+                    || source["spec_digest"] != goal["spec_digest"]
+                    || source["source_intent_ref"] != goal["source_intent_ref"]
+                    || goal["execution_binding"]["root_execution_id"] != graph.id
+                    || goal["execution_binding"]["session_id"] != lineage.session_id
+                    || goal["execution_binding"]["turn_id"] != lineage.turn_id
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "ordinary Goal source/spec/Session binding mismatch".into(),
+                    ));
+                }
+                if observation_sources
+                    .insert(event.event.stream_id.clone(), revision)
+                    .is_some_and(|previous| previous != revision)
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "ordinary Goal source conflicts with causal read-set".into(),
+                    ));
+                }
+            }
             if event.event.kind == "goal.observation" {
                 let source = &event.event.payload["goal_source"];
                 if event.schema_version != 2
@@ -11830,25 +12052,34 @@ mod recovery_physical_450_tests {
         for unrelated in [0usize, 100, 1000] {
             if unrelated > inserted {
                 let head = events.stream_revision(&parent_index).unwrap();
-                let noise = (inserted..unrelated).map(|position| {
-                    let key = format!("763-unselected-{position}");
-                    let mut event: crate::runtime_event_store::RuntimeTransactionEventInput =
-                        RuntimeEventInput {
+                let noise = (inserted..unrelated)
+                    .map(|position| {
+                        let key = format!("763-unselected-{position}");
+                        let mut event: crate::runtime_event_store::RuntimeTransactionEventInput =
+                            RuntimeEventInput {
+                                stream_id: parent_index.clone(),
+                                scope: RuntimeEventScope::ExecutionNode,
+                                kind: "execution.agent_tool.intent".into(),
+                                status: None,
+                                actor: Some("governed_tool".into()),
+                                refs: vec![],
+                                payload: json!({"idempotency_key":key}),
+                            }
+                            .into();
+                        event.idempotency_key = Some(format!("agent-tool-intent:{key}"));
+                        event
+                    })
+                    .collect();
+                events
+                    .append_transaction(AppendTransactionRequest {
+                        transaction_id: format!("763-unrelated-through-{unrelated}"),
+                        expected_streams: vec![ExpectedStreamRevision {
                             stream_id: parent_index.clone(),
-                            scope: RuntimeEventScope::ExecutionNode,
-                            kind: "execution.agent_tool.intent".into(),
-                            status: None, actor: Some("governed_tool".into()), refs: vec![],
-                            payload: json!({"idempotency_key":key}),
-                        }.into();
-                    event.idempotency_key = Some(format!("agent-tool-intent:{key}"));
-                    event
-                }).collect();
-                events.append_transaction(AppendTransactionRequest {
-                    transaction_id: format!("763-unrelated-through-{unrelated}"),
-                    expected_streams: vec![ExpectedStreamRevision {
-                        stream_id: parent_index.clone(), expected_revision: head,
-                    }], events: noise,
-                }).unwrap();
+                            expected_revision: head,
+                        }],
+                        events: noise,
+                    })
+                    .unwrap();
                 inserted = unrelated;
             }
             let head = events.stream_revision(&parent_index).unwrap();
@@ -11859,9 +12090,13 @@ mod recovery_physical_450_tests {
             ).unwrap().expect("original selected real receipt remains recoverable");
             let elapsed_ns = started.elapsed().as_nanos();
             let reads = counter.take_source_reads_763();
-            let index_records: usize = reads.iter()
-                .filter(|(port, stream, _, _)| port == "list_stream_after" && stream == &parent_index)
-                .map(|(_, _, records, _)| records).sum();
+            let index_records: usize = reads
+                .iter()
+                .filter(|(port, stream, _, _)| {
+                    port == "list_stream_after" && stream == &parent_index
+                })
+                .map(|(_, _, records, _)| records)
+                .sum();
             assert_eq!(index_records as u64, head);
             cumulative += index_records;
             assert!(selected.iter().any(|source|
@@ -11875,12 +12110,23 @@ mod recovery_physical_450_tests {
                 counter.begin_source_reads_763();
                 let started = std::time::Instant::now();
                 for _ in 0..lookups {
-                    let intent = events.event_by_idempotency_key(&parent_index,
-                        &format!("agent-tool-intent:{}", bound.request.idempotency_key)).unwrap();
-                    assert!(intent.is_none(), "a read must not fabricate a mutation intent");
-                    let receipt = events.event_by_idempotency_key(&parent_index,
-                        &format!("agent-tool-receipt:{}", bound.request.idempotency_key))
-                        .unwrap().expect("actual selected original read receipt");
+                    let intent = events
+                        .event_by_idempotency_key(
+                            &parent_index,
+                            &format!("agent-tool-intent:{}", bound.request.idempotency_key),
+                        )
+                        .unwrap();
+                    assert!(
+                        intent.is_none(),
+                        "a read must not fabricate a mutation intent"
+                    );
+                    let receipt = events
+                        .event_by_idempotency_key(
+                            &parent_index,
+                            &format!("agent-tool-receipt:{}", bound.request.idempotency_key),
+                        )
+                        .unwrap()
+                        .expect("actual selected original read receipt");
                     assert!(receipt.sequence <= head);
                     assert_eq!(receipt.stream_id, parent_index);
                     assert_eq!(receipt.kind, "execution.agent_tool.receipt");
@@ -11913,15 +12159,23 @@ mod recovery_physical_450_tests {
             assert!(events.durable_commit_cursor().unwrap() > before_cursor);
             let closure = events.append_transaction(AppendTransactionRequest {
                 transaction_id: format!("763-stale-closure-{unrelated}"),
-                expected_streams: selected.into_iter().chain(std::iter::once(ExpectedStreamRevision {
-                    stream_id: "763-must-not-close".into(),
-                    expected_revision: 0,
-                })).collect(),
+                expected_streams: selected
+                    .into_iter()
+                    .chain(std::iter::once(ExpectedStreamRevision {
+                        stream_id: "763-must-not-close".into(),
+                        expected_revision: 0,
+                    }))
+                    .collect(),
                 events: vec![RuntimeEventInput {
-                    stream_id: "763-must-not-close".into(), scope: RuntimeEventScope::ExecutionNode,
-                    kind: "test.763.must_not_close".into(), status: None, actor: None,
-                    refs: vec![], payload: json!({}),
-                }.into()],
+                    stream_id: "763-must-not-close".into(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "test.763.must_not_close".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: json!({}),
+                }
+                .into()],
             });
             assert!(matches!(closure, Err(RuntimeEventStoreError::StaleRevision { stream_id, .. })
                 if stream_id == parent_index));
