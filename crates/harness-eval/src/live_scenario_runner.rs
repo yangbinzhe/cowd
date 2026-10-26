@@ -1553,7 +1553,13 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
         resource_scopes.push("read:.");
     }
     let control = json!({
-        "corpus_id": if spec_id == ONE_TEAM_SCENARIO_ID { "live-one-team-v1" } else { "live-scenarios-v1" },
+        "corpus_id": if spec_id == ONE_TEAM_SCENARIO_ID {
+            "live-one-team-v1"
+        } else if matches!(spec_id, "u5-read-a" | "u5-read-b") {
+            "live-u5-fairness-v1"
+        } else {
+            "live-scenarios-v1"
+        },
         "workspace_fixture": "none",
         // The disposable Gateway config is the single-route authority. This
         // field belongs to Runtime's execution-resource contract, where the
@@ -7516,11 +7522,28 @@ mod read_evidence_consumer_tests {
             ("live_one_team_execution", "live-one-team-v1"),
             ("live_direct_terminal", "live-scenarios-v1"),
             ("live_tool_evidence", "live-scenarios-v1"),
+            ("u5-read-a", "live-u5-fairness-v1"),
+            ("u5-read-b", "live-u5-fairness-v1"),
+            (U7_MEMORY, "live-scenarios-v1"),
         ];
-        let mut originals = Vec::new();
+        let originals: Vec<_> = cases
+                .iter()
+                .map(|(selector, _)| json!({"selector":selector,
+                    "content":controlled_live_prompt(selector, "original controlled input".into(), None)}))
+                .collect();
+        // Export the real producer bytes even when a literal contract assertion
+        // fails, so the original Runtime parser can witness the same red input.
+        if let Some(path) = std::env::var_os("COWD_TEST_HARNESS_CONTROL_OUTPUT") {
+            std::fs::write(path, serde_json::to_vec(&originals).unwrap()).unwrap();
+        }
         for (selector, expected_corpus) in cases {
             let prompt = "original controlled input";
-            let content = controlled_live_prompt(selector, prompt.into(), None);
+            let content = originals
+                .iter()
+                .find(|v| v["selector"] == selector)
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
             let (line, actual_prompt) = content.split_once('\n').unwrap();
             let control: Value =
                 serde_json::from_str(line.strip_prefix("COWD_EVAL_CONTROL ").unwrap()).unwrap();
@@ -7528,14 +7551,24 @@ mod read_evidence_consumer_tests {
             assert_eq!(actual_prompt, prompt);
             assert_eq!(control["temperature_milli"], 0);
             assert_eq!(control["provider_constraint"], "normal");
+            if let Some(read) = match selector {
+                "u5-read-a" => Some("read:Cargo.toml"),
+                "u5-read-b" => Some("read:crates/runtime/Cargo.toml"),
+                _ => None,
+            } {
+                assert_eq!(
+                    control["resource_scopes"],
+                    json!(["provider", "provider_account", "provider_token_pool", read])
+                );
+            }
+            if selector == U7_MEMORY {
+                assert_eq!(
+                    control["resource_scopes"],
+                    json!(["provider", "provider_account", "provider_token_pool"])
+                );
+            }
             assert!(control.get("budget_lease_id").is_none());
             assert!(control.get("max_total_tokens").is_none());
-            originals.push(json!({"selector":selector,"content":content}));
-        }
-        // Optional immutable handoff to the original Runtime cfgtest parser.
-        // Expectations there are independent literals, never read from this file.
-        if let Some(path) = std::env::var_os("COWD_TEST_HARNESS_CONTROL_OUTPUT") {
-            std::fs::write(path, serde_json::to_vec(&originals).unwrap()).unwrap();
         }
     }
 

@@ -2162,7 +2162,7 @@ fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl
         .map_err(|error| RuntimeError::new(format!("invalid evaluation turn control: {error}")))?;
     if !matches!(
         control.corpus_id.as_str(),
-        "auto-strategy-v1" | "live-scenarios-v1" | "live-one-team-v1"
+        "auto-strategy-v1" | "live-scenarios-v1" | "live-one-team-v1" | "live-u5-fairness-v1"
     ) || configured_corpus.as_deref() != Some(control.corpus_id.as_str())
         || prompt.trim().is_empty()
     {
@@ -2234,13 +2234,16 @@ mod evaluation_control_corpus_tests {
         let raw = std::fs::read(path).unwrap();
         assert!(raw.len() < 16384);
         let originals: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(originals.len(), 3);
+        assert_eq!(originals.len(), 6);
         std::env::set_var("COWD_EVAL_HARNESS", "1");
         std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
         for (selector, corpus) in [
             ("live_one_team_execution", "live-one-team-v1"),
             ("live_direct_terminal", "live-scenarios-v1"),
             ("live_tool_evidence", "live-scenarios-v1"),
+            ("u5-read-a", "live-u5-fairness-v1"),
+            ("u5-read-b", "live-u5-fairness-v1"),
+            ("live_u7_persistent_memory_recall", "live-scenarios-v1"),
         ] {
             let case = originals
                 .iter()
@@ -2255,6 +2258,23 @@ mod evaluation_control_corpus_tests {
             assert_eq!(control.prompt, "original controlled input");
             assert_eq!(control.provider_constraint, "normal");
             assert_eq!(control.temperature_milli, 0);
+            if let Some(read) = match selector {
+                "u5-read-a" => Some("read:Cargo.toml"),
+                "u5-read-b" => Some("read:crates/runtime/Cargo.toml"),
+                _ => None,
+            } {
+                assert_eq!(
+                    control.resource_scopes,
+                    ["provider", "provider_account", "provider_token_pool", read]
+                );
+                // A known but wrong configured corpus is not an alias.
+                std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
+                assert!(evaluation_turn_control(content)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("corpus or prompt"));
+                std::env::set_var("COWD_EVAL_CORPUS_ID", corpus);
+            }
             let (line, prompt) = content.split_once('\n').unwrap();
             let original: serde_json::Value =
                 serde_json::from_str(line.strip_prefix(EVALUATION_TURN_CONTROL_PREFIX).unwrap())
@@ -2337,7 +2357,7 @@ mod evaluation_control_corpus_tests {
             assert!(evaluation_turn_control(content).unwrap().is_none());
             std::env::set_var("COWD_EVAL_HARNESS", "1");
         }
-        println!("ACTUAL_HARNESS_TO_RUNTIME_CORPUS_GATE: three original selector envelopes consumed; registry/equality/prompt/temperature/telemetry negatives hit");
+        println!("ACTUAL_HARNESS_TO_RUNTIME_CORPUS_GATE: six original selector envelopes consumed; registry/equality/prompt/temperature/telemetry negatives hit");
     }
 }
 
