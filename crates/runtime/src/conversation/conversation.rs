@@ -291,8 +291,8 @@ use harness_contract::{
     knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{
-        understand, ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
-        StrategyExperienceSummary, StrategyInput, StrategyWorkloadFingerprint,
+        ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
+        StrategyInput, StrategyWorkloadFingerprint,
     },
     turn::{
         SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId,

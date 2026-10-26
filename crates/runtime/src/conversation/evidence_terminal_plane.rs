@@ -1585,125 +1585,9 @@ where
     }
 
     pub(super) fn strategy_input_for_turn(&self, user_input: &str) -> StrategyInput {
-        let mut input = StrategyInput::from_prompt(user_input.to_string());
-        let Some(projector) = self.outcome_projector.as_ref() else {
-            return input;
-        };
-        let understanding = understand(&input);
-        let workload_fingerprint =
-            StrategyWorkloadFingerprint::from_input(&input, &understanding).digest();
-        input.understanding = Some(understanding);
-        let Some(model) = self
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-        else {
-            return input;
-        };
-        let Some(provider) = self.api_client.provider_name_for_model(model) else {
-            return input;
-        };
-        let snapshot = projector.snapshot();
-        let now = now_ms();
-        const EXPERIENCE_FRESHNESS_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
-        let mut comparable = Vec::new();
-        for candidate in [
-            ExecutionCandidateKind::Direct,
-            ExecutionCandidateKind::ParallelTools,
-            ExecutionCandidateKind::Team,
-        ] {
-            let key = harness_contract::outcome::StrategyExperienceKey {
-                workspace_key: self.checkpoint_workspace_id.clone(),
-                workload_fingerprint_sha256: workload_fingerprint.clone(),
-                config_revision: self.runtime_config_revision.clone(),
-                provider: provider.clone(),
-                model: model.to_string(),
-                evaluation_environment: "production".to_string(),
-                candidate,
-            };
-            let Some(experience) = snapshot.strategy_experience(&key) else {
-                continue;
-            };
-            if experience.sample_count == 0
-                || now.saturating_sub(experience.last_observed_at_ms) > EXPERIENCE_FRESHNESS_MS
-            {
-                continue;
-            }
-            input.candidate_costs.insert(
-                candidate,
-                StrategyCandidateCostSummary {
-                    sample_count: u32::try_from(experience.sample_count).unwrap_or(u32::MAX),
-                    average_critical_path_ms: experience.duration_p50_ms,
-                    average_total_tokens: experience.total_tokens_p50,
-                    average_coordination_cost_ms: experience.coordination_cost_p50_ms,
-                    calibration_source: format!(
-                        "runtime.outcome_strategy.v2:{}:{}",
-                        snapshot.revision, workload_fingerprint
-                    ),
-                },
-            );
-            comparable.push(experience);
-        }
-        if !comparable.is_empty() {
-            let total = comparable.iter().fold(0_u64, |sum, experience| {
-                sum.saturating_add(experience.sample_count)
-            });
-            let sum = |value: fn(&crate::StrategyExperienceSnapshot) -> u64| {
-                comparable.iter().fold(0_u64, |sum, experience| {
-                    sum.saturating_add(value(experience))
-                })
-            };
-            let weighted = |value: fn(&crate::StrategyExperienceSnapshot) -> u64| {
-                comparable
-                    .iter()
-                    .fold(0_u64, |sum, experience| {
-                        sum.saturating_add(
-                            value(experience).saturating_mul(experience.sample_count),
-                        )
-                    })
-                    .saturating_div(total.max(1))
-            };
-            let basis_points = |count: u64, sample_count: u64| {
-                u16::try_from(count.saturating_mul(10_000) / sample_count.max(1)).unwrap_or(10_000)
-            };
-            let team = comparable.iter().find(|experience| {
-                experience
-                    .key
-                    .as_ref()
-                    .is_some_and(|key| key.candidate == ExecutionCandidateKind::Team)
-            });
-            input.experience = Some(StrategyExperienceSummary {
-                sample_count: u32::try_from(total).unwrap_or(u32::MAX),
-                success_rate_bp: basis_points(sum(|experience| experience.success_count), total),
-                verification_block_rate_bp: basis_points(
-                    sum(|experience| experience.verification_block_count),
-                    total,
-                ),
-                context_pressure_rate_bp: basis_points(
-                    sum(|experience| experience.context_pressure_count),
-                    total,
-                ),
-                multi_agent_lift_rate_bp: team.map_or(0, |experience| {
-                    basis_points(
-                        experience.positive_lift_count,
-                        experience.paired_comparison_count,
-                    )
-                }),
-                multi_agent_lift_sample_count: team
-                    .map(|experience| {
-                        u32::try_from(experience.paired_comparison_count).unwrap_or(u32::MAX)
-                    })
-                    .unwrap_or_default(),
-                average_duration_ms: weighted(|experience| experience.duration_p50_ms),
-                average_total_tokens: weighted(|experience| experience.total_tokens_p50),
-                average_coordination_cost_ms: weighted(|experience| {
-                    experience.coordination_cost_p50_ms
-                }),
-                actual_cost_sample_count: u32::try_from(total).unwrap_or(u32::MAX),
-            });
-        }
-        input
+        // Planning advice is derived from this input, not production outcome
+        // history. Outcome records remain available to explicit offline evals.
+        StrategyInput::from_prompt(user_input.to_string())
     }
 
     /// Admit exactly one strategy identity for a turn. This is the only
@@ -2040,6 +1924,7 @@ where
         Ok(state.decision)
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(super) fn retarget_active_turn_strategy_for_tool_requirements(
         &self,
         selected_candidate: harness_contract::strategy::ExecutionCandidateKind,
@@ -2110,6 +1995,7 @@ where
     /// plan. Conversation and execution-graph routes call this same method so
     /// a graph node cannot validate a later write against an earlier
     /// evidence-only strategy snapshot.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn retarget_active_turn_strategy_for_governed_plan(
         &self,
         plan: &GovernedToolPlan,
