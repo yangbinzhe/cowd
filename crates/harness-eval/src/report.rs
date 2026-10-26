@@ -1053,6 +1053,25 @@ pub(crate) fn canonical_total_tokens(report: &Value) -> Option<u32> {
 #[must_use]
 /// Exact physical call IDs are additive; missing outcomes/usage never mean zero.
 pub(crate) fn u5_stage_usage(leaves: &[Value]) -> Result<Value, String> {
+    u5_stage_usage_inner(leaves, false)
+}
+
+pub(crate) fn u5_cancel_stage_usage(leaves: &[Value]) -> Result<Value, String> {
+    if leaves.len() != 2
+        || leaves[0]["status"] != "cancelled"
+        || leaves[1]["status"] != "passed"
+        || u5_stage_usage(&leaves[1..])?["total_tokens"]
+            .as_u64()
+            .is_none()
+    {
+        return Err(
+            "U5 cancellation requires one cancelled leaf and one known-usage normal leaf".into(),
+        );
+    }
+    u5_stage_usage_inner(leaves, true)
+}
+
+fn u5_stage_usage_inner(leaves: &[Value], cancellation: bool) -> Result<Value, String> {
     let mut calls = std::collections::BTreeMap::<String, Value>::new();
     let mut packed = std::collections::BTreeMap::new();
     for leaf in leaves {
@@ -1092,8 +1111,8 @@ pub(crate) fn u5_stage_usage(leaves: &[Value]) -> Result<Value, String> {
             return Err("U5 leaf has no physical call evidence".into());
         }
     }
-    if calls.is_empty()
-        || packed.keys().any(|id| !calls.contains_key(id))
+    if packed.is_empty()
+        || (!cancellation && (calls.is_empty() || packed.keys().any(|id| !calls.contains_key(id))))
         || calls.keys().any(|id| !packed.contains_key(id))
     {
         return Err("U5 physical call usage unknown".into());
@@ -1105,7 +1124,8 @@ pub(crate) fn u5_stage_usage(leaves: &[Value]) -> Result<Value, String> {
         "cache_creation_input_tokens",
         "cache_read_input_tokens",
     ] {
-        let total = calls.values().try_fold(0u64, |sum, call| {
+        let total = packed.keys().try_fold(0u64, |sum, id| {
+            let call = calls.get(id)?;
             if call["usage_status"] != "known" {
                 return None;
             }
@@ -1114,7 +1134,7 @@ pub(crate) fn u5_stage_usage(leaves: &[Value]) -> Result<Value, String> {
             }
             sum.checked_add(call["usage"][key].as_u64()?)
         });
-        if matches!(key, "input_tokens" | "output_tokens") && total.is_none() {
+        if !cancellation && matches!(key, "input_tokens" | "output_tokens") && total.is_none() {
             return Err("U5 required usage unknown".into());
         }
         result.insert(key.to_owned(), json!(total));
@@ -1128,11 +1148,36 @@ pub(crate) fn u5_stage_usage(leaves: &[Value]) -> Result<Value, String> {
     .iter()
     .try_fold(0u64, |sum, key| sum.checked_add(result[*key].as_u64()?));
     result.insert("total_tokens".into(), json!(total));
-    result.insert("physical_calls".into(), json!(calls.len()));
+    result.insert("physical_calls".into(), json!(packed.len()));
     result.insert(
         "source".into(),
         json!("original_provider_call_id_deduplicated"),
     );
+    if cancellation {
+        let unknown = packed
+            .keys()
+            .filter(|id| {
+                calls.get(*id).is_none_or(|call| {
+                    call["usage_status"] != "known"
+                        || call["cache_dimensions_status"] != "known"
+                        || [
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_creation_input_tokens",
+                            "cache_read_input_tokens",
+                        ]
+                        .iter()
+                        .any(|key| call["usage"][*key].as_u64().is_none())
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        result.insert(
+            "usage_status".into(),
+            json!(if total.is_some() { "known" } else { "unknown" }),
+        );
+        result.insert("unknown_call_ids".into(), json!(unknown));
+    }
     Ok(Value::Object(result))
 }
 
@@ -1141,6 +1186,7 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
     let pairs = live["scenarios"].as_array();
     let pair = pairs.and_then(|p| p.first()).unwrap_or(&Value::Null);
     let leaves = pair["sessions"].as_array();
+    let cancellation = pair["scenario_id"] == "live_u5_active_cancel_isolation";
     let leaf_ok = leaves.is_some_and(|l| {
         l.len() == 2
             && l.iter().all(|v| {
@@ -1163,7 +1209,37 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
                 })
             })
     });
-    let usage = leaves.and_then(|l| u5_stage_usage(l).ok());
+    let cancel_leaf_ok = leaves.is_some_and(|l| {
+        l.len() == 2
+            && l[0]["status"] == "cancelled"
+            && l[0].pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
+            && l[0].pointer("/physical_cancellation/local_response_cancel_observed")
+                == Some(&Value::Bool(true))
+            && l[0].pointer("/physical_cancellation/remote_server_inference_stop")
+                == Some(&json!("unknown"))
+            && l[1]["status"] == "passed"
+            && l[1].pointer("/acceptance/passed") == Some(&Value::Bool(true))
+            && l[1].pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
+            && l[1]
+                .pointer("/acceptance/checks")
+                .and_then(Value::as_array)
+                .is_some_and(|checks| {
+                    !checks.is_empty() && checks.iter().all(|c| c["passed"] == true)
+                })
+    });
+    let usage = leaves.and_then(|l| {
+        if cancellation {
+            u5_cancel_stage_usage(l)
+        } else {
+            u5_stage_usage(l)
+        }
+        .ok()
+    });
+    let selected_id = if cancellation {
+        "live_u5_active_cancel_isolation"
+    } else {
+        "live_u5_shared_session_fairness"
+    };
     let checks = [
         (
             "u5_exact_focused_selection",
@@ -1174,16 +1250,28 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
                 && live["claim_scope"] == "focused"
                 && live["health_status"] == "passed"
                 && live["selection_status"] == "passed"
-                && live["selected_scenario_ids"] == json!(["live_u5_shared_session_fairness"])
+                && live["selected_scenario_ids"] == json!([selected_id])
                 && pairs.is_some_and(|p| p.len() == 1)
-                && pair["scenario_id"] == "live_u5_shared_session_fairness",
+                && pair["scenario_id"] == selected_id,
         ),
         (
-            "u5_two_original_leaf_business_permissions_and_ACK",
-            leaf_ok && identities,
+            if cancellation {
+                "u5_cancelled_leaf_authorized_physical_and_other_leaf_business_permissions_and_ACK"
+            } else {
+                "u5_two_original_leaf_business_permissions_and_ACK"
+            },
+            (if cancellation {
+                cancel_leaf_ok
+            } else {
+                leaf_ok
+            }) && identities,
         ),
         (
-            "u5_original_capacity_witness",
+            if cancellation {
+                "u5_original_physical_cancellation_and_settlement"
+            } else {
+                "u5_original_capacity_witness"
+            },
             pair["status"] == "pending_outer_cleanup"
                 && pair.pointer("/acceptance/checks/internal_passed") == Some(&Value::Bool(true))
                 && [
@@ -1191,16 +1279,24 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
                     "selected_witnesses_complete",
                     "left_business",
                     "right_business",
-                    "capacity_competition",
                 ]
                 .iter()
-                .all(|k| pair["acceptance"]["checks"][k] == true),
+                .all(|k| pair["acceptance"]["checks"][k] == true)
+                && (if cancellation {
+                    pair["acceptance"]["checks"]["physical_cancellation"] == true
+                } else {
+                    pair["acceptance"]["checks"]["capacity_competition"] == true
+                }),
         ),
         (
-            "u5_original_usage_complete",
+            if cancellation {
+                "u5_original_usage_accounted"
+            } else {
+                "u5_original_usage_complete"
+            },
             usage
                 .as_ref()
-                .is_some_and(|u| u["total_tokens"].as_u64().is_some())
+                .is_some_and(|u| cancellation || u["total_tokens"].as_u64().is_some())
                 && usage.as_ref().is_some_and(|u| {
                     [
                         "input_tokens",
@@ -3660,6 +3756,98 @@ pub(crate) mod u5_stage_tests {
                 "acceptance":{"checks":{"internal_passed":true,"identity":true,"selected_witnesses_complete":true,"left_business":true,"right_business":true,"capacity_competition":true}},
                 "sessions":[leaf("a",1,2),leaf("b",3,4)]}]}})
     }
+    pub(crate) fn original_cancel_stage() -> Value {
+        let mut stage = original_stage();
+        stage["scenarios"][0]["capability"] = json!("live_u5_active_cancel_isolation");
+        stage["live_gateway_scenarios"]["selected_scenario_ids"] =
+            json!(["live_u5_active_cancel_isolation"]);
+        let pair = &mut stage["live_gateway_scenarios"]["scenarios"][0];
+        pair["scenario_id"] = json!("live_u5_active_cancel_isolation");
+        pair["acceptance"]["checks"]["capacity_competition"] = json!(false);
+        pair["acceptance"]["checks"]["physical_cancellation"] = json!(true);
+        pair["sessions"][0]["status"] = json!("cancelled");
+        pair["sessions"][0]["metrics"] = Value::Null;
+        pair["sessions"][0]["physical_cancellation"] = json!({
+                "local_response_cancel_observed":true,"remote_server_inference_stop":"unknown"});
+        pair["sessions"][0]["u5_provider_events"][1]["payload"]["usage_status"] = json!("unknown");
+        pair["sessions"][0]["u5_provider_events"][1]["payload"]["usage"] = Value::Null;
+        let usage = u5_cancel_stage_usage(pair["sessions"].as_array().unwrap()).unwrap();
+        stage["u5_usage"] = usage.clone();
+        stage["execution_trace"]["total_usage"] = usage;
+        stage["execution_trace"]["total_usage"]["usage_source"] =
+            json!("live_gateway_canonical_usage");
+        stage
+    }
+
+    #[test]
+    fn r203_cancel_stage_keeps_unknown_usage_and_requires_distinct_real_leaf_obligations() {
+        let good = original_cancel_stage();
+        let gate = evaluate_report_gate(&good);
+        assert_eq!(gate.status, "pending_outer_cleanup");
+        assert_eq!(good["u5_usage"]["usage_status"], "unknown");
+        assert_eq!(good["u5_usage"]["input_tokens"], Value::Null);
+        assert_eq!(good["u5_usage"]["total_tokens"], Value::Null);
+        assert_eq!(good["u5_usage"]["unknown_call_ids"], json!(["a"]));
+        let pair = "/live_gateway_scenarios/scenarios/0";
+        for (path, value) in [
+            (format!("{pair}/sessions/0/status"), json!("requested")),
+            (
+                format!("{pair}/sessions/0/actor_cleanup/passed"),
+                json!(false),
+            ),
+            (
+                format!("{pair}/sessions/0/physical_cancellation/local_response_cancel_observed"),
+                json!(false),
+            ),
+            (
+                format!("{pair}/sessions/0/physical_cancellation/remote_server_inference_stop"),
+                json!("proven"),
+            ),
+            (format!("{pair}/sessions/1/status"), json!("cancelled")),
+            (
+                format!("{pair}/sessions/1/acceptance/checks/0/passed"),
+                json!(false),
+            ),
+            (
+                format!("{pair}/sessions/1/u5_provider_events/1/payload/usage_status"),
+                json!("unknown"),
+            ),
+            (
+                format!("{pair}/acceptance/checks/physical_cancellation"),
+                json!(false),
+            ),
+            ("/u5_usage/input_tokens".into(), json!(0)),
+            ("/u5_usage/unknown_call_ids".into(), json!([])),
+            (
+                "/live_gateway_scenarios/selected_scenario_ids".into(),
+                json!(["live_u5_shared_session_fairness"]),
+            ),
+        ] {
+            let mut bad = good.clone();
+            *bad.pointer_mut(&path).unwrap() = value;
+            assert_eq!(evaluate_report_gate(&bad).status, "failed", "{path}");
+        }
+        let pair = &good["live_gateway_scenarios"]["scenarios"][0];
+        assert!(
+            u5_stage_usage(pair["sessions"].as_array().unwrap()).is_err(),
+            "F still refuses unknown usage"
+        );
+        let mut leaves = pair["sessions"].as_array().unwrap().clone();
+        leaves[0]["u5_provider_events"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let missing_outcome = u5_cancel_stage_usage(&leaves).unwrap();
+        assert_eq!(missing_outcome["physical_calls"], 2);
+        assert_eq!(missing_outcome["unknown_call_ids"], json!(["a"]));
+        assert_eq!(missing_outcome["total_tokens"], Value::Null);
+        leaves[1]["u5_provider_events"][1]["payload"]["usage_status"] = json!("unknown");
+        assert!(
+            u5_cancel_stage_usage(&leaves).is_err(),
+            "B's normal usage gate is not waived"
+        );
+    }
+
     #[test]
     fn u5_pending_requires_original_two_leaf_hardgates_and_typed_usage() {
         let good = original_stage();

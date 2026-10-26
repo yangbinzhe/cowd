@@ -435,9 +435,6 @@ impl U5EvidenceReader for U5Host {
         self.validate_live()?;
         Ok(self.owner())
     }
-    fn read(&self, _: &[String; 2], _: Instant) -> Result<U5ResourceEvidence, String> {
-        Err("U5 C physical active source unavailable".into())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -453,6 +450,7 @@ struct U5CancelContext {
     identity: U5Identity,
     cancellation_id: String,
     started_source: String,
+    opened_event: Value,
 }
 
 struct U5ActorOutcome {
@@ -487,8 +485,6 @@ struct U5ResourceEvidence {
     // Completeness of this bounded selected witness collection, not a claim
     // that the best-effort writer persisted every admission transition.
     selected_witnesses_complete: bool,
-    // A producer-certified active physical source, never merely an intent.
-    active: Option<(U5Identity, String)>,
 }
 
 fn u5_capacity_witness(evidence: &U5ResourceEvidence, sessions: &[String; 2]) -> Option<Value> {
@@ -692,11 +688,8 @@ fn u5_page_cursor(previous: Option<&str>, events: &[Value]) -> Result<Value, Str
 }
 
 trait U5EvidenceReader: Sync {
-    // The F adapter binds the original host/listener before using the bounded
-    // timeline reader. C still has no authenticated physical-active source.
+    // Both consumers authenticate the original host before bounded API reads.
     fn owner(&self) -> Result<U5Owner, String>;
-    fn read(&self, sessions: &[String; 2], deadline: Instant)
-        -> Result<U5ResourceEvidence, String>;
 }
 
 fn u5_gated(reason: String) -> Value {
@@ -711,11 +704,12 @@ fn u5_gated(reason: String) -> Value {
 
 fn u5_selection_preflight(selected: Option<&BTreeSet<String>>) -> Option<Value> {
     if selected.is_some_and(|ids| ids.iter().any(|id| U5Mode::from_id(id).is_some())) {
-        if selected.is_none_or(|ids| ids.len() != 1 || !ids.contains(U5_FAIRNESS))
-            || std::env::var("COWD_EVAL_LIVE_SCENARIOS").ok().as_deref() != Some(U5_FAIRNESS)
+        let exact = selected.and_then(|ids| (ids.len() == 1).then(|| ids.first()).flatten());
+        if exact.is_none_or(|id| U5Mode::from_id(id).is_none())
+            || std::env::var("COWD_EVAL_LIVE_SCENARIOS").ok().as_ref() != exact
         {
             return Some(u5_gated(
-                "U5 C/mixed selection lacks authenticated active source".into(),
+                "U5 requires one exact authenticated selection".into(),
             ));
         }
         if let Err(error) = U5Host::inherited() {
@@ -774,6 +768,37 @@ fn u5_package_answer(text: &str) -> bool {
     serde_json::from_str::<Value>(text).is_ok_and(|answer| {
         answer["package_name"] == "runtime" && answer["path"] == "crates/runtime/Cargo.toml"
     })
+}
+
+fn u5_cancel_principal(leases: &Value, sessions: &[String; 2]) -> Option<String> {
+    if leases["kind"] != "runtime_session_leases"
+        || leases["status"] != "available"
+        || leases["attached"] != true
+    {
+        return None;
+    }
+    let rows = leases["leases"].as_array()?;
+    let mut actor = None;
+    for (session, surface) in sessions.iter().zip(["harness-u5-a", "harness-u5-b"]) {
+        let owned = rows
+            .iter()
+            .filter(|r| r["session_id"] == *session)
+            .collect::<Vec<_>>();
+        if owned.len() != 1 || owned[0]["mode"] != "collaborative" {
+            return None;
+        }
+        let principal = owned[0]["owner"]
+            .as_str()?
+            .strip_suffix(&format!(":observer:{surface}"))?;
+        if !principal.starts_with("principal:")
+            || principal.len() <= "principal:".len()
+            || actor.as_ref().is_some_and(|old| old != principal)
+        {
+            return None;
+        }
+        actor = Some(principal.to_owned());
+    }
+    actor
 }
 
 fn u5_identity(report: &Value) -> Option<U5Identity> {
@@ -840,6 +865,209 @@ fn u5_cancel_settled(
         && axes.outcome.outcome != Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied)
 }
 
+// Decode the producer's existing wire type, not a model-authored "active" flag.
+fn u5_opened_identity(
+    event: &Value,
+    target: &U5Identity,
+) -> Option<runtime::provider_runtime_client::ProviderPhysicalIdentity> {
+    use runtime::provider_runtime_client::ProviderPhysicalObservation;
+    if event["session_id"] != target.session
+        || event["type"] != "context.provider_physical_observation"
+        || event["status"] != "opened"
+        || event["sequence"].as_u64().is_none()
+        || event["event_id"].as_str().is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    let ProviderPhysicalObservation::ResponseOpened { identity } =
+        serde_json::from_value(event["payload"].clone()).ok()?
+    else {
+        return None;
+    };
+    (identity.session_id == target.session
+        && identity.turn_id == target.turn
+        && identity.execution_id == target.root
+        && !identity.request_id.is_empty()
+        && !identity.response_id.is_empty()
+        && identity.opened_at_ms > 0
+        && !identity.resource_lease.is_empty()
+        && identity.step.session_id == identity.session_id
+        && identity.step.turn_id == identity.turn_id
+        && identity.step.execution_id.as_deref() == Some(identity.execution_id.as_str())
+        && !identity.step.step_id.is_empty()
+        && identity
+            .step
+            .attempt
+            .is_none_or(|a| a == identity.logical_attempt)
+        && identity.provider_attempt.origin_step_id == identity.step.step_id
+        && !identity.provider_attempt.attempt_id.is_empty())
+    .then_some(identity)
+}
+
+// This validates selected original API records. It does not mint a Runtime
+// capability, infer a remote inference stop, or replace Runtime settlement.
+fn u5_physical_cancel_evidence(
+    request: &U5CancelContext,
+    owner: &U5Owner,
+    events: &[Value],
+    resources: &U5ResourceEvidence,
+) -> Option<Value> {
+    use runtime::provider_runtime_client::ProviderPhysicalObservation;
+    let identity = u5_opened_identity(&request.opened_event, &request.identity)?;
+    let opened_sequence = request.opened_event["sequence"].as_u64()?;
+    if request.started_source != request.opened_event["event_id"].as_str()?
+        || resources.owner != *owner
+        || !resources.selected_witnesses_complete
+    {
+        return None;
+    }
+    // The same immutable open must survive the subsequent bounded source read.
+    if !events.iter().any(|e| e == &request.opened_event) {
+        return None;
+    }
+    let opened_digest = harness_contract::step::canonical_digest(
+        "provider-physical-observation",
+        &request.opened_event["payload"],
+    )
+    .ok()?;
+    for event in events {
+        if event["session_id"] != request.identity.session
+            || event["type"] != "context.provider_physical_observation"
+            || event["status"] != "cancel_observed"
+            || event["sequence"].as_u64()? <= opened_sequence
+        {
+            continue;
+        }
+        let Ok(ProviderPhysicalObservation::CancellationObserved {
+            identity: cancelled,
+            observed_at_ms,
+            opened,
+            requested,
+        }) = serde_json::from_value(event["payload"].clone())
+        else {
+            continue;
+        };
+        if cancelled != identity
+            || opened.identity != identity
+            || opened.session_sequence as u64 != opened_sequence
+            || opened.observation_digest != opened_digest
+            || observed_at_ms < identity.opened_at_ms
+            || requested.cancellation_id != request.cancellation_id
+            || requested.stream_id != format!("cancellation:{}", request.cancellation_id)
+            || requested.event_sequence != 1
+            || requested.commit_cursor == 0
+        {
+            continue;
+        }
+        let authorizations = events
+            .iter()
+            .filter(|auth| {
+                let p = &auth["payload"];
+                let receipt = &p["receipt"];
+                auth["type"] == "session.claim.cancellation_authorized.v1"
+                    && auth["status"] == "authorized"
+                    && auth["session_id"] == request.identity.session
+                    && auth["sequence"]
+                        .as_u64()
+                        .is_some_and(|s| s < event["sequence"].as_u64().unwrap_or(0))
+                    && p["schema_version"] == 1
+                    && p["cancellation_id"] == request.cancellation_id
+                    && receipt["cancellation_id"] == request.cancellation_id
+                    && receipt["session_id"] == request.identity.session
+                    && receipt["turn_id"] == request.identity.turn
+                    && receipt["execution_id"] == request.identity.root
+                    && receipt["actor_id"] == owner.principal_actor
+                    && receipt["cause"] == "user_requested"
+                    && receipt["status"] == "requested"
+                    && receipt["effective_at_ms"].is_null()
+                    && receipt["journal_sequence"] == requested.commit_cursor
+                    && receipt["projection_revision"] == requested.event_sequence
+                    && p["requested_ref"]["stream_id"] == requested.stream_id
+                    && p["requested_ref"]["event_sequence"] == requested.event_sequence
+                    && p["requested_ref"]["commit_cursor"] == requested.commit_cursor
+                    && p["requested_ref"]["payload_digest"] == requested.payload_digest
+            })
+            .collect::<Vec<_>>();
+        if authorizations.len() != 1 {
+            continue;
+        }
+        let auth = authorizations[0];
+        let p = &auth["payload"];
+        let binding = &p["claim_binding"];
+        if [
+            "ingress_message_id",
+            "request_id",
+            "claim_owner",
+            "claim_token_digest",
+        ]
+        .iter()
+        .any(|k| binding[*k].as_str().is_none_or(str::is_empty))
+            || binding["input_sequence"].as_u64().is_none()
+            || binding["session_generation"]
+                .as_u64()
+                .is_none_or(|n| n == 0)
+            || binding["claim_fence_epoch"].as_u64().is_none_or(|n| n == 0)
+        {
+            continue;
+        }
+        let unsigned = json!({"schema_version":1,"cancellation_id":p["cancellation_id"],
+            "receipt":p["receipt"],"claim_binding":binding,"requested_ref":p["requested_ref"]});
+        let Ok(digest) = harness_contract::step::canonical_digest(
+            "session-cancel-authorization-payload:v1",
+            &json!({"kind":"session.claim.cancellation_authorized.v1",
+                "session_id":request.identity.session,"turn_id":request.identity.turn,"payload":unsigned}),
+        ) else {
+            continue;
+        };
+        let Ok(key) = harness_contract::step::canonical_digest(
+            "session-cancel-authorization-key:v1",
+            &json!({"session_id":request.identity.session,"request_id":binding["request_id"],
+                "input_sequence":binding["input_sequence"],"session_generation":binding["session_generation"],
+                "claim_owner":binding["claim_owner"],"claim_fence_epoch":binding["claim_fence_epoch"],
+                "claim_token_digest":binding["claim_token_digest"],"cancellation_id":request.cancellation_id}),
+        ) else {
+            continue;
+        };
+        if p["authorization_digest"] != digest
+            || auth["event_id"] != format!("session-cancel-authorization:v1:{key}")
+        {
+            continue;
+        }
+        // The existing manager uses its request UUID as lease id. Generation
+        // remains bound by the full physical identity; never match a suffix only.
+        let mut lease = identity.resource_lease.split(':');
+        if lease.next() != Some("resource-lease") {
+            continue;
+        }
+        let Some(generation) = lease.next().and_then(|s| uuid::Uuid::parse_str(s).ok()) else {
+            continue;
+        };
+        let Some(lease_id) = lease.next().and_then(|s| uuid::Uuid::parse_str(s).ok()) else {
+            continue;
+        };
+        if generation.is_nil() || lease.next().is_some() {
+            continue;
+        }
+        let admitted = resources.observations.iter().enumerate().find(|(_, r)| {
+            r.request_id == lease_id
+                && r.fairness_key == format!("session:{}", request.identity.session)
+                && r.status
+                    == runtime::execution_core::graph::ResourceAdmissionObservationStatus::Granted
+        });
+        let Some((admission_index, _)) = admitted else {
+            continue;
+        };
+        return Some(
+            json!({"opened_event":request.opened_event,"authorization_event":auth,
+            "cancel_observed_event":event,"lease_admission_source":resources.source_refs.get(admission_index)?,
+            "lease_release":"requires_original_settlement_and_outer_shutdown",
+            "local_response_cancel_observed":true,"remote_server_inference_stop":"unknown",
+            "remote_billing_stop":"unknown"}),
+        );
+    }
+    None
+}
+
 fn u5_pair_acceptance(
     mode: U5Mode,
     owner: &U5Owner,
@@ -884,6 +1112,13 @@ fn u5_pair_acceptance(
                                 &left["projection"],
                             )
                         })
+                        && left
+                            .get("physical_events")
+                            .and_then(Value::as_array)
+                            .and_then(|events| {
+                                u5_physical_cancel_evidence(request, owner, events, evidence)
+                            })
+                            .is_some()
                 })
         }),
     };
@@ -894,6 +1129,7 @@ fn u5_pair_acceptance(
         && (mode == U5Mode::Cancel || contention);
     json!({"internal_passed":internal,"identity":identity_ok,"selected_witnesses_complete":origin_ok,
         "left_business":left_ok,"right_business":u5_normal_passed(right),"capacity_competition":contention,
+        "physical_cancellation":mode == U5Mode::Cancel && left_ok,
         "capacity_witness":witness,"whole_history_complete":"not_claimed",
         "outer_cleanup_observed":false})
 }
@@ -1996,7 +2232,6 @@ impl LiveScenarioRunner {
             observations,
             source_refs,
             selected_witnesses_complete: true,
-            active: None,
         })
     }
 
@@ -2007,7 +2242,7 @@ impl LiveScenarioRunner {
         telemetry: Option<u64>,
         source: &dyn U5EvidenceReader,
     ) -> Value {
-        let owner = match source.owner() {
+        let mut owner = match source.owner() {
             Ok(owner) if u5_valid_owner(&owner, &self.base_url) => owner,
             _ => return u5_gated(U5_MISSING.into()),
         };
@@ -2069,7 +2304,7 @@ impl LiveScenarioRunner {
             Ok(actor) => actor,
             Err(error) => return u5_gated(error),
         };
-        let b = match SessionActor::create(
+        let mut b = match SessionActor::create(
             &runner.client,
             &runner.base_url,
             runner.model.as_deref(),
@@ -2083,6 +2318,30 @@ impl LiveScenarioRunner {
             }
         };
         let sessions = [a.session_id().to_string(), b.session_id().to_string()];
+        if mode == U5Mode::Cancel {
+            let mut bytes_left = 2 * 1024 * 1024;
+            let leases =
+                reqwest::Url::parse(&format!("{}/api/runtime/session-leases", runner.base_url))
+                    .map_err(|e| e.to_string())
+                    .and_then(|url| {
+                        runner.read_u5_json(
+                            url,
+                            deadline.min(Instant::now() + Duration::from_secs(5)),
+                            &mut bytes_left,
+                        )
+                    });
+            let Some(principal) = leases
+                .as_ref()
+                .ok()
+                .and_then(|leases| u5_cancel_principal(leases, &sessions))
+            else {
+                let left = a.finish();
+                let right = b.finish();
+                return json!({"status":"failed","reason":"U5 original writer principal unavailable",
+                    "actor_cleanup":[left.is_ok(),right.is_ok()]});
+            };
+            owner.principal_actor = principal;
+        }
         let right_reads = reads.pop().expect("two preregistered inputs");
         let left_reads = reads.pop().expect("two preregistered inputs");
         let (left, right) = u5_parallel(
@@ -2108,10 +2367,7 @@ impl LiveScenarioRunner {
                 )
             },
         );
-        let evidence = match mode {
-            U5Mode::Fairness => runner.read_u5_resource_witnesses(&owner, &sessions, deadline),
-            U5Mode::Cancel => source.read(&sessions, deadline),
-        };
+        let evidence = runner.read_u5_resource_witnesses(&owner, &sessions, deadline);
         let internal = match evidence {
             Ok(evidence) => u5_pair_acceptance(
                 mode,
@@ -2148,6 +2404,7 @@ impl LiveScenarioRunner {
     ) -> U5ActorOutcome {
         let mut active_identity = None;
         let mut cancellation = None;
+        let cancellation_id = format!("u5:{}", uuid::Uuid::new_v4());
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match self.admit_scenario(
                 spec,
@@ -2164,17 +2421,25 @@ impl LiveScenarioRunner {
                     if mode == U5Mode::Cancel {
                         let identity = admitted.identity();
                         match self.observe_u5_cancel(
-                            &identity, owner, source, sessions, &mut actor, started,
+                            &identity,
+                            owner,
+                            source,
+                            sessions,
+                            &mut actor,
+                            started,
+                            &cancellation_id,
                         ) {
                             Ok((result, request)) => {
                                 cancellation = Some(request);
                                 result
                             }
                             Err(error) => {
-                                let cleanup = self.cancel_execution_lineage(
-                                    &identity.root,
-                                    &mut actor,
-                                    &mut Vec::new(),
+                                // A failed/unknown HTTP response does not mint a
+                                // new logical cancellation during cleanup.
+                                let cleanup = actor.post_cleanup_mutation(
+                                    &format!("/api/sessions/{}/cancel", identity.session),
+                                    json!({"cancellation_id":cancellation_id,
+                                        "expected_execution_id":identity.root,"expected_turn_id":identity.turn}),
                                 );
                                 json!({"status":"failed","error":error,"cancellation_cleanup":cleanup,
                                 "session_id":identity.session,"turn_id":identity.turn,"execution_id":identity.root})
@@ -2190,8 +2455,19 @@ impl LiveScenarioRunner {
             Ok(result) => result,
             Err(_) => {
                 if let Some(identity) = active_identity {
-                    let _ =
-                        self.cancel_execution_lineage(&identity.root, &mut actor, &mut Vec::new());
+                    if mode == U5Mode::Cancel {
+                        let _ = actor.post_cleanup_mutation(
+                            &format!("/api/sessions/{}/cancel", identity.session),
+                            json!({"cancellation_id":cancellation_id,
+                                "expected_execution_id":identity.root,"expected_turn_id":identity.turn}),
+                        );
+                    } else {
+                        let _ = self.cancel_execution_lineage(
+                            &identity.root,
+                            &mut actor,
+                            &mut Vec::new(),
+                        );
+                    }
                 }
                 json!({"status":"failed","reason":"U5 actor panicked; original evidence must be retained"})
             }
@@ -2207,39 +2483,191 @@ impl LiveScenarioRunner {
         }
     }
 
+    fn read_u5_json(
+        &self,
+        url: reqwest::Url,
+        deadline: Instant,
+        bytes_left: &mut usize,
+    ) -> Result<Value, String> {
+        use std::io::Read;
+        if let Some(host) = &self.u5_host {
+            host.validate_live_until(deadline)?;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || *bytes_left == 0 {
+            return Err("U5 evidence budget exhausted before IO".into());
+        }
+        let mut response = self
+            .client
+            .get(url.clone())
+            .timeout(remaining)
+            .send()
+            .map_err(|e| e.to_string())?;
+        if response.url() != &url
+            || !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|n| n > *bytes_left as u64)
+        {
+            return Err("U5 evidence response rejected".into());
+        }
+        let mut body = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            if Instant::now() >= deadline || *bytes_left == 0 {
+                return Err("U5 evidence stream budget exhausted".into());
+            }
+            let max = buffer.len().min(*bytes_left);
+            let n = response
+                .read(&mut buffer[..max])
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            *bytes_left -= n;
+            body.extend_from_slice(&buffer[..n]);
+        }
+        if Instant::now() >= deadline {
+            return Err("U5 evidence deadline reached".into());
+        }
+        serde_json::from_slice(&body).map_err(|e| e.to_string())
+    }
+
+    fn read_u5_session_events(
+        &self,
+        session: &str,
+        deadline: Instant,
+    ) -> Result<Vec<Value>, String> {
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+        let mut bytes_left = 2 * 1024 * 1024usize;
+        let mut events = Vec::new();
+        let mut next = 0u64;
+        let mut selected_total = None;
+        for _ in 0..32 {
+            if Instant::now() >= deadline || bytes_left == 0 || events.len() >= 512 {
+                return Err("U5 Session evidence budget exhausted before IO".into());
+            }
+            if let Some(host) = &self.u5_host {
+                host.validate_live_until(deadline)?;
+            }
+            let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| e.to_string())?;
+            url.path_segments_mut()
+                .map_err(|_| "U5 invalid Session URL")?
+                .extend(["api", "sessions", session, "events"]);
+            let limit = 100usize.min(512 - events.len());
+            url.query_pairs_mut()
+                .append_pair("from_seq", &next.to_string())
+                .append_pair("limit", &limit.to_string())
+                .append_pair("include_payload", "true");
+            let page = self.read_u5_json(url, deadline, &mut bytes_left)?;
+            if page["session_id"] != session
+                || page["from_seq"] != next
+                || page["include_payload"] != true
+                || page["limit"] != limit
+            {
+                return Err("U5 Session evidence page identity mismatch".into());
+            }
+            let total = page["total"]
+                .as_u64()
+                .ok_or("U5 missing Session event count")?;
+            let initial_total = *selected_total.get_or_insert(total);
+            if initial_total > 512 {
+                return Err("U5 selected Session prefix exceeds event budget".into());
+            }
+            let rows = page["events"]
+                .as_array()
+                .ok_or("U5 Session events missing")?;
+            if rows.len() > limit
+                || page["has_more"].as_bool() != Some((rows.len() as u64) < total)
+                || total < rows.len() as u64
+            {
+                return Err("U5 Session pagination contract mismatch".into());
+            }
+            // count_events_from is sampled before get_events_limited. Select
+            // that first count's immutable prefix; later appends never move it.
+            // No server-side through/snapshot guarantee is invented here.
+            for row in rows {
+                let sequence = row["sequence"]
+                    .as_u64()
+                    .ok_or("U5 Session event sequence missing")?;
+                if sequence < next || row["session_id"] != session {
+                    return Err("U5 Session event position/session mismatch".into());
+                }
+                next = sequence
+                    .checked_add(1)
+                    .ok_or("U5 Session sequence overflow")?;
+                if events.len() < initial_total as usize {
+                    events.push(row.clone());
+                }
+            }
+            if events.len() == initial_total as usize {
+                return Ok(events);
+            }
+            if rows.is_empty() {
+                return Err("U5 selected Session prefix incomplete".into());
+            }
+        }
+        Err("U5 Session evidence page budget exhausted".into())
+    }
+
     fn observe_u5_cancel(
         &self,
         identity: &U5Identity,
         owner: &U5Owner,
-        source: &dyn U5EvidenceReader,
+        _source: &dyn U5EvidenceReader,
         sessions: &[String; 2],
         actor: &mut SessionActor<'_>,
         started: Instant,
+        cancellation_id: &str,
     ) -> Result<(Value, U5CancelContext), String> {
         let deadline = self
             .u5_deadline
             .ok_or("U5 missing shared observation deadline")?;
         let start_deadline = deadline.min(started + Duration::from_secs(90));
-        let started_source = loop {
+        let opened_event = loop {
             if Instant::now() >= start_deadline {
                 return Err("U5 active physical start coverage missing".into());
             }
             actor.maintain_receipt_authority()?;
-            let evidence = source.read(sessions, start_deadline)?;
-            if evidence.owner != *owner || !evidence.selected_witnesses_complete {
-                return Err("U5 start evidence source incomplete or foreign".into());
+            let events = self.read_u5_session_events(&identity.session, start_deadline)?;
+            let projection = self.get_json(&format!(
+                "/api/runtime/executions/{}?detail_scope=summary",
+                identity.root
+            ))?;
+            if projection
+                .pointer("/terminal_axes/execution/phase")
+                .and_then(Value::as_str)
+                == Some("terminal")
+            {
+                return Err(
+                    "U5 EOF/terminal won before active cancellation; coverage not hit".into(),
+                );
             }
-            if let Some((active, reference)) = evidence.active.as_ref() {
-                if active == identity && !reference.is_empty() {
-                    break reference.clone();
-                }
+            if let Some(event) = events.iter().rev().find(|event| {
+                u5_opened_identity(event, identity).is_some_and(|physical| {
+                    !events.iter().any(|later| {
+                        later["sequence"].as_u64() > event["sequence"].as_u64()
+                            && later["type"] == "context.provider_attempt_outcome"
+                            && later["payload"]["request_id"] == physical.request_id
+                    })
+                })
+            }) {
+                break event.clone();
             }
             thread::sleep(
                 self.poll_interval
                     .min(start_deadline.saturating_duration_since(Instant::now())),
             );
         };
-        let cancellation_id = format!("u5:{}", uuid::Uuid::new_v4());
+        let request = U5CancelContext {
+            identity: identity.clone(),
+            cancellation_id: cancellation_id.to_owned(),
+            started_source: opened_event["event_id"]
+                .as_str()
+                .ok_or("U5 open source missing")?
+                .into(),
+            opened_event,
+        };
         let body = json!({"cancellation_id":cancellation_id,"expected_execution_id":identity.root,"expected_turn_id":identity.turn});
         loop {
             if Instant::now() >= deadline {
@@ -2260,15 +2688,36 @@ impl LiveScenarioRunner {
                 identity.root
             ))?;
             if u5_cancel_settled(identity, owner, &cancellation_id, &receipt, &projection) {
-                return Ok((
-                    json!({"status":"cancelled","session_id":identity.session,"turn_id":identity.turn,
-                    "execution_id":identity.root,"receipt":receipt,"projection":projection}),
-                    U5CancelContext {
-                        identity: identity.clone(),
-                        cancellation_id,
-                        started_source,
-                    },
-                ));
+                let events = self.read_u5_session_events(&identity.session, deadline)?;
+                let resources = self.read_u5_resource_witnesses(owner, sessions, deadline)?;
+                if let Some(physical) =
+                    u5_physical_cancel_evidence(&request, owner, &events, &resources)
+                {
+                    let provider_events = events
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e["type"].as_str(),
+                                Some(
+                                    "context.provider_request_packed"
+                                        | "context.provider_attempt_outcome"
+                                )
+                            )
+                        })
+                        .map(|e| {
+                            let mut e = e.clone();
+                            e["kind"] = e["type"].clone();
+                            e
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok((
+                        json!({"status":"cancelled","session_id":identity.session,"turn_id":identity.turn,
+                    "execution_id":identity.root,"receipt":receipt,"projection":projection,
+                    "physical_cancellation":physical,"physical_events":events,"u5_provider_events":provider_events,
+                    "remote_server_inference_stop":"unknown","remote_billing_stop":"unknown"}),
+                        request,
+                    ));
+                }
             }
             thread::sleep(
                 self.poll_interval
@@ -2570,9 +3019,9 @@ impl LiveScenarioRunner {
             && health_passed
             && selection_passed
             && comparison_passed
-            && selected_scenario_ids
-                .as_ref()
-                .is_some_and(|ids| ids.len() == 1 && ids.contains(U5_FAIRNESS))
+            && selected_scenario_ids.as_ref().is_some_and(|ids| {
+                ids.len() == 1 && ids.first().is_some_and(|id| U5Mode::from_id(id).is_some())
+            })
             && scenarios.len() == 1
             && scenarios[0]["status"] == "pending_outer_cleanup";
         let claim_status = match claim_scope {
@@ -2622,9 +3071,6 @@ impl LiveScenarioRunner {
         provider_token_telemetry_limit: Option<u64>,
     ) -> Value {
         if let LiveAcceptance::U5(mode) = spec.acceptance {
-            if mode != U5Mode::Fairness {
-                return u5_gated("U5 C active source unavailable".into());
-            }
             let host = match U5Host::inherited() {
                 Ok(host) => std::sync::Arc::new(host),
                 Err(error) => return u5_gated(error),

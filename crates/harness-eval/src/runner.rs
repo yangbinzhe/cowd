@@ -102,8 +102,10 @@ fn selected_u5_strategy() -> bool {
     if TEST_F_DRAFT.with(|slot| slot.borrow().is_some()) {
         return true;
     }
-    std::env::var("COWD_EVAL_LIVE_SCENARIOS").ok().as_deref()
-        == Some("live_u5_shared_session_fairness")
+    matches!(
+        std::env::var("COWD_EVAL_LIVE_SCENARIOS").ok().as_deref(),
+        Some("live_u5_shared_session_fairness" | "live_u5_active_cancel_isolation")
+    )
 }
 
 fn produce_u5_report(
@@ -133,10 +135,19 @@ fn produce_u5_report(
     }
     let host = crate::live_scenario_runner::U5Host::inherited()?;
     let details = run_live_gateway_scenarios(&options);
+    let scenario = std::env::var("COWD_EVAL_LIVE_SCENARIOS").map_err(|e| e.to_string())?;
+    let cancellation = scenario == "live_u5_active_cancel_isolation";
     let leaves = details
         .pointer("/scenarios/0/sessions")
         .and_then(Value::as_array);
-    let usage = leaves.and_then(|leaves| crate::report::u5_stage_usage(leaves).ok());
+    let usage = leaves.and_then(|leaves| {
+        if cancellation {
+            crate::report::u5_cancel_stage_usage(leaves)
+        } else {
+            crate::report::u5_stage_usage(leaves)
+        }
+        .ok()
+    });
     let calls = usage.as_ref().and_then(|u| u["physical_calls"].as_u64());
     let tools = leaves.and_then(|l| {
         l.iter().try_fold(0u64, |sum, v| {
@@ -151,7 +162,7 @@ fn produce_u5_report(
         "run_id":run_id,"u5_host":host.binding(),"u5_usage":usage,
         "provider":options.provider,"budget":options.budget,
         "live_gateway_scenarios":live_gateway_scenario_summary(&details),"live_gateway_scenario_details":details,
-        "scenarios":[{"capability":"live_u5_shared_session_fairness","status":"pending_outer_cleanup"}],
+        "scenarios":[{"capability":scenario,"status":"pending_outer_cleanup"}],
         "execution_trace":{"started_at_ms":requested,"total_elapsed_ms":now_ms().saturating_sub(requested),
             "provider_rounds":calls,"tool_calls":tools,"total_usage":trace_usage}});
     Ok(EvalDraft {
@@ -243,9 +254,20 @@ fn publish_u5_receipt(
         .map_err(|e| e.to_string())?;
     let stage_guard = PendingReceipt::own(staged.clone())?;
     let bytes = std::fs::read(report_path).map_err(|e| e.to_string())?;
+    let scenario = draft
+        .report
+        .pointer("/live_gateway_scenarios/selected_scenario_ids/0")
+        .and_then(Value::as_str)
+        .filter(|id| {
+            matches!(
+                *id,
+                "live_u5_shared_session_fairness" | "live_u5_active_cancel_isolation"
+            )
+        })
+        .ok_or("U5 exact scenario missing from original report")?;
     let receipt = json!({"schema_version":1,"disposition":"pending_outer_cleanup","run_id":run_id,
         "owner":host.binding(),"report_path":report_path,"report_sha256":format!("{:x}",Sha256::digest(&bytes)),
-        "scenario":"live_u5_shared_session_fairness","usage":draft.report["u5_usage"]});
+        "scenario":scenario,"usage":draft.report["u5_usage"]});
     file.write_all(
         serde_json::to_string(&receipt)
             .map_err(|e| e.to_string())?
@@ -1914,7 +1936,11 @@ mod shared_lifecycle_tests {
         }
     }
     fn install(root: &std::path::Path, fault: &str, flag: &Arc<AtomicBool>) -> ClearDraft {
-        let mut report = crate::report::u5_stage_tests::original_stage();
+        let mut report = if fault == "cancel-stage" {
+            crate::report::u5_stage_tests::original_cancel_stage()
+        } else {
+            crate::report::u5_stage_tests::original_stage()
+        };
         let host:crate::live_scenario_runner::U5Host=serde_json::from_value(json!({"nonce":"a".repeat(64),"launcher_pid":1,"launcher_start":1,"pid":2,"starttime":2,"image_sha256":format!("sha256:{}","c".repeat(64)),"exe_dev":1,"exe_ino":1,"listener_inode":1,"port":1,"candidate":"b".repeat(40),"source_sha256":"d".repeat(64),"namespace":"test-only-contract","base_url":"http://127.0.0.1:1","harness_sha256":"e".repeat(64),"runtime_dev":1,"runtime_ino":1})).unwrap();
         report["u5_host"] = host.binding();
         let path = if fault == "missing-parent" {
@@ -1942,6 +1968,35 @@ mod shared_lifecycle_tests {
         });
         ClearDraft
     }
+    #[test]
+    fn r203_shared_c_cli_uses_original_run_record_and_exact_pending_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let store = HarnessEvalReportStore::new(root.path().join("reports"));
+        let flag = Arc::new(AtomicBool::new(false));
+        let _clear = install(root.path(), "cancel-stage", &flag);
+        let (record, disposition) = run_eval_cli(&store, options()).unwrap();
+        assert_eq!(disposition, CliEvalDisposition::PendingOuterCleanup);
+        assert_eq!(record.status, "gated");
+        assert_eq!(
+            record.total_tokens, None,
+            "unknown cancelled usage is not zero"
+        );
+        let durable = store.get_run(&record.run_id).unwrap().unwrap();
+        assert_eq!(durable.status, "gated");
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("u5-inner-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["scenario"], "live_u5_active_cancel_isolation");
+        assert_eq!(receipt["run_id"], record.run_id);
+        assert_eq!(receipt["usage"]["usage_status"], "unknown");
+        assert_eq!(receipt["usage"]["total_tokens"], Value::Null);
+        assert_ne!(
+            receipt["disposition"], "passed",
+            "outer V1 has not yet happened"
+        );
+    }
+
     #[test]
     fn shared_f_library_and_cli_have_identical_hardgates_and_original_run_records() {
         let mut observed = Vec::new();

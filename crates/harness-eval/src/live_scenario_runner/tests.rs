@@ -60,7 +60,6 @@ fn u5_fixture_resources() -> U5ResourceEvidence {
             "fixture:wait-b".into(),
             "fixture:grant-b".into(),
         ],
-        active: None,
         observations: vec![
             observation(a, "a", ResourceAdmissionObservationStatus::Granted),
             ResourceAdmissionObservation {
@@ -77,7 +76,7 @@ fn u5_fixture_resources() -> U5ResourceEvidence {
 
 fn u5_fixture_cancelled() -> Value {
     let id = u5_fixture_id("a");
-    json!({"status":"cancelled","session_id":id.session,"turn_id":id.turn,"execution_id":id.root,
+    let mut result = json!({"status":"cancelled","session_id":id.session,"turn_id":id.turn,"execution_id":id.root,
         "actor_cleanup":{"passed":true},
         "receipt":{"cancellation_id":"fixture-cancel","session_id":id.session,"turn_id":id.turn,"execution_id":id.root,
             "actor_id":"principal:fixture","cause":"user_requested","requested_at_ms":10,"effective_at_ms":20,
@@ -86,14 +85,272 @@ fn u5_fixture_cancelled() -> Value {
             "outcome":{"goal_id":null,"goal_revision":null,"outcome":null,"terminal_fence":null},
             "execution":{"phase":"terminal","settlement":"proven_settled","coverage_complete":true,"evidence_refs":["fixture:closure-a"]},
             "delivery":{"runtime_terminal_ref":null,"session_client_evidence":"requires_fresh_context"},
-            "source_cursor":30,"source_race":false}}})
+            "source_cursor":30,"source_race":false}}});
+    result["physical_events"] = json!(u5_fixture_physical_events());
+    result
 }
 
 fn u5_fixture_cancel_context() -> U5CancelContext {
     U5CancelContext {
         identity: u5_fixture_id("a"),
         cancellation_id: "fixture-cancel".into(),
-        started_source: "fixture:independently-recorded-active-a".into(),
+        started_source: "opened-a".into(),
+        opened_event: u5_fixture_physical_events()[0].clone(),
+    }
+}
+
+// Wire-only selected source records. These are not a live authorization or
+// an SDK acknowledgement; the consumer must still reject each mutation.
+fn u5_fixture_physical_events() -> Vec<Value> {
+    use runtime::provider_runtime_client::{
+        ProviderPhysicalIdentity, ProviderPhysicalObservation, ProviderPhysicalReceipt,
+        RequestedCancellationReference,
+    };
+    let identity = ProviderPhysicalIdentity {
+        session_id: "session-a".into(),
+        turn_id: "turn-a".into(),
+        execution_id: "root-a".into(),
+        request_sequence: 1,
+        request_id: "provider-call-a".into(),
+        response_id: "response-a".into(),
+        opened_at_ms: 5,
+        logical_attempt: 1,
+        step: harness_contract::step::StepIdentity {
+            step_id: "step-a".into(),
+            session_id: "session-a".into(),
+            turn_id: "turn-a".into(),
+            execution_id: Some("root-a".into()),
+            actor_ref: Some("principal:fixture".into()),
+            run_ref: None,
+            attempt: Some(1),
+            epoch: Some("epoch-a".into()),
+            goal_ref: None,
+            program_ref: None,
+            task_ref: None,
+            build_ref: "build-a".into(),
+        },
+        provider_attempt: harness_contract::step::ProviderAttemptIdentity {
+            attempt_id: "attempt-a".into(),
+            origin_step_id: "step-a".into(),
+            model_profile_digest: "profile-a".into(),
+            request_digest: "request-a".into(),
+        },
+        resource_lease: format!(
+            "resource-lease:{}:{}",
+            uuid::Uuid::from_u128(3),
+            uuid::Uuid::from_u128(1)
+        ),
+    };
+    let open = serde_json::to_value(ProviderPhysicalObservation::ResponseOpened {
+        identity: identity.clone(),
+    })
+    .unwrap();
+    let requested = RequestedCancellationReference {
+        cancellation_id: "fixture-cancel".into(),
+        stream_id: "cancellation:fixture-cancel".into(),
+        event_sequence: 1,
+        commit_cursor: 2,
+        payload_digest: format!("sha256:{}", "d".repeat(64)),
+    };
+    let receipt: harness_contract::turn::CancellationReceipt = serde_json::from_value(json!({
+        "cancellation_id":"fixture-cancel","session_id":"session-a","turn_id":"turn-a","execution_id":"root-a",
+        "actor_id":"principal:fixture","cause":"user_requested","requested_at_ms":10,"effective_at_ms":null,
+        "status":"requested","journal_sequence":2,"projection_revision":1
+    })).unwrap();
+    let binding = json!({"ingress_message_id":"message-a","request_id":"ingress-a","input_sequence":0,
+        "session_generation":1,"claim_owner":"claim-a","claim_fence_epoch":1,
+        "claim_token_digest":format!("sha256:{}","a".repeat(64))});
+    let requested_ref = json!({"event_id":"requested-event-a","stream_id":requested.stream_id,
+        "event_sequence":1,"commit_cursor":2,"payload_digest":requested.payload_digest});
+    let mut payload = json!({"schema_version":1,"cancellation_id":"fixture-cancel",
+        "receipt":receipt,"claim_binding":binding,"requested_ref":requested_ref});
+    let digest = harness_contract::step::canonical_digest(
+        "session-cancel-authorization-payload:v1",
+        &json!({"kind":"session.claim.cancellation_authorized.v1","session_id":"session-a",
+            "turn_id":"turn-a","payload":payload}),
+    )
+    .unwrap();
+    payload["authorization_digest"] = json!(digest);
+    let key = harness_contract::step::canonical_digest(
+        "session-cancel-authorization-key:v1",
+        &json!({"session_id":"session-a","request_id":"ingress-a","input_sequence":0,
+            "session_generation":1,"claim_owner":"claim-a","claim_fence_epoch":1,
+            "claim_token_digest":binding["claim_token_digest"],"cancellation_id":"fixture-cancel"}),
+    )
+    .unwrap();
+    let cancelled = ProviderPhysicalObservation::CancellationObserved {
+        identity: identity.clone(),
+        observed_at_ms: 15,
+        opened: ProviderPhysicalReceipt {
+            identity,
+            session_sequence: 1,
+            observation_digest: harness_contract::step::canonical_digest(
+                "provider-physical-observation",
+                &open,
+            )
+            .unwrap(),
+        },
+        requested,
+    };
+    vec![
+        json!({"event_id":"opened-a","sequence":1,"session_id":"session-a","type":"context.provider_physical_observation",
+            "status":"opened","payload":open}),
+        json!({"event_id":format!("session-cancel-authorization:v1:{key}"),"sequence":2,"session_id":"session-a",
+            "type":"session.claim.cancellation_authorized.v1","status":"authorized","payload":payload}),
+        json!({"event_id":"cancel-observed-a","sequence":3,"session_id":"session-a","type":"context.provider_physical_observation",
+            "status":"cancel_observed","payload":cancelled}),
+    ]
+}
+
+#[test]
+fn r202_physical_consumer_requires_exact_original_open_authorization_and_lease() {
+    let request = u5_fixture_cancel_context();
+    let owner = u5_fixture_owner();
+    let events = u5_fixture_physical_events();
+    let resources = u5_fixture_resources();
+    let proof = u5_physical_cancel_evidence(&request, &owner, &events, &resources).unwrap();
+    assert_eq!(proof["remote_server_inference_stop"], "unknown");
+    assert_eq!(proof["remote_billing_stop"], "unknown");
+    for fault in [
+        "wrong-actor",
+        "old-response",
+        "old-attempt",
+        "missing-authorization",
+        "unknown-authorization",
+        "EOF-won",
+        "missing-lease",
+        "foreign-lease",
+        "missing-open",
+        "changed-open",
+        "wrong-source",
+        "wrong-auth-digest",
+        "wrong-auth-key",
+        "duplicate-authorization",
+        "wrong-step",
+        "wrong-requested-digest",
+    ] {
+        let mut events = events.clone();
+        let mut resources = resources.clone();
+        let mut request = request.clone();
+        match fault {
+            "wrong-actor" => {
+                events[1]["payload"]["receipt"]["actor_id"] = json!("principal:foreign")
+            }
+            "old-response" => {
+                events[2]["payload"]["identity"]["response_id"] = json!("old-response")
+            }
+            "old-attempt" => events[2]["payload"]["identity"]["logical_attempt"] = json!(0),
+            "missing-authorization" => {
+                events.remove(1);
+            }
+            "unknown-authorization" => events[1]["status"] = json!("unknown"),
+            "EOF-won" => {
+                events.pop();
+            }
+            "missing-lease" => {
+                resources.observations.remove(0);
+                resources.source_refs.remove(0);
+            }
+            "foreign-lease" => resources.observations[0].fairness_key = "session:foreign".into(),
+            "missing-open" => {
+                events.remove(0);
+            }
+            "changed-open" => events[0]["payload"]["identity"]["opened_at_ms"] = json!(6),
+            "wrong-source" => request.started_source = "model-authored-active".into(),
+            "wrong-auth-digest" => events[1]["payload"]["authorization_digest"] = json!("bad"),
+            "wrong-auth-key" => events[1]["event_id"] = json!("other-auth"),
+            "duplicate-authorization" => events.push(events[1].clone()),
+            "wrong-step" => events[2]["payload"]["identity"]["step"]["step_id"] = json!("old-step"),
+            "wrong-requested-digest" => {
+                events[2]["payload"]["requested"]["payload_digest"] = json!("bad")
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            u5_physical_cancel_evidence(&request, &owner, &events, &resources).is_none(),
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn r202_expected_principal_comes_from_two_original_writer_leases_not_cancel_reply() {
+    let sessions = ["session-a".into(), "session-b".into()];
+    let original = json!({"kind":"runtime_session_leases","status":"available","attached":true,
+        "leases":[{"session_id":"session-a","mode":"collaborative","owner":"principal:fixture:observer:harness-u5-a"},
+            {"session_id":"session-b","mode":"collaborative","owner":"principal:fixture:observer:harness-u5-b"}]});
+    assert_eq!(
+        u5_cancel_principal(&original, &sessions).as_deref(),
+        Some("principal:fixture")
+    );
+    for fault in [
+        "foreign",
+        "wrong-surface",
+        "missing",
+        "duplicate",
+        "unavailable",
+    ] {
+        let mut value = original.clone();
+        match fault {
+            "foreign" => {
+                value["leases"][1]["owner"] = json!("principal:other:observer:harness-u5-b")
+            }
+            "wrong-surface" => {
+                value["leases"][0]["owner"] = json!("principal:fixture:observer:harness-u5-b")
+            }
+            "missing" => {
+                value["leases"].as_array_mut().unwrap().pop();
+            }
+            "duplicate" => {
+                let a = value["leases"][0].clone();
+                value["leases"].as_array_mut().unwrap().push(a);
+            }
+            "unavailable" => value["status"] = json!("unavailable"),
+            _ => unreachable!(),
+        }
+        assert!(u5_cancel_principal(&value, &sessions).is_none(), "{fault}");
+    }
+}
+
+#[test]
+fn r202_session_reader_retains_actual_payload_and_rejects_foreign_or_truncated_pages() {
+    let original = u5_fixture_physical_events();
+    for fault in [
+        "none",
+        "foreign",
+        "truncated",
+        "wrong-position",
+        "count-mismatch",
+        "missing-fields",
+    ] {
+        let mut page = json!({"session_id":"session-a","from_seq":0,"limit":100,
+            "total":3,"has_more":false,"include_payload":true,"events":original});
+        match fault {
+            "none" => {}
+            "foreign" => page["session_id"] = json!("foreign"),
+            "truncated" => page["include_payload"] = json!(false),
+            "wrong-position" => page["events"][1]["sequence"] = json!(1),
+            "count-mismatch" => page["total"] = json!(1),
+            "missing-fields" => {
+                page.as_object_mut().unwrap().remove("total");
+            }
+            _ => unreachable!(),
+        }
+        let mut fixture = U5SingleCaseHttpFixture::start_wire(vec![(
+            "GET /api/sessions/session-a/events?from_seq=0&limit=100&include_payload=true".into(),
+            page,
+            false,
+            Duration::ZERO,
+        )]);
+        let runner = u5_fixture_runner(&fixture.url);
+        let result =
+            runner.read_u5_session_events("session-a", Instant::now() + Duration::from_secs(2));
+        if fault == "none" {
+            assert_eq!(result.unwrap(), original);
+        } else {
+            assert!(result.is_err(), "{fault}");
+        }
+        assert_eq!(fixture.finish().len(), 1);
     }
 }
 

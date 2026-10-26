@@ -104,14 +104,14 @@ MAX_PROVIDER_TOKENS="${COWD_EVAL_MAX_PROVIDER_TOKENS:-unbounded-explicit-opt-in}
   exit 2
 }
 case "$SCENARIO_ID" in
-  live_u7_persistent_memory_recall|live_u5_shared_session_fairness|live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_one_team_execution|live_small_two_team_collaboration|live_explicit_team_requirement|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek|live_minimal_batch_read|live_minimal_compute_reduce) ;;
+  live_u7_persistent_memory_recall|live_u5_shared_session_fairness|live_u5_active_cancel_isolation|live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_one_team_execution|live_small_two_team_collaboration|live_explicit_team_requirement|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek|live_minimal_batch_read|live_minimal_compute_reduce) ;;
   *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
 esac
 
-# F preregisters one real provider slot in this disposable configuration. Both
-# sessions must still produce the original Capacity/blocker witness to pass.
-if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness ]]; then
-  [[ -z "$MAX_CONCURRENCY" || "$MAX_CONCURRENCY" == 1 ]] || { echo 'U5 F requires its preregistered capacity1' >&2; exit 2; }
+# F and C preregister one real provider slot in this disposable configuration.
+# Both sessions must still produce the original Capacity/blocker witness to pass.
+if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness || "$SCENARIO_ID" == live_u5_active_cancel_isolation ]]; then
+  [[ -z "$MAX_CONCURRENCY" || "$MAX_CONCURRENCY" == 1 ]] || { echo 'U5 F/C requires its preregistered capacity1' >&2; exit 2; }
   MAX_CONCURRENCY=1
 fi
 
@@ -125,7 +125,10 @@ fi
 
 # Fixed evaluator corpus follows the exact registered scenario, never caller paths.
 case "$SCENARIO_ID" in
-  live_u5_shared_session_fairness) EVALUATION_CORPUS_ID=live-u5-fairness-v1 ;;
+  # Gateway evaluation_projection_resource_grants gives live-scenarios-v1 only
+  # Cargo.toml. F/C also require B's original crates/runtime/Cargo.toml read;
+  # the existing fairness corpus grants exactly those two original paths.
+  live_u5_shared_session_fairness|live_u5_active_cancel_isolation) EVALUATION_CORPUS_ID=live-u5-fairness-v1 ;;
   live_one_team_execution) EVALUATION_CORPUS_ID=live-one-team-v1 ;;
   *) EVALUATION_CORPUS_ID=live-scenarios-v1 ;;
 esac
@@ -452,7 +455,7 @@ raise SystemExit(1 if remaining else 0)
 PY
   then :; else secondary=1; fi
   [[ "$status" != 0 || "$secondary" == 0 ]] || status=1
-  if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness && "$status" == 75 && "$secondary" == 0 ]]; then
+  if [[ ( "$SCENARIO_ID" == live_u5_shared_session_fairness || "$SCENARIO_ID" == live_u5_active_cancel_isolation ) && "$status" == 75 && "$secondary" == 0 ]]; then
     if finalize_u5 "$status"; then status=0; else status=1; fi
   fi
   # Raw config/logs/receipts remain private; never copy them to a mode-blind mount.
@@ -536,9 +539,9 @@ PYHOST
 
 # This only appends a final receipt. Original report, exit75 and cleanup stay intact.
 finalize_u5() {
-  python3 - "$PRIVATE_RUNTIME" "$RUN_ROOT" "$EVIDENCE_ROOT" "$1" <<'PYFINAL'
+  python3 - "$PRIVATE_RUNTIME" "$RUN_ROOT" "$EVIDENCE_ROOT" "$1" "$SCENARIO_ID" <<'PYFINAL'
 import hashlib,json,os,pathlib,stat,sys
-private,root,evidence,status=map(str,sys.argv[1:])
+private,root,evidence,status,scenario=map(str,sys.argv[1:])
 def need(ok,reason):
     if not ok: raise ValueError(reason)
 def read(path,limit,mode=None):
@@ -552,31 +555,43 @@ try:
     need(status=='75','not the reserved pending exit')
     host,host_sha=read(pathlib.Path(private)/'u5-host.json',16384,0o400)
     inner,inner_sha=read(pathlib.Path(private)/'u5-inner-receipt.json',16384,0o600)
-    need(type(inner['schema_version']) is int and inner['schema_version']==1 and inner['disposition']=='pending_outer_cleanup' and inner['scenario']=='live_u5_shared_session_fairness','not exact F pending')
+    need(scenario in ('live_u5_shared_session_fairness','live_u5_active_cancel_isolation'),'not exact U5 scenario')
+    cancellation=scenario=='live_u5_active_cancel_isolation'
+    need(type(inner['schema_version']) is int and inner['schema_version']==1 and inner['disposition']=='pending_outer_cleanup' and inner['scenario']==scenario,'not exact U5 pending')
     owner=inner['owner']
     need(all(owner[k]==host[k] for k in owner) and set(owner)=={'nonce','pid','starttime','image_sha256','candidate','namespace','source_sha256','harness_sha256'},'wrong host binding')
     report_path=pathlib.Path(inner['report_path'])
     need(report_path.resolve().is_relative_to(pathlib.Path(evidence).resolve()),'report outside own evidence root')
     report,report_sha=read(report_path,8*1024*1024)
     need(report_sha==inner['report_sha256'] and report['kind']=='harness_eval.u5_internal' and report['status']=='pending_outer_cleanup' and report['run_id']==inner['run_id'] and report['u5_host']==owner,'wrong original report')
+    need(report['live_gateway_scenarios']['selected_scenario_ids']==[scenario],'wrong original selected scenario')
     gate=report['report_gate']
-    names={'u5_exact_focused_selection','u5_two_original_leaf_business_permissions_and_ACK','u5_original_capacity_witness','u5_original_usage_complete','u5_host_binding_present'}
+    names=({'u5_exact_focused_selection','u5_cancelled_leaf_authorized_physical_and_other_leaf_business_permissions_and_ACK','u5_original_physical_cancellation_and_settlement','u5_original_usage_accounted','u5_host_binding_present'} if cancellation else
+        {'u5_exact_focused_selection','u5_two_original_leaf_business_permissions_and_ACK','u5_original_capacity_witness','u5_original_usage_complete','u5_host_binding_present'})
     need(gate['status']=='pending_outer_cleanup' and gate['failed']==0 and len(gate['items'])==5 and {i['name'] for i in gate['items']}==names and all(i['required'] is True and i['status']=='passed' for i in gate['items']),'internal hardgate failed')
     need(inner['usage']==report['u5_usage'],'usage receipt mismatch')
     usage=inner['usage']
     need(usage['source']=='original_provider_call_id_deduplicated' and type(usage['physical_calls']) is int and usage['physical_calls']>0,'unknown physical usage source')
     dimensions=['input_tokens','output_tokens','cache_creation_input_tokens','cache_read_input_tokens','total_tokens']
-    need(all(type(usage.get(k)) is int and usage[k]>=0 for k in dimensions) and sum(usage[k] for k in dimensions[:-1])==usage['total_tokens'],'incomplete typed usage receipt')
+    if cancellation and usage.get('usage_status')=='unknown':
+        unknown=usage.get('unknown_call_ids')
+        need(type(unknown) is list and 0<len(unknown)<=usage['physical_calls'] and len(set(unknown))==len(unknown) and all(type(k) is str and k for k in unknown),'unknown usage needs exact original call identities')
+        need(all(k in usage and (usage[k] is None or (type(usage[k]) is int and usage[k]>=0)) for k in dimensions) and usage['total_tokens'] is None,'unknown usage was replaced by zero/total')
+    else:
+        need(not cancellation or (usage.get('usage_status')=='known' and usage.get('unknown_call_ids')==[]),'missing C usage disposition')
+        need(all(type(usage.get(k)) is int and usage[k]>=0 for k in dimensions) and sum(usage[k] for k in dimensions[:-1])==usage['total_tokens'],'incomplete typed usage receipt')
     cleanup,cleanup_sha=read(pathlib.Path(root)/'cleanup-result.json',65536)
     need(cleanup['business_exit']==75 and cleanup['cleanup_failed'] is False and cleanup['gateway_wait_status']=='0' and cleanup['remaining_owned']==[],'outer resource return failed')
     v1,v1_sha=read(pathlib.Path(root)/'shutdown-validation.json',65536)
     need(v1['status']=='passed' and all(v1['identity'][k]==host[k] for k in ['nonce','pid','starttime','image_sha256']),'wrong V1 identity')
     bindings,_=read(pathlib.Path(root)/'binary-bindings.json',65536)
     need(len(bindings)==2 and 'sha256:'+bindings[0]['sha256']==host['image_sha256'] and bindings[1]['sha256']==host['harness_sha256'],'wrong original dual image binding')
-    result=dict(schema_version=1,status='passed',scope='focused_U5_F_only',original_harness_exit=75,
+    result=dict(schema_version=1,status='passed',scope='focused_U5_C_local_only' if cancellation else 'focused_U5_F_only',original_harness_exit=75,
         run_id=inner['run_id'],owner=owner,inner_sha256=inner_sha,report_sha256=report_sha,
         shutdown_validation_sha256=v1_sha,shutdown_receipt_sha256=v1['receipt_sha256'],cleanup_sha256=cleanup_sha,
         host_sha256=host_sha,usage=inner['usage'])
+    if cancellation:
+        result.update(remote_server_inference_stop='unknown',remote_billing_stop='unknown')
     # verify_binary_bindings has just independently rehashed actual immutable images.
     path=pathlib.Path(root)/'u5-final-acceptance.v1.json'
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -588,7 +603,7 @@ PYFINAL
 
 launch_harness() {
   local -a u5_env=()
-  if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness ]]; then
+  if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness || "$SCENARIO_ID" == live_u5_active_cancel_isolation ]]; then
     [[ ! -e "/proc/$BASHPID/fd/9" ]] || { echo 'U5 reserved FD already occupied' >&2; return 1; }
     prepare_u5_host || return 1
     exec 9<"$PRIVATE_RUNTIME/u5-host.json"
@@ -611,7 +626,7 @@ launch_harness() {
     COWD_AI_HARNESS_REPORT_DIR="$EVIDENCE_ROOT" \
     "$HARNESS_BIN" deep-real --provider "$MODEL" --budget full --allow-real-model &
   HARNESS_PID=$!
-  if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness ]]; then exec 9<&-; fi
+  if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness || "$SCENARIO_ID" == live_u5_active_cancel_isolation ]]; then exec 9<&-; fi
   track_child "$HARNESS_PID" || return 1
   HARNESS_STARTTIME=${CHILD_START[$HARNESS_PID]}
   verify_child_image "$HARNESS_PID" "$HARNESS_BINARY_SHA256"
