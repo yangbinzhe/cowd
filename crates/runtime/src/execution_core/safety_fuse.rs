@@ -27,10 +27,8 @@ pub enum SafetyFuseDecision {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SafetyFusePolicy;
 
-/// Single complexity-keyed budget table. Every bound that must scale with
-/// complexity (the stall-step fuse here, the convergence-replan bound in the
-/// host, and any future dimension) reads this one table instead of each site
-/// re-deriving its own mapping, so the dimensions can never drift apart.
+/// The retained convergence/stall budget. The historical type name remains
+/// for callers, but predicted complexity is telemetry, never a work permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComplexityBudget {
     /// Consecutive unverified model steps tolerated before the stall fuse may
@@ -43,28 +41,13 @@ pub struct ComplexityBudget {
 
 impl ComplexityBudget {
     #[must_use]
-    pub const fn derive(complexity: TaskComplexity) -> Self {
-        match complexity {
-            TaskComplexity::Trivial => Self {
-                max_model_steps: 4,
-                convergence_replans: 2,
-            },
-            TaskComplexity::Simple => Self {
-                max_model_steps: 8,
-                convergence_replans: 2,
-            },
-            TaskComplexity::Moderate => Self {
-                max_model_steps: 14,
-                convergence_replans: 3,
-            },
-            TaskComplexity::Complex => Self {
-                max_model_steps: 24,
-                convergence_replans: 4,
-            },
-            TaskComplexity::Strategic => Self {
-                max_model_steps: 32,
-                convergence_replans: 6,
-            },
+    pub const fn derive(_complexity: TaskComplexity) -> Self {
+        // Keep the existing largest bound, so removing a prediction cannot
+        // shorten a previously admitted task. Actual operator limits still
+        // intersect this bounded no-progress lease below.
+        Self {
+            max_model_steps: 32,
+            convergence_replans: 6,
         }
     }
 }
@@ -84,7 +67,7 @@ impl SafetyFusePolicy {
             complexity,
             explicit_user_limit,
             reason: format!(
-                "consecutive unverified-progress threshold derived from policy complexity={complexity:?}, explicit_user_limit={explicit_user_limit:?}; context_window={context_window} and total model steps are telemetry only"
+                "consecutive unverified-progress threshold from fixed Runtime policy, explicit_user_limit={explicit_user_limit:?}; complexity={complexity:?} is telemetry; context_window={context_window} and total model steps are telemetry only"
             ),
         }
     }
@@ -118,10 +101,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derives_from_complexity_and_explicit_limit_not_context_window() {
+    fn derives_from_fixed_progress_policy_and_explicit_limit_not_prediction() {
         let simple = SafetyFusePolicy::derive(128_000, TaskComplexity::Simple, None);
         let strategic = SafetyFusePolicy::derive(1_000_000, TaskComplexity::Strategic, None);
-        assert!(strategic.max_model_steps > simple.max_model_steps);
+        assert_eq!(strategic.max_model_steps, simple.max_model_steps);
         assert_eq!(
             SafetyFusePolicy::derive(128_000, TaskComplexity::Strategic, None).max_model_steps,
             strategic.max_model_steps
@@ -135,12 +118,10 @@ mod tests {
     #[test]
     fn stall_streak_threshold_is_fixed_for_the_lifetime_of_the_lease() {
         let lease = SafetyFusePolicy::derive(1_000_000, TaskComplexity::Moderate, Some(20));
-        assert_eq!(lease.max_model_steps, 14);
-        assert!(
-            lease
-                .reason
-                .contains("total model steps are telemetry only")
-        );
+        assert_eq!(lease.max_model_steps, 20);
+        assert!(lease
+            .reason
+            .contains("total model steps are telemetry only"));
     }
 
     #[test]
@@ -189,8 +170,8 @@ mod tests {
         assert_eq!(strategic.max_model_steps, 32);
         assert_eq!(strategic.convergence_replans, 6);
         let simple = ComplexityBudget::derive(TaskComplexity::Simple);
-        assert_eq!(simple.max_model_steps, 8);
-        assert_eq!(simple.convergence_replans, 2);
+        assert_eq!(simple.max_model_steps, 32);
+        assert_eq!(simple.convergence_replans, 6);
         // The fuse derives its step bound from the same table, so the two
         // dimensions cannot drift.
         assert_eq!(
