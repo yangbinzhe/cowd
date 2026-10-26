@@ -104,7 +104,7 @@ MAX_PROVIDER_TOKENS="${COWD_EVAL_MAX_PROVIDER_TOKENS:-unbounded-explicit-opt-in}
   exit 2
 }
 case "$SCENARIO_ID" in
-  live_u5_shared_session_fairness|live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_one_team_execution|live_small_two_team_collaboration|live_explicit_team_requirement|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek|live_minimal_batch_read|live_minimal_compute_reduce) ;;
+  live_u7_persistent_memory_recall|live_u5_shared_session_fairness|live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_one_team_execution|live_small_two_team_collaboration|live_explicit_team_requirement|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek|live_minimal_batch_read|live_minimal_compute_reduce) ;;
   *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
 esac
 
@@ -113,6 +113,14 @@ esac
 if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness ]]; then
   [[ -z "$MAX_CONCURRENCY" || "$MAX_CONCURRENCY" == 1 ]] || { echo 'U5 F requires its preregistered capacity1' >&2; exit 2; }
   MAX_CONCURRENCY=1
+fi
+
+# U7 uses the existing non-file corpus: no new observer path grant.
+if [[ "$SCENARIO_ID" == live_u7_persistent_memory_recall ]]; then
+  [[ -n "${COWD_EVAL_U7_FIXTURE_FILE:-}" && -z "${COWD_EVAL_RESUME_SESSION:-}" ]] || {
+    echo 'U7 requires a fresh Session and a private fixture output path' >&2
+    exit 2
+  }
 fi
 
 # Fixed evaluator corpus follows the exact registered scenario, never caller paths.

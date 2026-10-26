@@ -26,6 +26,90 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// run report "not verified".
 const PROGRAM_EXTRACTION_RETRIES: u32 = 3;
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
+const U7_MEMORY: &str = "live_u7_persistent_memory_recall";
+const U7_MEMORY_PROMPT: &str = "请依据已保存的 u7-memory-lighthouse 项目备件调度记忆，回答仓库代号和出库口令。请用中文短句说明记忆中的两个实际值；找不到就明确说明缺失，不要猜测。不要读取工作区文件，不要执行写入工具，不要组队。";
+
+#[derive(serde::Serialize)]
+struct U7MemoryFixture {
+    lookup: String,
+    warehouse: String,
+    passphrase: String,
+    content: String,
+}
+
+impl U7MemoryFixture {
+    fn fresh() -> Self {
+        let warehouse = format!("WH-{}", uuid::Uuid::new_v4().simple());
+        let passphrase = format!("OUT-{}", uuid::Uuid::new_v4().simple());
+        Self {
+            lookup: "u7-memory-lighthouse".into(),
+            content: format!("u7-memory-lighthouse 项目备件调度：仓库代号为 {warehouse}；出库口令为 {passphrase}。"),
+            warehouse,
+            passphrase,
+        }
+    }
+}
+
+fn u7_memory_spec() -> LiveScenarioSpec {
+    LiveScenarioSpec {
+        id: U7_MEMORY,
+        prompt: U7_MEMORY_PROMPT,
+        acceptance: LiveAcceptance::MemoryRecall,
+        timeout: LiveScenarioTimeout::tool(),
+    }
+}
+
+fn u7_persisted_record(value: &Value, id: &str, content: &str) -> bool {
+    if value.get("id").and_then(Value::as_str) == Some(id)
+        && value.get("content").and_then(Value::as_str) == Some(content)
+    {
+        return true;
+    }
+    match value {
+        Value::Array(rows) => rows.iter().any(|row| u7_persisted_record(row, id, content)),
+        Value::Object(fields) => fields
+            .values()
+            .any(|row| u7_persisted_record(row, id, content)),
+        _ => false,
+    }
+}
+
+fn u7_memory_checks(
+    fixture: &U7MemoryFixture,
+    session: &str,
+    response: &str,
+    history: &Value,
+) -> Value {
+    let bound_history = history.get("session_id").and_then(Value::as_str) == Some(session)
+        && history.get("has_more").and_then(Value::as_bool) == Some(false);
+    let selected = bound_history
+        && history
+            .get("envelopes")
+            .and_then(Value::as_array)
+            .is_some_and(|events| {
+                events.iter().any(|event| {
+                    let envelope = &event["envelope"];
+                    event["session_id"].as_str() == Some(session)
+                        && event["type"].as_str() == Some("ContextEnvelope")
+                        && envelope["identity"]["session_id"].as_str() == Some(session)
+                        && envelope["intent"]
+                            .as_str()
+                            .is_some_and(|intent| intent.contains(&fixture.lookup))
+                        && envelope["selected"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["source"].as_str() == Some("memory")
+                                    && item["content"]
+                                        .as_str()
+                                        .is_some_and(|text| text.contains(&fixture.content))
+                            })
+                        })
+                })
+            });
+    let correct = response.contains(&fixture.warehouse) && response.contains(&fixture.passphrase);
+    json!({"passed": selected && correct, "persisted_context_memory_selected":selected,
+        "independent_business_values":correct, "history":history})
+}
+
 const U5_FAIRNESS: &str = "live_u5_shared_session_fairness";
 const U5_CANCEL: &str = "live_u5_active_cancel_isolation";
 const U5_MISSING: &str =
@@ -1223,7 +1307,7 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
         // exact: the isolated workspace plus network reads, never the host.
         resource_scopes.push("workspace:.");
         resource_scopes.push("network:*");
-    } else if !matches!(spec_id, "u5-read-a" | "u5-read-b") {
+    } else if !matches!(spec_id, "u5-read-a" | "u5-read-b" | U7_MEMORY) {
         // Read-only source-analysis scenarios must be able to read the isolated
         // candidate workspace (`crates/...`) to ground their evidence. Without
         // this lease every source read is denied by the resource ceiling.
@@ -2412,6 +2496,12 @@ impl LiveScenarioRunner {
                 });
             }
         }
+        if selected_scenario_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(U7_MEMORY))
+        {
+            scenario_specs.push(u7_memory_spec());
+        }
         let registered_scenario_ids = scenario_specs
             .iter()
             .map(|spec| spec.id.to_string())
@@ -2550,6 +2640,30 @@ impl LiveScenarioRunner {
         }
         let started = Instant::now();
         let mut trace = Vec::new();
+        let u7_fixture = if spec.id == U7_MEMORY {
+            if std::env::var("COWD_EVAL_RESUME_SESSION")
+                .ok()
+                .is_some_and(|id| !id.trim().is_empty())
+            {
+                return failed_scenario(
+                    spec,
+                    started,
+                    trace,
+                    "U7 requires a fresh Session, not resume".into(),
+                );
+            }
+            match self.prepare_u7_memory() {
+                Ok((fixture, evidence)) => {
+                    trace.push(
+                        json!({"kind":"u7_preregistered_persistent_memory", "evidence":evidence}),
+                    );
+                    Some(fixture)
+                }
+                Err(error) => return failed_scenario(spec, started, trace, error),
+            }
+        } else {
+            None
+        };
         let timeout = spec.timeout.with_cap(self.timeout_cap);
         let deadline = timeout.observation_deadline(started, started, Duration::ZERO, 0);
         // Resume mode reattaches to a retained session's in-flight turn instead
@@ -2588,6 +2702,26 @@ impl LiveScenarioRunner {
             trace,
             &mut actor,
         );
+        if let Some(fixture) = u7_fixture.as_ref() {
+            let session = actor.session_id();
+            let history = self.get_json(&format!(
+                "/api/sessions/{session}/context?include_envelopes=true&limit=200"
+            ));
+            let evidence = match history {
+                Ok(history) => u7_memory_checks(
+                    fixture,
+                    session,
+                    result["u7_terminal_answer"].as_str().unwrap_or_default(),
+                    &history,
+                ),
+                Err(error) => json!({"passed":false,"error":error}),
+            };
+            if evidence["passed"] != true {
+                result["status"] = json!("failed");
+                result["acceptance"]["passed"] = json!(false);
+            }
+            result["u7_memory_evidence"] = evidence;
+        }
         let cleanup = actor.finish().map_or_else(
             |error| json!({"status":"failed","error":error}),
             |_| json!({"status":"passed"}),
@@ -2606,6 +2740,49 @@ impl LiveScenarioRunner {
             result["session_actor_trace"] = json!(actor_trace);
         }
         result
+    }
+
+    fn prepare_u7_memory(&self) -> Result<(U7MemoryFixture, Value), String> {
+        use std::io::Write;
+        let fixture = U7MemoryFixture::fresh();
+        let path = std::env::var("COWD_EVAL_U7_FIXTURE_FILE")
+            .map_err(|_| "U7 requires a preregistered private fixture output path".to_string())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|error| format!("U7 fixture freeze: {error}"))?;
+        let bytes = serde_json::to_vec_pretty(&fixture).map_err(|error| error.to_string())?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        let created = response_json(
+            self.client
+                .post(format!("{}/api/memory/L3", self.base_url))
+                .json(&json!({"title":fixture.lookup,"content":fixture.content,
+                "tags":["u7-real-memory"],"category":"Reference","priority":"High"}))
+                .send()
+                .map_err(|error| error.to_string())?,
+        )?;
+        let id = created
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("U7 memory create response lacks its original id")?;
+        let readback = self.get_json("/api/memory/L3")?;
+        if !u7_persisted_record(&readback, id, &fixture.content) {
+            return Err(
+                "U7 original persistent memory readback does not match frozen input".into(),
+            );
+        }
+        let evidence = json!({"memory_id":id,"fixture_sha256":format!("{:x}",Sha256::digest(&bytes)),
+            "input":fixture,"readback":readback,"preparation_is_not_business_success":true});
+        Ok((fixture, evidence))
     }
 
     fn run_attached_scenario(
@@ -2955,6 +3132,9 @@ impl LiveScenarioRunner {
             },
             "read_evidence": timeline.get("read_evidence"),
         });
+        if spec.id == U7_MEMORY {
+            result["u7_terminal_answer"] = json!(response_text);
+        }
         if spec.id.starts_with("u5-read-") {
             result["u5_provider_events"] = json!(timeline
                 .get("events")
@@ -4721,6 +4901,7 @@ struct DescendantTeamWait {
 
 #[derive(Clone, Copy)]
 enum LiveAcceptance {
+    MemoryRecall,
     U5(U5Mode),
     Contains(&'static str),
     RequiresToolEvidence {
@@ -4823,6 +5004,13 @@ impl LiveAcceptance {
         root_execution_id: &str,
     ) -> LiveAcceptanceResult {
         let result = match self {
+            Self::MemoryRecall => LiveAcceptanceResult {
+                passed: !response.trim().is_empty(),
+                quality: None,
+                checks: vec![
+                    json!({"name":"durable_response", "passed":!response.trim().is_empty()}),
+                ],
+            },
             Self::U5(_) => LiveAcceptanceResult {
                 passed: false,
                 quality: None,

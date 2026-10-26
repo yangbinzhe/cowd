@@ -3616,3 +3616,128 @@ fn u5_inherited_host_fd_contract_probe() {
         ),
     }
 }
+
+fn u7_literal_fixture() -> U7MemoryFixture {
+    U7MemoryFixture {
+        lookup: "independent-project".into(),
+        warehouse: "WH-literal-527".into(),
+        passphrase: "OUT-literal-893".into(),
+        content: "independent memory body 527/893".into(),
+    }
+}
+
+fn u7_literal_history() -> Value {
+    json!({"session_id":"s-original", "has_more":false, "envelopes":[{
+    "session_id":"s-original", "type":"ContextEnvelope", "envelope":{
+        "identity":{"session_id":"s-original"}, "intent":"query independent-project",
+        "selected":[{"source":"memory","content":"independent memory body 527/893"}]
+    }}]})
+}
+
+#[test]
+fn u7_memory_requires_original_selected_context_and_independent_answer() {
+    let fixture = u7_literal_fixture();
+    let answer = "WH-literal-527 OUT-literal-893";
+    let history = u7_literal_history();
+    assert_eq!(
+        u7_memory_checks(&fixture, "s-original", answer, &history)["passed"],
+        true
+    );
+    for case in [
+        "foreign-session",
+        "foreign-envelope",
+        "wrong-source",
+        "omitted",
+        "partial-page",
+        "wrong-body",
+        "wrong-intent",
+    ] {
+        let mut changed = history.clone();
+        match case {
+            "foreign-session" => changed["session_id"] = json!("foreign"),
+            "foreign-envelope" => {
+                changed["envelopes"][0]["envelope"]["identity"]["session_id"] = json!("foreign")
+            }
+            "wrong-source" => {
+                changed["envelopes"][0]["envelope"]["selected"][0]["source"] = json!("user_request")
+            }
+            "omitted" => {
+                changed["envelopes"][0]["envelope"]["omitted"] =
+                    changed["envelopes"][0]["envelope"]["selected"].clone();
+                changed["envelopes"][0]["envelope"]["selected"] = json!([]);
+            }
+            "partial-page" => changed["has_more"] = json!(true),
+            "wrong-body" => {
+                changed["envelopes"][0]["envelope"]["selected"][0]["content"] =
+                    json!("different memory")
+            }
+            "wrong-intent" => {
+                changed["envelopes"][0]["envelope"]["intent"] = json!("other project")
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            u7_memory_checks(&fixture, "s-original", answer, &changed)["passed"],
+            false,
+            "{case}"
+        );
+    }
+    for wrong in [
+        "",
+        "WH-literal-527",
+        "OUT-literal-893",
+        "WH-other OUT-other",
+    ] {
+        assert_eq!(
+            u7_memory_checks(&fixture, "s-original", wrong, &history)["passed"],
+            false
+        );
+    }
+}
+
+#[test]
+fn u7_preparation_readback_requires_same_original_id_and_full_body() {
+    let row = json!({"entries":[{"id":"original-id","content":"literal-body"}]});
+    assert!(u7_persisted_record(&row, "original-id", "literal-body"));
+    assert!(!u7_persisted_record(&row, "foreign-id", "literal-body"));
+    assert!(!u7_persisted_record(&row, "original-id", "literal"));
+    assert!(!u7_persisted_record(
+        &json!({"entries":[]}),
+        "original-id",
+        "literal-body"
+    ));
+    assert_eq!(
+        u7_memory_checks(
+            &u7_literal_fixture(),
+            "s-original",
+            "WH-literal-527 OUT-literal-893",
+            &json!({})
+        )["passed"],
+        false,
+        "CRUD/readback cannot stand in for real context consumption"
+    );
+}
+
+#[test]
+fn u7_exact_selector_preserves_other_corpora_and_does_not_leak_expected() {
+    let spec = u7_memory_spec();
+    assert_eq!(spec.id, "live_u7_persistent_memory_recall");
+    assert!(spec.acceptance.read_obligations().is_empty());
+    let registry = BTreeSet::from([spec.id.to_string()]);
+    let good = BTreeSet::from(["live_u7_persistent_memory_recall".to_string()]);
+    let bad = BTreeSet::from(["live_u7_persistent_memory_recall_foreign".to_string()]);
+    assert!(live_scenario_selection_errors(Some(&good), &registry).is_empty());
+    assert_eq!(
+        live_scenario_selection_errors(Some(&bad), &registry).len(),
+        1
+    );
+    let fixture = U7MemoryFixture::fresh();
+    assert!(!spec.prompt.contains(&fixture.warehouse));
+    assert!(!spec.prompt.contains(&fixture.passphrase));
+    let prompt = controlled_live_prompt(spec.id, spec.prompt.to_string(), None);
+    assert!(!prompt.contains("read:."));
+    assert!(
+        controlled_live_prompt("live_tool_evidence", "original".into(), None)
+            .contains("read:Cargo.toml")
+    );
+}
