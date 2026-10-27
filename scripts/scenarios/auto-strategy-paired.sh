@@ -76,17 +76,27 @@ yaml_model_field() {
   local file="$1"
   local model="$2"
   local field="$3"
-  awk -v target="${model}" -v key="${field}" '
+  local raw="${4:-0}"
+  awk -v target="${model}" -v key="${field}" -v raw="${raw}" '
     function scalar(line, pos, value) {
       pos = index(line, ":")
       value = substr(line, pos + 1)
       sub(/^[[:space:]]+/, "", value)
       sub(/[[:space:]]+#.*$/, "", value)
+      if (raw) return value == "" ? "null" : value
       sub(/^\047/, "", value); sub(/\047$/, "", value)
       sub(/^\"/, "", value); sub(/\"$/, "", value)
       return value
     }
-    $0 ~ "^[[:space:]]*" target ":[[:space:]]*$" { matched = 1; next }
+    /^  [^[:space:]]/ {
+      if (matched) exit
+      name = $0
+      sub(/^  /, "", name); sub(/:[[:space:]]*$/, "", name)
+      sub(/^\047/, "", name); sub(/\047$/, "", name)
+      sub(/^\"/, "", name); sub(/\"$/, "", name)
+      matched = name == target
+      next
+    }
     matched && $0 ~ "^[[:space:]]{2}[^[:space:]]" { exit }
     matched && $0 ~ "^[[:space:]]{4}" key ":[[:space:]]*" { print scalar($0); exit }
   ' "${file}"
@@ -129,7 +139,7 @@ resolve_installed_provider_route() {
   }
 
   PROVIDER_ID="$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" provider)"
-  MODEL_CONTEXT_WINDOW="$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" context_window)"
+  MODEL_CONTEXT_WINDOW="$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" context_window 1)"
   MODEL_MAX_OUTPUT_TOKENS="$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" max_output_tokens)"
   [[ -n "${PROVIDER_ID}" && -n "${MODEL_CONTEXT_WINDOW}" && -n "${MODEL_MAX_OUTPUT_TOKENS}" ]] || {
     echo "model ${MODEL} must have provider, context_window, and max_output_tokens in ${SOURCE_MODELS_FILE}" >&2
@@ -214,6 +224,14 @@ for index in 0 1 2; do
   cp -a "${workspace}" "${SCENARIO_ROOT}/${condition}/pristine"
   {
     echo "model: \"${MODEL}\""
+    # Preserve refusal for malformed declarations despite the generic YAML
+    # loader's numeric narrowing; only a canonical integer may become a window.
+    capacity_value="$MODEL_CONTEXT_WINDOW"
+    if [[ ! "$capacity_value" =~ ^(0|[1-9][0-9]*)$ ]]; then
+      capacity_value="$(jq -cn --arg value "$capacity_value" '$value')"
+    fi
+    printf 'model_context_windows:\n  %s: %s\n' \
+      "$(jq -cn --arg model "$MODEL" '$model')" "$capacity_value"
     echo "fallbacks: []"
     echo "providers:"
     echo "  ${PROVIDER_ID}:"

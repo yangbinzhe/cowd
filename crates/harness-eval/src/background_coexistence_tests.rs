@@ -1320,6 +1320,71 @@ fn controlled_model_window_is_explicit_and_resolves_through_original_loader() ->
     );
     assert_eq!(fixed.configured_context_window("unregistered-model"), None);
     assert!(fixed.resolve("unregistered-model").is_none());
+    // An explicitly supplied offline proof exercises the real launcher's output
+    // through the same loader/registry, without starting services or a Provider.
+    if let Some(manifest) = std::env::var_os("COWD_EVAL_CAPACITY_PROOF") {
+        let cases: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(manifest)?)?;
+        anyhow::ensure!(
+            !cases.is_empty(),
+            "capacity proof must contain actual cases"
+        );
+        for case in cases {
+            let name = case["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing case name"))?;
+            let workspace = case["workspace"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing workspace"))?;
+            let config_home = case["config_home"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing config home"))?;
+            let model = case["model"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing model"))?;
+            let loaded = runtime::ConfigLoader::new(workspace, config_home).load();
+            if case["reject"] == true {
+                let error = loaded
+                    .expect_err("invalid declared capacity must not be accepted")
+                    .to_string();
+                anyhow::ensure!(
+                    error.contains("model_context_windows"),
+                    "{name}: wrong refusal: {error}"
+                );
+                println!(
+                    "R403_CAPACITY_PROOF {}",
+                    json!({"name":name,"rejected":true,"predicate":"model_context_windows"})
+                );
+                continue;
+            }
+            let loaded = loaded?;
+            let registry = runtime::ProviderRegistry::new_with_context_windows(
+                loaded.providers().clone(),
+                loaded.model_context_windows().clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("capacity proof registry rejected: {error:?}"))?;
+            let pinned = registry.pin();
+            anyhow::ensure!(
+                pinned.resolve(model).is_some(),
+                "{name}: original model route missing"
+            );
+            let observed = pinned.configured_context_window(model);
+            let expected = case["expected_window"]
+                .as_u64()
+                .map(u32::try_from)
+                .transpose()?;
+            anyhow::ensure!(
+                observed == expected,
+                "{name}: configured_context_window observed={observed:?} expected={expected:?}"
+            );
+            anyhow::ensure!(pinned
+                .configured_context_window("r403-foreign-unconfigured")
+                .is_none());
+            println!(
+                "R403_CAPACITY_PROOF {}",
+                json!({"name":name,"model":model,"configured_context_window":observed})
+            );
+        }
+    }
     Ok(())
 }
 

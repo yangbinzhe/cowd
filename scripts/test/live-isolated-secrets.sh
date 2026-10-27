@@ -94,6 +94,18 @@ if [[ "${1:-}" == --source-worker ]]; then
   exit
 fi
 
+if [[ "${1:-}" == --capacity-worker ]]; then
+  source "$MOCK_FUNCTIONS"
+  if [[ "${MOCK_CAPACITY_ENTRY:-main}" == paired ]]; then
+    resolve_installed_provider_route
+    source "$MOCK_CONFIG_BLOCK"
+  else
+    resolve_installed_route
+    write_isolated_config
+  fi
+  exit
+fi
+
 if [[ "${1:-}" == --diagnostic-worker ]]; then
   env() {
     printf '%s\n' "$MOCK_PASSWORD"
@@ -413,6 +425,41 @@ MODELS
   assert_equal "$source_case/source-exit" "$expected_source_status" "$source_status"
   assert_equal "$source_case/no-git-or-external" no "$([[ -e "$source_root/events" ]] && printf yes || printf no)"
   assert_contains "$source_case/prior-evidence-preserved" "$source_root/evidence/runs/prior/report.json" 'prior report'
+done
+# The same original generator must carry only this model's declared window.
+for capacity_case in valid missing quoted fraction foreign; do
+  capacity_root="$SANDBOX/capacity-$capacity_case"
+  mkdir -p "$capacity_root/home" "$capacity_root/source" "$capacity_root/config"
+  cp "$SANDBOX/source-no_git/config/config.yaml" "$capacity_root/source/config.yaml"
+  {
+    printf 'models:\n'
+    if [[ "$capacity_case" == foreign ]]; then
+      printf '  qwenXcustom:\n    provider: configured-route\n    context_window: 16384\n'
+    fi
+    printf '  qwen-custom:\n    provider: configured-route\n'
+    case "$capacity_case" in
+      valid) printf '    context_window: 8192\n' ;;
+      quoted) printf '    context_window: "8192"\n' ;;
+      fraction) printf '    context_window: 8192.5\n' ;;
+    esac
+  } >"$capacity_root/source/models.yaml"
+  capacity_status=0
+  env -i PATH=/usr/bin:/bin HOME="$capacity_root/home" \
+    MOCK_EVENTS="$capacity_root/events" MOCK_FUNCTIONS="$SANDBOX/source-functions.sh" \
+    SOURCE_CONFIG_FILE="$capacity_root/source/config.yaml" SOURCE_MODELS_FILE="$capacity_root/source/models.yaml" \
+    CONFIG_HOME="$capacity_root/config" MODEL=qwen-custom MAX_CONCURRENCY=1 \
+    STAGED_CREDENTIAL_ENV='' PORT=19998 TOKEN=offline-capacity-proof \
+    /bin/bash "$SELF" --capacity-worker >"$capacity_root/stdout" 2>"$capacity_root/stderr" || capacity_status=$?
+  CASES=$((CASES + 1))
+  assert_equal "$capacity_case/capacity-generator" 0 "$capacity_status"
+  assert_equal "$capacity_case/no-external" no "$([[ -e "$capacity_root/events" ]] && printf yes || printf no)"
+  assert_absent "$capacity_case/no-literal-credential" "$capacity_root/config/config.yaml" not-a-real-account
+  case "$capacity_case" in
+    valid) assert_contains "$capacity_case/declared-window" "$capacity_root/config/config.yaml" '"qwen-custom": 8192' ;;
+    missing|foreign) assert_absent "$capacity_case/no-invented-window" "$capacity_root/config/config.yaml" model_context_windows ;;
+    quoted) assert_contains "$capacity_case/invalid-type-retained" "$capacity_root/config/config.yaml" '\"8192\"' ;;
+    fraction) assert_contains "$capacity_case/no-numeric-truncation" "$capacity_root/config/config.yaml" '"8192.5"' ;;
+  esac
 done
 SOURCE_HASH_AFTER="$(sha256sum "$SOURCE_ROOT/scripts/scenarios/run-live-isolated.sh" "$SOURCE_ROOT/scripts/scenarios/harness-eval-real-qwen.sh")"
 assert_equal source-files-unchanged "$SOURCE_HASH_BEFORE" "$SOURCE_HASH_AFTER"

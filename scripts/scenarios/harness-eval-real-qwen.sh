@@ -793,17 +793,27 @@ yaml_model_field() {
   local file="$1"
   local model="$2"
   local field="$3"
-  awk -v target="$model" -v key="$field" '
+  local raw="${4:-0}"
+  awk -v target="$model" -v key="$field" -v raw="$raw" '
     function scalar(line, pos, value) {
       pos = index(line, ":")
       value = substr(line, pos + 1)
       sub(/^[[:space:]]+/, "", value)
       sub(/[[:space:]]+#.*$/, "", value)
+      if (raw) return value == "" ? "null" : value
       sub(/^\047/, "", value); sub(/\047$/, "", value)
       sub(/^\"/, "", value); sub(/\"$/, "", value)
       return value
     }
-    $0 ~ "^[[:space:]]*" target ":[[:space:]]*$" { matched = 1; next }
+    /^  [^[:space:]]/ {
+      if (matched) exit
+      name = $0
+      sub(/^  /, "", name); sub(/:[[:space:]]*$/, "", name)
+      sub(/^\047/, "", name); sub(/\047$/, "", name)
+      sub(/^\"/, "", name); sub(/\"$/, "", name)
+      matched = name == target
+      next
+    }
     matched && $0 ~ "^[[:space:]]{2}[^[:space:]]" { exit }
     matched && $0 ~ "^[[:space:]]{4}" key ":[[:space:]]*" { print scalar($0); exit }
   ' "$file"
@@ -844,6 +854,9 @@ resolve_installed_route() {
     exit 2
   }
   PROVIDER_ID="$(yaml_model_field "$SOURCE_MODELS_FILE" "$MODEL" provider)"
+  # Preserve the declared YAML type. Missing remains unknown; malformed/invalid
+  # declarations still reach the original ConfigLoader validation unchanged.
+  MODEL_CONTEXT_WINDOW="$(yaml_model_field "$SOURCE_MODELS_FILE" "$MODEL" context_window 1)"
   [[ -n "$PROVIDER_ID" ]] || {
     echo "model ${MODEL} has no provider mapping in ${SOURCE_MODELS_FILE}" >&2
     exit 2
@@ -875,37 +888,22 @@ fi
   esac
 }
 
-resolve_installed_route
-[[ -d "$WORKSPACE" ]] || {
-  echo "evaluation workspace does not exist: $WORKSPACE" >&2
-  exit 2
-}
-WORKSPACE="$(cd "$WORKSPACE" && pwd -P)"
-command -v curl >/dev/null || { echo 'curl is required.' >&2; exit 2; }
-command -v ss >/dev/null || { echo 'ss is required.' >&2; exit 2; }
-command -v jq >/dev/null || { echo 'jq is required.' >&2; exit 2; }
-# Source annotations are optional caller metadata. Never invoke Git or invent
-# a clean/source identity from an executable or from a directory name.
-CANDIDATE_STATE="${COWD_EVAL_TARGET_REPO_DIRTY_STATE:-unknown}"
-CANDIDATE_SHA="${COWD_EVAL_CANDIDATE_SHA:-unknown}"
-CANDIDATE_SOURCE_SHA256="${COWD_EVAL_CANDIDATE_SOURCE_SHA256:-}"
-ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
-SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
-prepare_binaries
-verify_binary_bindings
-printf 'Gateway binary sha256: %s\nHarness binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" >&2
-EVIDENCE_KEY="$(printf '%s\n' "deep-real-v6" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" | sha256sum | awk '{print $1}')"
-# Historical reports remain evidence. Their presence neither substitutes for
-# this execution nor prevents a new run requested by its owner.
-if ss -ltn | rg -q ":${PORT}\\b"; then
-  echo "isolated Gateway port $PORT is already in use" >&2
-  exit 2
-fi
-cd "$ROOT"
-
+write_isolated_config() {
 mkdir -p "$CONFIG_HOME"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "$MODEL"
+EOF
+if [[ -n "$MODEL_CONTEXT_WINDOW" ]]; then
+  # Keep non-integer declarations invalid. The generic YAML loader narrows
+  # floating numbers to integers; a quoted invalid scalar must never gain a window.
+  local capacity_value="$MODEL_CONTEXT_WINDOW"
+  if [[ ! "$capacity_value" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    capacity_value="$(jq -cn --arg value "$capacity_value" '$value')"
+  fi
+  printf 'model_context_windows:\n  %s: %s\n' \
+    "$(jq -cn --arg model "$MODEL" '$model')" "$capacity_value" >>"$CONFIG_HOME/config.yaml"
+fi
+cat >>"$CONFIG_HOME/config.yaml" <<EOF
 providers:
   "$PROVIDER_ID":
     base_url: "$PROVIDER_BASE_URL"
@@ -964,6 +962,38 @@ gateway:
         enabled: true
         token: "$TOKEN"
 EOF
+
+}
+
+resolve_installed_route
+[[ -d "$WORKSPACE" ]] || {
+  echo "evaluation workspace does not exist: $WORKSPACE" >&2
+  exit 2
+}
+WORKSPACE="$(cd "$WORKSPACE" && pwd -P)"
+command -v curl >/dev/null || { echo 'curl is required.' >&2; exit 2; }
+command -v ss >/dev/null || { echo 'ss is required.' >&2; exit 2; }
+command -v jq >/dev/null || { echo 'jq is required.' >&2; exit 2; }
+# Source annotations are optional caller metadata. Never invoke Git or invent
+# a clean/source identity from an executable or from a directory name.
+CANDIDATE_STATE="${COWD_EVAL_TARGET_REPO_DIRTY_STATE:-unknown}"
+CANDIDATE_SHA="${COWD_EVAL_CANDIDATE_SHA:-unknown}"
+CANDIDATE_SOURCE_SHA256="${COWD_EVAL_CANDIDATE_SOURCE_SHA256:-}"
+ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
+SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
+prepare_binaries
+verify_binary_bindings
+printf 'Gateway binary sha256: %s\nHarness binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" >&2
+EVIDENCE_KEY="$(printf '%s\n' "deep-real-v6" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" | sha256sum | awk '{print $1}')"
+# Historical reports remain evidence. Their presence neither substitutes for
+# this execution nor prevents a new run requested by its owner.
+if ss -ltn | rg -q ":${PORT}\\b"; then
+  echo "isolated Gateway port $PORT is already in use" >&2
+  exit 2
+fi
+cd "$ROOT"
+
+write_isolated_config
 
 if env COWD_CONFIG_HOME="$CONFIG_HOME" "$BIN" storage upgrade >/dev/null 2>&1; then
   :
