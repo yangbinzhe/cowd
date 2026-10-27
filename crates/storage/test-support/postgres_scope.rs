@@ -1,5 +1,9 @@
 //! Shared test-only namespace owner. Include with #[path] from PG fixtures.
 //! No production connection behavior or process-wide search path is changed.
+//! Drop is not a process cleanup owner: panic/abort can leave this namespace.
+//! PG tests must run inside scripts/test/pg-owned-run.py, whose bounded finally
+//! samples and stops its exclusive PG; failed/unaccepted volumes remain until
+//! the original owner supplies a matching acceptance or resolved-issue receipt.
 use std::sync::atomic::{AtomicU64, Ordering};
 use storage::{PostgresConnectionConfig, PostgresExecutor, StaticSecretRefResolver};
 

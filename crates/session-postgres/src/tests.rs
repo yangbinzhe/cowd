@@ -2940,3 +2940,18 @@ fn postgres_fixture_namespaces_are_disjoint_and_drop_only_their_own_data() {
         "dropping another fixture must preserve this fixture's data"
     );
 }
+
+/// Negative child for scripts/test/pg-owned-run.py. Its failure is intentional:
+/// the outer owner must stop PG and retain it until the issue is resolved.
+#[test]
+#[ignore = "dedicated owned PG cleanup negative probe; child must exit101 and outer cleanup must pass"]
+fn postgres_fixture_panic_is_reclaimed_by_outer_owned_run() {
+    let fixture = PostgresTestScope::new();
+    let executor = fixture.reconnect();
+    executor.checkout_critical().unwrap().batch_execute(
+        "CREATE TABLE cleanup_probe(id BIGINT PRIMARY KEY, payload TEXT); \
+         INSERT INTO cleanup_probe SELECT 1,string_agg(md5(n::text),'') FROM generate_series(1,2000) AS n; \
+         ANALYZE cleanup_probe; CREATE SCHEMA owned_empty_probe;",
+    ).unwrap();
+    panic!("owned PG cleanup probe: deliberate child panic after durable test writes");
+}

@@ -110,8 +110,9 @@ scripts/validate.sh release
 `full-regression` 让普通 Rust 测试使用 Cargo 默认并行度，完成后单独运行
 `gateway-global-env.sh`，再通过 `reference-app.sh` 构建、签名、发现并调用独立 APP。
 不得为了少量全局状态测试把整个 workspace 强制单线程。
-各 lane 默认复用仓库唯一 `target` 且关闭 incremental，不保留版本备份；需要验证干净
-构建时显式设置 `COWD_ISOLATED_TARGET=1`，退出后会删除一次性 target。
+本轮统一执行前先 `source /media/yi/Datas/workspace/.cowd-deps/env.sh`，离线复用唯一
+`next-kernel-dev-20261022` target 和共享 registry/git 源码缓存。不再启用旧的
+`COWD_ISOLATED_TARGET` 入口或复制依赖、每轮 target、历史 ELF。
 验证默认不递归统计大型 `target` 目录，构建体积专项才设置
 `COWD_MEASURE_TARGET_SIZE=1`。Gateway 架构边界是静态依赖/禁用路径门禁，不再为源码
 扫描链接完整 Gateway 测试二进制；Runtime 生命周期映射和 Memory 依赖合同集中在
@@ -129,8 +130,51 @@ scripts/validate.sh manual public-search-live
 scripts/validate.sh manual tui-production-acceptance
 ```
 
-PostgreSQL 合同要求隔离、可清空的 `COWD_TEST_POSTGRES_URL`；跨 PostgreSQL 复制还可
-提供 `COWD_TEST_POSTGRES_TARGET_URL`。统一入口覆盖 Fact、Surface、Gateway、
+本轮 PostgreSQL 测试使用外层唯一资源 owner，不提供已有数据库 URL：
+
+```bash
+python3 scripts/test/pg-owned-run.py --run-id local-contract --port 36435 \
+  --seconds 120 --report /absolute/path/to/local-contract.json -- \
+  /absolute/path/to/shared-target/test-binary exact_selector --exact --ignored --nocapture
+```
+
+该入口仅使用本机已存在的固定 PG 镜像；为一条命令创建全新容器、卷和私有临时目录，
+内部调用原 `pg-test-env.sh` 做真实 TCP 可用性验证。失败、超时、panic、可捕获信号或
+业务验收未知时，默认保留本轮独占卷、停止的容器及恢复所需的私有配置；仍停止子进程和
+PG、释放连接/端口。最多 15 秒采样；原件仅保存每个输出流最后 64KiB 和清单的加密副本，
+不是完整 wire 或数据库 dump。报告含密文 SHA 和原 owner 的私有密钥路径；关闭库时不能
+销毁密文的唯一密钥。没有到期自动删库，child exit 0 也不能代替业务验收。
+报告保留前后 DB 大小、schema/表/关系数量、top20 heap/index/TOAST 与行数估计，以及
+原子进程结果和清理结果；失败不会改写成通过。没有行数估计或持久 caller 列时记未知。
+Rust `PostgresTestScope::Drop` 仍可能在 panic 时留下本轮 schema，不能代替外层 owner；
+故意 panic 探针只供此入口验证失败生命周期，不是业务通过。SIGKILL/主机失效不能执行
+finally，必须按报告标签识别并报告未完成清理，不能宣称已回收。
+
+删除仅接受外层 owner 在 child 私有目录之外写入的 0600 `--closeout-receipt`。
+回执绑定报告的 `run_id/container/volume/owner_nonce`（nonce 取 `labels.cowd.test.owner`），
+并引用独立验收/复验原件 `evidence: {path: 绝对路径, sha256: 文件摘要}`。两种关闭条件为：
+
+- `kind: "business_acceptance"`，`business_success: true`、`acceptance_complete: true`；
+  本轮执行也必须正常退出且没有原执行错误。
+- `kind: "issue_closure"`，具名非空 `issue/root_cause/fix`，`revalidation_passed: true`；
+  表示原问题已修复且复验通过，不能只写“已知问题”或未闭环的失败说明。
+
+回执是原 owner 审查实际原件后的授权，脚本只校资源身份、完整字段和原件摘要，不是新的
+业务 grader。缺失、foreign、未闭环或原件摘要不符时拒删，原业务失败仍保持失败。
+修复复验完成后，用同一个入口关闭原保留资源，不重跑 child 或重复增长采样：
+
+```bash
+python3 scripts/test/pg-owned-run.py --close-retained \
+  --report /absolute/path/to/local-contract.json \
+  --closeout-receipt /absolute/path/to/owner-closeout.json
+```
+
+此操作复核原 Docker labels、原 PID/starttime 和卷身份；只删这份回执对应的资源。
+原失败结果与关闭记录分别保留。加密原件的私有密钥/配置仍由原 owner 保管，不能将
+端口释放、进程退出或一次成功停止容器表述成业务验收完成。
+
+`postgres-contract.sh` 作为该 owner 内部的原合同命令，仍通过生成的隔离 URL 执行。
+统一合同覆盖 Fact、Surface、Gateway、
 Memory、Matrix、Runtime、Session、Approval、Connector 存储合同；APP 私库合同由各自
 独立仓库负责，Cowd 只验证 Bundle、supervisor 与通用 transport 边界。
 每项必须真实执行且恰好有一个测试通过，禁止因环境缺失静默返回成功。这些入口不会
