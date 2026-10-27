@@ -473,6 +473,244 @@ fn task_control_phase_allows(
 }
 
 #[cfg(test)]
+mod system_parent_375_tests {
+    use super::*;
+    use harness_contract::execution_graph::{ExecutionGraphLineage, ExecutionParentBinding};
+
+    fn running_graph(
+        service: &ExecutionCommitService,
+        id: &str,
+        kind: ExecutionNodeKind,
+        parent: Option<ExecutionParentBinding>,
+    ) -> ExecutionGraph {
+        let mut graph = ExecutionGraph::new("synthetic parent-fence discriminator, no executor");
+        graph.id = id.into();
+        graph.parent_execution = parent;
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: "session:375".into(),
+            turn_id: "turn:375".into(),
+            root_task_id: "task:375".into(),
+            task_id: "task:375".into(),
+            generation: 1,
+        });
+        let mut node = ExecutionNodeSpec::new(kind, "not-executed", "synthetic-payload");
+        node.id = format!("{id}:node");
+        graph.nodes.push(node);
+        graph = service.register_graph(graph).unwrap().graph;
+        for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+            graph = service
+                .transition_node(&graph, &format!("{id}:node"), status, None, vec![])
+                .unwrap()
+                .graph;
+        }
+        graph
+    }
+
+    fn binding(graph: &ExecutionGraph) -> ExecutionParentBinding {
+        ExecutionParentBinding {
+            execution_id: graph.id.clone(),
+            node_id: graph.nodes[0].id.clone(),
+        }
+    }
+
+    fn system_request(parent: &ExecutionGraph, source: &str) -> crate::RuntimeToolExecutionRequest {
+        // Use the original SystemDerived constructor, never a ProviderStep as
+        // a stand-in for the live request. The catalog is pinned, not executed.
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("system-parent-375", workspace.path());
+        let step = crate::step_snapshot::BoundStep::bind(
+            harness_contract::step::StepIdentity {
+                step_id: "step:system:375".into(),
+                session_id: "session:375".into(),
+                turn_id: "turn:375".into(),
+                execution_id: Some(source.into()),
+                actor_ref: Some("runtime:checkpoint-guard".into()),
+                run_ref: None,
+                attempt: Some(1),
+                epoch: Some("1".into()),
+                goal_ref: None,
+                program_ref: None,
+                task_ref: None,
+                build_ref: "synthetic-375".into(),
+            },
+            host.pin_snapshot(),
+            &[],
+            &json!({}),
+            &json!({}),
+            BTreeMap::new(),
+            10,
+        )
+        .unwrap()
+        .with_parent("strategy:375");
+        crate::RuntimeToolExecutionRequest {
+            compiled_invocation: None,
+            step_binding: Some(crate::step_snapshot::StepCallBinding::system(
+                Arc::new(step),
+                "strategy:375",
+                "checkpoint:375",
+            )),
+            governed_plan_id: "plan:375".into(),
+            governed_plan_revision: 1,
+            observation_wave_sequence: 1,
+            idempotency_key: "effect:375:not-dispatched".into(),
+            tool_use_id: "checkpoint:375".into(),
+            tool_name: "checkpoint".into(),
+            input: r#"{"action":"create","paths":["proof.txt"]}"#.into(),
+            category: crate::ToolSafetyCategory::WriteLocal,
+            authorization: None,
+            session_id: Some("session:375".into()),
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 0,
+            authorized_scopes: vec![],
+            memory_context: None,
+            reality_context: None,
+            model_lease: None,
+            parent_execution: Some(binding(parent)),
+            parent_execution_attempt: Some(1),
+            execution_decision: None,
+            evaluation_isolated: true,
+            managed_invocation: None,
+            tool_progress: crate::ToolProgressSink::default(),
+        }
+    }
+
+    #[test]
+    fn r375_same_graph_run_alias_loads_but_hits_the_cross_graph_parent_fence() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let service = ExecutionCommitService::new(store.clone());
+        let root = running_graph(
+            &service,
+            "graph:375:root",
+            ExecutionNodeKind::InlineModel,
+            None,
+        );
+        let child = running_graph(
+            &service,
+            "graph:375:child",
+            ExecutionNodeKind::AgentTask,
+            Some(binding(&root)),
+        );
+        let canonical = system_request(&child, &child.id);
+        service.validate_system_tool_parent(&canonical).unwrap();
+        let alias = format!("run:{}", child.id);
+        let loaded = service.effect_authority_graphs.load(&alias).unwrap();
+        assert_eq!(loaded.id, "graph:375:child");
+        assert_eq!(loaded.revision, child.revision);
+        assert_eq!(loaded.parent_execution, Some(binding(&root)));
+        let aliased = system_request(&child, &alias);
+        assert_ne!(loaded.parent_execution, aliased.parent_execution);
+        // This records the current defect; it is not an acceptance of the
+        // aliased request or evidence about ROUND374's missing SystemStep.
+        assert!(matches!(service.validate_system_tool_parent(&aliased),
+            Err(ExecutionCommitError::InvalidCommand(reason))
+            if reason == "system_tool_parent_fence_rejected"));
+        assert_eq!(store.stream_revision(&child.id).unwrap(), child.revision);
+        assert_eq!(store.stream_revision(&root.id).unwrap(), root.revision);
+        assert_eq!(
+            store
+                .stream_event_count("execution-effect:effect:375:not-dispatched")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn r375_real_cross_graph_and_identity_refusals_have_no_effects() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let service = ExecutionCommitService::new(store.clone());
+        let parent = running_graph(
+            &service,
+            "graph:375:parent",
+            ExecutionNodeKind::ToolBatch,
+            None,
+        );
+        let source = running_graph(
+            &service,
+            "graph:375:source",
+            ExecutionNodeKind::InlineModel,
+            Some(binding(&parent)),
+        );
+        let request = system_request(&parent, &source.id);
+        service.validate_system_tool_parent(&request).unwrap();
+        let mut wrong_session = request.clone();
+        wrong_session.session_id = Some("foreign-session".into());
+        assert!(service.validate_system_tool_parent(&wrong_session).is_err());
+        let mut wrong_turn = request.clone();
+        Arc::make_mut(&mut wrong_turn.step_binding.as_mut().unwrap().snapshot)
+            .identity
+            .turn_id = "foreign-turn".into();
+        assert!(service.validate_system_tool_parent(&wrong_turn).is_err());
+        let foreign = running_graph(
+            &service,
+            "graph:375:foreign",
+            ExecutionNodeKind::InlineModel,
+            None,
+        );
+        assert!(service
+            .validate_system_tool_parent(&system_request(&parent, &foreign.id))
+            .is_err());
+        let terminal = service
+            .transition_node(
+                &source,
+                &source.nodes[0].id,
+                ExecutionNodeStatus::Completed,
+                None,
+                vec![],
+            )
+            .unwrap()
+            .graph;
+        assert!(service.validate_system_tool_parent(&request).is_err());
+        let valid_parent = system_request(&parent, &parent.id);
+        service.validate_system_tool_parent(&valid_parent).unwrap();
+        assert_eq!(store.stream_revision(&parent.id).unwrap(), parent.revision);
+        assert_eq!(
+            store.stream_revision(&source.id).unwrap(),
+            terminal.revision
+        );
+        assert_eq!(
+            store
+                .stream_event_count("execution-effect:effect:375:not-dispatched")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn r375_missing_graph_load_and_false_predicate_collapse_to_the_same_refusal() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let service = ExecutionCommitService::new(store.clone());
+        let graph = running_graph(
+            &service,
+            "graph:375:known",
+            ExecutionNodeKind::ToolBatch,
+            None,
+        );
+        let request = system_request(&graph, &graph.id);
+        service.validate_system_tool_parent(&request).unwrap();
+        let mut missing = request.clone();
+        missing.parent_execution.as_mut().unwrap().execution_id = "graph:375:missing".into();
+        assert!(matches!(
+            service.effect_authority_graphs.load("graph:375:missing"),
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. })
+        ));
+        let mut false_predicate = request;
+        false_predicate.parent_execution.as_mut().unwrap().node_id = "foreign-node".into();
+        for denied in [missing, false_predicate] {
+            assert!(matches!(service.validate_system_tool_parent(&denied),
+                Err(ExecutionCommitError::InvalidCommand(reason))
+                if reason == "system_tool_parent_fence_rejected"));
+        }
+        assert_eq!(store.stream_revision(&graph.id).unwrap(), graph.revision);
+        assert_eq!(
+            store
+                .stream_event_count("execution-effect:effect:375:not-dispatched")
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
 mod task_control_700_tests {
     use super::*;
     use harness_contract::agent::AgenticExecutionBinding;
