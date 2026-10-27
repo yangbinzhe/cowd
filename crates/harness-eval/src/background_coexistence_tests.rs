@@ -2806,7 +2806,7 @@ impl R344RoleStore {
             .append_pair("options", &options)
             .append_pair("connect_timeout", "1");
         let resolver =
-            storage::StaticSecretRefResolver::new([("r344-owned".into(), url.to_string())]);
+            storage::StaticSecretRefResolver::new([("r344-owned".into(), r348_postgres_uri(&url))]);
         let mut config = storage::PostgresConnectionConfig::new(
             "r344-role-reader",
             "r344-owned",
@@ -2860,6 +2860,59 @@ impl R344RoleStore {
         );
         Ok(graph)
     }
+}
+
+// URL's query builder uses form encoding, while PostgreSQL URI parameters
+// decode percent escapes without treating '+' as a space. Change only query
+// separators for spaces; a literal plus is already encoded as %2B.
+fn r348_postgres_uri(url: &reqwest::Url) -> String {
+    let mut url = url.clone();
+    if let Some(query) = url.query() {
+        let query = query.replace('+', "%20");
+        url.set_query(Some(&query));
+    }
+    url.into()
+}
+
+#[test]
+fn r348_role_store_options_use_postgres_uri_spaces_and_preserve_identity() {
+    let mut url = reqwest::Url::parse(
+        "postgresql://owned:p%2Bsecret@127.0.0.1:36433/owned?application_name=kept%2Bname",
+    )
+    .unwrap();
+    let options = "-c search_path=owned,public -c default_transaction_read_only=on -c statement_timeout=500 -c lock_timeout=200";
+    url.query_pairs_mut()
+        .append_pair("options", options)
+        .append_pair("connect_timeout", "1");
+    // Same serializer failure observed by the original server, not a second
+    // connection/timeout test: PostgreSQL does not decode these '+' bytes.
+    assert!(
+        url.query()
+            .unwrap()
+            .contains("+default_transaction_read_only")
+    );
+    let uri = r348_postgres_uri(&url);
+    let actual = reqwest::Url::parse(&uri).unwrap();
+    assert!(!actual.query().unwrap().contains('+'));
+    assert!(
+        actual
+            .query()
+            .unwrap()
+            .contains("%20default_transaction_read_only%3Don")
+    );
+    assert_eq!(actual.username(), "owned");
+    assert_eq!(actual.password(), Some("p%2Bsecret"));
+    assert_eq!(actual.host_str(), Some("127.0.0.1"));
+    assert_eq!(actual.port(), Some(36433));
+    assert_eq!(actual.path(), "/owned");
+    assert_eq!(
+        actual.query_pairs().collect::<Vec<_>>(),
+        vec![
+            ("application_name".into(), "kept+name".into()),
+            ("options".into(), options.into()),
+            ("connect_timeout".into(), "1".into()),
+        ]
+    );
 }
 
 fn r344_unique_packed<'a>(
