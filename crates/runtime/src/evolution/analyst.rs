@@ -100,6 +100,17 @@ pub(crate) enum EvolutionAnalysisClaim {
     Failed(String),
 }
 
+/// A bounded continuation over original claim records. References in this
+/// checkpoint are observations only; the original claim/terminal stream is
+/// reread before declaring an item settled, including after a cold reopen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EvolutionAnalysisDrainScan {
+    pub after: Option<(u64, u32)>,
+    pub complete: bool,
+    pub pending_streams: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EvolutionAnalystService {
     event_store: Arc<RuntimeEventStore>,
@@ -116,6 +127,97 @@ impl EvolutionAnalystService {
             event_store,
             discovery,
         }
+    }
+
+    pub(crate) fn scan_admitted_claims(
+        store: &RuntimeEventStore,
+        mut scan: EvolutionAnalysisDrainScan,
+    ) -> Result<EvolutionAnalysisDrainScan, String> {
+        for stream in scan.pending_streams.clone() {
+            if !Self::claim_stream_is_pending(store, &stream)? {
+                scan.pending_streams.remove(&stream);
+            }
+        }
+        if !scan.complete {
+            let claims = store
+                .list_scope_kind_page_asc(
+                    RuntimeEventScope::Evolution,
+                    ANALYSIS_CLAIMED_KIND,
+                    scan.after,
+                    32,
+                )
+                .map_err(|error| error.to_string())?;
+            for claim in &claims {
+                if claim.scope != RuntimeEventScope::Evolution
+                    || claim.kind != ANALYSIS_CLAIMED_KIND
+                {
+                    return Err("evolution drain reader returned a foreign claim".into());
+                }
+                if Self::claim_stream_is_pending(store, &claim.stream_id)? {
+                    scan.pending_streams.insert(claim.stream_id.clone());
+                }
+                if scan.pending_streams.len() > 128 {
+                    return Err(
+                        "evolution durable pending claims exceed bounded control response".into(),
+                    );
+                }
+                scan.after = Some((claim.commit_cursor, claim.transaction_index));
+            }
+            scan.complete = claims.len() < 32;
+        }
+        Ok(scan)
+    }
+
+    fn claim_stream_is_pending(store: &RuntimeEventStore, stream: &str) -> Result<bool, String> {
+        let claim = store
+            .latest_for_stream_kind(stream, ANALYSIS_CLAIMED_KIND)?
+            .ok_or("evolution drain claim reference is missing")?;
+        let analysis_id = claim
+            .payload
+            .get("analysis_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("evolution drain claim omitted identity")?;
+        if claim.scope != RuntimeEventScope::Evolution
+            || claim.stream_id != analysis_stream(analysis_id)
+            || stream != claim.stream_id
+        {
+            return Err("evolution drain claim identity mismatch".into());
+        }
+        let current = store
+            .latest_for_stream(stream)?
+            .ok_or("evolution drain stream is missing")?;
+        if current.stream_id != stream || current.scope != RuntimeEventScope::Evolution {
+            return Err("evolution drain reader returned a foreign terminal".into());
+        }
+        if current.sequence < claim.sequence {
+            return Err("evolution drain read regressed".into());
+        }
+        if current.kind == ANALYSIS_CLAIMED_KIND {
+            return Ok(true);
+        }
+        let terminal = match current.kind.as_str() {
+            ANALYSIS_DRAFTED_KIND => current
+                .payload
+                .get("draft")
+                .ok_or("evolution draft terminal omitted body")?,
+            ANALYSIS_FAILED_KIND => &current.payload,
+            _ => return Err("evolution drain stream has an unknown terminal".into()),
+        };
+        for field in ["analysis_id", "case_id", "contract_digest", "input_digest"] {
+            let expected = claim
+                .payload
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("evolution claim omitted source identity")?;
+            if terminal.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
+                return Err(format!(
+                    "evolution terminal {field} does not match its claim"
+                ));
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn prepare(&self, case_id: &str) -> Result<PreparedEvolutionAnalysis, String> {
@@ -160,23 +262,31 @@ impl EvolutionAnalystService {
         })
     }
 
-    pub(crate) fn draft_for_case(
-        &self,
+    pub(crate) fn read_draft_for_case(
+        event_store: &RuntimeEventStore,
+        discovery: &EvolutionDiscoveryService,
         case_id: &str,
     ) -> Result<Option<EvolutionAnalysisDraft>, String> {
-        let Some(case) = self.discovery.case(case_id)? else {
+        let Some(case) = discovery.case(case_id)? else {
             return Ok(None);
         };
         let analysis_id =
             stable_analysis_id(&case.key_sha256, &evolution_analysis_contract_digest());
-        self.draft(&analysis_id)
+        Self::read_draft(event_store, &analysis_id)
     }
 
     pub(crate) fn draft(
         &self,
         analysis_id: &str,
     ) -> Result<Option<EvolutionAnalysisDraft>, String> {
-        self.event_store
+        Self::read_draft(&self.event_store, analysis_id)
+    }
+
+    fn read_draft(
+        event_store: &RuntimeEventStore,
+        analysis_id: &str,
+    ) -> Result<Option<EvolutionAnalysisDraft>, String> {
+        event_store
             .list_stream(&analysis_stream(analysis_id))?
             .into_iter()
             .rev()
@@ -806,6 +916,64 @@ mod tests {
     }
 
     #[test]
+    fn drain_claim_inspection_continues_past_one_page_and_never_settles_unknown_terminal() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let analyst = EvolutionAnalystService::new(Arc::clone(&events), discovery);
+        for index in 0..35 {
+            let packet = packet();
+            let prepared = PreparedEvolutionAnalysis {
+                analysis_id: format!("drain-page-{index}"),
+                contract_digest: evolution_analysis_contract_digest(),
+                input_digest: packet.digest(),
+                evidence_refs: Vec::new(),
+                packet,
+            };
+            let EvolutionAnalysisClaim::Acquired { claim_revision } =
+                analyst.claim(&prepared, "test", "test", 1).unwrap()
+            else {
+                panic!("new claim must be acquired");
+            };
+            if index != 34 {
+                analyst
+                    .fail(&prepared, claim_revision, "original-analysis-failed", None)
+                    .unwrap();
+            }
+        }
+        let first = EvolutionAnalystService::scan_admitted_claims(
+            &events,
+            EvolutionAnalysisDrainScan::default(),
+        )
+        .unwrap();
+        assert!(
+            !first.complete && first.pending_streams.is_empty(),
+            "first page cannot prove whole drain"
+        );
+        let encoded = serde_json::to_value(&first).unwrap();
+        let reopened = serde_json::from_value(encoded).unwrap();
+        let last = EvolutionAnalystService::scan_admitted_claims(&events, reopened).unwrap();
+        assert!(last.complete);
+        assert_eq!(
+            last.pending_streams,
+            BTreeSet::from(["evolution:analysis:v1:drain-page-34".into()])
+        );
+        events
+            .append(RuntimeEventInput {
+                stream_id: "evolution:analysis:v1:drain-page-34".into(),
+                scope: RuntimeEventScope::Evolution,
+                kind: "unrecognized.analysis.terminal".into(),
+                status: None,
+                actor: Some("test".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        assert!(EvolutionAnalystService::scan_admitted_claims(&events, last)
+            .unwrap_err()
+            .contains("unknown terminal"));
+    }
+
+    #[test]
     fn durable_claim_is_single_flight_and_late_results_are_revision_fenced() {
         let events = Arc::new(RuntimeEventStore::for_test());
         let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
@@ -848,6 +1016,16 @@ mod tests {
         else {
             panic!("expired claim must be fenced by a new revision")
         };
+        let waiting = EvolutionAnalystService::scan_admitted_claims(
+            &events,
+            EvolutionAnalysisDrainScan::default(),
+        )
+        .unwrap();
+        assert!(waiting.complete);
+        assert_eq!(
+            waiting.pending_streams,
+            BTreeSet::from([analysis_stream("analysis")])
+        );
         let completion = crate::ProviderControlCompletion {
             text: serde_json::to_string(&valid_output()).unwrap(),
             model: "deepseek-v4".to_string(),
@@ -880,6 +1058,11 @@ mod tests {
             )
             .expect("current result");
         assert_eq!(draft.analysis_id, prepared.analysis_id);
+        let settled = EvolutionAnalystService::scan_admitted_claims(&events, waiting).unwrap();
+        assert!(
+            settled.complete && settled.pending_streams.is_empty(),
+            "only the original terminal settles its claim"
+        );
         assert!(matches!(
             analyst
                 .claim(&prepared, "deepseek", "deepseek-v4", 5)

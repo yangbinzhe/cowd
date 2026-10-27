@@ -221,6 +221,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn background_work(&self) -> BackgroundWorkConfig {
+        self.feature_config.background_work
+    }
+
+    #[must_use]
     pub fn hot_state(&self) -> &crate::execution_core::hot_state::HotStateConfig {
         &self.feature_config.hot_state
     }
@@ -332,6 +337,17 @@ impl RuntimeFeatureConfig {
     pub fn with_runtime_control(mut self, runtime_control: RuntimeControlConfig) -> Self {
         self.runtime_control = runtime_control;
         self
+    }
+
+    #[must_use]
+    pub fn with_background_work(mut self, background_work: BackgroundWorkConfig) -> Self {
+        self.background_work = background_work;
+        self
+    }
+
+    #[must_use]
+    pub fn background_work(&self) -> BackgroundWorkConfig {
+        self.background_work
     }
 
     #[must_use]
@@ -2697,6 +2713,95 @@ fn parse_optional_gate_auto_fix_config(root: &JsonValue) -> Result<GateAutoFixCo
         enabled,
         max_attempts,
     })
+}
+
+fn validate_background_config_source(
+    source: ConfigSource,
+    root: &BTreeMap<String, JsonValue>,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    // These are instance management settings, not workspace tool authority.
+    // Follow the existing operator-layer boundary used for executor manifests.
+    let has_background = root
+        .get("runtime")
+        .and_then(JsonValue::as_object)
+        .is_some_and(|runtime| runtime.contains_key("background"));
+    if has_background && source != ConfigSource::User {
+        return Err(ConfigError::Parse(format!(
+            "{}: runtime.background may only be loaded from the operator-owned user/deployment configuration layer",
+            path.display(),
+        )));
+    }
+    // Config `env:` is injected into this process by the existing loader.
+    // Prevent it from laundering an untrusted workspace value into a future
+    // reload's environment layer. The new switches deliberately have one
+    // persisted configuration owner rather than an ambient env override.
+    if root
+        .get("env")
+        .and_then(JsonValue::as_object)
+        .is_some_and(|env| {
+            env.keys().any(|key| {
+                let Some(rest) = key.strip_prefix(ENV_OVERRIDE_PREFIX) else {
+                    return false;
+                };
+                let mut parts = rest.split('_').filter(|part| !part.is_empty());
+                parts
+                    .next()
+                    .is_some_and(|part| part.eq_ignore_ascii_case("runtime"))
+                    && parts
+                        .next()
+                        .is_some_and(|part| part.eq_ignore_ascii_case("background"))
+            })
+        })
+    {
+        return Err(ConfigError::Parse(format!(
+            "{}: background switches cannot be injected through env; use runtime.background in operator-owned configuration",
+            path.display(),
+        )));
+    }
+    Ok(())
+}
+
+fn parse_optional_background_work_config(
+    root: &JsonValue,
+) -> Result<BackgroundWorkConfig, ConfigError> {
+    let mut config = BackgroundWorkConfig::default();
+    let Some(runtime) = root.as_object().and_then(|root| root.get("runtime")) else {
+        return Ok(config);
+    };
+    let runtime = expect_object(runtime, "merged settings.runtime")?;
+    let Some(value) = runtime.get("background") else {
+        return Ok(config);
+    };
+    let context = "merged settings.runtime.background";
+    let object = expect_object(value, context)?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "evolution" | "growth"))
+    {
+        return Err(ConfigError::Invalid {
+            key: format!("runtime.background.{key}"),
+            message: "unknown background control; expected evolution or growth".into(),
+        });
+    }
+    let enabled = |key: &str| -> Result<Option<bool>, ConfigError> {
+        object
+            .get(key)
+            .map(|value| {
+                value.as_bool().ok_or_else(|| ConfigError::Invalid {
+                    key: format!("runtime.background.{key}"),
+                    message: "expected a boolean (null is not a control value)".into(),
+                })
+            })
+            .transpose()
+    };
+    if let Some(enabled) = enabled("evolution")? {
+        config.evolution = enabled;
+    }
+    if let Some(enabled) = enabled("growth")? {
+        config.growth = enabled;
+    }
+    Ok(config)
 }
 
 fn parse_optional_runtime_control_config(

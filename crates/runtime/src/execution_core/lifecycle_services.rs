@@ -4,6 +4,219 @@ use super::*;
 use harness_contract::agent::AgentReturnPacket;
 
 impl RuntimeServices {
+    /// Current instance policy, independently of physical worker completion.
+    pub fn background_work(&self) -> crate::BackgroundWorkConfig {
+        *self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Growth composition stays in Gateway; Runtime remains the only lane owner.
+    pub fn stop_growth_background_admission(&self) {
+        let mut policy = self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        policy.growth = false;
+        self.event_reactor.stop_lane("projector:growth:v1");
+    }
+
+    pub async fn drain_growth_background_physical(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<crate::RuntimeProjectionLaneDrainReport, String> {
+        if self.background_work().growth {
+            return Err("growth admission must be stopped before drain".into());
+        }
+        self.event_reactor
+            .drain_lane("projector:growth:v1", deadline)
+            .await
+    }
+
+    /// Also used for recovery-only passes: the original checkpoint, not this
+    /// registration, decides whether any new source may be admitted.
+    pub fn register_growth_background_lane(
+        self: &Arc<Self>,
+        lane: crate::RuntimeProjectionLane,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if lane.descriptor().projection_id != "projector:growth:v1" {
+            return Err("foreign Growth projection lane".into());
+        }
+        let mut policy = self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .event_reactor
+            .lane_health("projector:growth:v1")?
+            .is_some()
+        {
+            return Err("original growth lane has not physically drained".into());
+        }
+        self.event_reactor.register_lane(lane)?;
+        policy.growth = enabled;
+        Ok(())
+    }
+
+    /// An automatic risk promotion is queued at its original canonical source,
+    /// never executed by the HTTP waiter. The policy lock orders it with stop.
+    pub fn admit_growth_risk_source(
+        &self,
+        event: harness_contract::growth::GrowthEvent,
+    ) -> Result<bool, String> {
+        let policy = self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !policy.growth {
+            return Ok(false);
+        }
+        if event.source_event_kind != "approval.risk_receipt"
+            || event.id.is_empty()
+            || event.session_id.is_empty()
+        {
+            return Err("invalid Growth risk source".into());
+        }
+        self.event_store.append(crate::RuntimeEventInput {
+            stream_id: format!("growth:risk:{}", event.id),
+            scope: crate::RuntimeEventScope::Task,
+            kind: "runtime.harness_contract.trace".into(),
+            status: Some("recorded".into()),
+            actor: Some("approval.risk_receipt".into()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"growth_event_schema_version":1,"growth_event":event}),
+        })?;
+        Ok(true)
+    }
+
+    /// Called by the configuration owner after persisting the operator's
+    /// desired state. New explicit claims and automatic passes close before
+    /// this returns; admitted work stays with its original retained owners.
+    pub fn stop_evolution_background_admission(&self) {
+        let mut policy = self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        policy.evolution = false;
+        for id in [
+            crate::evolution::projector::PROJECTOR_ID,
+            crate::evolution::collaboration_experience::PROJECTOR_ID,
+        ] {
+            self.event_reactor.stop_lane(id);
+        }
+    }
+
+    /// Physical drain only. The configuration consumer must also reconcile
+    /// durable analysis claims/cursor state before reporting effective off;
+    /// a joined worker or an Applied record is not business settlement.
+    pub async fn drain_evolution_background_physical(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<crate::RuntimeProjectionLaneDrainReport>, String> {
+        if self.background_work().evolution {
+            return Err("evolution admission must be stopped before physical drain".into());
+        }
+        let reports = futures::future::join_all([
+            self.event_reactor
+                .drain_lane(crate::evolution::projector::PROJECTOR_ID, deadline),
+            self.event_reactor.drain_lane(
+                crate::evolution::collaboration_experience::PROJECTOR_ID,
+                deadline,
+            ),
+        ])
+        .await;
+        let maintenance = self
+            .maintenance_supervisor
+            .drain_owner_prefix("evolution:", deadline)
+            .await;
+        let reports = reports.into_iter().collect::<Result<Vec<_>, _>>()?;
+        maintenance?;
+        let policy = self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if policy.evolution {
+            return Err("evolution physical drain superseded by newer enabled policy".into());
+        }
+        let error = reports
+            .iter()
+            .find_map(|report| report.last_error.as_deref());
+        crate::evolution::collaboration_experience::CollaborationExperienceProjector::new(
+            Arc::clone(&self.event_store),
+            self.graph_state_store.clone(),
+            self.workspace_key.clone(),
+        )
+        .recover_admitted_page()?;
+        self.evolution_signal_projector.pause_sources(error)?;
+        self.evolution_signal_projector.reconcile_paused_claims()?;
+        Ok(reports)
+    }
+
+    pub fn evolution_background_durable_drain_status(&self) -> Result<(bool, usize), String> {
+        self.evolution_signal_projector.paused_claim_status()
+    }
+
+    /// Composition/configuration owner installs the original evaluator before
+    /// opening admission. No evaluator is constructed by a cold-off runtime.
+    pub fn install_evolution_eval_runner(&self, runner: Arc<dyn crate::EvolutionEvalRunner>) {
+        *self
+            .evolution_eval_runner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(runner);
+    }
+
+    pub fn resume_evolution_background_admission(self: &Arc<Self>) -> Result<(), String> {
+        let mut policy = self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if policy.evolution {
+            return Ok(());
+        }
+        if self
+            .maintenance_supervisor
+            .pending_for_owner_prefix("evolution:")
+            != 0
+        {
+            return Err("evolution maintenance still draining".into());
+        }
+        for id in [
+            crate::evolution::projector::PROJECTOR_ID,
+            crate::evolution::collaboration_experience::PROJECTOR_ID,
+        ] {
+            if self.event_reactor.lane_health(id)?.is_some() {
+                return Err(
+                    "evolution original lane must be physically drained before resume".into(),
+                );
+            }
+        }
+        self.evolution_signal_projector.resume_sources()?;
+        let lanes = [
+            self.evolution_signal_projector.projection_lane()?,
+            crate::evolution::collaboration_experience::CollaborationExperienceProjector::new(
+                Arc::clone(&self.event_store),
+                self.graph_state_store.clone(),
+                self.workspace_key.clone(),
+            )
+            .projection_lane()?,
+        ];
+        self.event_reactor.register_lanes(lanes)?;
+        let mut analyst = self
+            .evolution_analyst
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        analyst.get_or_insert_with(|| {
+            Arc::new(crate::evolution::analyst::EvolutionAnalystService::new(
+                Arc::clone(&self.event_store),
+                Arc::clone(&self.evolution_discovery),
+            ))
+        });
+        policy.evolution = true;
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn use_recovery_lane_notifications_for_test(
         &self,
@@ -71,25 +284,82 @@ impl RuntimeServices {
     /// typed Draft and has no Candidate, release, Skill activation, tool, or
     /// workspace write path.
     pub async fn analyze_evolution_case(
+        self: &Arc<Self>,
+        case_id: &str,
+        model: &str,
+    ) -> Result<harness_contract::evolution::EvolutionAnalysisDraft, RuntimeServicesError> {
+        if let Some(existing) = self.evolution_analysis(case_id)? {
+            return Ok(existing);
+        }
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let services = Arc::clone(self);
+        let owned_case = case_id.to_string();
+        let owned_model = model.to_string();
+        {
+            let policy = self
+                .background_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !policy.evolution {
+                return Err(RuntimeServicesError::Invariant(
+                    "evolution_background_disabled".into(),
+                ));
+            }
+            // Use the original retained maintenance owner. Dropping an HTTP
+            // response waiter must not detach an admitted Provider operation.
+            self.maintenance_supervisor
+                .try_submit(format!("evolution:analysis:{case_id}"), async move {
+                    let result = services
+                        .analyze_evolution_case_owned(&owned_case, &owned_model)
+                        .await;
+                    let _ = send.send(result);
+                })
+                .map_err(|error| {
+                    RuntimeServicesError::Invariant(format!(
+                        "evolution_analysis_maintenance_admission:{error:?}"
+                    ))
+                })?;
+        }
+        receive.await.map_err(|_| {
+            RuntimeServicesError::Invariant("evolution_analysis_worker_result_unavailable".into())
+        })?
+    }
+
+    async fn analyze_evolution_case_owned(
         &self,
         case_id: &str,
         model: &str,
     ) -> Result<harness_contract::evolution::EvolutionAnalysisDraft, RuntimeServicesError> {
-        if let Some(existing) = self
-            .evolution_analyst
-            .draft_for_case(case_id)
-            .map_err(RuntimeServicesError::Invariant)?
-        {
+        // Replaying an already-durable result is a read, not new analysis.
+        // Keep it available while off without constructing the cold analyst.
+        if let Some(existing) = self.evolution_analysis(case_id)? {
             return Ok(existing);
         }
+        let analyst = {
+            let control = self
+                .background_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !control.evolution {
+                return Err(RuntimeServicesError::Invariant(
+                    "evolution_background_disabled".into(),
+                ));
+            }
+            self.evolution_analyst
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| {
+                    RuntimeServicesError::Invariant("evolution_background_not_ready".into())
+                })?
+        };
         let model = model.trim();
         if model.is_empty() {
             return Err(RuntimeServicesError::Invariant(
                 "evolution_analysis_model_not_configured".to_string(),
             ));
         }
-        let prepared = self
-            .evolution_analyst
+        let prepared = analyst
             .prepare(case_id)
             .map_err(RuntimeServicesError::Invariant)?;
         let prompt = prepared
@@ -157,24 +427,38 @@ impl RuntimeServices {
             }
         };
         let queue_wait = lease.queue_wait();
-        let claim_revision = match self
-            .evolution_analyst
-            .claim(&prepared, &provider, model, now_ms())
-            .map_err(RuntimeServicesError::Invariant)?
-        {
-            crate::evolution::analyst::EvolutionAnalysisClaim::Acquired { claim_revision } => {
-                claim_revision
-            }
-            crate::evolution::analyst::EvolutionAnalysisClaim::Existing(draft) => return Ok(draft),
-            crate::evolution::analyst::EvolutionAnalysisClaim::InProgress => {
+        let claim_revision = {
+            // The original durable claim and stop-new policy share one
+            // synchronous fence; no Provider await occurs under this lock.
+            let control = self
+                .background_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !control.evolution {
                 return Err(RuntimeServicesError::Invariant(
-                    "evolution_analysis_in_progress".to_string(),
+                    "evolution_background_disabled".into(),
                 ));
             }
-            crate::evolution::analyst::EvolutionAnalysisClaim::Failed(reason) => {
-                return Err(RuntimeServicesError::Invariant(format!(
-                    "evolution_analysis_terminal_failure:{reason}"
-                )));
+            match analyst
+                .claim(&prepared, &provider, model, now_ms())
+                .map_err(RuntimeServicesError::Invariant)?
+            {
+                crate::evolution::analyst::EvolutionAnalysisClaim::Acquired { claim_revision } => {
+                    claim_revision
+                }
+                crate::evolution::analyst::EvolutionAnalysisClaim::Existing(draft) => {
+                    return Ok(draft)
+                }
+                crate::evolution::analyst::EvolutionAnalysisClaim::InProgress => {
+                    return Err(RuntimeServicesError::Invariant(
+                        "evolution_analysis_in_progress".to_string(),
+                    ));
+                }
+                crate::evolution::analyst::EvolutionAnalysisClaim::Failed(reason) => {
+                    return Err(RuntimeServicesError::Invariant(format!(
+                        "evolution_analysis_terminal_failure:{reason}"
+                    )));
+                }
             }
         };
         let service_started = Instant::now();
@@ -193,7 +477,7 @@ impl RuntimeServices {
                     service_time,
                     ResourceResultClass::Failed,
                 );
-                self.evolution_analyst
+                analyst
                     .fail(
                         &prepared,
                         claim_revision,
@@ -212,7 +496,7 @@ impl RuntimeServices {
                     service_time,
                     ResourceResultClass::TimedOut,
                 );
-                self.evolution_analyst
+                analyst
                     .fail(
                         &prepared,
                         claim_revision,
@@ -239,7 +523,7 @@ impl RuntimeServices {
                     > crate::evolution::analyst::ANALYSIS_TOTAL_TOKEN_BUDGET
             })
         {
-            self.evolution_analyst
+            analyst
                 .fail(
                     &prepared,
                     claim_revision,
@@ -255,13 +539,13 @@ impl RuntimeServices {
         let output = match crate::evolution::analyst::parse_model_output(&completion.text) {
             Ok(output) => output,
             Err(error) => {
-                self.evolution_analyst
+                analyst
                     .fail(&prepared, claim_revision, &error, Some(raw_output_digest))
                     .map_err(RuntimeServicesError::Invariant)?;
                 return Err(RuntimeServicesError::Invariant(error));
             }
         };
-        match self.evolution_analyst.complete(
+        match analyst.complete(
             &prepared,
             claim_revision,
             provider,
@@ -271,7 +555,7 @@ impl RuntimeServices {
         ) {
             Ok(draft) => Ok(draft),
             Err(error) => {
-                self.evolution_analyst
+                analyst
                     .fail(&prepared, claim_revision, &error, Some(raw_output_digest))
                     .map_err(RuntimeServicesError::Invariant)?;
                 Err(RuntimeServicesError::Invariant(error))
@@ -811,9 +1095,14 @@ impl RuntimeServices {
             }
         };
         let proposal_id = intent.proposal_id;
-        let runner = self.evolution_eval_runner.as_ref().ok_or_else(|| {
-            RuntimeServicesError::Invariant("evolution_evaluator_not_configured".to_string())
-        })?;
+        let runner = self
+            .evolution_eval_runner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                RuntimeServicesError::Invariant("evolution_evaluator_not_configured".to_string())
+            })?;
         let readiness = runner.readiness(&evaluation_contract).map_err(|error| {
             RuntimeServicesError::Invariant(format!(
                 "evolution_evaluation_readiness_failed:{error}"
@@ -853,6 +1142,50 @@ impl RuntimeServices {
     /// is an explicit configuration error, never a permissive fallback or a
     /// Gateway-calculated verdict.
     pub async fn evaluate_evolution_candidate(
+        self: &Arc<Self>,
+        candidate_id: &str,
+    ) -> Result<crate::EvolutionGovernanceCandidate, RuntimeServicesError> {
+        let candidate = self
+            .evolution_governance
+            .candidate(candidate_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        if matches!(
+            candidate.lifecycle,
+            crate::EvolutionCandidateLifecycle::EvaluatedEligible
+                | crate::EvolutionCandidateLifecycle::EvaluatedIneligible
+        ) {
+            return Ok(candidate);
+        }
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let services = Arc::clone(self);
+        let owned_id = candidate_id.to_string();
+        {
+            let policy = self
+                .background_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !policy.evolution {
+                return Err(RuntimeServicesError::Invariant(
+                    "evolution_background_disabled".into(),
+                ));
+            }
+            self.maintenance_supervisor
+                .try_submit(format!("evolution:evaluation:{candidate_id}"), async move {
+                    let result = services.evaluate_evolution_candidate_owned(&owned_id).await;
+                    let _ = send.send(result);
+                })
+                .map_err(|error| {
+                    RuntimeServicesError::Invariant(format!(
+                        "evolution_evaluation_maintenance_admission:{error:?}"
+                    ))
+                })?;
+        }
+        receive.await.map_err(|_| {
+            RuntimeServicesError::Invariant("evolution_evaluation_worker_result_unavailable".into())
+        })?
+    }
+
+    async fn evaluate_evolution_candidate_owned(
         &self,
         candidate_id: &str,
     ) -> Result<crate::EvolutionGovernanceCandidate, RuntimeServicesError> {
@@ -867,10 +1200,21 @@ impl RuntimeServices {
         ) {
             return Ok(candidate);
         }
-        let _flight = EvolutionEvaluationFlight::try_acquire(
-            Arc::clone(&self.evolution_evaluation_flights),
-            candidate_id,
-        )?;
+        let _flight = {
+            let control = self
+                .background_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !control.evolution {
+                return Err(RuntimeServicesError::Invariant(
+                    "evolution_background_disabled".into(),
+                ));
+            }
+            EvolutionEvaluationFlight::try_acquire(
+                Arc::clone(&self.evolution_evaluation_flights),
+                candidate_id,
+            )?
+        };
         let proposal = self
             .evolution_discovery
             .proposal(&candidate.proposal_id)
@@ -891,7 +1235,12 @@ impl RuntimeServices {
                     .to_string(),
             ));
         }
-        let Some(runner) = self.evolution_eval_runner.as_ref() else {
+        let Some(runner) = self
+            .evolution_eval_runner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
             return self
                 .evolution_governance
                 .record_evaluation_blocked(candidate_id, "evolution_evaluator_not_configured")

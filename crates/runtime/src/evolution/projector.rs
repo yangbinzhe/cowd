@@ -25,6 +25,7 @@ use crate::{
 const PROJECTOR_STREAM: &str = "evolution-signal-projector";
 pub(crate) const PROJECTOR_ID: &str = "projector:evolution-case:v2";
 const LEGACY_BOOTSTRAP_ID: &str = "projector:evolution-case-bootstrap:v2";
+const POLICY_BOUNDARY_ID: &str = "projector:evolution-case-policy-boundary:v1";
 const PROJECTOR_BATCH: usize = 128;
 // Evolution is explicitly lower priority than foreground execution. Keep each
 // supervised pass small and leave a scheduling window between non-empty
@@ -55,6 +56,14 @@ const FAILURE_CATALOG_PAGE_KIND: &str = "evolution.signal.projector.failure_page
 const FAILURE_CATALOG_PAGE_SIZE: usize = 1_024;
 const AGENT_FAILURE_WINDOW_PREFIX: &str = "projector:evolution-agent-failure-window:v2:";
 const AGENT_FAILURE_WINDOW_SIZE: usize = 128;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvolutionAdmittedSourcePage {
+    source_upper_cursor: u64,
+    legacy_upper_position: Option<(u64, u32)>,
+    max_commits: usize,
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct AgentFailureWindow {
@@ -147,6 +156,319 @@ impl EvolutionSignalProjector {
         ))
     }
 
+    pub(crate) fn ensure_source_epoch(&self) -> Result<(), String> {
+        if let Some(entry) = self
+            .event_store
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .map_err(|error| error.to_string())?
+        {
+            entry
+                .payload
+                .get("paused")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or("invalid evolution source policy boundary")?;
+            if let Some(legacy) = entry.payload.get("legacy_admission_unknown") {
+                legacy
+                    .as_bool()
+                    .ok_or("invalid evolution legacy admission state")?;
+            }
+            return Ok(());
+        }
+        // Legacy cursors never recorded page admission. Do not fabricate that
+        // missing evidence when a cold-off instance first acquires controls.
+        let mut legacy = self.discovery.case_index()?.total_cases != 0;
+        for id in [
+            PROJECTOR_ID,
+            LEGACY_BOOTSTRAP_ID,
+            crate::evolution::collaboration_experience::PROJECTOR_ID,
+        ] {
+            legacy |= self
+                .event_store
+                .projection_checkpoint(id)
+                .map_err(|error| error.to_string())?
+                .is_some();
+        }
+        legacy |= !self
+            .event_store
+            .list_scope_kind_page_asc(
+                RuntimeEventScope::Evolution,
+                crate::evolution::collaboration_experience::EPISODE_KIND,
+                None,
+                1,
+            )
+            .map_err(|error| error.to_string())?
+            .is_empty();
+        match self.event_store.compare_and_put_projection_checkpoint(
+            POLICY_BOUNDARY_ID,
+            0,
+            0,
+            &serde_json::json!({"paused":false,"legacy_admission_unknown":legacy}),
+            now_ms(),
+        ) {
+            Ok(_) => Ok(()),
+            Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    // This is cursor bookkeeping in the original projection store, not a
+    // second desired-policy authority. Configuration owns desired on/off.
+    // Only the retained worker's physical drain owner may call this boundary.
+    pub(crate) fn pause_sources(&self, physical_error: Option<&str>) -> Result<(), String> {
+        self.ensure_source_epoch()?;
+        let mut previous = self
+            .event_store
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .map_err(|error| error.to_string())?;
+        let admitted = previous
+            .as_ref()
+            .and_then(|entry| entry.payload.get("pending_page"))
+            .filter(|value| !value.is_null())
+            .cloned();
+        let recovered = admitted.is_some();
+        if let Some(admitted) = admitted {
+            let plan: EvolutionAdmittedSourcePage = serde_json::from_value(admitted)
+                .map_err(|error| format!("invalid evolution admitted source page: {error}"))?;
+            self.run_once(plan.max_commits)?;
+            previous = self
+                .event_store
+                .projection_checkpoint(POLICY_BOUNDARY_ID)
+                .map_err(|error| error.to_string())?;
+            if previous
+                .as_ref()
+                .and_then(|entry| entry.payload.get("pending_page"))
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err("evolution original admitted source page remains pending".into());
+            }
+        }
+        let physical_error = if recovered { None } else { physical_error };
+        let legacy_unknown = previous
+            .as_ref()
+            .is_some_and(|entry| entry.payload["legacy_admission_unknown"] == true);
+        let physical_error = if legacy_unknown {
+            Some("legacy evolution source admission is unproven")
+        } else {
+            physical_error
+        };
+        if previous
+            .as_ref()
+            .map(|entry| {
+                entry
+                    .payload
+                    .get("paused")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or("invalid evolution pause boundary")
+            })
+            .transpose()?
+            .unwrap_or(false)
+        {
+            if physical_error.is_none() {
+                return Ok(());
+            }
+        }
+        let cut = self
+            .event_store
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
+        self.event_store
+            .put_projection_checkpoint_retrying(
+                POLICY_BOUNDARY_ID,
+                cut,
+                &serde_json::json!({"paused": true, "physical_error": physical_error}),
+                now_ms(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_paused_claims(&self) -> Result<(), String> {
+        self.repair_dead_letters(REPAIR_BATCH)?;
+        let checkpoint = self
+            .event_store
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .map_err(|error| error.to_string())?
+            .ok_or("evolution pause boundary is missing")?;
+        if checkpoint.payload["paused"].as_bool() != Some(true) {
+            return Err("evolution claim drain requires a paused source".into());
+        }
+        let scan = match checkpoint.payload.get("analysis_drain") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid evolution claim continuation: {error}"))?,
+            None => crate::evolution::analyst::EvolutionAnalysisDrainScan::default(),
+        };
+        let scan = crate::evolution::analyst::EvolutionAnalystService::scan_admitted_claims(
+            &self.event_store,
+            scan,
+        )?;
+        let after = checkpoint
+            .payload
+            .get("direct_signal_after")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                serde_json::from_value::<(u64, u32)>(value.clone())
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let (direct_after, direct_complete) =
+            self.discovery.recover_admitted_signals_page(after)?;
+        let mut payload = checkpoint.payload.clone();
+        payload["direct_signal_after"] =
+            serde_json::to_value(direct_after).map_err(|error| error.to_string())?;
+        payload["direct_signal_scan_complete"] = serde_json::json!(direct_complete);
+        payload["analysis_drain"] =
+            serde_json::to_value(scan).map_err(|error| error.to_string())?;
+        self.event_store
+            .compare_and_put_projection_checkpoint(
+                POLICY_BOUNDARY_ID,
+                checkpoint.source_cursor,
+                checkpoint.revision,
+                &payload,
+                now_ms(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn paused_claim_status(&self) -> Result<(bool, usize), String> {
+        let checkpoint = self
+            .event_store
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .map_err(|error| error.to_string())?
+            .ok_or("evolution pause boundary is missing")?;
+        if checkpoint.payload["paused"].as_bool() != Some(true) {
+            return Err("evolution pause boundary is not paused".into());
+        }
+        let scan: crate::evolution::analyst::EvolutionAnalysisDrainScan = serde_json::from_value(
+            checkpoint
+                .payload
+                .get("analysis_drain")
+                .ok_or("evolution durable claim inspection has not completed")?
+                .clone(),
+        )
+        .map_err(|error| format!("invalid evolution claim continuation: {error}"))?;
+        if let Some(error) = checkpoint
+            .payload
+            .get("physical_error")
+            .filter(|error| !error.is_null())
+        {
+            return Err(format!(
+                "evolution original pass remains unsettled: {error}"
+            ));
+        }
+        let dead_letters = usize::try_from(self.failure_index()?.unresolved_count)
+            .map_err(|_| "evolution pending count overflow")?;
+        let direct_complete = checkpoint
+            .payload
+            .get("direct_signal_scan_complete")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or("evolution admitted discovery inspection has not completed")?;
+        Ok((
+            scan.complete
+                && scan.pending_streams.is_empty()
+                && dead_letters == 0
+                && direct_complete,
+            scan.pending_streams.len().saturating_add(dead_letters),
+        ))
+    }
+
+    pub(crate) fn resume_sources(&self) -> Result<(), String> {
+        let Some(boundary) = self
+            .event_store
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        if !boundary
+            .payload
+            .get("paused")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or("invalid evolution pause boundary")?
+        {
+            return Ok(());
+        }
+        // A failed physical pass is not evidence that every admitted effect
+        // settled. Preserve that fact rather than skipping an unknown tail.
+        if boundary
+            .payload
+            .get("physical_error")
+            .is_some_and(|error| !error.is_null())
+        {
+            return Err("evolution_pause_has_unsettled_physical_pass".into());
+        }
+        if !self.paused_claim_status()?.0 {
+            return Err("evolution_pause_has_pending_analysis_claims_or_continuation".into());
+        }
+        self.repair_dead_letters(REPAIR_BATCH)?;
+        if self.failure_index()?.unresolved_count != 0 {
+            return Err("evolution_pause_has_pending_dead_letters".into());
+        }
+        // Fix the resume cut before moving any of the three original cursors.
+        // Retrying a partially applied resume reuses this cut, never extending
+        // the skipped interval to include events that arrived during recovery.
+        let cut = match boundary.payload.get("resume_cursor") {
+            Some(value) => value.as_u64().ok_or("invalid evolution resume cursor")?,
+            None => {
+                let cut = self
+                    .event_store
+                    .durable_commit_cursor()
+                    .map_err(|error| error.to_string())?;
+                let mut payload = boundary.payload.clone();
+                payload["resume_cursor"] = serde_json::json!(cut);
+                self.event_store
+                    .compare_and_put_projection_checkpoint(
+                        POLICY_BOUNDARY_ID,
+                        boundary.source_cursor,
+                        boundary.revision,
+                        &payload,
+                        now_ms(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                cut
+            }
+        };
+        for id in [
+            PROJECTOR_ID,
+            LEGACY_BOOTSTRAP_ID,
+            crate::evolution::collaboration_experience::PROJECTOR_ID,
+        ] {
+            let previous = self
+                .event_store
+                .projection_checkpoint(id)
+                .map_err(|error| error.to_string())?;
+            if previous
+                .as_ref()
+                .is_some_and(|entry| entry.source_cursor > cut)
+            {
+                return Err(format!(
+                    "evolution resume source cursor advanced concurrently: {id}"
+                ));
+            }
+            if previous.as_ref().is_some_and(|entry| {
+                entry.source_cursor == cut
+                    && entry.payload["resumed_at_cursor"].as_u64() == Some(cut)
+            }) {
+                continue;
+            }
+            self.event_store.put_projection_checkpoint_retrying(id, cut,
+                &serde_json::json!({"source_cursor": cut, "transaction_index": u32::MAX,
+                    "skipped_after_cursor": previous.as_ref().map_or(0, |entry| entry.source_cursor),
+                    "paused_at_cursor": boundary.source_cursor, "resumed_at_cursor": cut}), now_ms())
+                .map_err(|error| error.to_string())?;
+        }
+        self.event_store
+            .put_projection_checkpoint_retrying(
+                POLICY_BOUNDARY_ID,
+                cut,
+                &serde_json::json!({"paused": false, "paused_at_cursor": boundary.source_cursor,
+                "resumed_at_cursor": cut}),
+                now_ms(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn health(&self) -> Result<EvolutionProjectorHealth, String> {
         self.health_with_worker(false, 0)
@@ -216,35 +538,174 @@ impl EvolutionSignalProjector {
     }
 
     fn run_once_scoped(&self, max_commits: usize) -> Result<usize, String> {
-        self.bootstrap_legacy_signals(PROJECTOR_BATCH)?;
+        self.ensure_source_epoch()?;
+        let max_commits = max_commits.clamp(1, MAX_SCAN_EVENTS);
+        let control = self
+            .event_store
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .map_err(|error| error.to_string())?;
+        let mut fresh_page = None;
+        let pending = control
+            .as_ref()
+            .and_then(|entry| entry.payload.get("pending_page"))
+            .filter(|value| !value.is_null());
+        let admitted: EvolutionAdmittedSourcePage = if let Some(pending) = pending {
+            serde_json::from_value(pending.clone())
+                .map_err(|error| format!("invalid evolution admitted source page: {error}"))?
+        } else {
+            if control
+                .as_ref()
+                .is_some_and(|entry| entry.payload["paused"] == true)
+            {
+                return Ok(0);
+            }
+            let cursor = self.cursor()?;
+            let page = self
+                .event_store
+                .projection_scan_page(
+                    cursor,
+                    &projection_interest(),
+                    max_commits.max(1),
+                    MAX_SCAN_EVENTS,
+                    MAX_SCAN_BYTES,
+                )
+                .map_err(|error| error.to_string())?;
+            let legacy_checkpoint = self
+                .event_store
+                .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
+                .map_err(|error| error.to_string())?;
+            let legacy_after = legacy_checkpoint.as_ref().and_then(|entry| {
+                entry.payload["transaction_index"]
+                    .as_u64()
+                    .and_then(|index| u32::try_from(index).ok())
+                    .map(|index| (entry.source_cursor, index))
+            });
+            let legacy = self
+                .event_store
+                .list_scope_kind_page_asc(
+                    RuntimeEventScope::Evolution,
+                    "evolution.signal.recorded.v1",
+                    legacy_after,
+                    PROJECTOR_BATCH,
+                )
+                .map_err(|error| error.to_string())?;
+            if page.scanned_through_cursor == cursor && legacy.is_empty() {
+                self.discovery.resume_auto_cases(REPAIR_BATCH)?;
+                self.repair_dead_letters(REPAIR_BATCH)?;
+                return Ok(0);
+            }
+            let admitted = EvolutionAdmittedSourcePage {
+                source_upper_cursor: page.scanned_through_cursor,
+                legacy_upper_position: legacy
+                    .last()
+                    .map(|event| (event.commit_cursor, event.transaction_index)),
+                max_commits: max_commits.max(1),
+            };
+            fresh_page = Some(page);
+            let mut payload = control.as_ref().map_or_else(
+                || serde_json::json!({"paused":false}),
+                |entry| entry.payload.clone(),
+            );
+            payload["pending_page"] =
+                serde_json::to_value(&admitted).map_err(|error| error.to_string())?;
+            self.event_store
+                .compare_and_put_projection_checkpoint(
+                    POLICY_BOUNDARY_ID,
+                    control.as_ref().map_or(0, |entry| entry.source_cursor),
+                    control.as_ref().map_or(0, |entry| entry.revision),
+                    &payload,
+                    now_ms(),
+                )
+                .map_err(|error| error.to_string())?;
+            admitted
+        };
+        if admitted.max_commits == 0 || admitted.max_commits > MAX_SCAN_EVENTS {
+            return Err("evolution admitted source page has an invalid bound".into());
+        }
+        let cursor = self.cursor()?;
+        let head = self
+            .event_store
+            .durable_commit_cursor()
+            .map_err(|error| error.to_string())?;
+        if cursor > admitted.source_upper_cursor
+            || admitted.source_upper_cursor > head
+            || admitted
+                .legacy_upper_position
+                .is_some_and(|(cursor, _)| cursor > head)
+        {
+            return Err("evolution admitted source page has an invalid source cut".into());
+        }
+        self.bootstrap_legacy_signals_through(PROJECTOR_BATCH, admitted.legacy_upper_position)?;
         self.discovery.resume_auto_cases(REPAIR_BATCH)?;
         self.repair_dead_letters(REPAIR_BATCH)?;
-        let cursor = self.cursor()?;
-        let max_commits = max_commits.max(1);
+        let page = match fresh_page {
+            Some(page) => page,
+            None => self
+                .event_store
+                .projection_scan_page(
+                    cursor,
+                    &projection_interest(),
+                    admitted.max_commits,
+                    MAX_SCAN_EVENTS,
+                    MAX_SCAN_BYTES,
+                )
+                .map_err(|error| error.to_string())?,
+        };
         let mut processed = 0;
-        let page = self
-            .event_store
-            .projection_scan_page(
-                cursor,
-                &projection_interest(),
-                max_commits,
-                MAX_SCAN_EVENTS,
-                MAX_SCAN_BYTES,
-            )
-            .map_err(|error| error.to_string())?;
-        for batch in &page.batches {
+        for batch in page
+            .batches
+            .iter()
+            .filter(|batch| batch.commit_cursor <= admitted.source_upper_cursor)
+        {
             for event in &batch.events {
                 self.process_source(event, batch.commit_cursor)?;
             }
             processed += 1;
         }
-        if page.scanned_through_cursor > cursor {
-            self.checkpoint(page.scanned_through_cursor)?;
+        let through = page
+            .scanned_through_cursor
+            .min(admitted.source_upper_cursor);
+        if through > cursor {
+            self.checkpoint(through)?;
         }
+        if through != admitted.source_upper_cursor {
+            return Err("evolution admitted source page did not reach its original cut".into());
+        }
+        let checkpoint = self
+            .event_store
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .map_err(|error| error.to_string())?
+            .ok_or("evolution admitted source descriptor disappeared")?;
+        if checkpoint.payload.get("pending_page")
+            != Some(&serde_json::to_value(&admitted).map_err(|error| error.to_string())?)
+        {
+            return Err("evolution admitted source descriptor changed concurrently".into());
+        }
+        let mut payload = checkpoint.payload.clone();
+        payload
+            .as_object_mut()
+            .ok_or("invalid evolution source descriptor")?
+            .remove("pending_page");
+        self.event_store
+            .compare_and_put_projection_checkpoint(
+                POLICY_BOUNDARY_ID,
+                checkpoint.source_cursor,
+                checkpoint.revision,
+                &payload,
+                now_ms(),
+            )
+            .map_err(|error| error.to_string())?;
         Ok(processed)
     }
 
-    fn bootstrap_legacy_signals(&self, limit: usize) -> Result<usize, String> {
+    fn bootstrap_legacy_signals_through(
+        &self,
+        limit: usize,
+        through: Option<(u64, u32)>,
+    ) -> Result<usize, String> {
+        let Some(through) = through else {
+            return Ok(0);
+        };
         let checkpoint = self
             .event_store
             .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
@@ -266,6 +727,10 @@ impl EvolutionSignalProjector {
                 limit.clamp(1, PROJECTOR_BATCH),
             )
             .map_err(|error| error.to_string())?;
+        let events = events
+            .into_iter()
+            .filter(|event| (event.commit_cursor, event.transaction_index) <= through)
+            .collect::<Vec<_>>();
         let Some(last) = events.last() else {
             return Ok(0);
         };
@@ -1345,6 +1810,100 @@ mod tests {
     use crate::runtime_event_store::*;
     use std::sync::Mutex;
 
+    #[test]
+    fn policy_resume_refuses_unknown_physical_exit_and_malformed_pause_boundary() {
+        for malformed in [false, true] {
+            let store = Arc::new(RuntimeEventStore::for_test());
+            let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&store)));
+            let projector = EvolutionSignalProjector::new(Arc::clone(&store), discovery);
+            if malformed {
+                store
+                    .put_projection_checkpoint(
+                        POLICY_BOUNDARY_ID,
+                        0,
+                        &serde_json::json!({"paused":"true"}),
+                        1,
+                    )
+                    .unwrap();
+            } else {
+                projector
+                    .pause_sources(Some("original pass failed without proven settlement"))
+                    .unwrap();
+            }
+            assert!(projector.resume_sources().is_err());
+            assert!(store.projection_checkpoint(PROJECTOR_ID).unwrap().is_none());
+            assert!(store
+                .projection_checkpoint(LEGACY_BOOTSTRAP_ID)
+                .unwrap()
+                .is_none());
+            assert!(store
+                .projection_checkpoint(crate::evolution::collaboration_experience::PROJECTOR_ID)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn interrupted_policy_resume_keeps_drain_evidence_and_the_original_resume_cut() {
+        let backend = Arc::new(ObservationWorkerBackend {
+            inner: EphemeralRuntimeEventStore::new(),
+            faults: Mutex::new(ObservationWorkerFaults::default()),
+        });
+        let events = Arc::new(RuntimeEventStore::from_backend(backend.clone()));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let projector = EvolutionSignalProjector::new(Arc::clone(&events), discovery);
+        projector.pause_sources(None).unwrap();
+        projector.reconcile_paused_claims().unwrap();
+        assert_eq!(projector.paused_claim_status().unwrap(), (true, 0));
+        backend.faults.lock().unwrap().fail_checkpoint = true;
+        assert!(projector
+            .resume_sources()
+            .unwrap_err()
+            .contains("checkpoint write interrupted"));
+        let interrupted = events
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .unwrap()
+            .unwrap();
+        let cut = interrupted.payload["resume_cursor"].as_u64().unwrap();
+        assert_eq!(interrupted.payload["direct_signal_scan_complete"], true);
+        assert_eq!(projector.paused_claim_status().unwrap(), (true, 0));
+        events
+            .append(RuntimeEventInput {
+                stream_id: "foreground:during-policy-resume".into(),
+                scope: RuntimeEventScope::Task,
+                kind: "fixture.foreground.accepted".into(),
+                status: None,
+                actor: Some("fixture".into()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"value":"after-frozen-resume-cut"}),
+            })
+            .unwrap();
+        assert!(events.durable_commit_cursor().unwrap() > cut);
+        // The original reader retries its interrupted cursor write; the test
+        // does not re-run a projector page or synthesize a settlement receipt.
+        projector.resume_sources().unwrap();
+        for id in [
+            PROJECTOR_ID,
+            LEGACY_BOOTSTRAP_ID,
+            crate::evolution::collaboration_experience::PROJECTOR_ID,
+        ] {
+            assert_eq!(
+                events
+                    .projection_checkpoint(id)
+                    .unwrap()
+                    .unwrap()
+                    .source_cursor,
+                cut
+            );
+        }
+        let resumed = events
+            .projection_checkpoint(POLICY_BOUNDARY_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.payload["paused"], false);
+        assert_eq!(resumed.payload["resumed_at_cursor"], cut);
+    }
+
     #[derive(Debug, Default)]
     struct ObservationWorkerFaults {
         replacement: Option<DurableRuntimeEvent>,
@@ -1362,6 +1921,17 @@ mod tests {
     }
 
     impl ObservationWorkerBackend {
+        fn check_checkpoint_write(&self, projection_id: &str) -> RuntimeEventStoreResult<()> {
+            if projection_id == PROJECTOR_ID
+                && std::mem::take(&mut self.faults.lock().unwrap().fail_checkpoint)
+            {
+                return Err(crate::RuntimeEventStoreError::Corrupt(
+                    "checkpoint write interrupted".into(),
+                ));
+            }
+            Ok(())
+        }
+
         fn replace(&self, event: &mut DurableRuntimeEvent) {
             if let Some(replacement) = self.faults.lock().unwrap().replacement.as_ref() {
                 if replacement.event_id == event.event_id {
@@ -1479,16 +2049,28 @@ mod tests {
             payload: &serde_json::Value,
             updated_at_ms: u64,
         ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
-            if projection_id == PROJECTOR_ID
-                && std::mem::take(&mut self.faults.lock().unwrap().fail_checkpoint)
-            {
-                return Err(crate::RuntimeEventStoreError::Corrupt(
-                    "checkpoint write interrupted".into(),
-                ));
-            }
+            self.check_checkpoint_write(projection_id)?;
             self.inner.put_projection_checkpoint(
                 projection_id,
                 source_cursor,
+                payload,
+                updated_at_ms,
+            )
+        }
+
+        fn compare_and_put_projection_checkpoint(
+            &self,
+            projection_id: &str,
+            source_cursor: u64,
+            expected_revision: u64,
+            payload: &serde_json::Value,
+            updated_at_ms: u64,
+        ) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint> {
+            self.check_checkpoint_write(projection_id)?;
+            self.inner.compare_and_put_projection_checkpoint(
+                projection_id,
+                source_cursor,
+                expected_revision,
                 payload,
                 updated_at_ms,
             )
@@ -1505,7 +2087,6 @@ mod tests {
             fn append_transaction_with_verified_decision_lease(&self, request: AppendTransactionRequest, lease: &crate::VerifiedDecisionLease) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
             fn projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<Option<RuntimeProjectionCheckpoint>>;
             fn projection_checkpoints_with_prefix(&self, prefix: &str) -> RuntimeEventStoreResult<Vec<RuntimeProjectionCheckpoint>>;
-            fn compare_and_put_projection_checkpoint(&self, projection_id: &str, source_cursor: u64, expected_revision: u64, payload: &serde_json::Value, updated_at_ms: u64) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint>;
             fn compare_and_repair_projection_checkpoint(&self, projection_id: &str, source_cursor: u64, expected_revision: u64, payload: &serde_json::Value, updated_at_ms: u64) -> RuntimeEventStoreResult<RuntimeProjectionCheckpoint>;
             fn delete_projection_checkpoint(&self, projection_id: &str) -> RuntimeEventStoreResult<bool>;
             fn event_by_idempotency_key(&self, stream_id: &str, idempotency_key: &str) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>>;

@@ -35,6 +35,8 @@ impl SlashCommand {
             Self::Resume { .. } => "/resume",
             Self::Model { .. } => "/model",
             Self::Permissions { .. } => "/permissions",
+            Self::Evolution { .. } => "/evolution",
+            Self::Growth { .. } => "/growth",
             Self::Session { .. } => "/session",
             Self::Plugins { .. } => "/plugins",
             Self::Login => "/login",
@@ -157,6 +159,24 @@ pub fn validate_slash_command_input(
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
+        "evolution" | "growth" => {
+            let mode = optional_single_arg(command, &args, "[on|off|status]")?;
+            if mode
+                .as_deref()
+                .is_some_and(|mode| !matches!(mode, "on" | "off" | "status"))
+            {
+                return Err(command_error(
+                    "Expected on|off|status",
+                    command,
+                    "[on|off|status]",
+                ));
+            }
+            if command == "growth" {
+                SlashCommand::Growth { mode }
+            } else {
+                SlashCommand::Evolution { mode }
+            }
+        }
         "clear" => SlashCommand::Clear {
             confirm: parse_clear_args(&args)?,
         },

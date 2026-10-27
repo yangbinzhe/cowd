@@ -312,6 +312,7 @@ fn private_config(port: u16, identity: &str, model: &str, apps_dir: &Path) -> se
     // Config parsing flattens platform extras: host/port belong on the row.
     serde_json::json!({
         "model": model,
+        "runtime": {"background": {"evolution": false, "growth": false}},
         "storage": {"backend": "postgres", "postgres": {
             "logicalIdentity": identity,
             "secretRef": "env:COWD_TEST_POSTGRES_URL"
@@ -375,35 +376,62 @@ impl ServerProcess {
         expected_image: PathBuf,
     ) -> Result<Self> {
         let root = OwnedRoot::create()?;
+        Self::start_epoch(
+            postgres_url,
+            model,
+            cowd_bin,
+            expected_image,
+            root,
+            None,
+            None,
+        )
+    }
+
+    // A retained epoch preserves the complete operator file, logical database
+    // identity, workspace and HOME. It is reachable only after original F2 close.
+    fn start_epoch(
+        postgres_url: String,
+        model: String,
+        cowd_bin: PathBuf,
+        expected_image: PathBuf,
+        root: OwnedRoot,
+        retained_port: Option<u16>,
+        initial_operator_token: Option<&str>,
+    ) -> Result<Self> {
         let retained_path = root.path.clone();
         let result = (|| {
+            let nonce = {
+                let mut bytes = [0u8; 32];
+                File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            };
             let mut srv = Self {
                 proc: None,
                 base_url: String::new(),
                 config_home: root.path.join("config"),
                 home_dir: root.path.join("home"),
                 workspace: root.path.join("workspace"),
-                runtime_dir: root.path.join("run"),
+                runtime_dir: root.path.join(format!("run-{nonce}")),
                 cowd_bin,
                 postgres_url,
                 root: Some(root),
-                nonce: {
-                    let mut bytes = [0u8; 32];
-                    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-                    bytes.iter().map(|b| format!("{b:02x}")).collect()
-                },
+                nonce,
                 launch: None,
                 runtime_handle: None,
                 closed: false,
             };
-            for path in [
-                &srv.config_home,
-                &srv.home_dir,
-                &srv.workspace,
-                &srv.runtime_dir,
-            ] {
-                std::fs::create_dir(path)?;
+            for path in [&srv.config_home, &srv.home_dir, &srv.workspace] {
+                if retained_port.is_some() {
+                    if !path.is_dir() {
+                        return Err(anyhow!(
+                            "Retained epoch is missing an original owned directory"
+                        ));
+                    }
+                } else {
+                    std::fs::create_dir(path)?;
+                }
             }
+            std::fs::create_dir(&srv.runtime_dir)?;
             std::fs::set_permissions(&srv.runtime_dir, std::fs::Permissions::from_mode(0o700))?;
             srv.runtime_handle = match private_directory(&srv.runtime_dir) {
                 Ok(directory) => Some(directory),
@@ -424,9 +452,21 @@ impl ServerProcess {
                 srv.root.as_ref().unwrap().path.join("runtime-location.txt"),
                 srv.runtime_dir.as_os_str().as_encoded_bytes(),
             )?;
+            std::fs::write(
+                srv.root
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .join(format!("runtime-location-{}.txt", srv.nonce)),
+                srv.runtime_dir.as_os_str().as_encoded_bytes(),
+            )?;
             let apps_dir = srv.workspace.join("apps");
-            std::fs::create_dir(&apps_dir)?;
-            let reservation = TcpListener::bind(("127.0.0.1", 0))?;
+            if retained_port.is_none() {
+                std::fs::create_dir(&apps_dir)?;
+            } else if !apps_dir.is_dir() {
+                return Err(anyhow!("Retained epoch lost its original APP directory"));
+            }
+            let reservation = TcpListener::bind(("127.0.0.1", retained_port.unwrap_or(0)))?;
             let port = reservation.local_addr()?.port();
             srv.base_url = format!("http://127.0.0.1:{port}");
             let identity = srv
@@ -437,10 +477,37 @@ impl ServerProcess {
                 .file_name()
                 .unwrap()
                 .to_string_lossy();
-            std::fs::write(
-                srv.config_home.join("config.yaml"),
-                serde_json::to_vec_pretty(&private_config(port, &identity, &model, &apps_dir))?,
-            )?;
+            if retained_port.is_none() {
+                let mut config = private_config(port, &identity, &model, &apps_dir);
+                if let Some(token) = initial_operator_token {
+                    config["gateway"]["platforms"][0]["auth_token"] = token.into();
+                    // Same inert, declared completions shape as the original
+                    // Gateway test_provider_registry; initialization is real,
+                    // no account/environment inference or live model service.
+                    config["providers"]["r5-no-provider"] = serde_json::json!({
+                        "baseUrl":"http://127.0.0.1:9/v1", "apiKey":"r5-synthetic-only",
+                        "models":[model], "protocol":"completions"
+                    });
+                }
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(srv.config_home.join("config.yaml"))?;
+                if initial_operator_token.is_some()
+                    && file.metadata()?.permissions().mode() & 0o777 != 0o600
+                {
+                    return Err(anyhow!(
+                        "Synthetic operator configuration must actually be private0600"
+                    ));
+                }
+                file.write_all(&serde_json::to_vec_pretty(&config)?)?;
+            } else if !srv.config_home.join("config.yaml").is_file() {
+                return Err(anyhow!(
+                    "Retained epoch lost its persisted operator configuration"
+                ));
+            }
             let log_file = |name: &str| -> Result<File> {
                 let file = std::fs::OpenOptions::new()
                     .write(true)
@@ -456,20 +523,67 @@ impl ServerProcess {
             let stdout = log_file("gateway.stdout")?;
             let stderr = log_file("gateway.stderr")?;
             let expected_image_sha256 = hash_image(&expected_image)?;
-            let mut command = Command::new(&srv.cowd_bin);
-            command
-                .args(["gateway", "run"])
-                .env_clear()
-                .env("PATH", CHILD_PATH)
-                .env("HOME", &srv.home_dir)
-                .env("COWD_CONFIG_HOME", &srv.config_home)
-                .env("XDG_RUNTIME_DIR", &srv.runtime_dir)
-                .env("COWD_TEST_SHUTDOWN_RECEIPT_NONCE", &srv.nonce)
-                .env("COWD_TEST_POSTGRES_URL", &srv.postgres_url)
-                .current_dir(&srv.workspace)
-                .stdin(Stdio::null())
-                .stdout(stdout)
-                .stderr(stderr);
+            let owned_command = |args: &[&str]| {
+                let mut command = Command::new(&srv.cowd_bin);
+                command
+                    .args(args)
+                    .env_clear()
+                    .env("PATH", CHILD_PATH)
+                    .env("HOME", &srv.home_dir)
+                    .env("COWD_CONFIG_HOME", &srv.config_home)
+                    .env("XDG_RUNTIME_DIR", &srv.runtime_dir)
+                    .env("COWD_TEST_SHUTDOWN_RECEIPT_NONCE", &srv.nonce)
+                    .env("COWD_TEST_POSTGRES_URL", &srv.postgres_url)
+                    .current_dir(&srv.workspace)
+                    .stdin(Stdio::null());
+                command
+            };
+            if initial_operator_token.is_some() {
+                // Only the explicitly owned real-process specialty fixture
+                // bootstraps its new isolated database, before Gateway starts.
+                // Runtime readiness must still verify the original catalogs.
+                let mut maintenance = owned_command(&["storage", "upgrade"])
+                    .stdout(log_file("storage-upgrade.stdout")?)
+                    .stderr(log_file("storage-upgrade.stderr")?)
+                    .spawn()?;
+                let identity = serde_json::json!({"pid":maintenance.id(),
+                    "starttime":process_starttime(maintenance.id())?,
+                    "image_sha256":expected_image_sha256,"operation":"storage upgrade"});
+                use std::io::Write;
+                log_file("storage-upgrade.identity.json")?
+                    .write_all(&serde_json::to_vec(&identity)?)?;
+                let status = wait_bounded(&mut maintenance, Duration::from_secs(30))?;
+                if status.is_none() {
+                    let _ = maintenance.kill();
+                    let reaped = wait_bounded(&mut maintenance, Duration::from_secs(5))?.is_some();
+                    return Err(anyhow!(
+                        "Owned storage preparation timed out; reaped={reaped}"
+                    ));
+                }
+                if !status.unwrap().success() {
+                    return Err(anyhow!(
+                        "Original storage upgrade failed; preserve private startup logs"
+                    ));
+                }
+                let mut bytes = Vec::new();
+                File::open(srv.runtime_dir.join("storage-upgrade.stdout"))?
+                    .take(64 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > 64 * 1024 {
+                    return Err(anyhow!("Storage preparation report exceeded bound"));
+                }
+                let report: serde_json::Value = serde_json::from_slice(&bytes)?;
+                if report["operation"] != "postgres_schema_upgrade"
+                    || report["status"] != "completed"
+                    || report["gateway_stopped"] != true
+                {
+                    return Err(anyhow!(
+                        "Original storage preparation did not confirm its exact operation"
+                    ));
+                }
+            }
+            let mut command = owned_command(&["gateway", "run"]);
+            command.stdout(stdout).stderr(stderr);
             // No inherited listener support exists in this CLI. Release immediately
             // before spawn; a collision must fail child/health identity admission.
             drop(reservation);
@@ -553,6 +667,36 @@ impl ServerProcess {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Restart this owned test instance, never a user's daemon. A failed or
+    /// unconfirmed original shutdown cannot transfer the root to a new epoch.
+    pub fn restart(&mut self) -> Result<()> {
+        self.restart_with_image(self.cowd_bin.clone())
+    }
+
+    fn restart_with_image(&mut self, expected_image: PathBuf) -> Result<()> {
+        self.close()?;
+        let port = self
+            .base_url
+            .strip_prefix("http://127.0.0.1:")
+            .ok_or_else(|| anyhow!("Owned restart address is not loopback"))?
+            .parse::<u16>()?;
+        let root = self
+            .root
+            .take()
+            .ok_or_else(|| anyhow!("Owned root was already transferred"))?;
+        let next = Self::start_epoch(
+            self.postgres_url.clone(),
+            String::new(),
+            self.cowd_bin.clone(),
+            expected_image,
+            root,
+            Some(port),
+            None,
+        )?;
+        *self = next;
+        Ok(())
     }
 
     pub fn configure_tui(&self, config: &mut crate::tui::TuiLaunchConfig) {
@@ -934,7 +1078,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 signal.alarm(25)
 def shutdown(signum, frame):
-    if mode != "missing-receipt":
+    if mode not in ("missing-receipt", "restart-missing-receipt"):
         envelope = {"schema_version": 1, "identity": {"nonce": nonce, "pid": pid,
             "starttime": starttime, "image_sha256": image, "config_sha256": "sha256:" + "0" * 64},
             "report": {"phases": ["local-double-drained"], "failures": [], "execution_started": False,
@@ -1040,6 +1184,23 @@ server.serve_forever()
                 // A later successful direct reap cannot erase the earlier failure.
                 let mut failed_root = server.root.take().unwrap();
                 assert!(failed_root.remove_after_confirmed_completion().is_err());
+            } else if mode == "restart-missing-receipt" {
+                let first = server.launch.clone().unwrap();
+                assert!(server
+                    .restart_with_image("/usr/bin/python3".into())
+                    .is_err());
+                assert!(
+                    server.root.is_some(),
+                    "failed original closure cannot transfer the root"
+                );
+                assert_eq!(server.launch.as_ref().unwrap().pid, first.pid);
+                assert_eq!(server.nonce, first.nonce);
+                let unchanged: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&trace).unwrap()).unwrap();
+                assert_eq!(
+                    unchanged["pid"], first.pid,
+                    "no second launch on missing receipt"
+                );
             } else if matches!(
                 mode,
                 "missing-receipt"
@@ -1058,6 +1219,45 @@ server.serve_forever()
                     "failed closure cannot turn into default success"
                 );
             } else {
+                if mode == "restart" {
+                    let first = server.launch.clone().unwrap();
+                    let original_config =
+                        std::fs::read(server.config_home.join("config.yaml")).unwrap();
+                    let original_workspace = server.workspace.clone();
+                    std::fs::write(
+                        original_workspace.join("retained-business.txt"),
+                        b"independent-original",
+                    )
+                    .unwrap();
+                    server
+                        .restart_with_image("/usr/bin/python3".into())
+                        .unwrap();
+                    let second = server.launch.as_ref().unwrap();
+                    assert_ne!(first.pid, second.pid);
+                    assert_ne!(first.nonce, second.nonce);
+                    let second_pid = second.pid;
+                    assert!(!Path::new(&format!("/proc/{}", first.pid)).exists());
+                    assert_eq!(server.root.as_ref().unwrap().path, root);
+                    assert_eq!(server.workspace, original_workspace);
+                    assert_eq!(
+                        std::fs::read(server.config_home.join("config.yaml")).unwrap(),
+                        original_config
+                    );
+                    assert_eq!(
+                        std::fs::read(original_workspace.join("retained-business.txt")).unwrap(),
+                        b"independent-original"
+                    );
+                    assert_ne!(server.runtime_dir, runtime);
+                    assert!(runtime
+                        .join(format!("shutdown-{}.v1.json", first.nonce))
+                        .is_file());
+                    let second_runtime = server.runtime_dir.clone();
+                    server.close().unwrap();
+                    assert!(!Path::new(&format!("/proc/{second_pid}")).exists());
+                    if !second_runtime.starts_with(root) {
+                        std::fs::remove_dir_all(second_runtime).unwrap();
+                    }
+                }
                 server.close().unwrap();
                 server.close().unwrap();
                 assert!(server.proc.is_none());
@@ -1084,6 +1284,7 @@ server.serve_forever()
                 | "drop-stubborn"
                 | "close-error"
                 | "missing-receipt"
+                | "restart-missing-receipt"
                 | "wrong-nonce"
                 | "wide-receipt"
                 | "symlink-receipt"
@@ -1114,6 +1315,259 @@ server.serve_forever()
     fn owned_child_healthy_and_degraded_start_close_cleanup() {
         run_child_double("healthy");
         run_child_double("degraded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_root_epoch_does_not_rewrite_config_and_preserves_original_receipt() {
+        // This proves only the consumer's two leaf-double lifecycle, not real
+        // Gateway/background recovery. The real two-PID gate below is separate.
+        run_child_double("restart");
+        run_child_double("restart-missing-receipt");
+    }
+
+    // Original public broker protocol, using a fresh synthetic credential for
+    // this owned process only. No signer, authority-file edits or fake grants.
+    fn background_broker_request(
+        server: &super::ServerProcess,
+        token: &str,
+        mut request: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(server.config_home.join("auth-broker/broker.sock"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+        request["credential"] = token.into();
+        stream.write_all(&serde_json::to_vec(&request)?)?;
+        stream.write_all(b"\n")?;
+        let mut body = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| anyhow::anyhow!("Owned broker response deadline"))?;
+            stream.set_read_timeout(Some(left))?;
+            let n = stream.read(&mut chunk)?;
+            body.extend_from_slice(&chunk[..n]);
+            anyhow::ensure!(body.len() <= 65536, "Owned broker response exceeded bound");
+            if n == 0 || body.contains(&b'\n') {
+                break;
+            }
+        }
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        anyhow::ensure!(
+            value["kind"] != "error",
+            "Original broker refused test management request"
+        );
+        Ok(value)
+    }
+
+    fn background_http_command(
+        server: &super::ServerProcess,
+        token: &str,
+        domain: &str,
+        mode: &str,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let address = server
+            .base_url
+            .strip_prefix("http://")
+            .ok_or_else(|| anyhow::anyhow!("Owned test address must be HTTP"))?;
+        let mut stream =
+            TcpStream::connect_timeout(&address.parse()?, std::time::Duration::from_secs(2))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let body = serde_json::to_vec(&serde_json::json!({"command":domain,"args":{"mode":mode}}))?;
+        let header = format!("POST /api/slash/dispatch HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer {token}\r\nx-cowd-surface-id: legacy_gateway\r\nx-cowd-requested-capabilities: runtime.maintenance.manage\r\nContent-Length: {}\r\n\r\n", body.len());
+        stream.write_all(header.as_bytes())?;
+        stream.write_all(&body)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut response = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| anyhow::anyhow!("Owned HTTP response deadline"))?;
+            stream.set_read_timeout(Some(left))?;
+            let n = stream.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&buffer[..n]);
+            anyhow::ensure!(
+                response.len() <= 128 * 1024,
+                "Owned HTTP response exceeded bound"
+            );
+        }
+        let cut = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| anyhow::anyhow!("Owned HTTP response lacks headers"))?;
+        let headers = std::str::from_utf8(&response[..cut])?;
+        anyhow::ensure!(
+            !headers.to_ascii_lowercase().contains("transfer-encoding:"),
+            "Test consumer requires bounded Content-Length JSON"
+        );
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .ok_or_else(|| anyhow::anyhow!("Missing HTTP status"))?
+            .parse()?;
+        Ok((status, serde_json::from_slice(&response[cut + 4..])?))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual real Gateway/isolated PostgreSQL gate; run explicitly --ignored --exact, never counted as passed while ignored"]
+    fn background_off_survives_two_real_gateway_epochs_in_the_same_root() -> anyhow::Result<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+        // The controller must supply a new private database and a source-bound
+        // real cowd. No model is invoked and no account configuration is read.
+        let postgres = std::env::var("COWD_TEST_POSTGRES_URL")
+            .map_err(|_| anyhow::anyhow!("NotStarted: new isolated PostgreSQL URL required"))?;
+        let image = std::path::PathBuf::from(
+            std::env::var_os("COWD_BIN")
+                .ok_or_else(|| anyhow::anyhow!("NotStarted: exact current COWD_BIN required"))?,
+        )
+        .canonicalize()?;
+        let root_path =
+            std::path::PathBuf::from(std::env::var_os("COWD_R5_OWNED_ROOT").ok_or_else(|| {
+                anyhow::anyhow!("NotStarted: pre-registered private COWD_R5_OWNED_ROOT required")
+            })?);
+        anyhow::ensure!(
+            root_path.is_absolute() && root_path.symlink_metadata()?.is_dir(),
+            "R5 root must be an absolute original directory"
+        );
+        super::private_directory(&root_path)?;
+        anyhow::ensure!(
+            std::fs::read_dir(&root_path)?.next().is_none(),
+            "R5 pre-registered root must be fresh and empty"
+        );
+        let root = super::OwnedRoot {
+            path: root_path,
+            failed: false,
+        };
+        // The broker and synthetic credential cannot live on a filesystem
+        // which merely pretends chmod succeeded. Use the pre-registered private TMPDIR.
+        super::private_directory(&root.path)?;
+        let root_path = root.path.clone();
+        let token = {
+            let mut bytes = [0u8; 32];
+            std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mut server = super::ServerProcess::start_epoch(
+            postgres,
+            "isolation-no-provider".into(),
+            image.clone(),
+            image,
+            root,
+            None,
+            Some(&token),
+        )?;
+        let (status, _) = background_http_command(&server, &token, "growth", "status")?;
+        assert_eq!(
+            status, 403,
+            "ordinary initial operator must not gain maintenance from a requested header"
+        );
+        let original = background_broker_request(
+            &server,
+            &token,
+            serde_json::json!({"kind":"get_human_entitlements"}),
+        )?;
+        assert_eq!(original["kind"], "human_entitlements");
+        let before = &original["entitlement"];
+        let preview = background_broker_request(
+            &server,
+            &token,
+            serde_json::json!({
+                "kind":"preview_human_entitlements", "core_profile_id":"core_manager", "app_profiles":before["app_profiles"]
+            }),
+        )?;
+        assert_eq!(preview["kind"], "human_entitlement_preview");
+        let elevated = background_broker_request(
+            &server,
+            &token,
+            serde_json::json!({
+                "kind":"set_human_entitlements", "core_profile_id":"core_manager", "app_profiles":before["app_profiles"],
+                "expected_credential_epoch":before["credential_epoch"], "expected_profile_revision":before["profile_revision"],
+                "confirmation_digest":preview["confirmation_digest"]
+            }),
+        )?;
+        assert_eq!(elevated["kind"], "human_entitlements");
+        let mut snapshots = Vec::new();
+        for domain in ["evolution", "growth"] {
+            let (status, initial) = background_http_command(&server, &token, domain, "status")?;
+            assert_eq!(status, 200);
+            assert_eq!(initial["data"]["effective"], "off");
+            let (status, on) = background_http_command(&server, &token, domain, "on")?;
+            assert_eq!(status, 200);
+            assert_eq!(on["data"]["effective"], "on");
+            snapshots.push(on);
+        }
+        for domain in ["evolution", "growth"] {
+            let (status, off) = background_http_command(&server, &token, domain, "off")?;
+            assert_eq!(status, 200);
+            assert_eq!(off["data"]["effective"], "off");
+            assert_eq!(off["data"]["durable_recovery"], "settled");
+            snapshots.push(off);
+        }
+        let first = server.launch.clone().unwrap();
+        let old_runtime = server.runtime_dir.clone();
+        let config_before = std::fs::read(server.config_home.join("config.yaml"))?;
+        let config_digest = super::hash_image(&server.config_home.join("config.yaml"))?;
+        let same_url = server.base_url.clone();
+        server.restart()?;
+        let second = server.launch.clone().unwrap();
+        assert_ne!(first.pid, second.pid);
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(old_runtime, server.runtime_dir);
+        assert!(!std::path::Path::new(&format!("/proc/{}", first.pid)).exists());
+        assert_eq!(server.root.as_ref().unwrap().path, root_path);
+        assert_eq!(server.base_url, same_url);
+        assert!(
+            std::fs::read(server.config_home.join("config.yaml"))? == config_before,
+            "retained operator config must be byte-identical; contents are private"
+        );
+        assert_eq!(
+            super::hash_image(&server.config_home.join("config.yaml"))?,
+            config_digest
+        );
+        for domain in ["evolution", "growth"] {
+            let (status, cold) = background_http_command(&server, &token, domain, "status")?;
+            assert_eq!(status, 200);
+            assert_eq!(cold["data"]["effective"], "off");
+            assert_eq!(cold["data"]["desired"][domain], false);
+            assert_eq!(cold["data"]["durable_recovery"], "settled");
+            snapshots.push(cold);
+        }
+        let second_runtime = server.runtime_dir.clone();
+        server.close()?;
+        assert!(!std::path::Path::new(&format!("/proc/{}", second.pid)).exists());
+        assert!(std::net::TcpListener::bind(same_url.strip_prefix("http://").unwrap()).is_ok());
+        let receipt_paths = [
+            old_runtime.join(format!("shutdown-{}.v1.json", first.nonce)),
+            second_runtime.join(format!("shutdown-{}.v1.json", second.nonce)),
+        ];
+        assert!(receipt_paths.iter().all(|path| path.is_file()));
+        let report = serde_json::json!({"scope":"normal_two_epoch_background_control_only",
+            "root":root_path,"config_sha256":config_digest,"pid1":first.pid,"starttime1":first.starttime,
+            "pid2":second.pid,"starttime2":second.starttime,"nonce1":first.nonce,"nonce2":second.nonce,
+            "image_sha256":second.image_sha256,"receipts":receipt_paths,"management":snapshots,
+            "whole_G5_crash_pending_proven":false,"R6_foreground_ACK_proven":false,"model_calls":0});
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root_path.join("two-epoch-background-report.json"))?;
+        output.write_all(&serde_json::to_vec_pretty(&report)?)?;
+        Ok(())
     }
 
     #[cfg(unix)]

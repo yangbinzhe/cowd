@@ -714,6 +714,7 @@ pub struct RuntimeServicesBuilder {
     reality_recall_port: Option<Arc<RealityRecallPort>>,
     knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
+    background_work: crate::BackgroundWorkConfig,
     skill_catalog: crate::RuntimeSkillCatalog,
     mission_schedule_policy: crate::MissionSchedulePolicy,
     hot_state_config: crate::execution_core::hot_state::HotStateConfig,
@@ -753,10 +754,11 @@ struct MaintenanceState {
     lifecycle: MaintenanceLifecycle,
     next_generation: u64,
     owners: HashMap<String, MaintenanceOwner>,
-    reaping: usize,
+    reaping: HashMap<String, usize>,
 }
 
 struct MaintenanceCompletion {
+    owner_key: String,
     owner: MaintenanceOwner,
 }
 
@@ -844,7 +846,7 @@ impl RuntimeMaintenanceSupervisor {
                 lifecycle: MaintenanceLifecycle::Open,
                 next_generation: 0,
                 owners: HashMap::new(),
-                reaping: 0,
+                reaping: HashMap::new(),
             })),
             changed: Arc::new(tokio::sync::Notify::new()),
             completion_tx,
@@ -946,14 +948,18 @@ impl RuntimeMaintenanceSupervisor {
                         let Some(completed) = state.owners.remove(&worker_owner) else {
                             return;
                         };
-                        state.reaping = state.reaping.saturating_add(1);
+                        let count = state.reaping.entry(worker_owner.clone()).or_default();
+                        *count = count.saturating_add(1);
                         (None, Some(completed))
                     }
                 };
                 worker_changed.notify_waiters();
                 if let Some(completed) = completed {
                     if completion_tx
-                        .send(MaintenanceCompletion { owner: completed })
+                        .send(MaintenanceCompletion {
+                            owner_key: worker_owner.clone(),
+                            owner: completed,
+                        })
                         .await
                         .is_err()
                     {
@@ -1016,7 +1022,10 @@ impl RuntimeMaintenanceSupervisor {
                         let mut state = state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        state.reaping = state.reaping.saturating_sub(1);
+                        if let Some(count) = state.reaping.get_mut(&completion.owner_key) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 { state.reaping.remove(&completion.owner_key); }
+                        }
                         drop(state);
                         changed.notify_waiters();
                     }
@@ -1024,6 +1033,46 @@ impl RuntimeMaintenanceSupervisor {
             }
         }));
         true
+    }
+
+    fn pending_for_owner_prefix(&self, prefix: &str) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let running = state
+            .owners
+            .iter()
+            .filter(|(owner, _)| owner.starts_with(prefix))
+            .map(|(_, owner)| 1usize.saturating_add(owner.queued.len()))
+            .sum::<usize>();
+        let reaping = state
+            .reaping
+            .iter()
+            .filter(|(owner, _)| owner.starts_with(prefix))
+            .map(|(_, count)| *count)
+            .sum::<usize>();
+        running.saturating_add(reaping)
+    }
+
+    /// Observe physical joins for this domain in the existing reaper. Other
+    /// domains (including Memory/Skill maintenance) retain their own lifecycle.
+    async fn drain_owner_prefix(
+        &self,
+        prefix: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.pending_for_owner_prefix(prefix) == 0 {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, changed)
+                .await
+                .map_err(|_| format!("maintenance domain `{prefix}` is still draining"))?;
+        }
     }
 
     async fn shutdown_and_drain(&self) {
@@ -1054,7 +1103,7 @@ impl RuntimeMaintenanceSupervisor {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.owners.is_empty() && state.reaping == 0 {
+                if state.owners.is_empty() && state.reaping.is_empty() {
                     Some(state.lifecycle)
                 } else {
                     None
@@ -1116,7 +1165,10 @@ impl RuntimeMaintenanceSupervisor {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.owners.len().saturating_add(state.reaping)
+        state
+            .owners
+            .len()
+            .saturating_add(state.reaping.values().copied().sum::<usize>())
     }
 }
 
@@ -1411,7 +1463,8 @@ pub struct RuntimeServices {
     execution_capacity_profile: Arc<crate::ExecutionCapacityProfile>,
     evolution_governance: Arc<crate::EvolutionGovernanceService>,
     evolution_discovery: Arc<crate::evolution::EvolutionDiscoveryService>,
-    evolution_analyst: Arc<crate::evolution::analyst::EvolutionAnalystService>,
+    evolution_analyst: RwLock<Option<Arc<crate::evolution::analyst::EvolutionAnalystService>>>,
+    background_work: Mutex<crate::BackgroundWorkConfig>,
     evolution_signal_projector: Arc<crate::evolution::EvolutionSignalProjector>,
     skill_maintenance_projector: Arc<crate::SkillMaintenanceProjector>,
     event_reactor: Arc<crate::RuntimeEventReactor>,
@@ -1444,7 +1497,7 @@ pub struct RuntimeServices {
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     artifact_store: Arc<crate::ArtifactStore>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
-    evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
+    evolution_eval_runner: RwLock<Option<Arc<dyn crate::EvolutionEvalRunner>>>,
     evolution_evaluation_flights: Arc<Mutex<BTreeSet<String>>>,
     /// Runtime-instance single-flight for Agent-first physical dispatch. The
     /// durable task claim remains the cross-process owner; this local fence
@@ -1576,6 +1629,7 @@ impl RuntimeServices {
             reality_recall_port: None,
             knowledge_activation: None,
             evolution_eval_runner: None,
+            background_work: crate::BackgroundWorkConfig::default(),
             skill_catalog: crate::RuntimeSkillCatalog::default(),
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
             hot_state_config: crate::execution_core::hot_state::HotStateConfig::default(),
@@ -1603,6 +1657,10 @@ impl RuntimeServices {
                 cowd_home.join("test-artifacts"),
             )))
             .task_aggregate_service(Arc::new(crate::TaskAggregateService::for_test()))
+            .background_work(crate::BackgroundWorkConfig {
+                evolution: false,
+                growth: false,
+            })
     }
 
     pub fn in_memory() -> Result<Arc<Self>, RuntimeServicesError> {
@@ -1667,6 +1725,7 @@ impl RuntimeServices {
             None,
             None,
             crate::RuntimeSkillCatalog::default(),
+            crate::BackgroundWorkConfig::default(),
             crate::MissionSchedulePolicy::default(),
             crate::execution_core::hot_state::HotStateConfig::default(),
             ApprovalConfig::default(),
@@ -1726,6 +1785,7 @@ impl RuntimeServices {
         knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
         evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
         skill_catalog: crate::RuntimeSkillCatalog,
+        background_work: crate::BackgroundWorkConfig,
         mission_schedule_policy: crate::MissionSchedulePolicy,
         hot_state_config: crate::execution_core::hot_state::HotStateConfig,
         approval_config: ApprovalConfig,
@@ -1806,10 +1866,12 @@ impl RuntimeServices {
         let evolution_discovery = Arc::new(crate::evolution::EvolutionDiscoveryService::new(
             Arc::clone(&event_store),
         ));
-        let evolution_analyst = Arc::new(crate::evolution::analyst::EvolutionAnalystService::new(
-            Arc::clone(&event_store),
-            Arc::clone(&evolution_discovery),
-        ));
+        let evolution_analyst = RwLock::new(background_work.evolution.then(|| {
+            Arc::new(crate::evolution::analyst::EvolutionAnalystService::new(
+                Arc::clone(&event_store),
+                Arc::clone(&evolution_discovery),
+            ))
+        }));
         let evolution_signal_projector = Arc::new(
             crate::evolution::EvolutionSignalProjector::new(
                 Arc::clone(&event_store),
@@ -1817,6 +1879,12 @@ impl RuntimeServices {
             )
             .with_workspace_identity(workspace_key.clone()),
         );
+        if background_work.evolution && evolution_signal_projector.ensure_source_epoch().is_err() {
+            // Background bookkeeping failure must not prevent foreground
+            // Runtime creation. Its original projection lane retries under
+            // the same durable source owner; controls report unknown/error.
+            tracing::warn!("Evolution source epoch initialization remains pending");
+        }
         let skill_maintenance_projector = Arc::new(crate::SkillMaintenanceProjector::new(
             Arc::clone(&event_store),
         ));
@@ -2000,7 +2068,8 @@ impl RuntimeServices {
                 .ok_or_else(|| "upgrade_recovery_required".to_string())
         });
         let mission_evidence = Arc::new(MissionEvidenceBus::new(Arc::clone(&event_store)));
-        projection_lanes.push(
+        if background_work.evolution {
+            projection_lanes.push(
             crate::evolution::collaboration_experience::CollaborationExperienceProjector::new(
                 Arc::clone(&event_store),
                 graph_state_store.clone(),
@@ -2008,7 +2077,13 @@ impl RuntimeServices {
             )
             .projection_lane()
             .map_err(RuntimeServicesError::Invariant)?,
-        );
+            );
+            projection_lanes.push(
+                evolution_signal_projector
+                    .projection_lane()
+                    .map_err(RuntimeServicesError::Invariant)?,
+            );
+        }
         projection_lanes.extend([
             knowledge_candidate_projector
                 .projection_lane()
@@ -2017,9 +2092,6 @@ impl RuntimeServices {
                 .projection_lane()
                 .map_err(RuntimeServicesError::Invariant)?,
             mission_evidence
-                .projection_lane()
-                .map_err(RuntimeServicesError::Invariant)?,
-            evolution_signal_projector
                 .projection_lane()
                 .map_err(RuntimeServicesError::Invariant)?,
             skill_maintenance_projector
@@ -2111,6 +2183,7 @@ impl RuntimeServices {
             evolution_governance,
             evolution_discovery,
             evolution_analyst,
+            background_work: Mutex::new(background_work),
             evolution_signal_projector,
             skill_maintenance_projector,
             event_reactor,
@@ -2145,7 +2218,7 @@ impl RuntimeServices {
             tool_execution_host,
             artifact_store,
             memory_manager,
-            evolution_eval_runner,
+            evolution_eval_runner: RwLock::new(evolution_eval_runner),
             evolution_evaluation_flights: Arc::new(Mutex::new(BTreeSet::new())),
             agentic_dispatch_flights: Arc::new(Mutex::new(BTreeSet::new())),
             agentic_read_model,
@@ -5194,8 +5267,19 @@ impl RuntimeServices {
         &self,
         signal: crate::EvolutionSignal,
     ) -> Result<crate::EvolutionSignal, RuntimeServicesError> {
+        // Stop and this synchronous derived-work admission share the original
+        // policy fence. No Provider future or domain drain holds this lock.
+        let policy = self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if policy.evolution {
+            self.evolution_signal_projector
+                .ensure_source_epoch()
+                .map_err(RuntimeServicesError::Invariant)?;
+        }
         self.evolution_discovery
-            .record_signal(signal)
+            .record_signal_with_automatic_discovery(signal, policy.evolution)
             .map_err(RuntimeServicesError::Invariant)
     }
 
@@ -5253,8 +5337,11 @@ impl RuntimeServices {
         case_id: &str,
     ) -> Result<Option<harness_contract::evolution::EvolutionAnalysisDraft>, RuntimeServicesError>
     {
-        self.evolution_analyst
-            .draft_for_case(case_id)
+        crate::evolution::analyst::EvolutionAnalystService::read_draft_for_case(
+            &self.event_store,
+            &self.evolution_discovery,
+            case_id,
+        )
             .map_err(RuntimeServicesError::Invariant)
     }
 
@@ -6301,7 +6388,7 @@ mod exact_exit_lane_tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
         let state = supervisor.state.lock().unwrap();
         assert!(state.owners.is_empty());
-        assert_eq!(state.reaping, 0);
+        assert!(state.reaping.is_empty());
     }
 
     #[tokio::test]

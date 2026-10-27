@@ -85,6 +85,10 @@ pub fn fixture() -> EvolutionFixture {
         .expect("baseline stable assignment");
     let services = RuntimeServices::builder(root.path(), &workspace)
         .non_durable_backends_for_testing(root.path())
+        .background_work(runtime::BackgroundWorkConfig {
+            evolution: true,
+            growth: false,
+        })
         .evolution_eval_runner(Arc::new(EligibleEvalRunner))
         .build()
         .expect("Runtime services");

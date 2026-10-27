@@ -17,6 +17,7 @@ use memory::{
     types::{AgentVisibility, MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Priority},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{GrowthService, MatrixService, MemoryService};
 
@@ -75,6 +76,7 @@ impl GrowthService {
         self.ledger.list_facts().map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) async fn ingest_growth_event(
         &self,
         config_home: impl AsRef<Path>,
@@ -82,11 +84,92 @@ impl GrowthService {
         matrix: &MatrixService,
         event: GrowthEvent,
     ) -> GrowthIngestReceipt {
+        self.ingest_growth_event_inner(config_home, memory, matrix, event, false)
+            .await
+    }
+
+    pub(crate) async fn ingest_admitted_growth_event(
+        &self,
+        config_home: impl AsRef<Path>,
+        memory: &MemoryService,
+        matrix: &MatrixService,
+        event: GrowthEvent,
+    ) -> GrowthIngestReceipt {
+        self.ingest_growth_event_inner(config_home, memory, matrix, event, true)
+            .await
+    }
+
+    async fn ingest_growth_event_inner(
+        &self,
+        config_home: impl AsRef<Path>,
+        memory: &MemoryService,
+        matrix: &MatrixService,
+        event: GrowthEvent,
+        admitted_replay: bool,
+    ) -> GrowthIngestReceipt {
+        // Reuse original durable receipts only for the exact original payload.
+        // A repeated ID with changed content must never borrow earlier effects.
+        let snapshot_growth = self.clone();
+        let old =
+            match tokio::task::spawn_blocking(move || snapshot_growth.ledger.export_snapshot())
+                .await
+            {
+                Ok(Ok(snapshot)) => snapshot,
+                error => {
+                    return GrowthIngestReceipt {
+                        event_id: event.id,
+                        durable: false,
+                        promotions: Vec::new(),
+                        fact_health_issues: Vec::new(),
+                        errors: vec![format!("Growth original ledger lookup failed: {error:?}")],
+                    }
+                }
+            };
+        let previous_event = old.growth_events.iter().find(|e| e.id == event.id);
+        if previous_event.is_some_and(|old| old != &event) {
+            return GrowthIngestReceipt {
+                event_id: event.id,
+                durable: false,
+                promotions: Vec::new(),
+                fact_health_issues: Vec::new(),
+                errors: vec!["Growth event ID has foreign payload".into()],
+            };
+        }
+        let previous = old
+            .growth_promotions
+            .into_iter()
+            .filter(|p| p.event_id == event.id && p.error.is_none())
+            .collect::<Vec<_>>();
+        let fact_committed = admitted_replay && previous_event.is_some();
+        if fact_committed
+            && previous
+                .iter()
+                .filter(|p| matches!(p.target.as_str(), "fact.memory" | "fact.matrix"))
+                .count()
+                != event.memory_candidates.len() + event.matrix_signals.len()
+        {
+            return GrowthIngestReceipt {
+                event_id: event.id,
+                durable: false,
+                promotions: Vec::new(),
+                fact_health_issues: Vec::new(),
+                errors: vec!["Growth original Fact batch receipt is incomplete".into()],
+            };
+        }
         let mut errors = Vec::new();
         let fact_growth = self.clone();
         let fact_event = event.clone();
         let mut promotions = match tokio::task::spawn_blocking(move || {
-            fact_growth.promote_event_to_fact_kernel(&fact_event)
+            if fact_committed {
+                Ok(previous
+                    .iter()
+                    .filter(|p| matches!(p.target.as_str(), "fact.memory" | "fact.matrix"))
+                    .cloned()
+                    .map(GrowthPromotionReceipt::from)
+                    .collect())
+            } else {
+                fact_growth.promote_event_to_fact_kernel(&fact_event)
+            }
         })
         .await
         {
@@ -110,43 +193,27 @@ impl GrowthService {
                 };
             }
         };
-        let fact_promotion_count = promotions.len();
         let matrix_growth = self.clone();
         let matrix_service = matrix.clone();
         let matrix_event = event.clone();
         let config_home = config_home.as_ref().to_path_buf();
         match tokio::task::spawn_blocking(move || {
-            matrix_growth.promote_event_to_matrix(&config_home, &matrix_service, &matrix_event)
+            matrix_growth.promote_event_to_matrix(
+                &config_home,
+                &matrix_service,
+                &matrix_event,
+                admitted_replay,
+            )
         })
         .await
         {
             Ok(receipts) => promotions.extend(receipts),
             Err(error) => errors.push(format!("growth Matrix projection worker failed: {error}")),
         }
-        promotions.extend(self.promote_event_to_memory(memory, &event).await);
-
-        let persistence_growth = self.clone();
-        let persistence_event_id = event.id.clone();
-        let persistence_receipts = promotions
-            .iter()
-            .skip(fact_promotion_count)
-            .cloned()
-            .collect::<Vec<_>>();
-        match tokio::task::spawn_blocking(move || {
-            persistence_receipts
-                .iter()
-                .filter_map(|promotion| {
-                    persistence_growth
-                        .persist_promotion(&persistence_event_id, promotion)
-                        .err()
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        {
-            Ok(persistence_errors) => errors.extend(persistence_errors),
-            Err(error) => errors.push(format!("growth receipt persistence worker failed: {error}")),
-        }
+        promotions.extend(
+            self.promote_event_to_memory(memory, &event, admitted_replay)
+                .await,
+        );
 
         let health_growth = self.clone();
         let fact_health_issues = match tokio::task::spawn_blocking(move || {
@@ -176,25 +243,6 @@ impl GrowthService {
         }
     }
 
-    pub(crate) async fn ingest_risk_gate_receipt(
-        &self,
-        config_home: impl AsRef<Path>,
-        memory: &MemoryService,
-        matrix: &MatrixService,
-        session_id: impl Into<String>,
-        receipt: &harness_contract::policy::RiskGateReceipt,
-    ) -> serde_json::Value {
-        let event = self.build_risk_gate_event(session_id, receipt);
-        let ingest = self
-            .ingest_growth_event(config_home, memory, matrix, event.clone())
-            .await;
-        serde_json::json!({
-            "envelope": self.envelope("risk_gate_event"),
-            "event": event,
-            "ingest": ingest,
-        })
-    }
-
     pub(crate) fn durable_event_log(&self) -> Result<Vec<GrowthEvent>, String> {
         self.ledger
             .list_growth_events()
@@ -213,7 +261,7 @@ impl GrowthService {
             .map_err(|error| error.to_string())
     }
 
-    fn build_risk_gate_event(
+    pub(crate) fn build_risk_gate_event(
         &self,
         session_id: impl Into<String>,
         receipt: &harness_contract::policy::RiskGateReceipt,
@@ -410,20 +458,49 @@ impl GrowthService {
         config_home: &Path,
         matrix: &MatrixService,
         event: &GrowthEvent,
+        admitted_replay: bool,
     ) -> Vec<GrowthPromotionReceipt> {
+        let previous = match self.ledger.list_growth_promotions() {
+            Ok(values) => values,
+            Err(error) => {
+                return vec![GrowthPromotionReceipt {
+                    target: "matrix.fact".into(),
+                    status: "held".into(),
+                    target_id: None,
+                    summary: "original receipt lookup failed".into(),
+                    error: Some(error.to_string()),
+                }]
+            }
+        };
         event
             .matrix_signals
             .iter()
             .map(|signal| {
                 let fact = matrix_fact_from_signal(event, signal);
+                if let Some(old) = previous.iter().find(|p| {
+                    admitted_replay
+                        && p.event_id == event.id
+                        && p.target == "matrix.fact"
+                        && p.target_id.as_deref() == Some(fact.fact_id.as_str())
+                        && p.error.is_none()
+                        && p.status == "promoted"
+                }) {
+                    return GrowthPromotionReceipt::from(old.clone());
+                }
                 match matrix.ingest_fact(config_home, &fact) {
-                    Ok(attention) => GrowthPromotionReceipt {
-                        target: "matrix.fact".to_string(),
-                        status: "promoted".to_string(),
-                        target_id: Some(fact.fact_id),
-                        summary: format!("attention={}", attention.attention_id),
-                        error: None,
-                    },
+                    Ok(attention) => {
+                        let mut receipt = GrowthPromotionReceipt {
+                            target: "matrix.fact".to_string(),
+                            status: "promoted".to_string(),
+                            target_id: Some(fact.fact_id),
+                            summary: format!("attention={}", attention.attention_id),
+                            error: None,
+                        };
+                        if let Err(e) = self.persist_promotion(&event.id, &receipt) {
+                            receipt.error = Some(e);
+                        }
+                        receipt
+                    }
                     Err(error) => GrowthPromotionReceipt {
                         target: "matrix.fact".to_string(),
                         status: "held".to_string(),
@@ -440,16 +517,49 @@ impl GrowthService {
         &self,
         memory: &MemoryService,
         event: &GrowthEvent,
+        admitted_replay: bool,
     ) -> Vec<GrowthPromotionReceipt> {
+        let receipt_growth = self.clone();
+        let previous = match tokio::task::spawn_blocking(move || {
+            receipt_growth.ledger.list_growth_promotions()
+        })
+        .await
+        {
+            Ok(Ok(values)) => values,
+            result => {
+                return vec![GrowthPromotionReceipt {
+                    target: "memory.entry".into(),
+                    status: "held".into(),
+                    target_id: None,
+                    summary: "original receipt lookup failed".into(),
+                    error: Some(format!("{result:?}")),
+                }]
+            }
+        };
         let mut receipts = Vec::new();
         for candidate in &event.memory_candidates {
             let entry = memory_entry_from_candidate(event, candidate);
+            let target = entry.id.to_string();
+            if let Some(old) = previous.iter().find(|p| {
+                admitted_replay
+                    && p.event_id == event.id
+                    && p.target == "memory.entry"
+                    && p.target_id.as_deref() == Some(target.as_str())
+                    && p.error.is_none()
+                    && matches!(
+                        p.status.as_str(),
+                        "promoted" | "held" | "refreshed" | "duplicate" | "conflict_held"
+                    )
+            }) {
+                receipts.push(GrowthPromotionReceipt::from(old.clone()));
+                continue;
+            }
             let decision = memory_promotion_decision(memory, event, candidate, &entry).await;
             match decision {
                 MemoryPromotionDecision::Promote => {
                     let target_id = entry.id.to_string();
                     match memory
-                        .remember_entry_with_context(entry, &event.session_id, "growth")
+                        .remember_entry_with_context(entry, &event.session_id, "growth-service")
                         .await
                     {
                         Ok(()) => receipts.push(GrowthPromotionReceipt {
@@ -517,6 +627,15 @@ impl GrowthService {
                         error: None,
                     });
                 }
+                MemoryPromotionDecision::Unavailable { reason } => {
+                    receipts.push(GrowthPromotionReceipt {
+                        target: "memory.entry".into(),
+                        status: "held".into(),
+                        target_id: Some(entry.id.to_string()),
+                        summary: "original Memory governance read failed".into(),
+                        error: Some(reason),
+                    });
+                }
                 MemoryPromotionDecision::Hold { reason } => {
                     receipts.push(GrowthPromotionReceipt {
                         target: "memory.entry".to_string(),
@@ -525,6 +644,18 @@ impl GrowthService {
                         summary: reason,
                         error: None,
                     });
+                }
+            }
+            if let Some(receipt) = receipts.last_mut() {
+                let growth = self.clone();
+                let id = event.id.clone();
+                let value = receipt.clone();
+                match tokio::task::spawn_blocking(move || growth.persist_promotion(&id, &value))
+                    .await
+                {
+                    Ok(Ok(())) => (),
+                    Ok(Err(error)) => receipt.error = Some(error),
+                    Err(error) => receipt.error = Some(error.to_string()),
                 }
             }
         }
@@ -546,6 +677,7 @@ enum MemoryPromotionDecision {
     Duplicate { existing_id: String },
     Conflict { existing_id: String, reason: String },
     Hold { reason: String },
+    Unavailable { reason: String },
 }
 
 async fn memory_promotion_decision(
@@ -579,7 +711,7 @@ async fn memory_promotion_decision(
     {
         Ok(entries) => entries,
         Err(error) => {
-            return MemoryPromotionDecision::Hold {
+            return MemoryPromotionDecision::Unavailable {
                 reason: format!("memory governance unavailable: {error}"),
             };
         }
@@ -795,14 +927,35 @@ fn kernel_matrix_fact(
     }
 }
 
+#[cfg(test)]
+pub(super) fn memory_candidate_entry_for_test(
+    event: &GrowthEvent,
+    candidate: &GrowthMemoryCandidate,
+) -> MemoryEntry {
+    memory_entry_from_candidate(event, candidate)
+}
+
 fn memory_entry_from_candidate(
     event: &GrowthEvent,
     candidate: &GrowthMemoryCandidate,
 ) -> MemoryEntry {
     let now = Utc::now();
     let scope = MemoryScope::Session(event.session_id.clone());
+    // The original receipt must refer to the same target across cold retries.
+    // Content changes under this event ID are rejected before any target write.
+    let digest = Sha256::digest(
+        serde_json::to_vec(&(
+            "cowd.growth.memory.v1",
+            &event.id,
+            &candidate.id,
+            &event.session_id,
+        ))
+        .expect("string tuple serialization"),
+    );
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
     MemoryEntry {
-        id: uuid::Uuid::new_v4(),
+        id: uuid::Uuid::from_bytes(id),
         layer: MemoryLayer::L3,
         category: MemoryCategory::ProjectKnowledge,
         priority: if candidate.confidence_bp >= 9_000 {
@@ -930,6 +1083,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(config_home);
     }
 
+    #[test]
+    fn growth_memory_target_is_stable_and_bound_to_original_event_candidate_and_session() {
+        let mut event = sample_growth_event("session-A");
+        event.id = "event-A".into();
+        let mut candidate = event.memory_candidates[0].clone();
+        candidate.id = "candidate-A".into();
+        let first = memory_entry_from_candidate(&event, &candidate);
+        assert_eq!(first.id.to_string(), "aa5d0ed7-810b-a5fd-c2fa-fd1726a13377");
+        assert_eq!(memory_entry_from_candidate(&event, &candidate).id, first.id);
+        event.session_id = "foreign-session".into();
+        assert_ne!(memory_entry_from_candidate(&event, &candidate).id, first.id);
+        event.session_id = "session-A".into();
+        candidate.id = "foreign-candidate".into();
+        assert_ne!(memory_entry_from_candidate(&event, &candidate).id, first.id);
+        candidate.id = "candidate-A".into();
+        event.id = "foreign-event".into();
+        assert_ne!(memory_entry_from_candidate(&event, &candidate).id, first.id);
+    }
+    #[tokio::test]
+    async fn growth_memory_read_failure_is_retryable_not_a_governed_hold() {
+        let event = single_candidate_event(
+            "unknown-memory",
+            "eligible independent promotion",
+            "approved evidence",
+            9000,
+        );
+        let candidate = &event.memory_candidates[0];
+        let entry = memory_entry_from_candidate(&event, candidate);
+        match memory_promotion_decision(&MemoryService::new(), &event, candidate, &entry).await {
+            MemoryPromotionDecision::Unavailable { reason } => {
+                assert!(reason.contains("memory governance unavailable"))
+            }
+            _ => panic!("unavailable original Memory reader must remain retryable"),
+        }
+    }
     #[tokio::test]
     async fn memory_promotion_governance_suppresses_duplicate_growth_candidates() {
         let (_topology, config_home, _manager, memory, matrix, growth) =

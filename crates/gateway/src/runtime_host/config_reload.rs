@@ -191,6 +191,28 @@ pub(crate) async fn poll_config_reload_once(
     state: Arc<AppState>,
     trigger: &str,
 ) -> Value {
+    let report = poll_config_reload_sections_once(reload, Arc::clone(&state), trigger).await;
+    if state.services.runtime.is_some() {
+        if let Err(error) = reconcile_background_from_disk(reload, &state).await {
+            if let Ok(mut status) = reload.status.write() {
+                status.last_report["applied_sections"]["background_evolution"] = serde_json::json!({"effective":"error", "error":error, "scope":"instance_all_sessions"});
+            }
+        }
+    }
+    // Return the current original status projection after background apply,
+    // never the pre-drain section snapshot.
+    if state.services.runtime.is_some() {
+        status_value(reload)
+    } else {
+        report
+    }
+}
+
+async fn poll_config_reload_sections_once(
+    reload: &ConfigReloadState,
+    state: Arc<AppState>,
+    trigger: &str,
+) -> Value {
     let fingerprint =
         config_fingerprint_async(state.workspace_root.clone(), state.config_home.clone()).await;
     let digest = fingerprint.digest.clone();
@@ -283,6 +305,424 @@ fn merge_session_execution_policy_retry(
     snapshot
 }
 
+/// The same instance reload owner serializes persisted operator mutations.
+/// Authentication is checked here as well as by the public caller: a session
+/// write grant or a model-issued slash is not instance management authority.
+pub(crate) async fn background_control(
+    reload: &ConfigReloadState,
+    state: &Arc<AppState>,
+    principal: &runtime::VerifiedPrincipal,
+    args: &Value,
+    domain: &str,
+) -> Result<Value, String> {
+    require_background_operator(principal)?;
+    if !matches!(domain, "evolution" | "growth") {
+        return Err("unknown background domain".into());
+    }
+    let requested = parse_background_control(args, domain)?;
+    let runtime = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or("runtime service unavailable")?;
+    let services = runtime.runtime_services();
+    let (desired, revision) = {
+        let _apply = reload.apply_lock.lock().await;
+        let config = ConfigLoader::new(&state.workspace_root, &state.config_home)
+            .load()
+            .map_err(|error| format!("background config load failed: {error}"))?;
+        let previous = config_fingerprint(&state.workspace_root, &state.config_home);
+        if let Some(expected) = args.get("expected_revision") {
+            if expected.as_str() != Some(previous.digest.as_str()) {
+                return Err("background config revision is stale".into());
+            }
+        }
+        if let Some(enabled) = requested {
+            let mut policy = config.background_work();
+            if domain == "evolution" {
+                policy.evolution = enabled;
+            } else {
+                policy.growth = enabled;
+            }
+            persist_background_work(&state.config_home, policy)?;
+        }
+        let config = ConfigLoader::new(&state.workspace_root, &state.config_home)
+            .load()
+            .map_err(|error| format!("background config persisted but reload failed: {error}"))?;
+        let desired = config.background_work();
+        // Persisted intent and new-work admission linearize under the original
+        // apply lock. No drain or Provider await is held by that lock.
+        if !desired.evolution {
+            services.stop_evolution_background_admission();
+        }
+        if !desired.growth {
+            services.stop_growth_background_admission();
+        }
+        reload.write_current_config(config);
+        (
+            desired,
+            config_fingerprint(&state.workspace_root, &state.config_home).digest,
+        )
+    };
+    if domain == "evolution" {
+        reconcile_background_evolution(reload, state, desired, revision).await
+    } else {
+        reconcile_background_growth(reload, state, desired, revision).await
+    }
+}
+
+async fn reconcile_background_evolution(
+    reload: &ConfigReloadState,
+    state: &Arc<AppState>,
+    desired: runtime::BackgroundWorkConfig,
+    revision: String,
+) -> Result<Value, String> {
+    let services = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or("runtime service unavailable")?
+        .runtime_services();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut failure = None;
+    let mut physical_drained = false;
+    if !services.background_work().evolution {
+        match services.drain_evolution_background_physical(deadline).await {
+            Ok(reports) => {
+                physical_drained = true;
+                failure = reports.into_iter().find_map(|report| report.last_error);
+            }
+            Err(error) => failure = Some(error),
+        }
+    }
+    // A newer operator operation may have persisted while this waiter drained.
+    // Never apply the old desired state over its successor.
+    let _apply = reload.apply_lock.lock().await;
+    let current = ConfigLoader::new(&state.workspace_root, &state.config_home)
+        .load()
+        .map_err(|error| error.to_string())?;
+    let current_revision = config_fingerprint(&state.workspace_root, &state.config_home).digest;
+    if current_revision != revision {
+        return Ok(
+            serde_json::json!({"scope": "instance_all_sessions", "status": "superseded",
+            "desired": current.background_work(), "revision": current_revision,
+            "effective": "draining", "physical_drained": physical_drained}),
+        );
+    }
+    let (durable_drained, pending_claims) = if services.background_work().evolution {
+        (false, 0)
+    } else {
+        match services.evolution_background_durable_drain_status() {
+            Ok(status) => status,
+            Err(error) => {
+                failure = Some(error);
+                (false, 0)
+            }
+        }
+    };
+    if desired.evolution
+        && !services.background_work().evolution
+        && failure.is_none()
+        && durable_drained
+    {
+        let binding = Arc::new(std::sync::OnceLock::new());
+        binding
+            .set(Arc::downgrade(&services))
+            .map_err(|_| "evolution evaluator binding already initialized")?;
+        services.install_evolution_eval_runner(super::configured_evolution_eval_runner(
+            &state.config_home,
+            binding,
+        ));
+        if let Err(error) = services.resume_evolution_background_admission() {
+            failure = Some(error);
+        }
+    }
+    let effective = if failure.is_some() {
+        "error"
+    } else if services.background_work().evolution {
+        "on"
+    } else if !desired.evolution && physical_drained && durable_drained {
+        "off"
+    } else {
+        "draining"
+    };
+    let report = serde_json::json!({"scope": "instance_all_sessions", "status": effective,
+        "desired": desired, "effective": effective, "revision": revision,
+        "physical_drained": physical_drained,
+        "durable_recovery": if services.background_work().evolution { "original_projection_owner" }
+            else if durable_drained { "settled" } else { "pending" },
+        "pending_analysis_claims": pending_claims, "pending_count_is_lower_bound": !durable_drained,
+        "error": failure});
+    // Preserve the result in the original reload status. This is an apply
+    // projection, never an additional desired-policy writer.
+    let mut status = reload
+        .status
+        .write()
+        .map_err(|_| "config status lock poisoned")?;
+    status.last_report["applied_sections"]["background_evolution"] = report.clone();
+    if matches!(effective, "error" | "draining") {
+        status.status = "attention".into();
+        status.last_report["status"] = Value::String("attention".into());
+    }
+    Ok(report)
+}
+
+fn growth_store(state: &AppState) -> Result<&Arc<runtime::RuntimeEventStore>, String> {
+    state
+        .services
+        .selected_storage
+        .as_ref()
+        .map(|s| &s.runtime_event_store)
+        .ok_or_else(|| "Growth selected storage unavailable".into())
+}
+fn growth_lane(state: &AppState) -> Result<runtime::RuntimeProjectionLane, String> {
+    crate::services::growth_projection_lane(
+        state.config_home.clone(),
+        Arc::clone(growth_store(state)?),
+        state.services.growth.clone(),
+        state.services.memory.clone(),
+        state.services.matrix.clone(),
+    )
+}
+async fn reconcile_background_growth(
+    reload: &ConfigReloadState,
+    state: &Arc<AppState>,
+    desired: runtime::BackgroundWorkConfig,
+    revision: String,
+) -> Result<Value, String> {
+    let services = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or("runtime service unavailable")?
+        .runtime_services();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut error = None;
+    let mut physical = false;
+    if !services.background_work().growth {
+        match services.drain_growth_background_physical(deadline).await {
+            Ok(_) => physical = true,
+            Err(e) => error = Some(e),
+        }
+    }
+    let _apply = reload.apply_lock.lock().await;
+    let current = ConfigLoader::new(&state.workspace_root, &state.config_home)
+        .load()
+        .map_err(|e| e.to_string())?;
+    let current_revision = config_fingerprint(&state.workspace_root, &state.config_home).digest;
+    if current_revision != revision {
+        return Ok(
+            serde_json::json!({"scope":"instance_all_sessions","status":"superseded","desired":current.background_work(),"revision":current_revision,"effective":"draining"}),
+        );
+    }
+    if let Err(e) = crate::services::growth_projection_lane::initialize_growth_policy(
+        growth_store(state)?,
+        services.background_work().growth,
+    ) {
+        services.stop_growth_background_admission();
+        error = Some(e);
+    }
+    let settled = match crate::services::growth_projection_lane::growth_checkpoint_status(
+        growth_store(state)?,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            error = Some(e);
+            false
+        }
+    };
+    if physical && error.is_none() {
+        if settled && desired.growth {
+            if let Err(e) =
+                crate::services::growth_projection_lane::resume_growth_sources(growth_store(state)?)
+                    .and_then(|()| {
+                        services.register_growth_background_lane(growth_lane(state)?, true)
+                    })
+            {
+                error = Some(e);
+            }
+        } else if !settled {
+            // The same reactor owns recovery-only passes, including if the
+            // original HTTP waiter is cancelled. Paused checkpoints forbid new sources.
+            if let Err(e) = services.register_growth_background_lane(growth_lane(state)?, false) {
+                error = Some(e);
+            }
+        }
+    }
+    let effective = if error.is_some() {
+        "error"
+    } else if services.background_work().growth {
+        "on"
+    } else if physical && settled && !desired.growth {
+        "off"
+    } else {
+        "draining"
+    };
+    let report = serde_json::json!({"scope":"instance_all_sessions","status":effective,"desired":desired,
+        "effective":effective,"revision":revision,"physical_drained":physical,"durable_recovery":if settled{"settled"}else{"pending"},"pending_page":!settled,"error":error});
+    let mut status = reload
+        .status
+        .write()
+        .map_err(|_| "config status lock poisoned")?;
+    status.last_report["applied_sections"]["background_growth"] = report.clone();
+    if matches!(effective, "error" | "draining") {
+        status.status = "attention".into();
+        status.last_report["status"] = "attention".into();
+    }
+    Ok(report)
+}
+
+async fn reconcile_background_from_disk(
+    reload: &ConfigReloadState,
+    state: &Arc<AppState>,
+) -> Result<Value, String> {
+    let (desired, revision) = {
+        let _guard = reload.apply_lock.lock().await;
+        let config = ConfigLoader::new(&state.workspace_root, &state.config_home)
+            .load()
+            .map_err(|error| error.to_string())?;
+        let desired = config.background_work();
+        if !desired.evolution {
+            state
+                .services
+                .runtime
+                .as_ref()
+                .ok_or("runtime service unavailable")?
+                .runtime_services()
+                .stop_evolution_background_admission();
+        }
+        if !desired.growth {
+            state
+                .services
+                .runtime
+                .as_ref()
+                .ok_or("runtime service unavailable")?
+                .runtime_services()
+                .stop_growth_background_admission();
+        }
+        (
+            desired,
+            config_fingerprint(&state.workspace_root, &state.config_home).digest,
+        )
+    };
+    let evolution =
+        reconcile_background_evolution(reload, state, desired, revision.clone()).await?;
+    let growth = reconcile_background_growth(reload, state, desired, revision).await?;
+    Ok(serde_json::json!({"evolution":evolution,"growth":growth}))
+}
+
+pub(crate) fn require_background_operator(
+    principal: &runtime::VerifiedPrincipal,
+) -> Result<(), String> {
+    if !principal.is_human_interactive() || !principal.has_capability("runtime.maintenance.manage")
+    {
+        return Err(
+            "background control requires a verified human with runtime.maintenance.manage".into(),
+        );
+    }
+    Ok(())
+}
+
+fn parse_background_control(args: &Value, command: &str) -> Result<Option<bool>, String> {
+    let explicit = match args.get("mode") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or("background control mode must be a string")?,
+        ),
+        None => None,
+    };
+    let input = match args.get("input") {
+        Some(value) => {
+            let mut words = value
+                .as_str()
+                .ok_or("background slash input must be a string")?
+                .split_whitespace();
+            if words.next().map(|word| word.trim_start_matches('/')) != Some(command) {
+                return Err("background slash input belongs to another command".into());
+            }
+            let mode = words.next();
+            if words.next().is_some() {
+                return Err("background slash has excess arguments".into());
+            }
+            mode
+        }
+        None => None,
+    };
+    if explicit
+        .zip(input)
+        .is_some_and(|(left, right)| left != right)
+    {
+        return Err("background slash mode conflicts with its input".into());
+    }
+    match explicit.or(input).unwrap_or("status") {
+        "status" => Ok(None),
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        _ => Err("background control mode must be on|off|status".into()),
+    }
+}
+
+fn persist_background_work(
+    home: &Path,
+    policy: runtime::BackgroundWorkConfig,
+) -> Result<(), String> {
+    use std::io::Write;
+    fs::create_dir_all(home).map_err(|error| error.to_string())?;
+    // ConfigLoader gives config.yml precedence over config.yaml. Mutating the
+    // lower file would produce a convincing receipt with no effective change.
+    let path = if home.join("config.yml").exists() {
+        home.join("config.yml")
+    } else {
+        home.join("config.yaml")
+    };
+    let before = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut value: serde_yaml::Value = match before.as_ref() {
+        Some(bytes) => serde_yaml::from_slice(bytes).map_err(|error| error.to_string())?,
+        None => serde_yaml::Value::Mapping(Default::default()),
+    };
+    let root = value
+        .as_mapping_mut()
+        .ok_or("config root must be a mapping")?;
+    let runtime = root
+        .entry(serde_yaml::Value::String("runtime".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
+        .as_mapping_mut()
+        .ok_or("runtime config must be a mapping")?;
+    runtime.insert(
+        serde_yaml::Value::String("background".into()),
+        serde_yaml::to_value(policy).map_err(|error| error.to_string())?,
+    );
+    let bytes = serde_yaml::to_string(&value).map_err(|error| error.to_string())?;
+    let mut temporary = tempfile::NamedTempFile::new_in(home).map_err(|error| error.to_string())?;
+    temporary
+        .write_all(bytes.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    let current = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    if current != before {
+        return Err("operator config changed before persistence".into());
+    }
+    temporary
+        .persist(&path)
+        .map_err(|error| error.error.to_string())?;
+    fs::File::open(home)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub(crate) async fn force_gateway_config_reload(
     reload: &ConfigReloadState,
     state: &Arc<AppState>,
@@ -290,7 +730,27 @@ pub(crate) async fn force_gateway_config_reload(
 ) -> Value {
     let fingerprint =
         config_fingerprint_async(state.workspace_root.clone(), state.config_home.clone()).await;
-    reload_gateway_config_with_fingerprint(reload, state, trigger, fingerprint).await
+    let report = reload_gateway_config_with_fingerprint(reload, state, trigger, fingerprint).await;
+    if state.services.runtime.is_some() {
+        let background = match reconcile_background_from_disk(reload, state).await {
+            Ok(report) => report,
+            Err(error) => serde_json::json!({"effective":"error", "status":"error", "error":error,
+                "scope":"instance_all_sessions"}),
+        };
+        let mut report = report;
+        if ["evolution", "growth"].iter().any(|domain| {
+            matches!(
+                background[*domain]["effective"].as_str(),
+                Some("error" | "draining")
+            )
+        }) {
+            report["status"] = Value::String("attention".into());
+        }
+        report["applied_sections"]["background_evolution"] = background["evolution"].clone();
+        report["applied_sections"]["background_growth"] = background["growth"].clone();
+        return report;
+    }
+    report
 }
 
 pub(crate) async fn reload_runtime_providers_from_disk(
@@ -1322,6 +1782,128 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temp root");
         root
+    }
+
+    #[test]
+    fn background_control_preserves_operator_precedence_other_domain_and_restart_config() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let lower = b"model: preserved-model\nruntime:\n  background:\n    growth: false\n";
+        fs::write(home.join("config.yaml"), lower).unwrap();
+        fs::write(
+            home.join("config.yml"),
+            "runtime:\n  background:\n    evolution: true\n    growth: true\n",
+        )
+        .unwrap();
+        let original = ConfigLoader::new(&workspace, &home)
+            .load()
+            .unwrap()
+            .background_work();
+        assert!(original.evolution && original.growth);
+        persist_background_work(
+            &home,
+            runtime::BackgroundWorkConfig {
+                evolution: false,
+                growth: original.growth,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(home.join("config.yaml")).unwrap(), lower);
+        let fresh = ConfigLoader::new(&workspace, &home).load().unwrap();
+        assert_eq!(
+            fresh.background_work(),
+            runtime::BackgroundWorkConfig {
+                evolution: false,
+                growth: true
+            }
+        );
+        assert_eq!(fresh.model(), Some("preserved-model"));
+        let mut second = fresh.background_work();
+        second.evolution = true;
+        persist_background_work(&home, second).unwrap();
+        assert_eq!(
+            ConfigLoader::new(&workspace, &home)
+                .load()
+                .unwrap()
+                .background_work(),
+            runtime::BackgroundWorkConfig {
+                evolution: true,
+                growth: true
+            }
+        );
+        assert_eq!(
+            fs::read_dir(&home).unwrap().count(),
+            2,
+            "no temporary file retained"
+        );
+    }
+
+    #[test]
+    fn background_control_rejects_ambiguous_modes_and_persistence_failures_without_partial_write() {
+        for args in [
+            serde_json::json!({"mode":null}),
+            serde_json::json!({"mode":"enable"}),
+            serde_json::json!({"mode":"off", "input":"/evolution on"}),
+            serde_json::json!({"input":"/growth off"}),
+            serde_json::json!({"input":"/evolution off extra"}),
+        ] {
+            assert!(
+                parse_background_control(&args, "evolution").is_err(),
+                "{args}"
+            );
+        }
+        assert_eq!(
+            parse_background_control(&serde_json::json!({"input":"/evolution off"}), "evolution")
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            parse_background_control(&serde_json::json!({}), "evolution").unwrap(),
+            None
+        );
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        fs::write(home.join("config.yaml"), "model: unchanged\n").unwrap();
+        fs::create_dir(home.join("config.yml")).unwrap();
+        assert!(persist_background_work(
+            home,
+            runtime::BackgroundWorkConfig {
+                evolution: false,
+                growth: false
+            }
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(home.join("config.yaml")).unwrap(),
+            b"model: unchanged\n"
+        );
+        assert_eq!(fs::read_dir(home).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn background_control_requires_verified_instance_management_not_session_write() {
+        for (capabilities, permitted) in [
+            (vec!["session.write".to_string()], false),
+            (vec!["approval.manage".to_string()], false),
+            (vec!["runtime.maintenance.manage".to_string()], true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
+                root.path(),
+                "isolated-background-control-credential",
+                capabilities,
+                None,
+            )
+            .unwrap();
+            let principal = runtime::PrincipalVerifier::from_base64(&envelope.key_id, &public_key)
+                .unwrap()
+                .verify(&envelope)
+                .unwrap();
+            assert_eq!(require_background_operator(&principal).is_ok(), permitted);
+        }
     }
 
     #[test]

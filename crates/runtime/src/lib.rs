@@ -398,10 +398,10 @@ pub use compact::{
 };
 pub use config::{
     redact_serde_json, AppStartupConfig, ApprovalConfig, AppsConfig, ArtifactStorageConfig,
-    CompressionConfig, ConfigDiagnostic as RuntimeConfigDiagnostic, ConfigDiagnosticSeverity,
-    ConfigEntry, ConfigError, ConfigLoadResult, ConfigLoader, ConfigSource, DomainProfile,
-    GateAutoFixConfig, GatewayCapacityConfig, GatewayConfig, GatewayLiveConfig,
-    GatewayPresenceConfig, GatewayTranslationConfig, McpConfigCollection,
+    BackgroundWorkConfig, CompressionConfig, ConfigDiagnostic as RuntimeConfigDiagnostic,
+    ConfigDiagnosticSeverity, ConfigEntry, ConfigError, ConfigLoadResult, ConfigLoader,
+    ConfigSource, DomainProfile, GateAutoFixConfig, GatewayCapacityConfig, GatewayConfig,
+    GatewayLiveConfig, GatewayPresenceConfig, GatewayTranslationConfig, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
     PlatformConfig as GatewayPlatformConfig, PostgresTopologyConfig, ResolvedPermissionMode,
@@ -682,7 +682,8 @@ pub use resources::{
 pub use runtime_event_reactor::{
     RuntimeEventReactor, RuntimeEventReactorHealth, RuntimeEventReactorShutdownReport,
     RuntimeProjectionDescriptor, RuntimeProjectionFuture, RuntimeProjectionLane,
-    RuntimeProjectionLaneHealth, RuntimeProjectionLatencyClass, RuntimeProjectionPass,
+    RuntimeProjectionLaneDrainReport, RuntimeProjectionLaneHealth, RuntimeProjectionLatencyClass,
+    RuntimeProjectionPass,
 };
 pub use runtime_event_replay::{
     candidate_from_action, RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind,

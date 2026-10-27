@@ -48,6 +48,254 @@ impl Drop for EnvVarGuard {
 // Serialize tests that mutate environment variables to avoid race conditions.
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+#[test]
+fn r5_inert_provider_requires_a_declaration_and_registry_resolution_sends_no_request() {
+    use std::net::TcpListener;
+    let _environment = ENV_MUTEX.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let home = root.path().join("operator");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let file = home.join("config.yaml");
+    fs::write(
+        &file,
+        "model: isolation-no-provider\nruntime: {background: {evolution: false, growth: false}}\n",
+    )
+    .unwrap();
+    let old = ConfigLoader::new(&project, &home).load().unwrap();
+    assert_eq!(
+        old.resolved_model().as_deref(),
+        Some("isolation-no-provider")
+    );
+    let old_registry = crate::ProviderRegistry::new(old.providers().clone()).unwrap();
+    assert!(
+        old_registry
+            .pin()
+            .resolve("isolation-no-provider")
+            .is_none(),
+        "model declaration alone must not infer a provider or credentials"
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    fs::write(&file, format!("model: isolation-no-provider\nruntime: {{background: {{evolution: false, growth: false}}}}\nproviders:\n  r5-no-provider:\n    baseUrl: {url}\n    apiKey: r5-synthetic-only\n    models: [isolation-no-provider]\n    protocol: completions\n")).unwrap();
+    let loaded = ConfigLoader::new(&project, &home).load().unwrap();
+    let registry = crate::ProviderRegistry::new(loaded.providers().clone()).unwrap();
+    let pinned = registry.pin();
+    let provider = pinned
+        .resolve("isolation-no-provider")
+        .expect("explicit declared model resolves");
+    assert_eq!(provider.name, "r5-no-provider");
+    assert_eq!(provider.base_url, url);
+    assert_eq!(provider.models, ["isolation-no-provider"]);
+    assert_eq!(
+        ProviderProtocol::effective_for_provider(provider).unwrap(),
+        ProviderProtocol::Completions
+    );
+    assert!(pinned.resolve("foreign-model").is_none());
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "configuration and registry resolution must never send a model request"
+    );
+}
+
+#[test]
+fn background_work_defaults_preserve_production_and_independent_explicit_isolation() {
+    use super::{parse_optional_background_work_config, BackgroundWorkConfig};
+    let parse = |yaml: &str| {
+        let value = serde_yaml::from_str::<serde_yaml::Value>(yaml).unwrap();
+        let json = super::yaml_to_json(value).unwrap();
+        parse_optional_background_work_config(&json).unwrap()
+    };
+    assert_eq!(
+        RuntimeConfig::empty().background_work(),
+        BackgroundWorkConfig {
+            evolution: true,
+            growth: true,
+        }
+    );
+    assert_eq!(
+        parse("{}"),
+        BackgroundWorkConfig {
+            evolution: true,
+            growth: true
+        }
+    );
+    assert_eq!(
+        parse("runtime: {background: {}}"),
+        BackgroundWorkConfig {
+            evolution: true,
+            growth: true,
+        }
+    );
+    assert_eq!(
+        parse("runtime: {background: {evolution: false}}"),
+        BackgroundWorkConfig {
+            evolution: false,
+            growth: true,
+        }
+    );
+    assert_eq!(
+        parse("runtime: {background: {growth: false}}"),
+        BackgroundWorkConfig {
+            evolution: true,
+            growth: false,
+        }
+    );
+    assert_eq!(
+        parse("runtime: {background: {evolution: false, growth: false}}"),
+        BackgroundWorkConfig {
+            evolution: false,
+            growth: false,
+        }
+    );
+}
+
+#[test]
+fn background_work_rejects_unknown_or_untyped_control_without_defaulting_on() {
+    use super::parse_optional_background_work_config;
+    for yaml in [
+        "runtime: {background: null}",
+        "runtime: {background: false}",
+        "runtime: {background: {evolution: null}}",
+        "runtime: {background: {evolution: 'false'}}",
+        "runtime: {background: {growth: 0}}",
+        "runtime: {background: {growth: []}}",
+        "runtime: {background: {growth: {}, evolution: true}}",
+        "runtime: {background: {evoluton: false}}",
+    ] {
+        let value = serde_yaml::from_str::<serde_yaml::Value>(yaml).unwrap();
+        let json = super::yaml_to_json(value).unwrap();
+        assert!(
+            parse_optional_background_work_config(&json).is_err(),
+            "{yaml}"
+        );
+    }
+}
+
+#[test]
+fn background_work_file_layers_and_fresh_load_preserve_each_explicit_control() {
+    use super::BackgroundWorkConfig;
+    let _environment = ENV_MUTEX.lock().unwrap();
+    let root = temp_dir();
+    let project = root.join("project");
+    let home = root.join("home");
+    fs::create_dir_all(project.join(".cowd")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let loader = || ConfigLoader::new(&project, &home).load().unwrap();
+    assert_eq!(
+        loader().background_work(),
+        BackgroundWorkConfig {
+            evolution: true,
+            growth: true
+        }
+    );
+    fs::write(
+        home.join("config.yaml"),
+        "runtime: {background: {evolution: false}}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        loader().background_work(),
+        BackgroundWorkConfig {
+            evolution: false,
+            growth: true
+        }
+    );
+    fs::write(
+        home.join("config.yml"),
+        "runtime: {background: {growth: false}}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        loader().background_work(),
+        BackgroundWorkConfig {
+            evolution: false,
+            growth: false
+        }
+    );
+    fs::write(
+        home.join("config.yaml"),
+        "runtime: {background: {evolution: true}}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        loader().background_work(),
+        BackgroundWorkConfig {
+            evolution: true,
+            growth: false
+        }
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn background_work_rejects_workspace_or_environment_management_overrides() {
+    let _environment = ENV_MUTEX.lock().unwrap();
+    let root = temp_dir();
+    let project = root.join("project");
+    let home = root.join("home");
+    fs::create_dir_all(project.join(".cowd")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.yaml"),
+        "runtime: {background: {evolution: false, growth: false}}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        ConfigLoader::new(&project, &home)
+            .load()
+            .unwrap()
+            .background_work(),
+        super::BackgroundWorkConfig {
+            evolution: false,
+            growth: false
+        }
+    );
+    for name in ["config.yaml", "config.local.yaml"] {
+        let path = project.join(".cowd").join(name);
+        fs::write(&path, "runtime: {background: {growth: true}}\n").unwrap();
+        let error = ConfigLoader::new(&project, &home).load().unwrap_err();
+        assert!(error.to_string().contains("operator-owned"), "{error}");
+        fs::remove_file(path).unwrap();
+    }
+    let injected_key = "COWD_RUNTIME__BACKGROUND_EVOLUTION";
+    let before = std::env::var_os(injected_key);
+    let path = project.join(".cowd/config.yaml");
+    fs::write(&path, format!("env:\n  {injected_key}: 'true'\n")).unwrap();
+    let error = ConfigLoader::new(&project, &home).load().unwrap_err();
+    assert!(
+        error.to_string().contains("cannot be injected through env"),
+        "{error}"
+    );
+    assert_eq!(
+        std::env::var_os(injected_key),
+        before,
+        "reject before injecting process environment"
+    );
+    fs::remove_file(path).unwrap();
+    let overrides = JsonValue::parse(r#"{"runtime":{"background":{"evolution":true}}}"#).unwrap();
+    let error = super::validate_background_config_source(
+        ConfigSource::Environment,
+        overrides.as_object().unwrap(),
+        Path::new("<environment>"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("operator-owned"));
+    assert_eq!(
+        ConfigLoader::new(&project, &home)
+            .load()
+            .unwrap()
+            .background_work(),
+        super::BackgroundWorkConfig {
+            evolution: false,
+            growth: false
+        }
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn temp_dir() -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

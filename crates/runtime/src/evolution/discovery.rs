@@ -22,6 +22,7 @@ use crate::{
 };
 
 const SIGNAL_PREFIX: &str = "evolution:signal:";
+const DISCOVERY_ADMITTED_KIND: &str = "evolution.signal.discovery_admitted.v1";
 const DIAGNOSIS_PREFIX: &str = "evolution:diagnosis:";
 const MISSION_PREFIX: &str = "evolution:mission:";
 const PROPOSAL_PREFIX: &str = "evolution:proposal:";
@@ -44,9 +45,24 @@ impl EvolutionDiscoveryService {
     }
 
     pub(crate) fn record_signal(&self, signal: EvolutionSignal) -> Result<EvolutionSignal, String> {
+        self.record_signal_with_automatic_discovery(signal, true)
+    }
+
+    // Raw observations remain durable while automatic discovery is paused.
+    // Both paths use this same signal identity/validation/append owner; the
+    // policy controls derived Case work, never whether history is recorded.
+    pub(crate) fn record_signal_with_automatic_discovery(
+        &self,
+        signal: EvolutionSignal,
+        automatic_discovery: bool,
+    ) -> Result<EvolutionSignal, String> {
         validate_signal(&signal)?;
         if let Some(existing) = self.signal(&signal.signal_id)? {
             if existing == signal {
+                if !automatic_discovery {
+                    return Ok(existing);
+                }
+                self.admit_automatic_discovery(&existing)?;
                 let case = self.observe_case(&existing)?;
                 if matches!(
                     case.state,
@@ -84,6 +100,10 @@ impl EvolutionDiscoveryService {
         let recorded = self
             .signal(&signal.signal_id)?
             .ok_or_else(|| "recorded evolution signal was not materialized".to_string())?;
+        if !automatic_discovery {
+            return Ok(recorded);
+        }
+        self.admit_automatic_discovery(&recorded)?;
         let case = self.observe_case(&recorded)?;
         if matches!(
             case.state,
@@ -93,6 +113,111 @@ impl EvolutionDiscoveryService {
             self.promote_case(&case.case_id)?;
         }
         Ok(recorded)
+    }
+
+    fn admit_automatic_discovery(&self, signal: &EvolutionSignal) -> Result<(), String> {
+        let stream = signal_stream(&signal.signal_id);
+        let key = format!("automatic-discovery:{}", signal.signal_id);
+        let digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(signal).map_err(|error| error.to_string())?)
+        );
+        if let Some(existing) = self
+            .event_store
+            .event_by_idempotency_key(&stream, &key)
+            .map_err(|error| error.to_string())?
+        {
+            if existing.kind == DISCOVERY_ADMITTED_KIND
+                && existing.payload
+                    == serde_json::json!({"signal_id":signal.signal_id,"signal_digest":digest})
+            {
+                return Ok(());
+            }
+            return Err("evolution automatic discovery admission identity conflict".into());
+        }
+        self.event_store
+            .append_batch_if_revision(
+                stream.clone(),
+                self.stream_revision(&stream)?,
+                format!("evolution-discovery-admission:{}", signal.signal_id),
+                vec![evolution_event(
+                    stream,
+                    DISCOVERY_ADMITTED_KIND,
+                    Some("admitted"),
+                    vec![RuntimeEventRef {
+                        kind: "evolution_signal".into(),
+                        id: signal.signal_id.clone(),
+                    }],
+                    serde_json::json!({"signal_id":signal.signal_id,"signal_digest":digest}),
+                    Some(key),
+                )],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Only this original owner's durable admission receipt permits paused
+    /// recovery. A raw signal, a digest or missing legacy metadata is not an
+    /// authorization to start automatic Case derivation while disabled.
+    pub(crate) fn recover_admitted_signals_page(
+        &self,
+        after: Option<(u64, u32)>,
+    ) -> Result<(Option<(u64, u32)>, bool), String> {
+        let page = self
+            .event_store
+            .list_scope_kind_page_asc(
+                RuntimeEventScope::Evolution,
+                DISCOVERY_ADMITTED_KIND,
+                after,
+                32,
+            )
+            .map_err(|error| error.to_string())?;
+        for admission in &page {
+            let id = admission
+                .payload
+                .get("signal_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or("evolution discovery admission omitted identity")?;
+            let stream = signal_stream(id);
+            let key = format!("automatic-discovery:{id}");
+            let primary = self
+                .event_store
+                .event_by_idempotency_key(&stream, &key)
+                .map_err(|error| error.to_string())?
+                .ok_or("evolution discovery admission primary is missing")?;
+            if admission.scope != RuntimeEventScope::Evolution
+                || admission.kind != DISCOVERY_ADMITTED_KIND
+                || admission.stream_id != stream
+                || primary.event_id != admission.event_id
+                || primary.payload != admission.payload
+            {
+                return Err("evolution discovery admission primary identity mismatch".into());
+            }
+            let signal = self
+                .signal(id)?
+                .ok_or("admitted evolution signal is missing")?;
+            validate_signal(&signal)?;
+            let digest = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&signal).map_err(|error| error.to_string())?)
+            );
+            if admission
+                .payload
+                .get("signal_digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(digest.as_str())
+            {
+                return Err("admitted evolution signal material changed".into());
+            }
+            self.record_signal(signal)?;
+        }
+        Ok((
+            page.last()
+                .map(|event| (event.commit_cursor, event.transaction_index))
+                .or(after),
+            page.len() < 32,
+        ))
     }
 
     /// Materialize a deterministic projector signal without letting a replayed
@@ -116,7 +241,7 @@ impl EvolutionDiscoveryService {
 
     pub(crate) fn signal(&self, signal_id: &str) -> Result<Option<EvolutionSignal>, String> {
         self.event_store
-            .latest_for_stream(&signal_stream(signal_id))?
+            .latest_for_stream_kind(&signal_stream(signal_id), "evolution.signal.recorded.v1")?
             .filter(|event| event.kind == "evolution.signal.recorded.v1")
             .and_then(|event| event.payload.get("signal").cloned())
             .map(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
@@ -1240,6 +1365,127 @@ mod tests {
         assert_eq!(discovery.list_diagnoses().expect("diagnoses").len(), 1);
         assert_eq!(discovery.list_missions().expect("missions").len(), 1);
         assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+    }
+
+    #[test]
+    fn paused_discovery_recovers_only_original_admission_without_replaying_raw_facts() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let discovery = EvolutionDiscoveryService::new(Arc::clone(&events));
+        let mut admitted = signal();
+        admitted.signal_id = "admitted-before-case".into();
+        let mut raw_only = signal();
+        raw_only.signal_id = "raw-while-paused".into();
+        raw_only.scope.affected_subject = "independent-paused-subject".into();
+        for input in [&admitted, &raw_only] {
+            discovery
+                .record_signal_with_automatic_discovery(input.clone(), false)
+                .unwrap();
+        }
+        assert_eq!(discovery.case_index().unwrap().total_cases, 0);
+        assert_eq!(
+            discovery.recover_admitted_signals_page(None).unwrap(),
+            (None, true)
+        );
+        assert_eq!(discovery.case_index().unwrap().total_cases, 0);
+        // Stop at the real owner's durable admission boundary, before any Case
+        // write. Reopening this domain reader is not a full Runtime/PG restart.
+        discovery.admit_automatic_discovery(&admitted).unwrap();
+        assert_eq!(
+            discovery.signal("admitted-before-case").unwrap(),
+            Some(admitted)
+        );
+        drop(discovery);
+        let reopened = EvolutionDiscoveryService::new(Arc::clone(&events));
+        let (cursor, complete) = reopened.recover_admitted_signals_page(None).unwrap();
+        assert!(complete && cursor.is_some());
+        let cases = reopened.list_cases(10).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(
+            cases[0].signal_ids,
+            vec!["admitted-before-case".to_string()]
+        );
+        assert_eq!(reopened.case_index().unwrap().total_signal_observations, 1);
+        reopened.recover_admitted_signals_page(None).unwrap();
+        assert_eq!(reopened.case_index().unwrap().total_signal_observations, 1);
+        assert_eq!(reopened.signal("raw-while-paused").unwrap(), Some(raw_only));
+    }
+
+    #[test]
+    fn paused_domain_status_waits_for_the_entire_admitted_discovery_page_sequence() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let projector = crate::evolution::projector::EvolutionSignalProjector::new(
+            Arc::clone(&events),
+            Arc::clone(&discovery),
+        );
+        projector.ensure_source_epoch().unwrap();
+        for index in 0..35 {
+            let mut input = signal();
+            input.signal_id = format!("paused-admitted-{index}");
+            discovery
+                .record_signal_with_automatic_discovery(input.clone(), false)
+                .unwrap();
+            discovery.admit_automatic_discovery(&input).unwrap();
+        }
+        assert_eq!(discovery.case_index().unwrap().total_cases, 0);
+        projector.pause_sources(None).unwrap();
+        projector.reconcile_paused_claims().unwrap();
+        assert_eq!(
+            discovery.case_index().unwrap().total_signal_observations,
+            32
+        );
+        assert!(
+            !projector.paused_claim_status().unwrap().0,
+            "one completed 32-record page cannot certify the remaining three admissions drained"
+        );
+        projector.reconcile_paused_claims().unwrap();
+        assert_eq!(
+            discovery.case_index().unwrap().total_signal_observations,
+            35
+        );
+        assert_eq!(projector.paused_claim_status().unwrap(), (true, 0));
+    }
+
+    #[test]
+    fn paused_discovery_rejects_foreign_admission_and_changed_material_before_case_write() {
+        for foreign_stream in [false, true] {
+            let events = Arc::new(RuntimeEventStore::for_test());
+            let discovery = EvolutionDiscoveryService::new(Arc::clone(&events));
+            let mut input = signal();
+            input.signal_id = "unadmitted-material".into();
+            discovery
+                .record_signal_with_automatic_discovery(input.clone(), false)
+                .unwrap();
+            assert_eq!(
+                discovery.recover_admitted_signals_page(None).unwrap(),
+                (None, true)
+            );
+            assert_eq!(discovery.case_index().unwrap().total_cases, 0);
+            let stream = if foreign_stream {
+                "evolution:signal:foreign-source".to_string()
+            } else {
+                signal_stream("unadmitted-material")
+            };
+            events.append_batch_if_revision(stream.clone(), discovery.stream_revision(&stream).unwrap(),
+                "foreign-or-changed-admission", vec![evolution_event(stream, DISCOVERY_ADMITTED_KIND,
+                    Some("admitted"), Vec::new(), serde_json::json!({
+                        "signal_id":"unadmitted-material", "signal_digest":"sha256:wrong-material"
+                    }), Some("automatic-discovery:unadmitted-material".into()))]).unwrap();
+            let error = discovery.recover_admitted_signals_page(None).unwrap_err();
+            assert!(
+                error.contains(if foreign_stream {
+                    "admission primary is missing"
+                } else {
+                    "signal material changed"
+                }),
+                "{error}"
+            );
+            assert_eq!(discovery.case_index().unwrap().total_cases, 0);
+            assert_eq!(
+                discovery.signal("unadmitted-material").unwrap(),
+                Some(input)
+            );
+        }
     }
 
     #[test]

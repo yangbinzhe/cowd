@@ -579,6 +579,10 @@ const APPROVAL_FIELDS: &[FieldSpec] = &[
 
 const RUNTIME_FIELDS: &[FieldSpec] = &[
     FieldSpec {
+        name: "background",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "scenario",
         expected: FieldType::String,
     },
@@ -593,6 +597,17 @@ const RUNTIME_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "control",
         expected: FieldType::Object,
+    },
+];
+
+const RUNTIME_BACKGROUND_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "evolution",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "growth",
+        expected: FieldType::Bool,
     },
 ];
 
@@ -1006,6 +1021,15 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+        if let Some(background) = runtime.get("background").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                background,
+                RUNTIME_BACKGROUND_FIELDS,
+                "runtime.background",
+                source,
+                &path_display,
+            ));
+        }
         if let Some(control) = runtime.get("control").and_then(JsonValue::as_object) {
             result.merge(validate_object_keys(
                 control,

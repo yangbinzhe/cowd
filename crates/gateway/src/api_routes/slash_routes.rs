@@ -98,7 +98,15 @@ async fn slash_dispatch_handler(
     Json(body): Json<SlashDispatchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let args = body.args.unwrap_or_else(|| serde_json::json!({}));
-    if !slash_command_is_read_only(&body.command, &args) {
+    let instance_management = state.services.slash.detail(&body.command).is_some_and(|definition| {
+        matches!(definition.action, crate::command::slash::CommandActionTarget::Runtime { ref operation }
+            if matches!(operation.as_str(), "runtime.background.evolution" | "runtime.background.growth"))
+    });
+    if instance_management {
+        crate::runtime_host::config_reload::require_background_operator(&principal.0)
+            .map_err(|error| api_error(StatusCode::FORBIDDEN, error))?;
+    }
+    if !instance_management && !slash_command_is_read_only(&body.command, &args) {
         let session_id = args
             .get("session_id")
             .and_then(serde_json::Value::as_str)
@@ -121,7 +129,7 @@ async fn slash_dispatch_handler(
     let receipt = state
         .services
         .slash
-        .dispatch(&body.command, args)
+        .dispatch_authenticated(&body.command, args, &principal.0, &state)
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     if !receipt.ok {

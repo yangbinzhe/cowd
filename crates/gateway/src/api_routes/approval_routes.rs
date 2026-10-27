@@ -298,18 +298,27 @@ async fn risk_receipt_handler(
         .await
         .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
     let audit = state.services.audit.risk_gate_projection(&receipt);
-    let growth = state
-        .services
-        .growth
-        .ingest_risk_gate_receipt(
-            &state.config_home,
-            &state.services.memory,
-            &state.services.matrix,
-            body.session_id
-                .unwrap_or_else(|| "approval-risk-receipt".to_string()),
-            &receipt,
-        )
-        .await;
+    // Approval and audit are the explicit governance result. Attached Growth
+    // promotion is automatic and must use the original background admission.
+    let event = state.services.growth.build_risk_gate_event(
+        body.session_id
+            .unwrap_or_else(|| "approval-risk-receipt".to_string()),
+        &receipt,
+    );
+    let growth = match state.services.runtime.as_ref() {
+        Some(runtime) => match runtime
+            .runtime_services()
+            .admit_growth_risk_source(event.clone())
+        {
+            Ok(admitted) => {
+                serde_json::json!({"event":event,"status":if admitted{"queued"}else{"disabled"},"promotion_settled":false})
+            }
+            Err(error) => {
+                serde_json::json!({"event":event,"status":"error","promotion_settled":false,"error":error})
+            }
+        },
+        None => serde_json::json!({"status":"unavailable","promotion_settled":false}),
+    };
     Ok(Json(serde_json::json!({
         "ok": true,
         "receipt": receipt,

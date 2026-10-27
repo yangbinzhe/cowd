@@ -53,6 +53,222 @@ impl TestRuntimeBackends {
     }
 }
 
+#[test]
+fn background_evolution_configuration_controls_real_registration_without_removing_governance() {
+    for production_default in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let backends = TestRuntimeBackends::new(root.path());
+        let builder = backends.builder(root.path().join("home"), &workspace);
+        // No setting in the first branch: exercise the production builder's
+        // actual default and common assembly, not a copied expected bool.
+        let builder = if production_default {
+            builder
+        } else {
+            builder.background_work(crate::BackgroundWorkConfig {
+                evolution: false,
+                growth: false,
+            })
+        };
+        let services = builder.build().unwrap();
+        let ids = services
+            .event_reactor
+            .health()
+            .unwrap()
+            .lanes
+            .into_iter()
+            .map(|lane| lane.projection_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids.contains("projector:evolution-case:v2"),
+            production_default
+        );
+        assert_eq!(
+            ids.contains("projector:agentic-collaboration-experience:v1"),
+            production_default
+        );
+        assert_eq!(
+            services.evolution_analyst.read().unwrap().is_some(),
+            production_default
+        );
+        // Historical management/query owners are retained independently of
+        // automatic lane activation and do not require constructing an analyst.
+        assert!(services
+            .evolution_analysis("absent-case")
+            .unwrap()
+            .is_none());
+        assert!(services.evolution_cases(1).unwrap().is_empty());
+        assert!(
+            !ids.is_empty(),
+            "ordinary recovery/read-model owners remain registered"
+        );
+        let mut observation = crate::EvolutionSignal::low_novelty_tool_loop(
+            "runtime",
+            "background-control-observation",
+            vec![harness_contract::reality::EvidenceRef::observed(
+                "runtime_event",
+                "background-control-source",
+            )],
+        );
+        observation.severity = crate::EvolutionSignalSeverity::Critical;
+        let recorded = services
+            .record_evolution_signal(observation.clone())
+            .unwrap();
+        assert_eq!(
+            recorded, observation,
+            "raw source survives independent of policy"
+        );
+        assert_eq!(
+            services.evolution_signal(&recorded.signal_id).unwrap(),
+            Some(recorded.clone())
+        );
+        assert_eq!(
+            services.record_evolution_signal(recorded.clone()).unwrap(),
+            recorded
+        );
+        assert_eq!(
+            services.evolution_cases(10).unwrap().len(),
+            usize::from(production_default)
+        );
+        let mut conflicting = recorded.clone();
+        conflicting.summary = "changed payload under the original identity".into();
+        assert!(services
+            .record_evolution_signal(conflicting)
+            .unwrap_err()
+            .to_string()
+            .contains("signal idempotency conflict"));
+        if production_default {
+            let precondition_executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            precondition_executor.block_on(async {
+                assert!(services
+                    .drain_evolution_background_physical(tokio::time::Instant::now())
+                    .await
+                    .unwrap_err()
+                    .contains("stopped"));
+            });
+        }
+        services.stop_evolution_background_admission();
+        let cases_before = services.evolution_cases(10).unwrap();
+        let mut after_stop = observation;
+        after_stop.signal_id = "evo-signal-background-after-stop".into();
+        after_stop.source.session_id = Some("background-after-stop".into());
+        services
+            .record_evolution_signal(after_stop.clone())
+            .unwrap();
+        assert_eq!(
+            services.evolution_signal(&after_stop.signal_id).unwrap(),
+            Some(after_stop)
+        );
+        assert_eq!(
+            services.evolution_cases(10).unwrap(),
+            cases_before,
+            "stopped direct observation cannot bypass automatic lane admission"
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            if !production_default {
+                let error = services
+                    .analyze_evolution_case("absent-case", "not-a-provider")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("evolution_background_disabled"),
+                    "{error}"
+                );
+                services
+                    .drain_evolution_background_physical(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let reports = services
+                    .drain_evolution_background_physical(
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(reports.len(), 2);
+                assert!(reports.iter().all(|report| report.last_error.is_none()));
+                let remaining = services
+                    .event_reactor
+                    .health()
+                    .unwrap()
+                    .lanes
+                    .into_iter()
+                    .map(|lane| lane.projection_id)
+                    .collect::<BTreeSet<_>>();
+                let expected = ids
+                    .iter()
+                    .filter(|id| {
+                        id.as_str() != "projector:evolution-case:v2"
+                            && id.as_str() != "projector:agentic-collaboration-experience:v1"
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(remaining, expected, "stop only this background domain");
+            }
+            let growth_before = services.background_work().growth;
+            services.resume_evolution_background_admission().unwrap();
+            services.resume_evolution_background_admission().unwrap();
+            assert_eq!(
+                services.background_work().growth,
+                growth_before,
+                "Evolution control cannot alter Growth policy"
+            );
+            let resumed = services.event_reactor_health().unwrap();
+            assert_eq!(
+                resumed
+                    .lanes
+                    .iter()
+                    .filter(|lane| matches!(
+                        lane.projection_id.as_str(),
+                        "projector:evolution-case:v2"
+                            | "projector:agentic-collaboration-experience:v1"
+                    ))
+                    .count(),
+                2,
+                "repeated on must leave exactly the original two lanes"
+            );
+            services.evolution_signal_projector.run_once(128).unwrap();
+            assert_eq!(
+                services.evolution_cases(10).unwrap(),
+                cases_before,
+                "resume must not bootstrap paused raw signals into new Cases"
+            );
+            let mut new_observation = recorded.clone();
+            new_observation.signal_id = "evo-signal-background-after-resume".into();
+            new_observation.source.session_id = Some("background-after-resume".into());
+            services.record_evolution_signal(new_observation).unwrap();
+            assert_eq!(
+                services.evolution_cases(10).unwrap().len(),
+                cases_before.len() + 1,
+                "current observation remains eligible after resume"
+            );
+            services.stop_evolution_background_admission();
+            services
+                .drain_evolution_background_physical(
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            services.shutdown_maintenance().await;
+            let report = services.shutdown_execution().await;
+            assert_eq!(report.forced_aborts, 0);
+            assert_eq!(report.remaining_keys, 0);
+            assert!(report.errors.is_empty(), "{report:?}");
+        });
+        drop(services);
+    }
+}
+
 fn publish_agent_test_policy(services: &RuntimeServices, session_id: &str) {
     services.publish_session_execution_policy(
         session_id,
@@ -955,6 +1171,61 @@ async fn maintenance_supervisor_serializes_concurrent_submissions_per_owner() {
     assert_eq!(maximum.load(Ordering::SeqCst), 1);
     assert_eq!(completed.load(Ordering::SeqCst), 8);
     assert_eq!(supervisor.tracked_task_count(), 0);
+}
+
+#[tokio::test]
+async fn evolution_maintenance_drain_keeps_work_after_waiter_drop_without_stopping_memory_owner() {
+    let supervisor = RuntimeMaintenanceSupervisor::new();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let memory_release = Arc::new(tokio::sync::Notify::new());
+    let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<()>();
+    supervisor
+        .try_submit("evolution:analysis:controlled".into(), {
+            let entered = entered.clone();
+            let release = release.clone();
+            let returned = returned.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                returned.store(true, Ordering::SeqCst);
+                let _ = result_tx.send(());
+            }
+        })
+        .unwrap();
+    supervisor
+        .try_submit("memory:ordinary".into(), {
+            let release = memory_release.clone();
+            async move {
+                release.notified().await;
+            }
+        })
+        .unwrap();
+    drop(result_rx);
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert!(supervisor.pending_for_owner_prefix("evolution:") > 0);
+    assert!(supervisor
+        .drain_owner_prefix("evolution:", tokio::time::Instant::now())
+        .await
+        .is_err());
+    assert!(!returned.load(Ordering::SeqCst));
+    release.notify_one();
+    supervisor
+        .drain_owner_prefix(
+            "evolution:",
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(returned.load(Ordering::SeqCst));
+    assert_eq!(supervisor.pending_for_owner_prefix("evolution:"), 0);
+    assert_eq!(supervisor.pending_for_owner_prefix("memory:"), 1);
+    memory_release.notify_one();
+    supervisor.shutdown_and_drain().await;
+    assert_eq!(supervisor.pending_for_owner_prefix("memory:"), 0);
 }
 
 #[tokio::test]

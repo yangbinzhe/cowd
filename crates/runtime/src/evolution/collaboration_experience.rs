@@ -24,7 +24,7 @@ pub(crate) const EPISODE_KIND: &str = "evolution.collaboration_experience.record
 pub(crate) const PATTERN_KIND: &str = "evolution.collaboration_pattern.projected.v1";
 const SUPPORT_KIND: &str = "evolution.collaboration_pattern.support_updated.v1";
 const VERDICT_KIND: &str = "agentic.objective_verdict_bound";
-const PROJECTOR_ID: &str = "projector:agentic-collaboration-experience:v1";
+pub(crate) const PROJECTOR_ID: &str = "projector:agentic-collaboration-experience:v1";
 // Bounds projection working memory, not task length or model output. Complete
 // episodes remain durable; this is a recent independent evidence window only.
 const SUPPORT_WINDOW: usize = 256;
@@ -74,49 +74,103 @@ impl CollaborationExperienceProjector {
         ))
     }
 
-    pub(crate) fn project_available(
-        &self,
-        batch_size: usize,
-    ) -> Result<RuntimeProjectionPass, String> {
+    pub(crate) fn recover_admitted_page(&self) -> Result<(), String> {
         let checkpoint = self
             .store
             .projection_checkpoint(PROJECTOR_ID)
             .map_err(|error| error.to_string())?;
-        let cursor = checkpoint.as_ref().map_or(0, |value| value.source_cursor);
+        if let Some(batch) = checkpoint
+            .as_ref()
+            .and_then(|entry| entry.payload.get("pending_batch_size"))
+        {
+            let batch = batch
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0 && *value <= 10_000)
+                .ok_or("invalid collaboration admitted bound")?;
+            self.project_available(batch)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn project_available(
+        &self,
+        batch_size: usize,
+    ) -> Result<RuntimeProjectionPass, String> {
+        let mut checkpoint = self
+            .store
+            .projection_checkpoint(PROJECTOR_ID)
+            .map_err(|error| error.to_string())?;
+        let cursor = checkpoint.as_ref().map_or(0, |entry| entry.source_cursor);
+        let pending = checkpoint
+            .as_ref()
+            .and_then(|entry| entry.payload.get("pending_upper_cursor"));
+        let limit = match checkpoint
+            .as_ref()
+            .and_then(|entry| entry.payload.get("pending_batch_size"))
+        {
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0 && *value <= 10_000)
+                .ok_or("invalid collaboration admitted bound")?,
+            None if pending.is_some() => {
+                return Err("collaboration admitted page omitted its bound".into())
+            }
+            None => batch_size.clamp(1, 10_000),
+        };
         let page = self
             .store
-            .projection_scan_page(
-                cursor,
-                &Self::interest(),
-                batch_size.max(1),
-                10_000,
-                16 * 1024 * 1024,
-            )
+            .projection_scan_page(cursor, &Self::interest(), limit, 10_000, 16 * 1024 * 1024)
             .map_err(|error| error.to_string())?;
-        if page.scanned_commits == 0 {
-            return Ok(RuntimeProjectionPass::default());
-        }
-        for batch in &page.batches {
+        let upper = match pending {
+            Some(value) => value
+                .as_u64()
+                .filter(|upper| *upper >= cursor)
+                .ok_or("invalid collaboration admitted source cut")?,
+            None => {
+                if page.scanned_commits == 0 {
+                    return Ok(RuntimeProjectionPass::default());
+                }
+                let entry = self.store.compare_and_put_projection_checkpoint(PROJECTOR_ID, cursor,
+                    checkpoint.as_ref().map_or(0, |entry| entry.revision),
+                    &json!({"pending_upper_cursor":page.scanned_through_cursor,"pending_batch_size":limit}), episode::now_ms())
+                    .map_err(|error| error.to_string())?;
+                let upper = page.scanned_through_cursor;
+                checkpoint = Some(entry);
+                upper
+            }
+        };
+        let mut matched = 0;
+        for batch in page
+            .batches
+            .iter()
+            .filter(|batch| batch.commit_cursor <= upper)
+        {
             for event in &batch.events {
                 let episode =
                     episode::from_verdict(&self.store, &self.graphs, &self.workspace_key, event)?;
                 self.record_episode(&episode, &event.event_id)?;
+                matched += 1;
             }
         }
-        // Output transactions precede the source cursor. A crash here causes
-        // a safe replay, never a lost episode or a second pattern supporter.
+        if page.scanned_through_cursor < upper {
+            return Err("collaboration admitted page failed to reach its original cut".into());
+        }
         self.store
-            .put_projection_checkpoint_retrying(
+            .compare_and_put_projection_checkpoint(
                 PROJECTOR_ID,
-                page.scanned_through_cursor,
-                &json!({"matched_events": page.matched_events}),
+                upper,
+                checkpoint.as_ref().map_or(0, |entry| entry.revision),
+                &json!({"matched_events":matched}),
                 episode::now_ms(),
             )
             .map_err(|error| error.to_string())?;
-        Ok(
-            RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
-                .with_matches(page.matched_events),
+        Ok(RuntimeProjectionPass::scanned(
+            usize::try_from(upper.saturating_sub(cursor)).unwrap_or(usize::MAX),
+            limit,
         )
+        .with_matches(matched))
     }
 
     fn record_episode(

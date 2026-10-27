@@ -2171,6 +2171,40 @@ fn send_session_scoped_with_generation(
     .map_err(|_| ())
 }
 
+fn gateway_slash_status_message(command: &str, receipt: &serde_json::Value) -> String {
+    let status = receipt["status"].as_str().unwrap_or("complete");
+    let data = &receipt["data"];
+    if data["scope"].as_str() == Some("instance_all_sessions") {
+        return format!("Gateway /{command}: {status}; affects ALL sessions in this instance. desired={}; effective={}; revision={}; pending={}; error={}",
+            data["desired"], data["effective"], data["revision"], data["pending_analysis_claims"], data["error"]);
+    }
+    let dispatch = data["dispatch"].as_str().unwrap_or("gateway");
+    format!("Gateway slash /{command} {status} via {dispatch}")
+}
+
+#[cfg(test)]
+mod background_slash_display_tests {
+    #[test]
+    fn actual_gateway_receipt_displays_instance_scope_and_pending_without_claiming_off() {
+        let message = super::gateway_slash_status_message(
+            "evolution",
+            &serde_json::json!({
+            "status":"draining", "data":{"scope":"instance_all_sessions", "desired":{"evolution":false,"growth":true},
+            "effective":"draining", "revision":"revision-7", "pending_analysis_claims":1,"error":null}}),
+        );
+        assert!(message.contains("ALL sessions") && message.contains("draining"));
+        assert!(message.contains("revision-7") && message.contains("pending=1"));
+        assert!(message.contains("\"growth\":true"));
+        assert_eq!(
+            super::gateway_slash_status_message(
+                "status",
+                &serde_json::json!({"status":"complete"})
+            ),
+            "Gateway slash /status complete via gateway"
+        );
+    }
+}
+
 fn dispatch_gateway_slash(
     gateway_client: &GatewayApiClient,
     tx: &crate::events::CowdEventSender,
@@ -2198,22 +2232,12 @@ fn dispatch_gateway_slash(
         });
         match slash_client.slash_dispatch(&command, args).await {
             Ok(receipt) => {
-                let status = receipt
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("complete");
-                let dispatch = receipt
-                    .get("data")
-                    .and_then(|data| data.get("dispatch"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("gateway");
+                let message = gateway_slash_status_message(&command, &receipt);
                 let _ = send_session_scoped_with_generation(
                     &command_tx,
                     &event_session_id,
                     authority_generation,
-                    CowdEvent::Warning {
-                        message: format!("Gateway slash /{command} {status} via {dispatch}"),
-                    },
+                    CowdEvent::Warning { message },
                 );
             }
             Err(err) => {

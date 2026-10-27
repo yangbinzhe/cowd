@@ -349,7 +349,6 @@ fn test_services_for_workspace_with_config_home(
     tool_workspace_root: PathBuf,
     config_home: PathBuf,
 ) -> Arc<crate::services::GatewayServices> {
-    let sessions = Arc::new(ActiveSessionDirectory::new());
     let selected_storage = Arc::new(
         crate::selected_storage::SelectedStorageTopology::compose_for_test(
             &config_home,
@@ -357,6 +356,27 @@ fn test_services_for_workspace_with_config_home(
         )
         .expect("isolated PostgreSQL test topology; set COWD_TEST_POSTGRES_URL"),
     );
+    test_services_with_selected_storage(
+        session_repository,
+        surface_host,
+        tool_workspace_root,
+        config_home,
+        selected_storage,
+    )
+}
+
+fn test_services_with_selected_storage(
+    session_repository: Arc<SessionRepository>,
+    surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
+    tool_workspace_root: PathBuf,
+    config_home: PathBuf,
+    selected_storage: Arc<crate::selected_storage::SelectedStorageTopology>,
+) -> Arc<crate::services::GatewayServices> {
+    let sessions = Arc::new(ActiveSessionDirectory::new());
+    let background = runtime::ConfigLoader::new(&tool_workspace_root, &config_home)
+        .load()
+        .expect("explicit fixture operator configuration")
+        .background_work();
     let runtime_store = session_repository
         .test_unified_store()
         .unwrap_or_else(|| Arc::clone(&selected_storage.session_store));
@@ -372,6 +392,7 @@ fn test_services_for_workspace_with_config_home(
     );
     let session_runtime_port = crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
     let runtime_services = runtime::RuntimeServices::builder(&config_home, &tool_workspace_root)
+        .background_work(background)
         .provider_registry(test_provider_registry())
         .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
         .task_aggregate_service(Arc::clone(&selected_storage.task_service))
@@ -2296,4 +2317,412 @@ async fn webui_manifest_explains_gateway_runtime_host_router_relationship() {
     assert!(json["enabled_app_ids"]
         .as_array()
         .is_some_and(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn evolution_management_real_slash_rejects_session_writer_and_persists_across_cold_core() {
+    background_management_cold_core("evolution").await;
+}
+#[tokio::test]
+async fn growth_management_real_slash_preserves_evolution_and_persists_across_cold_core() {
+    background_management_cold_core("growth").await;
+}
+async fn background_management_cold_core(domain: &str) {
+    fn principal(home: &std::path::Path, capability: &str) -> runtime::VerifiedPrincipal {
+        let (envelope, key) = auth_broker::test_support::issue_human_principal(
+            home,
+            "isolated-evolution-management",
+            vec![capability.to_string()],
+            None,
+        )
+        .unwrap();
+        runtime::PrincipalVerifier::from_base64(&envelope.key_id, &key)
+            .unwrap()
+            .verify(&envelope)
+            .unwrap()
+    }
+    async fn command(
+        domain: &str,
+        state: Arc<AppState>,
+        principal: runtime::VerifiedPrincipal,
+        args: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = super::slash_routes::router()
+            .with_state(state)
+            .layer(Extension(AuthenticatedPrincipal(principal)))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(surface::gateway_api::paths::API_SLASH_DISPATCH.template())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"command":domain,"args":args}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("operator");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        if domain == "evolution" {
+            "runtime:\n  background:\n    evolution: true\n    growth: false\n"
+        } else {
+            "runtime:\n  background:\n    evolution: false\n    growth: true\n"
+        },
+    )
+    .unwrap();
+    let storage = Arc::new(
+        crate::selected_storage::SelectedStorageTopology::compose_for_test(&home, &workspace)
+            .expect("new isolated main PostgreSQL fixture required"),
+    );
+    storage
+        .preserve_failed_test_namespace()
+        .expect("owned fixture namespace");
+    let build = |storage: Arc<crate::selected_storage::SelectedStorageTopology>| {
+        let directory = Arc::new(ActiveSessionDirectory::new());
+        let bus = SessionProjectionHub::new();
+        let repository =
+            test_session_repository(directory, Some(Arc::clone(&storage.session_store)), bus);
+        Arc::new(AppState {
+            tool_registry: Arc::new(ToolCatalog::builtin()),
+            config: None,
+            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
+            auth_token: None,
+            workspace_root: workspace.clone(),
+            config_home: home.clone(),
+            profile_id: "default".into(),
+            profile_manager: test_profile_manager(),
+            services: test_services_with_selected_storage(
+                repository,
+                None,
+                workspace.clone(),
+                home.clone(),
+                Arc::clone(&storage),
+            ),
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
+        })
+    };
+    let operator = principal(
+        &root.path().join("authority-admin"),
+        "runtime.maintenance.manage",
+    );
+    let writer = principal(&root.path().join("authority-writer"), "session.write");
+    let state = build(Arc::clone(&storage));
+    let core = state.services.runtime.as_ref().unwrap().runtime_services();
+    crate::services::growth_projection_lane::initialize_growth_policy(
+        &storage.runtime_event_store,
+        core.background_work().growth,
+    )
+    .unwrap();
+    if core.background_work().growth {
+        core.register_growth_background_lane(
+            crate::services::growth_projection_lane(
+                home.clone(),
+                storage.runtime_event_store.clone(),
+                state.services.growth.clone(),
+                state.services.memory.clone(),
+                state.services.matrix.clone(),
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+    }
+    core.release_recovered_producers().await.unwrap();
+    let bytes_before = std::fs::read(home.join("config.yaml")).unwrap();
+    let (denied, _) = command(
+        domain,
+        Arc::clone(&state),
+        writer,
+        serde_json::json!({
+        "mode":"off", "capabilities":["runtime.maintenance.manage"]}),
+    )
+    .await;
+    assert_eq!(denied, StatusCode::FORBIDDEN);
+    assert_eq!(
+        std::fs::read(home.join("config.yaml")).unwrap(),
+        bytes_before
+    );
+    assert_eq!(core.background_work().evolution, domain == "evolution");
+    assert_eq!(core.background_work().growth, domain == "growth");
+    let (status, initial) = command(
+        domain,
+        Arc::clone(&state),
+        operator.clone(),
+        serde_json::json!({"mode":"status"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{initial}");
+    assert_eq!(initial["data"]["effective"], "on");
+    let (status, off) = command(
+        domain,
+        Arc::clone(&state),
+        operator.clone(),
+        serde_json::json!({"mode":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{off}");
+    assert_eq!(off["data"]["scope"], "instance_all_sessions");
+    assert_eq!(off["data"]["effective"], "off");
+    assert_eq!(off["data"]["durable_recovery"], "settled");
+    let projected = crate::runtime_host::config_reload::status_value(
+        &state.services.runtime.as_ref().unwrap().config_reload(),
+    );
+    assert_eq!(
+        projected["last_report"]["applied_sections"][format!("background_{domain}")]["effective"],
+        "off"
+    );
+    assert_eq!(
+        projected["last_report"]["applied_sections"][format!("background_{domain}")]["revision"],
+        off["data"]["revision"]
+    );
+    let persisted = std::fs::read(home.join("config.yaml")).unwrap();
+    if domain == "growth" {
+        let response=super::approval_routes::router().with_state(state.clone()).oneshot(
+            Request::builder().method("POST").uri(surface::gateway_api::paths::API_APPROVAL_RISK_RECEIPT.template())
+            .header("content-type","application/json").body(Body::from(serde_json::json!({"tool_name":"read_file","input":{"path":"Cargo.toml"},"session_id":"growth-risk-off"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], true);
+        assert!(value["receipt"].is_object());
+        assert!(value["audit"].is_object());
+        assert_eq!(value["growth"]["status"], "disabled");
+        assert_eq!(value["growth"]["promotion_settled"], false);
+        assert!(state
+            .services
+            .growth
+            .durable_event_log()
+            .unwrap()
+            .is_empty());
+    }
+
+    let (stale, _) = command(
+        domain,
+        Arc::clone(&state),
+        operator.clone(),
+        serde_json::json!({
+        "mode":"on", "expected_revision":initial["data"]["revision"]}),
+    )
+    .await;
+    assert_eq!(stale, StatusCode::BAD_REQUEST);
+    assert_eq!(std::fs::read(home.join("config.yaml")).unwrap(), persisted);
+    let weak = Arc::downgrade(&core);
+    let old_event_port = Arc::downgrade(&storage.runtime_event_store);
+    core.shutdown_maintenance().await;
+    let report = core.shutdown_execution().await;
+    assert_eq!(report.forced_aborts, 0);
+    assert_eq!(report.remaining_keys, 0);
+    assert!(report.errors.is_empty(), "{report:?}");
+    drop(core);
+    drop(state);
+    assert!(
+        weak.upgrade().is_none(),
+        "old Core must not remain alive across cold reopen"
+    );
+    // Reopen the original schema through its existing restart lease. The old
+    // Core and old domain ports must die; only namespace/executor ownership
+    // and operator files cross the epoch. No APP start/retry/recovery writer.
+    let topology = Arc::try_unwrap(storage)
+        .unwrap_or_else(|_| panic!("old Gateway still owns the selected topology"));
+    let lease = topology.detach_for_test_restart().unwrap();
+    assert!(
+        old_event_port.upgrade().is_none(),
+        "old event reader must not cross the cold epoch"
+    );
+    let reopened = Arc::new(lease.rebuild().unwrap());
+    let fresh = build(Arc::clone(&reopened));
+    let core = fresh.services.runtime.as_ref().unwrap().runtime_services();
+    assert!(!core.background_work().evolution && !core.background_work().growth);
+    core.release_recovered_producers().await.unwrap();
+    let (status, cold) = command(
+        domain,
+        Arc::clone(&fresh),
+        operator.clone(),
+        serde_json::json!({"mode":"status"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cold}");
+    assert_eq!(cold["data"]["effective"], "off");
+    let (status, on) = command(
+        domain,
+        Arc::clone(&fresh),
+        operator.clone(),
+        serde_json::json!({
+        "mode":"on", "expected_revision":cold["data"]["revision"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{on}");
+    assert_eq!(on["data"]["effective"], "on");
+    if domain == "growth" {
+        let health = core.event_reactor_health().unwrap();
+        assert_eq!(
+            health
+                .lanes
+                .iter()
+                .filter(|l| l.projection_id == "projector:growth:v1")
+                .count(),
+            1
+        );
+        let (_, again) = command(
+            domain,
+            fresh.clone(),
+            operator.clone(),
+            serde_json::json!({"mode":"on"}),
+        )
+        .await;
+        assert_eq!(again["data"]["effective"], "on");
+        assert_eq!(
+            core.event_reactor_health()
+                .unwrap()
+                .lanes
+                .iter()
+                .filter(|l| l.projection_id == "projector:growth:v1")
+                .count(),
+            1
+        );
+    }
+
+    assert_eq!(core.background_work().evolution, domain == "evolution");
+    assert_eq!(core.background_work().growth, domain == "growth");
+    if domain == "growth" {
+        let (status, both) = command(
+            "evolution",
+            fresh.clone(),
+            operator.clone(),
+            serde_json::json!({"mode":"on"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{both}");
+        assert_eq!(both["data"]["effective"], "on");
+        assert!(core.background_work().evolution && core.background_work().growth);
+        let revision = both["data"]["revision"].clone();
+        let (left, right) = tokio::join!(
+            command(
+                "evolution",
+                fresh.clone(),
+                operator.clone(),
+                serde_json::json!({"mode":"off","expected_revision":revision})
+            ),
+            command(
+                "growth",
+                fresh.clone(),
+                operator.clone(),
+                serde_json::json!({"mode":"off","expected_revision":revision})
+            )
+        );
+        assert_eq!(
+            [left.0, right.0]
+                .iter()
+                .filter(|s| **s == StatusCode::OK)
+                .count(),
+            1,
+            "{left:?} {right:?}"
+        );
+        assert_eq!(
+            [left.0, right.0]
+                .iter()
+                .filter(|s| **s == StatusCode::BAD_REQUEST)
+                .count(),
+            1
+        );
+        let persisted = runtime::ConfigLoader::new(&workspace, &home)
+            .load()
+            .unwrap()
+            .background_work();
+        assert_ne!(
+            persisted.evolution, persisted.growth,
+            "one revision may change exactly one domain"
+        );
+        let (status, other_off) = command(
+            "evolution",
+            fresh.clone(),
+            operator.clone(),
+            serde_json::json!({"mode":"off"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{other_off}");
+        assert_eq!(other_off["data"]["effective"], "off");
+    }
+    let (status, off_again) = command(
+        domain,
+        Arc::clone(&fresh),
+        operator.clone(),
+        serde_json::json!({"mode":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{off_again}");
+    assert_eq!(off_again["data"]["effective"], "off");
+    let final_policy = runtime::ConfigLoader::new(&workspace, &home)
+        .load()
+        .unwrap()
+        .background_work();
+    assert!(!final_policy.evolution && !final_policy.growth);
+    if domain == "growth" {
+        let old = reopened
+            .runtime_event_store
+            .projection_checkpoint("projector:growth:v1")
+            .unwrap()
+            .unwrap();
+        let mut payload = old.payload.clone();
+        payload["paused"] = "unknown".into();
+        reopened
+            .runtime_event_store
+            .compare_and_put_projection_checkpoint(
+                "projector:growth:v1",
+                old.source_cursor,
+                old.revision,
+                &payload,
+                0,
+            )
+            .unwrap();
+        let (status, other) = command(
+            "evolution",
+            fresh.clone(),
+            operator.clone(),
+            serde_json::json!({"mode":"status"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{other}");
+        assert_eq!(other["data"]["effective"], "off");
+        let (status, unknown) = command(
+            "growth",
+            fresh.clone(),
+            operator.clone(),
+            serde_json::json!({"mode":"status"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unknown}");
+        // The original HTTP error envelope carries the serialized failed
+        // dispatch receipt; do not mistake that outer DTO for a success DTO.
+        let failure: serde_json::Value = serde_json::from_str(
+            unknown["error"]
+                .as_str()
+                .expect("original ErrorResponse.error"),
+        )
+        .unwrap();
+        assert_eq!(failure["ok"], false);
+        assert_eq!(failure["status"], "apply_failed");
+        assert_eq!(failure["data"]["effective"], "error");
+        assert!(failure["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid Growth pause state"));
+        assert!(!core.background_work().growth);
+    }
+    core.shutdown_maintenance().await;
+    let report = core.shutdown_execution().await;
+    assert_eq!(report.forced_aborts, 0);
+    assert_eq!(report.remaining_keys, 0);
+    assert!(report.errors.is_empty(), "{report:?}");
 }

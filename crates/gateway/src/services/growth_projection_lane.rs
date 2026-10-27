@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harness_contract::growth::GrowthEvent;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{GrowthIngestReceipt, GrowthService, MatrixService, MemoryService};
 
@@ -71,34 +72,19 @@ async fn project_growth_page(
     max_commits: usize,
 ) -> Result<runtime::RuntimeProjectionPass, String> {
     let scan_store = Arc::clone(&event_store);
-    let (checkpoint, page) = tokio::task::spawn_blocking(move || {
+    let prepared = tokio::task::spawn_blocking(move || {
         scan_store.run_projection_work(runtime::RuntimeProjectionWorkClass::Background, || {
-            let checkpoint = scan_store
-                .projection_checkpoint(GROWTH_PROJECTOR_ID)
-                .map_err(|error| error.to_string())?;
-            let cursor = checkpoint
-                .as_ref()
-                .map_or(0, |checkpoint| checkpoint.source_cursor);
-            let interest = runtime::RuntimeProjectionInterest::new([
-                runtime::RuntimeProjectionEventInterest::new(
-                    runtime::RuntimeEventScope::Task,
-                    GROWTH_EVENT_KIND,
-                ),
-            ]);
-            let page = scan_store
-                .projection_scan_page(
-                    cursor,
-                    &interest,
-                    max_commits.max(1),
-                    GROWTH_BATCH,
-                    32 * 1024 * 1024,
-                )
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>((checkpoint, page))
+            prepare_growth_page(&scan_store, max_commits)
         })
     })
     .await
     .map_err(|error| format!("Growth projection scan worker failed: {error}"))??;
+    let Some((checkpoint, page)) = prepared else {
+        return Ok(runtime::RuntimeProjectionPass::scanned(
+            0,
+            max_commits.max(1),
+        ));
+    };
 
     for batch in &page.batches {
         for source in &batch.events {
@@ -114,50 +100,267 @@ async fn project_growth_page(
                     continue;
                 }
             };
+            if event.source_event_kind == "approval.risk_receipt"
+                && (source.actor.as_deref() != Some("approval.risk_receipt")
+                    || source.stream_id != format!("growth:risk:{}", event.id))
+            {
+                return Err("Growth risk source producer identity mismatch".into());
+            }
             let receipt = growth
-                .ingest_growth_event(&config_home, &memory, &matrix, event)
+                .ingest_admitted_growth_event(&config_home, &memory, &matrix, event)
                 .await;
             validate_receipt(&receipt)?;
         }
     }
 
-    let previous_cursor = checkpoint
-        .as_ref()
-        .map_or(0, |checkpoint| checkpoint.source_cursor);
-    if page.scanned_through_cursor > previous_cursor {
-        let checkpoint_store = Arc::clone(&event_store);
-        let source_cursor = page.scanned_through_cursor;
-        let scanned_commits = page.scanned_commits;
-        let matched_events = page.matched_events;
-        tokio::task::spawn_blocking(move || {
-            checkpoint_store.run_projection_work(
-                runtime::RuntimeProjectionWorkClass::Background,
-                || {
-                    checkpoint_store
-                        .put_projection_checkpoint_retrying(
-                            GROWTH_PROJECTOR_ID,
-                            source_cursor,
-                            &serde_json::json!({
-                                "schema_version": GROWTH_EVENT_SCHEMA_VERSION,
-                                "source_cursor": source_cursor,
-                                "scanned_commits": scanned_commits,
-                                "matched_events": matched_events,
-                            }),
-                            now_ms(),
-                        )
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                },
-            )
-        })
-        .await
-        .map_err(|error| format!("Growth checkpoint worker failed: {error}"))??;
+    // The admitted page stays durable until every original target receipt is
+    // settled. A concurrent stop may set paused; preserve it on completion.
+    let current = checkpoint_growth(&event_store)?;
+    if current.payload["pending_page"] != checkpoint.payload["pending_page"] {
+        return Err("Growth admitted page changed before settlement".into());
     }
+    let mut payload = current.payload.clone();
+    payload
+        .as_object_mut()
+        .ok_or("invalid Growth checkpoint")?
+        .remove("pending_page");
+    event_store
+        .compare_and_put_projection_checkpoint(
+            GROWTH_PROJECTOR_ID,
+            page.scanned_through_cursor,
+            current.revision,
+            &payload,
+            now_ms(),
+        )
+        .map_err(|error| error.to_string())?;
 
     Ok(
         runtime::RuntimeProjectionPass::scanned(page.scanned_commits, max_commits.max(1))
             .with_matches(page.matched_events),
     )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrowthAdmittedPage {
+    from: u64,
+    through: u64,
+    max_commits: usize,
+    scanned_commits: usize,
+    digest: String,
+}
+
+fn growth_interest() -> runtime::RuntimeProjectionInterest {
+    runtime::RuntimeProjectionInterest::new([runtime::RuntimeProjectionEventInterest::new(
+        runtime::RuntimeEventScope::Task,
+        GROWTH_EVENT_KIND,
+    )])
+}
+fn checkpoint_growth(
+    store: &runtime::RuntimeEventStore,
+) -> Result<runtime::RuntimeProjectionCheckpoint, String> {
+    store
+        .projection_checkpoint(GROWTH_PROJECTOR_ID)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Growth policy checkpoint missing".into())
+}
+/// Upgrade the original cursor in place. No source history is promoted merely
+/// by acquiring policy controls; an old fully committed cursor stays committed.
+pub(crate) fn initialize_growth_policy(
+    store: &runtime::RuntimeEventStore,
+    enabled: bool,
+) -> Result<(), String> {
+    let old = store
+        .projection_checkpoint(GROWTH_PROJECTOR_ID)
+        .map_err(|e| e.to_string())?;
+    if old
+        .as_ref()
+        .is_some_and(|c| c.payload.get("paused").is_some())
+    {
+        growth_checkpoint_status(store)?;
+        if !enabled {
+            pause_growth_sources(store)?;
+        }
+        return Ok(());
+    }
+    let cursor = old.as_ref().map_or(0, |c| c.source_cursor);
+    store
+        .compare_and_put_projection_checkpoint(
+            GROWTH_PROJECTOR_ID,
+            cursor,
+            old.as_ref().map_or(0, |c| c.revision),
+            &serde_json::json!({"schema_version":1,"paused":!enabled}),
+            now_ms(),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+pub(crate) fn growth_checkpoint_status(store: &runtime::RuntimeEventStore) -> Result<bool, String> {
+    let c = checkpoint_growth(store)?;
+    c.payload["paused"]
+        .as_bool()
+        .ok_or("invalid Growth pause state")?;
+    if let Some(value) = c.payload.get("pending_page") {
+        let p: GrowthAdmittedPage =
+            serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        if p.from != c.source_cursor
+            || p.through <= p.from
+            || p.max_commits == 0
+            || p.max_commits > GROWTH_BATCH
+            || p.scanned_commits == 0
+            || p.scanned_commits > p.max_commits
+            || p.through > store.durable_commit_cursor().map_err(|e| e.to_string())?
+            || p.digest.len() != 64
+        {
+            return Err("invalid Growth admitted page identity".into());
+        }
+        Ok(false)
+    } else {
+        Ok(true)
+    }
+}
+pub(crate) fn pause_growth_sources(store: &runtime::RuntimeEventStore) -> Result<(), String> {
+    // A pass can finish during this synchronous mutation; re-read its revision,
+    // never overwrite a newly admitted page with an earlier payload.
+    for _ in 0..3 {
+        let c = checkpoint_growth(store)?;
+        if c.payload["paused"].as_bool() == Some(true) {
+            return Ok(());
+        }
+        let mut payload = c.payload.clone();
+        payload["paused"] = true.into();
+        payload["pause_cut"] = store
+            .durable_commit_cursor()
+            .map_err(|e| e.to_string())?
+            .into();
+        match store.compare_and_put_projection_checkpoint(
+            GROWTH_PROJECTOR_ID,
+            c.source_cursor,
+            c.revision,
+            &payload,
+            now_ms(),
+        ) {
+            Ok(_) => return Ok(()),
+            Err(runtime::RuntimeEventStoreError::StaleRevision { .. }) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("Growth pause raced an original checkpoint writer".into())
+}
+pub(crate) fn resume_growth_sources(store: &runtime::RuntimeEventStore) -> Result<(), String> {
+    let c = checkpoint_growth(store)?;
+    if c.payload["paused"].as_bool() == Some(false) {
+        return Ok(());
+    }
+    if !growth_checkpoint_status(store)? {
+        return Err("Growth original admitted page remains pending".into());
+    }
+    let cut = store.durable_commit_cursor().map_err(|e| e.to_string())?;
+    let mut payload = c.payload.clone();
+    payload["paused"] = false.into();
+    payload["skipped_from"] = c.source_cursor.into();
+    payload["resume_cut"] = cut.into();
+    store
+        .compare_and_put_projection_checkpoint(
+            GROWTH_PROJECTOR_ID,
+            cut,
+            c.revision,
+            &payload,
+            now_ms(),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn page_digest(page: &runtime::RuntimeProjectionScanPage) -> Result<String, String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(
+                page.scanned_through_cursor,
+                page.scanned_commits,
+                &page.batches
+            ))
+            .map_err(|e| e.to_string())?
+        )
+    ))
+}
+fn prepare_growth_page(
+    store: &runtime::RuntimeEventStore,
+    max_commits: usize,
+) -> Result<
+    Option<(
+        runtime::RuntimeProjectionCheckpoint,
+        runtime::RuntimeProjectionScanPage,
+    )>,
+    String,
+> {
+    // Original callers/tests may invoke the lane directly without RuntimeHost.
+    if store
+        .projection_checkpoint(GROWTH_PROJECTOR_ID)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        initialize_growth_policy(store, true)?;
+    }
+    let mut c = checkpoint_growth(store)?;
+    c.payload["paused"]
+        .as_bool()
+        .ok_or("invalid Growth pause state")?;
+    let admitted = c.payload.get("pending_page").cloned();
+    if admitted.is_none() && c.payload["paused"].as_bool() == Some(true) {
+        return Ok(None);
+    }
+    let plan: Option<GrowthAdmittedPage> = admitted
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    if plan.is_some() {
+        growth_checkpoint_status(store)?;
+    }
+    let limit = plan
+        .as_ref()
+        .map_or(max_commits.clamp(1, GROWTH_BATCH), |p| p.max_commits);
+    let mut page = store
+        .projection_scan_page(
+            c.source_cursor,
+            &growth_interest(),
+            limit,
+            GROWTH_BATCH,
+            32 * 1024 * 1024,
+        )
+        .map_err(|e| e.to_string())?;
+    if let Some(p) = plan {
+        page.batches.retain(|b| b.commit_cursor <= p.through);
+        page.scanned_through_cursor = p.through;
+        page.scanned_commits = p.scanned_commits;
+        page.matched_events = page.batches.iter().map(|b| b.events.len()).sum();
+        if page_digest(&page)? != p.digest {
+            return Err("Growth admitted source page digest changed".into());
+        }
+    } else {
+        if page.scanned_through_cursor <= c.source_cursor {
+            return Ok(None);
+        }
+        let p = GrowthAdmittedPage {
+            from: c.source_cursor,
+            through: page.scanned_through_cursor,
+            max_commits: limit,
+            scanned_commits: page.scanned_commits,
+            digest: page_digest(&page)?,
+        };
+        let mut payload = c.payload.clone();
+        payload["pending_page"] = serde_json::to_value(p).map_err(|e| e.to_string())?;
+        c = store
+            .compare_and_put_projection_checkpoint(
+                GROWTH_PROJECTOR_ID,
+                c.source_cursor,
+                c.revision,
+                &payload,
+                now_ms(),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(Some((c, page)))
 }
 
 fn decode_growth_event(payload: &serde_json::Value) -> Result<GrowthEvent, String> {
@@ -171,7 +374,10 @@ fn decode_growth_event(payload: &serde_json::Value) -> Result<GrowthEvent, Strin
     }
     if envelope.growth_event.id.trim().is_empty()
         || envelope.growth_event.session_id.trim().is_empty()
-        || envelope.growth_event.source_event_kind != GROWTH_EVENT_KIND
+        || !matches!(
+            envelope.growth_event.source_event_kind.as_str(),
+            GROWTH_EVENT_KIND | "approval.risk_receipt"
+        )
     {
         return Err("GrowthEvent identity/source contract is incomplete".to_string());
     }
@@ -276,6 +482,7 @@ mod tests {
     struct SlowFactLedger {
         inner: Arc<dyn FactLedger>,
         delay: Duration,
+        fail_memory_receipt: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FactLedger for SlowFactLedger {
@@ -322,6 +529,15 @@ mod tests {
         }
 
         fn record_growth_promotion(&self, record: GrowthPromotionRecord) -> FactLedgerResult<()> {
+            if record.target == "memory.entry"
+                && record.error.is_none()
+                && record.status == "promoted"
+                && self.fail_memory_receipt.swap(false, Ordering::SeqCst)
+            {
+                return Err(fact_kernel::FactLedgerError::backend(
+                    "injected original memory receipt failure",
+                ));
+            }
             self.inner.record_growth_promotion(record)
         }
 
@@ -393,6 +609,83 @@ mod tests {
         }
     }
 
+    fn append_source(store: &runtime::RuntimeEventStore, id: &str) -> u64 {
+        store.append(runtime::RuntimeEventInput{stream_id:format!("growth-source:{id}"),scope:runtime::RuntimeEventScope::Task,
+            kind:GROWTH_EVENT_KIND.into(),status:None,actor:None,refs:Vec::new(),payload:serde_json::json!({"growth_event_schema_version":1,"growth_event":event()})}).unwrap().commit_cursor
+    }
+    #[test]
+    fn growth_pause_preserves_only_original_admission_and_resume_skips_the_paused_interval() {
+        let store = runtime::RuntimeEventStore::for_test();
+        initialize_growth_policy(&store, true).unwrap();
+        let a = append_source(&store, "A");
+        let (_, original) = prepare_growth_page(&store, 8).unwrap().unwrap();
+        assert_eq!(original.batches.len(), 1);
+        assert_eq!(original.scanned_through_cursor, a);
+        pause_growth_sources(&store).unwrap();
+        let b = append_source(&store, "B");
+        assert!(!growth_checkpoint_status(&store).unwrap());
+        assert!(resume_growth_sources(&store)
+            .unwrap_err()
+            .contains("pending"));
+        let (c, recovered) = prepare_growth_page(&store, 8).unwrap().unwrap();
+        assert_eq!(
+            recovered, original,
+            "pending source cut must not expand to B"
+        );
+        // This test isolates checkpoint CAS; actual effects/receipts are checked
+        // by the PG partial-effect test, not fabricated as successful here.
+        let mut payload = c.payload.clone();
+        payload.as_object_mut().unwrap().remove("pending_page");
+        store
+            .compare_and_put_projection_checkpoint(
+                GROWTH_PROJECTOR_ID,
+                a,
+                c.revision,
+                &payload,
+                now_ms(),
+            )
+            .unwrap();
+        assert!(prepare_growth_page(&store, 8).unwrap().is_none());
+        resume_growth_sources(&store).unwrap();
+        assert_eq!(checkpoint_growth(&store).unwrap().source_cursor, b);
+        let c = append_source(&store, "C");
+        let (_, next) = prepare_growth_page(&store, 8).unwrap().unwrap();
+        assert_eq!(next.scanned_through_cursor, c);
+        assert_eq!(next.batches.len(), 1);
+        assert_eq!(next.batches[0].events[0].stream_id, "growth-source:C");
+    }
+    #[test]
+    fn growth_admitted_page_rejects_foreign_cut_digest_and_unknown_pause() {
+        for field in ["from", "through", "digest", "paused"] {
+            let store = runtime::RuntimeEventStore::for_test();
+            initialize_growth_policy(&store, true).unwrap();
+            append_source(&store, "original");
+            prepare_growth_page(&store, 8).unwrap().unwrap();
+            let c = checkpoint_growth(&store).unwrap();
+            let mut p = c.payload.clone();
+            match field {
+                "from" => p["pending_page"][field] = 99.into(),
+                "through" => p["pending_page"][field] = 999.into(),
+                "digest" => p["pending_page"][field] = "0".repeat(64).into(),
+                _ => p[field] = "unknown".into(),
+            }
+            store
+                .compare_and_put_projection_checkpoint(
+                    GROWTH_PROJECTOR_ID,
+                    c.source_cursor,
+                    c.revision,
+                    &p,
+                    now_ms(),
+                )
+                .unwrap();
+            assert!(
+                growth_checkpoint_status(&store).is_err()
+                    || prepare_growth_page(&store, 8).is_err(),
+                "{field}"
+            );
+            assert_eq!(checkpoint_growth(&store).unwrap().source_cursor, 0);
+        }
+    }
     #[test]
     fn typed_payload_rejects_unknown_schema_without_legacy_guessing() {
         let payload = serde_json::json!({
@@ -598,12 +891,239 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("not durably recorded")));
-        assert!(store
-            .projection_checkpoint(GROWTH_PROJECTOR_ID)
-            .unwrap()
-            .is_none());
+        let pending = checkpoint_growth(&store).unwrap();
+        assert_eq!(pending.source_cursor, 0);
+        assert!(pending.payload.get("pending_page").is_some());
         let report = reactor.shutdown().await;
         assert!(report.timed_out_lanes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn growth_partial_receipt_cold_recovery_preserves_effects_and_skips_paused_sources() {
+        async fn selected(
+            root: &std::path::Path,
+            t: &crate::selected_storage::SelectedStorageTopology,
+        ) -> (MemoryService, MatrixService) {
+            let manager = Arc::new(
+                CognitiveContextManager::new_with_selected_store_and_auxiliaries(
+                    test_memory_config(&root.join("storage/memory-index")),
+                    Some(root.join("workspace")),
+                    Arc::clone(&t.memory_store),
+                    Some(t.memory_maintenance_queue.clone()),
+                )
+                .await
+                .unwrap(),
+            );
+            (
+                MemoryService::with_manager_and_knowledge(
+                    Some(manager),
+                    t.knowledge_fabric.clone(),
+                ),
+                MatrixService::with_store(
+                    Arc::clone(&t.matrix_store),
+                    t.registry
+                        .endpoint(&storage::StorageDomainId::Matrix)
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+        }
+        fn append(store: &runtime::RuntimeEventStore, id: &str) {
+            let mut value = rich_event();
+            value.id = id.into();
+            store.append(runtime::RuntimeEventInput{stream_id:format!("growth:{id}"),scope:runtime::RuntimeEventScope::Task,
+                kind:GROWTH_EVENT_KIND.into(),status:None,actor:None,refs:Vec::new(),
+                payload:serde_json::json!({"growth_event_schema_version":1,"growth_event":value})}).unwrap();
+        }
+        async fn await_settled(store: &runtime::RuntimeEventStore) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !growth_checkpoint_status(store).unwrap() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("original reactor must recover admitted page without test retry");
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+        let t = Arc::new(
+            crate::selected_storage::SelectedStorageTopology::compose_for_test(
+                root.path(),
+                &root.path().join("workspace"),
+            )
+            .unwrap(),
+        );
+        t.preserve_failed_test_namespace().unwrap();
+        let (memory, matrix) = selected(root.path(), &t).await;
+        let store = Arc::clone(&t.runtime_event_store);
+        let hit = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let growth = GrowthService::with_ledger(Arc::new(SlowFactLedger {
+            inner: Arc::clone(&t.fact_ledger),
+            delay: Duration::ZERO,
+            fail_memory_receipt: hit.clone(),
+        }));
+        let mut candidate = rich_event();
+        candidate.id = "A".into();
+        let wrong = super::super::growth_service::memory_candidate_entry_for_test(
+            &candidate,
+            &candidate.memory_candidates[0],
+        );
+        let refused = memory
+            .remember_entry_with_context(wrong, "session-1", "growth")
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("source cut is stale or foreign"),
+            "{refused}"
+        );
+        assert_eq!(
+            memory
+                .list_all_entries()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.source_agent.as_deref() == Some("growth-service"))
+                .count(),
+            0
+        );
+        initialize_growth_policy(&store, true).unwrap();
+        append(&store, "A");
+        let failed = project_growth_page(
+            root.path().to_path_buf(),
+            store.clone(),
+            growth.clone(),
+            memory.clone(),
+            matrix.clone(),
+            8,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            failed.contains("injected original memory receipt failure"),
+            "{failed}"
+        );
+        assert!(!hit.load(Ordering::SeqCst));
+        assert_eq!(
+            memory
+                .list_all_entries()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.source_agent.as_deref() == Some("growth-service"))
+                .count(),
+            1,
+            "receipt fault must follow a real successful Memory effect"
+        );
+
+        assert!(!growth_checkpoint_status(&store).unwrap());
+        assert_eq!(checkpoint_growth(&store).unwrap().source_cursor, 0);
+        let matrix_before = t
+            .fact_ledger
+            .list_growth_promotions()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.event_id == "A" && p.target == "matrix.fact")
+            .collect::<Vec<_>>();
+        assert_eq!(matrix_before.len(), 1);
+        assert!(matrix_before[0].error.is_none());
+        assert!(
+            t.fact_ledger.list_facts().unwrap().len() >= 2,
+            "eligible Fact effects must precede injected receipt failure"
+        );
+        pause_growth_sources(&store).unwrap();
+        append(&store, "B");
+        drop((memory, matrix, growth, store));
+        let old_port = Arc::downgrade(&t.runtime_event_store);
+        let lease = Arc::try_unwrap(t)
+            .unwrap_or_else(|_| panic!("old adapters retained"))
+            .detach_for_test_restart()
+            .unwrap();
+        assert!(old_port.upgrade().is_none());
+        let t = Arc::new(lease.rebuild().unwrap());
+        let (memory, matrix) = selected(root.path(), &t).await;
+        let store = Arc::clone(&t.runtime_event_store);
+        let growth = GrowthService::with_ledger(Arc::clone(&t.fact_ledger));
+        let lane = || {
+            growth_projection_lane(
+                root.path().to_path_buf(),
+                store.clone(),
+                growth.clone(),
+                memory.clone(),
+                matrix.clone(),
+            )
+            .unwrap()
+        };
+        let reactor =
+            Arc::new(runtime::RuntimeEventReactor::sealed(store.clone(), [lane()]).unwrap());
+        reactor.start().unwrap();
+        await_settled(&store).await;
+        assert_eq!(
+            growth
+                .durable_event_log()
+                .unwrap()
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A"]
+        );
+        let matrix_after = t
+            .fact_ledger
+            .list_growth_promotions()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.event_id == "A" && p.target == "matrix.fact")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(matrix_after).unwrap(),
+            serde_json::to_value(matrix_before).unwrap(),
+            "completed original Matrix receipt must not be rewritten"
+        );
+        let entries = memory.list_all_entries().await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.source_agent.as_deref() == Some("growth-service"))
+                .count(),
+            1
+        );
+        reactor.stop_lane(GROWTH_PROJECTOR_ID);
+        reactor
+            .drain_lane(
+                GROWTH_PROJECTOR_ID,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        resume_growth_sources(&store).unwrap();
+        append(&store, "C");
+        reactor.register_lane(lane()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while growth.durable_event_log().unwrap().len() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = reactor.shutdown().await;
+        assert!(report.timed_out_lanes.is_empty());
+        let ids = growth
+            .durable_event_log()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>();
+        assert!(
+            ids.contains(&"A".into()) && ids.contains(&"C".into()) && !ids.contains(&"B".into())
+        );
+        let mut foreign = rich_event();
+        foreign.id = "A".into();
+        foreign.session_id = "foreign-session".into();
+        let refused = growth
+            .ingest_growth_event(root.path(), &memory, &matrix, foreign)
+            .await;
+        assert!(!refused.durable);
+        assert!(refused.errors.iter().any(|e| e.contains("foreign payload")));
+        assert_eq!(growth.durable_event_log().unwrap().len(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -619,6 +1139,7 @@ mod tests {
         let growth = GrowthService::with_ledger(Arc::new(SlowFactLedger {
             inner: topology.fact_ledger.clone(),
             delay: Duration::from_millis(150),
+            fail_memory_receipt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }));
         let config_home = root.path().to_path_buf();
         let ingest = tokio::spawn(async move {

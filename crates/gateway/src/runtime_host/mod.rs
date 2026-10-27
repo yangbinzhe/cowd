@@ -161,6 +161,19 @@ struct GatewayEvolutionScenarioExecutor {
     runtime: Arc<OnceLock<Weak<runtime::RuntimeServices>>>,
 }
 
+fn configured_evolution_eval_runner(
+    config_home: &Path,
+    runtime: Arc<OnceLock<Weak<runtime::RuntimeServices>>>,
+) -> Arc<dyn runtime::EvolutionEvalRunner> {
+    let scenarios = Arc::new(harness_eval::FileDefinitionEvolutionScenarioCatalog::new(
+        config_home.join("runtime").join("evolution-scenarios"),
+    ));
+    let executor = Arc::new(GatewayEvolutionScenarioExecutor { runtime });
+    Arc::new(harness_eval::DefinitionEvolutionEvalRunner::new(Arc::new(
+        harness_eval::RuntimeDefinitionEvolutionWorkload::new(scenarios, executor),
+    )))
+}
+
 #[async_trait]
 impl harness_eval::DefinitionEvolutionScenarioExecutor for GatewayEvolutionScenarioExecutor {
     async fn execute(
@@ -2064,19 +2077,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // dependency cycle while keeping Gateway out of scoring and release
     // authorization.
 
-    let evolution_scenarios = Arc::new(harness_eval::FileDefinitionEvolutionScenarioCatalog::new(
-        approval_dir.join("runtime").join("evolution-scenarios"),
-    ));
-    let evolution_executor = Arc::new(GatewayEvolutionScenarioExecutor {
-        runtime: Arc::clone(&evolution_runtime),
-    });
-    let evolution_eval_runner: Arc<dyn runtime::EvolutionEvalRunner> =
-        Arc::new(harness_eval::DefinitionEvolutionEvalRunner::new(Arc::new(
-            harness_eval::RuntimeDefinitionEvolutionWorkload::new(
-                evolution_scenarios,
-                evolution_executor,
-            ),
-        )));
+    let evolution_eval_runner = runtime_config
+        .background_work()
+        .evolution
+        .then(|| configured_evolution_eval_runner(&approval_dir, Arc::clone(&evolution_runtime)));
     let session_runtime_port = crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
@@ -2085,6 +2089,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .provider_transport_pool(Arc::clone(&provider_transport_pool))
             .provider_template_cache(Arc::clone(&provider_template_cache))
             .provider_resource_config(runtime_config.provider_resources().clone())
+            .background_work(runtime_config.background_work())
             .process_jsonl_commands(
                 runtime_config
                     .agent_executor_commands()
@@ -2094,13 +2099,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .provider_fallbacks(runtime_config.fallbacks().iter().cloned())
             .tool_execution_host(runtime_tool_host)
             .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
-            .projection_lane(crate::services::growth_projection_lane(
-                approval_dir.clone(),
-                Arc::clone(&selected_storage.runtime_event_store),
-                growth_projection_services.growth.clone(),
-                growth_projection_services.memory.clone(),
-                growth_projection_services.matrix.clone(),
-            )?)
             .task_aggregate_service(Arc::clone(&selected_storage.task_service))
             .artifact_store(Arc::clone(&selected_storage.artifact_store))
             .reality_recall_port(Arc::new(
@@ -2116,7 +2114,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     selected_storage.knowledge_fabric.clone(),
                 ),
             )
-            .evolution_eval_runner(evolution_eval_runner)
             .mission_schedule_policy(
                 runtime_config
                     .runtime_control()
@@ -2140,6 +2137,39 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 session_runtime_port.clone(),
                 session_runtime_port.clone(),
             );
+    if let Some(runner) = evolution_eval_runner {
+        runtime_services_builder = runtime_services_builder.evolution_eval_runner(runner);
+    }
+    let growth_ready = crate::services::growth_projection_lane::initialize_growth_policy(
+        &selected_storage.runtime_event_store,
+        runtime_config.background_work().growth,
+    )
+    .and_then(|()| {
+        crate::services::growth_projection_lane::growth_checkpoint_status(
+            &selected_storage.runtime_event_store,
+        )
+    });
+    match growth_ready {
+        Ok(settled) if runtime_config.background_work().growth || !settled => {
+            runtime_services_builder =
+                runtime_services_builder.projection_lane(crate::services::growth_projection_lane(
+                    approval_dir.clone(),
+                    Arc::clone(&selected_storage.runtime_event_store),
+                    growth_projection_services.growth.clone(),
+                    growth_projection_services.memory.clone(),
+                    growth_projection_services.matrix.clone(),
+                )?);
+        }
+        Ok(_) => (),
+        Err(error) => {
+            // A failed automatic projection remains visible to its management
+            // owner. It cannot take down unrelated foreground/Memory/Skill.
+            tracing::error!(%error,"Growth automatic admission unavailable; configuration status will report error");
+            let mut effective = runtime_config.background_work();
+            effective.growth = false;
+            runtime_services_builder = runtime_services_builder.background_work(effective);
+        }
+    }
     let skill_catalog_started_at = Instant::now();
     let startup_skill_assets = crate::services::runtime_skill_assets_for_workspace(&workspace_root);
     tracing::info!(

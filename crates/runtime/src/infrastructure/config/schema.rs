@@ -561,6 +561,25 @@ pub struct RuntimeConfig {
     pub(super) feature_config: RuntimeFeatureConfig,
 }
 
+/// Instance-wide automatic analysis and promotion policy. Missing fields in
+/// operator configurations preserve production behavior. Test launchers must
+/// explicitly select isolation in their private configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackgroundWorkConfig {
+    pub evolution: bool,
+    pub growth: bool,
+}
+
+impl Default for BackgroundWorkConfig {
+    fn default() -> Self {
+        Self {
+            evolution: true,
+            growth: true,
+        }
+    }
+}
+
 /// Structured feature configuration consumed by runtime subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
@@ -589,6 +608,7 @@ pub struct RuntimeFeatureConfig {
     pub(super) storage: StorageTopologyConfig,
     pub(super) gate_auto_fix: GateAutoFixConfig,
     pub(super) runtime_control: RuntimeControlConfig,
+    pub(super) background_work: BackgroundWorkConfig,
     pub(super) hot_state: crate::execution_core::hot_state::HotStateConfig,
     pub(super) provider_resources: crate::ProviderResourceConfig,
     /// Commands eligible to back an external ProcessJsonl Agent. These are

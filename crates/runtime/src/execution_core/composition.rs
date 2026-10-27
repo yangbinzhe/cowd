@@ -16,6 +16,18 @@ impl RuntimeServicesBuilder {
                 root.join("artifacts"),
             )))
             .task_aggregate_service(Arc::new(crate::TaskAggregateService::for_test()))
+            .background_work(crate::BackgroundWorkConfig {
+                evolution: false,
+                growth: false,
+            })
+    }
+
+    /// Explicit instance policy. Defaults remain production on/on; private
+    /// routine fixtures and evaluation launchers select off/off deliberately.
+    #[must_use]
+    pub fn background_work(mut self, config: crate::BackgroundWorkConfig) -> Self {
+        self.background_work = config;
+        self
     }
 
     #[must_use]
@@ -318,6 +330,7 @@ impl RuntimeServicesBuilder {
             self.knowledge_activation,
             self.evolution_eval_runner,
             self.skill_catalog,
+            self.background_work,
             self.mission_schedule_policy,
             self.hot_state_config,
             self.approval_config,

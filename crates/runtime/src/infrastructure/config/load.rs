@@ -101,6 +101,7 @@ impl ConfigLoader {
                 validate_optional_hooks_config(&parsed.object, &entry.path)?;
             }
             merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            validate_background_config_source(entry.source, &parsed.object, &entry.path)?;
             for command in
                 parse_trusted_agent_executor_commands(entry.source, &parsed.object, &entry.path)?
             {
@@ -112,6 +113,11 @@ impl ConfigLoader {
 
         // Apply environment variable overrides (CC_* prefix) after file configs.
         let env_overrides = collect_env_overrides();
+        validate_background_config_source(
+            ConfigSource::Environment,
+            &env_overrides,
+            Path::new("<environment>"),
+        )?;
         deep_merge_objects(&mut merged, &env_overrides);
 
         // Inject config file `env:` section into the process environment.
@@ -163,6 +169,7 @@ impl ConfigLoader {
             storage: parse_optional_storage_config(&merged_value)?,
             gate_auto_fix: parse_optional_gate_auto_fix_config(&merged_value)?,
             runtime_control: parse_optional_runtime_control_config(&merged_value)?,
+            background_work: parse_optional_background_work_config(&merged_value)?,
             hot_state: parse_optional_hot_state_config(&merged_value)?,
             provider_resources: parse_optional_provider_resource_config(&merged_value)?,
             agent_executor_commands: agent_executor_commands.into_values().collect(),

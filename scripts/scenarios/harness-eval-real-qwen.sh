@@ -1037,6 +1037,9 @@ cat >>"$CONFIG_HOME/config.yaml" <<EOF
     models:
       - "$MODEL"
 runtime:
+  background:
+    evolution: ${COWD_EVAL_BACKGROUND_EVOLUTION:-false}
+    growth: ${COWD_EVAL_BACKGROUND_GROWTH:-false}
   # The in-flight MODEL-REQUEST ceiling belongs to provider admission only.
   # Collapsing agent/graph parallelism here would deadlock the supervisor:
   # a root parked on the Agentic barrier holds its owned-task permit for the

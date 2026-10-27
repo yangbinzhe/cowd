@@ -271,6 +271,22 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "evolution",
+        aliases: &[],
+        summary:
+            "Control automatic Evolution analysis for this instance (all sessions; operator only)",
+        argument_hint: Some("[on|off|status]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "growth",
+        aliases: &[],
+        summary:
+            "Control automatic Growth promotion for this instance (all sessions; operator only)",
+        argument_hint: Some("[on|off|status]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "clear",
         aliases: &[],
         summary: "Start a fresh local session",
@@ -1663,6 +1679,12 @@ fn action_target_for_slash(name: &str) -> CommandActionTarget {
         "permissions" => CommandActionTarget::Runtime {
             operation: "session.permissions".into(),
         },
+        "evolution" => CommandActionTarget::Runtime {
+            operation: "runtime.background.evolution".into(),
+        },
+        "growth" => CommandActionTarget::Runtime {
+            operation: "runtime.background.growth".into(),
+        },
         "model" => CommandActionTarget::Config {
             operation: "config.model".into(),
         },
@@ -1700,7 +1722,7 @@ fn action_target_for_slash(name: &str) -> CommandActionTarget {
 pub fn is_gateway_dispatchable_slash_command(name: &str) -> bool {
     matches!(
         name.trim().trim_start_matches('/'),
-        "status" | "tasks" | "permissions"
+        "status" | "tasks" | "permissions" | "evolution" | "growth"
     )
 }
 
@@ -1731,6 +1753,12 @@ pub enum SlashCommand {
         model: Option<String>,
     },
     Permissions {
+        mode: Option<String>,
+    },
+    Evolution {
+        mode: Option<String>,
+    },
+    Growth {
         mode: Option<String>,
     },
     Clear {

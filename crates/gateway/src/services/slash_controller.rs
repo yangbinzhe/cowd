@@ -10,8 +10,13 @@ use harness_contract::{reality::EvidenceRef, task::TaskStatus};
 
 use super::{ServiceEnvelope, TaskService};
 
-const GATEWAY_SLASH_OPERATIONS: [&str; 3] =
-    ["runtime.status", "task.manage", "session.permissions"];
+const GATEWAY_SLASH_OPERATIONS: [&str; 5] = [
+    "runtime.status",
+    "task.manage",
+    "session.permissions",
+    "runtime.background.evolution",
+    "runtime.background.growth",
+];
 
 #[derive(Clone)]
 pub(crate) struct SlashController {
@@ -119,6 +124,29 @@ impl SlashController {
         command: &str,
         args: serde_json::Value,
     ) -> Result<SlashDispatchReceipt, String> {
+        self.dispatch_with_context(command, args, None).await
+    }
+
+    pub(crate) async fn dispatch_authenticated(
+        &self,
+        command: &str,
+        args: serde_json::Value,
+        principal: &runtime::VerifiedPrincipal,
+        state: &Arc<crate::api_routes::AppState>,
+    ) -> Result<SlashDispatchReceipt, String> {
+        self.dispatch_with_context(command, args, Some((principal, state)))
+            .await
+    }
+
+    async fn dispatch_with_context(
+        &self,
+        command: &str,
+        args: serde_json::Value,
+        management: Option<(
+            &runtime::VerifiedPrincipal,
+            &Arc<crate::api_routes::AppState>,
+        )>,
+    ) -> Result<SlashDispatchReceipt, String> {
         let definition = self
             .registry()
             .find(command)
@@ -130,7 +158,9 @@ impl SlashController {
                 definition.name
             ));
         }
-        let (ok, status, data) = self.execute_target(&definition.action, args).await;
+        let (ok, status, data) = self
+            .execute_target(&definition.action, args, management)
+            .await;
         Ok(SlashDispatchReceipt {
             ok,
             slash: definition.name,
@@ -146,6 +176,10 @@ impl SlashController {
         &self,
         action: &CommandActionTarget,
         args: serde_json::Value,
+        management: Option<(
+            &runtime::VerifiedPrincipal,
+            &Arc<crate::api_routes::AppState>,
+        )>,
     ) -> (bool, &'static str, serde_json::Value) {
         match action {
             CommandActionTarget::Runtime { operation }
@@ -195,6 +229,54 @@ impl SlashController {
                             "error": error,
                         }),
                     ),
+                }
+            }
+            CommandActionTarget::Runtime { operation }
+                if operation == GATEWAY_SLASH_OPERATIONS[3]
+                    || operation == GATEWAY_SLASH_OPERATIONS[4] =>
+            {
+                let result = match management {
+                    Some((principal, state))
+                        if self
+                            .runtime
+                            .as_ref()
+                            .zip(state.services.runtime.as_ref())
+                            .is_some_and(|(own, selected)| Arc::ptr_eq(own, selected)) =>
+                    {
+                        let reload = self
+                            .runtime
+                            .as_ref()
+                            .expect("checked runtime")
+                            .config_reload();
+                        crate::runtime_host::config_reload::background_control(
+                            &reload,
+                            state,
+                            principal,
+                            &args,
+                            if operation == GATEWAY_SLASH_OPERATIONS[3] {
+                                "evolution"
+                            } else {
+                                "growth"
+                            },
+                        )
+                        .await
+                    }
+                    _ => Err(
+                        "instance background control requires its authenticated operator context"
+                            .into(),
+                    ),
+                };
+                match result {
+                    Ok(data) => {
+                        let (ok, status) = match data["status"].as_str() {
+                            Some("error") => (false, "apply_failed"),
+                            Some("superseded") => (false, "superseded"),
+                            Some("draining") => (true, "draining"),
+                            _ => (true, "complete"),
+                        };
+                        (ok, status, data)
+                    }
+                    Err(error) => (false, "rejected", serde_json::json!({"error": error})),
                 }
             }
             unsupported => (
@@ -340,6 +422,26 @@ mod contract_tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[tokio::test]
+    async fn instance_background_control_cannot_be_dispatched_without_authenticated_management_context(
+    ) {
+        let controller = SlashController::new(None, TaskService::new());
+        let receipt = controller
+            .dispatch(
+                "/evolution",
+                serde_json::json!({"mode":"off",
+            "session_id":"ordinary-session", "capabilities":["runtime.maintenance.manage"]}),
+            )
+            .await
+            .unwrap();
+        assert!(!receipt.ok);
+        assert_eq!(receipt.status, "rejected");
+        assert!(receipt.data["error"]
+            .as_str()
+            .unwrap()
+            .contains("authenticated operator context"));
+    }
 
     #[test]
     fn dispatchable_registry_is_exactly_the_gateway_handler_set() {
