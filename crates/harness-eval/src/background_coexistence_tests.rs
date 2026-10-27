@@ -86,6 +86,23 @@ fn get_owned_json(
 #[test]
 #[ignore = "manual isolated real Gateway/finite owned loopback-provider engineering gate; not AI/N8 acceptance"]
 fn admitted_background_pending_allows_real_goal_and_public_ack() -> anyhow::Result<()> {
+    goal_ack_coexistence(false, false)
+}
+
+#[test]
+#[ignore = "separate manually registered retained-root pre-ACK recovery gate; no model; not covered by normal Goal/ACK result"]
+fn pending_background_preserves_terminal_delivery_across_retained_gateway_epoch()
+-> anyhow::Result<()> {
+    goal_ack_coexistence(true, false)
+}
+
+#[test]
+#[ignore = "separate registered local active-response cancellation gate; original public cancellation and terminal settlement required"]
+fn pending_background_allows_owned_active_response_cancellation() -> anyhow::Result<()> {
+    goal_ack_coexistence(false, true)
+}
+
+fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> anyhow::Result<()> {
     use original_server::tests::{
         background_broker_request, background_http_command, background_http_post, growth_test_sql,
     };
@@ -103,7 +120,7 @@ fn admitted_background_pending_allows_real_goal_and_public_ack() -> anyhow::Resu
         })?);
     // The endpoint is owned here, never supplied by an account/config fallback.
     let model = "r6-finite-local".to_owned();
-    let mut provider = FiniteProvider::start(&root, &model)?;
+    let mut provider = FiniteProvider::start_mode(&root, &model, cancel_after_open)?;
     let token = {
         use std::io::Read;
         let mut value = [0u8; 32];
@@ -222,6 +239,31 @@ fn admitted_background_pending_allows_real_goal_and_public_ack() -> anyhow::Resu
                 graph: graph.to_owned(),
                 deadline,
             })?;
+            if cancel_after_open {
+                let cancellation = observe_owned_active_cancel(
+                    &client,
+                    &base,
+                    &root,
+                    &mut actor,
+                    &session_id,
+                    graph,
+                    turn,
+                    deadline,
+                )?;
+                let still_pending = snapshot()?;
+                anyhow::ensure!(
+                    still_pending["pending"] == true && still_pending["receipts"] == 0,
+                    "background cut was lost during foreground cancellation"
+                );
+                anyhow::ensure!(
+                    !root.join("workspace/recovery-effect.txt").exists(),
+                    "held root response unexpectedly executed the physical write"
+                );
+                return Ok(
+                    json!({"foreground_cancellation":cancellation,"background_pending":still_pending,
+                    "Goal_satisfied":false,"AI_proven":false,"inflight_recovery_proven":false}),
+                );
+            }
             let mut observer = LiveScenarioObserver::default();
             let started = Instant::now();
             let message_id = loop {
@@ -247,19 +289,90 @@ fn admitted_background_pending_allows_real_goal_and_public_ack() -> anyhow::Resu
                 }
                 std::thread::sleep(Duration::from_millis(50));
             };
-            let delivered = actor
-                .confirm_terminal_delivery(&message_id, turn, graph)
+            let recovery = if restart_before_ack {
+                use std::os::unix::fs::MetadataExt;
+                let file = root.join("workspace/recovery-effect.txt");
+                let identity = || -> anyhow::Result<Value> {
+                    let m = std::fs::metadata(&file)?;
+                    Ok(json!({"device":m.dev(),"inode":m.ino(),"length":m.len(),
+                        "mtime":m.mtime(),"mtime_nsec":m.mtime_nsec(),"ctime":m.ctime(),"ctime_nsec":m.ctime_nsec()}))
+                };
+                let requests = || -> anyhow::Result<Vec<String>> {
+                    let mut records = std::fs::read_dir(&root)?
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.starts_with("r6-provider-request-") && n.ends_with(".json"))
+                        .collect::<Vec<_>>();
+                    records.sort();
+                    Ok(records)
+                };
+                let before = actor
+                    .terminal_receipt_context(&message_id)
+                    .map_err(anyhow::Error::msg)?;
+                if let SessionMessageReceiptContext::Available { receipt, .. } = &before {
+                    anyhow::ensure!(
+                        receipt.is_none(),
+                        "recovery cut must precede this client's ACK"
+                    );
+                }
+                private_record(
+                    &root.join("r6-terminal-before-restart.json"),
+                    &serde_json::to_value(&before)?,
+                )?;
+                let file_before = identity()?;
+                let requests_before = requests()?;
+                actor.finish().map_err(anyhow::Error::msg)?;
+                // Original F2 closes the old child; restart keeps the original
+                // root/config/database/port and creates a fresh process epoch.
+                server.restart()?;
+                actor = SessionActor::resume(
+                    &client,
+                    &base,
+                    &session_id,
+                    "harness-eval-live",
+                    deadline,
+                )
                 .map_err(anyhow::Error::msg)?;
+                let after = actor
+                    .terminal_receipt_context(&message_id)
+                    .map_err(anyhow::Error::msg)?;
+                private_record(
+                    &root.join("r6-terminal-after-restart.json"),
+                    &serde_json::to_value(&after)?,
+                )?;
+                anyhow::ensure!(
+                    r6_same_recovered_terminal(&before, &after, graph, turn),
+                    "original terminal payload/identity did not recover"
+                );
+                let file_after = identity()?;
+                let requests_after = requests()?;
+                anyhow::ensure!(
+                    file_before == file_after,
+                    "physical output was rewritten during delivery recovery"
+                );
+                anyhow::ensure!(
+                    requests_before == requests_after,
+                    "delivery recovery requested another provider continuation"
+                );
+                Some(
+                    json!({"cut":"durable terminal before client ACK","fresh_attachment":true,"same_immutable_terminal":true,
+                    "file_identity_before":file_before,"file_identity_after":file_after,"provider_requests_before":requests_before,"provider_requests_after":requests_after,
+                    "inflight_graph_or_forced_crash_proven":false}),
+                )
+            } else {
+                None
+            };
+            let actual_context = actor
+                .terminal_receipt_context(&message_id)
+                .map_err(anyhow::Error::msg)?;
+            private_record(
+                &root.join("r6-terminal-before-ack.json"),
+                &serde_json::to_value(&actual_context)?,
+            )?;
+            // A public error terminal can be deliverable too. It is not the
+            // business success oracle. Verify original work/Goal before ACK.
             anyhow::ensure!(
-                delivered.observation["execution_id"] == graph,
-                "unknown outbox cannot prove the admitted Graph"
-            );
-            anyhow::ensure!(
-                delivered.observation["fresh_context_confirmed"] == true,
-                "missing ACK reread"
-            );
-            anyhow::ensure!(
-                std::fs::read(root.join("workspace/recovery-effect.txt"))?
+                std::fs::read(root.join("workspace/recovery-effect.txt")).map_err(|e|anyhow::anyhow!("foreground_business_artifact_missing_or_unreadable; actual terminal saved before ACK: {e}"))?
                     == b"recovery-effect-once\n",
                 "independent physical artifact differs"
             );
@@ -296,13 +409,24 @@ fn admitted_background_pending_allows_real_goal_and_public_ack() -> anyhow::Resu
                 serde_json::to_value(verdict.kind)? == json!("satisfied"),
                 "Goal verdict not Satisfied"
             );
+            let delivered = actor
+                .confirm_terminal_delivery(&message_id, turn, graph)
+                .map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                delivered.observation["execution_id"] == graph,
+                "unknown outbox cannot prove the admitted Graph"
+            );
+            anyhow::ensure!(
+                delivered.observation["fresh_context_confirmed"] == true,
+                "missing ACK reread"
+            );
             let still_pending = snapshot()?;
             anyhow::ensure!(
                 still_pending["pending"] == true && still_pending["receipts"] == 0,
                 "background unexpectedly succeeded; coexistence fault not held"
             );
             Ok(
-                json!({"session_id":session_id,"graph_id":graph,"turn_id":turn,"program":program,"terminal_message_id":message_id,"delivery":delivered.observation,"blocks":delivered.blocks,"background_pending":still_pending,"cancel_recovery_proven":false,"AI_proven":false}),
+                json!({"session_id":session_id,"graph_id":graph,"turn_id":turn,"program":program,"terminal_message_id":message_id,"delivery":delivered.observation,"blocks":delivered.blocks,"background_pending":still_pending,"pre_ack_delivery_recovery":recovery,"cancel_recovery_proven":false,"AI_proven":false}),
             )
         })();
         let detach = actor.finish();
@@ -441,6 +565,10 @@ struct FiniteProvider {
 
 impl FiniteProvider {
     fn start(root: &Path, model: &str) -> anyhow::Result<Self> {
+        Self::start_mode(root, model, false)
+    }
+
+    fn start_mode(root: &Path, model: &str, hold_stream: bool) -> anyhow::Result<Self> {
         use std::sync::{
             Arc, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -487,9 +615,15 @@ impl FiniteProvider {
                         let model = owned_model.clone();
                         let path = archive.clone();
                         workers.push(std::thread::spawn(move || {
-                            if let Err(e) =
-                                serve_script_request(socket, &model, &path, count, &tx, &st)
-                            {
+                            if let Err(e) = serve_script_request(
+                                socket,
+                                &model,
+                                &path,
+                                count,
+                                &tx,
+                                &st,
+                                hold_stream,
+                            ) {
                                 *er.lock().unwrap() = Some(e.to_string());
                             }
                         }));
@@ -589,6 +723,7 @@ fn serve_script_request(
     ordinal: usize,
     send: &std::sync::mpsc::SyncSender<ScriptRequest>,
     stop: &std::sync::atomic::AtomicBool,
+    hold_stream: bool,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
     use std::sync::{atomic::Ordering, mpsc};
@@ -660,6 +795,41 @@ fn serve_script_request(
         &root.join(format!("r6-provider-request-{ordinal}.json")),
         &body,
     )?;
+    if hold_stream && stream {
+        // A real HTTP response and first valid SSE chunk establish an active
+        // response, rather than merely a queued connection with no headers.
+        let first = json!({"id":format!("r6-hold-{ordinal}"),"object":"chat.completion.chunk","model":model,
+            "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]});
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {first}\n\n").as_bytes())?;
+        socket.flush()?;
+        private_record(
+            &root.join(format!("r6-provider-response-opened-{ordinal}.json")),
+            &json!({"ordinal":ordinal,"local_http_only":true,"Runtime_opened_evidence_required_separately":true}),
+        )?;
+        socket.set_nonblocking(true)?;
+        let hold_deadline = Instant::now() + Duration::from_secs(180);
+        while !stop.load(Ordering::Acquire) {
+            anyhow::ensure!(
+                Instant::now() < hold_deadline,
+                "finite active-response hold deadline"
+            );
+            match socket.peek(&mut [0u8; 1]) {
+                Ok(0) => {
+                    private_record(
+                        &root.join(format!("r6-provider-peer-closed-{ordinal}.json")),
+                        &json!({"local_peer_closed":true,"Runtime_cancel_settlement_required_separately":true}),
+                    )?;
+                    return Ok(());
+                }
+                Ok(_) => anyhow::bail!("unexpected data after bounded provider request"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        return Ok(());
+    }
     let (reply, response) = mpsc::sync_channel(1);
     send.try_send(ScriptRequest { body, reply })
         .map_err(|_| anyhow::anyhow!("finite provider queue bound"))?;
@@ -814,6 +984,44 @@ fn controlled_definitions_are_scoped_released_and_do_not_expand_reviewer() -> an
                 .is_err()
         );
     }
+    Ok(())
+}
+
+#[test]
+fn controlled_model_window_is_explicit_and_resolves_through_original_loader() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let config_home = root.path().join("config");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&config_home)?;
+    std::fs::create_dir(&workspace)?;
+    let mut config = json!({"model":"r6-finite-local","providers":{"r5-no-provider":{
+        "baseUrl":"http://127.0.0.1:9/v1","apiKey":"unit-synthetic-only","models":["r6-finite-local"],"protocol":"completions"}}});
+    let path = config_home.join("config.yaml");
+    let resolve = || -> anyhow::Result<runtime::ProviderRegistry> {
+        let loaded = runtime::ConfigLoader::new(&workspace, &config_home).load()?;
+        Ok(runtime::ProviderRegistry::new_with_context_windows(
+            loaded.providers().clone(),
+            loaded.model_context_windows().clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("controlled registry rejected: {e:?}"))?)
+    };
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    // Valid routing is insufficient for admission without a verified window.
+    let old = resolve()?;
+    let old = old.pin();
+    assert!(old.resolve("r6-finite-local").is_some());
+    assert_eq!(old.configured_context_window("r6-finite-local"), None);
+    original_server::configure_controlled_provider(&mut config, "r6-finite-local");
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    let fixed = resolve()?;
+    let fixed = fixed.pin();
+    assert_eq!(
+        fixed.configured_context_window("r6-finite-local"),
+        Some(128_000)
+    );
+    assert_eq!(fixed.configured_context_window("unregistered-model"), None);
+    assert!(fixed.resolve("unregistered-model").is_none());
     Ok(())
 }
 
@@ -1340,4 +1548,480 @@ fn r6_task_route_control_reply(body: &Value) -> Result<Option<Value>, String> {
         "action":"create_root",
         "reason":"This fresh recovery fixture has one bounded result with dependent production and verification, not independent objectives.",
     }).to_string()})))
+}
+
+// ROUND336: selected-source oracle only; the caller owns admission, cancellation,
+// retained-root epochs and physical-return evidence. Never derive principal from
+// the cancellation response itself: use the original owned session lease.
+fn r6_cancel_settled(
+    session: &str,
+    turn: &str,
+    graph: &str,
+    principal: &str,
+    cancellation_id: &str,
+    receipt: &harness_contract::turn::CancellationReceipt,
+    projection: &Value,
+) -> bool {
+    use harness_contract::{
+        projection::{ExecutionTerminalAxes, TerminalEffectSettlement, TerminalExecutionPhase},
+        turn::{CancellationCause, CancellationStatus},
+    };
+    let Ok(axes) = serde_json::from_value::<ExecutionTerminalAxes>(
+        projection
+            .get("terminal_axes")
+            .cloned()
+            .unwrap_or(Value::Null),
+    ) else {
+        return false;
+    };
+    !session.is_empty()
+        && !turn.is_empty()
+        && !graph.is_empty()
+        && !cancellation_id.is_empty()
+        && principal
+            .strip_prefix("principal:")
+            .is_some_and(|s| !s.is_empty())
+        && receipt.cancellation_id == cancellation_id
+        && receipt.session_id == session
+        && receipt.turn_id == turn
+        && receipt.execution_id == graph
+        && receipt.actor_id == principal
+        && receipt.status == CancellationStatus::Cancelled
+        && receipt.cause == CancellationCause::UserRequested
+        && receipt.journal_sequence > 0
+        && receipt
+            .effective_at_ms
+            .is_some_and(|t| t >= receipt.requested_at_ms)
+        && projection["execution_id"] == graph
+        && projection["session_id"] == session
+        && projection["turn_id"] == turn
+        && axes.execution.phase == TerminalExecutionPhase::Terminal
+        && axes.execution.settlement == TerminalEffectSettlement::ProvenSettled
+        && axes.execution.coverage_complete
+        && !axes.source_race
+        && axes.source_cursor > 0
+        && axes.outcome.outcome != Some(harness_contract::goal::ObjectiveTerminalKind::Satisfied)
+}
+
+fn r6_session_events(
+    client: &Client,
+    base: &str,
+    session: &str,
+    deadline: Instant,
+) -> anyhow::Result<Vec<Value>> {
+    let mut rows = vec![];
+    let mut next = 0u64;
+    let mut selected = None;
+    for _ in 0..32 {
+        let limit = 100usize.min(512 - rows.len());
+        anyhow::ensure!(
+            limit > 0 && Instant::now() < deadline,
+            "bounded R6 Session event prefix exhausted"
+        );
+        let page = get_owned_json(
+            client,
+            base,
+            &format!(
+                "/api/sessions/{session}/events?from_seq={next}&limit={limit}&include_payload=true"
+            ),
+            deadline,
+        )?;
+        anyhow::ensure!(
+            page["session_id"] == session
+                && page["from_seq"] == next
+                && page["limit"] == limit
+                && page["include_payload"] == true,
+            "foreign R6 event page"
+        );
+        let total = page["total"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("missing event count"))?;
+        let cut = *selected.get_or_insert(total);
+        anyhow::ensure!(cut <= 512, "R6 event prefix bound");
+        let events = page["events"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing events"))?;
+        anyhow::ensure!(
+            events.len() <= limit
+                && page["has_more"].as_bool() == Some((events.len() as u64) < total),
+            "event pagination contract"
+        );
+        for event in events {
+            let position = event["sequence"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("missing event position"))?;
+            anyhow::ensure!(
+                event["session_id"] == session && position >= next,
+                "foreign/nonmonotonic Session event"
+            );
+            next = position
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("event cursor overflow"))?;
+            if rows.len() < cut as usize {
+                rows.push(event.clone());
+            }
+        }
+        if rows.len() == cut as usize {
+            return Ok(rows);
+        }
+        anyhow::ensure!(!events.is_empty(), "selected event prefix incomplete");
+    }
+    anyhow::bail!("R6 event pagination bound")
+}
+
+fn observe_owned_active_cancel(
+    client: &Client,
+    base: &str,
+    root: &Path,
+    actor: &mut SessionActor<'_>,
+    session: &str,
+    graph: &str,
+    turn: &str,
+    deadline: Instant,
+) -> anyhow::Result<Value> {
+    use runtime::provider_runtime_client::ProviderPhysicalObservation;
+    // The actor is independently read before cancellation, never inferred from
+    // the returned receipt (which would make the identity check circular).
+    let leases = get_owned_json(client, base, "/api/runtime/session-leases", deadline)?;
+    let owned = leases["leases"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing original leases"))?
+        .iter()
+        .filter(|r| r["session_id"] == session)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        leases["status"] == "available"
+            && leases["attached"] == true
+            && owned.len() == 1
+            && owned[0]["mode"] == "collaborative",
+        "owned lease missing/ambiguous"
+    );
+    let principal = owned[0]["owner"]
+        .as_str()
+        .and_then(|o| o.strip_suffix(":observer:harness-eval-live"))
+        .filter(|p| p.strip_prefix("principal:").is_some_and(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow::anyhow!("original principal binding missing"))?
+        .to_owned();
+    private_record(&root.join("r6-cancel-original-lease.json"), &leases)?;
+    let (opened_event, physical) = loop {
+        anyhow::ensure!(Instant::now() < deadline, "original ResponseOpened not hit");
+        actor
+            .maintain_receipt_authority()
+            .map_err(anyhow::Error::msg)?;
+        let events = r6_session_events(client, base, session, deadline)?;
+        let found = events.iter().rev().find_map(|event| {
+            if event["type"] != "context.provider_physical_observation"
+                || event["status"] != "opened"
+                || event["sequence"].as_u64().is_none()
+            {
+                return None;
+            }
+            let ProviderPhysicalObservation::ResponseOpened { identity } =
+                serde_json::from_value(event["payload"].clone()).ok()?
+            else {
+                return None;
+            };
+            (identity.session_id == session
+                && identity.turn_id == turn
+                && identity.execution_id == graph
+                && identity.step.session_id == session
+                && identity.step.turn_id == turn
+                && identity.step.execution_id.as_deref() == Some(graph)
+                && !identity.step.step_id.is_empty()
+                && identity.provider_attempt.origin_step_id == identity.step.step_id
+                && !identity.provider_attempt.attempt_id.is_empty()
+                && !identity.request_id.is_empty()
+                && !identity.response_id.is_empty()
+                && identity.opened_at_ms > 0
+                && !identity.resource_lease.is_empty()
+                && !events.iter().any(|later| {
+                    later["sequence"].as_u64() > event["sequence"].as_u64()
+                        && later["type"] == "context.provider_attempt_outcome"
+                        && later["payload"]["request_id"] == identity.request_id
+                }))
+            .then(|| (event.clone(), identity))
+        });
+        if let Some(value) = found {
+            break value;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    private_record(&root.join("r6-cancel-original-opened.json"), &opened_event)?;
+    let before = get_owned_json(
+        client,
+        base,
+        &format!("/api/runtime/executions/{graph}?detail_scope=summary"),
+        deadline,
+    )?;
+    anyhow::ensure!(
+        before.pointer("/terminal_axes/execution/phase") != Some(&json!("terminal")),
+        "AlreadyTerminal cut does not prove active cancellation"
+    );
+    let cancellation_id = format!("r6-owned-cancel:{graph}");
+    let opened_digest = harness_contract::step::canonical_digest(
+        "provider-physical-observation",
+        &opened_event["payload"],
+    )
+    .map_err(anyhow::Error::msg)?;
+    for poll in 0..64 {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "active cancellation remains unproven"
+        );
+        let raw=actor.post_mutation(&format!("/api/sessions/{session}/cancel"),json!({"cancellation_id":cancellation_id,"expected_execution_id":graph,"expected_turn_id":turn})).map_err(anyhow::Error::msg)?;
+        private_record(&root.join(format!("r6-cancel-receipt-{poll}.json")), &raw)?;
+        let receipt: harness_contract::turn::CancellationReceipt = serde_json::from_value(raw)?;
+        anyhow::ensure!(
+            receipt.status != harness_contract::turn::CancellationStatus::AlreadyTerminal,
+            "active cancel lost to terminal"
+        );
+        let projection = get_owned_json(
+            client,
+            base,
+            &format!("/api/runtime/executions/{graph}?detail_scope=summary"),
+            deadline,
+        )?;
+        if r6_cancel_settled(
+            session,
+            turn,
+            graph,
+            &principal,
+            &cancellation_id,
+            &receipt,
+            &projection,
+        ) {
+            let events = r6_session_events(client, base, session, deadline)?;
+            for event in &events {
+                if event["type"] != "context.provider_physical_observation"
+                    || event["status"] != "cancel_observed"
+                {
+                    continue;
+                }
+                let Ok(ProviderPhysicalObservation::CancellationObserved {
+                    identity,
+                    observed_at_ms,
+                    opened,
+                    requested,
+                }) = serde_json::from_value(event["payload"].clone())
+                else {
+                    continue;
+                };
+                if identity != physical
+                    || opened.identity != physical
+                    || opened.observation_digest != opened_digest
+                    || Some(opened.session_sequence as u64) != opened_event["sequence"].as_u64()
+                    || observed_at_ms < physical.opened_at_ms
+                    || requested.cancellation_id != cancellation_id
+                    || requested.stream_id != format!("cancellation:{cancellation_id}")
+                    || requested.event_sequence != 1
+                    || requested.commit_cursor == 0
+                {
+                    continue;
+                }
+                let requested_json = serde_json::to_value(&requested)?;
+                let auth = events
+                    .iter()
+                    .filter(|a| {
+                        a["type"] == "session.claim.cancellation_authorized.v1"
+                            && a["status"] == "authorized"
+                            && a["sequence"].as_u64() < event["sequence"].as_u64()
+                            && a["payload"]["requested_ref"] == requested_json
+                            && a["payload"]["receipt"]["actor_id"] == principal
+                            && a["payload"]["receipt"]["session_id"] == session
+                            && a["payload"]["receipt"]["turn_id"] == turn
+                            && a["payload"]["receipt"]["execution_id"] == graph
+                            && a["payload"]["receipt"]["cancellation_id"] == cancellation_id
+                    })
+                    .collect::<Vec<_>>();
+                if auth.len() != 1 || !events.iter().any(|e| e == &opened_event) {
+                    continue;
+                }
+                private_record(&root.join("r6-cancel-settled-events.json"), &json!(events))?;
+                return Ok(
+                    json!({"receipt":receipt,"projection":projection,"opened_event":opened_event,"cancel_observed":event,
+                    "authorization_event":auth[0],"local_response_cancellation_observed":true,"physical_release":"requires_original_F2_and_owned_resource_return",
+                    "remote_inference_stop":"unknown","remote_billing_stop":"unknown"}),
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("bounded original cancel receipt/physical evidence did not settle")
+}
+
+// Before-ACK durable-delivery recovery only. A fresh attachment has a NEW client
+// identity/grant; compare immutable message content, not the entire context.
+// Both contexts must be actually fetched, one in each independently proved epoch.
+fn r6_same_recovered_terminal(
+    before: &SessionMessageReceiptContext,
+    after: &SessionMessageReceiptContext,
+    graph: &str,
+    turn: &str,
+) -> bool {
+    if !exact_graph_context(before, graph, turn) || !exact_graph_context(after, graph, turn) {
+        return false;
+    }
+    match (before, after) {
+        (
+            SessionMessageReceiptContext::Available {
+                session_id: a_session,
+                message_id: a_message,
+                message_sequence: a_sequence,
+                payload_kind: a_kind,
+                payload_json: a_payload,
+                content_digest: a_digest,
+                ..
+            },
+            SessionMessageReceiptContext::Available {
+                session_id: b_session,
+                message_id: b_message,
+                message_sequence: b_sequence,
+                payload_kind: b_kind,
+                payload_json: b_payload,
+                content_digest: b_digest,
+                ..
+            },
+        ) => {
+            !a_session.is_empty()
+                && !a_message.is_empty()
+                && !a_digest.is_empty()
+                && a_session == b_session
+                && a_message == b_message
+                && a_sequence == b_sequence
+                && a_kind == b_kind
+                && a_payload == b_payload
+                && a_digest == b_digest
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn r6_cancel_oracle_rejects_foreign_and_unsettled_receipts() {
+    let receipt = json!({"cancellation_id":"cancel-a","session_id":"session-a",
+        "turn_id":"turn-a","execution_id":"graph-a","actor_id":"principal:fixture",
+        "cause":"user_requested","requested_at_ms":10,"effective_at_ms":20,
+        "status":"cancelled","journal_sequence":2,"projection_revision":3});
+    let projection = json!({"session_id":"session-a","turn_id":"turn-a","execution_id":"graph-a",
+        "terminal_axes":{
+            "outcome":{"goal_id":null,"goal_revision":null,"outcome":null,"terminal_fence":null},
+            "execution":{"phase":"terminal","settlement":"proven_settled","coverage_complete":true,"evidence_refs":["fixture:closure"]},
+            "delivery":{"runtime_terminal_ref":null,"session_client_evidence":"requires_fresh_context"},
+            "source_cursor":30,"source_race":false}});
+    let accepts = |r: Value, p: &Value| {
+        let r = serde_json::from_value(r).unwrap();
+        r6_cancel_settled(
+            "session-a",
+            "turn-a",
+            "graph-a",
+            "principal:fixture",
+            "cancel-a",
+            &r,
+            p,
+        )
+    };
+    assert!(accepts(receipt.clone(), &projection));
+    for (key, value) in [
+        ("cancellation_id", json!("foreign")),
+        ("session_id", json!("foreign")),
+        ("turn_id", json!("foreign")),
+        ("execution_id", json!("foreign")),
+        ("actor_id", json!("principal:foreign")),
+        ("cause", json!("system")),
+        ("status", json!("requested")),
+        ("status", json!("already_terminal")),
+        ("journal_sequence", json!(0)),
+        ("effective_at_ms", Value::Null),
+        ("effective_at_ms", json!(9)),
+    ] {
+        let mut changed = receipt.clone();
+        changed[key] = value;
+        assert!(!accepts(changed, &projection), "receipt {key}");
+    }
+    for (path, value) in [
+        ("/session_id", json!("foreign")),
+        ("/turn_id", json!("foreign")),
+        ("/execution_id", json!("foreign")),
+        ("/terminal_axes", Value::Null),
+        ("/terminal_axes/execution/coverage_complete", json!(false)),
+        ("/terminal_axes/execution/settlement", json!("unknown")),
+        ("/terminal_axes/source_race", json!(true)),
+        ("/terminal_axes/source_cursor", json!(0)),
+        ("/terminal_axes/outcome/outcome", json!("satisfied")),
+    ] {
+        let mut changed = projection.clone();
+        *changed.pointer_mut(path).unwrap() = value;
+        assert!(!accepts(receipt.clone(), &changed), "projection {path}");
+    }
+}
+
+#[test]
+fn r6_recovery_oracle_allows_fresh_client_but_rejects_changed_content() {
+    let mut before = super::tests::context();
+    if let SessionMessageReceiptContext::Available {
+        session_source,
+        runtime_commit_cursor,
+        outbox_observation,
+        ..
+    } = &mut before
+    {
+        *outbox_observation = SessionReceiptOutboxObservation::RuntimeOutbox {
+            terminal_id: format!("turn-terminal:{}", session_source.request_id),
+            revision: "1".into(),
+            status: "materialized".into(),
+            materialized_at_ms: Some(100),
+            runtime_commit_cursor: runtime_commit_cursor.clone(),
+            execution_id: Some("graph-a".into()),
+            turn_id: session_source.turn_id.clone(),
+            request_id: session_source.request_id.clone(),
+        };
+    }
+    let turn = match &before {
+        SessionMessageReceiptContext::Available { session_source, .. } => {
+            session_source.turn_id.clone()
+        }
+        _ => unreachable!(),
+    };
+    let mut after = before.clone();
+    if let SessionMessageReceiptContext::Available {
+        client_id, receipt, ..
+    } = &mut after
+    {
+        *client_id = "fresh-epoch-client".into();
+        *receipt = None;
+    }
+    assert!(r6_same_recovered_terminal(
+        &before, &after, "graph-a", &turn
+    ));
+    for field in [
+        "session", "message", "sequence", "payload", "digest", "unknown",
+    ] {
+        let mut changed = after.clone();
+        if let SessionMessageReceiptContext::Available {
+            session_id,
+            message_id,
+            message_sequence,
+            payload_json,
+            content_digest,
+            outbox_observation,
+            ..
+        } = &mut changed
+        {
+            match field {
+                "session" => session_id.push_str("-foreign"),
+                "message" => message_id.push_str("-foreign"),
+                "sequence" => message_sequence.push('0'),
+                "payload" => payload_json.push(' '),
+                "digest" => content_digest.push('0'),
+                "unknown" => {
+                    *outbox_observation = SessionReceiptOutboxObservation::RuntimeOutboxUnknown
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            !r6_same_recovered_terminal(&before, &changed, "graph-a", &turn),
+            "{field}"
+        );
+    }
 }

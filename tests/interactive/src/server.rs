@@ -325,6 +325,14 @@ fn private_config(port: u16, identity: &str, model: &str, apps_dir: &Path) -> se
     })
 }
 
+// The finite local service declares a verified 128k window, just as the
+// original Gateway no-hold provider_registry fixture does. An arbitrary model
+// name alone must continue to have unknown capacity and fail closed.
+pub(crate) fn configure_controlled_provider(config: &mut serde_json::Value, model: &str) {
+    config["runtime"]["background"] = serde_json::json!({"evolution":true,"growth":true});
+    config["model_context_windows"] = serde_json::json!({model:128_000});
+}
+
 pub struct ServerProcess {
     proc: Option<Child>,
     base_url: String,
@@ -560,8 +568,7 @@ impl ServerProcess {
             if retained_port.is_none() {
                 let mut config = private_config(port, &identity, &model, &apps_dir);
                 if controlled_endpoint.is_some() {
-                    config["runtime"]["background"] =
-                        serde_json::json!({"evolution":true,"growth":true});
+                    configure_controlled_provider(&mut config, &model);
                 }
                 if let Some(token) = initial_operator_token {
                     config["gateway"]["platforms"][0]["auth_token"] = token.into();
