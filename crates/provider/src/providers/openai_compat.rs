@@ -1020,7 +1020,8 @@ impl StreamState {
                             "stream_compat_finish",
                             error.class(),
                             frame.as_bytes(),
-                        ));
+                        )
+                        .with_compatibility_tool_closure_predicate(error.closure_predicate()));
                 }
             }
         }
@@ -2419,7 +2420,8 @@ fn normalize_chat_completion_response(
                             "nonstream_compat_content",
                             error.class(),
                             protocol_frame.as_bytes(),
-                        ));
+                        )
+                        .with_compatibility_tool_closure_predicate(error.closure_predicate()));
                 }
             }
         } else {
@@ -2632,7 +2634,7 @@ struct DsmlToolCall {
 enum CompatToolFrameError {
     FrameTooLarge,
     UnrecognizedMarker,
-    Unterminated,
+    Unterminated(CompatClosurePredicate),
     InvalidAttributes,
     InvalidArguments,
     DuplicateParameter,
@@ -2640,17 +2642,57 @@ enum CompatToolFrameError {
     UnsupportedShape,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatClosurePredicate {
+    DsmlToolCallsClose,
+    DsmlInvokeTagEnd,
+    DsmlInvokeClose,
+    DsmlParameterTagEnd,
+    DsmlParameterClose,
+    LegacyToolCallClose,
+    LegacyFunctionTagEnd,
+    LegacyFunctionClose,
+    LegacyParameterTagEnd,
+    LegacyParameterClose,
+    LegacyToolNameClose,
+}
+
+impl CompatClosurePredicate {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DsmlToolCallsClose => "dsml_tool_calls_close",
+            Self::DsmlInvokeTagEnd => "dsml_invoke_tag_end",
+            Self::DsmlInvokeClose => "dsml_invoke_close",
+            Self::DsmlParameterTagEnd => "dsml_parameter_tag_end",
+            Self::DsmlParameterClose => "dsml_parameter_close",
+            Self::LegacyToolCallClose => "legacy_tool_call_close",
+            Self::LegacyFunctionTagEnd => "legacy_function_tag_end",
+            Self::LegacyFunctionClose => "legacy_function_close",
+            Self::LegacyParameterTagEnd => "legacy_parameter_tag_end",
+            Self::LegacyParameterClose => "legacy_parameter_close",
+            Self::LegacyToolNameClose => "legacy_tool_name_close",
+        }
+    }
+}
+
 impl CompatToolFrameError {
     const fn class(self) -> &'static str {
         match self {
             Self::FrameTooLarge => "frame_too_large",
             Self::UnrecognizedMarker => "unrecognized_marker",
-            Self::Unterminated => "unterminated",
+            Self::Unterminated(_) => "unterminated",
             Self::InvalidAttributes => "invalid_attributes",
             Self::InvalidArguments => "invalid_arguments",
             Self::DuplicateParameter => "duplicate_parameter",
             Self::EmptyCalls => "empty_calls",
             Self::UnsupportedShape => "unsupported_shape",
+        }
+    }
+
+    const fn closure_predicate(self) -> Option<&'static str> {
+        match self {
+            Self::Unterminated(predicate) => Some(predicate.label()),
+            _ => None,
         }
     }
 }
@@ -2659,7 +2701,7 @@ fn compatibility_tool_protocol_error(error: CompatToolFrameError) -> ApiError {
     ApiError::CompatibilityToolProtocol(match error {
         CompatToolFrameError::FrameTooLarge => CompatibilityToolProtocolFailure::FrameTooLarge,
         CompatToolFrameError::UnrecognizedMarker
-        | CompatToolFrameError::Unterminated
+        | CompatToolFrameError::Unterminated(_)
         | CompatToolFrameError::InvalidAttributes
         | CompatToolFrameError::InvalidArguments
         | CompatToolFrameError::DuplicateParameter
@@ -2690,7 +2732,9 @@ fn parse_dsml_tool_calls(
         .strip_prefix(DSML_TOOL_CALLS_OPEN)
         .ok_or(CompatToolFrameError::UnrecognizedMarker)?
         .strip_suffix(DSML_TOOL_CALLS_CLOSE)
-        .ok_or(CompatToolFrameError::Unterminated)?;
+        .ok_or(CompatToolFrameError::Unterminated(
+            CompatClosurePredicate::DsmlToolCallsClose,
+        ))?;
     let mut remaining = body.trim();
     let mut calls = Vec::new();
 
@@ -2700,7 +2744,9 @@ fn parse_dsml_tool_calls(
             .ok_or(CompatToolFrameError::UnsupportedShape)?;
         let tag_end = after_open
             .find('>')
-            .ok_or(CompatToolFrameError::Unterminated)?;
+            .ok_or(CompatToolFrameError::Unterminated(
+                CompatClosurePredicate::DsmlInvokeTagEnd,
+            ))?;
         let attributes = parse_dsml_attributes(&after_open[..tag_end])?;
         if attributes.len() != 1 {
             return Err(CompatToolFrameError::InvalidAttributes);
@@ -2710,18 +2756,24 @@ fn parse_dsml_tool_calls(
             .ok_or(CompatToolFrameError::InvalidAttributes)?
             .clone();
         let after_tag = &after_open[tag_end + 1..];
-        let (parameters, after_close) = after_tag
-            .split_once(DSML_INVOKE_CLOSE)
-            .ok_or(CompatToolFrameError::Unterminated)?;
+        let (parameters, after_close) =
+            after_tag
+                .split_once(DSML_INVOKE_CLOSE)
+                .ok_or(CompatToolFrameError::Unterminated(
+                    CompatClosurePredicate::DsmlInvokeClose,
+                ))?;
         let mut parameter_source = parameters.trim();
         let mut input = serde_json::Map::new();
         while !parameter_source.is_empty() {
             let after_parameter_open = parameter_source
                 .strip_prefix(DSML_PARAMETER_OPEN)
                 .ok_or(CompatToolFrameError::UnsupportedShape)?;
-            let parameter_tag_end = after_parameter_open
-                .find('>')
-                .ok_or(CompatToolFrameError::Unterminated)?;
+            let parameter_tag_end =
+                after_parameter_open
+                    .find('>')
+                    .ok_or(CompatToolFrameError::Unterminated(
+                        CompatClosurePredicate::DsmlParameterTagEnd,
+                    ))?;
             let parameter_attributes =
                 parse_dsml_attributes(&after_parameter_open[..parameter_tag_end])?;
             if parameter_attributes.len() != 2 {
@@ -2741,9 +2793,10 @@ fn parse_dsml_tool_calls(
                 _ => return Err(CompatToolFrameError::InvalidAttributes),
             };
             let parameter_after_tag = &after_parameter_open[parameter_tag_end + 1..];
-            let (value, after_parameter_close) = parameter_after_tag
-                .split_once(DSML_PARAMETER_CLOSE)
-                .ok_or(CompatToolFrameError::Unterminated)?;
+            let (value, after_parameter_close) =
+                parameter_after_tag.split_once(DSML_PARAMETER_CLOSE).ok_or(
+                    CompatToolFrameError::Unterminated(CompatClosurePredicate::DsmlParameterClose),
+                )?;
             let value = if is_string {
                 Value::String(value.to_string())
             } else {
@@ -2868,7 +2921,9 @@ fn parse_legacy_tool_calls(
         .strip_prefix(LEGACY_TOOL_CALLS_OPEN)
         .ok_or(CompatToolFrameError::UnrecognizedMarker)?
         .strip_suffix(LEGACY_TOOL_CALLS_CLOSE)
-        .ok_or(CompatToolFrameError::Unterminated)?;
+        .ok_or(CompatToolFrameError::Unterminated(
+            CompatClosurePredicate::LegacyToolCallClose,
+        ))?;
     let trimmed_body = body.trim();
     if trimmed_body.starts_with('{') {
         return legacy_json_body_call(trimmed_body)
@@ -2881,30 +2936,37 @@ fn parse_legacy_tool_calls(
         if let Some(after_open) = remaining.strip_prefix(LEGACY_FUNCTION_OPEN) {
             let tag_end = after_open
                 .find('>')
-                .ok_or(CompatToolFrameError::Unterminated)?;
+                .ok_or(CompatToolFrameError::Unterminated(
+                    CompatClosurePredicate::LegacyFunctionTagEnd,
+                ))?;
             let name = after_open[..tag_end].trim().to_string();
             if name.is_empty() || name.contains('<') {
                 return Err(CompatToolFrameError::InvalidAttributes);
             }
             let after_tag = &after_open[tag_end + 1..];
-            let (parameters, after_close) = after_tag
-                .split_once(LEGACY_FUNCTION_CLOSE)
-                .ok_or(CompatToolFrameError::Unterminated)?;
+            let (parameters, after_close) = after_tag.split_once(LEGACY_FUNCTION_CLOSE).ok_or(
+                CompatToolFrameError::Unterminated(CompatClosurePredicate::LegacyFunctionClose),
+            )?;
             let mut parameter_source = parameters.trim();
             let mut input = serde_json::Map::new();
             while !parameter_source.is_empty() {
                 let after_parameter_open = parameter_source
                     .strip_prefix(LEGACY_PARAMETER_OPEN)
                     .ok_or(CompatToolFrameError::UnsupportedShape)?;
-                let parameter_tag_end = after_parameter_open
-                    .find('>')
-                    .ok_or(CompatToolFrameError::Unterminated)?;
+                let parameter_tag_end =
+                    after_parameter_open
+                        .find('>')
+                        .ok_or(CompatToolFrameError::Unterminated(
+                            CompatClosurePredicate::LegacyParameterTagEnd,
+                        ))?;
                 let (parameter_name, is_string) =
                     parse_legacy_parameter_attributes(&after_parameter_open[..parameter_tag_end])?;
                 let parameter_after_tag = &after_parameter_open[parameter_tag_end + 1..];
                 let (value, after_parameter_close) = parameter_after_tag
                     .split_once(LEGACY_PARAMETER_CLOSE)
-                    .ok_or(CompatToolFrameError::Unterminated)?;
+                    .ok_or(CompatToolFrameError::Unterminated(
+                        CompatClosurePredicate::LegacyParameterClose,
+                    ))?;
                 if input
                     .insert(parameter_name, decode_legacy_parameter_value(value, is_string)?)
                     .is_some()
@@ -2920,9 +2982,9 @@ fn parse_legacy_tool_calls(
             });
             remaining = after_close.trim();
         } else if let Some(after_open) = remaining.strip_prefix(LEGACY_TOOL_NAME_OPEN) {
-            let (name, after_close) = after_open
-                .split_once(LEGACY_TOOL_NAME_CLOSE)
-                .ok_or(CompatToolFrameError::Unterminated)?;
+            let (name, after_close) = after_open.split_once(LEGACY_TOOL_NAME_CLOSE).ok_or(
+                CompatToolFrameError::Unterminated(CompatClosurePredicate::LegacyToolNameClose),
+            )?;
             let name = name.trim().to_string();
             if name.is_empty() {
                 return Err(CompatToolFrameError::InvalidAttributes);
@@ -3461,7 +3523,12 @@ mod tests {
                 CompatToolFrameError::UnrecognizedMarker,
                 "unrecognized_marker",
             ),
-            (CompatToolFrameError::Unterminated, "unterminated"),
+            (
+                CompatToolFrameError::Unterminated(
+                    super::CompatClosurePredicate::DsmlToolCallsClose,
+                ),
+                "unterminated",
+            ),
             (
                 CompatToolFrameError::InvalidAttributes,
                 "invalid_attributes",
@@ -3500,6 +3567,78 @@ mod tests {
             let metadata = error.compatibility_tool_frame_metadata().unwrap();
             assert_eq!(metadata["stage"], "nonstream_tool_arguments");
             assert_eq!(metadata["class"], "invalid_arguments");
+        }
+    }
+
+    #[test]
+    fn compatibility_closure_predicates_come_from_each_actual_parser_branch() {
+        let cases = [
+            ("<｜｜DSML｜｜tool_calls>", "dsml_tool_calls_close"),
+            ("<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"</｜｜DSML｜｜tool_calls>", "dsml_invoke_tag_end"),
+            ("<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"></｜｜DSML｜｜tool_calls>", "dsml_invoke_close"),
+            ("<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"><｜｜DSML｜｜parameter name=\"path\" string=\"true\"</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>", "dsml_parameter_tag_end"),
+            ("<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"><｜｜DSML｜｜parameter name=\"path\" string=\"true\">PRIVATE_CLOSURE_319</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>", "dsml_parameter_close"),
+            ("<tool_call>", "legacy_tool_call_close"),
+            ("<tool_call><function=read_file</tool_call>", "legacy_function_tag_end"),
+            ("<tool_call><function=read_file></tool_call>", "legacy_function_close"),
+            ("<tool_call><function=read_file><parameter=path</function></tool_call>", "legacy_parameter_tag_end"),
+            ("<tool_call><function=read_file><parameter=path>PRIVATE_CLOSURE_319</function></tool_call>", "legacy_parameter_close"),
+            ("<tool_call><tool_name>read_file</tool_call>", "legacy_tool_name_close"),
+        ];
+        for (frame, expected) in cases {
+            let mut state = StreamState::new("closure-fixture".into(), &[]);
+            state
+                .ingest_chunk(compat_test_chunk(Some(frame), Some("stop")))
+                .unwrap();
+            let error = state.finish().unwrap_err();
+            let metadata = error.compatibility_tool_frame_metadata().unwrap();
+            assert_eq!(
+                metadata["closure_predicate"], expected,
+                "actual failure branch for {frame}"
+            );
+            assert_eq!(metadata["stage"], "stream_compat_finish");
+            assert_eq!(metadata["class"], "unterminated");
+            let response = serde_json::from_value(json!({
+                "id":"closure-fixture", "model":"closure-fixture",
+                "choices":[{"message":{"role":"assistant", "content":frame}, "finish_reason":"stop"}]
+            })).unwrap();
+            let nonstream =
+                super::normalize_chat_completion_response("closure-fixture", response, &[])
+                    .unwrap_err();
+            let other = nonstream.compatibility_tool_frame_metadata().unwrap();
+            assert_eq!(other["closure_predicate"], expected);
+            assert_eq!(other["stage"], "nonstream_compat_content");
+            assert_eq!(other["sha256"], metadata["sha256"]);
+            assert_eq!(
+                error.private_compatibility_tool_frame(),
+                Some(frame.as_bytes())
+            );
+            assert!(!format!("{error:?}").contains("PRIVATE_CLOSURE_319"));
+        }
+        for frame in [
+            "<tool_call>PRIVATE_CLOSURE_319</tool_call>",
+            "<tool_call>{bad}</tool_call>",
+        ] {
+            let mut state = StreamState::new("closure-fixture".into(), &[]);
+            state
+                .ingest_chunk(compat_test_chunk(Some(frame), Some("stop")))
+                .unwrap();
+            let error = state.finish().unwrap_err();
+            assert!(error
+                .compatibility_tool_frame_metadata()
+                .unwrap()
+                .get("closure_predicate")
+                .is_none());
+        }
+        for frame in [
+            "<tool_call><function=read_file></function></tool_call>",
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+        ] {
+            let mut state = StreamState::new("closure-fixture".into(), &[]);
+            state.ingest_chunk(compat_test_chunk(Some(frame), Some("stop"))).unwrap();
+            let events = state.finish().unwrap();
+            assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::MessageStop(_))).count(), 1);
+            assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::ContentBlockStart(start) if matches!(&start.content_block, OutputContentBlock::ToolUse {name, ..} if name == "read_file"))).count(), 1);
         }
     }
 

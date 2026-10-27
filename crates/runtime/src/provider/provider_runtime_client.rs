@@ -2676,7 +2676,7 @@ impl BoundProviderProtocolDiagnostic {
         }
         // Do not copy the decoder's in-memory capture status into a claim that
         // ordinary session visibility provides encrypted response storage.
-        Ok(serde_json::json!({
+        let mut metadata = serde_json::json!({
             "schema_version": 1,
             "physical_identity": self.identity,
             "opened_sequence": self.opened_sequence,
@@ -2689,7 +2689,11 @@ impl BoundProviderProtocolDiagnostic {
             "capture_limit": self.decoder["capture_limit"],
             "raw_omitted": true, "raw_persisted": false, "raw_replayable": false,
             "raw_omission_reason": "private_encrypted_artifact_unavailable"
-        }))
+        });
+        if let Some(predicate) = self.decoder.get("closure_predicate") {
+            metadata["closure_predicate"] = predicate.clone();
+        }
+        Ok(metadata)
     }
 }
 
@@ -4073,6 +4077,60 @@ mod tests {
         assert_eq!(safe["raw_persisted"], false);
         assert_eq!(safe["raw_replayable"], false);
         assert!(!safe.to_string().contains("PRIVATE_BOUND_FRAME_302"));
+        assert!(
+            safe.get("closure_predicate").is_none(),
+            "old diagnostics remain unannotated"
+        );
+        // The parser's finite labels must survive both the bound diagnostic
+        // view and the exact payload passed to the original outcome writer.
+        // This adds no new physical binding or response/storage authority.
+        for predicate in [
+            "dsml_tool_calls_close",
+            "dsml_invoke_tag_end",
+            "dsml_invoke_close",
+            "dsml_parameter_tag_end",
+            "dsml_parameter_close",
+            "legacy_tool_call_close",
+            "legacy_function_tag_end",
+            "legacy_function_close",
+            "legacy_parameter_tag_end",
+            "legacy_parameter_close",
+            "legacy_tool_name_close",
+        ] {
+            let error = provider::ApiError::CompatibilityToolProtocol(
+                provider::CompatibilityToolProtocolFailure::MalformedFrame,
+            )
+            .with_compatibility_tool_frame_diagnostic(
+                "stream_compat_finish",
+                "unterminated",
+                b"PRIVATE_BOUND_FRAME_302",
+            )
+            .with_compatibility_tool_closure_predicate(Some(predicate));
+            let branch = super::bind_provider_protocol_diagnostic(
+                &error,
+                context,
+                &step.identity,
+                &step.provider_attempt,
+                "original-request",
+                "original-lease",
+                &ack,
+            )
+            .unwrap();
+            assert_eq!(branch.metadata()["decoder"]["closure_predicate"], predicate);
+            let mut branch_payload = branch.outcome_metadata(context, &outcome, &packed).unwrap();
+            assert_eq!(
+                branch_payload
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("closure_predicate"),
+                Some(serde_json::json!(predicate))
+            );
+            assert_eq!(
+                branch_payload, safe,
+                "all original identity/raw-omission fields must remain unchanged"
+            );
+            assert!(!format!("{branch:?}").contains("PRIVATE_BOUND_FRAME_302"));
+        }
         let mut tampered = bound.clone();
         tampered.opened_digest.push('x');
         assert!(

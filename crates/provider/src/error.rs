@@ -41,6 +41,7 @@ const QUOTA_EXHAUSTED_MARKERS: &[&str] = &[
 pub struct CompatibilityToolFrameDiagnostic {
     stage: &'static str,
     class: &'static str,
+    closure_predicate: Option<&'static str>,
     observed_bytes: usize,
     sha256: String,
     private_frame: Option<Vec<u8>>,
@@ -50,7 +51,7 @@ impl CompatibilityToolFrameDiagnostic {
     const CAPTURE_LIMIT: usize = 64 * 1024;
 
     fn metadata(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut metadata = serde_json::json!({
             "stage": self.stage, "class": self.class,
             "scope": "observed_decoder_frame",
             "observed_bytes": self.observed_bytes, "sha256": self.sha256,
@@ -58,7 +59,11 @@ impl CompatibilityToolFrameDiagnostic {
             "omission_reason": self.private_frame.is_none().then_some("diagnostic_capture_limit"),
             "capture_limit": Self::CAPTURE_LIMIT,
             "persisted": false, "replayable": false
-        })
+        });
+        if let Some(predicate) = self.closure_predicate {
+            metadata["closure_predicate"] = serde_json::json!(predicate);
+        }
+        metadata
     }
 }
 
@@ -192,6 +197,7 @@ impl ApiError {
         let diagnostic = CompatibilityToolFrameDiagnostic {
             stage,
             class,
+            closure_predicate: None,
             observed_bytes: frame.len(),
             sha256: format!("{:x}", Sha256::digest(frame)),
             private_frame: (frame.len() <= CompatibilityToolFrameDiagnostic::CAPTURE_LIMIT)
@@ -206,6 +212,49 @@ impl ApiError {
             }
             already_annotated => already_annotated,
         })
+    }
+
+    /// A decoder-selected predicate, never a frame fragment or a guessed
+    /// interpretation of the frame. Unknown labels and unrelated errors do
+    /// not acquire a closure diagnosis; existing unannotated callers stay so.
+    #[must_use]
+    pub fn with_compatibility_tool_closure_predicate(
+        mut self,
+        predicate: Option<&'static str>,
+    ) -> Self {
+        let Some(predicate) = predicate.filter(|predicate| {
+            matches!(
+                *predicate,
+                "dsml_tool_calls_close"
+                    | "dsml_invoke_tag_end"
+                    | "dsml_invoke_close"
+                    | "dsml_parameter_tag_end"
+                    | "dsml_parameter_close"
+                    | "legacy_tool_call_close"
+                    | "legacy_function_tag_end"
+                    | "legacy_function_close"
+                    | "legacy_parameter_tag_end"
+                    | "legacy_parameter_close"
+                    | "legacy_tool_name_close"
+            )
+        }) else {
+            return self;
+        };
+        if let Self::CompatibilityToolProtocol(
+            CompatibilityToolProtocolFailure::MalformedFrameWithDiagnostic(diagnostic),
+        ) = &mut self
+        {
+            if diagnostic.class == "unterminated"
+                && matches!(
+                    diagnostic.stage,
+                    "stream_compat_finish" | "nonstream_compat_content"
+                )
+                && diagnostic.closure_predicate.is_none()
+            {
+                diagnostic.closure_predicate = Some(predicate);
+            }
+        }
+        self
     }
 
     fn compatibility_tool_frame_diagnostic(&self) -> Option<&CompatibilityToolFrameDiagnostic> {
@@ -1146,6 +1195,84 @@ mod tests {
             .with_compatibility_tool_frame_diagnostic("stream_compat_finish", "unterminated", canary);
         assert!(unrelated.compatibility_tool_frame_metadata().is_none());
         assert!(!unrelated.is_compatibility_tool_protocol_failure());
+    }
+
+    #[test]
+    fn closure_predicate_is_finite_optional_and_preserves_existing_diagnostics() {
+        let legacy =
+            ApiError::CompatibilityToolProtocol(CompatibilityToolProtocolFailure::MalformedFrame)
+                .with_compatibility_tool_frame_diagnostic(
+                    "stream_compat_finish",
+                    "unterminated",
+                    b"PRIVATE_CLOSURE_319",
+                );
+        let old = legacy.compatibility_tool_frame_metadata().unwrap();
+        assert!(old.get("closure_predicate").is_none());
+        let annotated =
+            ApiError::CompatibilityToolProtocol(CompatibilityToolProtocolFailure::MalformedFrame)
+                .with_compatibility_tool_frame_diagnostic(
+                    "stream_compat_finish",
+                    "unterminated",
+                    b"PRIVATE_CLOSURE_319",
+                )
+                .with_compatibility_tool_closure_predicate(Some("dsml_parameter_close"));
+        let mut metadata = annotated.compatibility_tool_frame_metadata().unwrap();
+        assert_eq!(
+            metadata
+                .as_object_mut()
+                .unwrap()
+                .remove("closure_predicate"),
+            Some(serde_json::json!("dsml_parameter_close"))
+        );
+        assert_eq!(metadata, old);
+        assert_eq!(annotated.to_string(), legacy.to_string());
+        assert_eq!(annotated.safe_failure_class(), legacy.safe_failure_class());
+        assert_eq!(annotated.is_retryable(), legacy.is_retryable());
+        assert_eq!(
+            annotated.private_compatibility_tool_frame(),
+            legacy.private_compatibility_tool_frame()
+        );
+        assert!(!format!("{annotated:?}").contains("PRIVATE_CLOSURE_319"));
+        let wrapped = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(annotated),
+        };
+        assert_eq!(
+            wrapped.compatibility_tool_frame_metadata().unwrap()["closure_predicate"],
+            "dsml_parameter_close"
+        );
+        for label in [
+            None,
+            Some("PRIVATE_CLOSURE_319"),
+            Some("tool_call_close"),
+            Some(""),
+        ] {
+            let error = ApiError::CompatibilityToolProtocol(
+                CompatibilityToolProtocolFailure::MalformedFrame,
+            )
+            .with_compatibility_tool_frame_diagnostic(
+                "stream_compat_finish",
+                "unterminated",
+                b"PRIVATE_CLOSURE_319",
+            )
+            .with_compatibility_tool_closure_predicate(label);
+            assert_eq!(error.compatibility_tool_frame_metadata(), Some(old.clone()));
+        }
+        for (stage, class) in [
+            ("stream_compat_finish", "invalid_arguments"),
+            ("nonstream_tool_arguments", "unterminated"),
+        ] {
+            let error = ApiError::CompatibilityToolProtocol(
+                CompatibilityToolProtocolFailure::MalformedFrame,
+            )
+            .with_compatibility_tool_frame_diagnostic(stage, class, b"PRIVATE_CLOSURE_319")
+            .with_compatibility_tool_closure_predicate(Some("legacy_tool_call_close"));
+            assert!(error
+                .compatibility_tool_frame_metadata()
+                .unwrap()
+                .get("closure_predicate")
+                .is_none());
+        }
     }
 
     #[test]
