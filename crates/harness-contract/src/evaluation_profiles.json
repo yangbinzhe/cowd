@@ -62,6 +62,59 @@
         "read:crates/runtime",
         "read:crates/gateway"
       ]
+    },
+    {
+      "corpus_id": "live-group-theory-v1",
+      "selectors": [
+        "live_group_theory_ai_research_simulation"
+      ],
+      "observer_resource_grants": [
+        "read:crates/runtime/src/agentic/program.rs",
+        "read:crates/runtime/src/agentic/action_service.rs",
+        "read:crates/runtime/src/agentic/execution.rs"
+      ]
+    },
+    {
+      "corpus_id": "live-three-domain-team-v1",
+      "selectors": [
+        "live_explicit_team_requirement",
+        "live_team_projection"
+      ],
+      "observer_resource_grants": [
+        "read:crates/runtime",
+        "read:crates/memory",
+        "read:crates/gateway"
+      ]
+    },
+    {
+      "corpus_id": "live-agent-escalation-v1",
+      "selectors": [
+        "live_agent_escalation"
+      ],
+      "observer_resource_grants": [
+        "read:crates/runtime",
+        "read:crates/gateway"
+      ]
+    },
+    {
+      "corpus_id": "live-large-scale-v1",
+      "selectors": [
+        "live_qwen38_large_scale_collaboration"
+      ],
+      "observer_resource_grants": [
+        "read:crates/runtime/src/agentic/program.rs",
+        "read:crates/runtime/src/agentic/action_service.rs",
+        "read:crates/runtime/src/agentic/execution.rs",
+        "read:crates/runtime/src/agentic/work_market.rs",
+        "read:crates/runtime/src/agentic/topic.rs",
+        "read:crates/runtime/src/agentic/supervision.rs",
+        "read:crates/runtime/src/agent/in_process_worker.rs",
+        "read:crates/gateway/src/runtime/gateway_tool_executor.rs",
+        "read:crates/gateway/src/api_routes/runtime_routes.rs",
+        "read:crates/runtime/src/conversation/host.rs",
+        "read:crates/runtime/src/execution_core/services.rs",
+        "read:crates/runtime/src/recovery/runtime_event_reactor.rs"
+      ]
     }
   ]
 }

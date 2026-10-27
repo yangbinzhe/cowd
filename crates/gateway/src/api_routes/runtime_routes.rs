@@ -716,6 +716,42 @@ mod read_evidence_api_tests {
         ].into_iter().map(|path| ("live-small-team-v1", path)).collect()).await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires immutable envelopes exported by the actual Harness producer exact test"]
+    async fn original_team_profile_exports_reach_owner_reader_and_reject_outside() {
+        let input = std::env::var_os("COWD_TEST_HARNESS_CONTROL_INPUT").expect("same Harness export");
+        let cases: Vec<Value> = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
+        for (selector, corpus) in [
+            ("live_group_theory_ai_research_simulation", "live-group-theory-v1"),
+            ("live_explicit_team_requirement", "live-three-domain-team-v1"),
+            ("live_team_projection", "live-three-domain-team-v1"),
+            ("live_agent_escalation", "live-agent-escalation-v1"),
+            ("live_qwen38_large_scale_collaboration", "live-large-scale-v1"),
+        ] {
+            let content = cases.iter().find(|v| v["selector"] == selector).unwrap()["content"].as_str().unwrap();
+            let (line, prompt) = content.split_once('\n').unwrap();
+            let control: Value = serde_json::from_str(line.strip_prefix("COWD_EVAL_CONTROL ").unwrap()).unwrap();
+            assert_eq!(control["corpus_id"], corpus); assert_eq!(prompt, "original controlled input");
+        }
+        check_evaluator_read_paths(vec![
+            ("live-group-theory-v1", "crates/runtime/src/agentic/program.rs"),
+            ("live-group-theory-v1", "crates/runtime/src/agentic/action_service.rs"),
+            ("live-group-theory-v1", "crates/runtime/src/agentic/execution.rs"),
+            ("live-group-theory-v1", "crates/runtime/src/lib.rs"),
+            ("live-group-theory-v1", "Cargo.toml"),
+            ("live-three-domain-team-v1", "crates/runtime/src/lib.rs"),
+            ("live-three-domain-team-v1", "crates/memory/src/lib.rs"),
+            ("live-three-domain-team-v1", "crates/gateway/src/main.rs"),
+            ("live-three-domain-team-v1", "crates/tools/src/lib.rs"),
+            ("live-agent-escalation-v1", "crates/runtime/src/lib.rs"),
+            ("live-agent-escalation-v1", "crates/gateway/src/main.rs"),
+            ("live-agent-escalation-v1", "crates/memory/src/lib.rs"),
+            ("live-large-scale-v1", "crates/runtime/src/agentic/program.rs"),
+            ("live-large-scale-v1", "crates/gateway/src/api_routes/runtime_routes.rs"),
+            ("live-large-scale-v1", "crates/runtime/src/lib.rs"),
+        ]).await;
+    }
+
     async fn check_evaluator_read_paths(cases: Vec<(&str, &str)>) {
         let _lock = crate::test_process_env_lock();
         struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -848,6 +884,12 @@ mod read_evidence_api_tests {
                             .contains(&path))
                         || (corpus == "live-u5-fairness-v1"
                             && ["Cargo.toml", "crates/runtime/Cargo.toml"].contains(&path))
+                        || (corpus == "live-group-theory-v1" && ["crates/runtime/src/agentic/program.rs",
+                            "crates/runtime/src/agentic/action_service.rs", "crates/runtime/src/agentic/execution.rs"].contains(&path))
+                        || (corpus == "live-three-domain-team-v1" && ["crates/runtime/src/lib.rs",
+                            "crates/memory/src/lib.rs", "crates/gateway/src/main.rs"].contains(&path))
+                        || (corpus == "live-agent-escalation-v1" && ["crates/runtime/src/lib.rs", "crates/gateway/src/main.rs"].contains(&path))
+                        || (corpus == "live-large-scale-v1" && ["crates/runtime/src/agentic/program.rs", "crates/gateway/src/api_routes/runtime_routes.rs"].contains(&path))
                         || (corpus == "live-small-team-v1"
                             && ["crates/runtime/src/lib.rs", "crates/runtime/src/agentic/execution/dispatch.rs",
                                 "crates/gateway/src/main.rs", "crates/gateway/src/api_routes/runtime_routes.rs"].contains(&path))
@@ -1943,6 +1985,21 @@ mod v2_upgrade_tests {
         // A graph's resource scope is intentionally absent: it may be used by
         // the worker, but is never promoted into a viewer's claims.
         assert!(!grants.contains(&"read:private/worker-only".to_string()));
+    }
+
+    #[test]
+    fn new_team_profile_grants_keep_session_owner_and_flag_required() {
+        for (corpus, scopes) in [
+            ("live-group-theory-v1", vec!["read:crates/runtime/src/agentic/program.rs", "read:crates/runtime/src/agentic/action_service.rs", "read:crates/runtime/src/agentic/execution.rs"]),
+            ("live-three-domain-team-v1", vec!["read:crates/runtime", "read:crates/memory", "read:crates/gateway"]),
+            ("live-agent-escalation-v1", vec!["read:crates/runtime", "read:crates/gateway"]),
+        ] {
+            assert_eq!(evaluation_projection_resource_grants(Some("1"), Some(corpus), true), scopes);
+            for (harness, owner) in [(None,true),(Some("0"),true),(Some("1"),false)] {
+                assert!(evaluation_projection_resource_grants(harness, Some(corpus), owner).is_empty());
+            }
+        }
+        assert!(evaluation_projection_resource_grants(Some("1"), Some("live-large-scale-v1"), false).is_empty());
     }
 
     #[test]

@@ -59,7 +59,7 @@ mod fixture_profile_tests {
     fn fixed_fixture_asset_preserves_registry_and_generic_semantics() {
         let data = evaluation_fixture_profiles().expect("compiled fixture asset must decode");
         assert_eq!(data.default_corpus_id, "live-scenarios-v1");
-        assert_eq!(data.profiles.len(), 6);
+        assert_eq!(data.profiles.len(), 10);
         let mut ids = BTreeSet::new();
         let mut selectors = BTreeSet::new();
         for profile in data.profiles {
@@ -69,6 +69,14 @@ mod fixture_profile_tests {
             }
         }
         assert!(evaluation_fixture_profile("foreign").is_none());
+        for (selector, corpus) in [
+            ("live_group_theory_ai_research_simulation", "live-group-theory-v1"),
+            ("live_explicit_team_requirement", "live-three-domain-team-v1"),
+            ("live_team_projection", "live-three-domain-team-v1"),
+            ("live_agent_escalation", "live-agent-escalation-v1"),
+            ("live_qwen38_large_scale_collaboration", "live-large-scale-v1"),
+        ] { assert_eq!(evaluation_fixture_corpus(selector).as_deref(), Some(corpus)); }
+
         assert_eq!(evaluation_fixture_corpus("live_small_two_team_collaboration").as_deref(),
             Some("live-small-team-v1"));
         assert_eq!(evaluation_fixture_profile("live-small-team-v1").unwrap().observer_resource_grants,

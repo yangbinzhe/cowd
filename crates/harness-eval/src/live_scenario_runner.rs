@@ -7511,6 +7511,11 @@ mod read_evidence_consumer_tests {
     #[test]
     fn original_selector_builds_the_registered_runtime_control_envelope() {
         let cases = [
+            ("live_group_theory_ai_research_simulation", "live-group-theory-v1"),
+            ("live_explicit_team_requirement", "live-three-domain-team-v1"),
+            ("live_team_projection", "live-three-domain-team-v1"),
+            ("live_agent_escalation", "live-agent-escalation-v1"),
+            ("live_qwen38_large_scale_collaboration", "live-large-scale-v1"),
             ("live_one_team_execution", "live-one-team-v1"),
             ("live_small_two_team_collaboration", "live-small-team-v1"),
             ("live_direct_terminal", "live-scenarios-v1"),
@@ -7563,6 +7568,25 @@ mod read_evidence_consumer_tests {
             }
             assert!(control.get("budget_lease_id").is_none());
             assert!(control.get("max_total_tokens").is_none());
+        }
+    }
+
+    #[test]
+    fn research_and_scale_profiles_bind_original_source_obligations() {
+        for (corpus, sources) in [
+            ("live-group-theory-v1", GROUP_THEORY_SOURCE_PATHS.as_slice()),
+            ("live-large-scale-v1", LARGE_SCALE_SOURCE_PATHS.as_slice()),
+        ] {
+            assert_eq!(harness_contract::evaluation::evaluation_fixture_profile(corpus)
+                .unwrap().observer_resource_grants,
+                sources.iter().map(|path| format!("read:{path}")).collect::<Vec<_>>());
+        }
+        for (corpus, scopes) in [
+            ("live-three-domain-team-v1", vec!["read:crates/runtime", "read:crates/memory", "read:crates/gateway"]),
+            ("live-agent-escalation-v1", vec!["read:crates/runtime", "read:crates/gateway"]),
+        ] {
+            assert_eq!(harness_contract::evaluation::evaluation_fixture_profile(corpus)
+                .unwrap().observer_resource_grants, scopes);
         }
     }
 

@@ -1397,4 +1397,30 @@ mod directory_grant_tests {
             assert!(!strategy_ref_visible(path, &context, Some("read")), "{path}");
         }
     }
+    #[test]
+    fn new_team_profiles_reuse_original_exact_and_directory_matcher() {
+        let cases = [
+            ("live-group-theory-v1", "read:crates/runtime/src/agentic/action_service.rs", "read:crates/runtime/src/lib.rs"),
+            ("live-three-domain-team-v1", "read:crates/memory/src/lib.rs", "read:crates/tools/src/lib.rs"),
+            ("live-agent-escalation-v1", "read:crates/gateway/src/main.rs", "read:crates/memory/src/lib.rs"),
+            ("live-large-scale-v1", "read:crates/gateway/src/api_routes/runtime_routes.rs", "read:crates/runtime/src/lib.rs"),
+        ];
+        for (corpus, allowed, outside) in cases {
+            let context = ProjectionQueryContext {
+                principal: "original-session-owner".into(), workspace_id: "workspace".into(),
+                session_scopes: vec!["session".into()], mission_scopes: vec![],
+                visibility_grants: harness_contract::evaluation::evaluation_fixture_profile(corpus)
+                    .unwrap().observer_resource_grants,
+                detail_scope: ProjectionDetailScope::Full, authorization_revision: 1,
+            };
+            assert!(strategy_ref_visible(allowed, &context, Some("read")), "{corpus}");
+            assert!(!strategy_ref_visible(outside, &context, Some("read")), "{corpus}");
+            for bad in [allowed.replacen("read:", "write:", 1),
+                "read:crates/runtime-extra/src/lib.rs".into(),
+                "read:crates/runtime/../tools/src/lib.rs".into(), "read:/etc/passwd".into()] {
+                assert!(!strategy_ref_visible(&bad, &context, Some("read")), "{corpus}/{bad}");
+            }
+        }
+    }
+
 }
