@@ -123,6 +123,7 @@ case "$SCENARIO_ID" in
   # the existing fairness corpus grants exactly those two original paths.
   live_u5_shared_session_fairness|live_u5_active_cancel_isolation) EVALUATION_CORPUS_ID=live-u5-fairness-v1 ;;
   live_one_team_execution) EVALUATION_CORPUS_ID=live-one-team-v1 ;;
+  live_minimal_batch_read) EVALUATION_CORPUS_ID=live-batchread-v1 ;;
   *) EVALUATION_CORPUS_ID=live-scenarios-v1 ;;
 esac
 

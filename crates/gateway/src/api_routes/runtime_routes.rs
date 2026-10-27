@@ -507,6 +507,17 @@ fn evaluation_projection_resource_grants(
         .into_iter()
         .map(String::from)
         .collect(),
+        (Some("1"), Some("live-batchread-v1"), true) => [
+            "read:crates/tools/src/lib.rs",
+            "read:crates/runtime/src/lib.rs",
+            "read:crates/memory/src/lib.rs",
+            "read:crates/gateway/src/main.rs",
+            "read:crates/provider/src/lib.rs",
+            "read:crates/harness-eval/src/lib.rs",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
         _ => Vec::new(),
     }
 }
@@ -710,7 +721,16 @@ mod read_evidence_api_tests {
             ]
             .into_iter()
             .map(move |path| (corpus, path))
-        }) {
+        })
+        .chain([
+            "crates/tools/src/lib.rs",
+            "crates/runtime/src/lib.rs",
+            "crates/memory/src/lib.rs",
+            "crates/gateway/src/main.rs",
+            "crates/provider/src/lib.rs",
+            "crates/harness-eval/src/lib.rs",
+            "src/a.rs",
+        ].into_iter().map(|path| ("live-batchread-v1", path))) {
             let state = crate::api_routes::tests::test_state();
             let supplied = state.services.runtime.as_ref().unwrap().runtime_services();
             let (runtime, execution_id, _) =
@@ -827,7 +847,16 @@ mod read_evidence_api_tests {
                             ]
                             .contains(&path))
                         || (corpus == "live-u5-fairness-v1"
-                            && ["Cargo.toml", "crates/runtime/Cargo.toml"].contains(&path)))
+                            && ["Cargo.toml", "crates/runtime/Cargo.toml"].contains(&path))
+                        || (corpus == "live-batchread-v1"
+                            && [
+                                "crates/tools/src/lib.rs",
+                                "crates/runtime/src/lib.rs",
+                                "crates/memory/src/lib.rs",
+                                "crates/gateway/src/main.rs",
+                                "crates/provider/src/lib.rs",
+                                "crates/harness-eval/src/lib.rs",
+                            ].contains(&path)))
                 {
                     assert_eq!(page.reads.len(), 1, "{page:?}");
                     let read = &page.reads[0];
@@ -1941,7 +1970,18 @@ mod v2_upgrade_tests {
                 "read:crates/memory/src/lib.rs"
             ]
         );
+        assert_eq!(
+            evaluation_projection_resource_grants(Some("1"), Some("live-batchread-v1"), true),
+            vec![
+                "read:crates/tools/src/lib.rs", "read:crates/runtime/src/lib.rs",
+                "read:crates/memory/src/lib.rs", "read:crates/gateway/src/main.rs",
+                "read:crates/provider/src/lib.rs", "read:crates/harness-eval/src/lib.rs",
+            ]
+        );
         for (harness, corpus, owns_session) in [
+            (None, Some("live-batchread-v1"), true),
+            (Some("0"), Some("live-batchread-v1"), true),
+            (Some("1"), Some("live-batchread-v1"), false),
             (None, Some("live-one-team-v1"), true),
             (Some("0"), Some("live-one-team-v1"), true),
             (Some("1"), Some("live-one-team-v1"), false),
