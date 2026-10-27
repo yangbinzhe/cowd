@@ -1056,6 +1056,65 @@ fn scripted_tool(id: &str, name: &str, input: Value, text: Option<&str>) -> Valu
     json!({"role":"assistant","content":text,"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}}]})
 }
 
+fn r381_complete_write_output(
+    content: &str,
+    call_id: &str,
+) -> anyhow::Result<tools::file_ops::WriteFileOutput> {
+    let raw = if content.trim_start().starts_with('{') {
+        // Retain the original bare JSON contract. Never search error prose
+        // for a later JSON object, even when physical bytes happen to match.
+        content
+    } else {
+        let prefix = format!("Tool `edit` completed. Evidence: tool://tool-raw-{call_id}-");
+        let framed = content
+            .strip_prefix(&prefix)
+            .ok_or_else(|| anyhow::anyhow!("r381 not the original successful call envelope"))?;
+        let (fingerprint, rendered) = framed
+            .split_once(". ")
+            .ok_or_else(|| anyhow::anyhow!("r381 incomplete evidence reference"))?;
+        let (_, raw) = rendered
+            .split_once(". ")
+            .ok_or_else(|| anyhow::anyhow!("r381 incomplete JSON presentation"))?;
+        let expected = format!(
+            "{:016x}",
+            model_protocol::fingerprint::stable_hash_bytes(raw.as_bytes())
+        );
+        anyhow::ensure!(
+            fingerprint == expected,
+            "r381 original call/output evidence mismatch"
+        );
+        let reference = harness_contract::reality::EvidenceRef::observed(
+            "tool",
+            format!("tool-raw-{call_id}-{expected}"),
+        );
+        // This verifies presentation only, not authority or a new context
+        // allowance. Exact re-rendering rejects altered headers, truncation,
+        // embedded errors and valid JSON hidden inside arbitrary text.
+        let budget = (content.len() as u64)
+            .saturating_mul(4)
+            .saturating_add(1024);
+        let receipt =
+            runtime::context_evidence::build_tool_receipt("edit", raw, false, reference, budget);
+        anyhow::ensure!(
+            !receipt.truncated && receipt.summary == content,
+            "r381 not a complete original presentation"
+        );
+        raw
+    };
+    let value = harness_contract::step::parse_strict_json(raw)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("r381 write output is not an object"))?;
+    anyhow::ensure!(
+        object.keys().all(|key| matches!(
+            key.as_str(),
+            "type" | "filePath" | "content" | "structuredPatch" | "originalFile" | "gitDiff"
+        )),
+        "r381 unknown or error-bearing write output field"
+    );
+    Ok(serde_json::from_value(value)?)
+}
+
 // This is the fixed engineering driver's effect oracle, not authorization.
 // The Runtime still owns grants, Tool execution and durable settlement. The
 // remaining Goal/independent review/public ACK oracles are kept unchanged.
@@ -1082,14 +1141,19 @@ fn r365_previous_write_success(body: &Value, root: &Path) -> anyhow::Result<()> 
         calls[0]["function"]["name"] == "edit",
         "r365 foreign write tool"
     );
-    let output: tools::file_ops::WriteFileOutput = serde_json::from_str(
+    anyhow::ensure!(
+        matches!(results[0].get("is_error"), None | Some(Value::Bool(false))),
+        "r365 write result explicitly failed or has unknown error status"
+    );
+    let output = r381_complete_write_output(
         results[0]["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("r365 write result missing text"))?,
+        "recovery-write",
     )
-    .map_err(|_| {
+    .map_err(|error| {
         anyhow::anyhow!(
-            "r365 write result is a refusal or unknown, not a successful WriteFileOutput"
+            "r365 write result is a refusal or unknown, not a successful WriteFileOutput: {error}"
         )
     })?;
     let input: Value = serde_json::from_str(
@@ -4177,6 +4241,118 @@ fn r365_write_result_requires_successful_original_output_and_physical_bytes() ->
     assert!(r365_previous_write_success(&duplicate, root.path()).is_err());
     std::fs::write(workspace.join("recovery-effect.txt"), b"wrong")?;
     assert!(r365_previous_write_success(&request, root.path()).is_err());
+    Ok(())
+}
+
+#[test]
+fn r381_complete_presented_write_is_bound_and_fail_closed() -> anyhow::Result<()> {
+    use harness_contract::reality::EvidenceRef;
+    let root = tempfile::tempdir()?;
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace)?;
+    let policy = tools::path_policy::WorkspacePathPolicy::new(&workspace);
+    let written =
+        tools::file_ops::write_file(&policy, "recovery-effect.txt", "recovery-effect-once\n")?;
+    let raw = serde_json::to_string_pretty(&written)?;
+    let evidence = format!(
+        "tool-raw-recovery-write-{:016x}",
+        model_protocol::fingerprint::stable_hash_bytes(raw.as_bytes())
+    );
+    let present = |tool: &str, text: &str, failed: bool, reference: &str, budget: u64| {
+        runtime::context_evidence::build_tool_receipt(
+            tool,
+            text,
+            failed,
+            EvidenceRef::observed("tool", reference),
+            budget,
+        )
+    };
+    let receipt = present("edit", &raw, false, &evidence, 4096);
+    assert!(!receipt.truncated);
+    let body = |content: &str| {
+        json!({"messages":[
+        {"role":"assistant","tool_calls":[{"id":"recovery-write","function":{
+            "name":"edit","arguments":json!({"action":"write","path":"recovery-effect.txt",
+                "content":"recovery-effect-once\n"}).to_string()}}]},
+        {"role":"tool","tool_call_id":"recovery-write","content":content}]})
+    };
+    // The producer creates the input envelope. Expected input, output and
+    // physical bytes remain the independent literal in the original consumer.
+    r365_previous_write_success(&body(&receipt.summary), root.path())?;
+    r365_previous_write_success(&body(&raw), root.path())?;
+    assert_eq!(
+        std::fs::read(workspace.join("recovery-effect.txt"))?,
+        b"recovery-effect-once\n"
+    );
+    let clipped = present("edit", &raw, false, &evidence, 1);
+    assert!(
+        clipped.truncated,
+        "negative must hit the real producer's truncation"
+    );
+    let foreign = present(
+        "edit",
+        &raw,
+        false,
+        &evidence.replace("recovery-write", "foreign-call"),
+        4096,
+    );
+    let wrong_tool = present("read_file", &raw, false, &evidence, 4096);
+    let failed = present("edit", &raw, true, &evidence, 4096);
+    let mut error_object = serde_json::to_value(&written)?;
+    error_object["error"] = json!("denied; successful-looking fields do not erase this error");
+    let bad_hash = receipt
+        .summary
+        .replace(&evidence, "tool-raw-recovery-write-0000000000000000");
+    let bad_metadata = receipt
+        .summary
+        .replace("JSON object with 6 keys:", "JSON object with 7 keys:");
+    for (case, content) in [
+        ("failed", failed.summary),
+        ("error contains valid JSON", format!("error: denied. {raw}")),
+        ("completed alone", format!("completed. {raw}")),
+        ("foreign reference", foreign.summary),
+        ("foreign tool", wrong_tool.summary),
+        ("wrong content hash", bad_hash),
+        ("wrong summary metadata", bad_metadata),
+        ("truncated", clipped.summary),
+        (
+            "missing JSON closing brace",
+            receipt.summary[..receipt.summary.len() - 1].to_string(),
+        ),
+        (
+            "trailing error",
+            format!("{}\nerror: denied", receipt.summary),
+        ),
+        ("raw error object", error_object.to_string()),
+        (
+            "duplicate JSON key",
+            raw.replacen(
+                "\"type\": \"create\"",
+                "\"type\":\"error\",\"type\":\"create\"",
+                1,
+            ),
+        ),
+    ] {
+        assert!(
+            r365_previous_write_success(&body(&content), root.path()).is_err(),
+            "accepted {case}"
+        );
+    }
+    let mut explicit_error = body(&receipt.summary);
+    explicit_error["messages"][1]["is_error"] = json!(true);
+    assert!(r365_previous_write_success(&explicit_error, root.path()).is_err());
+    let mut duplicate = body(&receipt.summary);
+    let duplicate_result = duplicate["messages"][1].clone();
+    duplicate["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_result);
+    assert!(r365_previous_write_success(&duplicate, root.path()).is_err());
+    let mut foreign_result = body(&receipt.summary);
+    foreign_result["messages"][1]["tool_call_id"] = json!("foreign-call");
+    assert!(r365_previous_write_success(&foreign_result, root.path()).is_err());
+    std::fs::write(workspace.join("recovery-effect.txt"), b"wrong")?;
+    assert!(r365_previous_write_success(&body(&receipt.summary), root.path()).is_err());
     Ok(())
 }
 
