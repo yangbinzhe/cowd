@@ -42,6 +42,11 @@ mod runner;
 mod session_actor;
 mod terminal_gate;
 mod terminal_matrix;
+// The original process fixture's existing TUI projection type is shared under
+// cfgtest, not duplicated or exposed as a production Harness dependency.
+#[cfg(test)]
+#[path = "../../../tests/interactive/src/tui.rs"]
+mod tui;
 
 pub use auto_strategy_paired::{
     run_auto_strategy_paired, write_auto_strategy_report, AutoStrategyPairedOptions,

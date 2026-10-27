@@ -387,6 +387,54 @@ impl ServerProcess {
         )
     }
 
+    /// Only the explicitly selected engineering test can supply an already
+    /// owned local provider. Ordinary interactive/R5 entry points stay inert.
+    #[cfg(test)]
+    pub(crate) fn start_with_controlled_provider(
+        postgres_url: String,
+        model: String,
+        image: PathBuf,
+        root_path: PathBuf,
+        credential: &str,
+        endpoint: &str,
+        prepare_definitions: fn(&Path, &Path, &str) -> Result<()>,
+    ) -> Result<Self> {
+        let port = endpoint.strip_prefix("http://127.0.0.1:")
+            .and_then(|v|v.strip_suffix("/v1"))
+            .and_then(|v|v.parse::<u16>().ok())
+            .filter(|v|*v>1023)
+            .ok_or_else(||anyhow!("Controlled test provider must be a pre-owned unprivileged IPv4 loopback /v1 endpoint"))?;
+        if endpoint != format!("http://127.0.0.1:{port}/v1")
+            || model.trim().is_empty()
+            || credential.is_empty()
+        {
+            return Err(anyhow!(
+                "Noncanonical controlled test provider/model/credential"
+            ));
+        }
+        private_directory(&root_path)?;
+        if !root_path.is_absolute() || std::fs::read_dir(&root_path)?.next().is_some() {
+            return Err(anyhow!(
+                "Controlled test requires its registered fresh private root"
+            ));
+        }
+        let root = OwnedRoot {
+            path: root_path,
+            failed: false,
+        };
+        Self::start_epoch_with_provider(
+            postgres_url,
+            model,
+            image.clone(),
+            image,
+            root,
+            None,
+            Some(credential),
+            Some(endpoint),
+            Some(prepare_definitions),
+        )
+    }
+
     // A retained epoch preserves the complete operator file, logical database
     // identity, workspace and HOME. It is reachable only after original F2 close.
     fn start_epoch(
@@ -398,6 +446,38 @@ impl ServerProcess {
         retained_port: Option<u16>,
         initial_operator_token: Option<&str>,
     ) -> Result<Self> {
+        Self::start_epoch_with_provider(
+            postgres_url,
+            model,
+            cowd_bin,
+            expected_image,
+            root,
+            retained_port,
+            initial_operator_token,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_epoch_with_provider(
+        postgres_url: String,
+        model: String,
+        cowd_bin: PathBuf,
+        expected_image: PathBuf,
+        root: OwnedRoot,
+        retained_port: Option<u16>,
+        initial_operator_token: Option<&str>,
+        controlled_endpoint: Option<&str>,
+        prepare_definitions: Option<fn(&Path, &Path, &str) -> Result<()>>,
+    ) -> Result<Self> {
+        if controlled_endpoint.is_some()
+            && (retained_port.is_some() || initial_operator_token.is_none())
+        {
+            return Err(anyhow!(
+                "Controlled provider is only installed by the fresh specialty test constructor"
+            ));
+        }
         let retained_path = root.path.clone();
         let result = (|| {
             let nonce = {
@@ -479,13 +559,17 @@ impl ServerProcess {
                 .to_string_lossy();
             if retained_port.is_none() {
                 let mut config = private_config(port, &identity, &model, &apps_dir);
+                if controlled_endpoint.is_some() {
+                    config["runtime"]["background"] =
+                        serde_json::json!({"evolution":true,"growth":true});
+                }
                 if let Some(token) = initial_operator_token {
                     config["gateway"]["platforms"][0]["auth_token"] = token.into();
                     // Same inert, declared completions shape as the original
                     // Gateway test_provider_registry; initialization is real,
                     // no account/environment inference or live model service.
                     config["providers"]["r5-no-provider"] = serde_json::json!({
-                        "baseUrl":"http://127.0.0.1:9/v1", "apiKey":"r5-synthetic-only",
+                        "baseUrl":controlled_endpoint.unwrap_or("http://127.0.0.1:9/v1"), "apiKey":"r5-synthetic-only",
                         "models":[model], "protocol":"completions"
                     });
                 }
@@ -507,6 +591,14 @@ impl ServerProcess {
                 return Err(anyhow!(
                     "Retained epoch lost its persisted operator configuration"
                 ));
+            }
+            if let Some(prepare) = prepare_definitions {
+                if controlled_endpoint.is_none() || retained_port.is_some() {
+                    return Err(anyhow!(
+                        "Definition fixture belongs only to the fresh controlled epoch"
+                    ));
+                }
+                prepare(&srv.config_home, &srv.workspace, &model)?;
             }
             let log_file = |name: &str| -> Result<File> {
                 let file = std::fs::OpenOptions::new()
@@ -748,6 +840,7 @@ impl ServerProcess {
     }
 
     fn finish_close(&mut self, budget: Duration) -> Result<()> {
+        let deadline = Instant::now() + budget;
         if let Some(child) = self.proc.as_mut() {
             if child.try_wait()?.is_none() {
                 if let Some(launch) = &self.launch {
@@ -757,16 +850,35 @@ impl ServerProcess {
                         return Err(anyhow!("Owned child identity changed before SIGTERM"));
                     }
                 }
-                // Linux kill targets this still-owned, unreaped Child; no process search.
-                unsafe extern "C" {
-                    fn kill(pid: i32, signal: i32) -> i32;
+                // The unreaped Child still reserves this exact PID. Use the
+                // original signal without importing unsafe code into consumers
+                // that forbid it. This helper is owned, bounded and reaped;
+                // neither it nor SIGTERM constitutes the F2 closure receipt.
+                let mut signal = Command::new("/usr/bin/kill")
+                    .env_clear()
+                    .args(["-TERM", "--", &child.id().to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                let signal_budget = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(1));
+                let sent = wait_bounded(&mut signal, signal_budget)?;
+                if sent.is_none() {
+                    signal.kill()?;
+                    let reaped = wait_bounded(&mut signal, Duration::from_millis(250))?.is_some();
+                    return Err(anyhow!(
+                        "Owned SIGTERM helper timed out; reaped={reaped}; root closure unconfirmed"
+                    ));
                 }
-                let sent = unsafe { kill(child.id() as i32, 15) };
-                if sent != 0 && child.try_wait()?.is_none() {
-                    return Err(std::io::Error::last_os_error().into());
+                if !sent.unwrap().success() && child.try_wait()?.is_none() {
+                    return Err(anyhow!(
+                        "Owned SIGTERM helper failed; root closure unconfirmed"
+                    ));
                 }
             }
-            let status = wait_bounded(child, budget)?;
+            let status = wait_bounded(child, deadline.saturating_duration_since(Instant::now()))?;
             if status.is_none() {
                 let _ = child.kill();
                 let reaped = wait_bounded(child, Duration::from_millis(250))?.is_some();
@@ -843,7 +955,7 @@ impl Drop for ServerProcess {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{owned_health, private_config};
     use std::path::Path;
 
@@ -1328,7 +1440,7 @@ server.serve_forever()
 
     // Original public broker protocol, using a fresh synthetic credential for
     // this owned process only. No signer, authority-file edits or fake grants.
-    fn background_broker_request(
+    pub(crate) fn background_broker_request(
         server: &super::ServerProcess,
         token: &str,
         mut request: serde_json::Value,
@@ -1363,7 +1475,7 @@ server.serve_forever()
         Ok(value)
     }
 
-    fn background_http_command(
+    pub(crate) fn background_http_command(
         server: &super::ServerProcess,
         token: &str,
         domain: &str,
@@ -1377,7 +1489,7 @@ server.serve_forever()
         )
     }
 
-    fn background_http_post(
+    pub(crate) fn background_http_post(
         server: &super::ServerProcess,
         token: &str,
         path: &str,
@@ -1717,7 +1829,7 @@ server.serve_forever()
 
     // Only this explicitly selected fixture can use the controller's isolated
     // libpq identity. Credentials stay in the environment, never argv/output.
-    fn growth_test_sql(root: &std::path::Path, sql: &str) -> anyhow::Result<String> {
+    pub(crate) fn growth_test_sql(root: &std::path::Path, sql: &str) -> anyhow::Result<String> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         use std::process::{Command, Stdio};

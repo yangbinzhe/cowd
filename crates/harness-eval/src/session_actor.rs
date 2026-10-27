@@ -918,7 +918,7 @@ mod tests {
         .is_err());
     }
 
-    fn context() -> SessionMessageReceiptContext {
+    pub(super) fn context() -> SessionMessageReceiptContext {
         let payload_json = r#"[{"type":"text","text":"56"}]"#.to_string();
         SessionMessageReceiptContext::Available {
             payload_kind: SessionPublicPayloadKind::SessionPublicV1,
@@ -1543,3 +1543,8 @@ mod tests {
         );
     }
 }
+
+// Same public receipt consumer, with the original real process fixture.
+#[cfg(test)]
+#[path = "background_coexistence_tests.rs"]
+mod background_coexistence_tests;

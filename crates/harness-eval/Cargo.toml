@@ -21,6 +21,7 @@ tools = { path = "../tools" }
 uuid.workspace = true
 
 [dev-dependencies]
+anyhow = "1"
 tempfile = "3"
 
 [lints]
