@@ -4601,3 +4601,84 @@ fn u7_correction_producer_patches_the_original_id_before_any_model_request() {
         "no Provider request or baseline recall is permitted"
     );
 }
+
+
+#[test]
+fn u8_fixed_order_preserves_revision_order_and_independent_integer_oracle() {
+    let input = U8OrderInput::fixed();
+    assert_eq!(input.rows.len(), 64);
+    assert_eq!(input.total(false), 389_400);
+    assert_eq!(input.total(true), 387_900);
+    assert_eq!(input.revisions[0], ("PO447-003".into(), Some(12)));
+    assert_eq!(input.revisions[2], ("PO447-003".into(), Some(4)));
+    let mut reordered = input.clone();
+    reordered.revisions.swap(0, 2);
+    assert_eq!(
+        reordered.total(true),
+        404_700,
+        "later quantity replaces rather than adds"
+    );
+    assert_eq!(input.prompts.len(), 3);
+    assert!(!input.prompts[2].contains("387900"));
+    assert!(!input.prompts[2].contains(U8_CLAUSE));
+    assert!(!input.prompts[2].contains("389400"));
+    assert_eq!(
+        serde_json::to_vec(&input).unwrap(),
+        serde_json::to_vec(&U8OrderInput::fixed()).unwrap()
+    );
+}
+
+#[test]
+fn u8_answer_requires_both_latest_total_and_complete_original_clause() {
+    let input = U8OrderInput::fixed();
+    let correct = json!({"total_cents":387900,"original_clause":U8_CLAUSE});
+    assert!(u8_answer(&input, &correct.to_string()));
+    assert!(u8_answer(&input, &format!("```json\n{correct}\n```")));
+    for changed in [
+        json!({"total_cents":389400,"original_clause":U8_CLAUSE}),
+        json!({"total_cents":387900}),
+        json!({"total_cents":"387900","original_clause":U8_CLAUSE}),
+        json!({"total_cents":387900,"original_clause":"取消行不计费"}),
+        json!({"total_cents":387900,"original_clause":"foreign clause"}),
+    ] {
+        assert!(!u8_answer(&input, &changed.to_string()));
+    }
+    assert!(!u8_answer(
+        &input,
+        &format!("工具失败，但猜到答案 {correct}")
+    ));
+}
+
+#[test]
+fn u8_source_and_terminal_are_required_without_inventing_history_mechanism_hit() {
+    let input = U8OrderInput::fixed();
+    let source = controlled_live_prompt(U8_HISTORY, input.prompts[0].clone(), None);
+    let control: Value = serde_json::from_str(
+        source
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("COWD_EVAL_CONTROL ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        control["resource_scopes"],
+        json!(["provider", "provider_account", "provider_token_pool"])
+    );
+    let mut case = json!({"session_id":"s","trace":[{"channel":"messages","response":{"messages":[{"id":"m","role":"user","session_id":"s","blocks":[{"text":source}]}]}}]});
+    assert!(u8_source_observed(&case, &source));
+    assert!(!u8_source_observed(&case, &input.prompts[1]));
+    case["trace"][0]["response"]["messages"][0]["session_id"] = json!("foreign");
+    assert!(!u8_source_observed(&case, &source));
+    assert!(
+        !u8_turn_passed(&case, "s"),
+        "a source and a guessed answer cannot supply outcome or ACK"
+    );
+    // Correct arithmetic alone deliberately has no history offload/range/wire claim.
+    assert!(u8_answer(
+        &input,
+        &json!({"total_cents":387900,"original_clause":U8_CLAUSE}).to_string()
+    ));
+    assert!(case.get("history_offload").is_none());
+}

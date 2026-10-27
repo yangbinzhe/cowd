@@ -26,6 +26,110 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// run report "not verified".
 const PROGRAM_EXTRACTION_RETRIES: u32 = 3;
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
+const U8_HISTORY: &str = "live_u8_order_history_original_clause";
+const U8_CLAUSE: &str =
+    "原条款 U8-447：取消行不计费；未取消行按最后一次明确数量与单价计费；包装费已含，不另加税费。";
+
+#[derive(Clone, serde::Serialize)]
+struct U8OrderInput {
+    seed: u64,
+    rows: Vec<(String, u64, u64)>,
+    revisions: Vec<(String, Option<u64>)>,
+    clause: String,
+    prompts: Vec<String>,
+}
+impl U8OrderInput {
+    fn fixed() -> Self {
+        let seed = 447u64;
+        let rows: Vec<_> = (1..=64u64)
+            .map(|i| {
+                (
+                    format!("PO447-{i:03}"),
+                    (i * 7 + seed) % 9 + 1,
+                    ((i * 11 + seed) % 23 + 1) * 100,
+                )
+            })
+            .collect();
+        let revisions = vec![
+            ("PO447-003".into(), Some(12)),
+            ("PO447-017".into(), None),
+            ("PO447-003".into(), Some(4)),
+            ("PO447-052".into(), Some(8)),
+        ];
+        let mut initial = format!("我们分三轮核对采购订单 PO447。这是首版完整订单，所有金额单位为整数分。保留每个行ID、数量、单价和原条款用于后续修订；本轮请确认收到了64行及原条款，先不要给最终总额。不要访问外部资料，不要写文件或组队。\n原来源：PO447/initial-v1\n{U8_CLAUSE}\n行ID,数量,单价分\n");
+        for (id, quantity, price) in &rows {
+            initial.push_str(&format!("{id},{quantity},{price}\n"));
+        }
+        let revision = "继续同一份 PO447 订单。来源 PO447/revision-v2，按以下顺序覆盖原行：PO447-003 数量改为12；PO447-017取消；随后 PO447-003 数量改为4（覆盖刚才的12）；PO447-052数量改为8。单价与其他行均不改。请确认逐条修订关系，保留首版原条款，下一轮才交最终总额；不新增业务义务、不组队。".to_owned();
+        let final_query = "请依据本Session的原始订单和后续修订完成最终核对。只返回JSON对象，字段total_cents是最新有效订单总额（整数分），original_clause是首版原条款逐字全文。不要用旧总额，不要猜原条款；若缺少必要历史，明确说明缺失。需要原文时可使用已有获准历史/原文读取。不要读取无关工作区、不要写入或组队。".to_owned();
+        Self {
+            seed,
+            rows,
+            revisions,
+            clause: U8_CLAUSE.into(),
+            prompts: vec![initial, revision, final_query],
+        }
+    }
+    fn total(&self, revised: bool) -> u64 {
+        self.rows
+            .iter()
+            .map(|(id, quantity, price)| {
+                let quantity = if revised {
+                    self.revisions
+                        .iter()
+                        .rev()
+                        .find(|(changed, _)| changed == id)
+                        .map(|(_, q)| q.unwrap_or(0))
+                        .unwrap_or(*quantity)
+                } else {
+                    *quantity
+                };
+                quantity * price
+            })
+            .sum()
+    }
+}
+fn u8_answer(input: &U8OrderInput, answer: &str) -> bool {
+    let answer = answer.trim();
+    let answer = answer
+        .strip_prefix("```json\n")
+        .or_else(|| answer.strip_prefix("```\n"))
+        .and_then(|text| text.strip_suffix("```"))
+        .unwrap_or(answer)
+        .trim();
+    serde_json::from_str::<Value>(answer).ok().is_some_and(|v| {
+        v["total_cents"].as_u64() == Some(input.total(true)) && v["original_clause"] == input.clause
+    })
+}
+fn u8_turn_passed(case: &Value, session: &str) -> bool {
+    u7_terminal_business(case, session)
+        && case["acceptance"]["checks"]
+            .as_array()
+            .is_some_and(|checks| {
+                !checks.is_empty()
+                    && checks.iter().all(|c| {
+                        c["passed"] == true
+                            || (c["name"] == "terminal_three_piece_complete"
+                                && c["missing"].as_array().is_some_and(|m| {
+                                    !m.is_empty() && m.iter().all(|v| v == "goal_verified")
+                                }))
+                    })
+            })
+}
+fn u8_source_observed(case: &Value, source: &str) -> bool {
+    case["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["channel"] == "messages")
+        .flat_map(|r| r["response"]["messages"].as_array().into_iter().flatten())
+        .any(|m| {
+            m["role"] == "user"
+                && m["session_id"] == case["session_id"]
+                && m["id"].as_str().is_some_and(|id| !id.is_empty())
+                && message_text(m) == source
+        })
+}
 const U7_MEMORY: &str = "live_u7_persistent_memory_recall";
 const U7_MEMORY_LIFECYCLE: &str = "live_u7_memory_correction_delete_restart";
 const U7_MEMORY_PROMPT: &str = "请依据已保存的 u7-memory-lighthouse 项目备件调度记忆，回答仓库代号和出库口令。请用中文短句说明记忆中的两个实际值；找不到就明确说明缺失，不要猜测。不要读取工作区文件，不要执行写入工具，不要组队。";
@@ -1752,7 +1856,7 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
         // exact: the isolated workspace plus network reads, never the host.
         resource_scopes.push("workspace:.");
         resource_scopes.push("network:*");
-    } else if !matches!(spec_id, "u5-read-a" | "u5-read-b" | U7_MEMORY | U7_MEMORY_LIFECYCLE) {
+    } else if !matches!(spec_id, "u5-read-a" | "u5-read-b" | U7_MEMORY | U7_MEMORY_LIFECYCLE | U8_HISTORY) {
         // Read-only source-analysis scenarios must be able to read the isolated
         // candidate workspace (`crates/...`) to ground their evidence. Without
         // this lease every source read is denied by the resource ceiling.
@@ -3161,6 +3265,9 @@ impl LiveScenarioRunner {
         if selected_scenario_ids.as_ref().is_some_and(|ids|ids.contains(U7_MEMORY_LIFECYCLE)) {
             scenario_specs.push(LiveScenarioSpec {id:U7_MEMORY_LIFECYCLE,..u7_memory_spec()});
         }
+        if selected_scenario_ids.as_ref().is_some_and(|ids| ids.contains(U8_HISTORY)) {
+            scenario_specs.push(LiveScenarioSpec { id: U8_HISTORY, prompt: "U8 order history", acceptance: LiveAcceptance::MemoryRecall, timeout: LiveScenarioTimeout::tool() });
+        }
         let registered_scenario_ids = scenario_specs
             .iter()
             .map(|spec| spec.id.to_string())
@@ -3277,6 +3384,9 @@ impl LiveScenarioRunner {
         spec: LiveScenarioSpec,
         provider_token_telemetry_limit: Option<u64>,
     ) -> Value {
+        if spec.id == U8_HISTORY {
+            return self.run_u8_order_history(spec, provider_token_telemetry_limit);
+        }
         if spec.id == U7_MEMORY_LIFECYCLE {
             return self.run_u7_memory_lifecycle(provider_token_telemetry_limit);
         }
@@ -3419,6 +3529,129 @@ impl LiveScenarioRunner {
         result
     }
 
+    fn run_u8_order_history(&self, spec: LiveScenarioSpec, telemetry: Option<u64>) -> Value {
+        let started = Instant::now();
+        let input = U8OrderInput::fixed();
+        let mut phases = Vec::new();
+        let mut actor = None;
+        let operation = (|| -> Result<Value, String> {
+            let path = std::path::PathBuf::from(
+                std::env::var("COWD_EVAL_U8_FIXTURE_FILE")
+                    .map_err(|_| "U8 private preregistered input path missing")?,
+            );
+            u7_private_json(
+                &path,
+                &json!({"input":input,"independent_expected":{"total_cents":input.total(true),"old_total_cents":input.total(false),"original_clause":input.clause},"source_ids":["PO447/initial-v1","PO447/revision-v2"],"input_bytes":input.prompts.iter().map(|p|p.len()).collect::<Vec<_>>(),"size_chosen_once":true}),
+            )?;
+            actor = Some(SessionActor::create(
+                &self.client,
+                &self.base_url,
+                self.model.as_deref(),
+                "harness-eval-live",
+                Instant::now() + Duration::from_secs(600),
+            )?);
+            let current = actor.as_mut().ok_or("U8 actor missing")?;
+            let session = current.session_id().to_string();
+            let mut submitted = Vec::new();
+            for (index, prompt) in input.prompts.iter().enumerate() {
+                let turn_started = Instant::now();
+                current.set_observation_deadline(turn_started + Duration::from_secs(600));
+                let source = controlled_live_prompt(U8_HISTORY, prompt.clone(), telemetry);
+                let admission=current.post_mutation(&format!("/api/sessions/{session}/messages"),json!({"content":source,"idempotency_key":format!("u8-447-{index}-{}",uuid::Uuid::new_v4())}))?;
+                let execution = admission
+                    .pointer("/execution/graph_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("U8 canonical graph identity missing")?
+                    .to_owned();
+                let turn = admission
+                    .pointer("/execution/turn_id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("U8 canonical turn identity missing")?
+                    .to_owned();
+                let admitted = AdmittedLiveScenario {
+                    session_id: session.clone(),
+                    execution_id: execution,
+                    turn_id: turn,
+                    expected_reads: BTreeMap::new(),
+                    trace: vec![
+                        json!({"kind":"u8_original_input_admission","phase":index,"source_sha256":format!("{:x}",Sha256::digest(source.as_bytes())),"source_bytes":source.len(),"admission":admission}),
+                    ],
+                };
+                let mut phase = self.observe_admitted_scenario(
+                    spec,
+                    turn_started,
+                    spec.timeout.with_cap(self.timeout_cap),
+                    admitted,
+                    current,
+                );
+                submitted.push(source);
+                let sources_present = submitted
+                    .iter()
+                    .all(|source| u8_source_observed(&phase, source));
+                phase["u8_original_user_sources_present"] = json!(sources_present);
+                let passed = u8_turn_passed(&phase, &session) && sources_present;
+                phases.push(phase);
+                if !passed {
+                    return Err(format!("U8 phase {} failed original outcome/ACK or persistent input source; later phases not dispatched",index+1));
+                }
+            }
+            let last = phases.last().ok_or("U8 final result missing")?;
+            let correct = u8_answer(
+                &input,
+                last["u8_terminal_answer"].as_str().unwrap_or_default(),
+            );
+            let mut result = last.clone();
+            result["status"] = json!(if correct { "passed" } else { "failed" });
+            result["acceptance"]["passed"] = json!(correct);
+            if let Some(checks) = result["acceptance"]["checks"].as_array_mut() {
+                for check in checks.iter_mut() {
+                    if check["name"] == "terminal_three_piece_complete"
+                        && check["missing"].as_array().is_some_and(|m| {
+                            !m.is_empty() && m.iter().all(|v| v == "goal_verified")
+                        })
+                    {
+                        check["required"] = json!(false);
+                        check["observation_only"] = json!(true);
+                    }
+                }
+                checks.push(
+                    json!({"name":"u8_latest_integer_total_and_original_clause","passed":correct}),
+                );
+            }
+            let context = self.get_json(&format!(
+                "/api/sessions/{session}/context?include_envelopes=true&limit=200"
+            ));
+            let history_observation = match context {
+                Ok(v) => json!({"status":"observed","original_response":v}),
+                Err(e) => json!({"status":"unavailable","error":e}),
+            };
+            result["u8_history"] = json!({"business_passed":correct,"input_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&input).map_err(|e|e.to_string())?)),"input_bytes":input.prompts.iter().map(|p|p.len()).collect::<Vec<_>>(),"row_count":input.rows.len(),"phase_results":phases,"context_observation":history_observation,"long_history_selection":"not_proven_by_business_success","history_offload":"not_proven","on_demand_original_range":"not_proven; inline availability does not require redundant reads","prepared_wire_completeness":"requires_actual_wire_source_comparison","TUI_ACK_gap_reconnect":"not_tested","size_increase_or_retry":false});
+            // Every observer starts at this same Session's original cut. The
+            // final metrics already deduplicate all request IDs; adding phase
+            // snapshots would double count the same physical attempts.
+            result["u8_history"]["usage_basis"]=json!("final cumulative Session request-ID deduplication; phase metrics are source-cut snapshots, not additive");
+            result["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+            Ok(result)
+        })();
+        let mut result=operation.unwrap_or_else(|error|{let mut failed=failed_scenario(spec,started,phases.last().and_then(|p|p["trace"].as_array()).cloned().unwrap_or_default(),error);if let Some(last)=phases.last(){failed["metrics"]=last["metrics"].clone();}failed["u8_history"]=json!({"business_passed":false,"phase_results":phases,"remaining_phases_not_dispatched":true,"long_history_selection":"not_proven"});failed});
+        if let Some(current) = actor.as_mut() {
+            let cleanup = current.finish().map_or_else(
+                |e| json!({"status":"failed","error":e}),
+                |()| json!({"status":"passed"}),
+            );
+            if cleanup["status"] != "passed" {
+                result["status"] = json!("failed");
+                result["acceptance"]["passed"] = json!(false);
+            }
+            result["session_actor_cleanup"] = cleanup;
+            if let Some(trace) = result["trace"].as_array_mut() {
+                trace.extend(current.drain_trace());
+            }
+        }
+        result
+    }
     fn prepare_u7_correction(
         &self,
     ) -> Result<(U7MemoryFixture, U7MemoryFixture, String, Value), String> {
@@ -4008,6 +4241,9 @@ impl LiveScenarioRunner {
             },
             "read_evidence": timeline.get("read_evidence"),
         });
+        if spec.id == U8_HISTORY {
+            result["u8_terminal_answer"] = json!(response_text);
+        }
         if matches!(spec.acceptance, LiveAcceptance::MemoryRecall) {
             result["u7_terminal_answer"] = json!(response_text);
         }
