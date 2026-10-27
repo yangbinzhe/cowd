@@ -60,6 +60,16 @@ fn get_owned_json(
     path: &str,
     deadline: Instant,
 ) -> anyhow::Result<Value> {
+    get_owned_json_recorded(client, base, path, deadline, None)
+}
+
+fn get_owned_json_recorded(
+    client: &Client,
+    base: &str,
+    path: &str,
+    deadline: Instant,
+    evidence: Option<&Path>,
+) -> anyhow::Result<Value> {
     use std::io::Read;
     anyhow::ensure!(path.starts_with("/api/"), "owned fixed API path");
     let left = deadline
@@ -79,7 +89,22 @@ fn get_owned_json(
         .take(256 * 1024 + 1)
         .read_to_end(&mut body)?;
     anyhow::ensure!(body.len() <= 256 * 1024, "R6 API response bound");
-    anyhow::ensure!(status.is_success(), "R6 API read refused status={status}");
+    if !status.is_success() {
+        if let Some(root) = evidence {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            private_record(
+                &root.join(format!("r6-api-read-refused-{ordinal}.json")),
+                &json!({
+                    "method":"GET","base_url":base,"path_and_query":path,"status":status.as_u16(),
+                    "body_utf8":std::str::from_utf8(&body).ok(),"body_bytes":body,
+                    "observed_at_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis(),
+                    "caller":"finite_provider_root_program","auth_headers_recorded":false
+                }),
+            )?;
+        }
+        anyhow::bail!("R6 API read refused path={path} status={status}");
+    }
     Ok(serde_json::from_slice(&body)?)
 }
 
@@ -219,6 +244,7 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
             SessionActor::create(&client, &base, Some(&model), "harness-eval-live", deadline)
                 .map_err(anyhow::Error::msg)?;
         let session_id = actor.session_id().to_owned();
+        let mut admitted_target = None;
         let foreground = (|| -> anyhow::Result<Value> {
             // Independent original task/physical oracle; never inferred from the response.
             let accepted=actor.post_mutation(&format!("/api/sessions/{session_id}/messages"),json!({"content":"Write recovery-effect.txt containing recovery-effect-once, delegate one public Task and independently inspect its physical result and report before satisfying the user_intent criterion. Deliver that reviewed report.","idempotency_key":"r6-foreground-original"})).map_err(anyhow::Error::msg)?;
@@ -231,6 +257,7 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
                 .pointer("/execution/turn_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("missing original turn admission"))?;
+            admitted_target = Some((graph.to_owned(), turn.to_owned()));
             provider.bind(ProviderBinding {
                 client: client.clone(),
                 base: base.clone(),
@@ -238,6 +265,7 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
                 turn: turn.to_owned(),
                 graph: graph.to_owned(),
                 deadline,
+                evidence_root: root.clone(),
             })?;
             if cancel_after_open {
                 let cancellation = observe_owned_active_cancel(
@@ -429,10 +457,7 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
                 json!({"session_id":session_id,"graph_id":graph,"turn_id":turn,"program":program,"terminal_message_id":message_id,"delivery":delivered.observation,"blocks":delivered.blocks,"background_pending":still_pending,"pre_ack_delivery_recovery":recovery,"cancel_recovery_proven":false,"AI_proven":false}),
             )
         })();
-        let detach = actor.finish();
-        let value = foreground?;
-        detach.map_err(anyhow::Error::msg)?;
-        Ok(value)
+        r6_finish_foreground(&root, &mut actor, admitted_target.as_ref(), foreground)
     })();
     // The primary original is committed before cleanup, even on test Err.
     private_record(
@@ -446,11 +471,75 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
     )?;
     let close = server.close();
     let provider_close = provider.close();
+    // Shutdown failures are secondary to the retained business first error,
+    // but are never discarded or inferred away from physical PID absence.
+    let cleanup_record = private_record(
+        &root.join("r6-shutdown-owner-results.json"),
+        &json!({
+            "gateway_f2":close.as_ref().map(|_| "confirmed").map_err(|e|e.to_string()),
+            "provider_join":provider_close.as_ref().map(|_| "joined").map_err(|e|e.to_string()),
+            "physical_exit_is_not_f2":true
+        }),
+    );
     let value = result?;
     close?;
     provider_close?;
+    cleanup_record?;
     private_record(&root.join("r6-goal-ack-result.json"), &value)?;
     Ok(())
+}
+
+// Original Session cancellation, finish and Gateway shutdown have different
+// owners. Detach releases observation only; it cannot stop a still-running
+// accepted turn. On fixture failure explicitly cancel only this admitted call
+// before releasing its original Session actor. No cancellation receipt alone
+// certifies settlement; original F2 must independently pass afterwards.
+fn r6_finish_foreground<T>(
+    root: &Path,
+    actor: &mut SessionActor<'_>,
+    admitted: Option<&(String, String)>,
+    primary: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let first_record = private_record(
+        &root.join("r6-foreground-before-session-cleanup.json"),
+        &json!({
+            "primary_error":primary.as_ref().err().map(ToString::to_string),
+            "session_id":actor.session_id(),
+            "admitted_graph_and_turn":admitted,
+            "business_passed":primary.is_ok()
+        }),
+    );
+    let cancel = if primary.is_err() {
+        if let Some((graph, turn)) = admitted {
+            Some(actor.post_cleanup_mutation(
+                &format!("/api/sessions/{}/cancel", actor.session_id()),
+                json!({"cancellation_id":format!("r6-fixture-error:{graph}"),
+                    "expected_execution_id":graph,"expected_turn_id":turn}),
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Always finish even if the bounded cancel request failed/timed out.
+    // The shared original cleanup deadline remains two seconds, not a new
+    // retry loop or an extension of the original outer180+180 process bound.
+    let detach = actor.finish();
+    let secondary = private_record(
+        &root.join("r6-session-cleanup-results.json"),
+        &json!({
+            "cancel_request":cancel,
+            "finish":detach,
+            "first_error_persisted":first_record.is_ok(),
+            "settlement_or_F2_proven":false
+        }),
+    );
+    let value = primary?; // Never replace original business error with cleanup.
+    first_record?;
+    detach.map_err(anyhow::Error::msg)?;
+    secondary?;
+    Ok(value)
 }
 
 // Only fixture setup: the same immutable Definition store/release owner used by
@@ -546,6 +635,7 @@ struct ProviderBinding {
     turn: String,
     graph: String,
     deadline: Instant,
+    evidence_root: PathBuf,
 }
 
 struct ScriptRequest {
@@ -876,9 +966,10 @@ fn serve_script_request(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RecoveryReplies {
     router_used: bool,
+    interpretation_used: bool,
     root: usize,
     producer: usize,
     reviewer: usize,
@@ -1025,8 +1116,134 @@ fn controlled_model_window_is_explicit_and_resolves_through_original_loader() ->
     Ok(())
 }
 
+// This local provider must obey this request's exposed function set. Runtime
+// remains the authority for full input-schema validation and tool admission.
+fn r6_validate_exposed_calls(body: &Value, delta: &Value) -> anyhow::Result<()> {
+    if let Some(calls) = delta.get("tool_calls") {
+        for call in calls
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("invalid local calls"))?
+        {
+            let name = call["function"]["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing local function name"))?;
+            let exposed = body["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter(|tool| {
+                            tool["type"] == "function" && tool["function"]["name"] == name
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            anyhow::ensure!(
+                exposed == 1,
+                "R6 function {name} is not uniquely exposed by this request"
+            );
+            let input: Value = serde_json::from_str(
+                call["function"]["arguments"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("local arguments must be encoded JSON"))?,
+            )?;
+            anyhow::ensure!(input.is_object(), "local arguments must be an object");
+        }
+    }
+    Ok(())
+}
+
+const R6_OBJECTIVE: &str = "Write recovery-effect.txt containing recovery-effect-once, delegate one public Task and independently inspect its physical result and report before satisfying the user_intent criterion. Deliver that reviewed report.";
+const R6_INTERPRETATION: &str = "## Internal user-input interpretation (NOT a final response)";
+
+// Fixed engineering input only. This is a no-tools semantic proposal; it
+// cannot create grants, physical identities or Graph plans. The real owner
+// still binds the authenticated input and applies its source/claim/CAS fences.
+fn r6_input_interpretation_reply(
+    body: &Value,
+    binding: &ProviderBinding,
+) -> anyhow::Result<Option<Value>> {
+    let messages = body["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing messages"))?;
+    let controls: Vec<&str> = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_str())
+        .filter(|text| text.lines().any(|line| line == R6_INTERPRETATION))
+        .collect();
+    if controls.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        controls.len() == 1
+            && body["stream"] == true
+            && (matches!(body.get("tools"), None | Some(Value::Null))
+                || body["tools"]
+                    .as_array()
+                    .is_some_and(|tools| tools.is_empty())),
+        "invalid no-tools interpretation contract"
+    );
+    let frames: Vec<Value> = controls[0]
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v.get("current_goal").is_some() && v.get("inputs").is_some())
+        .collect();
+    anyhow::ensure!(frames.len() == 1, "ambiguous input interpretation frame");
+    let frame = &frames[0];
+    let goal = &frame["current_goal"];
+    let execution = &goal["execution_binding"];
+    anyhow::ensure!(
+        execution["session_id"] == binding.session
+            && execution["turn_id"] == binding.turn
+            && execution["root_execution_id"] == binding.graph,
+        "foreign interpretation binding"
+    );
+    anyhow::ensure!(
+        frame["inputs"] == json!([{"input_slot":0,"text":R6_OBJECTIVE}])
+            && goal["objective"] == R6_OBJECTIVE
+            && goal["constraints"] == json!([])
+            && goal["obligations"] == json!([])
+            && goal["completion"] == "open"
+            && goal["input_contract"]["commitments"] == json!([]),
+        "not the fixed fresh R6 input"
+    );
+    let path = "recovery-effect.txt";
+    let start = R6_OBJECTIVE
+        .find(path)
+        .ok_or_else(|| anyhow::anyhow!("fixture path span"))?;
+    let proposal = json!({"decisions":[{"input_slots":[0],"action":"amend_current_turn",
+        "relation":"supplement","objective":R6_OBJECTIVE,"required":true,"confidence_basis_points":10000,
+        "reason":"Retain the complete file, delegation, independent physical/report review and delivery objective.",
+        "business_revision":{"commitments":[{"kind":"workspace_write","path":path,"source":{"start":start,"end":start+path.len()}}],
+        "constraints":[],"retired_criteria":[],"retired_obligations":[]}}]});
+    let content = proposal.to_string();
+    harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(
+        &content, 1,
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(Some(json!({"role":"assistant","content":content})))
+}
+
 impl RecoveryReplies {
     fn reply(
+        &mut self,
+        body: &Value,
+        binding: Option<&ProviderBinding>,
+    ) -> anyhow::Result<Option<Value>> {
+        // Commit counters only after checking the actual exposed schema set.
+        // A rejected call must not consume its business stage or provoke a
+        // subsequent Program lookup before TeamCreate was actually applied.
+        let mut next = self.clone();
+        let delta = next.reply_inner(body, binding)?;
+        if let Some(ref delta) = delta {
+            r6_validate_exposed_calls(body, delta)?;
+        }
+        *self = next;
+        Ok(delta)
+    }
+
+    fn reply_inner(
         &mut self,
         body: &Value,
         binding: Option<&ProviderBinding>,
@@ -1043,9 +1260,33 @@ impl RecoveryReplies {
             Instant::now() < binding.deadline,
             "R6 script absolute foreground deadline"
         );
+        if let Some(delta) = r6_input_interpretation_reply(body, binding)? {
+            anyhow::ensure!(
+                !self.interpretation_used,
+                "unexpected repeated fresh input interpretation"
+            );
+            self.interpretation_used = true;
+            return Ok(Some(delta));
+        }
         let messages = body["messages"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("missing messages"))?;
+        // Synthesize/reviewer final text may expose no tools. All earlier
+        // business stages require actual schemas before even reading Program.
+        let requires_tool = if messages.iter().any(|m| {
+            m["role"] == "system"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.lines().any(|l| l == "R6_REVIEWER_LANE"))
+        }) {
+            self.reviewer < 7
+        } else {
+            self.root < 9
+        };
+        anyhow::ensure!(
+            !requires_tool || body["tools"].as_array().is_some_and(|v| !v.is_empty()),
+            "R6 business stage has no exposed tool schemas"
+        );
         // Only the Definition's real system instructions choose a role. A
         // quoted marker in a user message/tool result cannot choose authority.
         let markers = ["R6_PRODUCER_LANE", "R6_REVIEWER_LANE"].map(|marker| {
@@ -1067,7 +1308,7 @@ impl RecoveryReplies {
                 None,
             )));
         }
-        let program_value = get_owned_json(
+        let program_value = get_owned_json_recorded(
             &binding.client,
             &binding.base,
             &format!(
@@ -1075,6 +1316,7 @@ impl RecoveryReplies {
                 binding.session, binding.turn
             ),
             binding.deadline,
+            Some(&binding.evidence_root),
         )?;
         let p: runtime::AgenticProgramProjection = serde_json::from_value(program_value)?;
         anyhow::ensure!(
@@ -2024,4 +2266,367 @@ fn r6_recovery_oracle_allows_fresh_client_but_rejects_changed_content() {
             "{field}"
         );
     }
+}
+
+fn r6_control_test_binding(root: &Path) -> anyhow::Result<ProviderBinding> {
+    Ok(ProviderBinding {
+        client: Client::builder().timeout(Duration::from_secs(1)).build()?,
+        base: "http://127.0.0.1:9".into(),
+        session: "owned-session".into(),
+        turn: "owned-turn".into(),
+        graph: "owned-graph".into(),
+        deadline: Instant::now() + Duration::from_secs(5),
+        evidence_root: root.into(),
+    })
+}
+
+#[test]
+fn r6_control_business_boundary_preserves_counters_and_rejects_foreign_input() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let binding = r6_control_test_binding(root.path())?;
+    // Literal independent framing/oracle: no production generator supplies expected.
+    let frame = json!({"current_goal":{"objective":"Write recovery-effect.txt containing recovery-effect-once, delegate one public Task and independently inspect its physical result and report before satisfying the user_intent criterion. Deliver that reviewed report.",
+        "execution_binding":{"session_id":"owned-session","turn_id":"owned-turn","root_execution_id":"owned-graph"},
+        "constraints":[],"obligations":[],"completion":"open","input_contract":{"commitments":[]}},
+        "inputs":[{"input_slot":0,"text":"Write recovery-effect.txt containing recovery-effect-once, delegate one public Task and independently inspect its physical result and report before satisfying the user_intent criterion. Deliver that reviewed report."}]});
+    let request = |f: &Value| json!({"stream":true,"tools":[],"messages":[{"role":"user","content":format!("## Internal user-input interpretation (NOT a final response)\nReturn exactly one strict JSON ModelInputDispositionBatch, no markdown or tools.\n{f}")}]});
+    let mut driver = RecoveryReplies::default();
+    let delta = driver
+        .reply(&request(&frame), Some(&binding))?
+        .expect("control reply");
+    assert!(delta.get("tool_calls").is_none());
+    let batch =
+        harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(
+            delta["content"].as_str().unwrap(),
+            1,
+        )
+        .map_err(anyhow::Error::msg)?;
+    let actual = serde_json::to_value(batch)?;
+    assert_eq!(
+        actual["decisions"][0]["business_revision"]["commitments"],
+        json!([{"kind":"workspace_write","path":"recovery-effect.txt","source":{"start":6,"end":25}}])
+    );
+    assert_eq!(
+        actual["decisions"][0]["objective"],
+        frame["inputs"][0]["text"]
+    );
+    assert!(driver.interpretation_used);
+    assert_eq!(
+        (
+            driver.root,
+            driver.producer,
+            driver.reviewer,
+            driver.final_replies
+        ),
+        (0, 0, 0, 0)
+    );
+    for pointer in [
+        "/current_goal/execution_binding/session_id",
+        "/current_goal/execution_binding/turn_id",
+        "/current_goal/execution_binding/root_execution_id",
+        "/inputs/0/text",
+    ] {
+        let mut foreign = frame.clone();
+        *foreign.pointer_mut(pointer).unwrap() = json!("foreign");
+        assert!(
+            RecoveryReplies::default()
+                .reply(&request(&foreign), Some(&binding))
+                .is_err()
+        );
+    }
+    let mut invalid_contract = request(&frame);
+    invalid_contract["tools"] = json!("not a schema list");
+    assert!(
+        RecoveryReplies::default()
+            .reply(&invalid_contract, Some(&binding))
+            .is_err()
+    );
+    let mut changed = frame.clone();
+    changed["current_goal"]["constraints"] = json!(["Never change any file"]);
+    assert!(
+        RecoveryReplies::default()
+            .reply(&request(&changed), Some(&binding))
+            .is_err()
+    );
+    assert!(
+        r6_input_interpretation_reply(
+            &json!({"messages":[{"role":"assistant","content":delta["content"]}]}),
+            &binding
+        )?
+        .is_none()
+    );
+    // The already used control cannot be replayed to advance a business role.
+    assert!(driver.reply(&request(&frame), Some(&binding)).is_err());
+    let mut business = json!({"stream":true,"messages":[],"tools":[]});
+    assert!(driver.reply(&business, Some(&binding)).is_err());
+    assert_eq!(driver.root, 0);
+    business["tools"] =
+        json!([{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]);
+    assert!(driver.reply(&business, Some(&binding)).is_err());
+    assert_eq!(driver.root, 0);
+    business["tools"] = json!([{"type":"function","function":{"name":"team_create","parameters":{"type":"object","required":["name","mission"]}}}]);
+    let team = driver.reply(&business, Some(&binding))?.unwrap();
+    assert_eq!(team["tool_calls"][0]["function"]["name"], "team_create");
+    assert_eq!(driver.root, 1);
+    Ok(())
+}
+
+#[test]
+#[ignore = "explicit saved own ROUND338 control-wire replay; requires its private registered root, no PG/model"]
+fn r6_saved_control_requests_obey_original_parser_without_business_progress() -> anyhow::Result<()>
+{
+    let root = PathBuf::from(
+        std::env::var_os("COWD_R6_CONTROL_REPLAY_ROOT")
+            .ok_or_else(|| anyhow::anyhow!("registered replay root required"))?,
+    );
+    let accepted: Value =
+        serde_json::from_slice(&std::fs::read(root.join("r6-foreground-admission.json"))?)?;
+    let mut binding = r6_control_test_binding(&root)?;
+    binding.session = accepted["session_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("actual session"))?
+        .into();
+    binding.turn = accepted["execution"]["turn_id"].as_str().unwrap().into();
+    binding.graph = accepted["execution"]["graph_id"].as_str().unwrap().into();
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(root.join("r6-provider-reply-2.json"))?)?;
+    let old = &saved["delta"];
+    assert_eq!(old["tool_calls"][0]["function"]["name"], "team_create");
+    for ordinal in [2, 3] {
+        let body: Value = serde_json::from_slice(&std::fs::read(
+            root.join(format!("r6-provider-request-{ordinal}.json")),
+        )?)?;
+        assert!(
+            body.get("tools").is_none(),
+            "original wire omits tools entirely"
+        );
+        assert!(
+            r6_validate_exposed_calls(&body, &old).is_err(),
+            "original wrong tool must fail"
+        );
+        if ordinal == 3 {
+            assert!(body.to_string().contains("tool_protocol_violation: provider emitted a tool call during a request that exposed no tool schemas: [team_create]"));
+        }
+        let mut driver = RecoveryReplies::default();
+        let answer = driver
+            .reply(&body, Some(&binding))?
+            .expect("actual no-tools control");
+        assert!(answer.get("tool_calls").is_none());
+        let parsed = harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(answer["content"].as_str().unwrap(),1).map_err(anyhow::Error::msg)?;
+        assert_eq!(parsed.decisions.len(), 1);
+        assert_eq!(parsed.decisions[0].input_slots, vec![0]);
+        assert_eq!((driver.root, driver.producer, driver.reviewer), (0, 0, 0));
+    }
+    Ok(())
+}
+
+#[test]
+fn r6_refused_api_preserves_actual_path_status_and_body_before_return() -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let server = std::thread::spawn(move || -> anyhow::Result<String> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    anyhow::ensure!(Instant::now() < deadline, "local accept deadline");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let mut bytes = Vec::new();
+        let mut byte = [0];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            anyhow::ensure!(bytes.len() < 4096, "local headers bounded");
+            stream.read_exact(&mut byte)?;
+            bytes.push(byte[0]);
+        }
+        // Literal local response is not the lost original 404 body.
+        let body = r#"{"error":"literal-owned-entity-absent"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
+        Ok(String::from_utf8(bytes)?.lines().next().unwrap().into())
+    });
+    let client = Client::builder().timeout(Duration::from_secs(3)).build()?;
+    let error = get_owned_json_recorded(
+        &client,
+        &base,
+        "/api/runtime/agentic/programs/root?session_id=owned&turn_id=turn",
+        Instant::now() + Duration::from_secs(3),
+        Some(root.path()),
+    )
+    .unwrap_err();
+    let request = server
+        .join()
+        .map_err(|_| anyhow::anyhow!("local server panic"))??;
+    assert_eq!(
+        request,
+        "GET /api/runtime/agentic/programs/root?session_id=owned&turn_id=turn HTTP/1.1"
+    );
+    assert!(error.to_string().contains("404 Not Found"));
+    let paths: Vec<_> = std::fs::read_dir(root.path())?.collect::<Result<_, _>>()?;
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].metadata()?.permissions().mode() & 0o777, 0o600);
+    let stored: Value = serde_json::from_slice(&std::fs::read(paths[0].path())?)?;
+    assert_eq!(
+        stored["path_and_query"],
+        "/api/runtime/agentic/programs/root?session_id=owned&turn_id=turn"
+    );
+    assert_eq!(stored["status"], 404);
+    assert_eq!(
+        stored["body_utf8"],
+        r#"{"error":"literal-owned-entity-absent"}"#
+    );
+    assert!(stored["observed_at_unix_ms"].as_u64().unwrap() > 0);
+    Ok(())
+}
+
+#[test]
+fn r6_failed_foreground_preserves_first_error_and_cancels_before_finish() -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    // Real original SessionActor HTTP consumer, synthetic endpoint only. The
+    // requested receipt below is deliberately NOT called physical settlement.
+    for cancel_status in [200, 503] {
+        let root = tempfile::tempdir()?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let report_root = root.path().to_owned();
+        let server = std::thread::spawn(move || -> anyhow::Result<Vec<String>> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut paths = Vec::new();
+            for expected in [
+                "/api/sessions/session-1/cancel",
+                "/api/runtime/session-leases/release",
+                "/api/sessions/session-1/detach",
+            ] {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            anyhow::ensure!(
+                                Instant::now() < deadline,
+                                "cleanup local accept deadline"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let mut header = Vec::new();
+                let mut byte = [0];
+                while !header.ends_with(b"\r\n\r\n") {
+                    anyhow::ensure!(header.len() < 8192, "header bound");
+                    stream.read_exact(&mut byte)?;
+                    header.push(byte[0]);
+                }
+                let header = String::from_utf8(header)?;
+                let path = header
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                anyhow::ensure!(
+                    path == expected,
+                    "cleanup must cancel before lease release/detach"
+                );
+                let len = header
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                anyhow::ensure!(len < 8192, "body bound");
+                let mut bytes = vec![0; len];
+                stream.read_exact(&mut bytes)?;
+                let body: Value = serde_json::from_slice(&bytes)?;
+                if path.ends_with("/cancel") {
+                    let first: Value = serde_json::from_slice(&std::fs::read(
+                        report_root.join("r6-foreground-before-session-cleanup.json"),
+                    )?)?;
+                    assert_eq!(first["primary_error"], "original-finite-provider-failed");
+                    assert_eq!(
+                        body,
+                        json!({"cancellation_id":"r6-fixture-error:graph-1","expected_execution_id":"graph-1","expected_turn_id":"turn-1"})
+                    );
+                }
+                let (status, body) = if path.ends_with("/cancel") {
+                    (
+                        cancel_status,
+                        if cancel_status == 200 {
+                            json!({"status":"requested","execution_id":"graph-1","turn_id":"turn-1"})
+                        } else {
+                            json!({"error":"literal cancellation unavailable"})
+                        },
+                    )
+                } else {
+                    (200, json!({}))
+                };
+                let body = body.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )?;
+                paths.push(path.to_owned());
+            }
+            Ok(paths)
+        });
+        let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+        let mut actor = SessionActor::new(
+            &client,
+            &base,
+            "session-1",
+            "harness-eval-live",
+            Instant::now() + Duration::from_secs(5),
+        );
+        actor.attached = true;
+        actor.lease_cleanup_pending = true;
+        actor.receipt_selector = Some("owned-test-selector".into());
+        let result: anyhow::Result<()> = r6_finish_foreground(
+            root.path(),
+            &mut actor,
+            Some(&("graph-1".into(), "turn-1".into())),
+            Err(anyhow::anyhow!("original-finite-provider-failed")),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "original-finite-provider-failed"
+        );
+        let paths = server
+            .join()
+            .map_err(|_| anyhow::anyhow!("cleanup endpoint panicked"))??;
+        assert_eq!(paths.len(), 3);
+        let secondary: Value = serde_json::from_slice(&std::fs::read(
+            root.path().join("r6-session-cleanup-results.json"),
+        )?)?;
+        assert_eq!(secondary["first_error_persisted"], true);
+        assert_eq!(secondary["settlement_or_F2_proven"], false);
+        assert!(secondary["finish"].get("Ok").is_some());
+        assert!(
+            secondary["cancel_request"]
+                .get(if cancel_status == 200 { "Ok" } else { "Err" })
+                .is_some()
+        );
+    }
+    Ok(())
 }
