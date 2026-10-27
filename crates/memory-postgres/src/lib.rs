@@ -603,17 +603,18 @@ impl PostgresMemoryStore {
         let category = category.map(|value| enum_label(&value)).transpose()?;
         let layer = layer.map(|value| enum_label(&value)).transpose()?;
         let limit = limit_i64(limit)?;
+        let patterns = lexical_query_patterns(query);
         self.entries(
             "SELECT payload FROM memory_entries
              WHERE (to_tsvector('simple', title || ' ' || content || ' ' || coalesce(payload ->> 'tags', ''))
                        @@ websearch_to_tsquery('simple', $1)
-                    OR title ILIKE '%' || $1 || '%'
-                    OR content ILIKE '%' || $1 || '%')
+                    OR (cardinality($6::TEXT[]) > 0 AND
+                        (title || ' ' || content || ' ' || coalesce(payload ->> 'tags', '')) ILIKE ALL($6)))
                AND ($2::TEXT IS NULL OR scope_key='global' OR scope_key=$2)
                AND ($3::TEXT IS NULL OR category=$3)
                AND ($4::TEXT IS NULL OR layer=$4)
              ORDER BY updated_at DESC, id ASC LIMIT $5",
-            &[&query, &scope, &category, &layer, &limit],
+            &[&query, &scope, &category, &layer, &limit, &patterns],
         )
     }
 
@@ -626,6 +627,7 @@ impl PostgresMemoryStore {
         if query.trim().is_empty() {
             return Ok(0);
         }
+        let patterns = lexical_query_patterns(query);
         let category = category.map(|value| enum_label(&value)).transpose()?;
         let layer = layer.map(|value| enum_label(&value)).transpose()?;
         let mut connection = self
@@ -637,11 +639,11 @@ impl PostgresMemoryStore {
                 "SELECT count(*) FROM memory_entries
                  WHERE (to_tsvector('simple', title || ' ' || content || ' ' || coalesce(payload ->> 'tags', ''))
                            @@ websearch_to_tsquery('simple', $1)
-                        OR title ILIKE '%' || $1 || '%'
-                        OR content ILIKE '%' || $1 || '%')
+                        OR (cardinality($4::TEXT[]) > 0 AND
+                            (title || ' ' || content || ' ' || coalesce(payload ->> 'tags', '')) ILIKE ALL($4)))
                    AND ($2::TEXT IS NULL OR category=$2)
                    AND ($3::TEXT IS NULL OR layer=$3)",
-                &[&query, &category, &layer],
+                &[&query, &category, &layer, &patterns],
             )
             .map_err(postgres_memory_error)?
             .try_get(0)
@@ -1249,12 +1251,13 @@ impl MemoryStore for PostgresMemoryStore {
             }
             let limit = query.limit.clamp(1,128); let sql_limit = (limit+1) as i64;
             let sql_skip = i64::try_from(query.skip).map_err(|_| MemoryError::Store("memory cursor skip is out of range".into()))?;
+            let patterns = lexical_query_patterns(&query.query);
             let mut rows = transaction.query(
                 "SELECT e.payload, k.key, k.value FROM memory_entries e LEFT JOIN memory_kv k ON k.key='memory_lifecycle:'||e.id
                  WHERE e.scope_key=ANY($1) AND ($2::TEXT IS NULL OR e.id > $2)
                    AND ($3='' OR to_tsvector('simple',e.title||' '||e.content||' '||coalesce(e.payload->>'tags','')) @@ websearch_to_tsquery('simple',$3)
-                        OR e.title ILIKE '%'||$3||'%' OR e.content ILIKE '%'||$3||'%')
-                 ORDER BY e.id ASC LIMIT $4 OFFSET $5", &[&scopes,&query.after_id,&query.query,&sql_limit,&sql_skip]).map_err(postgres_memory_error)?;
+                        OR (cardinality($6::TEXT[]) > 0 AND (e.title||' '||e.content||' '||coalesce(e.payload->>'tags','')) ILIKE ALL($6)))
+                 ORDER BY e.id ASC LIMIT $4 OFFSET $5", &[&scopes,&query.after_id,&query.query,&sql_limit,&sql_skip,&patterns]).map_err(postgres_memory_error)?;
             let has_more = rows.len() > limit; rows.truncate(limit);
             let mut entries = Vec::with_capacity(rows.len()); let mut lifecycle = Vec::new();
             for row in rows {
@@ -2686,6 +2689,24 @@ fn write_entry(
             .map_err(postgres_memory_error)?;
     }
     Ok(())
+}
+
+/// Literal all-term fallback, matching the Ephemeral MemoryStore contract.
+/// PostgreSQL's simple FTS tokenizer keeps CJK runs intact, so query fragments
+/// such as 仓库代号 do not match 仓库代号为 without this lexical fallback.
+fn lexical_query_patterns(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| term.trim_matches(|c| matches!(c, '\"' | '*' | '\'')))
+        .filter(|term| !term.is_empty())
+        .map(|term| {
+            let literal = term
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            format!("%{literal}%")
+        })
+        .collect()
 }
 
 fn enum_label<T: Serialize>(value: &T) -> MemoryResult<String> {

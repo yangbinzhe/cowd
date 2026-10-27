@@ -753,3 +753,134 @@ async fn test_find_conversations_by_symbol() {
     let none = store.find_memories_by_symbol("nonexistent").await.unwrap();
     assert!(none.is_empty());
 }
+
+/// Original U7 query/seed: prove candidate matching before ranking, with exact scopes.
+#[tokio::test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+async fn u7_original_multiterm_query_matches_authorized_seed_before_ranking() {
+    use memory::store::MemoryDiscoveryQuery;
+    let fixture = PostgresTestScope::new();
+    let scoped = fixture.reconnect();
+    let store = PostgresMemoryStore::new(scoped.clone()).unwrap();
+    let query = "u7-memory-lighthouse 备件调度 仓库代号 出库口令";
+    let mut seed = entry("u7-original", "u7-memory-lighthouse", "u7-memory-lighthouse 项目备件调度：仓库代号为 WH-0135ef7ded534225a0fb6854c234f542；出库口令为 OUT-bcc1c6448fea4c05bd8b710957bafc2f。", MemoryLayer::L3);
+    seed.id = Uuid::parse_str("51750fcf-615d-4bc0-90af-4768bc546fe3").unwrap();
+    seed.source = MemorySource::UserExplicit;
+    seed.category = MemoryCategory::Reference;
+    seed.source_agent = Some("api".into());
+    seed.session_id = Some("api-memory-create".into());
+    seed.visibility = AgentVisibility::Shared;
+    seed.scope = MemoryScope::Global;
+    // Rebuild provenance through the original writer, rather than borrowing
+    // the old run's memory-turn tag without its binding.
+    seed.tags = vec!["u7-real-memory".into()];
+    async fn persist(store: &PostgresMemoryStore, value: &mut MemoryEntry) {
+        value.tags.retain(|tag| !tag.starts_with("memory-turn:"));
+        let turn = memory::MemoryTurnContext::new("api-memory-create", "api");
+        let origin = memory::store::MemoryExtractionOrigin::for_turn_entry(&turn, value).unwrap();
+        store.write_extraction(value, &origin, None).await.unwrap();
+    }
+    persist(&store, &mut seed).await;
+    assert_eq!(
+        store.get(&seed.id).await.unwrap().unwrap().content,
+        seed.content
+    );
+    let diagnostic = scoped.checkout_online_read().unwrap().query_one(
+        "SELECT to_tsvector('simple', title||' '||content||' '||coalesce(payload->>'tags','')) @@ websearch_to_tsquery('simple',$1), title ILIKE '%'||$1||'%', content ILIKE '%'||$1||'%', (payload->>'tags') ILIKE '%'||$1||'%' FROM memory_entries WHERE id=$2",
+        &[&query, &seed.id.to_string()],
+    ).unwrap();
+    let fts: bool = diagnostic.get(0);
+    let title: bool = diagnostic.get(1);
+    let content: bool = diagnostic.get(2);
+    let tags: bool = diagnostic.get(3);
+    eprintln!("round439 original predicates fts={fts} whole_title={title} whole_content={content} whole_tags={tags}");
+    assert!(
+        !fts && !title && !content && !tags,
+        "original production disjunction rejects before ranking"
+    );
+    assert!(query
+        .split_whitespace()
+        .all(|term| seed.content.contains(term)));
+    let authorized = MemoryScope::Project("u7-authorized".into());
+    let mut foreign = seed.clone();
+    foreign.id = Uuid::nil();
+    foreign.scope = MemoryScope::Project("u7-foreign".into());
+    persist(&store, &mut foreign).await;
+    let mut partial = seed.clone();
+    partial.id = Uuid::from_u128(1);
+    partial.content = "u7-memory-lighthouse 备件调度 仓库代号".into();
+    persist(&store, &mut partial).await;
+    let found = store
+        .search_fts_scoped(query, &authorized, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+        vec![seed.id],
+        "all query words must match inside authorized candidates before ranking/limit"
+    );
+    let page = store
+        .discover_page(MemoryDiscoveryQuery {
+            scopes: vec![MemoryScope::Global, authorized],
+            query: query.into(),
+            after_id: None,
+            skip: 0,
+            expected_revisions: None,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        vec![seed.id]
+    );
+    assert!(
+        page.next_id.is_none(),
+        "foreign and partially matching rows cannot leak through pagination"
+    );
+    let advanced = store
+        .search_fts_advanced(query, memory::store::FtsSearchOptions::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        advanced.total_matches, 2,
+        "unscoped search/count both match exactly the seed and foreign copy"
+    );
+    assert_eq!(advanced.entries.len(), advanced.total_matches);
+    assert_eq!(
+        store
+            .search_fts_scoped("u7-real-memory 出库口令", &MemoryScope::Global, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        vec![seed.id],
+        "all-term fallback includes tags and content together"
+    );
+    assert_eq!(
+        store
+            .search_fts_scoped("never_present OR lighthouse", &MemoryScope::Global, 10)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the existing FTS OR query remains available"
+    );
+    assert!(store
+        .search_fts_scoped("u7-memory-lighthouse 不存在词", &MemoryScope::Global, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        store
+            .search_fts_scoped("%_", &MemoryScope::Global, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "literal wildcard characters cannot broaden token matching"
+    );
+}
