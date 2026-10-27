@@ -1369,8 +1369,26 @@ server.serve_forever()
         domain: &str,
         mode: &str,
     ) -> anyhow::Result<(u16, serde_json::Value)> {
+        background_http_post(
+            server,
+            token,
+            "/api/slash/dispatch",
+            &serde_json::json!({"command":domain,"args":{"mode":mode}}),
+        )
+    }
+
+    fn background_http_post(
+        server: &super::ServerProcess,
+        token: &str,
+        path: &str,
+        value: &serde_json::Value,
+    ) -> anyhow::Result<(u16, serde_json::Value)> {
         use std::io::{Read, Write};
         use std::net::TcpStream;
+        anyhow::ensure!(
+            matches!(path, "/api/slash/dispatch" | "/api/approval/risk-receipt"),
+            "fixed owned test routes only"
+        );
         let address = server
             .base_url
             .strip_prefix("http://")
@@ -1378,8 +1396,8 @@ server.serve_forever()
         let mut stream =
             TcpStream::connect_timeout(&address.parse()?, std::time::Duration::from_secs(2))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
-        let body = serde_json::to_vec(&serde_json::json!({"command":domain,"args":{"mode":mode}}))?;
-        let header = format!("POST /api/slash/dispatch HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer {token}\r\nx-cowd-surface-id: legacy_gateway\r\nx-cowd-requested-capabilities: runtime.maintenance.manage\r\nContent-Length: {}\r\n\r\n", body.len());
+        let body = serde_json::to_vec(value)?;
+        let header = format!("POST {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer {token}\r\nx-cowd-surface-id: legacy_gateway\r\nx-cowd-requested-capabilities: runtime.maintenance.manage\r\nContent-Length: {}\r\n\r\n", body.len());
         stream.write_all(header.as_bytes())?;
         stream.write_all(&body)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1415,7 +1433,134 @@ server.serve_forever()
             .and_then(|line| line.split_whitespace().nth(1))
             .ok_or_else(|| anyhow::anyhow!("Missing HTTP status"))?
             .parse()?;
-        Ok((status, serde_json::from_slice(&response[cut + 4..])?))
+        let value = serde_json::from_slice(&response[cut + 4..])?;
+        // Preserve the exact public result before an assertion/unwind. The
+        // controller encrypts this owned root; no credential is in the body.
+        use std::os::unix::fs::OpenOptionsExt;
+        static NEXT_RESPONSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT_RESPONSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut original = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(
+                server
+                    .root
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("owned root missing"))?
+                    .path
+                    .join(format!("public-response-{n}.json")),
+            )?;
+        original.write_all(&serde_json::to_vec(
+            &serde_json::json!({"path":path,"status":status,"body":value}),
+        )?)?;
+        original.sync_all()?;
+        Ok((status, value))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_error_response_is_preserved_before_business_assertions() -> anyhow::Result<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let root = super::OwnedRoot::create()?;
+        let path = root.path.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let expected = serde_json::json!({"error":"independent fixture error; no original 503 message inferred"});
+        let wire = serde_json::to_vec(&expected)?;
+        let leaf = std::thread::spawn(move || -> anyhow::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        anyhow::ensure!(
+                            std::time::Instant::now() < deadline,
+                            "HTTP double accept deadline"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk)?;
+                anyhow::ensure!(n > 0, "incomplete fixture request");
+                request.extend_from_slice(&chunk[..n]);
+                anyhow::ensure!(request.len() <= 4096, "fixture request bound");
+                if let Some(cut) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..cut])?;
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|h| h.strip_prefix("Content-Length: "))
+                        .ok_or_else(|| anyhow::anyhow!("missing length"))?
+                        .parse()?;
+                    if request.len() >= cut + 4 + length {
+                        break;
+                    }
+                }
+            }
+            stream.write_all(format!("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",wire.len()).as_bytes())?;
+            stream.write_all(&wire)?;
+            Ok(())
+        });
+        // No Gateway/child is represented by this HTTP-only consumer value.
+        let mut consumer = super::ServerProcess {
+            proc: None,
+            base_url: format!("http://{address}"),
+            root: Some(root),
+            config_home: path.clone(),
+            home_dir: path.clone(),
+            workspace: path.clone(),
+            runtime_dir: path.clone(),
+            cowd_bin: Default::default(),
+            postgres_url: String::new(),
+            nonce: String::new(),
+            launch: None,
+            runtime_handle: None,
+            closed: true,
+        };
+        let response = background_http_post(
+            &consumer,
+            "synthetic-test-only",
+            "/api/approval/risk-receipt",
+            &serde_json::json!({}),
+        )?;
+        leaf.join()
+            .map_err(|_| anyhow::anyhow!("HTTP double panicked"))??;
+        assert_eq!(response, (503, expected.clone()));
+        let originals = std::fs::read_dir(&path)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("public-response-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(originals.len(), 1);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&originals[0])?)?;
+        assert_eq!(
+            saved,
+            serde_json::json!({"path":"/api/approval/risk-receipt","status":503,"body":expected})
+        );
+        assert_eq!(
+            std::fs::metadata(&originals[0])?.permissions().mode() & 0o777,
+            0o600
+        );
+        consumer
+            .root
+            .as_mut()
+            .unwrap()
+            .remove_after_confirmed_completion()?;
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1567,6 +1712,386 @@ server.serve_forever()
             .mode(0o600)
             .open(root_path.join("two-epoch-background-report.json"))?;
         output.write_all(&serde_json::to_vec_pretty(&report)?)?;
+        Ok(())
+    }
+
+    // Only this explicitly selected fixture can use the controller's isolated
+    // libpq identity. Credentials stay in the environment, never argv/output.
+    fn growth_test_sql(root: &std::path::Path, sql: &str) -> anyhow::Result<String> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::{Command, Stdio};
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::private_directory(root)?;
+        let out_path = root.join(format!("growth-sql-{n}.stdout"));
+        let err_path = root.join(format!("growth-sql-{n}.stderr"));
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&out_path)?;
+        let error = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&err_path)?;
+        let mut command = Command::new("psql");
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+        for key in ["PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD"] {
+            command.env(
+                key,
+                std::env::var(key).map_err(|_| {
+                    anyhow::anyhow!("NotStarted: isolated libpq field {key} required")
+                })?,
+            );
+        }
+        command
+            .env("PGCONNECT_TIMEOUT", "3")
+            .env(
+                "PGOPTIONS",
+                "-c statement_timeout=5000 -c lock_timeout=2000",
+            )
+            .args(["-X", "-qAt", "-v", "ON_ERROR_STOP=1"])
+            .stdin(Stdio::piped())
+            .stdout(output)
+            .stderr(error);
+        anyhow::ensure!(sql.len() < 24 * 1024, "test SQL is bounded");
+        let mut child = command.spawn()?;
+        child.stdin.take().unwrap().write_all(sql.as_bytes())?;
+        let status = super::wait_bounded(&mut child, std::time::Duration::from_secs(8))?;
+        if status.is_none() {
+            child.kill()?;
+            anyhow::ensure!(
+                super::wait_bounded(&mut child, std::time::Duration::from_secs(2))?.is_some(),
+                "test SQL child unreaped"
+            );
+            anyhow::bail!("isolated test SQL deadline; private stderr retained");
+        }
+        anyhow::ensure!(
+            status.unwrap().success(),
+            "isolated test SQL rejected; private stderr retained at {}",
+            err_path.display()
+        );
+        let metadata = std::fs::metadata(&out_path)?;
+        anyhow::ensure!(metadata.len() <= 128 * 1024, "test SQL output bound");
+        Ok(std::fs::read_to_string(out_path)?.trim().to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual isolated PostgreSQL fault-scope gate; explicit exact only"]
+    fn growth_receipt_fault_is_scoped_and_rollback_retains_its_hit() -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("COWD_R5_SQL_ROOT")
+                .ok_or_else(|| anyhow::anyhow!("NotStarted: private SQL root required"))?,
+        );
+        let sql = format!(
+            r#"
+BEGIN;
+CREATE TEMP TABLE growth_events(event_id TEXT, session_id TEXT);
+CREATE TEMP TABLE growth_promotions(event_id TEXT,target TEXT,status TEXT,error TEXT);
+INSERT INTO growth_events VALUES('event-A-exact','r326-growth-A'),('event-foreign','foreign');
+{}
+INSERT INTO growth_promotions VALUES
+ ('event-A-exact','matrix.fact','promoted',NULL),
+ ('event-foreign','memory.entry','promoted',NULL),
+ ('r326-growth-A','memory.entry','promoted',NULL),
+ ('event-A-exact','memory.entry','promoted','actual failure'),
+ ('event-A-exact','memory.entry','held',NULL);
+DO $$ BEGIN
+  BEGIN
+    INSERT INTO growth_promotions VALUES('event-A-exact','memory.entry','promoted',NULL);
+    RAISE EXCEPTION 'fault did not fire';
+  EXCEPTION WHEN SQLSTATE 'P0326' THEN NULL; END;
+  IF (SELECT count(*) FROM growth_promotions) <> 5 THEN RAISE EXCEPTION 'rollback changed rows'; END IF;
+  IF (SELECT last_value FROM r326_receipt_fault_hits) <> 1 OR NOT (SELECT is_called FROM r326_receipt_fault_hits) THEN RAISE EXCEPTION 'nontransactional fault hit missing'; END IF;
+END $$;
+SELECT 'scoped-fault-hit-after-rollback';
+ROLLBACK;
+"#,
+            include_str!("growth_receipt_fault.sql")
+        );
+        assert_eq!(
+            growth_test_sql(&root, &sql)?,
+            "scoped-fault-hit-after-rollback"
+        );
+        Ok(())
+    }
+
+    // Original static CLI catalog, not an effect/Provider dispatch and not a
+    // claim that the failed public request's missing response body was saved.
+    fn growth_current_catalog_preflight(root: &std::path::Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::{Command, Stdio};
+        super::private_directory(root)?;
+        let image = std::env::var_os("COWD_BIN")
+            .ok_or_else(|| anyhow::anyhow!("NotStarted: frozen CLI required"))?;
+        let out_path = root.join("growth-tool-catalog.json");
+        let out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&out_path)?;
+        let err = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join("growth-tool-catalog.stderr"))?;
+        let mut command = Command::new(image);
+        command
+            .env_clear()
+            .env("HOME", root)
+            .env("TMPDIR", root)
+            .env("XDG_CONFIG_HOME", root)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["tool", "list", "--output-format", "json"])
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err);
+        if let Some(library) = std::env::var_os("LD_LIBRARY_PATH") {
+            command.env("LD_LIBRARY_PATH", library);
+        }
+        let mut child = command.spawn()?;
+        let status = super::wait_bounded(&mut child, std::time::Duration::from_secs(5))?;
+        if status.is_none() {
+            child.kill()?;
+            child.wait()?;
+            anyhow::bail!("static catalog deadline");
+        }
+        anyhow::ensure!(
+            status.unwrap().success(),
+            "original static catalog command failed"
+        );
+        anyhow::ensure!(
+            std::fs::metadata(&out_path)?.len() < 64 * 1024,
+            "catalog output bound"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(out_path)?)?;
+        assert_eq!(value["runtime_effect"], "none");
+        let names = value["tools"].as_array().unwrap();
+        assert!(
+            !names.contains(&serde_json::json!("write_file")),
+            "retired fixture tool must not be silently resurrected"
+        );
+        assert!(
+            names.contains(&serde_json::json!("edit")),
+            "current mutation primitive must be registered"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual source-bound static CLI precondition; no PG/Gateway/model"]
+    fn growth_risk_source_uses_current_catalog_without_tool_dispatch() -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("COWD_R5_SQL_ROOT")
+                .ok_or_else(|| anyhow::anyhow!("NotStarted: private root required"))?,
+        );
+        growth_current_catalog_preflight(&root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "manual real Gateway/isolated PostgreSQL in-flight recovery gate; explicit exact only"]
+    fn growth_admitted_memory_receipt_recovers_in_second_gateway_pid() -> anyhow::Result<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+        let postgres = std::env::var("COWD_TEST_POSTGRES_URL")?;
+        let image = std::path::PathBuf::from(
+            std::env::var_os("COWD_BIN")
+                .ok_or_else(|| anyhow::anyhow!("NotStarted: frozen CLI required"))?,
+        )
+        .canonicalize()?;
+        let root_path = std::path::PathBuf::from(
+            std::env::var_os("COWD_R5_OWNED_ROOT")
+                .ok_or_else(|| anyhow::anyhow!("NotStarted: registered root required"))?,
+        );
+        super::private_directory(&root_path)?;
+        anyhow::ensure!(
+            root_path.is_absolute() && std::fs::read_dir(&root_path)?.next().is_none(),
+            "fresh registered root only"
+        );
+        let mut bytes = [0u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        growth_current_catalog_preflight(&root_path)?;
+        let root = super::OwnedRoot {
+            path: root_path.clone(),
+            failed: false,
+        };
+        let mut server = super::ServerProcess::start_epoch(
+            postgres,
+            "isolation-no-provider".into(),
+            image.clone(),
+            image,
+            root,
+            None,
+            Some(&token),
+        )?;
+        let original = background_broker_request(
+            &server,
+            &token,
+            serde_json::json!({"kind":"get_human_entitlements"}),
+        )?;
+        let before = &original["entitlement"];
+        let preview = background_broker_request(
+            &server,
+            &token,
+            serde_json::json!({"kind":"preview_human_entitlements","core_profile_id":"core_manager","app_profiles":before["app_profiles"]}),
+        )?;
+        let granted = background_broker_request(
+            &server,
+            &token,
+            serde_json::json!({"kind":"set_human_entitlements","core_profile_id":"core_manager","app_profiles":before["app_profiles"],"expected_credential_epoch":before["credential_epoch"],"expected_profile_revision":before["profile_revision"],"confirmation_digest":preview["confirmation_digest"]}),
+        )?;
+        assert_eq!(granted["kind"], "human_entitlements");
+        growth_test_sql(&root_path, include_str!("growth_receipt_fault.sql"))?;
+        let (status, on) = background_http_command(&server, &token, "growth", "on")?;
+        assert_eq!(status, 200);
+        assert_eq!(on["data"]["effective"], "on");
+        let request = |session: &str| serde_json::json!({"tool_name":"edit","input":{"action":"write","path":"r326-never-executed.txt","content":"risk assessment only"},"session_id":session});
+        let (status, source) = background_http_post(
+            &server,
+            &token,
+            "/api/approval/risk-receipt",
+            &request("r326-growth-A"),
+        )?;
+        assert_eq!(status, 200);
+        assert_eq!(source["growth"]["status"], "queued");
+        assert_eq!(source["receipt"]["approval_required"], true);
+        assert_eq!(
+            source["growth"]["event"]["source_event_kind"],
+            "approval.risk_receipt"
+        );
+        assert_eq!(
+            source["growth"]["event"]["memory_candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let event_id = source["growth"]["event"]["id"].as_str().unwrap().to_owned();
+        let sql_snapshot = r#"SELECT jsonb_build_object(
+ 'event_ids',(SELECT COALESCE(jsonb_agg(event_id ORDER BY event_id),'[]') FROM growth_events WHERE session_id='r326-growth-A'),
+ 'memory',(SELECT COALESCE(jsonb_agg(payload ORDER BY id),'[]') FROM memory_entries WHERE session_id='r326-growth-A' AND source_agent='growth-service'),
+ 'matrix_receipts',(SELECT COALESCE(jsonb_agg(payload ORDER BY id),'[]') FROM growth_promotions WHERE event_id IN(SELECT event_id FROM growth_events WHERE session_id='r326-growth-A') AND target='matrix.fact'),
+ 'memory_receipts',(SELECT COALESCE(jsonb_agg(payload ORDER BY id),'[]') FROM growth_promotions WHERE event_id IN(SELECT event_id FROM growth_events WHERE session_id='r326-growth-A') AND target='memory.entry'),
+ 'checkpoint',(SELECT payload FROM runtime_projection_checkpoints WHERE projection_id='projector:growth:v1'),
+ 'hits',(SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM r326_receipt_fault_hits),
+ 'off_events',(SELECT count(*) FROM growth_events WHERE session_id='r326-growth-B'))::text;"#;
+        let snapshot = || -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::from_str(&growth_test_sql(
+                &root_path,
+                sql_snapshot,
+            )?)?)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+        let pending = loop {
+            let value = snapshot()?;
+            if value["hits"].as_u64().unwrap_or(0) > 0
+                && value["memory"].as_array().unwrap().len() == 2
+            {
+                break value;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "original effect/receipt cut not reached"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(pending["event_ids"], serde_json::json!([event_id]));
+        assert!(pending["memory_receipts"].as_array().unwrap().is_empty());
+        assert_eq!(pending["matrix_receipts"].as_array().unwrap().len(), 2);
+        assert!(pending["checkpoint"]["pending_page"].is_object());
+        assert!(!root_path.join("workspace/r326-never-executed.txt").exists());
+        let (status, off) = background_http_command(&server, &token, "growth", "off")?;
+        assert_eq!(status, 200);
+        // Stop new admission while the deliberately missing original receipt
+        // remains a durable obligation. Physical drain is not settlement.
+        assert_eq!(off["data"]["desired"]["growth"], false);
+        assert_eq!(off["data"]["effective"], "draining");
+        assert_eq!(off["data"]["durable_recovery"], "pending");
+        assert_eq!(off["data"]["pending_page"], true);
+        assert_eq!(off["data"]["physical_drained"], true);
+        let (status, disabled) = background_http_post(
+            &server,
+            &token,
+            "/api/approval/risk-receipt",
+            &request("r326-growth-B"),
+        )?;
+        assert_eq!(status, 200);
+        assert_eq!(disabled["growth"]["status"], "disabled");
+        let first = server.launch.clone().unwrap();
+        let first_runtime = server.runtime_dir.clone();
+        let config = std::fs::read(server.config_home.join("config.yaml"))?;
+        server.close()?; // Original F2 must succeed; no fake closed flag or crash substitution.
+        let at_exit = snapshot()?;
+        assert_eq!(at_exit["memory"], pending["memory"]);
+        assert!(at_exit["memory_receipts"].as_array().unwrap().is_empty());
+        assert!(at_exit["checkpoint"]["pending_page"].is_object());
+        growth_test_sql(
+            &root_path,
+            "DROP TRIGGER r326_receipt_fault ON growth_promotions;",
+        )?;
+        server.restart()?; // Only original retained-root startup drives recovery.
+        let second = server.launch.clone().unwrap();
+        assert_ne!(first.pid, second.pid);
+        assert_ne!(first.nonce, second.nonce);
+        assert!(!std::path::Path::new(&format!("/proc/{}", first.pid)).exists());
+        assert_eq!(server.root.as_ref().unwrap().path, root_path);
+        assert!(
+            std::fs::read(server.config_home.join("config.yaml"))? == config,
+            "same private config bytes"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+        let recovered = loop {
+            let value = snapshot()?;
+            if value["checkpoint"]["pending_page"].is_null()
+                && value["memory_receipts"].as_array().unwrap().len() == 2
+            {
+                break value;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "original second-PID recovery did not settle admitted receipt"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(
+            recovered["memory"], pending["memory"],
+            "original effects must not be rewritten or duplicated"
+        );
+        assert_eq!(recovered["matrix_receipts"], pending["matrix_receipts"]);
+        assert_eq!(recovered["event_ids"], pending["event_ids"]);
+        assert_eq!(recovered["off_events"], 0);
+        assert_eq!(
+            recovered["hits"], at_exit["hits"],
+            "fault released only after old PID physically returned"
+        );
+        for receipt in recovered["memory_receipts"].as_array().unwrap() {
+            assert!(receipt["error"].is_null());
+            assert_eq!(receipt["status"], "duplicate");
+        }
+        let (status, cold) = background_http_command(&server, &token, "growth", "status")?;
+        assert_eq!(status, 200);
+        assert_eq!(cold["data"]["effective"], "off");
+        assert_eq!(cold["data"]["durable_recovery"], "settled");
+        let second_runtime = server.runtime_dir.clone();
+        server.close()?;
+        assert!(!std::path::Path::new(&format!("/proc/{}", second.pid)).exists());
+        let report = serde_json::json!({"scope":"original_growth_inflight_retained_root_two_gateway_pids","pid1":first.pid,"starttime1":first.starttime,"pid2":second.pid,"starttime2":second.starttime,"root":root_path,"source":source,"pending":pending,"at_first_exit":at_exit,"recovered":recovered,"off":off,"disabled_source":disabled,"cold":cold,"receipts":[first_runtime.join(format!("shutdown-{}.v1.json",first.nonce)),second_runtime.join(format!("shutdown-{}.v1.json",second.nonce))],"R6_proven":false,"real_AI_proven":false});
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root_path.join("inflight-background-report.json"))?;
+        out.write_all(&serde_json::to_vec_pretty(&report)?)?;
+        growth_test_sql(
+            &root_path,
+            "DROP FUNCTION r326_memory_receipt_fault(); DROP SEQUENCE r326_receipt_fault_hits;",
+        )?;
         Ok(())
     }
 
