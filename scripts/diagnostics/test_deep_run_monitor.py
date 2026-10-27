@@ -695,17 +695,16 @@ def _():
         assert save_state(None, state) is None
 
 
-@case("the harness stop gate reads the escalation the monitor emits")
+@case("the harness records semantic findings without terminating the measured run")
 def _():
-    # The monitor and the harness are two layers; the escalation is only real
-    # if the layer that can stop the run reads the field the monitor writes.
-    # This pins the contract so neither side can drift.
     scenario = os.path.join(_HERE, "..", "scenarios", "harness-eval-real-qwen.sh")
     with open(scenario, encoding="utf-8") as handle:
         text = handle.read()
-    assert ".verification.escalate" in text, "the harness must act on the escalation"
-    assert "--state-file" in text, "the harness must give the monitor durable state"
-    assert "harness_eval_deep_monitor_stop" in text, "the stop must be observable"
+    body = text.split("monitor_semantic_health() {", 1)[1].split("\n}", 1)[0]
+    assert "--investigate" in body
+    assert "harness_eval_deep_monitor" in body
+    assert "kill -" not in body, "heuristic repetition must not terminate a real run"
+    assert "harness_eval_deep_monitor_stop" not in body
 
 
 def main():

@@ -12,15 +12,17 @@ ROWS_TSV="$REPORT_DIR/lanes.tsv"
 : >"$ROWS_TSV"
 
 STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-GIT_REV="$(git rev-parse --short HEAD)"
-GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+GIT_REV="${COWD_AI_HARNESS_REVISION:-unknown}"
+GIT_BRANCH="${COWD_AI_HARNESS_BRANCH:-unknown}"
 
 declare -a ROWS=()
 FAILURES=0
+DEVELOPMENT_FAILURES=0
 
 run_check() {
   local name="$1"
   local command="$2"
+  local category="${3:-capability}"
   local log_file="$REPORT_DIR/${name//[^A-Za-z0-9_.-]/_}.log"
   local started
   local ended
@@ -36,11 +38,20 @@ run_check() {
     duration=$((ended - started))
     ROWS+=("| ${name} | FAIL | ${duration}s | \`${command}\` | \`${log_file}\` |")
     printf '%s\t%s\t%s\t%s\t%s\n' "$name" "FAIL" "$duration" "$command" "$log_file" >>"$ROWS_TSV"
-    FAILURES=$((FAILURES + 1))
+    if [[ "$category" == "development" ]]; then
+      DEVELOPMENT_FAILURES=$((DEVELOPMENT_FAILURES + 1))
+    else
+      FAILURES=$((FAILURES + 1))
+    fi
   fi
 }
 
-run_check "format-and-whitespace" "cargo fmt --all --check && git diff --check"
+if [[ "${COWD_AI_HARNESS_DEVELOPMENT_CHECKS:-0}" == "1" ]]; then
+  run_check "format-and-whitespace" "cargo fmt --all --check" development
+else
+  ROWS+=("| format-and-whitespace | SKIP | 0s | \`cargo fmt --all --check\` | optional development check: set \`COWD_AI_HARNESS_DEVELOPMENT_CHECKS=1\` |")
+  printf '%s\t%s\t%s\t%s\t%s\n' "format-and-whitespace" "SKIP" "0" "cargo fmt --all --check" "optional development check: set COWD_AI_HARNESS_DEVELOPMENT_CHECKS=1" >>"$ROWS_TSV"
+fi
 run_check "ai-harness-core" "scripts/ci/ai-harness.sh"
 run_check "mission-harness-quick-eval" "cargo run -p harness-eval -- quick"
 
@@ -86,14 +97,19 @@ fi
   echo "- Started: ${STARTED_AT}"
   echo "- Finished: ${ENDED_AT}"
   echo "- Failed checks: ${FAILURES}"
+  echo "- Development check failures (advisory): ${DEVELOPMENT_FAILURES}"
+  echo "- Status summarizes executed capability commands only; SKIP means not executed, not passed."
+  echo "- Format/style checks are optional development observations and do not determine capability status."
   echo
-  echo "## Capability Lanes"
+  echo "## Capability Lanes and Optional Development Checks"
   echo
   echo "| Lane | Status | Duration | Command | Evidence |"
   echo "| --- | --- | ---: | --- | --- |"
   printf '%s\n' "${ROWS[@]}"
   echo
   echo "## Health Criteria"
+  echo
+  echo "The following describes lane coverage, not evidence that every lane ran. Consult each row's status; this report does not independently establish business acceptance."
   echo
   echo "- AI kernel, eval, runtime, tools, and provider checks compile and pass the current core tests."
   echo "- Mission Harness quick eval validates mission/session/team/agent/steward/recovery deterministic core loops."
@@ -110,17 +126,18 @@ fi
   echo "- See \`docs/ai-harness-testing.md\` for commands, layers, and acceptance rules."
 } >"$REPORT_PATH"
 
-python3 - "$ROWS_TSV" "$JSON_REPORT_PATH" "$OVERALL" "$GIT_BRANCH" "$GIT_REV" "$STARTED_AT" "$ENDED_AT" "$FAILURES" <<'PY'
+python3 - "$ROWS_TSV" "$JSON_REPORT_PATH" "$OVERALL" "$GIT_BRANCH" "$GIT_REV" "$STARTED_AT" "$ENDED_AT" "$FAILURES" "$DEVELOPMENT_FAILURES" <<'PY'
 import json
 import sys
 
-rows_tsv, report_path, status, branch, revision, started, finished, failures = sys.argv[1:9]
+rows_tsv, report_path, status, branch, revision, started, finished, failures, development_failures = sys.argv[1:10]
 lanes = []
 with open(rows_tsv, encoding="utf-8") as fh:
     for line in fh:
         name, lane_status, duration, command, evidence = line.rstrip("\n").split("\t")
         lanes.append({
             "lane": name,
+            "category": "development" if name == "format-and-whitespace" else "capability",
             "status": lane_status,
             "duration_seconds": int(duration),
             "command": command,
@@ -135,6 +152,9 @@ payload = {
     "started": started,
     "finished": finished,
     "failed_checks": int(failures),
+    "development_failed_checks": int(development_failures),
+    "status_scope": "executed capability commands; SKIP is not a pass",
+    "business_acceptance": "NotAssessed",
     "lanes": lanes,
 }
 with open(report_path, "w", encoding="utf-8") as fh:

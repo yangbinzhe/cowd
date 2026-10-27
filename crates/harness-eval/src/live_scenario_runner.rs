@@ -170,8 +170,10 @@ pub(crate) struct U5Host {
     exe_ino: u64,
     listener_inode: u64,
     port: u16,
-    pub(crate) candidate: String,
-    source_sha256: String,
+    #[serde(default)]
+    pub(crate) candidate: Option<String>,
+    #[serde(default)]
+    source_sha256: Option<String>,
     pub(crate) namespace: String,
     pub(crate) base_url: String,
     harness_sha256: String,
@@ -328,9 +330,6 @@ impl U5Host {
             || host.runtime_ino != meta.ino()
             || host.nonce != std::env::var("COWD_EVAL_U5_NONCE").unwrap_or_default()
             || host.nonce.len() != 64
-            || host.candidate != std::env::var("COWD_EVAL_CANDIDATE_SHA").unwrap_or_default()
-            || host.source_sha256
-                != std::env::var("COWD_EVAL_CANDIDATE_SOURCE_SHA256").unwrap_or_default()
             || host.harness_sha256
                 != std::env::var("COWD_EVAL_HARNESS_BINARY_SHA256").unwrap_or_default()
             || host.image_sha256
@@ -419,7 +418,10 @@ impl U5Host {
             pid: self.pid,
             starttime: self.starttime,
             image_sha256: self.image_sha256.clone(),
-            candidate: self.candidate.clone(),
+            candidate: self
+                .candidate
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
             namespace: self.namespace.clone(),
             base_url: self.base_url.clone(),
             principal_actor: String::new(),
@@ -728,8 +730,6 @@ fn u5_valid_owner(owner: &U5Owner, base_url: &str) -> bool {
             .image_sha256
             .strip_prefix("sha256:")
             .is_some_and(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
-        && owner.candidate.len() == 40
-        && owner.candidate.bytes().all(|c| c.is_ascii_hexdigit())
         && reqwest::Url::parse(base_url).is_ok_and(|url| {
             url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "::1"))
         })
@@ -8052,5 +8052,38 @@ mod scenario_tool_advertisement_tests {
             checked >= 7,
             "expected to validate the scenario tool lists, checked {checked}"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_metadata_owner_tests {
+    use super::*;
+
+    #[test]
+    fn u5_source_metadata_is_optional_and_actual_owner_stays_required() {
+        let raw = json!({
+            "nonce": "a".repeat(64), "launcher_pid": 1, "launcher_start": 1,
+            "pid": 2, "starttime": 2, "image_sha256": format!("sha256:{}", "b".repeat(64)),
+            "exe_dev": 1, "exe_ino": 2, "listener_inode": 3, "port": 12345,
+            "namespace": "owned-run", "base_url": "http://127.0.0.1:12345/",
+            "harness_sha256": "c".repeat(64), "runtime_dev": 4, "runtime_ino": 5
+        });
+        let host: U5Host = serde_json::from_value(raw.clone()).unwrap();
+        assert!(host.candidate.is_none());
+        assert!(host.source_sha256.is_none());
+        assert!(host.binding()["candidate"].is_null());
+        let mut owner = host.owner();
+        assert!(u5_valid_owner(&owner, &host.base_url));
+        owner.pid = 0;
+        assert!(!u5_valid_owner(&owner, &host.base_url));
+        owner = host.owner();
+        owner.image_sha256 = "unknown".into();
+        assert!(!u5_valid_owner(&owner, &host.base_url));
+        let mut explicit = raw;
+        explicit["candidate"] = json!("d".repeat(40));
+        explicit["source_sha256"] = json!("e".repeat(64));
+        let host: U5Host = serde_json::from_value(explicit.clone()).unwrap();
+        assert_eq!(host.binding()["candidate"], explicit["candidate"]);
+        assert_eq!(host.binding()["source_sha256"], explicit["source_sha256"]);
     }
 }

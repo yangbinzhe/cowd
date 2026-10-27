@@ -73,20 +73,15 @@ if ss -ltnp | rg -q ":$WEB_PORT\\b"; then
 fi
 
 cd "$ROOT"
-cargo build -p cli
-
-# The edge WebUI is a separate repository. Build the exact checkout that the
-# Gateway will serve and fail closed when its release entry is absent; running
-# a Vite dev server or a missing historical spec is not browser evidence.
-WEBUI_ROOT="$(cd "$SURFACE_WEBUI_DIR" && pwd)"
-if [[ ! -f "$WEBUI_ROOT/package-lock.json" ]]; then
-  echo "WebUI package lock is missing: $WEBUI_ROOT/package-lock.json" >&2
-  exit 1
-fi
-(cd "$WEBUI_ROOT" && npm ci --ignore-scripts && npm run build)
+# Exercise existing build artifacts; dependency installation/building belongs to
+# the shared build step, not every measurement invocation.
+[[ -x "$BIN" ]] || {
+  echo "Cowd executable missing: $BIN; set COWD_BIN to the shared build artifact" >&2
+  exit 2
+}
 [[ -f "$SURFACE_WEBUI_DIR/dist/index.html" ]] || {
-  echo "WebUI release build did not produce dist/index.html" >&2
-  exit 1
+  echo "WebUI artifact missing: $SURFACE_WEBUI_DIR/dist/index.html" >&2
+  exit 2
 }
 
 cat >"$WORKDIR/mock_provider.py" <<'PY'

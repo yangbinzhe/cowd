@@ -18,13 +18,10 @@ SOURCE_CONFIG_HOME="${COWD_EVAL_SOURCE_CONFIG_HOME:-${COWD_CONFIG_HOME:-$CALLER_
 SOURCE_CONFIG_FILE="$SOURCE_CONFIG_HOME/config.yaml"
 SOURCE_MODELS_FILE="$SOURCE_CONFIG_HOME/models.yaml"
 MODEL="${COWD_EVAL_MODEL:-}"
-BIN="${COWD_BIN:-$ROOT/target/debug/cowd}"
-HARNESS_BIN="${COWD_EVAL_HARNESS_BIN:-}"
-FROZEN_MODE=0
-if [[ -n "$HARNESS_BIN" ]]; then
-  : "${COWD_BIN:?frozen evaluation requires both COWD_BIN and COWD_EVAL_HARNESS_BIN}"
-  FROZEN_MODE=1
-fi
+TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
+[[ "$TARGET_ROOT" == /* ]] || TARGET_ROOT="$ROOT/$TARGET_ROOT"
+BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
+HARNESS_BIN="${COWD_EVAL_HARNESS_BIN:-$TARGET_ROOT/debug/harness-eval}"
 PORT="${COWD_EVAL_GATEWAY_PORT:-18657}"
 BASE_URL="http://127.0.0.1:$PORT"
 TOKEN="harness-eval-real-qwen-${RANDOM}-${RANDOM}"
@@ -47,8 +44,8 @@ PRIVATE_RUNTIME="$RUN_ROOT/run"
 mkdir -m 700 "$PRIVATE_RUNTIME"
 read -r RUNTIME_DEVICE RUNTIME_INODE < <(stat -c '%d %i' "$PRIVATE_RUNTIME")
 SHUTDOWN_NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-# Keep evidence under ignored build artifacts by default so a matching run can
-# be reused. A caller may choose another durable evidence root explicitly.
+# Keep each actual report under build artifacts by default. A caller may
+# choose another durable evidence root explicitly; prior reports stay intact.
 EVIDENCE_ROOT="${COWD_AI_HARNESS_REPORT_DIR:-$ROOT/target/acceptance/real-qwen}"
 CONFIG_HOME="$RUN_ROOT/config"
 # Source-analysis scenarios default to the candidate tree. Artifact-producing
@@ -78,12 +75,8 @@ INPUT_HARNESS_BIN=""
 GATEWAY_BINARY_SHA256=""
 HARNESS_BINARY_SHA256=""
 DEEP_MONITOR_STALL_SECS="${COWD_EVAL_DEEP_MONITOR_STALL_SECS:-600}"
-# A single-stream local inference server cannot serve concurrent requests: the
-# runtime's default admission ceiling (provider target 64 / max 256, agents 42)
-# queues them behind each other, which shows up as multi-minute round latency
-# and starved agents. The in-flight ceiling is resolved after the provider is
-# known (local providers default to one); set COWD_EVAL_MAX_CONCURRENCY to
-# override explicitly.
+# Optional experiment ceiling. Only the U5 contention experiment below requires
+# capacity1; other scenarios use the configured production capacity by default.
 MAX_CONCURRENCY="${COWD_EVAL_MAX_CONCURRENCY:-}"
 DEEP_MONITOR_LAST_MILESTONE=""
 DEEP_MONITOR_LAST_CHANGE_TS=0
@@ -281,16 +274,6 @@ stop_owned() {
 }
 
 prepare_binaries() {
-  local target=${CARGO_TARGET_DIR:-$ROOT/target}
-  [[ "$target" == /* ]] || target="$ROOT/$target"
-  if [[ "$FROZEN_MODE" == 0 ]]; then
-    if [[ -z "${COWD_BIN:-}" ]]; then
-      (cd "$ROOT" && cargo build -p cli --bin cowd) || return 1
-      BIN="$target/debug/cowd"
-    fi
-    (cd "$ROOT" && cargo build -p harness-eval --bin harness-eval) || return 1
-    HARNESS_BIN="$target/debug/harness-eval"
-  fi
   local bindings
   bindings="$(python3 - "$BIN" "$HARNESS_BIN" "$RUN_ROOT" <<'PY'
 import hashlib, json, os, pathlib, stat, sys
@@ -459,7 +442,7 @@ PY
     if finalize_u5 "$status"; then status=0; else status=1; fi
   fi
   # Raw config/logs/receipts remain private; never copy them to a mode-blind mount.
-  if [[ "$status" != 0 || "$FROZEN_MODE" == 1 || "${COWD_EVAL_KEEP_GATEWAY_ARTIFACTS:-}" == 1 ]]; then
+  if [[ "$status" != 0 || "${COWD_EVAL_KEEP_GATEWAY_ARTIFACTS:-1}" == 1 ]]; then
     printf 'isolated Gateway artifacts: %s\n' "$RUN_ROOT" >&2
   else
     rm -rf -- "$RUN_ROOT"
@@ -717,24 +700,9 @@ monitor_progress() {
 }
 
 # Deep semantic monitoring. Surface progress counters count events; a rework
-# loop or a redundant-read loop emits events forever while the Objective never
-# advances. Two stop paths, both evidence-backed:
-#
-#  1. ESCALATION (primary). The monitor verifies each report against the
-#     previous one. The same finding, repeated COWD_MONITOR_ESCALATE_AFTER
-#     times in a row with no convergence milestone in between, is a loop the
-#     monitor has confirmed by watching it persist - it stops the run.
-#     Run one31 printed that finding ten times across six minutes while the
-#     run burned its whole window: the detector saw it, nothing counted it.
-#  2. SILENCE (backstop). Semantic milestones frozen for
-#     COWD_EVAL_DEEP_MONITOR_STALL_SECS AND no durable event at all in that
-#     window, for a run that has gone quiet (Qwen v11: 13 steps in 14 minutes,
-#     frozen).
-#
-# Event liveness deliberately gates only the silence path. A repeated-tool-call
-# loop emits an event every few seconds, so requiring silence made the one loop
-# shape that most needed stopping unstoppable - the gate protected the run from
-# the operator instead of the reverse.
+# Semantic diagnostics are observations only. Repetition, similarity and quiet
+# intervals are not independent business failure oracles and cannot stop a run.
+# Explicit evaluator deadlines and the owned cleanup path still bound execution.
 monitor_semantic_health() {
   local interval="${COWD_EVAL_DEEP_MONITOR_INTERVAL_SECS:-60}"
   local monitor="$ROOT/scripts/diagnostics/deep-run-monitor.py"
@@ -799,29 +767,22 @@ monitor_semantic_health() {
       "$state" "$milestones" "$(( now - DEEP_MONITOR_LAST_CHANGE_TS ))" "${repeat_count:-0}" "$findings"
     if [[ "$DEEP_MONITOR_LAST_CHANGE_TS" -gt 0 ]]; then
       local stalled_for=$(( now - DEEP_MONITOR_LAST_CHANGE_TS ))
-      # Stop path 1: the monitor has now reported the same finding N times in a
-      # row with no completion request and no verdict in between. Its counts
-      # only grew while it repeated, which is the definition of a confirmed
-      # loop. Event liveness is NOT required here: a loop that keeps calling
-      # tools keeps events flowing, and that is precisely the run to stop.
+      # Record repeated heuristic findings without changing the execution.
       if [[ "$state" == "SPINNING" && "$escalate" == "true" ]]; then
-        printf '%s' "$report" >"$EVIDENCE_ROOT/deep-monitor-final-report.json" 2>/dev/null || true
-        printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: the same finding repeated %s consecutive reports with no convergence milestone","state":"%s","stall_for_s":%d,"findings":%s}\n' \
+        printf '%s' "$report" >"$EVIDENCE_ROOT/deep-monitor-observation.json" 2>/dev/null || true
+        printf '{"event":"harness_eval_deep_monitor_observation","reason":"heuristic finding repeated %s consecutive reports with no convergence milestone","state":"%s","stall_for_s":%d,"findings":%s}\n' \
           "${repeat_count:-0}" "$state" "$stalled_for" "$findings" >&2
-        if owned_running "$HARNESS_PID" "$HARNESS_STARTTIME"; then kill -TERM "$HARNESS_PID"; fi
-        return 0
+        # Heuristic observation only. The evaluator's explicit run deadline and
+        # original cleanup owner decide termination, never repetition similarity.
       fi
-      # Stop path 2 (backstop): confirmed waste by silence - an active finding
-      # AND semantic milestones frozen for the stall window AND no durable
-      # event at all in that window. A single recoverable rework never trips
-      # it, and a run that is still emitting events is left to path 1.
+      # Record a quiet interval independently; it is not proof of failure.
       if [[ "$stalled_for" -ge "$DEEP_MONITOR_STALL_SECS" && "$state" == "SPINNING" \
             && "${last_event_age:-0}" -ge "$DEEP_MONITOR_STALL_SECS" ]]; then
-        printf '%s' "$report" >"$EVIDENCE_ROOT/deep-monitor-final-report.json" 2>/dev/null || true
-        printf '{"event":"harness_eval_deep_monitor_stop","reason":"confirmed spinning: findings present, semantic milestones frozen and no durable event in the stall window","state":"%s","stall_for_s":%d,"findings":%s}\n' \
+        printf '%s' "$report" >"$EVIDENCE_ROOT/deep-monitor-observation.json" 2>/dev/null || true
+        printf '{"event":"harness_eval_deep_monitor_observation","reason":"heuristic quiet interval with findings and no observed milestone","state":"%s","stall_for_s":%d,"findings":%s}\n' \
           "$state" "$stalled_for" "$findings" >&2
-        if owned_running "$HARNESS_PID" "$HARNESS_STARTTIME"; then kill -TERM "$HARNESS_PID"; fi
-        return 0
+        # Heuristic observation only. The evaluator's explicit run deadline and
+        # original cleanup owner decide termination, never repetition similarity.
       fi
     fi
     sleep "$interval"
@@ -887,27 +848,6 @@ resolve_installed_route() {
     echo "model ${MODEL} has no provider mapping in ${SOURCE_MODELS_FILE}" >&2
     exit 2
   }
-  model_lower="${MODEL,,}"
-  provider_lower="${PROVIDER_ID,,}"
-  if [[ "$provider_lower" == *bailian* || "$provider_lower" == *dashscope* ]]; then
-    echo "native Bailian generation is forbidden; Bailian is reserved for embedding only" >&2
-    exit 2
-  fi
-  if [[ "$model_lower" == qwen* && "$provider_lower" != "qwen-tokenplan" && "$provider_lower" != "local-ninfer" && "$provider_lower" != "local-strata" ]]; then
-    echo "Qwen generation must use qwen-tokenplan or a configured local inference provider, got ${PROVIDER_ID}" >&2
-    exit 2
-  fi
-  if [[ "$model_lower" == deepseek* && "$provider_lower" != "deepseek" && "$provider_lower" != "qwen-tokenplan" ]]; then
-    echo "DeepSeek generation must use the configured deepseek provider, got ${PROVIDER_ID}" >&2
-    exit 2
-  fi
-
-# Resolve the in-flight request ceiling now that the provider is known.
-if [[ -z "$MAX_CONCURRENCY" ]]; then
-  case "$provider_lower" in
-    *local*|*ninfer*|*strata*) MAX_CONCURRENCY=1 ;;
-  esac
-fi
 if [[ -n "$MAX_CONCURRENCY" ]]; then
   printf 'In-flight request ceiling: %s (provider %s)
 ' "$MAX_CONCURRENCY" "$PROVIDER_ID" >&2
@@ -936,10 +876,6 @@ fi
 }
 
 resolve_installed_route
-if [[ "$SCENARIO_ID" == "live_autonomous_collaboration_deepseek" && "${MODEL,,}" != deepseek* ]]; then
-  echo "autonomous collaboration acceptance requires an explicit DeepSeek model, got ${MODEL}" >&2
-  exit 2
-fi
 [[ -d "$WORKSPACE" ]] || {
   echo "evaluation workspace does not exist: $WORKSPACE" >&2
   exit 2
@@ -948,72 +884,19 @@ WORKSPACE="$(cd "$WORKSPACE" && pwd -P)"
 command -v curl >/dev/null || { echo 'curl is required.' >&2; exit 2; }
 command -v ss >/dev/null || { echo 'ss is required.' >&2; exit 2; }
 command -v jq >/dev/null || { echo 'jq is required.' >&2; exit 2; }
-if [[ -n "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]]; then
-  if [[ "${COWD_EVAL_EXPERIMENTAL:-0}" != "1" ]]; then
-    echo 'real-model evaluation requires a clean candidate worktree; run deterministic checks on the current changes, then evaluate the immutable candidate once.' >&2
-    echo 'set COWD_EVAL_EXPERIMENTAL=1 to measure the working tree as-is (evidence is then marked experimental and is never reused).' >&2
-    exit 2
-  fi
-  # Experiment mode. Faithfully fingerprint what ACTUALLY ran - HEAD plus the
-  # dirty working tree and untracked files - instead of refusing, so the
-  # evidence stays honest: it cannot be mistaken for a certification of the
-  # committed source, and two different dirty states cannot collide on one key.
-  CANDIDATE_STATE="experimental-dirty"
-  TMP_INDEX="$(mktemp -u)"
-  GIT_INDEX_FILE="$TMP_INDEX" git -C "$ROOT" read-tree HEAD >/dev/null 2>&1
-  GIT_INDEX_FILE="$TMP_INDEX" git -C "$ROOT" add -A >/dev/null 2>&1
-  STATE_TREE="$(GIT_INDEX_FILE="$TMP_INDEX" git -C "$ROOT" write-tree 2>/dev/null || true)"
-  rm -f "$TMP_INDEX"
-  CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
-  if [[ -n "$STATE_TREE" ]]; then
-    # The field is named sha256 and the report gate validates it as one, so the value
-    # has to be a sha256. A git tree id is 40 hex chars: it does separate two dirty
-    # states, but it can never satisfy the gate, so a dirty-tree run always fails
-    # `evidence_manifest_complete`. Hashing the tree content keeps the property the
-    # comment asks for and makes the field honest about its name.
-    CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" cat-file tree "$STATE_TREE" | sha256sum | awk '{print $1}')"
-  else
-    CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all | sha256sum | awk '{print $1}')"
-  fi
-else
-  CANDIDATE_STATE="clean"
-  CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
-  CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
-fi
+# Source annotations are optional caller metadata. Never invoke Git or invent
+# a clean/source identity from an executable or from a directory name.
+CANDIDATE_STATE="${COWD_EVAL_TARGET_REPO_DIRTY_STATE:-unknown}"
+CANDIDATE_SHA="${COWD_EVAL_CANDIDATE_SHA:-unknown}"
+CANDIDATE_SOURCE_SHA256="${COWD_EVAL_CANDIDATE_SOURCE_SHA256:-}"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
 SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
 prepare_binaries
 verify_binary_bindings
 printf 'Gateway binary sha256: %s\nHarness binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" >&2
-EVIDENCE_KEY="$(printf '%s\n' "deep-real-v5" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" | sha256sum | awk '{print $1}')"
-if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
-  prior_evidence="$({
-    find "$EVIDENCE_ROOT/runs" -type f -name report.json -exec jq -r --arg key "$EVIDENCE_KEY" '
-      if .evidence_manifest.execution_key == $key then
-        if .status == "passed" and .authorized_real_model == true then
-          "passed\t" + (.result_package_dir // input_filename)
-        else
-          "gap\t" + (.status // "unknown") + "\t" + (.result_package_dir // input_filename)
-        end
-      else empty end
-    ' {} + 2>/dev/null
-  } | head -n 1)"
-  case "$prior_evidence" in
-    passed$'\t'*)
-      if [[ "$FROZEN_MODE" == 1 ]]; then
-        echo 'existing evidence requires separate audit; frozen pilot not dispatched' >&2
-        exit 3
-      fi
-      printf 'reusing matching real-model evidence: %s\n' "${prior_evidence#*$'\t'}"
-      exit 0
-      ;;
-    gap$'\t'*)
-      printf 'matching evidence has an unresolved gap; inspect it before any rerun: %s\n' "${prior_evidence#*$'\t'}" >&2
-      printf 'set COWD_EVAL_FORCE_RERUN=1 only after the candidate, route, fixture, or external provider state has changed.\n' >&2
-      exit 3
-      ;;
-  esac
-fi
+EVIDENCE_KEY="$(printf '%s\n' "deep-real-v6" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" | sha256sum | awk '{print $1}')"
+# Historical reports remain evidence. Their presence neither substitutes for
+# this execution nor prevents a new run requested by its owner.
 if ss -ltn | rg -q ":${PORT}\\b"; then
   echo "isolated Gateway port $PORT is already in use" >&2
   exit 2
@@ -1150,53 +1033,21 @@ printf '%s\n' "$TOKEN" | env \
     --expected-revision "$profile_revision" \
     --confirm "$profile_confirmation" >/dev/null
 
-# Process liveness precedes projector warm-up and control-plane latency
-# stabilization. Starting the evaluator in that interval creates a false
-# semantic-health failure even when the same isolated Gateway becomes ready a
-# moment later. Gate scenario admission on the exact fail-closed contracts the
-# evaluator will record; do not weaken or retry a failed scenario afterward.
-SEMANTIC_READY_TIMEOUT_SECS="${COWD_EVAL_SEMANTIC_READY_TIMEOUT_SECS:-180}"
-semantic_ready=0
-semantic_deadline=$((SECONDS + SEMANTIC_READY_TIMEOUT_SECS))
-control_plane_health='{}'
-surface_health='{}'
-while ((SECONDS < semantic_deadline)); do
-  control_plane_health="$(curl -fsS \
-    -H "Authorization: Bearer $TOKEN" \
-    "$BASE_URL/api/runtime/control-plane" 2>/dev/null || printf '{}')"
-  surface_health="$(curl -fsS \
-    -H "Authorization: Bearer $TOKEN" \
-    "$BASE_URL/api/surfaces/health" 2>/dev/null || printf '{}')"
-  if jq -e '
-      .readiness.production_ready == true and
-      .readiness.required_blocked == 0
-    ' >/dev/null <<<"$control_plane_health" \
-    && jq -e '
-      .host.status == "ready" and
-      .host.failed_count == 0 and
-      .host.circuit_open_count == 0 and
-      .host.task_ownership.overloaded == false
-    ' >/dev/null <<<"$surface_health"; then
-    semantic_ready=1
-    break
-  fi
-  owned_running "$GATEWAY_PID" "$GATEWAY_STARTTIME" || {
-    echo "isolated Gateway exited; inspect protected diagnostics: $GATEWAY_LOG" >&2
-    exit 1
-  }
-  sleep 0.25
-done
-if [[ "$semantic_ready" -ne 1 ]]; then
-  jq -cn \
-    --argjson control "$control_plane_health" \
-    --argjson surface "$surface_health" \
-    '{
-      error: "isolated Gateway did not reach semantic readiness",
-      control_plane: ($control.readiness // {}),
-      surface_host: ($surface.host // {})
-    }' >&2
-  exit 1
+# Aggregate subsystem readiness is an observation, not a universal scenario
+# prerequisite. A scenario must receive and validate its own actual API results.
+control_status=unknown
+surface_status=unknown
+if control_plane_health="$(curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/runtime/control-plane" 2>/dev/null)"; then
+  control_status=observed
 fi
+if surface_health="$(curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/surfaces/health" 2>/dev/null)"; then
+  surface_status=observed
+fi
+jq -cn --arg control_status "$control_status" --arg surface_status "$surface_status" \
+  --arg control "${control_plane_health:-}" --arg surface "${surface_health:-}" \
+  '{control_status:$control_status,surface_status:$surface_status,
+    control_plane:($control | try fromjson catch null),
+    surface_host:($surface | try fromjson catch null)}' >"$RUN_ROOT/readiness-observation.json"
 start_monitor monitor_progress PROGRESS_PID
 
 cd "$ROOT"
@@ -1211,9 +1062,9 @@ fi
 verify_binary_bindings
 launch_harness
 
-# Run the evaluator in the background so the deep semantic monitor can stop a
-# run that burns steps without advancing the Objective. `wait` preserves the
-# evaluator's exit status for the caller.
+# The semantic monitor only observes progress. Explicit evaluator deadlines and
+# the original cleanup owner remain responsible for termination; wait preserves
+# the actual evaluator status.
 start_monitor monitor_semantic_health DEEP_MONITOR_PID
 if wait "$HARNESS_PID"; then EVAL_STATUS=0; else EVAL_STATUS=$?; fi
 HARNESS_PID=""

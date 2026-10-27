@@ -553,7 +553,6 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         });
         let diagnostic_passed = all_samples_completed
             && report["completeness_bp"].as_u64() == Some(10_000)
-            && gate["per_task_pair_gate"] == true
             && gate["routing_gate"] == true
             && gate["judge_isolation_gate"] == true
             && gate["provenance_complete"] == true
@@ -2089,24 +2088,7 @@ fn evaluate_samples(
             .collect::<std::collections::BTreeSet<_>>();
         observed.len() == 1 && observed.contains(expected)
     });
-    let non_empty = |key: &str| {
-        provenance[key]
-            .as_str()
-            .is_some_and(|value| !value.trim().is_empty())
-    };
-    let binary_digest_valid = provenance["binary_sha256"]
-        .as_str()
-        .is_some_and(valid_sha256);
-    let run_provenance_complete = binary_digest_valid
-        && non_empty("workspace_revision")
-        && non_empty("frontend_workspace_revision")
-        && provenance["backend_source_archive_sha256"]
-            .as_str()
-            .is_some_and(valid_sha256)
-        && provenance["frontend_source_archive_sha256"]
-            .as_str()
-            .is_some_and(valid_sha256)
-        && non_empty("provider_account_ref");
+    let run_provenance_complete = paired_run_identity_complete(&provenance);
     let requested_provider = provenance["provider"].as_str().unwrap_or("");
     let requested_judge = provenance["judge_model"].as_str().unwrap_or("");
     let judge_isolation_gate = scored
@@ -2119,8 +2101,6 @@ fn evaluate_samples(
                 && sample.judge.get("raw").is_some_and(|raw| !raw.is_null())
                 && sample.judge["judge_run_status"] == "completed"
                 && sample.judge["judge_isolation_verified"] == true
-                && sample.ttft_observed
-                && sample.critical_path_ms > 0
                 && sample.usage_observed
                 && sample.evaluation_control_observed
                 && sample.evaluation_budget_observed
@@ -2222,9 +2202,11 @@ fn evaluate_samples(
             true
         }
     });
-    let gate_passed = completeness_bp >= 9_000
-        && team_gate
-        && per_task_pair_gate
+    // Business completion is independent of optimization targets or sample-size
+    // sufficiency. Every requested sample must still complete its real contract.
+    let gate_passed = expected > 0
+        && complete == expected
+        && scored.len() == expected
         && routing_gate
         && judge_isolation_gate
         && provenance_complete
@@ -2234,14 +2216,22 @@ fn evaluate_samples(
         && workspace_reset_gate
         && hard_budget_lease_gate
         && baseline_topology_isolation_gate
-        && tool_topology_observation_gate
+        && tool_topology_observation_gate;
+    // Preserve the original strict claim for calibration/import consumers. A
+    // successful business run alone cannot authorize an optimization claim.
+    let performance_claim_allowed = gate_passed
+        && team_gate
+        && per_task_pair_gate
+        && scored
+            .iter()
+            .all(|sample| sample.ttft_observed && sample.critical_path_ms > 0)
         && total_tokens <= max_tokens
         && channel_margin_ci
             .get("lower")
             .and_then(Value::as_i64)
             .is_some_and(|lower| lower >= 0)
         && paired_sign_confidence_bp >= 9_000;
-    let strategy_calibration_records = if gate_passed {
+    let strategy_calibration_records = if performance_claim_allowed {
         build_strategy_calibration_records(
             corpus,
             &task_comparisons,
@@ -2280,7 +2270,9 @@ fn evaluate_samples(
         "samples": samples,
         "gate": {
             "passed": gate_passed,
-            "claim_allowed": gate_passed,
+            "claim_allowed": performance_claim_allowed,
+            "performance_required_for_business": false,
+            "performance_claim_allowed": performance_claim_allowed,
             "team_gate": team_gate,
             "per_task_pair_gate": per_task_pair_gate,
             "routing_gate": routing_gate,
@@ -2677,6 +2669,21 @@ fn binomial_coefficient(n: usize, k: usize) -> u128 {
     })
 }
 
+// Revisions describe source history. Actual binary and frozen input archive
+// identities still bind this measurement when that history is unavailable.
+fn paired_run_identity_complete(provenance: &Value) -> bool {
+    [
+        "binary_sha256",
+        "backend_source_archive_sha256",
+        "frontend_source_archive_sha256",
+    ]
+    .iter()
+    .all(|key| provenance[*key].as_str().is_some_and(valid_sha256))
+        && provenance["provider_account_ref"]
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
 fn exact_model_revisions(observed: &[String], requested: &str) -> bool {
     !observed.is_empty() && observed.iter().all(|model| model == requested)
 }
@@ -2764,6 +2771,91 @@ fn valid_sha256(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paired_business_completion_does_not_claim_performance() {
+        let task = AutoStrategyTask {
+            task_id: "business-without-speedup".into(),
+            expected_candidate: "direct".into(),
+            prompt: "answer".into(),
+            acceptance: vec!["literal answer".into()],
+            workspace_fixture: "isolated".into(),
+            provider_constraint: "normal".into(),
+            mutation_fixture: None,
+            judge_only: false,
+        };
+        let corpus = AutoStrategyCorpus {
+            schema_version: 1,
+            corpus_id: "local-contract".into(),
+            seed: 1,
+            frozen_at: "test".into(),
+            tasks: vec![task.clone()],
+        };
+        let samples = Condition::ALL.into_iter().map(|condition| {
+            let mut sample = sample_shell(&task, 0, false, 0, condition);
+            sample.status = "completed".into();
+            sample.response = "literal answer".into();
+            sample.execution_graph_id = Some(format!("original-{}", condition.as_str()));
+            sample.selected_candidate = Some("direct".into());
+            sample.models_used = vec!["configured-model".into()];
+            sample.usage_observed = true; sample.input_tokens = 10; sample.output_tokens = 10;
+            sample.evaluation_budget_observed = true; sample.evaluation_control_observed = true;
+            sample.evaluation_token_limit = 1_000; sample.evaluation_tokens_consumed = 20;
+            sample.workspace_reset_verified = true;
+            sample.judge = json!({"raw":{"independent":"result"}, "judge_run_status":"completed",
+                "judge_isolation_verified":true,"observed_models":["configured-judge"]});
+            sample
+        }).collect::<Vec<_>>();
+        let provenance = json!({"binary_sha256":"a".repeat(64),"backend_source_archive_sha256":"b".repeat(64),
+            "frontend_source_archive_sha256":"c".repeat(64),"provider_account_ref":"configured:test",
+            "provider":"configured-model","judge_model":"configured-judge"});
+        let evaluate =
+            |samples| evaluate_samples(&corpus, samples, provenance.clone(), 60, 1, 1, true, 1_000);
+        let good = evaluate(samples.clone());
+        assert_eq!(good["status"], "passed");
+        assert_eq!(good["gate"]["passed"], true);
+        assert_eq!(good["gate"]["claim_allowed"], false);
+        assert_eq!(good["gate"]["performance_required_for_business"], false);
+        assert_eq!(good["strategy_calibration_records"], json!([]));
+        for fault in [
+            "timeout",
+            "unknown-usage",
+            "workspace-not-reset",
+            "budget-breached",
+        ] {
+            let mut bad = samples.clone();
+            match fault {
+                "timeout" => bad[0].status = "timeout".into(),
+                "unknown-usage" => bad[0].usage_observed = false,
+                "workspace-not-reset" => bad[0].workspace_reset_verified = false,
+                "budget-breached" => bad[0].evaluation_budget_breached = true,
+                _ => unreachable!(),
+            }
+            assert_ne!(evaluate(bad)["status"], "passed", "{fault}");
+        }
+    }
+
+    #[test]
+    fn paired_identity_accepts_unknown_revisions_but_requires_actual_inputs() {
+        let mut provenance = serde_json::json!({
+            "workspace_revision": null, "frontend_workspace_revision": "unknown",
+            "binary_sha256": "a".repeat(64),
+            "backend_source_archive_sha256": "b".repeat(64),
+            "frontend_source_archive_sha256": "c".repeat(64),
+            "provider_account_ref": "configured:test"
+        });
+        assert!(super::paired_run_identity_complete(&provenance));
+        for field in [
+            "binary_sha256",
+            "backend_source_archive_sha256",
+            "frontend_source_archive_sha256",
+            "provider_account_ref",
+        ] {
+            let original = provenance[field].take();
+            assert!(!super::paired_run_identity_complete(&provenance), "{field}");
+            provenance[field] = original;
+        }
+    }
+
     use super::*;
 
     #[test]

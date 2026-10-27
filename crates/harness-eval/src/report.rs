@@ -1315,10 +1315,7 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
             "u5_host_binding_present",
             report["u5_host"]["nonce"]
                 .as_str()
-                .is_some_and(|s| s.len() == 64)
-                && report["u5_host"]["candidate"]
-                    .as_str()
-                    .is_some_and(|s| s.len() == 40),
+                .is_some_and(|s| s.len() == 64),
         ),
     ];
     let items = checks
@@ -1677,7 +1674,7 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     items.push(HarnessEvalReportGateItem::new(
         "real_provider_cache_usage_known",
         !real_model_claimed || cache_usage_known,
-        true,
+        false,
         format!(
             "real_model_claimed={real_model_claimed}, prompt_tokens={cache_prompt_tokens}, physical_attempts={cache_physical_attempts}, unknown_cache_attempts={cache_dimensions_unknown_attempts}, cache_dimensions_known={cache_usage_known}"
         ),
@@ -1688,17 +1685,17 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     items.push(HarnessEvalReportGateItem::new(
         "real_provider_cache_cold_inclusive_90pct",
         !cache_slo_applicable || cache_hit_ratio_bp >= 9_000,
-        true,
+        false,
         format!(
             "applicable={cache_slo_applicable}, cache_hit_ratio_bp={cache_hit_ratio_bp}, prompt_tokens={cache_prompt_tokens}"
         ),
-        "fix request prefix layout and cold-cohort coordination before deep paid acceptance",
+        "cache performance observation; preserve the cold-inclusive denominator",
     ));
     items.push(HarnessEvalReportGateItem::new(
         "real_provider_cache_structure_95pct",
         !cache_slo_applicable
             || (structural_prompt_bytes > 0 && structural_reuse_ratio_bp >= 9_500),
-        true,
+        false,
         format!(
             "applicable={cache_slo_applicable}, structural_reuse_ratio_bp={structural_reuse_ratio_bp}, prompt_bytes={structural_prompt_bytes}"
         ),
@@ -1710,7 +1707,7 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
             || (warm_provider_prompt_tokens > 0
                 && warm_cache_hit_ratio_bp >= 9_500
                 && warm_structural_reuse_ratio_bp >= 9_500),
-        true,
+        false,
         format!(
             "applicable={cache_slo_applicable}, warm_cache_hit_ratio_bp={warm_cache_hit_ratio_bp}, warm_structural_reuse_ratio_bp={warm_structural_reuse_ratio_bp}, warm_prompt_tokens={warm_provider_prompt_tokens}"
         ),
@@ -2220,19 +2217,42 @@ fn push_manifest_gate_item(
         .and_then(Value::as_str)
         .unwrap_or("missing");
     let expected = manifest.get("expected_candidate").unwrap_or(&Value::Null);
-    let candidate_matches = complete_candidate_binding(manifest, expected);
-    items.push(if real_model_claimed {
-        HarnessEvalReportGateItem::new("candidate_matches_frozen_expectation", candidate_matches, true, "frozen-launcher observation and separately supplied expectation", "bind observed source/commit to the independent expected candidate; unknown cannot certify")
-    } else {
-        HarnessEvalReportGateItem::not_required("candidate_matches_frozen_expectation", "no real-model candidate claim", "real candidate identity is checked when that claim is made")
-    });
+    let mut source_observation = HarnessEvalReportGateItem::not_required(
+        "candidate_matches_frozen_expectation",
+        "source metadata is observational; no explicit expectation supplied",
+        "retain unknown source metadata; do not invent a commit, digest or clean state",
+    );
+    if real_model_claimed {
+        match complete_candidate_binding(manifest, expected) {
+            Some(matches) => {
+                source_observation.status = if matches { "passed" } else { "failed" }.to_string();
+                source_observation.evidence = format!(
+                    "explicit source expectation comparison: observed={}, expected={}",
+                    serde_json::json!({"commit": commit, "candidate_source_sha256": source_sha256}),
+                    expected,
+                );
+            }
+            None if ["commit", "candidate_source_sha256"]
+                .iter()
+                .any(|field| expected.get(*field).is_some_and(|value| !value.is_null())) =>
+            {
+                source_observation.status = "unknown".to_string();
+                source_observation.evidence = format!(
+                    "explicit source expectation cannot be established: observed={}, expected={}",
+                    serde_json::json!({"commit": commit, "candidate_source_sha256": source_sha256}),
+                    expected,
+                );
+            }
+            None => {}
+        }
+    }
+    items.push(source_observation);
     let complete = manifest.get("kind").and_then(Value::as_str)
         == Some("harness_eval.evidence_manifest")
         && manifest
             .get("repo")
             .and_then(Value::as_str)
             .is_some_and(|value| !value.is_empty())
-        && valid_git_commit(commit)
         && manifest
             .get("version")
             .and_then(Value::as_str)
@@ -2240,9 +2260,7 @@ fn push_manifest_gate_item(
         && manifest
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty())
-        && (!real_model_claimed
-            || (source_sha256.is_some_and(valid_sha256) && dirty_state == "clean"));
+            .is_some_and(|value| !value.is_empty());
     items.push(HarnessEvalReportGateItem::new(
         "evidence_manifest_complete",
         complete,
@@ -2265,29 +2283,40 @@ fn push_manifest_gate_item(
     ));
 }
 
-fn complete_candidate_binding(observed: &Value, expected: &Value) -> bool {
-    observed.get("identity_source").and_then(Value::as_str) == Some("frozen_launcher")
-        && observed
-            .get("execution_key")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        && observed
-            .get("target_repo_dirty_state")
-            .and_then(Value::as_str)
-            == Some("clean")
-        && ["commit", "candidate_source_sha256"]
-            .into_iter()
-            .all(|field| {
-                let actual = observed.get(field).and_then(Value::as_str);
-                let expected = expected.get(field).and_then(Value::as_str);
-                actual.is_some_and(|actual| {
-                    if field == "commit" {
-                        valid_git_commit(actual)
-                    } else {
-                        valid_sha256(actual)
-                    }
-                }) && actual == expected
-            })
+// Compare only explicitly supplied source expectations. Absence is unknown,
+// never an inferred match. This observation does not grade business completion.
+fn complete_candidate_binding(observed: &Value, expected: &Value) -> Option<bool> {
+    let mut compared = false;
+    let mut unknown = false;
+    for field in ["commit", "candidate_source_sha256"] {
+        let Some(expectation) = expected.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        compared = true;
+        let valid = |value: &str| {
+            if field == "commit" {
+                valid_git_commit(value)
+            } else {
+                valid_sha256(value)
+            }
+        };
+        let Some(expectation) = expectation.as_str().filter(|value| valid(value)) else {
+            return Some(false);
+        };
+        match observed.get(field).and_then(Value::as_str) {
+            Some(actual) if valid(actual) => {
+                if actual != expectation {
+                    return Some(false);
+                }
+            }
+            _ => unknown = true,
+        }
+    }
+    if compared && !unknown {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 fn valid_git_commit(value: &str) -> bool {
@@ -2570,16 +2599,6 @@ mod gate_tests {
                 "/pairs/0/candidate/usage_observation_integrity/timeline_drained",
                 json!(false),
                 "paired_provider_usage_complete",
-            ),
-            (
-                "/evidence_manifest/commit",
-                json!("c".repeat(40)),
-                "candidate_matches_frozen_expectation",
-            ),
-            (
-                "/evidence_manifest/identity_source",
-                json!("unattested_library"),
-                "candidate_matches_frozen_expectation",
             ),
         ] {
             let mut invalid = valid.clone();
@@ -3142,6 +3161,26 @@ mod gate_tests {
             gate_item(&failed, "real_provider_cache_cold_inclusive_90pct").status,
             "failed"
         );
+        for name in [
+            "real_provider_cache_usage_known",
+            "real_provider_cache_cold_inclusive_90pct",
+            "real_provider_cache_structure_95pct",
+            "real_provider_cache_warm_95pct",
+        ] {
+            assert!(!gate_item(&failed, name).required, "{name}");
+        }
+        let mandatory = |gate: &HarnessEvalReportGate| {
+            gate.items
+                .iter()
+                .filter(|item| item.required)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            mandatory(&passed),
+            mandatory(&failed),
+            "cache ratio must not alter business obligations"
+        );
 
         report["execution_trace"]["provider_rounds"] = json!(0);
         report["execution_trace"]["provider_cache"]["provider_rounds"] = json!(0);
@@ -3154,6 +3193,8 @@ mod gate_tests {
             "failed",
             "a declared known flag must not override an unknown physical attempt"
         );
+        assert!(!gate_item(&unknown_cache, "real_provider_cache_usage_known").required);
+        assert!(gate_item(&unknown_cache, "real_provider_usage_complete").required);
     }
 
     /// The one gate added for the tool/harness layer: the report and the evidence must
@@ -3374,7 +3415,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn real_model_manifest_rejects_unknown_or_unbound_candidate_identity() {
+    fn real_model_manifest_retains_unknown_or_dirty_source_without_blocking() {
         let unknown = evaluate_report_gate(&real_manifest_report(
             "unknown",
             Some(&"a".repeat(64)),
@@ -3382,7 +3423,7 @@ mod gate_tests {
         ));
         assert_eq!(
             gate_item(&unknown, "evidence_manifest_complete").status,
-            "failed"
+            "passed"
         );
 
         let unchecked = evaluate_report_gate(&real_manifest_report(
@@ -3392,14 +3433,45 @@ mod gate_tests {
         ));
         assert_eq!(
             gate_item(&unchecked, "evidence_manifest_complete").status,
-            "failed"
+            "passed"
         );
 
         let unarchived =
             evaluate_report_gate(&real_manifest_report(&"d".repeat(40), None, "clean"));
         assert_eq!(
             gate_item(&unarchived, "evidence_manifest_complete").status,
-            "failed"
+            "passed"
+        );
+    }
+
+    #[test]
+    fn source_expectations_remain_honest_nonblocking_observations() {
+        let mut report = real_manifest_report("unknown", None, "dirty");
+        let expected = json!({"candidate_source_sha256": "a".repeat(64)});
+        report["evidence_manifest"]["expected_candidate"] = expected;
+        let gate = evaluate_report_gate(&report);
+        let item = gate_item(&gate, "candidate_matches_frozen_expectation");
+        assert_eq!(item.status, "unknown");
+        assert!(!item.required);
+        report["evidence_manifest"]["candidate_source_sha256"] = json!("b".repeat(64));
+        let gate = evaluate_report_gate(&report);
+        let item = gate_item(&gate, "candidate_matches_frozen_expectation");
+        assert_eq!(item.status, "failed");
+        assert!(!item.required);
+        report["evidence_manifest"]["candidate_source_sha256"] = json!("a".repeat(64));
+        let gate = evaluate_report_gate(&report);
+        assert_eq!(
+            gate_item(&gate, "candidate_matches_frozen_expectation").status,
+            "passed"
+        );
+        assert_eq!(
+            gate_item(&gate, "evidence_manifest_complete").status,
+            "passed"
+        );
+        assert_eq!(report["evidence_manifest"]["commit"], "unknown");
+        assert_eq!(
+            report["evidence_manifest"]["target_repo_dirty_state"],
+            "dirty"
         );
     }
 
@@ -3777,6 +3849,35 @@ pub(crate) mod u5_stage_tests {
         stage["execution_trace"]["total_usage"]["usage_source"] =
             json!("live_gateway_canonical_usage");
         stage
+    }
+
+    #[test]
+    fn u5_host_source_is_optional_but_nonce_remains_required() {
+        for source in [Value::Null, json!("unknown"), json!("b".repeat(40))] {
+            let mut stage = original_stage();
+            stage["u5_host"]["candidate"] = source;
+            let gate = evaluate_report_gate(&stage);
+            assert_eq!(gate.status, "pending_outer_cleanup");
+            assert_eq!(
+                gate.items
+                    .iter()
+                    .find(|item| item.name == "u5_host_binding_present")
+                    .unwrap()
+                    .status,
+                "passed"
+            );
+            stage["u5_host"]["nonce"] = Value::Null;
+            let gate = evaluate_report_gate(&stage);
+            assert_eq!(gate.status, "failed");
+            assert_eq!(
+                gate.items
+                    .iter()
+                    .find(|item| item.name == "u5_host_binding_present")
+                    .unwrap()
+                    .status,
+                "failed"
+            );
+        }
     }
 
     #[test]

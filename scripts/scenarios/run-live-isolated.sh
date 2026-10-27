@@ -87,8 +87,7 @@ cleanup() {
       echo "failed to drop fresh eval database: $DB_NAME; run owner must reconcile cleanup" >&2
     fi
     if [[ -n "${WORKSPACE_DIR:-}" && -d "$WORKSPACE_DIR" ]]; then
-      git -C "$ROOT" worktree remove --force "$WORKSPACE_DIR" >/dev/null 2>&1 \
-        || rm -rf "$WORKSPACE_DIR"
+      rm -rf -- "$WORKSPACE_DIR"
       echo "removed isolated workspace: $WORKSPACE_DIR" >&2
     fi
   fi
@@ -109,17 +108,23 @@ else
   echo "reusing retained eval database: $DB_NAME" >&2
 fi
 
-# Each run works in its own checkout so generated artifacts never pollute the
-# candidate repository and every run's process content stays in one folder for
-# troubleshooting. A git worktree is a full checkout, so scenarios that read
-# repository source still work while their writes stay isolated.
+# Copy the actual source inputs, including local edits, into an owned workspace.
+# Git metadata/trust and a clean checkout are not execution prerequisites.
 WS_ROOT="${COWD_EVAL_WORKSPACE_ROOT:-/tmp/cowd-eval-workspaces}"
 WORKSPACE_DIR="$WS_ROOT/$DB_NAME"
 mkdir -p "$WS_ROOT"
 export COWD_EVAL_WORKSPACE="$WORKSPACE_DIR"
 if [[ ! -d "$WORKSPACE_DIR" ]]; then
-  if ! git -C "$ROOT" worktree add --detach "$WORKSPACE_DIR" HEAD >/dev/null 2>&1; then
-    echo "failed to create isolated worktree at $WORKSPACE_DIR" >&2
+  mkdir -p "$WORKSPACE_DIR"
+  entries=()
+  for entry in Cargo.toml Cargo.lock README.md AGENTS.md crates contracts scripts docs fixtures .cargo; do
+    [[ ! -e "$ROOT/$entry" ]] || entries+=("$entry")
+  done
+  [[ "${#entries[@]}" -gt 0 ]] || { echo 'no source inputs for isolated workspace' >&2; exit 2; }
+  if ! (set -o pipefail; tar --exclude='*/target' --exclude='*/node_modules' --exclude='*/__pycache__' \
+      --exclude-vcs -C "$ROOT" -cf - "${entries[@]}" | tar -C "$WORKSPACE_DIR" -xf -); then
+    rm -rf -- "$WORKSPACE_DIR"
+    echo "failed to copy isolated workspace at $WORKSPACE_DIR" >&2
     exit 2
   fi
   echo "created isolated workspace: $WORKSPACE_DIR" >&2

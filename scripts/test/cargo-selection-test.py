@@ -329,9 +329,15 @@ mod b { #[test] #[ignore="COWD_AI_HARNESS_LIVE=1"] fn database() {} }
         self.assertEqual(paths, ["crates/owner/src/lib.rs", "crates/unrelated/src/moved file.rs"])
         self.assertEqual(self.plan(*paths)["packages"], ["consumer", "owner", "unrelated"])
 
-    def test_invalid_base_fails_closed(self):
-        with self.assertRaises(selection.NotStarted):
-            selection.changed_paths(self.root, "does-not-exist")
+    def test_invalid_base_selects_workspace_instead_of_blocking_tests(self):
+        self.assertEqual(selection.changed_paths(self.root, "does-not-exist"), ["Cargo.toml"])
+
+    def test_source_archive_needs_no_git_and_missing_git_selects_workspace(self):
+        before = selection.source_identity(self.root)
+        shutil.rmtree(self.root / ".git")
+        with patch.object(selection, "command", side_effect=FileNotFoundError("git")):
+            self.assertEqual(selection.source_identity(self.root), before)
+            self.assertEqual(selection.changed_paths(self.root, "HEAD"), ["Cargo.toml"])
 
     def test_untracked_file_with_spaces(self):
         (self.root / "crates/leaf/src/new file.rs").write_text("fn sample() {}")

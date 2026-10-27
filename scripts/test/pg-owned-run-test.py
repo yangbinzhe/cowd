@@ -73,7 +73,11 @@ class OwnerBoundary(unittest.TestCase):
                         owner.interrupted = signal.SIGTERM
                     owner.report["child_exit"] = 0 if mode == "exit_zero" else 101
                 with patch.object(owner, "start"), patch.object(owner, "run_child", side_effect=child), patch.object(owner, "op", side_effect=operation):
-                    self.assertNotEqual(owner.execute(), 0)
+                    result = owner.execute()
+                    if mode == "exit_zero":
+                        self.assertEqual(result, 0)
+                    else:
+                        self.assertNotEqual(result, 0)
                 self.assertEqual(present, {"container", "volume"})
                 self.assertIn("stop-owned", calls)
                 self.assertNotIn("remove-volume", calls)
@@ -247,7 +251,21 @@ class OwnerBoundary(unittest.TestCase):
             self.assertIn("foreign container ownership", owner.report["cleanup_errors"][0])
             self.assertEqual(calls, ["find-attempted-container", "inspect-container"])
 
-    def test_missing_growth_sample_cannot_be_promoted_to_full_pass(self):
+    def test_initial_growth_failure_does_not_prevent_child_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = self.owner(directory)
+            operation, calls, present = self.resources(owner)
+            def child():
+                owner.report["child_exit"] = 0
+            with patch.object(owner, "start", side_effect=owner.sample_before), patch.object(owner, "sql", side_effect=TimeoutError("growth-before timed out")), patch.object(owner, "run_child", side_effect=child) as run_child, patch.object(owner, "op", side_effect=operation):
+                self.assertEqual(owner.execute(), 0)
+                run_child.assert_called_once()
+            self.assertEqual(owner.report["execution_status"], "passed")
+            self.assertEqual(owner.report["diagnostics_status"], "incomplete")
+            self.assertNotIn("before", owner.report["samples"])
+            self.assertTrue(owner.report["volume_retained"])
+
+    def test_missing_growth_sample_is_separate_from_child_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             owner = self.owner(directory)
             def child():
@@ -255,10 +273,23 @@ class OwnerBoundary(unittest.TestCase):
             def cleanup():
                 owner.report["diagnostic_errors"].append("growth sample timed out")
             with patch.object(owner, "start"), patch.object(owner, "run_child", side_effect=child), patch.object(owner, "cleanup", side_effect=cleanup):
-                self.assertEqual(owner.execute(), 1)
+                self.assertEqual(owner.execute(), 0)
             report = json.loads(owner.args.report.read_text())
             self.assertEqual(report["child_exit"], 0)
-            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["status"], "acceptance_pending")
+            self.assertEqual(report["execution_status"], "passed")
+            self.assertEqual(report["diagnostics_status"], "incomplete")
+
+    def test_low_capacity_is_recorded_without_an_arbitrary_admission_threshold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = self.owner(directory)
+            owner.root = Path(directory)
+            from types import SimpleNamespace
+            with patch.object(module.shutil, "disk_usage", return_value=SimpleNamespace(free=1)):
+                owner.disk_sample(admission=True)
+                owner.disk_sample()
+            self.assertEqual(len(owner.report["disk_samples"]), 2)
+            self.assertTrue(all(value == 1 for value in owner.report["disk_samples"][0]["available_bytes"].values()))
 
 
 if __name__ == "__main__":

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Replay run one31's spinning signature against the deep monitor and prove the
-# escalation stops it.
+# repeated findings are recorded as advisory observations.
 #
 # Run one31 printed the same finding ten times across six minutes while the run
 # burned its whole window: the detector saw it, nothing counted it, and the
 # harness stop gate demanded an event silence the loop never produced. This
 # replay rebuilds that event shape in a disposable PostgreSQL (docker), runs the
 # monitor three times with a state file, and asserts the third report escalates
-# - the condition the harness now acts on.
+# - an observation that does not terminate the measured run.
 #
 # Usage:
 #   scripts/diagnostics/monitor-escalation-replay.sh
@@ -191,11 +191,11 @@ for round in 1 2 3; do
       echo "FAIL round 3: the confirmed repeat must escalate" >&2
       failures=$(( failures + 1 ))
     fi
-    # The harness stop condition, evaluated exactly as the scenario script does.
+    # Repeated findings remain visible without deciding business completion.
     if [[ "$state" == "SPINNING" && "$escalate" == "true" ]]; then
-      echo "round 3: harness stop path 1 fires (same finding, $repeat consecutive reports, no convergence)"
+      echo "round 3: advisory repeated finding (same finding, $repeat consecutive reports, no convergence)"
     else
-      echo "FAIL round 3: the harness stop condition did not fire" >&2
+      echo "FAIL round 3: the repeated finding was not observed" >&2
       failures=$(( failures + 1 ))
     fi
   fi

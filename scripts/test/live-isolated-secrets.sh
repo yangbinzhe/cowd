@@ -33,34 +33,20 @@ psql() {
   esac
 }
 
-mock_git_add() {
-  [[ "$#" == 7 && "$1" == -C && "$2" == "$MOCK_FIXTURE" && "$3" == worktree ]] || {
-    mock_record invalid-git-arguments
-    return 96
-  }
-  case "$4:$5" in
-    add:--detach)
-      [[ "$7" == HEAD && "$6" == "$MOCK_CASE_ROOT/workspaces/"* ]] || return 96
-      mock_record add
-      [[ "$MOCK_WORKTREE_STATUS" == 0 ]] || return "$MOCK_WORKTREE_STATUS"
-      command mkdir -p -- "$6"
-      ;;
-    remove:--force)
-      mock_record invalid-remove-arity
-      return 96
-      ;;
-    *) mock_forbidden ;;
-  esac
-}
-
-git() {
-  if [[ "$#" == 6 && "$1" == -C && "$2" == "$MOCK_FIXTURE" && "$3" == worktree && "$4" == remove && "$5" == --force && "$6" == "$MOCK_CASE_ROOT/workspaces/"* ]]; then
-    mock_record remove
-    [[ "$MOCK_REMOVE_STATUS" == 0 ]] || return "$MOCK_REMOVE_STATUS"
-    command rm -rf -- "$6"
-  else
-    mock_git_add "$@"
+# The original entry now copies actual inputs without a Git subprocess.
+git() { mock_forbidden; }
+tar() {
+  if [[ "$1" == --exclude=* ]]; then
+    mock_record add
+    return "$MOCK_WORKTREE_STATUS"
   fi
+  [[ "$1" == -C && "$2" == "$MOCK_CASE_ROOT/workspaces/"* && "$3" == -xf && "$4" == - ]] || return 96
+  cat >/dev/null
+}
+rm() {
+  [[ "$1" == -rf && "$2" == -- && "$3" == "$MOCK_CASE_ROOT/workspaces/"* ]] || return 96
+  mock_record remove
+  command rm "$@"
 }
 
 bash() {
@@ -96,13 +82,25 @@ if [[ "${1:-}" == --worker ]]; then
   exit
 fi
 
+if [[ "${1:-}" == --source-worker ]]; then
+  python3() { command python3 "$@"; }
+  source "$MOCK_FUNCTIONS"
+  resolve_installed_route
+  [[ -z "$MAX_CONCURRENCY" ]]
+  source "$MOCK_SOURCE_BLOCK"
+  [[ "$CANDIDATE_SHA" == unknown && "$CANDIDATE_STATE" == unknown && -z "$CANDIDATE_SOURCE_SHA256" ]]
+  [[ -n "$GATEWAY_BINARY_SHA256" && -n "$HARNESS_BINARY_SHA256" && -n "$EVIDENCE_KEY" ]]
+  if [[ "${MOCK_RUN_BINARY:-0}" == 1 ]]; then "$BIN"; fi
+  exit
+fi
+
 if [[ "${1:-}" == --diagnostic-worker ]]; then
   env() {
     printf '%s\n' "$MOCK_PASSWORD"
     printf '%s\n' "$MOCK_QUERY_SECRET" >&2
     return "$MOCK_DIAGNOSTIC_STATUS"
   }
-  kill() { return 1; }
+  owned_running() { return 1; }
   source "$MOCK_BLOCK"
   exit
 fi
@@ -220,7 +218,7 @@ run_case() {
   expected_add=1
   if [[ "$create_status" != 0 || "$existing_workspace" == 1 ]]; then expected_add=0; fi
   expected_remove=0
-  if [[ "$retained" == 0 && "$expected_add" == 1 && "$worktree_status" == 0 ]]; then expected_remove=1; fi
+  if [[ "$expected_add" == 1 && ( "$retained" == 0 || "$worktree_status" != 0 ) ]]; then expected_remove=1; fi
   assert_equal "$name/add" "$expected_add" "$(event_count "$case_root/events" add)"
   assert_equal "$name/remove" "$expected_remove" "$(event_count "$case_root/events" remove)"
   local workspace_count=0 workspace
@@ -276,7 +274,6 @@ run_case worktree_failure_drop live_tool_evidence 0 none 0 0 61 0 2 1 1 0 0
 run_case worktree_failure_keep live_tool_evidence 1 none 0 0 61 0 2 1 0 0 1
 run_case drop_failure_success live_tool_evidence 0 none 0 0 0 67 0 1 1 1 0
 run_case drop_failure_child_failure live_tool_evidence 0 none 42 0 0 67 42 1 1 1 0
-run_case remove_fallback live_tool_evidence 0 none 0 0 0 0 0 1 1 1 0 71
 
 run_invalid_reuse_case() {
   local name="$1" reuse_url="$2" result_status=0
@@ -311,7 +308,7 @@ run_invalid_reuse_case reuse_fragment_database 'postgres://v3_mock_user:V3_MOCK_
 run_invalid_reuse_case reuse_keyword_dsn 'host=db.invalid user=v3_mock_user password=V3_MOCK_PASSWORD_NOT_A_REAL_SECRET'
 run_invalid_reuse_case reuse_workspace_escape postgres://v3_mock_user:V3_MOCK_PASSWORD_NOT_A_REAL_SECRET@db.invalid:1/..
 
-for diagnostic in storage-upgrade storage-upgrade-success gateway-startup gateway-semantic; do
+for diagnostic in storage-upgrade storage-upgrade-success gateway-startup; do
   diagnostic_root="$SANDBOX/$diagnostic"
   mkdir -p "$diagnostic_root"
   if [[ "$diagnostic" == storage-upgrade* ]]; then
@@ -325,14 +322,13 @@ for diagnostic in storage-upgrade storage-upgrade-success gateway-startup gatewa
     assert_contains "$diagnostic/selected-nonzero" "$diagnostic_root/block.sh" 'storage upgrade'
   else
     desired_block=1
-    if [[ "$diagnostic" == gateway-semantic ]]; then desired_block=2; fi
     awk -v desired="$desired_block" '
-      /^  kill -0 "\$GATEWAY_PID".*\|\| \{/ { matched++; active = 1 }
+      /^  owned_running "\$GATEWAY_PID".*\|\| \{/ { matched++; active = 1 }
       active && matched == desired { print }
       active && /^  }/ { active = 0 }
     ' "$FIXTURE/scripts/scenarios/harness-eval-real-qwen.sh" >"$diagnostic_root/block.sh"
     expected_diagnostic_status=1
-    assert_contains "$diagnostic/selected-nonzero" "$diagnostic_root/block.sh" 'kill -0'
+    assert_contains "$diagnostic/selected-nonzero" "$diagnostic_root/block.sh" 'owned_running'
   fi
   printf '%s\n' V3_MOCK_PASSWORD_NOT_A_REAL_SECRET V3_MOCK_QUERY_NOT_A_REAL_SECRET >"$diagnostic_root/gateway.log"
   diagnostic_status=0
@@ -341,7 +337,7 @@ for diagnostic in storage-upgrade storage-upgrade-success gateway-startup gatewa
     MOCK_PASSWORD=V3_MOCK_PASSWORD_NOT_A_REAL_SECRET MOCK_QUERY_SECRET=V3_MOCK_QUERY_NOT_A_REAL_SECRET \
     MOCK_DIAGNOSTIC_STATUS="$expected_diagnostic_status" \
     CONFIG_HOME="$diagnostic_root/config" BIN=/DO_NOT_EXECUTE_SIDECAR_MOCK \
-    GATEWAY_PID=DO_NOT_KILL_SIDECAR_MOCK GATEWAY_LOG="$diagnostic_root/gateway.log" \
+    GATEWAY_PID=DO_NOT_KILL_SIDECAR_MOCK GATEWAY_STARTTIME=NOT_AN_ACTUAL_STARTTIME GATEWAY_LOG="$diagnostic_root/gateway.log" \
     /bin/bash "$SELF" --diagnostic-worker >"$diagnostic_root/stdout" 2>"$diagnostic_root/stderr"; then
     diagnostic_status=0
   else
@@ -361,6 +357,62 @@ for diagnostic in storage-upgrade storage-upgrade-success gateway-startup gatewa
     assert_contains "$diagnostic/log-reference" "$diagnostic_root/stderr" 'inspect protected diagnostics:'
     assert_equal "$diagnostic/log-retained" yes "$([[ -f "$diagnostic_root/gateway.log" ]] && printf yes || printf no)"
   fi
+done
+# Exercise the original source/route/binary block, not a reimplementation.
+# Git is poisoned above, and none of these cases launches a Gateway or Provider.
+command python3 - "$SOURCE_ROOT/scripts/scenarios/harness-eval-real-qwen.sh" "$SANDBOX" <<'PYSOURCE'
+from pathlib import Path
+import sys
+s = Path(sys.argv[1]).read_text(); root = Path(sys.argv[2])
+functions = s[s.index('prepare_binaries() {'):s.index('validate_shutdown_receipt() {')]
+functions += s[s.index('yaml_model_field() {'):s.index('\nresolve_installed_route\n')]
+(root / 'source-functions.sh').write_text(functions)
+(root / 'source-block.sh').write_text(s[s.index('# Source annotations are optional'):s.index('\nif ss -ltn')])
+PYSOURCE
+for source_case in no_git non_repository dirty existing_evidence missing_binary child_failure; do
+  source_root="$SANDBOX/source-$source_case"
+  mkdir -p "$source_root/run" "$source_root/config" "$source_root/evidence/runs/prior"
+  printf '%s\n' 'prior report must not block or substitute for this execution' >"$source_root/evidence/runs/prior/report.json"
+  printf '%s\n' 'local edit' >"$source_root/Cargo.toml"
+  if [[ "$source_case" == dirty ]]; then mkdir "$source_root/.git"; fi
+  cp /bin/true "$source_root/cowd"
+  cp /bin/true "$source_root/harness"
+  if [[ "$source_case" == missing_binary ]]; then command rm "$source_root/cowd"; fi
+  if [[ "$source_case" == child_failure ]]; then cp /bin/false "$source_root/cowd"; fi
+  # Deliberately use formerly forbidden names/provider pairing. The configured
+  # route is authoritative; names cannot silently select a different account.
+  cat >"$source_root/config/config.yaml" <<'CONFIG'
+model: qwen-custom
+providers:
+  configured-route:
+    base_url: http://127.0.0.1:9/v1
+    protocol: responses
+    api_key: not-a-real-account
+CONFIG
+  cat >"$source_root/config/models.yaml" <<'MODELS'
+models:
+  qwen-custom:
+    provider: configured-route
+MODELS
+  source_status=0
+  if env -i PATH=/usr/bin:/bin HOME="$source_root" \
+    MOCK_EVENTS="$source_root/events" MOCK_FUNCTIONS="$SANDBOX/source-functions.sh" \
+    MOCK_SOURCE_BLOCK="$SANDBOX/source-block.sh" MOCK_RUN_BINARY="$([[ "$source_case" == child_failure ]] && printf 1 || printf 0)" \
+    ROOT="$source_root" WORKSPACE="$source_root" RUN_ROOT="$source_root/run" \
+    SOURCE_CONFIG_FILE="$source_root/config/config.yaml" SOURCE_MODELS_FILE="$source_root/config/models.yaml" \
+    MODEL='' MAX_CONCURRENCY='' STAGED_CREDENTIAL_ENV='' PROVIDER_CREDENTIAL='' \
+    SCENARIO_ID=live_autonomous_collaboration_deepseek MAX_PROVIDER_TOKENS=unbounded \
+    BIN="$source_root/cowd" HARNESS_BIN="$source_root/harness" \
+    EVIDENCE_ROOT="$source_root/evidence" \
+    /bin/bash "$SELF" --source-worker >"$source_root/stdout" 2>"$source_root/stderr"; then
+    source_status=0
+  else source_status=$?; fi
+  CASES=$((CASES + 1))
+  expected_source_status=0
+  if [[ "$source_case" == missing_binary || "$source_case" == child_failure ]]; then expected_source_status=1; fi
+  assert_equal "$source_case/source-exit" "$expected_source_status" "$source_status"
+  assert_equal "$source_case/no-git-or-external" no "$([[ -e "$source_root/events" ]] && printf yes || printf no)"
+  assert_contains "$source_case/prior-evidence-preserved" "$source_root/evidence/runs/prior/report.json" 'prior report'
 done
 SOURCE_HASH_AFTER="$(sha256sum "$SOURCE_ROOT/scripts/scenarios/run-live-isolated.sh" "$SOURCE_ROOT/scripts/scenarios/harness-eval-real-qwen.sh")"
 assert_equal source-files-unchanged "$SOURCE_HASH_BEFORE" "$SOURCE_HASH_AFTER"

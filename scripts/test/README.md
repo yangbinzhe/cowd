@@ -16,8 +16,10 @@ scripts/validate.sh changed-crates
 所属 package 及 normal/dev/build/optional 反向消费者的传递闭包；不是只测文件所属
 crate。任意 Cargo manifest/lock、workspace 配置或无法映射的路径保守提升至全部
 workspace package。改名同时计入旧、新路径，删除文件仍按目录映射；无修改使用
-quick 集合，错误 base 显式失败。独立 `tests/interactive` 变化仍检查自己的 manifest。
+quick 集合；Git 不可用或 base 无法解析时退回全 workspace 选择，不阻止测试。独立 `tests/interactive` 变化仍检查自己的 manifest。
 APP 由独立仓库构建为签名 Bundle，不进入 Cowd 源码映射。
+
+源码指纹从实际文件读取，不依赖 Git 跟踪列表。Git 仅用于可选的变更范围优化。
 
 三个原入口共用 `cargo-selection.py`，不维护第二份 package/feature/target 清单。
 所有受影响 target 使用 `--all-features`，包括 manifest 声明的 required-features；

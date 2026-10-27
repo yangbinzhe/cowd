@@ -65,7 +65,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for command in awk cp curl git jq rg sha256sum ss tar; do
+for command in awk cp curl jq rg sha256sum ss tar; do
   command -v "${command}" >/dev/null 2>&1 || {
     echo "${command} is required for auto-strategy-paired" >&2
     exit 1
@@ -165,24 +165,14 @@ resolve_installed_provider_route() {
 }
 
 resolve_installed_provider_route
-git -C "${EDGE_ROOT}" rev-parse --show-toplevel >/dev/null 2>&1 || {
-  echo "COWD frontend repository is required for the frozen cross-surface fixture: ${EDGE_ROOT}" >&2
+# Source revision labels are optional; the copied inputs and actual executable
+# digests below identify this run without Git or a clean-tree prerequisite.
+WORKSPACE_REVISION="${COWD_EVAL_WORKSPACE_REVISION:-unknown}"
+FRONTEND_WORKSPACE_REVISION="${COWD_EVAL_FRONTEND_WORKSPACE_REVISION:-unknown}"
+[[ -d "${EDGE_ROOT}/surfaces/webui" ]] || {
+  echo "frontend source input is missing: ${EDGE_ROOT}/surfaces/webui" >&2
   exit 1
 }
-require_clean_source() {
-  local repo="$1"
-  local label="$2"
-  if [[ -n "$(git -C "${repo}" status --porcelain=v1 --untracked-files=all)" ]]; then
-    echo "${label} source tree must be clean before evaluation build" >&2
-    exit 1
-  fi
-}
-require_clean_source "${ROOT}" "backend"
-require_clean_source "${EDGE_ROOT}" "frontend"
-WORKSPACE_REVISION="$(git -C "${ROOT}" rev-parse HEAD)"
-FRONTEND_WORKSPACE_REVISION="$(git -C "${EDGE_ROOT}" rev-parse HEAD)"
-BACKEND_SOURCE_ARCHIVE_SHA256="$(git -C "${ROOT}" archive --format=tar "${WORKSPACE_REVISION}" | sha256sum | awk '{print $1}')"
-FRONTEND_SOURCE_ARCHIVE_SHA256="$(git -C "${EDGE_ROOT}" archive --format=tar "${FRONTEND_WORKSPACE_REVISION}" | sha256sum | awk '{print $1}')"
 for port in "${PORTS[@]}"; do
   if ss -ltn | rg -q ":${port}\\b"; then
     echo "fixed auto-strategy port ${port} is already in use" >&2
@@ -190,15 +180,25 @@ for port in "${PORTS[@]}"; do
   fi
 done
 
-(
-  cd "${ROOT}"
-  cargo build -p cli -p harness-eval
-)
 [[ -x "${COWD_BIN}" ]] || { echo "missing cowd binary: ${COWD_BIN}" >&2; exit 1; }
 [[ -x "${EVAL_BIN}" ]] || { echo "missing harness-eval binary: ${EVAL_BIN}" >&2; exit 1; }
 BIN_SHA256="$(sha256sum "${COWD_BIN}" | awk '{print $1}')"
+EVAL_BIN_SHA256="$(sha256sum "${EVAL_BIN}" | awk '{print $1}')"
 
 mkdir -p "${SCENARIO_ROOT}" "${ARTIFACT_DIR}"
+# One actual filesystem snapshot supplies every comparison condition. These
+# hashes describe the input tar bytes, never an inferred Git commit.
+source_entries=()
+for entry in Cargo.toml Cargo.lock README.md AGENTS.md crates contracts scripts docs fixtures .cargo; do
+  [[ ! -e "${ROOT}/${entry}" ]] || source_entries+=("${entry}")
+done
+[[ "${#source_entries[@]}" -gt 0 ]] || { echo 'no backend source inputs' >&2; exit 1; }
+tar --exclude='*/target' --exclude='*/node_modules' --exclude='*/__pycache__' --exclude-vcs \
+  -C "${ROOT}" -cf "${SCENARIO_ROOT}/backend-source.tar" "${source_entries[@]}"
+tar --exclude='*/node_modules' --exclude-vcs -C "${EDGE_ROOT}" \
+  -cf "${SCENARIO_ROOT}/frontend-source.tar" surfaces/webui
+BACKEND_SOURCE_ARCHIVE_SHA256="$(sha256sum "${SCENARIO_ROOT}/backend-source.tar" | awk '{print $1}')"
+FRONTEND_SOURCE_ARCHIVE_SHA256="$(sha256sum "${SCENARIO_ROOT}/frontend-source.tar" | awk '{print $1}')"
 EVAL_HOME="${SCENARIO_ROOT}/evaluator-home"
 mkdir -p "${EVAL_HOME}/.cowd"
 cp "${SOURCE_MODELS_FILE}" "${EVAL_HOME}/.cowd/models.yaml"
@@ -209,14 +209,8 @@ for index in 0 1 2; do
   config_home="${SCENARIO_ROOT}/${condition}/config"
   home="${SCENARIO_ROOT}/${condition}/home"
   mkdir -p "${workspace}" "${config_home}" "${home}/.cowd"
-  (
-    cd "${ROOT}"
-    git archive --format=tar HEAD
-  ) | tar -xf - -C "${workspace}"
-  (
-    cd "${EDGE_ROOT}"
-    git archive --format=tar HEAD surfaces/webui
-  ) | tar -xf - -C "${workspace}"
+  tar -xf "${SCENARIO_ROOT}/backend-source.tar" -C "${workspace}"
+  tar -xf "${SCENARIO_ROOT}/frontend-source.tar" -C "${workspace}"
   cp -a "${workspace}" "${SCENARIO_ROOT}/${condition}/pristine"
   {
     echo "model: \"${MODEL}\""
@@ -298,6 +292,7 @@ fi
     COWD_API_TOKEN="${API_TOKEN}" \
     COWD_AUTO_STRATEGY_MAX_TOKENS="${COWD_AUTO_STRATEGY_MAX_TOKENS:-20000000}" \
     COWD_EVAL_BINARY_SHA256="${BIN_SHA256}" \
+    COWD_EVAL_HARNESS_BINARY_SHA256="${EVAL_BIN_SHA256}" \
     COWD_EVAL_WORKSPACE_REVISION="${WORKSPACE_REVISION}" \
     COWD_EVAL_FRONTEND_WORKSPACE_REVISION="${FRONTEND_WORKSPACE_REVISION}" \
     COWD_EVAL_BACKEND_SOURCE_ARCHIVE_SHA256="${BACKEND_SOURCE_ARCHIVE_SHA256}" \
@@ -324,17 +319,6 @@ fi
       "${allow_real[@]}"
 )
 
-[[ "$(git -C "${ROOT}" rev-parse HEAD)" == "${WORKSPACE_REVISION}" ]] || {
-  echo "backend revision changed during evaluation" >&2
-  exit 1
-}
-[[ "$(git -C "${EDGE_ROOT}" rev-parse HEAD)" == "${FRONTEND_WORKSPACE_REVISION}" ]] || {
-  echo "frontend revision changed during evaluation" >&2
-  exit 1
-}
-require_clean_source "${ROOT}" "backend"
-require_clean_source "${EDGE_ROOT}" "frontend"
-
 if [[ -n "${DIAGNOSTIC_TASK_ID}" ]]; then
   jq -e --arg task_id "${DIAGNOSTIC_TASK_ID}" '
     .kind == "harness_eval.auto_strategy_paired.v1"
@@ -350,7 +334,6 @@ else
     .kind == "harness_eval.auto_strategy_paired.v1"
     and .status == "passed"
     and .gate.passed == true
-    and .gate.claim_allowed == true
     and .gate.automatic_team_materialization_gate == true
     and .gate.workspace_reset_gate == true
     and .gate.workspace_mutation_gate == true

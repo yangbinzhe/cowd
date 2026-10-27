@@ -115,7 +115,22 @@ def write_log(path, data, root=None):
 
 
 def source_identity(root):
-    paths = command(root, ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"]).split(b"\0")
+    # Tests also run from source archives and ordinary directories. Git's index
+    # and trust configuration are not prerequisites for measuring those bytes.
+    excluded = {".git", "target", "node_modules", "__pycache__", ".venv",
+                ".cowd-build", ".cowd-deps", ".cowd-test-evidence"}
+    paths = []
+    for directory, subdirs, files in os.walk(root, followlinks=False):
+        subdirs[:] = sorted(name for name in subdirs if name not in excluded)
+        for name in list(subdirs):
+            path = Path(directory) / name
+            if path.is_symlink():
+                paths.append(os.fsencode(path.relative_to(root)))
+                subdirs.remove(name)
+        for name in files:
+            if name == ".git" or name.endswith((".pyc", ".pyo")):
+                continue
+            paths.append(os.fsencode((Path(directory) / name).relative_to(root)))
     checksum = hashlib.sha256()
     for relative in sorted(set(paths) - {b""}):
         path = root / os.fsdecode(relative)
@@ -133,9 +148,15 @@ def source_identity(root):
 
 
 def changed_paths(root, base):
-    command(root, ["git", "rev-parse", "--verify", base + "^{commit}"])
-    paths = command(root, ["git", "diff", "--name-only", "--no-renames", "-z", base, "--"])
-    paths += command(root, ["git", "ls-files", "--others", "--exclude-standard", "-z"])
+    try:
+        command(root, ["git", "rev-parse", "--verify", base + "^{commit}"])
+        paths = command(root, ["git", "diff", "--name-only", "--no-renames", "-z", base, "--"])
+        paths += command(root, ["git", "ls-files", "--others", "--exclude-standard", "-z"])
+    except (NotStarted, FileNotFoundError):
+        # Changed-only selection is an optimization, not admission. Without a
+        # usable comparison, select the whole workspace rather than refuse tests.
+        print("Git change selection unavailable; selecting the whole workspace", file=sys.stderr)
+        return ["Cargo.toml"]
     return sorted(set(os.fsdecode(item) for item in paths.split(b"\0") if item))
 
 
