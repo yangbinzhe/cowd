@@ -266,6 +266,7 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
                 graph: graph.to_owned(),
                 deadline,
                 evidence_root: root.clone(),
+                role_store: Some(std::sync::Arc::new(R344RoleStore::open(deadline)?)),
             })?;
             if cancel_after_open {
                 let cancellation = observe_owned_active_cancel(
@@ -636,10 +637,14 @@ struct ProviderBinding {
     graph: String,
     deadline: Instant,
     evidence_root: PathBuf,
+    role_store: Option<std::sync::Arc<R344RoleStore>>,
 }
 
 struct ScriptRequest {
     body: Value,
+    raw_sha256: String,
+    lane: Option<R344Lane>,
+    ordinal: usize,
     reply: std::sync::mpsc::SyncSender<Result<Value, String>>,
 }
 
@@ -749,7 +754,7 @@ impl FiniteProvider {
                 let mut i = 0;
                 while i < pending.len() {
                     let current = script_binding.lock().unwrap().clone();
-                    let reply = state.reply(&pending[i].body, current.as_ref());
+                    let reply = r344_reply_bound(&mut state, &mut pending[i], current.as_ref());
                     match reply {
                         Ok(None) => i += 1,
                         Ok(Some(delta)) => {
@@ -797,6 +802,7 @@ impl FiniteProvider {
         for thread in self.threads.drain(..) {
             anyhow::ensure!(thread.join().is_ok(), "finite provider owner panicked");
         }
+        *self.binding.lock().unwrap() = None; // release read-only PG pool after all owners join
         self.ensure_healthy()
     }
 }
@@ -821,7 +827,7 @@ fn serve_script_request(
     socket.set_write_timeout(Some(Duration::from_secs(1)))?;
     let mut bytes = vec![];
     let read_deadline = Instant::now() + Duration::from_secs(3);
-    let body = loop {
+    let (body, raw_sha256) = loop {
         anyhow::ensure!(
             Instant::now() < read_deadline,
             "provider request read deadline"
@@ -865,7 +871,12 @@ fn serve_script_request(
                     bytes.len() == split + 4 + lengths[0],
                     "provider trailing input"
                 );
-                break serde_json::from_slice::<Value>(&bytes[split + 4..])?;
+                use sha2::{Digest, Sha256};
+                let raw = &bytes[split + 4..];
+                break (
+                    serde_json::from_slice::<Value>(raw)?,
+                    format!("{:x}", Sha256::digest(raw)),
+                );
             }
         }
     };
@@ -921,8 +932,14 @@ fn serve_script_request(
         return Ok(());
     }
     let (reply, response) = mpsc::sync_channel(1);
-    send.try_send(ScriptRequest { body, reply })
-        .map_err(|_| anyhow::anyhow!("finite provider queue bound"))?;
+    send.try_send(ScriptRequest {
+        body,
+        raw_sha256,
+        lane: None,
+        ordinal,
+        reply,
+    })
+    .map_err(|_| anyhow::anyhow!("finite provider queue bound"))?;
     let deadline = Instant::now() + Duration::from_secs(180);
     let delta = loop {
         if stop.load(Ordering::Acquire) {
@@ -968,6 +985,7 @@ fn serve_script_request(
 
 #[derive(Clone, Default)]
 struct RecoveryReplies {
+    proven_lane: Option<R344Lane>,
     router_used: bool,
     interpretation_used: bool,
     root: usize,
@@ -1268,35 +1286,19 @@ impl RecoveryReplies {
             self.interpretation_used = true;
             return Ok(Some(delta));
         }
-        let messages = body["messages"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("missing messages"))?;
-        // Synthesize/reviewer final text may expose no tools. All earlier
-        // business stages require actual schemas before even reading Program.
-        let requires_tool = if messages.iter().any(|m| {
-            m["role"] == "system"
-                && m["content"]
-                    .as_str()
-                    .is_some_and(|c| c.lines().any(|l| l == "R6_REVIEWER_LANE"))
-        }) {
-            self.reviewer < 7
-        } else {
-            self.root < 9
+        let lane = self
+            .proven_lane
+            .ok_or_else(|| anyhow::anyhow!("business request lacks proven lane"))?;
+        let requires_tool = match lane {
+            R344Lane::Producer => true,
+            R344Lane::Reviewer => self.reviewer < 7,
+            R344Lane::Root => self.root < 9,
         };
         anyhow::ensure!(
             !requires_tool || body["tools"].as_array().is_some_and(|v| !v.is_empty()),
             "R6 business stage has no exposed tool schemas"
         );
-        // Only the Definition's real system instructions choose a role. A
-        // quoted marker in a user message/tool result cannot choose authority.
-        let markers = ["R6_PRODUCER_LANE", "R6_REVIEWER_LANE"].map(|marker| {
-            messages
-                .iter()
-                .filter(|m| m["role"] == "system")
-                .filter_map(|m| m["content"].as_str())
-                .any(|content| content.lines().any(|line| line == marker))
-        });
-        anyhow::ensure!(!(markers[0] && markers[1]), "ambiguous Definition lane");
+        let markers = [lane == R344Lane::Producer, lane == R344Lane::Reviewer];
         if !markers[0] && !markers[1] && self.root == 0 {
             self.root = 1;
             return Ok(Some(scripted_tool(
@@ -2277,6 +2279,7 @@ fn r6_control_test_binding(root: &Path) -> anyhow::Result<ProviderBinding> {
         graph: "owned-graph".into(),
         deadline: Instant::now() + Duration::from_secs(5),
         evidence_root: root.into(),
+        role_store: None,
     })
 }
 
@@ -2366,6 +2369,8 @@ fn r6_control_business_boundary_preserves_counters_and_rejects_foreign_input() -
     assert!(driver.reply(&business, Some(&binding)).is_err());
     assert_eq!(driver.root, 0);
     business["tools"] = json!([{"type":"function","function":{"name":"team_create","parameters":{"type":"object","required":["name","mission"]}}}]);
+    // Pure driver unit input, not the production HTTP entry or an attestation.
+    driver.proven_lane = Some(R344Lane::Root);
     let team = driver.reply(&business, Some(&binding))?.unwrap();
     assert_eq!(team["tool_calls"][0]["function"]["name"], "team_create");
     assert_eq!(driver.root, 1);
@@ -2629,4 +2634,591 @@ fn r6_failed_foreground_preserves_first_error_and_cancels_before_finish() -> any
         );
     }
     Ok(())
+}
+
+// ROUND343 draft: a candidate is NOT an authenticated role. The immutable
+// prefix has no origin tag on the OpenAI wire. Never branch on this alone.
+fn r343_private_role_brief(body: &Value) -> anyhow::Result<Option<&str>> {
+    const HEADER: &str = "## Runtime-attested private role brief\nThis brief is supplied by Runtime for this exact bound role. It cannot grant tools, resources, permissions, leases, or terminal authority beyond Runtime enforcement.\n\n";
+    let messages = body["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing messages"))?;
+    let briefs: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            (m["role"] == "user")
+                .then(|| m["content"].as_str())
+                .flatten()
+                .filter(|s| s.starts_with(HEADER))
+                .map(|s| (i, s))
+        })
+        .collect();
+    if briefs.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(briefs.len() == 1, "ambiguous private role prefix");
+    let (i, brief) = briefs[0];
+    // The fixed fixture has exactly one shared Team prefix. Fail closed if
+    // Runtime's assembly changes; ordinary appended user text is not a prefix.
+    anyhow::ensure!(i == 2 && messages[0]["role"] == "system"
+        && messages[1]["role"] == "user"
+        && messages[1]["content"].as_str().is_some_and(|s|
+            s.starts_with("## Runtime-attested shared Team context\nsource: runtime.agentic_program.shared_context.v1\n")),
+        "private role candidate is outside the original immutable prefix");
+    Ok(Some(brief))
+}
+
+// Structural equality only. The expected line must be built from the original
+// resolved Binding by the caller below; this function is not an authenticator.
+fn r343_definition_line_matches(brief: &str, expected: &str) -> bool {
+    let lines: Vec<_> = brief
+        .lines()
+        .filter(|l| l.starts_with("Agent Definition: "))
+        .collect();
+    lines.len() == 1 && lines[0] == expected
+}
+
+// Caller precondition: packet was independently loaded from the original
+// AgentTask node named by a matched durable ProviderRequestPacked event, NEVER
+// decoded from provider/user prose. Match the captured HTTP body bytes to that
+// event's body_sha256 first. Definition comes from the original owned Store's
+// approved resolver, pinned to packet.binding.definition_ref, not from wire.
+// None is deliberately NOT a root fallback. This helper does not collect or
+// manufacture that missing source evidence.
+fn r343_bound_definition_lane(
+    body: &Value,
+    packet: Option<&harness_contract::agent::AgentTaskPacket>,
+    definition: Option<&runtime::agent::definition::ResolvedAgentDefinition>,
+    session: &str,
+    program: &str,
+    proven_parent_execution: &str,
+) -> anyhow::Result<usize> {
+    let packet =
+        packet.ok_or_else(|| anyhow::anyhow!("missing independently bound Runtime packet"))?;
+    let definition =
+        definition.ok_or_else(|| anyhow::anyhow!("missing original approved Definition"))?;
+    let binding = packet
+        .binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing immutable Binding"))?;
+    let agentic = packet
+        .agentic_binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing Agentic binding"))?;
+    binding.validate()?;
+    agentic.validate()?;
+    packet
+        .validate_cohort_prompt_package()
+        .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        !session.is_empty()
+            && !program.is_empty()
+            && !proven_parent_execution.is_empty()
+            && packet.session_id() == session
+            && packet.graph_id() == proven_parent_execution
+            && binding.data_lease.session_id == session
+            && agentic.program_id == program,
+        "foreign Runtime packet identity"
+    );
+    anyhow::ensure!(
+        definition.revision.revision_ref == binding.definition_ref
+            && definition.revision.content_digest == binding.definition_digest
+            && definition.agent_markdown.trim() == binding.instructions.trim(),
+        "Definition source does not match immutable Binding"
+    );
+    let (lane, name, marker) = match binding.definition_ref.definition_id.as_str() {
+        "workspace/recovery/producer" => (0, "producer", "R6_PRODUCER_LANE"),
+        "workspace/recovery/reviewer" => (1, "reviewer", "R6_REVIEWER_LANE"),
+        _ => anyhow::bail!("foreign R6 Definition"),
+    };
+    let instructions = format!(
+        "# R6 {name}\n\nPerform only the claimed bounded Task and acquire its real evidence.\n{marker}"
+    );
+    anyhow::ensure!(
+        binding.definition_ref.revision == 1 && binding.instructions.trim() == instructions,
+        "not the fixed released R6 Definition revision/content"
+    );
+    let brief = r343_private_role_brief(body)?
+        .ok_or_else(|| anyhow::anyhow!("bound Agent request lacks its private role prefix"))?;
+    let definition_line = format!(
+        "Agent Definition: {}@{} (binding {}).",
+        binding.definition_ref.definition_id.as_str(),
+        binding.definition_ref.revision,
+        binding.binding_id
+    );
+    anyhow::ensure!(
+        r343_definition_line_matches(brief, &definition_line)
+            && brief.contains(&format!("\n\nDefinition instructions:\n{instructions}\n\n"))
+            && brief.contains(&format!("\n\nObjective: {}\n\n", packet.objective))
+            && brief.contains(&format!(
+                "\n\nAuthorized resource scopes: {}.",
+                packet.resource_scopes.join(", ")
+            )),
+        "wire private brief differs from original Runtime packet"
+    );
+    Ok(lane)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R344Lane {
+    Root,
+    Producer,
+    Reviewer,
+}
+
+// Test-only private adapter. RuntimeReadiness registers/checks the existing
+// schema catalog; default_transaction_read_only additionally rejects any SQL
+// writes. No migrations, checkpoint writes, custom payload decoder or new API.
+struct R344RoleStore {
+    executor: storage::PostgresExecutor,
+    events: std::sync::Arc<runtime::RuntimeEventStore>,
+}
+impl R344RoleStore {
+    fn open(deadline: Instant) -> anyhow::Result<Self> {
+        anyhow::ensure!(Instant::now() < deadline, "role store absolute deadline");
+        let original = std::env::var("COWD_TEST_POSTGRES_URL")?;
+        let mut url = reqwest::Url::parse(&original)
+            .map_err(|_| anyhow::anyhow!("invalid owned PostgreSQL URL"))?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "postgres" | "postgresql")
+                && url.host_str() == Some("127.0.0.1"),
+            "role store requires owned loopback database"
+        );
+        let pairs: Vec<_> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let mut options = String::new();
+        url.set_query(None);
+        for (k, v) in pairs {
+            if k == "options" {
+                options.push_str(&v);
+                options.push(' ');
+            } else if k != "connect_timeout" {
+                url.query_pairs_mut().append_pair(&k, &v);
+            }
+        }
+        options.push_str(
+            "-c default_transaction_read_only=on -c statement_timeout=500 -c lock_timeout=200",
+        );
+        url.query_pairs_mut()
+            .append_pair("options", &options)
+            .append_pair("connect_timeout", "1");
+        let resolver =
+            storage::StaticSecretRefResolver::new([("r344-owned".into(), url.to_string())]);
+        let mut config = storage::PostgresConnectionConfig::new(
+            "r344-role-reader",
+            "r344-owned",
+            "r344-role-reader",
+        );
+        config.max_connections = 1;
+        config.min_idle_connections = Some(0);
+        config.checkout_timeout_ms = 500;
+        let executor = storage::PostgresExecutor::connect_with_migration_mode(
+            config,
+            &resolver,
+            storage::PostgresMigrationMode::RuntimeReadiness,
+        )
+        .map_err(|_| anyhow::anyhow!("owned read-only role-store connection failed"))?;
+        let events = std::sync::Arc::new(
+            runtime_postgres::PostgresRuntimeEventStore::new(executor.clone())?
+                .into_runtime_event_store(),
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "role store initialization deadline"
+        );
+        Ok(Self { executor, events })
+    }
+    fn graph(
+        &self,
+        id: &str,
+        deadline: Instant,
+    ) -> anyhow::Result<harness_contract::execution_graph::ExecutionGraph> {
+        anyhow::ensure!(Instant::now() < deadline, "packet read absolute deadline");
+        // Use the original store's public lookup normalization for both the
+        // budget precheck and replay (run: is not a second stream namespace).
+        let key = runtime::execution_core::graph::graph_id_for_lookup(id);
+        // Refuse an unexpectedly large stream BEFORE original store replay.
+        let mut conn = self.executor.checkout_online_read()?;
+        let row = conn.query_one("SELECT count(*)::BIGINT, COALESCE(sum(n),0)::BIGINT FROM (SELECT octet_length(payload::TEXT)::BIGINT AS n FROM runtime_events WHERE stream_id=$1 LIMIT 257) bounded", &[&key])?;
+        let count: i64 = row.try_get(0)?;
+        let bytes: i64 = row.try_get(1)?;
+        anyhow::ensure!(
+            count > 0 && count <= 256 && bytes <= 8 * 1024 * 1024,
+            "role graph stream bound"
+        );
+        drop(conn); // release the sole connection before original store checkout
+        // Fresh store prevents a previous request's hot snapshot becoming identity authority.
+        let graph =
+            runtime::execution_core::graph::ExecutionGraphStateStore::new(self.events.clone())
+                .load(id)?;
+        anyhow::ensure!(
+            Instant::now() < deadline && graph.id == key,
+            "packet read deadline/identity"
+        );
+        Ok(graph)
+    }
+}
+
+fn r344_unique_packed<'a>(
+    events: &'a [Value],
+    digest: &str,
+    session: &str,
+    turn: &str,
+    model: &Value,
+) -> anyhow::Result<&'a Value> {
+    anyhow::ensure!(
+        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid raw HTTP SHA"
+    );
+    let selected: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e["type"] == "context.provider_request_packed" && e["payload"]["body_sha256"] == digest
+        })
+        .collect();
+    anyhow::ensure!(
+        selected.len() == 1,
+        "missing or ambiguous original packed request"
+    );
+    let e = selected[0];
+    let p = &e["payload"];
+    anyhow::ensure!(
+        e["session_id"] == session
+            && e["sequence"].as_u64().is_some_and(|n| n > 0)
+            && e["event_id"].as_str().is_some_and(|s| !s.is_empty())
+            && p["schema_version"] == 5
+            && p["turn_id"] == turn
+            && &p["model"] == model
+            && p["execution_id"].as_str().is_some_and(|s| !s.is_empty())
+            && p["request_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "foreign/incomplete packed request"
+    );
+    Ok(e)
+}
+
+fn r344_prove_lane(request: &ScriptRequest, owner: &ProviderBinding) -> anyhow::Result<R344Lane> {
+    anyhow::ensure!(
+        Instant::now() < owner.deadline,
+        "role proof absolute deadline"
+    );
+    // Packed is committed BEFORE HTTP dispatch. Missing evidence is a failure,
+    // never a response-dependent wait or a fallback to the root lane.
+    let events = r6_session_events(&owner.client, &owner.base, &owner.session, owner.deadline)?;
+    let packed = r344_unique_packed(
+        &events,
+        &request.raw_sha256,
+        &owner.session,
+        &owner.turn,
+        &request.body["model"],
+    )?;
+    let execution = packed["payload"]["execution_id"].as_str().unwrap();
+    let store = owner
+        .role_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing private role-store owner"))?;
+    let mut graph = store.graph(execution, owner.deadline)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        anyhow::ensure!(seen.insert(graph.id.clone()), "cyclic role ancestry");
+        let lineage = graph
+            .lineage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing role lineage"))?;
+        anyhow::ensure!(
+            lineage.session_id == owner.session && lineage.turn_id == owner.turn,
+            "foreign role graph lineage"
+        );
+        if graph.id == owner.graph {
+            anyhow::ensure!(
+                r343_private_role_brief(&request.body)?.is_none(),
+                "root request cannot carry delegated private prefix"
+            );
+            private_record(
+                &owner
+                    .evidence_root
+                    .join(format!("r344-role-proof-{}.json", request.ordinal)),
+                &json!({"packed":packed,"raw_body_sha256":request.raw_sha256,"lane":"root","root_execution":owner.graph}),
+            )?;
+            return Ok(R344Lane::Root);
+        }
+        let parent = graph
+            .parent_execution
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("role request has no admitted root ancestry"))?
+            .clone();
+        let parent_graph = store.graph(&parent.execution_id, owner.deadline)?;
+        let node = parent_graph
+            .nodes
+            .iter()
+            .find(|n| n.id == parent.node_id)
+            .ok_or_else(|| anyhow::anyhow!("original parent node missing"))?;
+        if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
+            graph = parent_graph;
+            continue;
+        }
+        let packet: harness_contract::agent::AgentTaskPacket =
+            serde_json::from_str(&node.payload_ref)?;
+        anyhow::ensure!(
+            packet.graph_id() == parent_graph.id
+                && packet.node_id() == node.id
+                && parent_graph.recovery_cursor.node_attempts.get(&node.id)
+                    == Some(&packet.attempt),
+            "stale/foreign original AgentTask packet"
+        );
+        let program: runtime::AgenticProgramProjection =
+            serde_json::from_value(get_owned_json_recorded(
+                &owner.client,
+                &owner.base,
+                &format!(
+                    "/api/runtime/agentic/programs/root?session_id={}&turn_id={}",
+                    owner.session, owner.turn
+                ),
+                owner.deadline,
+                Some(&owner.evidence_root),
+            )?)?;
+        anyhow::ensure!(
+            program.session_id == owner.session
+                && program.turn_id == owner.turn
+                && program.root_execution_id.as_deref() == Some(owner.graph.as_str()),
+            "foreign root Program"
+        );
+        let agentic = packet
+            .agentic_binding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing Agentic binding"))?;
+        let (task_ref, expected_mode) = match &agentic.focus {
+            harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } => (
+                task_ref,
+                harness_contract::agent_action::AgentAttemptMode::Execute,
+            ),
+            harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } => (
+                task_ref,
+                harness_contract::agent_action::AgentAttemptMode::Review,
+            ),
+            _ => anyhow::bail!("unexpected R6 bound focus"),
+        };
+        let task = program
+            .tasks
+            .get(task_ref)
+            .ok_or_else(|| anyhow::anyhow!("foreign bound Task"))?;
+        let attempt = task
+            .active_attempts
+            .get(packet.graph_id())
+            .ok_or_else(|| anyhow::anyhow!("inactive bound Task attempt"))?;
+        let member = program
+            .memberships
+            .get(&agentic.membership_id)
+            .ok_or_else(|| anyhow::anyhow!("missing bound membership"))?;
+        anyhow::ensure!(
+            attempt.mode == expected_mode
+                && attempt.execution_id == packet.graph_id()
+                && attempt.agent_id == agentic.agent_id
+                && attempt.membership_id == agentic.membership_id
+                && member.agent_id == agentic.agent_id
+                && member.team_id == agentic.team_id,
+            "foreign Agent/membership attempt"
+        );
+        let bound = packet
+            .binding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing immutable Definition binding"))?;
+        let definitions = runtime::agent::definition::AgentDefinitionStore::new(
+            runtime::agent::definition::RegisteredAgentDefinitionLayout::new(
+                owner
+                    .evidence_root
+                    .join("config/runtime/builtin-definitions"),
+                owner.evidence_root.join("config/definitions"),
+                owner.evidence_root.join("workspace"),
+            )?,
+        );
+        let resolved = runtime::agent::definition::AgentDefinitionResolver::new(&definitions)
+            .resolve(
+                &bound.definition_ref.definition_id,
+                harness_contract::agent::RevisionSelector::ExactApprovedRevision {
+                    revision: bound.definition_ref.revision,
+                },
+            )?;
+        let lane = match r343_bound_definition_lane(
+            &request.body,
+            Some(&packet),
+            Some(&resolved),
+            &owner.session,
+            &program.program_id,
+            &parent_graph.id,
+        )? {
+            0 => R344Lane::Producer,
+            1 => R344Lane::Reviewer,
+            _ => unreachable!(),
+        };
+        // Store original evidence privately. This never creates Runtime truth.
+        private_record(
+            &owner
+                .evidence_root
+                .join(format!("r344-role-proof-{}.json", request.ordinal)),
+            &json!({"packed":packed,"raw_body_sha256":request.raw_sha256,"packet":packet,
+                "program":program,"definition_revision":resolved.revision,"lane":format!("{lane:?}")}),
+        )?;
+        anyhow::ensure!(Instant::now() < owner.deadline, "role proof deadline");
+        return Ok(lane);
+    }
+    anyhow::bail!("role ancestry depth bound")
+}
+
+fn r344_reply_bound(
+    state: &mut RecoveryReplies,
+    request: &mut ScriptRequest,
+    owner: Option<&ProviderBinding>,
+) -> anyhow::Result<Option<Value>> {
+    // The pre-admission, non-streaming TaskRouter control is its original strict
+    // no-tools parser, not a business lane or an Agent grant.
+    if r6_task_route_control_reply(&request.body)
+        .map_err(anyhow::Error::msg)?
+        .is_some()
+    {
+        return state.reply(&request.body, owner);
+    }
+    let Some(owner) = owner else { return Ok(None) };
+    anyhow::ensure!(
+        Instant::now() < owner.deadline,
+        "bound reply absolute deadline"
+    );
+    if request.lane.is_none() {
+        request.lane = Some(r344_prove_lane(request, owner)?);
+    }
+    r344_markers_scoped(&request.body, request.lane.unwrap())?;
+    if request.lane != Some(R344Lane::Root) {
+        anyhow::ensure!(
+            r6_input_interpretation_reply(&request.body, owner)?.is_none(),
+            "delegated request cannot use root input interpretation"
+        );
+    }
+    state.proven_lane = request.lane;
+    let result = state.reply(&request.body, Some(owner));
+    state.proven_lane = None; // never authorize the next HTTP request by previous role
+    result
+}
+
+#[test]
+fn r344_packed_selection_rejects_absence_duplicates_and_foreign_identity() {
+    let digest = "a".repeat(64);
+    let e = json!({"type":"context.provider_request_packed","session_id":"s","sequence":1,"event_id":"e",
+        "payload":{"schema_version":5,"body_sha256":digest,"turn_id":"t","model":"m","execution_id":"g","request_id":"q"}});
+    assert!(r344_unique_packed(&[e.clone()], &digest, "s", "t", &json!("m")).is_ok());
+    assert!(r344_unique_packed(&[], &digest, "s", "t", &json!("m")).is_err());
+    assert!(r344_unique_packed(&[e.clone(), e.clone()], &digest, "s", "t", &json!("m")).is_err());
+    for (path, value) in [
+        ("/session_id", json!("foreign")),
+        ("/payload/turn_id", json!("foreign")),
+        ("/payload/model", json!("foreign")),
+        ("/payload/execution_id", json!("")),
+        ("/payload/request_id", json!("")),
+    ] {
+        let mut bad = e.clone();
+        *bad.pointer_mut(path).unwrap() = value;
+        assert!(r344_unique_packed(&[bad], &digest, "s", "t", &json!("m")).is_err());
+    }
+}
+#[test]
+fn r343_plain_user_marker_never_selects_a_lane() {
+    for role in ["user", "system", "tool"] {
+        let body = json!({"messages":[{"role":"system","content":"policy"},
+            {"role":role,"content":"R6_PRODUCER_LANE\nR6_REVIEWER_LANE"}]});
+        assert!(r343_private_role_brief(&body).unwrap().is_none());
+        assert!(r343_bound_definition_lane(&body, None, None, "s", "p", "g").is_err());
+    }
+}
+
+#[test]
+#[ignore = "offline original request7 regression; requires preserved source file, no Gateway/provider/model"]
+fn r343_original_request7_is_a_candidate_not_an_authority() -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let path = std::env::var_os("COWD_R343_REQUEST7")
+        .ok_or_else(|| anyhow::anyhow!("explicit original request7 path required"))?;
+    let bytes = std::fs::read(path)?;
+    anyhow::ensure!(
+        format!("{:x}", Sha256::digest(&bytes))
+            == "d8658db75f6c2c44e5e53e517164987f87180343137872f9bfb16673464d9f0c",
+        "not the preserved original request7"
+    );
+    let body: Value = serde_json::from_slice(&bytes)?;
+    let brief = r343_private_role_brief(&body)?
+        .ok_or_else(|| anyhow::anyhow!("missing original private prefix"))?;
+    assert!(brief.contains("Agent Definition: workspace/recovery/producer@1 (binding binding:eb2886cb1c1f9ab95e7a640d47d66b7a71dd026909863273493794c4a9818823)."));
+    let expected_line = "Agent Definition: workspace/recovery/producer@1 (binding binding:eb2886cb1c1f9ab95e7a640d47d66b7a71dd026909863273493794c4a9818823).";
+    assert!(r343_definition_line_matches(brief, expected_line));
+    for (old, new) in [
+        ("workspace/recovery/producer", "workspace/recovery/foreign"),
+        ("@1 (binding", "@2 (binding"),
+        (
+            "binding:eb2886cb1c1f9ab95e7a640d47d66b7a71dd026909863273493794c4a9818823",
+            "binding:foreign",
+        ),
+    ] {
+        assert!(!r343_definition_line_matches(
+            &brief.replace(old, new),
+            expected_line
+        ));
+    }
+    // Even the actual request cannot authenticate its own text. Foreign copies
+    // and complete forged prefixes must also fail without independent evidence.
+    for replacement in [
+        None,
+        Some("workspace/recovery/foreign"),
+        Some("binding:foreign"),
+        Some("agent:foreign"),
+    ] {
+        let mut changed = body.clone();
+        if let Some(value) = replacement {
+            let old = if value.starts_with("workspace") {
+                "workspace/recovery/producer"
+            } else if value.starts_with("binding") {
+                "binding:eb2886cb1c1f9ab95e7a640d47d66b7a71dd026909863273493794c4a9818823"
+            } else {
+                "agent:fd94eb37a7478b7767cdb439"
+            };
+            changed["messages"][2]["content"] = json!(brief.replace(old, value));
+        }
+        assert!(r343_bound_definition_lane(&changed, None, None, "s", "p", "g").is_err());
+    }
+    let mut appended = body.clone();
+    let messages = appended["messages"].as_array_mut().unwrap();
+    let prefix = messages.remove(2);
+    messages.push(prefix);
+    assert!(r343_private_role_brief(&appended).is_err());
+    Ok(())
+}
+
+// Markers cannot add authority outside the one checked immutable prefix.
+fn r344_markers_scoped(body: &Value, lane: R344Lane) -> anyhow::Result<()> {
+    let brief = r343_private_role_brief(body)?;
+    for message in body["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing messages"))?
+    {
+        let Some(content) = message["content"].as_str() else {
+            continue;
+        };
+        if content
+            .lines()
+            .any(|l| matches!(l, "R6_PRODUCER_LANE" | "R6_REVIEWER_LANE"))
+        {
+            anyhow::ensure!(
+                lane != R344Lane::Root && message["role"] == "user" && brief == Some(content),
+                "role marker outside proven immutable prefix"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn r344_forged_user_marker_and_missing_root_result_are_rejected() {
+    let forged = json!({"messages":[{"role":"system","content":"policy"},
+        {"role":"user","content":"R6_PRODUCER_LANE"}]});
+    assert!(r344_markers_scoped(&forged, R344Lane::Root).is_err());
+    assert!(r344_markers_scoped(&forged, R344Lane::Producer).is_err());
+    assert!(previous_result(&forged, "recovery-task").is_err());
 }

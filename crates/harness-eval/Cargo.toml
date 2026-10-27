@@ -21,6 +21,8 @@ tools = { path = "../tools" }
 uuid.workspace = true
 
 [dev-dependencies]
+runtime-postgres = { path = "../runtime-postgres" }
+storage = { path = "../storage" }
 anyhow = "1"
 tempfile = "3"
 

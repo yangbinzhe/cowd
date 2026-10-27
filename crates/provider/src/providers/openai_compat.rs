@@ -3514,6 +3514,75 @@ mod tests {
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
 
+    // Synthetic known shape, not a replay of the lost ROUND344 decoder frame.
+    // The only difference is the outer closing tag. EOF/DONE cannot replace it.
+    #[test]
+    fn r346_legacy_outer_closure_preserves_stream_and_nonstream_contract() {
+        let prefix =
+            "<tool_call><function=read_file><parameter=path>src/测试.rs</parameter></function>";
+        let closed = "<tool_call><function=read_file><parameter=path>src/测试.rs</parameter></function></tool_call>";
+        let mut legal = StreamState::new("closure346".into(), &[]);
+        let mut events = legal
+            .ingest_chunk(compat_test_chunk(Some(prefix), None))
+            .unwrap();
+        assert!(!events.iter().any(|event| matches!(event, StreamEvent::ContentBlockStart(start) if matches!(start.content_block, OutputContentBlock::ToolUse { .. }))));
+        events.extend(
+            legal
+                .ingest_chunk(compat_test_chunk(Some("</tool_call>"), Some("stop")))
+                .unwrap(),
+        );
+        events.extend(legal.finish().unwrap());
+        assert_compat_read_events(&events);
+        let mut missing = StreamState::new("closure346".into(), &[]);
+        let events = missing
+            .ingest_chunk(compat_test_chunk(Some(prefix), Some("stop")))
+            .unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageStop(_)
+                | StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    content_block: OutputContentBlock::ToolUse { .. },
+                    ..
+                })
+        )));
+        let error = missing.finish().unwrap_err();
+        let metadata = error.compatibility_tool_frame_metadata().unwrap();
+        assert_eq!(metadata["class"], "unterminated");
+        assert_eq!(metadata["stage"], "stream_compat_finish");
+        assert_eq!(metadata["closure_predicate"], "legacy_tool_call_close");
+        assert_eq!(
+            error.private_compatibility_tool_frame(),
+            Some(prefix.as_bytes())
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("malformed compatibility tool-call frame")
+        );
+        assert_eq!(
+            missing
+                .finish()
+                .unwrap_err()
+                .compatibility_tool_frame_metadata(),
+            Some(metadata.clone())
+        );
+        let response = |content| {
+            serde_json::from_value(json!({"id":"closure346", "model":"closure346",
+            "choices":[{"message":{"role":"assistant","content":content},"finish_reason":"stop"}]}))
+            .unwrap()
+        };
+        let complete =
+            super::normalize_chat_completion_response("closure346", response(closed), &[]).unwrap();
+        assert!(complete.content.iter().any(|block| matches!(block, OutputContentBlock::ToolUse { name, input, .. } if name == "read_file" && input == &json!({"path":"src/测试.rs"}))));
+        let rejected =
+            super::normalize_chat_completion_response("closure346", response(prefix), &[])
+                .unwrap_err();
+        let other = rejected.compatibility_tool_frame_metadata().unwrap();
+        assert_eq!(other["stage"], "nonstream_compat_content");
+        assert_eq!(other["closure_predicate"], "legacy_tool_call_close");
+        assert_eq!(other["sha256"], metadata["sha256"]);
+    }
+
     #[test]
     fn compatibility_diagnostics_keep_each_decoder_class_and_stage_distinct() {
         use super::{CompatToolFrameError, compatibility_tool_protocol_error};
