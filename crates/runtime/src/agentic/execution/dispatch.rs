@@ -29,6 +29,21 @@ enum RetirementProgress {
     Pending,
 }
 
+// Test-only faults at the original registration-to-admission return boundary.
+// They never synthesize Graph events, attempts, Provider responses or exits.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RegistrationFault393 {
+    PostAppendObservation,
+    BeforeGraphCommit,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static REGISTRATION_FAULT_393: RegistrationFault393;
+    pub(super) static BEFORE_REGISTRATION_393: AgentActionEnvelope;
+}
+
 // Accounting prediction only. `ParentExecutionBudgetLedger::reserve_provider`
 // records overruns and borrowing but never rejects or shrinks an Agent model
 // request, so this estimate cannot become a business-execution budget gate.
@@ -1682,6 +1697,12 @@ impl RuntimeServices {
                         // model. Preserve it for the same graph factory.
                         continue;
                     }
+                    if attempt.mode == harness_contract::agent_action::AgentAttemptMode::Review {
+                        // No Graph/packet/local exit exists to settle. Preserve
+                        // this registration and let the original dispatcher
+                        // authenticate and admit that same unconsumed review.
+                        continue;
+                    }
                     "startup recovered an Agent attempt whose graph was never admitted"
                 }
                 Err(error) => return Err(error.to_string()),
@@ -1908,6 +1929,72 @@ impl RuntimeServices {
         Ok(receipts)
     }
 
+    /// A registered review is an outbox obligation, not evidence that its
+    /// Agent started. Only the exact current registration with no Graph history
+    /// may re-enter the original factory; every existing Graph keeps FlightBusy.
+    pub(super) async fn unadmitted_review_registration(
+        &self,
+        projection: &AgenticProgramProjection,
+        task: &AgenticTaskProjection,
+    ) -> Result<Option<AgenticTaskAttemptProjection>, String> {
+        use harness_contract::agent_action::AgentAttemptMode;
+        let mut reviews = task
+            .active_attempts
+            .values()
+            .filter(|attempt| attempt.mode == AgentAttemptMode::Review);
+        let Some(attempt) = reviews.next() else {
+            return Ok(None);
+        };
+        if reviews.next().is_some() {
+            return Err("agentic_review_registration_ambiguous".into());
+        }
+        if task.status != AgenticTaskStatus::Submitted
+            || attempt.generation != task.review_generation
+            || attempt.execution_id
+                != deterministic_graph_id(
+                    &projection.program_id,
+                    &task.task_id,
+                    &attempt.agent_id,
+                    DispatchMode::Review,
+                    task.review_generation,
+                )
+            || !eligible_members(projection, task, DispatchMode::Review)
+                .iter()
+                .any(|member| member.agent_id == attempt.agent_id)
+            || projection
+                .dispatch_team_id_for(&attempt.agent_id, task, true)
+                .is_none_or(|team| {
+                    attempt.membership_id
+                        != AgenticProgramProjection::membership_id(&attempt.agent_id, team)
+                })
+        {
+            return Err("agentic_review_registration_identity_mismatch".into());
+        }
+        match self
+            .graph_state_store()
+            .load_current_async(&attempt.execution_id)
+            .await
+        {
+            Ok(_) => Ok(None),
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                // A corrupt/unreadable recorded graph is never treated as a
+                // never-admitted invocation, nor does absence authorize an exit.
+                let revision = self
+                    .event_store()
+                    .stream_revision(&attempt.execution_id)
+                    .map_err(|error| format!("agentic_review_registration_history_read:{error}"))?;
+                if revision != 0 {
+                    return Err("agentic_review_registration_graph_history_present".into());
+                }
+                Ok(Some(attempt.clone()))
+            }
+            Err(error) => Err(format!(
+                "agentic_review_registration_graph_read:{}:{error}",
+                attempt.execution_id
+            )),
+        }
+    }
+
     pub(super) async fn dispatch_agentic_task(
         self: &Arc<Self>,
         projection: &AgenticProgramProjection,
@@ -2023,6 +2110,26 @@ impl RuntimeServices {
             None
         };
         let resumed = coordination_wake.and_then(|wake| wake.coordination.as_ref());
+        let review_resume = if mode == DispatchMode::Review {
+            self.unadmitted_review_registration(&availability, task)
+                .await?
+        } else {
+            None
+        };
+        let resumed_identity = resumed
+            .map(|resume| (resume.execution_id.as_str(), resume.agent_id.as_str()))
+            .or_else(|| {
+                review_resume
+                    .as_ref()
+                    .map(|resume| (resume.execution_id.as_str(), resume.agent_id.as_str()))
+            });
+        // Recompile unconsumed work from the current causal Program snapshot,
+        // keeping the original execution/member identity and current authority.
+        let projection = if review_resume.is_some() {
+            availability.as_ref()
+        } else {
+            projection
+        };
         if match mode {
             DispatchMode::Execute => !task_is_ready(&availability, task_ref),
             DispatchMode::Review => task.status != AgenticTaskStatus::Submitted,
@@ -2046,7 +2153,7 @@ impl RuntimeServices {
         let attempt_mode = mode.attempt_mode();
         if task.active_attempts.values().any(|attempt| {
             attempt.mode == attempt_mode
-                && resumed.is_none_or(|resume| resume.execution_id != attempt.execution_id)
+                && resumed_identity.is_none_or(|(execution, _)| execution != attempt.execution_id)
         }) {
             // An attempt for this very mode is already in flight, so a second
             // dispatch would be the duplicate the guard exists to prevent.
@@ -2091,7 +2198,7 @@ impl RuntimeServices {
         };
         let mut members = eligible_members(&availability, task, mode)
             .into_iter()
-            .filter(|member| resumed.is_none_or(|resume| resume.agent_id == member.agent_id))
+            .filter(|member| resumed_identity.is_none_or(|(_, agent)| agent == member.agent_id))
             .filter_map(|member| projection.agents.get(&member.agent_id))
             .collect::<Vec<_>>();
         let running_members = self
@@ -2102,8 +2209,8 @@ impl RuntimeServices {
                 || availability.tasks.values().any(|candidate| {
                     candidate.active_attempts.values().any(|attempt| {
                         attempt.agent_id == member.agent_id
-                            && resumed
-                                .is_none_or(|resume| resume.execution_id != attempt.execution_id)
+                            && resumed_identity
+                                .is_none_or(|(execution, _)| execution != attempt.execution_id)
                     }) || (candidate.status == AgenticTaskStatus::Claimed
                         && candidate.claimant.as_deref() == Some(member.agent_id.as_str()))
                 })
@@ -2543,7 +2650,7 @@ impl RuntimeServices {
                     member.agent_id
                 ),
                 actor: agentic_supervisor_actor(projection, Some(graph_id.clone())),
-                expected_revision: None,
+                expected_revision: (mode == DispatchMode::Review).then_some(availability.revision),
                 action: AgentAction::TaskAttemptDispatch(
                     harness_contract::agent_action::TaskAttemptDispatchInput {
                         task_ref: task_ref.to_string(),
@@ -2558,8 +2665,29 @@ impl RuntimeServices {
                     },
                 ),
             };
+            #[cfg(test)]
+            let _ = BEFORE_REGISTRATION_393.try_with(|change| {
+                let applied = self.agent_action_service().apply(change).unwrap();
+                assert_eq!(
+                    applied.status,
+                    harness_contract::agent_action::AgentActionStatus::Applied
+                );
+            });
             if resumed.is_none() {
-                let observation = self.submit_agent_action(&attempt).await?;
+                let observation = if review_resume.is_some() {
+                    self.agent_action_service()
+                        .replay_if_applied(&attempt)
+                        .map_err(|error| {
+                            format!("agentic_review_registration_replay:{graph_id}:{error}")
+                        })?
+                        .ok_or_else(|| {
+                            format!("agentic_review_registration_original_missing:{graph_id}")
+                        })?
+                } else {
+                    self.submit_agent_action(&attempt).await.map_err(|error| {
+                        format!("agentic_attempt_registration_result:{graph_id}:{error}")
+                    })?
+                };
                 if observation.status != harness_contract::agent_action::AgentActionStatus::Applied
                 {
                     return Err(format!(
@@ -2571,17 +2699,57 @@ impl RuntimeServices {
                     ));
                 }
             }
-            if let Err(error) = self
-                .execution_supervisor()
-                .submit(
-                    graph,
-                    ExecutionGraphCommand::Start {
-                        expected_revision: 0,
-                    },
-                )
-                .await
+            if review_resume.is_some() {
+                let current = self
+                    .agent_action_service()
+                    .project_snapshot(&projection.program_id)
+                    .map_err(|error| format!("agentic_review_registration_source_read:{error}"))?;
+                if current.revision != availability.revision
+                    || current
+                        .tasks
+                        .get(task_ref)
+                        .and_then(|task| task.active_attempts.get(&graph_id))
+                        != review_resume.as_ref()
+                {
+                    return Err("agentic_review_registration_source_changed".into());
+                }
+            }
+            #[cfg(test)]
+            if REGISTRATION_FAULT_393.try_with(|fault| *fault)
+                == Ok(RegistrationFault393::PostAppendObservation)
             {
+                return Err("r393 post-append registration observation unavailable".into());
+            }
+            let admission = async {
+                #[cfg(test)]
+                if REGISTRATION_FAULT_393.try_with(|fault| *fault)
+                    == Ok(RegistrationFault393::BeforeGraphCommit)
+                {
+                    return Err("r393 first Graph commit unavailable".to_string());
+                }
+                self.execution_supervisor()
+                    .submit(
+                        graph,
+                        ExecutionGraphCommand::Start {
+                            expected_revision: 0,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            if let Err(error) = admission {
                 let reason = format!("physical Agent graph admission failed: {error}");
+                if mode == DispatchMode::Review {
+                    match self.graph_state_store().load_current_async(&graph_id).await {
+                        Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                            return Err(format!("agentic_review_admission_pending:{graph_id}:{reason}"));
+                        }
+                        Err(read_error) => return Err(format!("agentic_review_admission_unknown:{graph_id}:{reason}; Graph read: {read_error}")),
+                        Ok(_) => {} // Existing execution retains its original exit/settlement contract.
+                    }
+                }
                 if matches!(mode, DispatchMode::Coordination(_)) {
                     return Err(format!(
                         "coordination_admission_pending:{graph_id}:{reason}"

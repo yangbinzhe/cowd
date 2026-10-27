@@ -3426,6 +3426,390 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
     }
 }
 
+async fn registered_review_recovers_393(
+    fault: super::dispatch::RegistrationFault393,
+    negative: u8,
+) {
+    let (services, team, _, task, execution) = one_shot_fixture().await;
+    // Hold only the existing recovery lane during the controlled first dispatch.
+    // Releasing it below lets production's already-running reactor do recovery;
+    // the positive path never calls recover/retry/dispatch a second time.
+    let hold = DispatchFlight::acquire(
+        services.agentic_dispatch_flights(),
+        "runtime:agentic-program-recovery:v1".into(),
+    )
+    .unwrap();
+    let actions = services.agent_action_service();
+    let reviewer = actions
+        .apply(&root(
+            "r393-reviewer",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "Independent reviewer".into(),
+                mission: "review delivered evidence".into(),
+                required_capabilities: vec!["read".into()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: vec![],
+                execution_requirements: vec![],
+            }),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let content = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/plain".into(),
+                visibility_scope: "session:session-dispatch".into(),
+                expected_bytes: Some(22),
+                original_name: Some("r393-evidence.txt".into()),
+            },
+            b"independent input body",
+        )
+        .await
+        .unwrap();
+    let author = actions.project("program-dispatch").unwrap().tasks[&task]
+        .claimant
+        .clone()
+        .unwrap();
+    let submit = agent(
+        "r393-real-submit",
+        &team,
+        &author,
+        &execution,
+        AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: task.clone(),
+            artifact_refs: vec![],
+            evidence_refs: vec![],
+            unresolved: vec![],
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 0,
+                kind: "report".into(),
+                title: "Original submitted result".into(),
+                resolved_content_ref: Some(content.selector),
+            }),
+        }),
+    );
+    let submitted = services.submit_agent_action(&submit).await.unwrap();
+    assert_eq!(
+        submitted.status,
+        AgentActionStatus::Applied,
+        "{:?}",
+        submitted.error
+    );
+    let before = actions.project_snapshot("program-dispatch").unwrap();
+    assert_eq!(before.tasks[&task].status, AgenticTaskStatus::Submitted);
+    let graph = deterministic_graph_id(
+        "program-dispatch",
+        &task,
+        &reviewer,
+        DispatchMode::Review,
+        0,
+    );
+    let context = AgenticDispatchContext {
+        session_id: "session-dispatch".into(),
+        turn_id: "turn-dispatch".into(),
+        model_lease: "test".into(),
+        permission_ceiling: PermissionMode::ReadOnly,
+        resource_scopes: vec![],
+    };
+    if negative == 2 {
+        let mut withdraw = root(
+            "r393-concurrent-withdraw",
+            AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
+                task_ref: task.clone(),
+                reason_ref: before.tasks[&task].artifact_refs[0].clone(),
+                evidence_refs: vec![],
+            }),
+        );
+        withdraw.expected_revision = Some(before.revision);
+        let refused = super::dispatch::BEFORE_REGISTRATION_393
+            .scope(
+                withdraw,
+                services.dispatch_agentic_task(
+                    &before,
+                    &task,
+                    DispatchMode::Review,
+                    &context,
+                    &submit,
+                ),
+            )
+            .await;
+        assert!(
+            refused
+                .as_ref()
+                .unwrap_err()
+                .contains("agentic_attempt_registration_rejected:stale_revision"),
+            "{refused:?}"
+        );
+        let current = actions.project_snapshot("program-dispatch").unwrap();
+        assert!(current.revision > before.revision);
+        assert!(current.tasks[&task].active_attempts.is_empty());
+        assert_eq!(services.event_store().stream_revision(&graph).unwrap(), 0);
+        drop(hold);
+        services.shutdown_maintenance().await;
+        assert_eq!(services.shutdown_execution().await.forced_aborts, 0);
+        return;
+    }
+    let first = super::dispatch::REGISTRATION_FAULT_393
+        .scope(
+            fault,
+            services.dispatch_agentic_task(&before, &task, DispatchMode::Review, &context, &submit),
+        )
+        .await;
+    assert!(
+        first.is_err(),
+        "controlled return boundary must actually fail"
+    );
+    let pending = actions.project_snapshot("program-dispatch").unwrap();
+    assert_eq!(pending.tasks[&task].status, AgenticTaskStatus::Submitted);
+    let original = pending.tasks[&task]
+        .active_attempts
+        .get(&graph)
+        .expect("real durable review registration")
+        .clone();
+    assert_eq!(original.agent_id, reviewer);
+    assert_eq!(original.generation, 0);
+    assert_eq!(services.event_store().stream_revision(&graph).unwrap(), 0);
+    assert_eq!(pending.tasks[&task].failed_review_attempts, 0);
+    eprintln!("R393 original-registration={graph} first-return={first:?}");
+    match fault {
+        super::dispatch::RegistrationFault393::BeforeGraphCommit => assert!(
+            first
+                .as_ref()
+                .unwrap_err()
+                .contains("agentic_review_admission_pending")
+                && first
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("r393 first Graph commit unavailable")
+        ),
+        super::dispatch::RegistrationFault393::PostAppendObservation => assert!(first
+            .as_ref()
+            .unwrap_err()
+            .contains("post-append registration observation unavailable")),
+    }
+    assert_eq!(
+        services
+            .unadmitted_review_registration(&pending, &pending.tasks[&task])
+            .await
+            .unwrap(),
+        Some(original.clone())
+    );
+    if negative == 3 {
+        let mut withdraw = root(
+            "r393-resume-source-race",
+            AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
+                task_ref: task.clone(),
+                reason_ref: pending.tasks[&task].artifact_refs[0].clone(),
+                evidence_refs: vec![],
+            }),
+        );
+        withdraw.expected_revision = Some(pending.revision);
+        let refused = super::dispatch::BEFORE_REGISTRATION_393
+            .scope(
+                withdraw,
+                services.dispatch_agentic_task(
+                    &pending,
+                    &task,
+                    DispatchMode::Review,
+                    &context,
+                    &submit,
+                ),
+            )
+            .await;
+        assert_eq!(
+            refused.unwrap_err(),
+            "agentic_review_registration_source_changed"
+        );
+        assert_eq!(services.event_store().stream_revision(&graph).unwrap(), 0);
+        let changed = actions.project_snapshot("program-dispatch").unwrap();
+        assert!(changed.revision > pending.revision);
+        assert_eq!(
+            changed.tasks[&task].active_attempts.get(&graph),
+            Some(&original)
+        );
+        assert_eq!(changed.tasks[&task].failed_review_attempts, 0);
+        drop(hold);
+        services.shutdown_maintenance().await;
+        assert_eq!(services.shutdown_execution().await.forced_aborts, 0);
+        return;
+    }
+    if negative == 1 {
+        for case in [
+            "foreign-execution",
+            "producer",
+            "membership",
+            "generation",
+            "ambiguous",
+        ] {
+            let mut altered = (*pending).clone();
+            let t = altered.tasks.get_mut(&task).unwrap();
+            let a = t.active_attempts.get_mut(&graph).unwrap();
+            match case {
+                "foreign-execution" => a.execution_id = "agentic-graph:foreign".into(),
+                "producer" => a.agent_id = author.clone(),
+                "membership" => a.membership_id = "membership:foreign".into(),
+                "generation" => a.generation += 1,
+                "ambiguous" => {
+                    let second = a.clone();
+                    t.active_attempts.insert("foreign".into(), second);
+                }
+                _ => unreachable!(),
+            }
+            let expected = if case == "ambiguous" {
+                "agentic_review_registration_ambiguous"
+            } else {
+                "agentic_review_registration_identity_mismatch"
+            };
+            assert_eq!(
+                services
+                    .unadmitted_review_registration(&altered, &altered.tasks[&task])
+                    .await
+                    .unwrap_err(),
+                expected,
+                "{case}"
+            );
+            assert_eq!(services.event_store().stream_revision(&graph).unwrap(), 0);
+        }
+        let mut withdraw = root(
+            "r393-withdraw-pending",
+            AgentAction::TaskWithdraw(harness_contract::agent_action::TaskWithdrawInput {
+                task_ref: task.clone(),
+                reason_ref: pending.tasks[&task].artifact_refs[0].clone(),
+                evidence_refs: vec![],
+            }),
+        );
+        withdraw.expected_revision = Some(pending.revision);
+        assert_eq!(
+            actions.apply(&withdraw).unwrap().status,
+            AgentActionStatus::Applied
+        );
+        let refused = services
+            .dispatch_agentic_task(&pending, &task, DispatchMode::Review, &context, &submit)
+            .await;
+        assert!(
+            refused
+                .as_ref()
+                .unwrap_err()
+                .contains("agentic_review_registration_identity_mismatch"),
+            "{refused:?}"
+        );
+        assert_eq!(services.event_store().stream_revision(&graph).unwrap(), 0);
+        drop(hold);
+        services.shutdown_maintenance().await;
+        assert_eq!(services.shutdown_execution().await.forced_aborts, 0);
+        return;
+    }
+    let busy = DispatchFlight::acquire(
+        services.agentic_dispatch_flights(),
+        format!("program-dispatch|{task}|review|0"),
+    )
+    .unwrap();
+    assert!(services
+        .dispatch_agentic_task(&pending, &task, DispatchMode::Review, &context, &submit)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(services.event_store().stream_revision(&graph).unwrap(), 0);
+    drop(busy);
+    drop(hold);
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            if services.event_store().stream_revision(&graph).unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    services.shutdown_maintenance().await;
+    let shutdown = services.shutdown_execution().await;
+    assert_eq!(shutdown.forced_aborts, 0);
+    assert!(recovered.is_ok(), "original reactor must recover the same registered review, not settle a Graph that never existed; first={first:?}");
+    let events = services.event_reader().list_stream(&graph).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == "execution_graph.planned")
+            .count(),
+        1
+    );
+    let registration = services
+        .event_reader()
+        .list_stream("agentic-program:program-dispatch")
+        .unwrap();
+    assert_eq!(registration.iter().filter(|event| {
+        if event.kind != "agentic.action_applied" { return false; }
+        let envelope: AgentActionEnvelope = serde_json::from_value(event.payload["envelope"].clone()).unwrap();
+        matches!(envelope.action, AgentAction::TaskAttemptDispatch(input)
+            if input.execution_id == graph && input.agent_ref == reviewer
+                && input.mode == harness_contract::agent_action::AgentAttemptMode::Review && input.generation == 0)
+    }).count(), 1);
+    let current = actions.project_snapshot("program-dispatch").unwrap();
+    // A durable/started graph is never treated as an absent admission, even
+    // when the caller still carries the original registered Task snapshot.
+    assert!(services
+        .unadmitted_review_registration(&pending, &pending.tasks[&task])
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!current.tasks[&task]
+        .active_attempts
+        .values()
+        .any(|a| a.execution_id == graph && a.generation != original.generation));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "execution_graph.nodes_started"),
+        "actual original Start must be observed; kinds={:?}",
+        events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    let session = services
+        .event_reader()
+        .list_stream("session:session-dispatch")
+        .unwrap();
+    assert!(!session
+        .iter()
+        .any(|e| e.kind == "context.provider_request_packed"));
+}
+
+#[tokio::test]
+async fn r393_registered_review_recovers_after_first_graph_commit_failure() {
+    registered_review_recovers_393(super::dispatch::RegistrationFault393::BeforeGraphCommit, 0)
+        .await;
+}
+
+#[tokio::test]
+async fn r393_registered_review_recovers_after_lost_registration_observation() {
+    registered_review_recovers_393(
+        super::dispatch::RegistrationFault393::PostAppendObservation,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r393_review_registration_rejects_foreign_stale_and_withdrawn_sources() {
+    registered_review_recovers_393(super::dispatch::RegistrationFault393::BeforeGraphCommit, 1)
+        .await;
+}
+
+#[tokio::test]
+async fn r393_review_registration_respects_original_program_cas() {
+    registered_review_recovers_393(super::dispatch::RegistrationFault393::BeforeGraphCommit, 2)
+        .await;
+}
+
+#[tokio::test]
+async fn r393_review_resume_rechecks_current_source_after_original_replay() {
+    registered_review_recovers_393(super::dispatch::RegistrationFault393::BeforeGraphCommit, 3)
+        .await;
+}
+
 #[tokio::test]
 async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicating_admitted_work() {
     let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
