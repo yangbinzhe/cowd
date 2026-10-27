@@ -1069,6 +1069,7 @@ fn small_exact_tool_result_retains_content_after_receipt_envelope() {
         &harness_contract::reality::EvidenceRef::observed("tool", "small-exact-read"),
         None,
         &ToolModelDeliveryRequirement::exact(vec!["small-read".to_string()]),
+        "{}",
     );
 
     assert!(!receipt.truncated, "{}", receipt.summary);
@@ -1147,6 +1148,7 @@ fn exact_evidence_mode_expands_tool_delivery_without_bypassing_context_ceiling()
             "session:test",
         )),
         &ToolModelDeliveryRequirement::exact(vec!["large-read".to_string()]),
+        "{}",
     );
 
     assert!(
@@ -1160,6 +1162,56 @@ fn exact_evidence_mode_expands_tool_delivery_without_bypassing_context_ceiling()
     );
     assert_eq!(receipt.omitted_tokens, 0);
     assert!(receipt.summary.contains(&"x".repeat(256)));
+}
+
+#[test]
+fn complete_read_body_survives_receipt_and_serialized_tool_result() {
+    let runtime = ConversationRuntime::new(
+        Session::new(), MockApi, StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["system".into()],
+    ).without_memory();
+    let plan = runtime.runtime_budget_plan();
+    let padding = "a".repeat(plan.tool_result_budget.per_tool_max_tokens as usize * 3);
+    let body = format!("{padding}\nR420_UNIQUE_MIDDLE_CONTENT\n{padding}");
+    let output = serde_json::json!({"type":"text","truncated":false,"file":{
+        "filePath":"src/full.rs", "content":body,"startLine":1,"numLines":3,"totalLines":3,
+        "endsWithNewline":false,"byteLength":body.len(),
+        "sha256":format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
+    }}).to_string();
+    let reference = harness_contract::reality::EvidenceRef::observed("tool", "r420-full");
+    // Deterministic old bounded path: the distinct middle is actually removed.
+    let bounded = runtime.tool_model_receipt("read_file", &output, false, &reference,
+        None, &ToolModelDeliveryRequirement::Bounded, "{}");
+    assert!(bounded.truncated);
+    assert!(!bounded.summary.contains("R420_UNIQUE_MIDDLE_CONTENT"));
+    let complete = runtime.tool_model_receipt("read_file", &output, false, &reference,
+        None, &ToolModelDeliveryRequirement::Bounded, r#"{"complete":true}"#);
+    assert!(!complete.truncated);
+    assert_eq!(complete.omitted_tokens, 0);
+    assert!(complete.receipt_tokens + plan.max_output_tokens < plan.subsystem_budget_tokens,
+        "fixture must fit the original real context capacity");
+    let message = ConversationMessage::tool_result("r420-call", "read_file", &complete.summary, false);
+    let provider_messages = crate::provider_runtime_client::convert_messages([&message]);
+    let serialized = serde_json::to_vec(&provider_messages).expect("original Provider message codec");
+    let wire: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
+    let sent = wire[0]["content"][0]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(sent, complete.summary);
+    assert!(sent.contains("R420_UNIQUE_MIDDLE_CONTENT"));
+    let payload: serde_json::Value = serde_json::from_str(
+        &sent[sent.find('{').unwrap()..]).unwrap();
+    assert_eq!(payload["file"]["content"], body);
+    let seal = crate::context_evidence::read_body_seal("read_file", &output).unwrap();
+    assert!(matches!(seal.extent, crate::context_evidence::ReadExtent::FileLines {
+        source_omitted:false, start_line:1, line_count:3, total_lines:3, ..
+    }));
+    let descriptor = serde_json::json!({"type":"text","file":{
+        "filePath":"src/full.rs","sha256":payload["file"]["sha256"],"byteLength":body.len()
+    }}).to_string();
+    assert!(crate::context_evidence::read_body_seal("read_file", &descriptor).is_none());
+    // The complete marker must not turn unrelated tools into full-body delivery.
+    let other = runtime.tool_model_receipt("grep_search", &output, false, &reference,
+        None, &ToolModelDeliveryRequirement::Bounded, r#"{"complete":true}"#);
+    assert!(other.truncated);
 }
 
 #[test]
@@ -1190,6 +1242,7 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
         &raw_ref,
         Some(&access),
         &requirement,
+        "{}",
     );
     runtime
         .record_generated_model_receipt(
@@ -1256,6 +1309,10 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
     );
 
     let mut corrupted = request;
+    corrupted.messages = Vec::<ConversationMessage>::new().into();
+    assert!(runtime.packed_model_observation_candidates(&corrupted, 3, 2)
+        .expect("a dropped ToolResult is not observed").is_empty());
+    assert!(runtime.turn_model_observations().is_empty());
     corrupted.messages = vec![ConversationMessage::tool_result(
         "tool-call-1".to_string(),
         "read_file".to_string(),
@@ -1321,7 +1378,7 @@ async fn runtime_prefetch_receipt_survives_first_provider_node_and_is_turn_isola
     let requirement = ToolModelDeliveryRequirement::exact(vec!["required-agent-read".to_string()]);
     let output = r#"{"content":"complete runtime-prefetched evidence","truncated":false}"#;
     let receipt =
-        runtime.tool_model_receipt("read_file", output, false, &raw_ref, None, &requirement);
+        runtime.tool_model_receipt("read_file", output, false, &raw_ref, None, &requirement, "{}");
     runtime
         .record_generated_model_receipt(
             "runtime-focus-verify-0-0",

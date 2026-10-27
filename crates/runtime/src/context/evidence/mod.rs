@@ -846,6 +846,17 @@ pub fn build_tool_receipt(
     evidence_ref: EvidenceRef,
     token_budget: u64,
 ) -> ModelReceipt {
+    build_tool_receipt_for_delivery(tool_name, output, is_error, evidence_ref, token_budget, false)
+}
+
+pub(crate) fn build_tool_receipt_for_delivery(
+    tool_name: &str,
+    output: &str,
+    is_error: bool,
+    evidence_ref: EvidenceRef,
+    token_budget: u64,
+    preserve_complete_read: bool,
+) -> ModelReceipt {
     let content_kind = classify_content(output, is_error);
     let raw_tokens = estimate_text_tokens(output);
     let fixed_prefix = format!(
@@ -856,14 +867,14 @@ pub fn build_tool_receipt(
     let prefix_tokens = estimate_text_tokens(&fixed_prefix);
     let body_budget = token_budget.saturating_sub(prefix_tokens).max(1);
     let raw_lines = output.lines().count();
-    let (body, body_omitted) = summarize_body(
-        tool_name,
-        output,
-        content_kind,
-        body_budget,
-        raw_tokens,
-        raw_lines,
-    );
+    let (body, body_omitted) = if preserve_complete_read && tool_name == "read_file" && !is_error {
+        // A complete acquisition must not lose its middle to a second generic
+        // receipt summary. The original request packing/capacity and wire proof
+        // still decide whether these actual bytes reach the model.
+        (output.to_string(), false)
+    } else {
+        summarize_body(tool_name, output, content_kind, body_budget, raw_tokens, raw_lines)
+    };
     let summary = format!("{fixed_prefix}{body}");
     let receipt_tokens = estimate_text_tokens(&summary);
     ModelReceipt {

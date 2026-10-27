@@ -1553,15 +1553,7 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
         resource_scopes.push("read:.");
     }
     let control = json!({
-        "corpus_id": if spec_id == ONE_TEAM_SCENARIO_ID {
-            "live-one-team-v1"
-        } else if matches!(spec_id, "u5-read-a" | "u5-read-b") {
-            "live-u5-fairness-v1"
-        } else if spec_id == "live_minimal_batch_read" {
-            "live-batchread-v1"
-        } else {
-            "live-scenarios-v1"
-        },
+        "corpus_id": harness_contract::evaluation::evaluation_fixture_corpus(spec_id),
         "workspace_fixture": "none",
         // The disposable Gateway config is the single-route authority. This
         // field belongs to Runtime's execution-resource contract, where the

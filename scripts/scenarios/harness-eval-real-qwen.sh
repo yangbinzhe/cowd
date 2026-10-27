@@ -117,15 +117,14 @@ if [[ "$SCENARIO_ID" == live_u7_persistent_memory_recall ]]; then
 fi
 
 # Fixed evaluator corpus follows the exact registered scenario, never caller paths.
-case "$SCENARIO_ID" in
-  # Gateway evaluation_projection_resource_grants gives live-scenarios-v1 only
-  # Cargo.toml. F/C also require B's original crates/runtime/Cargo.toml read;
-  # the existing fairness corpus grants exactly those two original paths.
-  live_u5_shared_session_fairness|live_u5_active_cancel_isolation) EVALUATION_CORPUS_ID=live-u5-fairness-v1 ;;
-  live_one_team_execution) EVALUATION_CORPUS_ID=live-one-team-v1 ;;
-  live_minimal_batch_read) EVALUATION_CORPUS_ID=live-batchread-v1 ;;
-  *) EVALUATION_CORPUS_ID=live-scenarios-v1 ;;
-esac
+EVALUATION_CORPUS_ID="$(python3 - "$ROOT/crates/harness-contract/src/evaluation_profiles.json" "$SCENARIO_ID" <<'PYPROFILE'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as source:
+    profiles = json.load(source)
+print(next((profile['corpus_id'] for profile in profiles['profiles']
+            if sys.argv[2] in profile['selectors']), profiles['default_corpus_id']))
+PYPROFILE
+)"
 
 # Functions below stay in this original launch owner; no daemon or second
 # Runtime lifecycle is introduced. Local doubles extract these same functions.

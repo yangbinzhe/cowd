@@ -2227,11 +2227,8 @@ fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl
     }
     let mut control = serde_json::from_str::<EvaluationTurnControl>(encoded)
         .map_err(|error| RuntimeError::new(format!("invalid evaluation turn control: {error}")))?;
-    if !matches!(
-        control.corpus_id.as_str(),
-        "auto-strategy-v1" | "live-scenarios-v1" | "live-one-team-v1" | "live-u5-fairness-v1"
-            | "live-batchread-v1"
-    ) || configured_corpus.as_deref() != Some(control.corpus_id.as_str())
+    if harness_contract::evaluation::evaluation_fixture_profile(&control.corpus_id).is_none()
+        || configured_corpus.as_deref() != Some(control.corpus_id.as_str())
         || prompt.trim().is_empty()
     {
         return Err(RuntimeError::new(

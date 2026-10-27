@@ -488,38 +488,18 @@ fn evaluation_projection_resource_grants(
     corpus: Option<&str>,
     owns_session: bool,
 ) -> Vec<String> {
-    match (harness, corpus, owns_session) {
-        // Preserve the existing paired evaluator contract.
-        (Some("1"), Some("auto-strategy-v1"), _) => vec!["resource:*".into()],
-        // Fixed, preregistered live fixture; never worker scopes or caller input.
-        (Some("1"), Some("live-scenarios-v1"), true) => vec!["read:Cargo.toml".into()],
-        (Some("1"), Some("live-u5-fairness-v1"), true) => {
-            vec![
-                "read:Cargo.toml".into(),
-                "read:crates/runtime/Cargo.toml".into(),
-            ]
-        }
-        (Some("1"), Some("live-one-team-v1"), true) => [
-            "read:crates/runtime/src/lib.rs",
-            "read:crates/tools/src/lib.rs",
-            "read:crates/memory/src/lib.rs",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-        (Some("1"), Some("live-batchread-v1"), true) => [
-            "read:crates/tools/src/lib.rs",
-            "read:crates/runtime/src/lib.rs",
-            "read:crates/memory/src/lib.rs",
-            "read:crates/gateway/src/main.rs",
-            "read:crates/provider/src/lib.rs",
-            "read:crates/harness-eval/src/lib.rs",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-        _ => Vec::new(),
+    if harness != Some("1") {
+        return Vec::new();
     }
+    // Preserve the existing paired exception; live fixtures still require the
+    // original authenticated Session owner, never worker scopes or caller paths.
+    if !owns_session && corpus != Some("auto-strategy-v1") {
+        return Vec::new();
+    }
+    corpus
+        .and_then(harness_contract::evaluation::evaluation_fixture_profile)
+        .map(|profile| profile.observer_resource_grants)
+        .unwrap_or_default()
 }
 
 fn projection_visibility_grants(claims: &[String]) -> Vec<String> {

@@ -1,0 +1,57 @@
+{
+  "default_corpus_id": "live-scenarios-v1",
+  "profiles": [
+    {
+      "corpus_id": "auto-strategy-v1",
+      "selectors": [],
+      "observer_resource_grants": [
+        "resource:*"
+      ]
+    },
+    {
+      "corpus_id": "live-scenarios-v1",
+      "selectors": [],
+      "observer_resource_grants": [
+        "read:Cargo.toml"
+      ]
+    },
+    {
+      "corpus_id": "live-u5-fairness-v1",
+      "selectors": [
+        "live_u5_shared_session_fairness",
+        "live_u5_active_cancel_isolation",
+        "u5-read-a",
+        "u5-read-b"
+      ],
+      "observer_resource_grants": [
+        "read:Cargo.toml",
+        "read:crates/runtime/Cargo.toml"
+      ]
+    },
+    {
+      "corpus_id": "live-one-team-v1",
+      "selectors": [
+        "live_one_team_execution"
+      ],
+      "observer_resource_grants": [
+        "read:crates/runtime/src/lib.rs",
+        "read:crates/tools/src/lib.rs",
+        "read:crates/memory/src/lib.rs"
+      ]
+    },
+    {
+      "corpus_id": "live-batchread-v1",
+      "selectors": [
+        "live_minimal_batch_read"
+      ],
+      "observer_resource_grants": [
+        "read:crates/tools/src/lib.rs",
+        "read:crates/runtime/src/lib.rs",
+        "read:crates/memory/src/lib.rs",
+        "read:crates/gateway/src/main.rs",
+        "read:crates/provider/src/lib.rs",
+        "read:crates/harness-eval/src/lib.rs"
+      ]
+    }
+  ]
+}

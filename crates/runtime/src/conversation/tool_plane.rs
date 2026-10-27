@@ -2511,6 +2511,7 @@ where
                     &raw_ref,
                     Some(&raw_access),
                     &model_delivery_requirement,
+                    &effective_input,
                 );
                 if let Some(payload) = prepared_vision.as_ref() {
                     model_receipt.summary = vision_tool_model_receipt(payload, &raw_ref);
@@ -2766,6 +2767,7 @@ where
             &raw_ref,
             Some(&raw_access),
             &delivery_requirement,
+            input,
         );
         self.record_generated_model_receipt(
             tool_use_id,
@@ -3180,6 +3182,7 @@ where
         raw_ref: &EvidenceRef,
         access: Option<&EvidenceAccessRef>,
         delivery_requirement: &ToolModelDeliveryRequirement,
+        input: &str,
     ) -> crate::context_evidence::ModelReceipt {
         let raw_tokens = crate::context_ledger::estimate_text_tokens(output);
         let plan = if delivery_requirement.is_exact() && !is_error {
@@ -3224,12 +3227,17 @@ where
                 }
             })
             .unwrap_or(requested);
-        let mut receipt = crate::context_evidence::build_tool_receipt(
+        let preserve_complete_read = tool_name == "read_file" && !is_error
+            && (delivery_requirement.is_exact()
+                || serde_json::from_str::<serde_json::Value>(input).ok()
+                    .is_some_and(|value| value["complete"].as_bool() == Some(true)));
+        let mut receipt = crate::context_evidence::build_tool_receipt_for_delivery(
             tool_name,
             output,
             is_error,
             raw_ref.clone(),
             granted.max(24),
+            preserve_complete_read,
         );
         if access.is_none() {
             if receipt.summary.starts_with("Tool `") {

@@ -15,6 +15,69 @@ use crate::agent::ValidationError;
 use crate::policy::PermissionMode;
 use crate::reality::EvidenceRef;
 
+/// Immutable fixture data, not tool or Agent authorization. The original
+/// callers retain their flag, Session ownership and exact-config checks.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvaluationFixtureProfile {
+    pub corpus_id: String,
+    pub selectors: Vec<String>,
+    pub observer_resource_grants: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct EvaluationFixtureProfiles {
+    default_corpus_id: String,
+    profiles: Vec<EvaluationFixtureProfile>,
+}
+
+fn evaluation_fixture_profiles() -> Option<EvaluationFixtureProfiles> {
+    serde_json::from_str(include_str!("evaluation_profiles.json")).ok()
+}
+
+/// A malformed compiled asset yields no profile; original consumers fail closed.
+pub fn evaluation_fixture_profile(corpus_id: &str) -> Option<EvaluationFixtureProfile> {
+    evaluation_fixture_profiles()?
+        .profiles
+        .into_iter()
+        .find(|profile| profile.corpus_id == corpus_id)
+}
+
+/// Preserve the original generic fixture for selectors without a specialization.
+pub fn evaluation_fixture_corpus(selector: &str) -> Option<String> {
+    let data = evaluation_fixture_profiles()?;
+    Some(data.profiles.iter()
+        .find(|profile| profile.selectors.iter().any(|id| id == selector))
+        .map(|profile| profile.corpus_id.clone())
+        .unwrap_or(data.default_corpus_id))
+}
+
+#[cfg(test)]
+mod fixture_profile_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_fixture_asset_preserves_registry_and_generic_semantics() {
+        let data = evaluation_fixture_profiles().expect("compiled fixture asset must decode");
+        assert_eq!(data.default_corpus_id, "live-scenarios-v1");
+        assert_eq!(data.profiles.len(), 5);
+        let mut ids = BTreeSet::new();
+        let mut selectors = BTreeSet::new();
+        for profile in data.profiles {
+            assert!(ids.insert(profile.corpus_id.clone()), "duplicate corpus");
+            for selector in profile.selectors {
+                assert!(selectors.insert(selector), "ambiguous selector");
+            }
+        }
+        assert!(evaluation_fixture_profile("foreign").is_none());
+        assert_eq!(evaluation_fixture_corpus("live_small_two_team_collaboration").as_deref(),
+            Some("live-scenarios-v1"));
+        assert_eq!(evaluation_fixture_corpus("live_u5_active_cancel_isolation").as_deref(),
+            Some("live-u5-fairness-v1"));
+        assert_eq!(evaluation_fixture_corpus("live_minimal_batch_read").as_deref(),
+            Some("live-batchread-v1"));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvaluationMetricDirection {
