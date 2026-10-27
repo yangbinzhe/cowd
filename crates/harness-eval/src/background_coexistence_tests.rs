@@ -1455,6 +1455,12 @@ impl RecoveryReplies {
         body: &Value,
         binding: Option<&ProviderBinding>,
     ) -> anyhow::Result<Option<Value>> {
+        if r385_memory_candidate(body) {
+            let Some(owner) = binding else {
+                return Ok(None);
+            };
+            return r385_memory_reply(body, owner).map(Some);
+        }
         if let Some(control) = r6_task_route_control_reply(body).map_err(anyhow::Error::msg)? {
             anyhow::ensure!(!self.router_used, "repeated fresh Task control");
             self.router_used = true;
@@ -1887,6 +1893,229 @@ fn exact_goal_witness_rejects_unknown_null_and_foreign_outbox_identity() {
             "{which}"
         );
     }
+}
+
+// A finite Memory extraction response is NOT a business role or a grant.
+// Pin the complete original extractor schema, not only its opening sentence.
+// Compatibility is checked below through MemoryExtractor::llm_extract itself.
+const R385_MEMORY_PROMPT: &str = r#"You are a memory extraction system. Analyze the following conversation and extract key memories as a JSON array.
+
+Each memory entry must have these fields:
+- "title": A short, clear title (max 80 characters)
+- "content": Detailed description of the memory
+- "category": One of "UserPreference", "Decision", "Reference", "ProjectConvention", "ProjectKnowledge", "CompressedSummary", "Shared"
+- "layer": One of "L1" (critical identity/preferences), "L2" (project context/decisions), "L3" (reference/patterns)
+- "priority": One of "High", "Normal", "Low"
+- "confidence": A float from 0.0 to 1.0
+- "tags": Array of short keyword strings
+
+Extraction guidelines:
+- Extract user preferences and coding style preferences as "UserPreference" / "L1"
+- Extract architectural decisions and approach choices as "Decision" / "L2"
+- Extract error resolutions, fixes, and workarounds as "Reference" / "L2"
+- Extract repeated patterns and conventions as "ProjectConvention" / "L2"
+- Extract project facts and entity knowledge as "ProjectKnowledge" / "L2"
+- Extract summaries and compressed content as "CompressedSummary" / "L3"
+- Extract a genuinely generalized, cross-turn reusable method or architecture
+  pattern as "Reference" / "L3" when it abstracts beyond one project decision
+- Do not duplicate the same claim across L2 and L3: L2 retains the concrete
+  project decision, while L3 is emitted only for a distinct reusable abstraction
+- Cross-agent output may be extracted only into L2/L3 as a review candidate.
+  Never emit L4: shared/team knowledge reaches L4 only through Runtime's
+  evidence-backed promotion and approval lifecycle
+- L1 entries should have confidence >= 0.8; L2/L3 >= 0.6
+- A question that asks to recall, inspect, explain, or verify an existing
+  memory is not a new memory. Do not extract it.
+- An assistant answer that merely restates information recalled from memory is
+  not a new decision or fact. Extract only information newly established by
+  this turn.
+
+Only extract genuinely new and useful information. Skip trivial, obvious, or redundant content.
+Return ONLY the JSON array, no other text or explanation."#;
+
+fn r385_memory_candidate(body: &Value) -> bool {
+    body["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("You are a memory extraction system."))
+        })
+    })
+}
+
+// These are the original extractor's presentation frames, not trusted identities.
+// Validate them against the finite owner's already emitted replies below. Tool
+// bodies remain untrusted/re-readable data and never establish Task success.
+fn r385_memory_frames(input: &str) -> anyhow::Result<Vec<(String, String)>> {
+    anyhow::ensure!(input.len() <= 32768, "finite Memory input bound");
+    let mut frames: Vec<(String, String)> = Vec::new();
+    for line in input.split_inclusive('\n') {
+        let header = line.starts_with("[User]: ")
+            || line.starts_with("[Assistant]: ")
+            || line.starts_with("[Tool ");
+        if header {
+            let (role, rest) = line
+                .split_once("]: ")
+                .ok_or_else(|| anyhow::anyhow!("Memory frame role"))?;
+            anyhow::ensure!(frames.len() < 128, "finite Memory frame bound");
+            frames.push((role.into(), rest.into()));
+        } else {
+            frames
+                .last_mut()
+                .ok_or_else(|| anyhow::anyhow!("Memory input lacks original role frames"))?
+                .1
+                .push_str(line);
+        }
+    }
+    for (_, text) in &mut frames {
+        anyhow::ensure!(text.ends_with('\n'), "incomplete Memory source frame");
+        text.pop();
+    }
+    anyhow::ensure!(!frames.is_empty(), "empty Memory source");
+    Ok(frames)
+}
+
+fn r385_memory_reply(body: &Value, owner: &ProviderBinding) -> anyhow::Result<Value> {
+    anyhow::ensure!(Instant::now() < owner.deadline, "Memory control deadline");
+    anyhow::ensure!(
+        body["stream"] == false && body["model"] == "r6-finite-local" && body["max_tokens"] == 2048,
+        "Memory control stream/model/budget contract"
+    );
+    anyhow::ensure!(
+        body.get("tools")
+            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+            && body.get("tool_choice").is_none(),
+        "Memory control exposes tools or choice"
+    );
+    anyhow::ensure!(
+        body.as_object().is_some_and(|m| m.keys().all(|k| [
+            "model",
+            "messages",
+            "stream",
+            "max_tokens",
+            "tools"
+        ]
+        .contains(&k.as_str()))),
+        "unknown Memory request fields"
+    );
+    let messages = body["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Memory messages"))?;
+    anyhow::ensure!(
+        messages.len() == 2
+            && messages[0]["role"] == "system"
+            && messages[1]["role"] == "user"
+            && messages
+                .iter()
+                .all(|m| m.as_object().is_some_and(|m| m.len() == 2)),
+        "Memory message roles/schema"
+    );
+    let strict = format!(
+        "{R385_MEMORY_PROMPT}\n\nReturn ONLY a JSON array. Do not include markdown fences, prose, or trailing text."
+    );
+    anyhow::ensure!(
+        messages[0]["content"] == R385_MEMORY_PROMPT || messages[0]["content"] == strict,
+        "Memory extraction schema/purpose changed"
+    );
+    let frames = r385_memory_frames(
+        messages[1]["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Memory source text"))?,
+    )?;
+    // Never obtain a path, a reply, or a role from control text. Read only this
+    // original owner's fixed private archive names, with bounds before materialization.
+    let mut assistant = Vec::new();
+    let mut tools = Vec::new();
+    for ordinal in 1..=64 {
+        let path = owner
+            .evidence_root
+            .join(format!("r6-provider-reply-{ordinal}.json"));
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() <= 65536,
+            "Memory source reply bound"
+        );
+        let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let delta = &value["delta"];
+        // Prior Memory/control answers have no conversation-business provenance.
+        if delta.get("tool_calls").is_none() {
+            if let Some(text) = delta["content"].as_str().filter(|text| [
+                "The physical result and authored report are independently verified for user_intent.",
+                "The independently reviewed recovery result is complete: recovery-effect.txt contains recovery-effect-once.",
+            ].contains(text)) { assistant.push(text.to_owned()); }
+            continue;
+        }
+        let mut blocks = vec![delta["content"].as_str().unwrap_or_default().to_owned()];
+        for call in delta["tool_calls"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("recorded reply tools"))?
+        {
+            let id = call["id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("recorded call id"))?;
+            let name = call["function"]["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("recorded tool name"))?;
+            let input: Value = serde_json::from_str(
+                call["function"]["arguments"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("recorded call input"))?,
+            )?;
+            blocks.push(format!("[tool_use id={id} name={name}]\n{input}"));
+            tools.push((
+                format!("[Tool {name}"),
+                format!("[tool_result id={id} name={name} error=false]\n"),
+            ));
+        }
+        assistant.push(blocks.join("\n\n"));
+    }
+    let mut users = 0;
+    let mut replies = 0;
+    let mut results = 0;
+    for (role, content) in &frames {
+        match role.as_str() {
+            "[User" => {
+                anyhow::ensure!(
+                    content == R6_OBJECTIVE
+                        || content
+                            == "Begin the bounded role using the Runtime-attested shared Team context and private role brief above. Return verified findings, evidence, and genuine gaps.",
+                    "Memory input is not the fixed R6 conversation"
+                );
+                users += 1;
+            }
+            "[Assistant" => {
+                anyhow::ensure!(
+                    assistant.contains(content),
+                    "Memory assistant is not an original finite reply"
+                );
+                replies += 1;
+            }
+            _ => {
+                anyhow::ensure!(
+                    content.chars().count() <= 501
+                        && tools
+                            .iter()
+                            .any(|(label, prefix)| role == label && content.starts_with(prefix)),
+                    "Memory result is not a bounded original-call presentation"
+                );
+                results += 1;
+            }
+        }
+    }
+    anyhow::ensure!(
+        users == 1 && replies > 0 && results > 0,
+        "Memory fixed source scope incomplete"
+    );
+    // The fixed task adds no durable user preference/decision. Its authored
+    // report and tool data can be re-derived by the original read/evidence tools
+    // (extractor's derivation-exclusion rule). This finite fixture returns no
+    // NEW memory atom; it does not disable Memory, swallow errors, settle Task,
+    // or assert an independent review/Goal/ACK. Other inputs remain refused.
+    Ok(json!({"role":"assistant", "content":"[]"}))
 }
 
 // Same strict fresh-Task control contract as the original no-hold sequence.
@@ -3644,8 +3873,12 @@ fn r344_reply_bound(
     request: &mut ScriptRequest,
     owner: Option<&ProviderBinding>,
 ) -> anyhow::Result<Option<Value>> {
-    // The pre-admission, non-streaming TaskRouter control is its original strict
-    // no-tools parser, not a business lane or an Agent grant.
+    // Original control analyses do not carry Packed Graph identity. A complete
+    // known Memory contract is checked separately, never used to select a lane.
+    // Unknown nonstreaming controls still fail in the original TaskRouter parser.
+    if request.body["stream"] == false || r385_memory_candidate(&request.body) {
+        return state.reply(&request.body, owner);
+    }
     if r6_task_route_control_reply(&request.body)
         .map_err(anyhow::Error::msg)?
         .is_some()
@@ -4391,5 +4624,287 @@ fn r365_original_write_refusal_stops_before_program_lookup() -> anyhow::Result<(
         "{error}"
     );
     assert_eq!((driver.producer, driver.root, driver.reviewer), (2, 4, 0));
+    Ok(())
+}
+
+fn r385_literal_memory_source(root: &Path) -> anyhow::Result<(Value, Vec<memory::types::Message>)> {
+    // Independent fixture input, not a production-generated expected result.
+    let reply = json!({"delta":{"role":"assistant","content":null,"tool_calls":[{"id":"recovery-claim","function":{"name":"task_claim","arguments":"{\"task_ref\":\"task:bounded\"}"}}]},"synthetic_usage":true});
+    private_record(&root.join("r6-provider-reply-1.json"), &reply)?;
+    let kickoff = "Begin the bounded role using the Runtime-attested shared Team context and private role brief above. Return verified findings, evidence, and genuine gaps.";
+    let assistant =
+        "\n\n[tool_use id=recovery-claim name=task_claim]\n{\"task_ref\":\"task:bounded\"}";
+    let tool =
+        "[tool_result id=recovery-claim name=task_claim error=false]\n{\"action\":\"task_claim\"}";
+    let transcript =
+        format!("[User]: {kickoff}\n[Assistant]: {assistant}\n[Tool task_claim]: {tool}\n");
+    let body = json!({"model":"r6-finite-local","stream":false,"max_tokens":2048,"messages":[{"role":"system","content":R385_MEMORY_PROMPT},{"role":"user","content":transcript}]});
+    let messages = vec![
+        memory::types::Message::user(kickoff),
+        memory::types::Message {
+            turn_index: 1,
+            role: memory::types::MessageRole::Assistant,
+            content: assistant.into(),
+            tool_name: None,
+            tool_use_id: None,
+            pinned: false,
+        },
+        memory::types::Message {
+            turn_index: 2,
+            role: memory::types::MessageRole::Tool,
+            content: tool.into(),
+            tool_name: Some("task_claim".into()),
+            tool_use_id: Some("recovery-claim".into()),
+            pinned: false,
+        },
+    ];
+    Ok((body, messages))
+}
+
+#[test]
+fn r385_original_memory_extractor_uses_typed_empty_result_without_business_authority()
+-> anyhow::Result<()> {
+    use memory::compression::llm_summarizer::{LlmSummarizer, LlmSummarizerError};
+    use std::sync::{Arc, Mutex};
+    struct OriginalPort {
+        root: PathBuf,
+        observed: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmSummarizer for OriginalPort {
+        async fn summarize(
+            &self,
+            prompt: &str,
+            content: &str,
+        ) -> Result<String, LlmSummarizerError> {
+            self.observed
+                .lock()
+                .unwrap()
+                .push((prompt.into(), content.into()));
+            let body = json!({"model":"r6-finite-local","stream":false,"max_tokens":2048,"messages":[{"role":"system","content":prompt},{"role":"user","content":content}]});
+            let binding = r6_control_test_binding(&self.root)
+                .map_err(|e| LlmSummarizerError::Provider(e.to_string()))?;
+            let (tx, _) = std::sync::mpsc::sync_channel(1);
+            let mut request = ScriptRequest {
+                body,
+                raw_sha256: String::new(),
+                lane: None,
+                ordinal: 2,
+                reply: tx,
+            };
+            let mut driver = RecoveryReplies::default();
+            let reply = r344_reply_bound(&mut driver, &mut request, Some(&binding))
+                .map_err(|e| LlmSummarizerError::Provider(e.to_string()))?
+                .unwrap();
+            assert_eq!(reply, json!({"role":"assistant","content":"[]"}));
+            assert!(request.lane.is_none() && driver.proven_lane.is_none());
+            assert!(!driver.router_used && !driver.interpretation_used);
+            assert_eq!(
+                (
+                    driver.root,
+                    driver.producer,
+                    driver.reviewer,
+                    driver.final_replies
+                ),
+                (0, 0, 0, 0)
+            );
+            Ok(reply["content"].as_str().unwrap().into())
+        }
+    }
+    let root = tempfile::tempdir()?;
+    let (body, messages) = r385_literal_memory_source(root.path())?;
+    let port = Arc::new(OriginalPort {
+        root: root.path().into(),
+        observed: Mutex::new(vec![]),
+    });
+    let extractor =
+        memory::extractor::MemoryExtractor::new(memory::config::ExtractorConfig::default())
+            .with_llm(port.clone());
+    let entries = futures::executor::block_on(extractor.llm_extract(&messages))?;
+    assert!(
+        entries.is_empty(),
+        "literal expected: no new durable atom from the bounded re-readable tool trace"
+    );
+    assert_eq!(
+        port.observed.lock().unwrap().as_slice(),
+        &[(
+            body["messages"][0]["content"].as_str().unwrap().into(),
+            body["messages"][1]["content"].as_str().unwrap().into()
+        )]
+    );
+    // Nonempty typed entries still parse in the original owner; empty is not an
+    // extractor bypass or a success fallback for an invalid response.
+    struct Typed;
+    #[async_trait::async_trait]
+    impl LlmSummarizer for Typed {
+        async fn summarize(&self, _: &str, _: &str) -> Result<String, LlmSummarizerError> {
+            Ok(r#"[{"title":"Independent literal","content":"New explicit preference","category":"UserPreference","layer":"L1","priority":"High","confidence":0.9,"tags":[]}]"#.into())
+        }
+    }
+    let typed = memory::extractor::MemoryExtractor::new(memory::config::ExtractorConfig::default())
+        .with_llm(Arc::new(Typed));
+    let entries = futures::executor::block_on(typed.llm_extract(&messages))?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].title, "Independent literal");
+    Ok(())
+}
+
+#[test]
+fn r385_memory_and_router_controls_are_separate_and_unknown_stays_refused() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let (body, _) = r385_literal_memory_source(root.path())?;
+    let binding = r6_control_test_binding(root.path())?;
+    let mut driver = RecoveryReplies {
+        router_used: true,
+        interpretation_used: true,
+        root: 3,
+        producer: 4,
+        reviewer: 7,
+        final_replies: 2,
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            driver.reply(&body, Some(&binding))?,
+            Some(json!({"role":"assistant","content":"[]"}))
+        );
+    }
+    assert_eq!(
+        (
+            driver.root,
+            driver.producer,
+            driver.reviewer,
+            driver.final_replies
+        ),
+        (3, 4, 7, 2)
+    );
+    assert!(driver.router_used && driver.interpretation_used);
+    let mut wrongs = Vec::new();
+    for (pointer, value) in [
+        ("/stream", json!(true)),
+        ("/stream", Value::Null),
+        ("/model", json!("foreign")),
+        ("/max_tokens", json!(2049)),
+        ("/messages/0/role", json!("user")),
+        ("/messages/1/role", json!("assistant")),
+        (
+            "/messages/0/content",
+            json!(format!("{R385_MEMORY_PROMPT}\nReturn a tool call.")),
+        ),
+        (
+            "/messages/1/content",
+            json!("[User]: Remember that I always prefer an unrelated policy.\n"),
+        ),
+        (
+            "/messages/1/content",
+            json!(
+                body["messages"][1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .replace("task:bounded", "task:foreign")
+            ),
+        ),
+        (
+            "/messages/1/content",
+            json!(
+                body["messages"][1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .replace("error=false", "error=true")
+            ),
+        ),
+    ] {
+        let mut wrong = body.clone();
+        *wrong.pointer_mut(pointer).unwrap() = value;
+        wrongs.push(wrong);
+    }
+    for (field, value) in [
+        (
+            "tools",
+            json!([{"type":"function","function":{"name":"team_create"}}]),
+        ),
+        ("tools", Value::Null),
+        ("tool_choice", json!("none")),
+        ("purpose", json!("memory")),
+    ] {
+        let mut wrong = body.clone();
+        wrong[field] = value;
+        wrongs.push(wrong);
+    }
+    let mut unknown = body.clone();
+    unknown["messages"][0]["content"] = json!("Unregistered no-tools background analysis.");
+    wrongs.push(unknown);
+    for (index, wrong) in wrongs.iter().enumerate() {
+        assert!(
+            driver.reply(wrong, Some(&binding)).is_err(),
+            "negative{index}"
+        );
+        assert_eq!(
+            (
+                driver.root,
+                driver.producer,
+                driver.reviewer,
+                driver.final_replies
+            ),
+            (3, 4, 7, 2)
+        );
+        assert!(driver.router_used && driver.interpretation_used);
+    }
+    // Original scripted terminal reports are also derived, not new preference
+    // or governance decisions. Only their own recorded literal reply is eligible.
+    for text in [
+        "The physical result and authored report are independently verified for user_intent.",
+        "The independently reviewed recovery result is complete: recovery-effect.txt contains recovery-effect-once.",
+    ] {
+        let saved = root.path().join("r6-provider-reply-2.json");
+        private_record(
+            &saved,
+            &json!({"delta":{"role":"assistant","content":text},"synthetic_usage":true}),
+        )?;
+        let mut terminal = body.clone();
+        terminal["messages"][1]["content"] = json!(format!(
+            "{}[Assistant]: {text}\n",
+            body["messages"][1]["content"].as_str().unwrap()
+        ));
+        assert_eq!(
+            driver.reply(&terminal, Some(&binding))?,
+            Some(json!({"role":"assistant","content":"[]"}))
+        );
+        std::fs::remove_file(saved)?;
+    }
+    // Full known Memory prompt but no original reply provenance is not enough.
+    let foreign = tempfile::tempdir()?;
+    assert!(
+        driver
+            .reply(&body, Some(&r6_control_test_binding(foreign.path())?))
+            .is_err()
+    );
+    let router = json!({"model":"r6-finite-local","stream":false,"max_tokens":512,"messages":[{"role":"system","content":"Route one user input to durable Tasks. Return one strict JSON object only."},{"role":"user","content":json!({"input":"A fresh bounded result","mission_hint":null,"candidates":[],"schema":{"action":"continue | create_compound | create_root","task_id":"string or null","additional_objectives":[],"reason":"string"}}).to_string()}]});
+    let mut fresh = RecoveryReplies::default();
+    let answer = fresh.reply(&router, None)?.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(answer["content"].as_str().unwrap())?["action"],
+        "create_root"
+    );
+    assert!(fresh.router_used);
+    assert!(fresh.reply(&router, None).is_err());
+    assert_eq!(
+        (
+            fresh.root,
+            fresh.producer,
+            fresh.reviewer,
+            fresh.final_replies
+        ),
+        (0, 0, 0, 0)
+    );
+    for pointer in [
+        "/messages/0/role",
+        "/messages/1/role",
+        "/messages/1/content",
+    ] {
+        let mut wrong = router.clone();
+        *wrong.pointer_mut(pointer).unwrap() = json!("foreign");
+        assert!(RecoveryReplies::default().reply(&wrong, None).is_err());
+    }
     Ok(())
 }
