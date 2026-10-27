@@ -2299,11 +2299,12 @@ mod evaluation_control_corpus_tests {
         let raw = std::fs::read(path).unwrap();
         assert!(raw.len() < 16384);
         let originals: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(originals.len(), 7);
+        assert_eq!(originals.len(), 8);
         std::env::set_var("COWD_EVAL_HARNESS", "1");
         std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
         for (selector, corpus) in [
             ("live_one_team_execution", "live-one-team-v1"),
+            ("live_small_two_team_collaboration", "live-small-team-v1"),
             ("live_direct_terminal", "live-scenarios-v1"),
             ("live_tool_evidence", "live-scenarios-v1"),
             ("live_minimal_batch_read", "live-batchread-v1"),
@@ -2341,7 +2342,7 @@ mod evaluation_control_corpus_tests {
                     .contains("corpus or prompt"));
                 std::env::set_var("COWD_EVAL_CORPUS_ID", corpus);
             }
-            if selector == "live_minimal_batch_read" {
+            if matches!(selector, "live_minimal_batch_read" | "live_small_two_team_collaboration") {
                 assert_eq!(
                     control.resource_scopes,
                     ["provider", "provider_account", "provider_token_pool", "read:."]

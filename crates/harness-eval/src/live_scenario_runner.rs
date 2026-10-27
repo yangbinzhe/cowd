@@ -7512,6 +7512,7 @@ mod read_evidence_consumer_tests {
     fn original_selector_builds_the_registered_runtime_control_envelope() {
         let cases = [
             ("live_one_team_execution", "live-one-team-v1"),
+            ("live_small_two_team_collaboration", "live-small-team-v1"),
             ("live_direct_terminal", "live-scenarios-v1"),
             ("live_tool_evidence", "live-scenarios-v1"),
             ("live_minimal_batch_read", "live-batchread-v1"),

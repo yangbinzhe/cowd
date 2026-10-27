@@ -59,7 +59,7 @@ mod fixture_profile_tests {
     fn fixed_fixture_asset_preserves_registry_and_generic_semantics() {
         let data = evaluation_fixture_profiles().expect("compiled fixture asset must decode");
         assert_eq!(data.default_corpus_id, "live-scenarios-v1");
-        assert_eq!(data.profiles.len(), 5);
+        assert_eq!(data.profiles.len(), 6);
         let mut ids = BTreeSet::new();
         let mut selectors = BTreeSet::new();
         for profile in data.profiles {
@@ -70,7 +70,10 @@ mod fixture_profile_tests {
         }
         assert!(evaluation_fixture_profile("foreign").is_none());
         assert_eq!(evaluation_fixture_corpus("live_small_two_team_collaboration").as_deref(),
-            Some("live-scenarios-v1"));
+            Some("live-small-team-v1"));
+        assert_eq!(evaluation_fixture_profile("live-small-team-v1").unwrap().observer_resource_grants,
+            ["read:crates/runtime", "read:crates/gateway"]);
+        assert_eq!(evaluation_fixture_corpus("live_direct_terminal").as_deref(), Some("live-scenarios-v1"));
         assert_eq!(evaluation_fixture_corpus("live_u5_active_cancel_isolation").as_deref(),
             Some("live-u5-fairness-v1"));
         assert_eq!(evaluation_fixture_corpus("live_minimal_batch_read").as_deref(),

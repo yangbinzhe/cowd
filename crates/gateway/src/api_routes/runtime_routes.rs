@@ -664,27 +664,7 @@ mod read_evidence_api_tests {
     use super::*;
     #[tokio::test]
     async fn evaluator_owner_context_reaches_registered_read_handler() {
-        let _lock = crate::test_process_env_lock();
-        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                for (key, value) in &self.0 {
-                    if let Some(value) = value {
-                        std::env::set_var(key, value);
-                    } else {
-                        std::env::remove_var(key);
-                    }
-                }
-            }
-        }
-        let _restore = Restore(
-            ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID"]
-                .into_iter()
-                .map(|key| (key, std::env::var_os(key)))
-                .collect(),
-        );
-        let principal = AuthenticatedPrincipal(super::super::test_human_principal());
-        for (corpus, path) in [
+        check_evaluator_read_paths([
             "live-scenarios-v1",
             "live-one-team-v1",
             "live-u5-fairness-v1",
@@ -710,7 +690,47 @@ mod read_evidence_api_tests {
             "crates/provider/src/lib.rs",
             "crates/harness-eval/src/lib.rs",
             "src/a.rs",
-        ].into_iter().map(|path| ("live-batchread-v1", path))) {
+        ].into_iter().map(|path| ("live-batchread-v1", path))).collect()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires immutable envelopes exported by the actual Harness producer exact test"]
+    async fn small_team_export_reaches_owner_reader_and_rejects_foreign_or_outside() {
+        let input = std::env::var_os("COWD_TEST_HARNESS_CONTROL_INPUT")
+            .expect("same bytes exported by original Harness producer");
+        let cases: Vec<Value> = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
+        let content = cases.iter().find(|case| case["selector"] == "live_small_two_team_collaboration")
+            .unwrap()["content"].as_str().unwrap();
+        let (line, prompt) = content.split_once('\n').unwrap();
+        let control: Value = serde_json::from_str(line.strip_prefix("COWD_EVAL_CONTROL ").unwrap()).unwrap();
+        assert_eq!(control["corpus_id"], "live-small-team-v1");
+        assert_eq!(prompt, "original controlled input");
+        check_evaluator_read_paths([
+            "crates/runtime/src/lib.rs",
+            "crates/runtime/src/agentic/execution/dispatch.rs",
+            "crates/gateway/src/main.rs",
+            "crates/gateway/src/api_routes/runtime_routes.rs",
+            "crates/runtime-extra/src/lib.rs",
+            "crates/tools/src/lib.rs",
+            "Cargo.toml",
+        ].into_iter().map(|path| ("live-small-team-v1", path)).collect()).await;
+    }
+
+    async fn check_evaluator_read_paths(cases: Vec<(&str, &str)>) {
+        let _lock = crate::test_process_env_lock();
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    if let Some(value) = value { std::env::set_var(key, value); }
+                    else { std::env::remove_var(key); }
+                }
+            }
+        }
+        let _restore = Restore(["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID"]
+            .into_iter().map(|key| (key, std::env::var_os(key))).collect());
+        let principal = AuthenticatedPrincipal(super::super::test_human_principal());
+        for (corpus, path) in cases {
             let state = crate::api_routes::tests::test_state();
             let supplied = state.services.runtime.as_ref().unwrap().runtime_services();
             let (runtime, execution_id, _) =
@@ -828,6 +848,9 @@ mod read_evidence_api_tests {
                             .contains(&path))
                         || (corpus == "live-u5-fairness-v1"
                             && ["Cargo.toml", "crates/runtime/Cargo.toml"].contains(&path))
+                        || (corpus == "live-small-team-v1"
+                            && ["crates/runtime/src/lib.rs", "crates/runtime/src/agentic/execution/dispatch.rs",
+                                "crates/gateway/src/main.rs", "crates/gateway/src/api_routes/runtime_routes.rs"].contains(&path))
                         || (corpus == "live-batchread-v1"
                             && [
                                 "crates/tools/src/lib.rs",
@@ -1958,7 +1981,14 @@ mod v2_upgrade_tests {
                 "read:crates/provider/src/lib.rs", "read:crates/harness-eval/src/lib.rs",
             ]
         );
+        assert_eq!(
+            evaluation_projection_resource_grants(Some("1"), Some("live-small-team-v1"), true),
+            vec!["read:crates/runtime", "read:crates/gateway"]
+        );
         for (harness, corpus, owns_session) in [
+            (None, Some("live-small-team-v1"), true),
+            (Some("0"), Some("live-small-team-v1"), true),
+            (Some("1"), Some("live-small-team-v1"), false),
             (None, Some("live-batchread-v1"), true),
             (Some("0"), Some("live-batchread-v1"), true),
             (Some("1"), Some("live-batchread-v1"), false),

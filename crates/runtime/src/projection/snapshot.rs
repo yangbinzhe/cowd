@@ -1361,3 +1361,40 @@ pub(super) fn safe_event_payload_ref(
         .and_then(serde_json::Value::as_str)
         .and_then(safe_public_ref)
 }
+
+#[cfg(test)]
+mod directory_grant_tests {
+    use super::*;
+
+    #[test]
+    fn small_team_directory_grants_use_existing_mode_and_path_boundaries() {
+        let context = ProjectionQueryContext {
+            principal: "original-session-owner".into(),
+            workspace_id: "workspace".into(),
+            session_scopes: vec!["session".into()],
+            mission_scopes: vec![],
+            visibility_grants: vec!["read:crates/runtime".into(), "read:crates/gateway".into()],
+            detail_scope: ProjectionDetailScope::Full,
+            authorization_revision: 1,
+        };
+        for path in [
+            "read:crates/runtime/src/lib.rs",
+            "read:crates/runtime/src/agentic/execution/dispatch.rs",
+            "read:crates/gateway/src/main.rs",
+            "read:crates/gateway/src/api_routes/runtime_routes.rs",
+        ] {
+            assert!(strategy_ref_visible(path, &context, Some("read")), "{path}");
+        }
+        for path in [
+            "read:crates/runtime-extra/src/lib.rs",
+            "read:crates/gateway-extra/src/main.rs",
+            "read:crates/tools/src/lib.rs",
+            "read:Cargo.toml",
+            "read:crates/runtime/../tools/src/lib.rs",
+            "read:/etc/passwd",
+            "write:crates/runtime/src/lib.rs",
+        ] {
+            assert!(!strategy_ref_visible(path, &context, Some("read")), "{path}");
+        }
+    }
+}

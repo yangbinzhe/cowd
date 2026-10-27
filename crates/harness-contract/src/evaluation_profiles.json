@@ -52,6 +52,16 @@
         "read:crates/provider/src/lib.rs",
         "read:crates/harness-eval/src/lib.rs"
       ]
+    },
+    {
+      "corpus_id": "live-small-team-v1",
+      "selectors": [
+        "live_small_two_team_collaboration"
+      ],
+      "observer_resource_grants": [
+        "read:crates/runtime",
+        "read:crates/gateway"
+      ]
     }
   ]
 }
