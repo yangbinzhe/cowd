@@ -2814,3 +2814,90 @@ async fn publication_query_without_match_keeps_unread_source_as_continuation() {
     assert!(last["next_request"].is_null());
     assert_eq!(last["coverage"]["complete"], false);
 }
+
+/// Production uses the bound Step validator, not the unbound CLI validator.
+/// Reproduce the observed actions:string / malformed inner entries; this is a
+/// controlled shape counterexample, not a claim of replaying an entire HTTP frame.
+#[test]
+fn bound_step_refusal_carries_the_existing_pinned_schema_example() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let inner = concat!(
+        r#"[{"input":{"mission":"first independent audit"}"#,
+        r#", "input":{"mission":"second independent audit"}]"#,
+    );
+    let frame = json!({"actions":inner,"tool":"agent_invite"}).to_string();
+    let unbound = executor
+        .validate_tool_input("agent_action_batch", &frame)
+        .unwrap_err();
+    assert!(
+        unbound.to_string().contains("Send it shaped like this:"),
+        "{unbound}"
+    );
+    let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+        &runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "bound-refused-batch".into(),
+            tool_name: "agent_action_batch".into(),
+            input: frame.clone(),
+            depends_on: vec![],
+        },
+    );
+    request.session_id = Some("bound-feedback-session".into());
+    attach_gateway_step(&executor, &mut request);
+    let binding = request.step_binding.as_ref().unwrap();
+    let refused = executor
+        .validate_step_tool_input(Some(binding), "agent_action_batch", &frame)
+        .unwrap_err();
+    let message = refused.to_string();
+    let example_text = message
+        .split_once("Send it shaped like this: ")
+        .expect("the actual bound production caller must carry the existing example")
+        .1;
+    let example: serde_json::Value =
+        serde_json::from_str(example_text).expect("complete JSON example");
+    assert!(example["actions"].is_array());
+    assert!(example["actions"][0]["tool"].is_string());
+    assert!(example["actions"][0]["input"].is_object());
+    let accepted = executor
+        .validate_step_tool_input(Some(binding), "agent_action_batch", example_text)
+        .expect("the same original pinned Step accepts the example's shape");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&accepted).unwrap(),
+        example
+    );
+    for invalid in [
+        frame.as_str(),
+        r#"{"actions":[{"input":{"mission":"missing tool"}}]}"#,
+        r#"{"actions":[],"actions":[{"tool":"team_create","input":{}}]}"#,
+        r#"{"actions":[{"tool":"team_create","input":{}}"#,
+    ] {
+        assert!(
+            executor
+                .validate_step_tool_input(Some(binding), "agent_action_batch", invalid)
+                .is_err(),
+            "invalid frame must not become a dispatchable input: {invalid}"
+        );
+    }
+    let mut foreign = binding.clone();
+    foreign.origin.source = harness_contract::step::CallSource::Provider {
+        attempt_id: "foreign-attempt".into(),
+    };
+    let foreign_error = executor
+        .validate_step_tool_input(Some(&foreign), "agent_action_batch", &frame)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        foreign_error.contains("step_origin_source_rejected"),
+        "{foreign_error}"
+    );
+    assert!(
+        !foreign_error.contains("Send it shaped like this:"),
+        "authentication failures must not be converted into schema guidance"
+    );
+    assert_eq!(
+        request.input, frame,
+        "the refused original input is not rewritten or broadcast"
+    );
+}

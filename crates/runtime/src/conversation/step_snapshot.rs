@@ -389,11 +389,31 @@ impl BoundStep {
         }) {
             return Err(RuntimeError::new("tool_outside_bound_step"));
         }
+        // This is the production bound-call path. It deliberately does not
+        // delegate to an executor's unbound validator (which could consult a
+        // newer catalog). Reuse the existing example from this exact pinned
+        // schema, after authenticating the origin and exposure above.
+        let input_error = |error: String| {
+            let example = self
+                .lease
+                .snapshot()
+                .catalog
+                .definitions(None)
+                .into_iter()
+                .find(|definition| definition.name == tool_name)
+                .and_then(|definition| {
+                    harness_contract::tool_input_contract::input_example(&definition.input_schema)
+                });
+            RuntimeError::new(match example {
+                Some(example) => format!("{error}. Send it shaped like this: {example}"),
+                None => error,
+            })
+        };
         let input = harness_contract::step::parse_strict_json(input)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+            .map_err(|error| input_error(error.to_string()))?;
         self.lease
             .validate_input(tool_name, &input)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+            .map_err(|error| input_error(error.to_string()))?;
         Ok(input)
     }
 
