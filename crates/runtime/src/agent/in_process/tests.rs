@@ -3422,7 +3422,7 @@ pub(super) struct DiscoveryTestHost {
 }
 
 impl DiscoveryTestHost {
-    fn new(root: &std::path::Path) -> Self {
+    pub(super) fn new(root: &std::path::Path) -> Self {
         Self {
             tools: tools::ToolHost::builtin("discovery-fixture", root)
                 .with_authorization_lease_verifier(Arc::new(
@@ -6753,19 +6753,21 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
             .expect("hidden checkpoint should reach the pinned Runtime host"),
         harness_contract::context::ToolOutputDraft::bounded_inline("authorized:checkpoint")
     );
-    assert!(executor
-        .receipts
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_empty());
-    assert_eq!(
+    assert!(
+        executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+    assert!(
         executor
             .internal_checkpoint_input(serde_json::json!({
-                "label": "guard",
-                "paths": ["model-must-not-control-this"]
+                "action":"create", "label":"guard",
+                "paths":["model-must-not-control-this"]
             }))
-            .expect("bounded checkpoint input")["paths"],
-        serde_json::json!(["fixtures/target.txt"])
+            .is_err(),
+        "an explicit foreign range must not be replaced with the Team grant"
     );
 }
 
@@ -6802,12 +6804,19 @@ fn root_write_scope_compiles_to_the_checkpoint_whole_workspace_form() {
 
     let input = executor
         .internal_checkpoint_input(serde_json::json!({
-            "label": "guard",
-            "paths": ["model-must-not-control-this"]
+            "label": "guard"
         }))
         .expect("whole-workspace checkpoint input");
     assert_eq!(input.get("label"), Some(&serde_json::json!("guard")));
     assert!(input.get("paths").is_none());
+    assert!(
+        executor
+            .internal_checkpoint_input(serde_json::json!({
+                "action":"create", "label":"guard", "paths":[]
+            }))
+            .is_err(),
+        "explicit empty range must never fall back to the legacy whole-workspace form"
+    );
 }
 
 #[test]

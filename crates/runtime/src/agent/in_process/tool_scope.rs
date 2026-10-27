@@ -252,6 +252,385 @@ mod resource_frame_tests {
             .enforce_resource_ceiling("tool_orchestrate", &broad.to_string())
             .unwrap();
     }
+    fn checkpoint_executor(
+        root: &std::path::Path,
+        host: Arc<dyn RuntimeExecutionHost>,
+        scopes: Option<Vec<String>>,
+    ) -> ScopedRuntimeToolExecutor {
+        ScopedRuntimeToolExecutor {
+            tool_batch: None,
+            host,
+            allowed_tools: BTreeSet::from(["edit".into()]),
+            session_id: "r372-session".into(),
+            sandbox_posture: harness_contract::policy::SandboxPosture::WorkspaceWriteSandbox,
+            policy_revision: 1,
+            memory_context: memory::MemoryTurnContext::new("r372-session", "producer"),
+            reality_context: None,
+            model_lease: "never-dispatched".into(),
+            execution_id: "r372-graph".into(),
+            node_id: "r372-node".into(),
+            attempt: 1,
+            workspace_root: root.into(),
+            path_identity_resolver: Arc::new(
+                crate::path_identity::WorkspacePathIdentityResolver::discover(root).unwrap(),
+            ),
+            scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
+            resource_scopes: scopes,
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
+        }
+    }
+
+    fn checkpoint_assessment(
+        effect: harness_contract::tool::ToolEffectDescriptor,
+        input: &str,
+        parent: PermissionMode,
+        idempotency_key: &str,
+    ) -> crate::EffectiveToolAuthorizationAssessment {
+        let policy = permission_policy(None, parent, &BTreeSet::new());
+        crate::AuthorizationNegotiator::new().assess_effective(
+            &policy,
+            &crate::AuthorizationRequest {
+                principal_id: "agent:r372-producer".into(),
+                capability: "checkpoint".into(),
+                input: input.into(),
+                idempotency_key: idempotency_key.into(),
+                effect,
+                parent_ceiling: policy.active_mode(),
+                parent_lease_id: Some("binding:r372-producer".into()),
+                policy_revision: 1,
+                recovery_scope: "turn:r372".into(),
+                context: crate::PermissionContext::default(),
+                safe_alternatives: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn r372_checkpoint_explicit_range_survives_team_ceiling_and_stays_fail_closed() {
+        use harness_contract::policy::{CapabilityGapKind, DataClassification};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("project")).unwrap();
+        std::fs::write(root.path().join("project/a.txt"), b"preimage").unwrap();
+        let host = Arc::new(CatalogHost(
+            tools::ToolHost::builtin("r372-pure-descriptor", root.path()).pin_snapshot(),
+        ));
+        let input = serde_json::json!({
+            "action":"create", "label":"original prepared range",
+            "paths":["new.txt","project/a.txt","new.txt"]
+        });
+        let builtin = host.0.describe_effect("checkpoint", &input);
+        for scopes in [
+            vec!["workspace:."],
+            vec!["write:project", "write:new.txt", "write:unrelated.txt"],
+            vec!["write:project/a.txt", "write:new.txt"],
+        ] {
+            let executor = checkpoint_executor(
+                root.path(),
+                host.clone(),
+                Some(scopes.into_iter().map(str::to_string).collect()),
+            );
+            let adapted = executor.internal_checkpoint_input(input.clone()).unwrap();
+            assert_eq!(
+                adapted, input,
+                "a ceiling must not expand, truncate or reorder the prepared range"
+            );
+            assert_eq!(
+                executor.internal_checkpoint_input(adapted.clone()).unwrap(),
+                adapted
+            );
+            let descriptor = executor
+                .registered_tool_effect("checkpoint", &input)
+                .unwrap();
+            assert_eq!(descriptor, builtin);
+            let assessed = checkpoint_assessment(
+                descriptor.clone(),
+                &input.to_string(),
+                PermissionMode::WorkspaceWrite,
+                "r372-pure",
+            );
+            assert_eq!(
+                assessed.effective.descriptor.required_permission,
+                PermissionMode::WorkspaceWrite
+            );
+            assert_eq!(
+                assessed.effective.descriptor.assessment.data_sensitivity,
+                DataClassification::Internal
+            );
+            assert_ne!(
+                assessed.assessment.gap.as_ref().map(|gap| gap.kind),
+                Some(CapabilityGapKind::PermissionCeiling)
+            );
+            assert_eq!(
+                checkpoint_assessment(
+                    descriptor,
+                    &input.to_string(),
+                    PermissionMode::ReadOnly,
+                    "r372-low"
+                )
+                .assessment
+                .gap
+                .unwrap()
+                .kind,
+                CapabilityGapKind::PermissionCeiling
+            );
+            assert!(executor.receipts.lock().unwrap().is_empty());
+        }
+        // Preserve the independently observed bad transform as a test-only
+        // counterexample. Production must never apply it to an explicit range.
+        let mut legacy_widened = input.clone();
+        legacy_widened.as_object_mut().unwrap().remove("paths");
+        let legacy = checkpoint_assessment(
+            host.0.describe_effect("checkpoint", &legacy_widened),
+            &input.to_string(),
+            PermissionMode::WorkspaceWrite,
+            "r371-old-widening",
+        );
+        assert_eq!(
+            legacy.effective.descriptor.required_permission,
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            legacy.assessment.gap.unwrap().reason,
+            "requested effect exceeds the parent Mission permission ceiling"
+        );
+
+        let mut executor = checkpoint_executor(root.path(), host, Some(vec!["workspace:.".into()]));
+        for paths in [
+            serde_json::json!([]),
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([1]),
+            serde_json::json!(["../outside"]),
+            serde_json::json!(["/outside"]),
+            serde_json::json!(["."]),
+            serde_json::json!([".cowd/checkpoints"]),
+            serde_json::json!(["project//a.txt"]),
+            serde_json::json!(["new.txt/"]),
+            serde_json::json!(["./new.txt"]),
+        ] {
+            let mut invalid = input.clone();
+            invalid["paths"] = paths;
+            assert!(
+                executor.internal_checkpoint_input(invalid.clone()).is_err(),
+                "{invalid}"
+            );
+            assert!(
+                executor
+                    .registered_tool_effect("checkpoint", &invalid)
+                    .is_none()
+            );
+        }
+        let mut invalid_action = input.clone();
+        invalid_action["action"] = serde_json::json!("restore");
+        assert!(executor.internal_checkpoint_input(invalid_action).is_err());
+        executor.resource_scopes = Some(vec!["write:project/a.txt".into()]);
+        assert!(
+            executor.internal_checkpoint_input(input.clone()).is_err(),
+            "one foreign member must reject the whole request, never silently truncate"
+        );
+        assert!(
+            executor
+                .internal_checkpoint_input(
+                    serde_json::json!({"action":"create","paths":["project"]})
+                )
+                .is_err(),
+            "a file lease does not cover its parent directory"
+        );
+        for scopes in [
+            vec![],
+            vec!["read:.".into()],
+            vec!["write:foreign.txt".into()],
+        ] {
+            executor.resource_scopes = Some(scopes);
+            assert!(executor.internal_checkpoint_input(input.clone()).is_err());
+        }
+        executor.resource_scopes = Some(vec!["workspace:.".into()]);
+        let secret = serde_json::json!({"action":"create","paths":[".env"]});
+        let secret_descriptor = executor
+            .registered_tool_effect("checkpoint", &secret)
+            .unwrap();
+        assert_eq!(
+            checkpoint_assessment(
+                secret_descriptor,
+                &secret.to_string(),
+                PermissionMode::WorkspaceWrite,
+                "r372-secret"
+            )
+            .assessment
+            .gap
+            .unwrap()
+            .kind,
+            CapabilityGapKind::PermissionCeiling
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("project/a.txt", root.path().join("alias")).unwrap();
+            std::os::unix::fs::symlink("absent", root.path().join("dangling")).unwrap();
+            for path in ["alias", "dangling", "dangling/child.txt"] {
+                assert!(
+                    executor
+                        .internal_checkpoint_input(
+                            serde_json::json!({"action":"create","paths":[path]})
+                        )
+                        .is_err(),
+                    "{path}"
+                );
+            }
+        }
+        assert_eq!(executor.next_receipt_sequence.load(Ordering::SeqCst), 0);
+        assert!(!root.path().join(".cowd").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("project/a.txt")).unwrap(),
+            b"preimage"
+        );
+    }
+
+    #[tokio::test]
+    async fn r372_scoped_checkpoint_signed_input_matches_original_execution_range() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), b"preimage").unwrap();
+        std::fs::write(
+            root.path().join("unrelated.txt"),
+            b"not authorized for this checkpoint",
+        )
+        .unwrap();
+        let host = Arc::new(super::super::tests::DiscoveryTestHost::new(root.path()));
+        let executor =
+            checkpoint_executor(root.path(), host.clone(), Some(vec!["workspace:.".into()]));
+        let lease = host.tools.pin_snapshot();
+        let definitions = lease
+            .snapshot()
+            .catalog
+            .definitions(Some(&BTreeSet::from(["checkpoint".into()])))
+            .into_iter()
+            .map(|d| crate::ProviderToolDefinition {
+                name: d.name,
+                description: d.description,
+                input_schema: d.input_schema,
+            })
+            .collect::<Vec<_>>();
+        let input = serde_json::json!({"action":"create","label":"r372 exact signed range","paths":["a.txt"]});
+        let wire = input.to_string();
+        let step = Arc::new(
+            crate::step_snapshot::BoundStep::bind(
+                harness_contract::step::StepIdentity {
+                    step_id: "r372-checkpoint-step".into(),
+                    session_id: "r372-session".into(),
+                    turn_id: "r372-turn".into(),
+                    execution_id: Some("r372-graph".into()),
+                    actor_ref: Some("runtime:checkpoint-guard".into()),
+                    run_ref: None,
+                    attempt: None,
+                    epoch: None,
+                    goal_ref: None,
+                    program_ref: None,
+                    task_ref: None,
+                    build_ref: "unit".into(),
+                },
+                lease,
+                &definitions,
+                &serde_json::json!({"source":"runtime_system"}),
+                &input,
+                BTreeMap::new(),
+                i64::MAX,
+            )
+            .unwrap()
+            .with_parent("r372-original-step"),
+        );
+        let binding = crate::step_snapshot::StepCallBinding::system(
+            step.clone(),
+            "r372-original-step",
+            "r372-system-checkpoint",
+        );
+        let idempotency = binding.effect_idempotency_key();
+        let descriptor = executor
+            .registered_tool_effect("checkpoint", &input)
+            .unwrap();
+        let assessed = checkpoint_assessment(
+            descriptor,
+            &wire,
+            PermissionMode::WorkspaceWrite,
+            &idempotency,
+        );
+        let authorization = crate::ToolPolicy
+            .authorize(
+                &assessed.effective,
+                &assessed.assessment,
+                idempotency,
+                assessed
+                    .assessment
+                    .lease
+                    .clone()
+                    .expect("original pure negotiator must issue an allowed lease"),
+                30,
+            )
+            .unwrap()
+            .authorization;
+        let forged_provider =
+            crate::step_snapshot::StepCallBinding::provider(step, "r372-provider-checkpoint");
+        assert!(
+            executor
+                .execute_step_authorized_invocation_output(
+                    Some(&forged_provider),
+                    &forged_provider.origin.call_id,
+                    &authorization,
+                    "checkpoint",
+                    &wire
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("SystemDerived")
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+        let output = executor
+            .execute_step_authorized_invocation_output(
+                Some(&binding),
+                &binding.origin.call_id,
+                &authorization,
+                "checkpoint",
+                &wire,
+            )
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(output.model_text()).unwrap();
+        let saved = std::path::PathBuf::from(output["path"].as_str().unwrap());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(saved.join(".manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["scopes"], serde_json::json!(["a.txt"]));
+        assert_eq!(std::fs::read(saved.join("a.txt")).unwrap(), b"preimage");
+        assert!(!saved.join("unrelated.txt").exists());
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        let mut changed = input.clone();
+        changed["paths"] = serde_json::json!(["unrelated.txt"]);
+        assert!(
+            executor
+                .execute_step_authorized_invocation_output(
+                    Some(&binding),
+                    &binding.origin.call_id,
+                    &authorization,
+                    "checkpoint",
+                    &changed.to_string()
+                )
+                .await
+                .is_err(),
+            "a different allowed path cannot borrow this input's signature"
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            executor.internal_checkpoint_input(input.clone()).unwrap(),
+            input
+        );
+        assert!(executor.receipts.lock().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(root.path().join("a.txt")).unwrap(),
+            b"preimage"
+        );
+    }
 }
 
 impl ScopedRuntimeToolExecutor {
@@ -336,6 +715,72 @@ impl ScopedRuntimeToolExecutor {
             .as_object()
             .cloned()
             .ok_or_else(|| ToolError::new("Runtime checkpoint input must be a JSON object"))?;
+        if let Some(value) = object.get("paths") {
+            // The prepared operation owns its range. A Team lease is only its
+            // ceiling: it must never replace this range or erase it to `None`.
+            if object.get("action").and_then(serde_json::Value::as_str) != Some("create") {
+                return Err(ToolError::new(
+                    "explicit Runtime checkpoint requires action create",
+                ));
+            }
+            let paths = value
+                .as_array()
+                .filter(|paths| !paths.is_empty())
+                .ok_or_else(|| {
+                    ToolError::new("Runtime checkpoint requires explicit nonempty paths")
+                })?;
+            for value in paths {
+                let raw = value
+                    .as_str()
+                    .ok_or_else(|| ToolError::new("Runtime checkpoint path must be a string"))?;
+                let path = std::path::Path::new(raw);
+                if raw.is_empty() || raw.trim() != raw || raw.contains('\\')
+                    || path.components().any(|part| !matches!(part, std::path::Component::Normal(name) if name != ".cowd"))
+                    || path.components().collect::<std::path::PathBuf>().to_str() != Some(raw)
+                {
+                    return Err(ToolError::new("Runtime checkpoint path is not a canonical workspace range"));
+                }
+                let identity = self
+                    .path_identity_resolver
+                    .resolve_planned_file(raw)
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                if identity.workspace_relative_path != raw {
+                    return Err(ToolError::new(
+                        "Runtime checkpoint path identity changed its range",
+                    ));
+                }
+                // Match the original checkpoint executor's no-symlink rule,
+                // including a dangling link. It checks again at actual use.
+                let mut cursor = self.workspace_root.clone();
+                for component in path.components() {
+                    cursor.push(component.as_os_str());
+                    match std::fs::symlink_metadata(&cursor) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            return Err(ToolError::new(
+                                "Runtime checkpoint path crosses a symlink",
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(error) => return Err(ToolError::new(error.to_string())),
+                    }
+                }
+                if let Some(scopes) = self.resource_scopes.as_deref() {
+                    if !resource_path_is_authorized(&self.path_identity_resolver, raw, scopes, true)
+                        && !crate::tool_host::whole_workspace_resource_lease(scopes, true)
+                    {
+                        return Err(ToolError::new(
+                            "Runtime checkpoint path is outside the Team write scope",
+                        ));
+                    }
+                }
+            }
+            // Preserve even ordering and duplicate values: the original
+            // descriptor, signed input digest and executor see the same JSON.
+            return Ok(input);
+        }
+        // Retain the original legacy no-path contract. It is not a fallback
+        // for any malformed, empty or unauthorized explicit range above.
         object.insert("action".to_string(), serde_json::json!("create"));
         if let Some(scopes) = self.resource_scopes.as_deref() {
             let mut paths = scopes
