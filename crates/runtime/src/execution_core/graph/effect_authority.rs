@@ -57,7 +57,9 @@ impl ExecutionCommitService {
             .execution_id
             .as_deref()
             .ok_or_else(denied)?;
-        if source_id != execution_id {
+        if crate::execution_core::graph::graph_id_for_lookup(source_id)
+            != crate::execution_core::graph::graph_id_for_lookup(execution_id)
+        {
             let source = self
                 .effect_authority_graphs
                 .load(source_id)
@@ -575,7 +577,7 @@ mod system_parent_375_tests {
     }
 
     #[test]
-    fn r375_same_graph_run_alias_loads_but_hits_the_cross_graph_parent_fence() {
+    fn r379_same_graph_run_alias_keeps_the_original_parent_fence() {
         let store = Arc::new(RuntimeEventStore::for_test());
         let service = ExecutionCommitService::new(store.clone());
         let root = running_graph(
@@ -599,11 +601,19 @@ mod system_parent_375_tests {
         assert_eq!(loaded.parent_execution, Some(binding(&root)));
         let aliased = system_request(&child, &alias);
         assert_ne!(loaded.parent_execution, aliased.parent_execution);
-        // This records the current defect; it is not an acceptance of the
-        // aliased request or evidence about ROUND374's missing SystemStep.
-        assert!(matches!(service.validate_system_tool_parent(&aliased),
-            Err(ExecutionCommitError::InvalidCommand(reason))
-            if reason == "system_tool_parent_fence_rejected"));
+        service.validate_system_tool_parent(&aliased).unwrap();
+        // Only the original reader's run: convention is recognized. Unknown
+        // graph names and distinct runner:/runs: namespaces remain refused.
+        for source in [
+            "graph:379:unknown".to_string(),
+            format!("runner:{}", child.id),
+            format!("runs:{}", child.id),
+        ] {
+            assert!(service.effect_authority_graphs.load(&source).is_err());
+            assert!(service
+                .validate_system_tool_parent(&system_request(&child, &source))
+                .is_err());
+        }
         assert_eq!(store.stream_revision(&child.id).unwrap(), child.revision);
         assert_eq!(store.stream_revision(&root.id).unwrap(), root.revision);
         assert_eq!(
