@@ -1557,6 +1557,8 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
             "live-one-team-v1"
         } else if matches!(spec_id, "u5-read-a" | "u5-read-b") {
             "live-u5-fairness-v1"
+        } else if spec_id == "live_minimal_batch_read" {
+            "live-batchread-v1"
         } else {
             "live-scenarios-v1"
         },
@@ -7520,6 +7522,7 @@ mod read_evidence_consumer_tests {
             ("live_one_team_execution", "live-one-team-v1"),
             ("live_direct_terminal", "live-scenarios-v1"),
             ("live_tool_evidence", "live-scenarios-v1"),
+            ("live_minimal_batch_read", "live-batchread-v1"),
             ("u5-read-a", "live-u5-fairness-v1"),
             ("u5-read-b", "live-u5-fairness-v1"),
             (U7_MEMORY, "live-scenarios-v1"),

@@ -2230,6 +2230,7 @@ fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl
     if !matches!(
         control.corpus_id.as_str(),
         "auto-strategy-v1" | "live-scenarios-v1" | "live-one-team-v1" | "live-u5-fairness-v1"
+            | "live-batchread-v1"
     ) || configured_corpus.as_deref() != Some(control.corpus_id.as_str())
         || prompt.trim().is_empty()
     {
@@ -2301,13 +2302,14 @@ mod evaluation_control_corpus_tests {
         let raw = std::fs::read(path).unwrap();
         assert!(raw.len() < 16384);
         let originals: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(originals.len(), 6);
+        assert_eq!(originals.len(), 7);
         std::env::set_var("COWD_EVAL_HARNESS", "1");
         std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
         for (selector, corpus) in [
             ("live_one_team_execution", "live-one-team-v1"),
             ("live_direct_terminal", "live-scenarios-v1"),
             ("live_tool_evidence", "live-scenarios-v1"),
+            ("live_minimal_batch_read", "live-batchread-v1"),
             ("u5-read-a", "live-u5-fairness-v1"),
             ("u5-read-b", "live-u5-fairness-v1"),
             ("live_u7_persistent_memory_recall", "live-scenarios-v1"),
@@ -2335,6 +2337,19 @@ mod evaluation_control_corpus_tests {
                     ["provider", "provider_account", "provider_token_pool", read]
                 );
                 // A known but wrong configured corpus is not an alias.
+                std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
+                assert!(evaluation_turn_control(content)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("corpus or prompt"));
+                std::env::set_var("COWD_EVAL_CORPUS_ID", corpus);
+            }
+            if selector == "live_minimal_batch_read" {
+                assert_eq!(
+                    control.resource_scopes,
+                    ["provider", "provider_account", "provider_token_pool", "read:."]
+                );
+                // The old generic corpus is not an alias for the fixed six-file scene.
                 std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
                 assert!(evaluation_turn_control(content)
                     .unwrap_err()
