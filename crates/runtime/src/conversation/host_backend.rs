@@ -366,11 +366,6 @@ impl<C: ApiClient + Send + Sync + 'static, T: ToolExecutor> TurnModelStepBackend
             .input_interpretation
             .clone()
             .ok_or_else(|| fail("input interpretation purpose missing".into()))?;
-        let proposal = if unseen {
-            Err("new input arrived beyond the frozen interpretation cut".into())
-        } else {
-            proposal
-        };
         let mut outcome = NodeExecutionOutcome::new(completed_result(None, usage.clone()))
             .with_replan(ExecutionGraphReplan {
                 nodes: vec![dynamic_node(
@@ -387,21 +382,14 @@ impl<C: ApiClient + Send + Sync + 'static, T: ToolExecutor> TurnModelStepBackend
             });
         outcome.replan.as_mut().unwrap().edges =
             dynamic_edges(&ticket.node_id, &outcome.replan.as_ref().unwrap().nodes);
-        let proposal = match proposal {
-            Ok(proposal) => proposal,
-            Err(reason) => {
-                let mut state = self.state.lock().await;
-                state.last_verified_progress = false;
-                state.consecutive_unverified_model_steps =
-                    state.consecutive_unverified_model_steps.saturating_add(1);
-                let mut item=ContextItem::new(format!("user-input-proposal-rejected:{}",ticket.node_id),ContextSourceKind::Task,ContextRole::Instruction,
-                    format!("The internal business proposal was not adopted: {reason}. Reconsider the same authenticated inputs; do not emit tools in the interpretation step."));
-                item.authority = ContextAuthority::System;
-                item.visibility = ContextVisibility::Private;
-                state.pending_next_model_context.push(item);
-                return Ok(outcome);
-            }
-        };
+        if unseen {
+            // Re-read the original pending inputs after a genuine cut change.
+            // This says nothing about the validity of the stale proposal.
+            return Ok(outcome);
+        }
+        let proposal = proposal.map_err(|reason| fail(format!(
+            "user input interpretation rejected: {reason}"
+        )))?;
         let decision = &proposal.decisions[0];
         let mutation = if decision.action == InputDispositionAction::AmendCurrentTurn {
             Some(
@@ -1964,27 +1952,30 @@ where
                     reason: format!("prepare working context: {reason}"),
                 })?
         };
-        let (user_goal_id,user_request,user_ids,owns_user_goal)={
+        let (user_goal_id,user_ingress,user_ids,owns_user_goal)={
             let state=self.state.lock().await;
-            (state.goal_id.clone(),state.ingress.as_ref().map(|r|r.request_id.clone()),
+            (state.goal_id.clone(),state.ingress.clone(),
                 state.pending_disposition_inputs.iter().map(|r|r.envelope.input_id.to_string()).collect::<Vec<_>>(),state.execution_role.owns_root_presentation())
         };
         let user_goal_source=self.services.goal_store().projection(&user_goal_id)
             .map_err(|reason|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason})?
             .ok_or_else(||NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:"user Goal source missing".into()})?;
-        let user_frame=if owns_user_goal {
-            if let Some(binding)=user_goal_source.goal.execution_binding.as_ref() {
-                crate::turn_inbox::authenticated_goal_inputs(self.services.as_ref(),binding,user_request.as_deref(),&user_ids).await
-                    .map_err(|reason|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason})?
-            } else {None}
-        } else {None};
-        let user_graph_revision=self.services.graph_state_store().load(&ticket.graph_id)
-            .map_err(|e|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:e.to_string()})?.revision;
-        let user_program_cut=if let Some(binding)=user_goal_source.goal.execution_binding.as_ref() {
-            self.services.agent_action_service().project_if_exists(&binding.agentic_program_id)
-                .map_err(|e|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:e.to_string()})?
-                .map(|p|(p.program_id,p.revision))
-        } else {None};
+        let user_frame = if owns_user_goal {
+            crate::turn_inbox::authenticated_goal_inputs(
+                self.services.as_ref(), &user_goal_source, user_ingress.as_ref(), &user_ids,
+            ).await.map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?
+        } else { None };
+        // These cuts belong to amendment preparation, not ordinary execution.
+        let user_source_cuts = if user_frame.is_some() {
+            let graph_revision = self.services.graph_state_store().load(&ticket.graph_id)
+                .map_err(|e| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: e.to_string() })?.revision;
+            let program_cut = if let Some(binding) = user_goal_source.goal.execution_binding.as_ref() {
+                self.services.agent_action_service().project_if_exists(&binding.agentic_program_id)
+                    .map_err(|e| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: e.to_string() })?
+                    .map(|p| (p.program_id, p.revision))
+            } else { None };
+            Some((graph_revision, program_cut))
+        } else { None };
         let user_framing=user_frame.as_ref().map(|frame|serde_json::json!({
             "current_goal":user_goal_source.goal,
             "inputs":frame.inputs.iter().enumerate().map(|(slot,(_,_,text))|serde_json::json!({"input_slot":slot,"text":text})).collect::<Vec<_>>()
@@ -2331,6 +2322,8 @@ where
         drop(runtime);
         if result.as_ref().ok().is_some_and(|step|step.input_interpretation.is_some()) {
             let step=result.map_err(|e|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:e.to_string()})?;
+            let (user_graph_revision, user_program_cut) = user_source_cuts.ok_or_else(||
+                NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "interpretation has no frozen source cuts".into() })?;
             return self.accept_user_input_interpretation(ticket,user_goal_source,
                 user_frame.ok_or_else(||NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:"interpretation has no authenticated frame".into()})?,
                 user_graph_revision,user_program_cut,step,&consumed_inputs).await;
@@ -2456,7 +2449,7 @@ where
                         }
                         state.pending_disposition_inputs.clone()
                     };
-                let input_update_applied = !pending_disposition_inputs.is_empty();
+                let input_update_pending = !pending_disposition_inputs.is_empty();
                 let mut state = self.state.lock().await;
                 for receipt in &step.early_tool_receipts {
                     if receipt.started_at_ms < step.response_completed_at_ms {
@@ -2518,7 +2511,7 @@ where
                     state.assistant_messages.pop();
                     state.pending_transcript.remove(&ticket.node_id);
                 }
-                if input_update_applied {
+                if input_update_pending {
                     // The provider candidate did not observe these durable inputs.
                     // Preserve usage telemetry, but force a fresh semantic model step
                     // with new data context. Only authenticated original inputs
@@ -2526,20 +2519,12 @@ where
                     // context absorption cannot alter the current Goal contract.
                     state.assistant_messages.pop();
                     state.pending_transcript.remove(&ticket.node_id);
-                    state.pending_disposition_inputs.clear();
                     state.clean_terminal_synthesis_next = false;
                     state.clean_terminal_synthesis_attempted = false;
                     state.last_verified_progress = true;
-                    for record in &pending_disposition_inputs {
-                        state.content.push_str("\n\nApplied running-Turn input:\n");
-                        state.content.push_str(&record.envelope.content);
-                    }
-                    state.pending_next_model_context.extend(
-                        crate::turn_inbox::checkpoint_context_items(
-                            TurnInputCheckpoint::BeforeProviderRequest,
-                            &pending_disposition_inputs,
-                        ),
-                    );
+                    // Keep the labelled originals pending until the original
+                    // application transaction and receipt adopt them. Context
+                    // absorption is not a second business application owner.
                 }
                 for record in late_disposition_inputs {
                     if !state
@@ -2581,14 +2566,14 @@ where
                         "runtime.session_input_checkpoint",
                         observation_revision,
                         format!(
-                            "consumed {} session input update(s); incorporated_into_agent_context={input_update_applied}",
+                            "consumed {} session input update(s); awaiting_original_application={input_update_pending}",
                             consumed_inputs.len(),
                         ),
                         format!("session-input:{}", sha256_digest(&evidence_refs.join("\n"))),
                         ObservationResultClass::Informational,
                     );
                     observation.evidence_refs.clone_from(&evidence_refs);
-                    if input_update_applied {
+                    if input_update_pending {
                         observation.information_gain = InformationGain {
                             distinguishing_evidence_refs: evidence_refs,
                             resolved_unknown_refs: Vec::new(),
@@ -2602,10 +2587,10 @@ where
                     }
                     observation
                 });
-                let mut intent = if late_inputs || input_update_applied {
+                let mut intent = if late_inputs || input_update_pending {
                     ModelStepIntent::Replan {
                         reason:
-                            "new Session input was incorporated into authoritative Agent context; continue from the newer durable input cursor"
+                            "new Session input awaits original authenticated application; continue from the newer durable input cursor"
                                 .to_string(),
                     }
                 } else {
@@ -2641,7 +2626,7 @@ where
                             // and do not fail the whole graph before recovery.
                             ModelStepIntent::FinalAnswer { text: final_text }
                         }
-                        ModelStepIntent::Replan { .. } if !input_update_applied => {
+                        ModelStepIntent::Replan { .. } if !input_update_pending => {
                             // ConversationRuntime turns a tool call outside the
                             // current exposure lease into Replan. During a
                             // text-only checkpoint that replan must not restore
@@ -2681,13 +2666,6 @@ where
                 observation.evidence_refs = vec![format!("execution_node:{}", ticket.node_id)];
                 observation.parallelism_delta.ready_work =
                     u16::try_from(independent_tool_call_count(&intent)).unwrap_or(u16::MAX);
-                if input_update_applied {
-                    observation.unknown_deltas.push(UnknownDelta {
-                        unknown_id: format!("replan-after-user-input:{}", ticket.node_id),
-                        change: ResolutionDeltaKind::Resolved,
-                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                    });
-                }
                 let mut provider_observation = runtime_observation(
                     observation_identity.clone(),
                     RuntimeObservationKind::ProviderProgress,
@@ -2768,7 +2746,7 @@ where
                     || state.execution_role.is_delegated_leaf()
                     || intent_requests_explicit_content(&intent);
                 let _retained_agentic_content_ref =
-                    if late_inputs || input_update_applied || !agentic_content_bridge_active {
+                    if late_inputs || input_update_pending || !agentic_content_bridge_active {
                         None
                     } else {
                         persist_agentic_content_draft(

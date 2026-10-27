@@ -422,6 +422,32 @@ pub struct GoalProjection {
     pub progress: GoalProgressSnapshot,
 }
 
+impl GoalProjection {
+    /// Initial execution already adopted this exact Session message in the
+    /// goal.created snapshot. This is classification, never a fresh grant or
+    /// an amendment receipt. Continuations may carry a different original source.
+    pub(crate) fn binds_initial_input(
+        &self,
+        session: &str,
+        turn: &str,
+        request: &str,
+        message: &str,
+    ) -> bool {
+        if [session, turn, request, message].iter().any(|value| value.is_empty()) {
+            return false;
+        }
+        self.goal.session_id == session
+            && self.goal.source_intent_ref.as_deref()
+                == Some(format!("session_message:{message}").as_str())
+            && self.goal.execution_binding.as_ref().is_some_and(|binding| {
+                binding.session_id == session
+                    && binding.turn_id == turn
+                    && binding.root_execution_id
+                        == crate::session_execution::session_ingress_graph_id(session, request, turn)
+            })
+    }
+}
+
 pub struct GoalProgressReducer;
 
 impl GoalProgressReducer {
@@ -3790,6 +3816,99 @@ mod tests {
             },
             ticket,
         )
+    }
+
+    #[tokio::test]
+    async fn initial_goal_binding_survives_runtime_reconstruction_without_reinterpreting_input() {
+        use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
+        let workspace = tempfile::tempdir().unwrap();
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let sessions = Arc::new(crate::test_support::session_store());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(workspace.path().join("original-artifacts")));
+        sessions.create_session(&session::SessionRecord {
+            session_id: "session-test".into(), platform: "test".into(),
+            chat_id: "session-test".into(), user_id: None, model: None,
+            created_at: "2026-10-28T00:00:00Z".into(), last_activity: "2026-10-28T00:00:00Z".into(),
+            message_count: 0, reset_policy: "manual".into(), metadata_json: None,
+            input_tokens: 0, output_tokens: 0, status: "active".into(),
+        }).await.unwrap();
+        for (n, id) in [(0, "initial"), (1, "append-a"), (2, "append-b")] {
+            let origin = SessionInputUserSource {
+                principal_id: "real-user".into(), session_id: "session-test".into(),
+                input_id: id.into(), request_id: format!("request-{id}"),
+                message_id: format!("message-{id}"), session_generation: 1,
+                content_sha256: format!("{:x}", sha2::Sha256::digest(b"56")),
+            };
+            sessions.append_ingress_with_runtime_outbox("session-test", "user",
+                Some(&serde_json::json!([{"type":"text","text":"56"}]).to_string()), n + 1,
+                &session::SessionRuntimeOutboxRequest {
+                    input_id: id.into(), request_id: origin.request_id.clone(),
+                    turn_id: if n == 0 { "user-turn".into() } else { format!("turn-{id}") }, message_id: origin.message_id.clone(),
+                    session_generation: 1,
+                    decision: if n == 0 { harness_contract::turn::InputRoutingDecision::StartNewTurn } else { harness_contract::turn::InputRoutingDecision::SupplementCurrentTurn },
+                    target_turn_id: (n > 0).then(|| "user-turn".into()),
+                    classification_json: Some(serde_json::json!({"metadata":{SESSION_INPUT_USER_SOURCE_KEY:origin}}).to_string()),
+                    task_route_hint: None, created_at_ms: n + 1, runtime_options_json: None,
+                }).await.unwrap();
+        }
+        let mut initial = goal();
+        initial.scope = harness_contract::goal::GoalScope::UserObjective;
+        initial.source_intent_ref = Some("session_message:message-initial".into());
+        initial.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
+            objective_id: "user-objective".into(), session_id: "session-test".into(),
+            turn_id: "user-turn".into(),
+            root_execution_id: crate::session_execution::session_ingress_graph_id(
+                "session-test", "request-initial", "user-turn"),
+            agentic_program_id: "user-program".into(),
+        });
+        GoalStore::new(events.clone()).create(initial).unwrap();
+        for _epoch in 0..2 {
+            let services = crate::RuntimeServices::test_builder(workspace.path(), workspace.path())
+                .runtime_event_store(events.clone()).artifact_store(artifacts.clone()).build().unwrap();
+            services.install_test_session_store(sessions.clone()).unwrap();
+            let source = services.goal_store().projection("goal-test").unwrap().unwrap();
+            let ingress = crate::TurnIngressRef {
+                session_id: "session-test".into(), turn_id: "user-turn".into(),
+                request_id: "request-initial".into(), message_id: "message-initial".into(),
+                primary_task_id: "task".into(), root_task_id: "task".into(),
+                session_generation: 1, input_sequence: 1, claim_owner: "original".into(),
+                claim_token: "claim".into(), claim_revision: 1, handoff_id: None,
+            };
+            assert!(crate::turn_inbox::authenticated_goal_inputs(
+                services.as_ref(), &source, Some(&ingress), &[])
+                .await.unwrap().is_none(), "initial input already belongs to durable Goal, not an amendment");
+            let frame = crate::turn_inbox::authenticated_goal_inputs(
+                services.as_ref(), &source, Some(&ingress),
+                &["initial".into(), "append-a".into(), "append-b".into()])
+                .await.unwrap().unwrap();
+            assert_eq!(frame.inputs.iter().map(|(r,_,_)|r.input_id.as_str()).collect::<Vec<_>>(),
+                vec!["append-a", "append-b"], "same text is not an input identity");
+            assert_eq!(frame.inputs[0].2, "56");
+            assert_eq!(frame.inputs[1].2, "56");
+            let mut continuation = source.clone();
+            continuation.goal.source_intent_ref = Some("session_message:old-original".into());
+            let new_frame = crate::turn_inbox::authenticated_goal_inputs(
+                services.as_ref(), &continuation, Some(&ingress), &[]).await.unwrap().unwrap();
+            assert_eq!(new_frame.inputs[0].0.input_id, "initial",
+                "a continuation carrying an old source must not skip its new ingress");
+            for mismatch in ["session", "turn", "root", "source", "missing"] {
+                let mut changed = source.clone();
+                match mismatch {
+                    "session" => changed.goal.execution_binding.as_mut().unwrap().session_id = "foreign".into(),
+                    "turn" => changed.goal.execution_binding.as_mut().unwrap().turn_id = "foreign".into(),
+                    "root" => changed.goal.execution_binding.as_mut().unwrap().root_execution_id = "foreign".into(),
+                    "source" => changed.goal.source_intent_ref = Some("session_message:other".into()),
+                    "missing" => changed.goal.execution_binding = None,
+                    _ => unreachable!(),
+                }
+                assert!(!changed.binds_initial_input("session-test", "user-turn", "request-initial", "message-initial"), "{mismatch}");
+            }
+            services.shutdown_maintenance().await;
+            assert_eq!(services.shutdown_execution().await.forced_aborts, 0);
+            drop(services);
+        }
+        assert!(sessions.get_session_runtime_outbox("request-initial").await.unwrap().unwrap()
+            .application_receipt.is_none(), "selection cannot fabricate application consumption");
     }
 
     fn current_write_goal_fixture() -> (

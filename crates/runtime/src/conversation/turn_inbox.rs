@@ -120,11 +120,20 @@ pub fn checkpoint_context_items(
 /// must agree with the Session record returned by the original query port.
 pub(crate) async fn authenticated_goal_inputs(
     services: &crate::RuntimeServices,
-    binding: &harness_contract::goal::GoalExecutionBinding,
-    request_id: Option<&str>,
+    goal: &crate::execution_core::goal::GoalProjection,
+    ingress: Option<&crate::TurnIngressRef>,
     input_ids: &[String],
 ) -> Result<Option<crate::execution_core::goal::UserGoalInputFrame>, String> {
     use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
+    let Some(binding) = goal.goal.execution_binding.as_ref() else {
+        return Ok(None);
+    };
+    let request_id = ingress.filter(|input| !goal.binds_initial_input(
+        &input.session_id, &input.turn_id, &input.request_id, &input.message_id,
+    )).map(|input| input.request_id.as_str());
+    if request_id.is_none() && input_ids.is_empty() {
+        return Ok(None);
+    }
     let Some(query) = services.session_query_port() else {
         return Ok(None);
     };
@@ -150,6 +159,9 @@ pub(crate) async fn authenticated_goal_inputs(
     }
     let mut inputs = Vec::new();
     for record in records {
+        if goal.binds_initial_input(&record.session_id, &record.turn_id, &record.request_id, &record.message_id) {
+            continue;
+        }
         if record
             .application_receipt
             .as_ref()
