@@ -27,9 +27,10 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROGRAM_EXTRACTION_RETRIES: u32 = 3;
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 const U7_MEMORY: &str = "live_u7_persistent_memory_recall";
+const U7_MEMORY_LIFECYCLE: &str = "live_u7_memory_correction_delete_restart";
 const U7_MEMORY_PROMPT: &str = "请依据已保存的 u7-memory-lighthouse 项目备件调度记忆，回答仓库代号和出库口令。请用中文短句说明记忆中的两个实际值；找不到就明确说明缺失，不要猜测。不要读取工作区文件，不要执行写入工具，不要组队。";
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct U7MemoryFixture {
     scope: &'static str,
     lookup: String,
@@ -75,6 +76,72 @@ fn u7_persisted_record(value: &Value, id: &str, content: &str) -> bool {
             .any(|row| u7_persisted_record(row, id, content)),
         _ => false,
     }
+}
+
+fn u7_terminal_business(case: &Value, session: &str) -> bool {
+    let execution = case["execution_id"].as_str().filter(|id| !id.is_empty());
+    let turn = case["turn_id"].as_str().filter(|id| !id.is_empty());
+    execution.zip(turn).is_some_and(|(execution, turn)| {
+        let outcome = &case["business_observation"];
+        let delivery = &case["delivery_observation"];
+        case["session_id"] == session
+            && outcome["event_status"] == "succeeded"
+            && outcome["session_id"] == session
+            && outcome["turn_id"] == turn
+            && outcome["execution_id"] == execution
+            && delivery["status"] == "confirmed"
+            && delivery["fresh_context_confirmed"] == true
+            && delivery["session_id"] == session
+            && delivery["turn_id"] == turn
+            && delivery["execution_id"] == execution
+            && case["terminal_id"].as_str().is_some_and(|id| {
+                !id.is_empty()
+                    && delivery["message_id"] == id
+                    && delivery["ack"]["message_id"] == id
+            })
+            && delivery["ack"]["session_id"] == session
+    })
+}
+
+fn u7_memory_receipt_previews<'a>(case: &'a Value, session: &str, lookup: &str) -> Vec<&'a str> {
+    let Some(execution) = case["execution_id"].as_str().filter(|id| !id.is_empty()) else {
+        return Vec::new();
+    };
+    let Some(turn) = case["turn_id"].as_str().filter(|id| !id.is_empty()) else {
+        return Vec::new();
+    };
+    case["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["channel"] == "timeline")
+        .flat_map(|row| row["response"]["events"].as_array().into_iter().flatten())
+        .filter_map(|event| {
+            let payload = &event["payload"];
+            let binding = &payload["_runtime_activity_binding"];
+            let input = payload["input_preview"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            let valid = event["kind"] == "tool.invocation.completed"
+                && event["stream_id"] == format!("session:{session}")
+                && payload["tool_name"] == "context_retrieve"
+                && payload["status"] == "completed"
+                && payload["is_error"] == false
+                && payload["session_id"] == session
+                && binding["session_id"] == session
+                && binding["turn_id"] == turn
+                && binding["root_execution_id"] == execution
+                && binding["tool_contract_id"] == "context_retrieve"
+                && payload["tool_call_id"]
+                    .as_str()
+                    .is_some_and(|call| !call.is_empty() && binding["tool_call_id"] == call)
+                && input.as_ref().is_some_and(|input| {
+                    input["source"] == "memory"
+                        && input["query"].as_str().is_some_and(|q| q.contains(lookup))
+                });
+            valid.then(|| payload["output_preview"].as_str()).flatten()
+        })
+        .collect()
 }
 
 fn u7_memory_checks(
@@ -135,54 +202,18 @@ fn u7_memory_checks(
                 )
             && u7_persisted_record(&row["readback"], id, &fixture.content)
     });
-    let execution = case["execution_id"].as_str().filter(|id| !id.is_empty());
-    let turn = case["turn_id"].as_str().filter(|id| !id.is_empty());
-    let retrieval = seed_verified && seed_id.zip(execution).zip(turn).is_some_and(|((id, execution), turn)| {
-        case["trace"].as_array().into_iter().flatten()
-            .filter(|row| row["channel"] == "timeline")
-            .flat_map(|row| row["response"]["events"].as_array().into_iter().flatten())
-            .any(|event| {
-                let payload = &event["payload"];
-                let binding = &payload["_runtime_activity_binding"];
-                let input = payload["input_preview"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok());
-                let preview = payload["output_preview"].as_str().unwrap_or_default();
-                event["kind"] == "tool.invocation.completed"
-                    && event["stream_id"] == format!("session:{session}")
-                    && payload["tool_name"] == "context_retrieve"
-                    && payload["status"] == "completed" && payload["is_error"] == false
-                    && payload["session_id"] == session
-                    && binding["session_id"] == session && binding["turn_id"] == turn
-                    && binding["root_execution_id"] == execution
-                    && payload["tool_call_id"].as_str().is_some_and(|call| !call.is_empty() && binding["tool_call_id"] == call)
-                    && binding["tool_contract_id"] == "context_retrieve"
-                    && input.as_ref().is_some_and(|input| input["source"] == "memory" && input["query"].as_str().is_some_and(|q| q.contains(&fixture.lookup)))
-                    // This is a retained Runtime-owned receipt preview, not a
-                    // claim to have recovered or parsed the complete raw body.
-                    && preview.starts_with("{\n  \"selected\": [\n    {")
-                    && preview.contains(&format!("\"memory_id\": {}", json!(id)))
-                    && preview.contains(&format!("\"preview\": {}", json!(&fixture.content)))
-            })
-    });
-    let terminal = execution.zip(turn).is_some_and(|(execution, turn)| {
-        let outcome = &case["business_observation"];
-        let delivery = &case["delivery_observation"];
-        case["session_id"] == session
-            && outcome["event_status"] == "succeeded"
-            && outcome["session_id"] == session
-            && outcome["turn_id"] == turn
-            && outcome["execution_id"] == execution
-            && delivery["status"] == "confirmed"
-            && delivery["fresh_context_confirmed"] == true
-            && delivery["session_id"] == session
-            && delivery["turn_id"] == turn
-            && delivery["execution_id"] == execution
-            && case["terminal_id"].as_str().is_some_and(|id| {
-                !id.is_empty()
-                    && delivery["message_id"] == id
-                    && delivery["ack"]["message_id"] == id
-            })
-            && delivery["ack"]["session_id"] == session
-    });
+    let retrieval = seed_verified
+        && seed_id.is_some_and(|id| {
+            u7_memory_receipt_previews(case, session, &fixture.lookup)
+                .iter()
+                .any(|preview| {
+                    // Only the retained receipt preview is verified, never a full-body claim.
+                    preview.starts_with("{\n  \"selected\": [\n    {")
+                        && preview.contains(&format!("\"memory_id\": {}", json!(id)))
+                        && preview.contains(&format!("\"preview\": {}", json!(&fixture.content)))
+                })
+        });
+    let terminal = u7_terminal_business(case, session);
     json!({"passed": seed_verified && retrieval && correct && terminal,
         "business_passed":seed_verified && retrieval && correct && terminal,
         "authorized_persistent_seed_verified":seed_verified, "bound_memory_retrieval_observed":retrieval,
@@ -190,6 +221,102 @@ fn u7_memory_checks(
         "retrieval_evidence_kind":"durable_bound_tool_receipt_preview", "full_result_body_verified":false,
         "persisted_context_memory_selected":selected, "automatic_context_selection_required":false,
         "independent_business_values":correct, "history":history})
+}
+
+fn u7_phase_delivery_passed(case: &Value) -> bool {
+    let session = case["session_id"].as_str().unwrap_or_default();
+    !session.is_empty()
+        && u7_terminal_business(case, session)
+        && case["session_actor_cleanup"]["status"] == "passed"
+        && case["acceptance"]["checks"]
+            .as_array()
+            .is_some_and(|checks| {
+                !checks.is_empty()
+                    && checks.iter().all(|check| {
+                        check["passed"] == true
+                            || (check["name"] == "terminal_three_piece_complete"
+                                && check["missing"].as_array().is_some_and(|missing| {
+                                    !missing.is_empty()
+                                        && missing.iter().all(|piece| piece == "goal_verified")
+                                }))
+                    })
+            })
+}
+fn u7_contains_any_secret(answer: &str, old: &U7MemoryFixture, new: &U7MemoryFixture) -> bool {
+    let answer = answer.to_ascii_lowercase();
+    [
+        &old.warehouse,
+        &old.passphrase,
+        &new.warehouse,
+        &new.passphrase,
+    ]
+    .iter()
+    .any(|secret| answer.contains(&secret.to_ascii_lowercase()))
+}
+fn u7_explicit_absence(answer: &str) -> bool {
+    [
+        "不存在",
+        "未找到",
+        "找不到",
+        "缺失",
+        "未检索到",
+        "没有找到",
+        "没有相关",
+        "无相关",
+        "已删除",
+    ]
+    .iter()
+    .any(|word| answer.contains(word))
+}
+fn u7_active_memory_absent(readback: &Value, id: &str) -> bool {
+    readback["enabled"] == true
+        && readback["layer"] == "L3"
+        && readback["include_archived"] == false
+        && readback["entries"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .all(|entry| entry["id"].as_str().is_some_and(|found| found != id))
+        })
+}
+fn u7_private_json(path: &std::path::Path, value: &Value) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if path.exists() {
+        return Err("U7 owner request already exists".into());
+    }
+    let temporary = path.with_extension("tmp");
+    let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
+    file.write_all(&serde_json::to_vec(value).map_err(|e| e.to_string())?)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(temporary, path).map_err(|e| e.to_string())
+}
+fn u7_restart_matches(returned: &Value, request: &Value) -> bool {
+    returned["kind"] == "u7_owned_restart_returned"
+        && returned["memory_id"] == request["memory_id"]
+        && returned["request_sha256"]
+            == format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(request).unwrap_or_default())
+            )
+        && returned["old_pid"].as_u64().is_some_and(|old| {
+            old > 0
+                && returned["new_pid"]
+                    .as_u64()
+                    .is_some_and(|new| new > 0 && new != old)
+        })
+        && request["config_sha256"]
+            .as_str()
+            .is_some_and(|sha| sha.len() == 64 && returned["same_config_sha256"] == sha)
+        && returned["first_shutdown_validation"]["status"] == "passed"
+        && returned["first_shutdown_validation"]["identity"]["pid"] == returned["old_pid"]
+        && returned["ready"] == true
 }
 
 const U5_FAIRNESS: &str = "live_u5_shared_session_fairness";
@@ -1625,7 +1752,7 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option
         // exact: the isolated workspace plus network reads, never the host.
         resource_scopes.push("workspace:.");
         resource_scopes.push("network:*");
-    } else if !matches!(spec_id, "u5-read-a" | "u5-read-b" | U7_MEMORY) {
+    } else if !matches!(spec_id, "u5-read-a" | "u5-read-b" | U7_MEMORY | U7_MEMORY_LIFECYCLE) {
         // Read-only source-analysis scenarios must be able to read the isolated
         // candidate workspace (`crates/...`) to ground their evidence. Without
         // this lease every source read is denied by the resource ceiling.
@@ -3031,6 +3158,9 @@ impl LiveScenarioRunner {
         {
             scenario_specs.push(u7_memory_spec());
         }
+        if selected_scenario_ids.as_ref().is_some_and(|ids|ids.contains(U7_MEMORY_LIFECYCLE)) {
+            scenario_specs.push(LiveScenarioSpec {id:U7_MEMORY_LIFECYCLE,..u7_memory_spec()});
+        }
         let registered_scenario_ids = scenario_specs
             .iter()
             .map(|spec| spec.id.to_string())
@@ -3147,6 +3277,13 @@ impl LiveScenarioRunner {
         spec: LiveScenarioSpec,
         provider_token_telemetry_limit: Option<u64>,
     ) -> Value {
+        if spec.id == U7_MEMORY_LIFECYCLE {
+            return self.run_u7_memory_lifecycle(provider_token_telemetry_limit);
+        }
+        self.run_prepared_scenario(spec, provider_token_telemetry_limit, None)
+    }
+
+    fn run_prepared_scenario(&self, spec:LiveScenarioSpec, provider_token_telemetry_limit:Option<u64>, prepared:Option<(U7MemoryFixture,Value)>) -> Value {
         if let LiveAcceptance::U5(mode) = spec.acceptance {
             let host = match U5Host::inherited() {
                 Ok(host) => std::sync::Arc::new(host),
@@ -3166,7 +3303,10 @@ impl LiveScenarioRunner {
         }
         let started = Instant::now();
         let mut trace = Vec::new();
-        let u7_fixture = if spec.id == U7_MEMORY {
+        let u7_fixture = if let Some((fixture, evidence)) = prepared {
+            trace.push(json!({"kind":"u7_preregistered_persistent_memory","evidence":evidence}));
+            Some(fixture)
+        } else if spec.id == U7_MEMORY {
             if std::env::var("COWD_EVAL_RESUME_SESSION")
                 .ok()
                 .is_some_and(|id| !id.trim().is_empty())
@@ -3277,6 +3417,205 @@ impl LiveScenarioRunner {
             result["session_actor_trace"] = json!(actor_trace);
         }
         result
+    }
+
+    fn prepare_u7_correction(
+        &self,
+    ) -> Result<(U7MemoryFixture, U7MemoryFixture, String, Value), String> {
+        let (old, original) = self.prepare_u7_memory()?;
+        let id = original["memory_id"]
+            .as_str()
+            .ok_or("original seed id missing")?
+            .to_owned();
+        let mut corrected = U7MemoryFixture::fresh();
+        corrected.lookup = old.lookup.clone();
+        // Freeze the independent corrected values before PATCH and provider dispatch.
+        let corrected_path = std::path::PathBuf::from(
+            std::env::var("COWD_EVAL_U7_FIXTURE_FILE")
+                .map_err(|_| "U7 private fixture path missing")?,
+        )
+        .with_extension("corrected.json");
+        u7_private_json(&corrected_path, &json!(&corrected))?;
+        let patch = response_json(
+            self.client
+                .patch(format!("{}/api/memory/entry/{id}", self.base_url))
+                .json(&json!({"content":corrected.content}))
+                .send()
+                .map_err(|e| e.to_string())?,
+        )?;
+        if patch["id"] != id || patch["updated"] != true {
+            return Err("same-id Memory correction not confirmed".into());
+        }
+        let readback = self.get_json("/api/memory/L3")?;
+        if !u7_persisted_record(&readback, &id, &corrected.content) {
+            return Err("same-id corrected Memory readback failed".into());
+        }
+        let evidence = json!({"memory_id":id,"input":corrected,"fixture_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec_pretty(&corrected).map_err(|e|e.to_string())?)),"readback":readback,"original_seed":original,"patch":patch,"preparation_is_not_business_success":true});
+        Ok((old, corrected, id, evidence))
+    }
+
+    fn run_u7_memory_lifecycle(&self, telemetry: Option<u64>) -> Value {
+        let spec = LiveScenarioSpec {
+            id: U7_MEMORY_LIFECYCLE,
+            ..u7_memory_spec()
+        };
+        let started = Instant::now();
+        let mut phases = Vec::new();
+        let operation = (|| -> Result<Value, String> {
+            let (old, corrected, id, evidence) = self.prepare_u7_correction()?;
+            let correction = self.run_prepared_scenario(
+                u7_memory_spec(),
+                telemetry,
+                Some((corrected.clone(), evidence)),
+            );
+            let answer = correction["u7_terminal_answer"]
+                .as_str()
+                .unwrap_or_default();
+            let corrected_passed = u7_phase_delivery_passed(&correction)
+                && correction["u7_memory_evidence"]["business_passed"] == true
+                && !u7_contains_any_secret(answer, &old, &old);
+            phases.push(correction);
+            if !corrected_passed {
+                return Err("U7 correction phase failed; deletion/restart phase not dispatched".into());
+            }
+            let deleted = self
+                .client
+                .delete(format!("{}/api/memory/L3/{id}", self.base_url))
+                .send()
+                .map_err(|e| e.to_string())?;
+            if deleted.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err(format!(
+                    "original DELETE refused status={}",
+                    deleted.status()
+                ));
+            }
+            let deleted_readback = self.get_json("/api/memory/L3")?;
+            if !u7_active_memory_absent(&deleted_readback, &id) {
+                return Err("deleted Memory remains in persistent active projection".into());
+            }
+            let restart_dir = std::path::PathBuf::from(
+                std::env::var("COWD_EVAL_U7_RESTART_DIR")
+                    .map_err(|_| "original U7 launch-owner restart seam missing")?,
+            );
+            let config_path = std::path::PathBuf::from(
+                std::env::var_os("COWD_CONFIG_HOME").ok_or("U7 owned config home missing")?,
+            )
+            .join("config.yaml");
+            if std::fs::metadata(&config_path)
+                .map_err(|e| e.to_string())?
+                .len()
+                > 1_048_576
+            {
+                return Err("U7 config exceeds original owner bound".into());
+            }
+            let config_sha = format!(
+                "{:x}",
+                Sha256::digest(std::fs::read(config_path).map_err(|e| e.to_string())?)
+            );
+            let request = json!({"config_sha256":config_sha,"kind":"u7_deleted_memory_restart","memory_id":id,"phase_a_session":phases[0]["session_id"],"phase_a_turn":phases[0]["turn_id"],"phase_a_execution":phases[0]["execution_id"],"phase_a_business_passed":true,"active_readback_absent":true});
+            u7_private_json(&restart_dir.join("request.json"), &request)?;
+            let restart_deadline = Instant::now() + Duration::from_secs(180);
+            let restart = loop {
+                let path = restart_dir.join("returned.json");
+                if path.is_file() {
+                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    if bytes.len() > 16384 {
+                        return Err("U7 restart owner receipt exceeds bound".into());
+                    }
+                    break serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?;
+                }
+                if Instant::now() >= restart_deadline {
+                    return Err("original U7 owner restart did not return within 180 seconds".into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+            if !u7_restart_matches(&restart, &request) {
+                return Err("U7 restart did not confirm original F2/same root/new PID identity".into());
+            }
+            let after_restart = self.get_json("/api/memory/L3")?;
+            if !u7_active_memory_absent(&after_restart, &id) {
+                return Err("deleted Memory reappeared after actual Gateway restart".into());
+            }
+            let absence = self.run_prepared_scenario(spec, telemetry, None);
+            let absence_session = absence["session_id"].as_str().unwrap_or_default();
+            let answer = absence["u7_terminal_answer"].as_str().unwrap_or_default();
+            let query_empty = u7_memory_receipt_previews(&absence, absence_session, &old.lookup)
+                .iter()
+                .any(|preview| {
+                    preview.starts_with("{\n  \"selected\": []")
+                        && preview.contains("\"kind\": \"authorized_lexical_catalog\"")
+                        && preview.contains("\"complete\": true")
+                });
+            let secrets_absent = !u7_contains_any_secret(answer, &old, &corrected);
+            let absence_passed = u7_phase_delivery_passed(&absence)
+                && absence["session_id"] != phases[0]["session_id"]
+                && absence["execution_id"] != phases[0]["execution_id"]
+                && query_empty
+                && u7_explicit_absence(answer)
+                && !answer.to_ascii_lowercase().contains("wh-")
+                && !answer.to_ascii_lowercase().contains("out-")
+                && secrets_absent;
+            phases.push(absence);
+            let mut result = phases.last().cloned().ok_or("U7 phase result missing")?;
+            result["scenario_id"] = json!(U7_MEMORY_LIFECYCLE);
+            result["status"] = json!(if absence_passed { "passed" } else { "failed" });
+            result["acceptance"]["passed"] = json!(absence_passed);
+            if let Some(checks)=result["acceptance"]["checks"].as_array_mut() {
+                for check in checks.iter_mut() {
+                    if check["name"]=="terminal_three_piece_complete" && check["missing"].as_array().is_some_and(|missing|missing.iter().all(|piece|piece=="goal_verified")) {
+                        check["required"]=json!(false);
+                        check["observation_only"]=json!(true);
+                    }
+                }
+                checks.push(json!({"name":"same_memory_id_correction","passed":true,"phase":"A"}));
+                checks.push(json!({"name":"delete_real_restart_no_resurrection","passed":absence_passed,"phase":"B"}));
+            }
+            result["u7_lifecycle"] = json!({"passed":absence_passed,"memory_id":id,"correction_passed":true,"delete_status":204,"deleted_active_projection":deleted_readback,"restarted_active_projection":after_restart,"restart":restart,"absence_retrieval_proven":query_empty,"old_and_new_secrets_absent":secrets_absent,"phase_results":phases,"claim_scope":"correction plus logical deletion/no resurrection in active retrieval; no claim of all auxiliary bytes erased"});
+            // Same original report, each phase retains its own Session/turn/usage.
+            // Aggregate counters only; never merge the two phases' identity proofs.
+            let mut metrics = phases[0]["metrics"].clone();
+            for key in [
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "total_tokens",
+                "model_rounds",
+                "provider_attempt_count",
+                "provider_attempt_usage_unknown_count",
+                "provider_attempt_cache_dimensions_unknown_count",
+                "provider_usage_records",
+                "token_usage_records",
+                "usage_unknown_attempts",
+                "tool_calls",
+                "wall_ms",
+            ] {
+                metrics[key] = match (
+                    phases[0]["metrics"][key].as_u64(),
+                    phases[1]["metrics"][key].as_u64(),
+                ) {
+                    (Some(a), Some(b)) => json!(a.saturating_add(b)),
+                    _ => Value::Null,
+                };
+            }
+            result["metrics"] = metrics;
+            result["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+            // Existing report/evidence accounting traverses the ordinary trace.
+            result["trace"] = json!(phases
+                .iter()
+                .flat_map(|phase| phase["trace"].as_array().into_iter().flatten().cloned())
+                .collect::<Vec<_>>());
+            Ok(result)
+        })();
+        match operation {
+            Ok(result) => result,
+            Err(error) => {
+                let mut failed = failed_scenario(spec, started, Vec::new(), error);
+                failed["u7_lifecycle"] =
+                    json!({"passed":false,"phase_results":phases,"later_phase_dispatched":false});
+                failed
+            }
+        }
     }
 
     fn prepare_u7_memory(&self) -> Result<(U7MemoryFixture, Value), String> {
@@ -3669,7 +4008,7 @@ impl LiveScenarioRunner {
             },
             "read_evidence": timeline.get("read_evidence"),
         });
-        if spec.id == U7_MEMORY {
+        if matches!(spec.acceptance, LiveAcceptance::MemoryRecall) {
             result["u7_terminal_answer"] = json!(response_text);
         }
         if spec.id.starts_with("u5-read-") {

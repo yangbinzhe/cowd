@@ -4403,3 +4403,201 @@ fn u7_exact_selector_preserves_other_corpora_and_does_not_leak_expected() {
             .contains("read:Cargo.toml")
     );
 }
+#[test]
+fn u7_lifecycle_oracles_keep_correction_absence_and_original_terminal_hard() {
+    let prompt = controlled_live_prompt(U7_MEMORY_LIFECYCLE, U7_MEMORY_PROMPT.into(), None);
+    let control: Value = serde_json::from_str(prompt.lines().next().unwrap().strip_prefix("COWD_EVAL_CONTROL ").unwrap()).unwrap();
+    assert_eq!(control["resource_scopes"], json!(["provider", "provider_account", "provider_token_pool"]), "lifecycle cannot inherit source-file/network/Team permissions");
+    let old = u7_literal_fixture();
+    let new = U7MemoryFixture {
+        warehouse: "WH-new-991".into(),
+        passphrase: "OUT-new-337".into(),
+        content: "new body".into(),
+        ..old.clone()
+    };
+    assert!(u7_contains_any_secret("仓库代号WH-literal-527", &old, &new));
+    assert!(u7_contains_any_secret("out-new-337", &old, &new));
+    assert!(!u7_contains_any_secret("该项目记忆不存在。", &old, &new));
+    assert!(u7_explicit_absence("未找到相关项目记忆，两个值均缺失。"));
+    assert!(!u7_explicit_absence("已有项目记录，稍后提供口令。"));
+    let absent = json!({"enabled":true,"layer":"L3","include_archived":false,"entries":[]});
+    assert!(u7_active_memory_absent(&absent, "original-id"));
+    for defect in [
+        "disabled",
+        "unknown-page",
+        "wrong-layer",
+        "archived-view",
+        "resurrected-id",
+    ] {
+        let mut page = absent.clone();
+        match defect {
+            "disabled" => page["enabled"] = json!(false),
+            "unknown-page" => {
+                page.as_object_mut().unwrap().remove("entries");
+            }
+            "wrong-layer" => page["layer"] = json!("L2"),
+            "archived-view" => page["include_archived"] = json!(true),
+            "resurrected-id" => {
+                page["entries"] = json!([{"id":"original-id","content":"old body"}])
+            }
+            _ => unreachable!(),
+        }
+        assert!(!u7_active_memory_absent(&page, "original-id"), "{defect}");
+    }
+    let mut case = u7_literal_case(&old);
+    case["session_actor_cleanup"] = json!({"status":"passed"});
+    case["acceptance"] = json!({"checks":[{"name":"current_public_terminal_delivery","passed":true},{"name":"terminal_three_piece_complete","passed":false,"missing":["goal_verified"]}]});
+    assert!(u7_phase_delivery_passed(&case));
+    let mut denied = case.clone();
+    denied["acceptance"]["checks"][0]["passed"] = json!(false);
+    assert!(!u7_phase_delivery_passed(&denied));
+    denied = case.clone();
+    denied["acceptance"]["checks"][1]["missing"] = json!(["user_visible_delivery"]);
+    assert!(!u7_phase_delivery_passed(&denied));
+    denied = case.clone();
+    denied["session_actor_cleanup"]["status"] = json!("failed");
+    assert!(!u7_phase_delivery_passed(&denied));
+}
+
+#[test]
+fn u7_retained_restart_requires_real_distinct_epoch_and_original_f2() {
+    let request = json!({"memory_id":"original-id","config_sha256":"7".repeat(64)});
+    let receipt = json!({"kind":"u7_owned_restart_returned","memory_id":"original-id","request_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&request).unwrap())),"old_pid":101,"new_pid":202,"same_config_sha256":"7".repeat(64),"first_shutdown_validation":{"status":"passed","identity":{"pid":101}},"ready":true});
+    assert!(u7_restart_matches(&receipt, &request));
+    for defect in [
+        "same-pid",
+        "missing-pid",
+        "foreign-memory",
+        "foreign-config",
+        "foreign-request",
+        "foreign-first-owner",
+        "failed-f2",
+        "not-ready",
+    ] {
+        let mut changed = receipt.clone();
+        match defect {
+            "same-pid" => changed["new_pid"] = json!(101),
+            "missing-pid" => changed["new_pid"] = Value::Null,
+            "foreign-memory" => changed["memory_id"] = json!("foreign"),
+            "foreign-config" => changed["same_config_sha256"] = json!("8".repeat(64)),
+            "foreign-request" => changed["request_sha256"] = json!("8".repeat(64)),
+            "foreign-first-owner" => {
+                changed["first_shutdown_validation"]["identity"]["pid"] = json!(303)
+            }
+            "failed-f2" => changed["first_shutdown_validation"]["status"] = json!("failed"),
+            "not-ready" => changed["ready"] = json!(false),
+            _ => unreachable!(),
+        }
+        assert!(!u7_restart_matches(&changed, &request), "{defect}");
+    }
+}
+
+#[test]
+#[ignore = "local typed CRUD double requires an owner-supplied private U7 fixture path; zero model/PG"]
+fn u7_correction_producer_patches_the_original_id_before_any_model_request() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = std::thread::spawn(move || {
+        let id = "00000000-0000-0000-0000-000000000007";
+        let mut stored = Value::Null;
+        let mut requests = Vec::new();
+        for step in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let (header_end, length) = loop {
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                assert!(bytes.len() < 32768);
+                if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while bytes.len() < header_end + length {
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+            }
+            let first = String::from_utf8_lossy(&bytes[..header_end])
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned();
+            requests.push(first.clone());
+            let expected = [
+                "POST /api/memory/L3 HTTP/1.1",
+                "GET /api/memory/L3 HTTP/1.1",
+                "PATCH /api/memory/entry/00000000-0000-0000-0000-000000000007 HTTP/1.1",
+                "GET /api/memory/L3 HTTP/1.1",
+            ][step];
+            assert_eq!(first, expected);
+            let body = if length > 0 {
+                serde_json::from_slice::<Value>(&bytes[header_end..header_end + length]).unwrap()
+            } else {
+                Value::Null
+            };
+            let response=match step {
+                0=>{stored=body;json!({"id":id})},
+                2=>{assert_ne!(stored["content"],body["content"]);stored["content"]=body["content"].clone();json!({"id":id,"updated":true})},
+                _=>json!({"enabled":true,"layer":"L3","include_archived":false,"entries":[{"id":id,"scope":"Global","content":stored["content"]}]}),
+            }.to_string();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).unwrap();
+        }
+        requests
+    });
+    let runner = LiveScenarioRunner {
+        client: Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap(),
+        base_url: base,
+        timeout_cap: None,
+        poll_interval: Duration::from_millis(1),
+        model: None,
+        claim_scope: LiveClaimScope::Focused,
+        u5_deadline: None,
+        u5_host: None,
+    };
+    let (old, new, id, evidence) = runner.prepare_u7_correction().unwrap();
+    let frozen = std::path::PathBuf::from(std::env::var("COWD_EVAL_U7_FIXTURE_FILE").unwrap())
+        .with_extension("corrected.json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(frozen).unwrap()).unwrap(),
+        json!(&new),
+        "independent corrected values must be frozen before the model request"
+    );
+    assert_eq!(id, "00000000-0000-0000-0000-000000000007");
+    assert_ne!(old.warehouse, new.warehouse);
+    assert_ne!(old.passphrase, new.passphrase);
+    assert!(u7_persisted_record(
+        &evidence["readback"],
+        &id,
+        &new.content
+    ));
+    assert!(!u7_persisted_record(
+        &evidence["readback"],
+        &id,
+        &old.content
+    ));
+    assert_eq!(
+        task.join().unwrap().len(),
+        4,
+        "no Provider request or baseline recall is permitted"
+    );
+}

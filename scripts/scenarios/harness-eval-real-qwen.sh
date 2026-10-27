@@ -97,7 +97,7 @@ MAX_PROVIDER_TOKENS="${COWD_EVAL_MAX_PROVIDER_TOKENS:-unbounded-explicit-opt-in}
   exit 2
 }
 case "$SCENARIO_ID" in
-  live_u7_persistent_memory_recall|live_u5_shared_session_fairness|live_u5_active_cancel_isolation|live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_one_team_execution|live_small_two_team_collaboration|live_explicit_team_requirement|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek|live_minimal_batch_read|live_minimal_compute_reduce) ;;
+  live_u7_persistent_memory_recall|live_u7_memory_correction_delete_restart|live_u5_shared_session_fairness|live_u5_active_cancel_isolation|live_direct_terminal|live_tool_evidence|live_single_architecture_baseline|live_one_team_execution|live_small_two_team_collaboration|live_explicit_team_requirement|live_team_projection|live_agent_escalation|live_group_theory_ai_research_simulation|live_qwen38_large_scale_collaboration|live_autonomous_collaboration_deepseek|live_minimal_batch_read|live_minimal_compute_reduce) ;;
   *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
 esac
 
@@ -109,7 +109,7 @@ if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness || "$SCENARIO_ID" == liv
 fi
 
 # U7 uses the existing non-file corpus: no new observer path grant.
-if [[ "$SCENARIO_ID" == live_u7_persistent_memory_recall ]]; then
+if [[ "$SCENARIO_ID" == live_u7_persistent_memory_recall || "$SCENARIO_ID" == live_u7_memory_correction_delete_restart ]]; then
   [[ -n "${COWD_EVAL_U7_FIXTURE_FILE:-}" && -z "${COWD_EVAL_RESUME_SESSION:-}" ]] || {
     echo 'U7 requires a fresh Session and a private fixture output path' >&2
     exit 2
@@ -615,6 +615,63 @@ launch_harness() {
   verify_child_image "$HARNESS_PID" "$HARNESS_BINARY_SHA256"
 }
 
+# One concrete U7 boundary, still owned and reaped by this original parent.
+# It never accepts a PID, command, path or credential from the model/HTTP.
+u7_restart_gateway() {
+  local request="$RUN_ROOT/u7-restart/request.json" old_pid=$GATEWAY_PID old_start=$GATEWAY_STARTTIME config_sha new_sha index
+  [[ "$SCENARIO_ID" == live_u7_memory_correction_delete_restart && ! -e "$RUN_ROOT/u7-restart/returned.json" ]] || return 1
+  python3 - "$request" "$CONFIG_HOME/config.yaml" <<'PYU7REQUEST' || return 1
+import hashlib,json,os,stat,sys,uuid
+p=sys.argv[1];m=os.stat(p,follow_symlinks=False)
+assert stat.S_ISREG(m.st_mode) and m.st_uid==os.getuid() and stat.S_IMODE(m.st_mode)==0o600 and m.st_size<16384
+x=json.load(open(p));assert x['kind']=='u7_deleted_memory_restart' and x['phase_a_business_passed'] is True and x['active_readback_absent'] is True
+uuid.UUID(x['memory_id'])
+assert x['config_sha256']==hashlib.sha256(open(sys.argv[2],'rb').read()).hexdigest()
+assert all(isinstance(x[k],str) and x[k] for k in ['phase_a_session','phase_a_turn','phase_a_execution'])
+PYU7REQUEST
+  config_sha="$(sha256sum "$CONFIG_HOME/config.yaml" | awk '{print $1}')"
+  stop_owned DEEP_MONITOR_PID "$MONITOR_STOP_SECONDS" "$MONITOR_KILL_SECONDS" || return 1
+  stop_owned PROGRESS_PID "$MONITOR_STOP_SECONDS" "$MONITOR_KILL_SECONDS" || return 1
+  stop_owned GATEWAY_PID "$GATEWAY_STOP_SECONDS" "$GATEWAY_KILL_SECONDS" || return 1
+  [[ "$LAST_WAIT_STATUS" == 0 ]] || return 1
+  validate_shutdown_receipt || return 1
+  mv "$RUN_ROOT/shutdown-validation.json" "$RUN_ROOT/u7-first-shutdown-validation.json" || return 1
+  cp "$GATEWAY_LOG" "$RUN_ROOT/u7-first-gateway.log" || return 1
+  PRIVATE_RUNTIME="$RUN_ROOT/u7-second-run"
+  mkdir -m 700 "$PRIVATE_RUNTIME" || return 1
+  read -r RUNTIME_DEVICE RUNTIME_INODE < <(stat -c '%d %i' "$PRIVATE_RUNTIME")
+  SHUTDOWN_NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  for index in "${!gateway_env[@]}"; do
+    case "${gateway_env[$index]}" in
+      XDG_RUNTIME_DIR=*) gateway_env[$index]="XDG_RUNTIME_DIR=$PRIVATE_RUNTIME" ;;
+      COWD_TEST_SHUTDOWN_RECEIPT_NONCE=*) gateway_env[$index]="COWD_TEST_SHUTDOWN_RECEIPT_NONCE=$SHUTDOWN_NONCE" ;;
+    esac
+  done
+  launch_gateway || return 1
+  [[ "$GATEWAY_PID" != "$old_pid" ]] || return 1
+  local ready=0 attempt
+  for attempt in {1..240}; do
+    if curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/healthz" >/dev/null 2>&1; then ready=1; break; fi
+    owned_running "$GATEWAY_PID" "$GATEWAY_STARTTIME" || return 1
+    sleep 0.25
+  done
+  [[ "$ready" == 1 ]] || return 1
+  new_sha="$(sha256sum "$CONFIG_HOME/config.yaml" | awk '{print $1}')"
+  [[ "$new_sha" == "$config_sha" ]] || return 1
+  python3 - "$RUN_ROOT/u7-restart" "$old_pid" "$old_start" "$GATEWAY_PID" "$GATEWAY_STARTTIME" "$config_sha" "$RUN_ROOT/u7-first-shutdown-validation.json" <<'PYU7RETURN' || return 1
+import hashlib,json,os,pathlib,sys
+root,old,oldstart,new,newstart,config,validation=sys.argv[1:];root=pathlib.Path(root)
+request=(root/'request.json').read_bytes();v=json.loads(request)
+x=dict(kind='u7_owned_restart_returned',memory_id=v['memory_id'],request_sha256=hashlib.sha256(request).hexdigest(),old_pid=int(old),old_starttime=int(oldstart),new_pid=int(new),new_starttime=int(newstart),same_config_sha256=config,first_shutdown_validation=json.load(open(validation)),ready=True)
+# Atomic publication: the observer never reads a partially written return.
+path=root/'returned.tmp';fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+with os.fdopen(fd,'w') as out:json.dump(x,out);out.flush();os.fsync(out.fileno())
+os.rename(path,root/'returned.json')
+PYU7RETURN
+  start_monitor monitor_progress PROGRESS_PID || return 1
+  start_monitor monitor_semantic_health DEEP_MONITOR_PID || return 1
+}
+
 monitor_entry() {
   # Run in the group's actual leader, without another asynchronous worker or
   # inherited wait trap. The parent waits this leader AND checks the group.
@@ -1090,12 +1147,24 @@ if [[ -n "${COWD_EVAL_TIMEOUT_SECS:-}" && -z "${COWD_EVAL_SCENARIO_TIMEOUT_SECS:
   export COWD_EVAL_SCENARIO_TIMEOUT_SECS="$COWD_EVAL_TIMEOUT_SECS"
 fi
 verify_binary_bindings
+if [[ "$SCENARIO_ID" == live_u7_memory_correction_delete_restart ]]; then
+  mkdir -m 700 "$RUN_ROOT/u7-restart"
+  export COWD_EVAL_U7_RESTART_DIR="$RUN_ROOT/u7-restart"
+fi
 launch_harness
 
 # The semantic monitor only observes progress. Explicit evaluator deadlines and
 # the original cleanup owner remain responsible for termination; wait preserves
 # the actual evaluator status.
 start_monitor monitor_semantic_health DEEP_MONITOR_PID
+if [[ "$SCENARIO_ID" == live_u7_memory_correction_delete_restart ]]; then
+  while owned_running "$HARNESS_PID" "$HARNESS_STARTTIME"; do
+    if [[ -f "$RUN_ROOT/u7-restart/request.json" && ! -f "$RUN_ROOT/u7-restart/returned.json" ]]; then
+      u7_restart_gateway || { echo 'original U7 retained-root restart failed' >&2; exit 1; }
+    fi
+    sleep 0.1
+  done
+fi
 if wait "$HARNESS_PID"; then EVAL_STATUS=0; else EVAL_STATUS=$?; fi
 HARNESS_PID=""
 exit "$EVAL_STATUS"
