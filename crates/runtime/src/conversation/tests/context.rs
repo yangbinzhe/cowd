@@ -254,7 +254,7 @@ fn telemetry_wall_speed_uses_wall_duration() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn concrete_mutation_creates_real_checkpoint_before_dispatch() {
+async fn unprepared_mutation_cannot_create_a_checkpoint_or_dispatch() {
     use harness_contract::core::{
         ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, TaskRisk,
     };
@@ -305,12 +305,26 @@ async fn concrete_mutation_creates_real_checkpoint_before_dispatch() {
     let mut validation = plan.validate_against_execution_decision(&decision);
 
     runtime
-        .satisfy_tool_strategy_gates(&decision, &mut validation, &crate::SharedPrompter::none())
+        .satisfy_tool_strategy_gates(
+            &decision,
+            &plan,
+            &mut validation,
+            &crate::SharedPrompter::none(),
+        )
         .await;
 
-    assert!(validation.allowed, "{:?}", validation.findings);
-    assert!(validation.checkpoint_created);
-    assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
+    // This legacy fixture has no prepared Step and uses a placeholder effect.
+    // The positive real-checkpoint contract lives in checkpoint_scope_366_tests
+    // with an original ToolHost and signed authorization, not this text stub.
+    assert!(!validation.allowed, "{:?}", validation.findings);
+    assert!(!validation.checkpoint_created);
+    assert!(
+        validation
+            .findings
+            .iter()
+            .any(|f| f.starts_with("checkpoint_scope_unproven:"))
+    );
+    assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 0);
     assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
 
     decision.strategy.understanding.risk = TaskRisk::Critical;
@@ -319,14 +333,15 @@ async fn concrete_mutation_creates_real_checkpoint_before_dispatch() {
     runtime
         .satisfy_tool_strategy_gates(
             &decision,
+            &plan,
             &mut critical_validation,
             &crate::SharedPrompter::none(),
         )
         .await;
-    assert!(critical_validation.allowed);
+    assert!(!critical_validation.allowed);
     assert!(critical_validation.requires_approval);
-    assert!(critical_validation.checkpoint_created);
-    assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 2);
+    assert!(!critical_validation.checkpoint_created);
+    assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 0);
     assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
 }
 

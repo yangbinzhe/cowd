@@ -1056,6 +1056,73 @@ fn scripted_tool(id: &str, name: &str, input: Value, text: Option<&str>) -> Valu
     json!({"role":"assistant","content":text,"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}}]})
 }
 
+// This is the fixed engineering driver's effect oracle, not authorization.
+// The Runtime still owns grants, Tool execution and durable settlement. The
+// remaining Goal/independent review/public ACK oracles are kept unchanged.
+fn r365_previous_write_success(body: &Value, root: &Path) -> anyhow::Result<()> {
+    let messages = body["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("r365 missing messages"))?;
+    let calls: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .filter_map(|m| m["tool_calls"].as_array())
+        .flatten()
+        .filter(|call| call["id"] == "recovery-write")
+        .collect();
+    let results: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["role"] == "tool" && m["tool_call_id"] == "recovery-write")
+        .collect();
+    anyhow::ensure!(
+        calls.len() == 1 && results.len() == 1,
+        "r365 write call/result missing or ambiguous"
+    );
+    anyhow::ensure!(
+        calls[0]["function"]["name"] == "edit",
+        "r365 foreign write tool"
+    );
+    let output: tools::file_ops::WriteFileOutput = serde_json::from_str(
+        results[0]["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("r365 write result missing text"))?,
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "r365 write result is a refusal or unknown, not a successful WriteFileOutput"
+        )
+    })?;
+    let input: Value = serde_json::from_str(
+        calls[0]["function"]["arguments"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("r365 write input missing"))?,
+    )?;
+    let expected = b"recovery-effect-once\n";
+    let expected_path = root.join("workspace/recovery-effect.txt");
+    anyhow::ensure!(
+        input["action"] == "write"
+            && input["path"] == "recovery-effect.txt"
+            && input["content"].as_str().map(str::as_bytes) == Some(expected.as_slice()),
+        "r365 write input differs from independent literal"
+    );
+    anyhow::ensure!(
+        matches!(output.kind.as_str(), "create" | "update")
+            && Path::new(&output.file_path) == expected_path
+            && output.content.as_bytes() == expected,
+        "r365 write output identity/content differs"
+    );
+    use std::io::Read;
+    let mut physical = Vec::new();
+    std::fs::File::open(&expected_path)?
+        .take(expected.len() as u64 + 1)
+        .read_to_end(&mut physical)?;
+    anyhow::ensure!(
+        physical == expected,
+        "r365 write output not backed by exact physical file"
+    );
+    Ok(())
+}
+
 fn previous_result(body: &Value, id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         body["messages"].as_array().is_some_and(|messages| messages
@@ -1357,6 +1424,11 @@ impl RecoveryReplies {
             "R6 business stage has no exposed tool schemas"
         );
         let markers = [lane == R344Lane::Producer, lane == R344Lane::Reviewer];
+        // A tool-result message can contain a refusal. Stop at that actual
+        // write result before any Program read or business-counter advance.
+        if markers[0] && self.producer == 2 {
+            r365_previous_write_success(body, &binding.evidence_root)?;
+        }
         if !markers[0] && !markers[1] && self.root == 0 {
             self.root = 1;
             return Ok(Some(scripted_tool(
@@ -1430,15 +1502,12 @@ impl RecoveryReplies {
                         None,
                     )
                 }
-                2 => {
-                    previous_result(body, "recovery-write")?;
-                    scripted_tool(
-                        "recovery-producer-read",
-                        "read_file",
-                        json!({"path":"recovery-effect.txt","complete":true}),
-                        None,
-                    )
-                }
+                2 => scripted_tool(
+                    "recovery-producer-read",
+                    "read_file",
+                    json!({"path":"recovery-effect.txt","complete":true}),
+                    None,
+                ),
                 3 => {
                     previous_result(body, "recovery-producer-read")?;
                     scripted_tool(
@@ -4016,5 +4085,135 @@ fn r361_readonly_role_store_loads_original_inline_and_blob_graphs() -> anyhow::R
         );
     }
     drop(observer);
+    Ok(())
+}
+
+#[test]
+fn r365_write_result_requires_successful_original_output_and_physical_bytes() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace)?;
+    let input =
+        json!({"action":"write","path":"recovery-effect.txt","content":"recovery-effect-once\n"});
+    // Literal input follows the retained original byte contract, not a new
+    // interpretation of its escaping. The final business oracle is unchanged.
+    let body = |result: Value| {
+        json!({"stream":true,"messages":[
+        {"role":"assistant","tool_calls":[{"id":"recovery-write","function":{"name":"edit","arguments":input.to_string()}}]},
+        {"role":"tool","tool_call_id":"recovery-write","content":result.as_str().unwrap_or("")}]})
+    };
+    for refusal in [
+        "runtime strategy lease `original` denied tool batch: checkpoint_authorization_denied:requested effect exceeds the parent Mission permission ceiling",
+        "error",
+        "{}",
+        "{\"error\":\"denied\"}",
+    ] {
+        let request = body(json!(refusal));
+        // This is the actual old presence predicate: it accepts the error.
+        assert!(previous_result(&request, "recovery-write").is_ok());
+        let mut driver = RecoveryReplies {
+            proven_lane: Some(R344Lane::Producer),
+            producer: 2,
+            root: 4,
+            ..Default::default()
+        };
+        let binding = r6_control_test_binding(root.path())?;
+        let mut request = request;
+        request["tools"] = json!([{"type":"function","function":{"name":"read_file"}}]);
+        let error = driver.reply(&request, Some(&binding)).unwrap_err();
+        assert!(
+            error.to_string().contains("r365 write result"),
+            "must refuse before any HTTP Program lookup: {error}"
+        );
+        assert_eq!((driver.producer, driver.root, driver.reviewer), (2, 4, 0));
+    }
+    let policy = tools::path_policy::WorkspacePathPolicy::new(&workspace);
+    let written =
+        tools::file_ops::write_file(&policy, "recovery-effect.txt", "recovery-effect-once\n")?;
+    let request = body(json!(serde_json::to_string(&written)?));
+    r365_previous_write_success(&request, root.path())?;
+    assert_eq!(
+        std::fs::read(workspace.join("recovery-effect.txt"))?,
+        b"recovery-effect-once\n"
+    );
+    assert_eq!(b"recovery-effect-once\n".len(), 21);
+    assert_eq!(&b"recovery-effect-once\n"[19..], &[0x65, 0x0a]);
+    assert_eq!(b"recovery-effect-once\\n".len(), 22);
+    assert_eq!(&b"recovery-effect-once\\n"[20..], &[0x5c, 0x6e]);
+    let mut literal_slash = request.clone();
+    let mut slash_output = serde_json::to_value(&written)?;
+    slash_output["content"] = json!("recovery-effect-once\\n");
+    literal_slash["messages"][1]["content"] = json!(slash_output.to_string());
+    std::fs::write(
+        workspace.join("recovery-effect.txt"),
+        b"recovery-effect-once\\n",
+    )?;
+    assert!(r365_previous_write_success(&literal_slash, root.path()).is_err());
+    assert!(
+        r365_previous_write_success(&request, root.path()).is_err(),
+        "physical literal slash-n is not a newline"
+    );
+    std::fs::write(
+        workspace.join("recovery-effect.txt"),
+        b"recovery-effect-once\n",
+    )?;
+    r365_previous_write_success(&request, root.path())?;
+    for field in ["content", "filePath", "type"] {
+        let mut changed = serde_json::to_value(&written)?;
+        changed[field] = json!("foreign");
+        assert!(
+            r365_previous_write_success(&body(json!(changed.to_string())), root.path()).is_err()
+        );
+    }
+    let mut foreign = request.clone();
+    foreign["messages"][1]["tool_call_id"] = json!("foreign");
+    assert!(r365_previous_write_success(&foreign, root.path()).is_err());
+    let mut duplicate = request.clone();
+    duplicate["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(request["messages"][1].clone());
+    assert!(r365_previous_write_success(&duplicate, root.path()).is_err());
+    std::fs::write(workspace.join("recovery-effect.txt"), b"wrong")?;
+    assert!(r365_previous_write_success(&request, root.path()).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "registered ROUND364 original request9 replay; no PG, Gateway or provider"]
+fn r365_original_write_refusal_stops_before_program_lookup() -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let root = PathBuf::from(std::env::var("COWD_R365_REPLAY_ROOT")?);
+    let bytes = std::fs::read(root.join("r6-provider-request-9.json"))?;
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        "9bbe2ab6280afd0ca00abe2832721d1d2f47dd3e8d91f661a59c25221a29486f"
+    );
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["messages"][7]["tool_call_id"], "recovery-write");
+    assert_eq!(
+        body["messages"][7]["content"],
+        "runtime strategy lease `strategy-lease-a2eaac78-b87f-4727-a1d7-1b12e41af08b` denied tool batch: checkpoint_authorization_denied:requested effect exceeds the parent Mission permission ceiling"
+    );
+    assert!(
+        previous_result(&body, "recovery-write").is_ok(),
+        "actual old predicate counterexample"
+    );
+    let mut driver = RecoveryReplies {
+        proven_lane: Some(R344Lane::Producer),
+        producer: 2,
+        root: 4,
+        ..Default::default()
+    };
+    let binding = r6_control_test_binding(&root)?; // inert port9: gate must precede HTTP
+    let error = driver.reply(&body, Some(&binding)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("r365 write result is a refusal or unknown"),
+        "{error}"
+    );
+    assert_eq!((driver.producer, driver.root, driver.reviewer), (2, 4, 0));
     Ok(())
 }
