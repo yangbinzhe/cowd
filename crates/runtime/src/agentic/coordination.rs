@@ -227,17 +227,17 @@ pub(crate) mod tests {
         missing_graph: bool,
         process: Option<crate::ProcessJsonlSpec>,
     ) -> Fixture {
-        fixture_with_options(missing_graph, process, None, false, false).await
+        fixture_with_options(missing_graph, process, None, false, false, None).await
     }
 
     /// A TaskExecute-scoped process fixture. An ordinary write needs an active
     /// Task execution claim, which a Coordination focus does not provide.
     pub(crate) async fn fixture_with_process_task(process: crate::ProcessJsonlSpec) -> Fixture {
-        fixture_with_options(false, Some(process), None, true, true).await
+        fixture_with_options(false, Some(process), None, true, true, None).await
     }
 
     pub(crate) async fn fixture_with_provider(provider: Arc<crate::ProviderRegistry>) -> Fixture {
-        fixture_with_options(false, None, Some(provider), false, false).await
+        fixture_with_options(false, None, Some(provider), false, false, None).await
     }
 
     async fn fixture_with_options(
@@ -246,6 +246,7 @@ pub(crate) mod tests {
         provider: Option<Arc<crate::ProviderRegistry>>,
         write: bool,
         task_execute: bool,
+        runtime_backend: Option<Arc<dyn crate::AgentRuntimeBackend>>,
     ) -> Fixture {
         let workspace = tempfile::tempdir().unwrap();
         let (permission_ceiling, resource_scopes, required_capabilities) = if write {
@@ -297,9 +298,15 @@ pub(crate) mod tests {
         }
         let services = builder.build().unwrap();
         host.0.set(Arc::downgrade(&services)).unwrap();
-        services
-            .agent_task_executor()
-            .install_resolver(Arc::new(ControlledAgenticWorker));
+        if let Some(backend) = runtime_backend {
+            // This case must retain the production resolver installed by assemble:
+            // only AgentRuntime owns the authenticated admission/exit publication.
+            services.agent_runtime().register_backend(backend);
+        } else {
+            services
+                .agent_task_executor()
+                .install_resolver(Arc::new(ControlledAgenticWorker));
+        }
         let process_definition = process.map(|spec| {
             use harness_contract::agent::*;
             services
@@ -692,9 +699,158 @@ pub(crate) mod tests {
         );
     }
 
+    /// Controls the backend return, not the Graph executor's lifecycle facts.
+    /// The original AgentRuntime must publish admission/exit and settle the wake.
+    struct CoordinationExitBackend {
+        entered: tokio::sync::mpsc::UnboundedSender<AgentTaskPacket>,
+        release: tokio::sync::Semaphore,
+        returned: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::AgentRuntimeBackend for CoordinationExitBackend {
+        fn kind(&self) -> crate::AgentBackendKind {
+            crate::AgentBackendKind::InProcess
+        }
+        fn capabilities(&self) -> crate::AgentBackendCapabilities {
+            crate::AgentBackendCapabilities::in_process()
+        }
+        async fn execute(
+            &self,
+            packet: AgentTaskPacket,
+            _: crate::AgentModelSelection,
+        ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
+            self.entered.send(packet.clone()).unwrap();
+            self.release.acquire().await.unwrap().forget();
+            self.returned.send(packet.run_id().to_string()).unwrap();
+            Err("controlled backend returned without a coordination reply".into())
+        }
+    }
+
+    async fn finish_coordination_backend(
+        fixture: &Fixture,
+        packet: &AgentTaskPacket,
+        backend: &CoordinationExitBackend,
+        returned: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        assert!(
+            crate::agent_runtime::confirmed_run_exit(fixture.services.event_store(), packet)
+                .unwrap()
+                .is_none(),
+            "an entered backend is not a durable exit"
+        );
+        let cursor = fixture
+            .services
+            .event_store()
+            .durable_commit_cursor()
+            .unwrap();
+        let error = fixture
+            .services
+            .settle_abandoned_agentic_attempt(packet, "not returned")
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Agent attempt awaits exact durable local exit");
+        assert_eq!(
+            fixture
+                .services
+                .event_store()
+                .durable_commit_cursor()
+                .unwrap(),
+            cursor
+        );
+        backend.release.add_permits(1);
+        assert_eq!(returned.recv().await.as_deref(), Some(packet.run_id()));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let exited = crate::agent_runtime::confirmed_run_exit(
+                    fixture.services.event_store(),
+                    packet,
+                )
+                .unwrap()
+                .is_some();
+                let projection = fixture
+                    .services
+                    .agent_action_service()
+                    .project("coord-program")
+                    .unwrap();
+                if exited
+                    && !projection.tasks[&fixture.task_ref]
+                        .active_attempts
+                        .contains_key(packet.graph_id())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original owner must publish exit and automatically settle");
+        let mut foreign = packet.clone();
+        foreign.attempt += 1;
+        assert!(
+            crate::agent_runtime::confirmed_run_exit(fixture.services.event_store(), &foreign)
+                .is_err(),
+            "another attempt cannot borrow this run's durable exit"
+        );
+        foreign = packet.clone();
+        foreign
+            .agentic_binding
+            .as_mut()
+            .unwrap()
+            .membership_id
+            .push_str("-foreign");
+        assert!(
+            crate::agent_runtime::confirmed_run_exit(fixture.services.event_store(), &foreign)
+                .is_err(),
+            "another binding cannot borrow this run's durable exit"
+        );
+    }
+
     #[tokio::test]
     async fn coordination_concurrent_repeated_wake_keeps_one_registered_execution() {
-        let fixture = fixture(false).await;
+        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let (returned_tx, mut returned) = tokio::sync::mpsc::unbounded_channel();
+        let backend = Arc::new(CoordinationExitBackend {
+            entered: entered_tx,
+            release: tokio::sync::Semaphore::new(0),
+            returned: returned_tx,
+        });
+        // Metadata only: this backend never invokes the Provider. An unavailable
+        // local endpoint also prevents a personal account or hidden fallback.
+        let provider = Arc::new(
+            crate::ProviderRegistry::new(crate::config::ProvidersConfig {
+                providers: std::collections::HashMap::from([(
+                    "coordination-test".into(),
+                    crate::config::ProviderConfig {
+                        name: "coordination-test".into(),
+                        base_url: "http://127.0.0.1:9/v1".into(),
+                        api_key: "not-an-account".into(),
+                        models: vec!["test".into()],
+                        protocol: Some("responses".into()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
+                    },
+                )]),
+            })
+            .unwrap(),
+        );
+        let fixture = fixture_with_options(
+            false,
+            None,
+            Some(provider),
+            false,
+            false,
+            Some(backend.clone()),
+        )
+        .await;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.run_id(), fixture.packet.run_id());
+        assert_eq!(first.agent_id(), fixture.packet.agent_id());
+        assert_eq!(first.attempt, fixture.packet.attempt);
+        assert_eq!(first.agentic_binding, fixture.packet.agentic_binding);
         let mut workers = tokio::task::JoinSet::new();
         for index in 0..16 {
             let services = fixture.services.clone();
@@ -723,11 +879,7 @@ pub(crate) mod tests {
         assert!(projection.tasks[&fixture.task_ref]
             .active_attempts
             .contains_key(fixture.packet.graph_id()));
-        fixture
-            .services
-            .settle_abandoned_agentic_attempt(&fixture.packet, "fixture previous worker exited")
-            .await
-            .unwrap();
+        finish_coordination_backend(&fixture, &fixture.packet, &backend, &mut returned).await;
         let mut workers = tokio::task::JoinSet::new();
         for index in 0..16 {
             let services = fixture.services.clone();
@@ -758,6 +910,31 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(projection.coordination_requests().len(), 2);
         assert_eq!(projection.tasks[&fixture.task_ref].active_attempts.len(), 1);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(second.run_id(), first.run_id());
+        assert!(projection.tasks[&fixture.task_ref]
+            .active_attempts
+            .contains_key(second.graph_id()));
+        let second_graph = fixture
+            .services
+            .graph_state_store()
+            .load(second.graph_id())
+            .unwrap();
+        let second_original: AgentTaskPacket =
+            serde_json::from_str(&second_graph.nodes[0].payload_ref).unwrap();
+        assert_eq!(second_original.run_id(), second.run_id());
+        finish_coordination_backend(&fixture, &second_original, &backend, &mut returned).await;
+        assert!(matches!(
+            entered.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        fixture.services.shutdown_maintenance().await;
+        let shutdown = fixture.services.shutdown_execution().await;
+        assert!(shutdown.errors.is_empty(), "{shutdown:?}");
+        assert_eq!(shutdown.forced_aborts, 0, "{shutdown:?}");
     }
 
     fn context(envelope: &AgentActionEnvelope) -> crate::AgenticDispatchContext {
