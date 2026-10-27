@@ -1004,12 +1004,13 @@ impl StreamState {
         if self.finished {
             return Ok(Vec::new());
         }
-        self.finished = true;
-
         let mut events = Vec::new();
-        if let Some(frame) = self.dsml_frame.take() {
+        if let Some(frame) = self.dsml_frame.as_deref() {
             match parse_compat_tool_calls(&frame, &self.exposed_tool_names) {
-                Ok(calls) => self.emit_dsml_tool_calls(calls, &mut events),
+                Ok(calls) => {
+                    self.dsml_frame = None;
+                    self.emit_dsml_tool_calls(calls, &mut events);
+                }
                 Err(error) => {
                     log_rejected_compat_tool_frame(&self.model, &frame, error);
                     // Once a provider emitted any supported protocol marker,
@@ -1023,6 +1024,10 @@ impl StreamState {
                 }
             }
         }
+        // Do not consume a rejected protocol frame or turn a subsequent finish
+        // into a successful EOF. The caller may observe the same failed stream
+        // again, but it must never obtain a MessageStop for that failure.
+        self.finished = true;
         if !self.dsml_prefix.is_empty() {
             let pending_text = std::mem::take(&mut self.dsml_prefix);
             self.emit_text_content(pending_text, &mut events);
@@ -2997,16 +3002,18 @@ fn longest_compat_tool_prefix_suffix(text: &str) -> String {
 
 fn find_sse_separator(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
     let start = from.min(buffer.len());
-    if let Some(relative) = buffer[start..].windows(2).position(|window| window == b"\n\n") {
-        return Some((start + relative, 2));
-    }
-    if let Some(relative) = buffer[start..]
+    let lf = buffer[start..]
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|relative| (start + relative, 2));
+    let crlf = buffer[start..]
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-    {
-        return Some((start + relative, 4));
-    }
-    None
+        .map(|relative| (start + relative, 4));
+    // Select the first boundary on the wire, not the preferred newline style.
+    // Otherwise one network chunk containing CRLF followed by LF merges two
+    // independent SSE events and changes decoding with transport chunking.
+    lf.into_iter().chain(crlf).min_by_key(|(position, _)| *position)
 }
 
 fn parse_chat_sse_frame(
@@ -4291,6 +4298,229 @@ mod tests {
         assert!(matches!(error, ApiError::InvalidSseFrame(_)));
     }
 
+    fn compat_test_chunk(content: Option<&str>, finish: Option<&str>) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "bounded-compat-fixture".into(),
+            model: Some("compat-fixture".into()),
+            choices: vec![ChunkChoice {
+                delta: ChunkDelta {
+                    content: content.map(str::to_owned),
+                    ..ChunkDelta::default()
+                },
+                finish_reason: finish.map(str::to_owned),
+            }],
+            usage: None,
+        }
+    }
+
+    fn assert_compat_read_events(events: &[StreamEvent]) {
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart(start) => match &start.content_block {
+                    OutputContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ["read_file"]);
+        let inputs: Vec<serde_json::Value> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta(delta) => match &delta.delta {
+                    ContentBlockDelta::InputJsonDelta { partial_json } => {
+                        Some(serde_json::from_str(partial_json).expect("complete input"))
+                    }
+                    ContentBlockDelta::TextDelta { .. } => {
+                        panic!("protocol bytes escaped as prose")
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inputs, [json!({"path":"src/测试.rs"})]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::MessageStop(_)))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(event,
+            StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use"))));
+    }
+
+    #[test]
+    fn compatibility_stream_marker_splits_preserve_exact_calls() {
+        let frames = [
+            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"><｜｜DSML｜｜parameter name=\"path\" string=\"true\">src/测试.rs</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+            "<tool_call><function=read_file><parameter=path>src/测试.rs</parameter></function></tool_call>",
+            "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"src/测试.rs\"}}</tool_call>",
+        ];
+        let tool = ToolDefinition {
+            name: "read_file".into(),
+            description: None,
+            input_schema: json!({"type":"object"}),
+        };
+        for frame in frames {
+            for split in (0..=frame.len()).filter(|index| frame.is_char_boundary(*index)) {
+                let mut state =
+                    StreamState::new("compat-fixture".into(), std::slice::from_ref(&tool));
+                let mut events = state
+                    .ingest_chunk(compat_test_chunk(Some(&frame[..split]), None))
+                    .unwrap();
+                // A finish_reason records provider intent; it does not finish
+                // before ingesting the content in this same last delta.
+                events.extend(
+                    state
+                        .ingest_chunk(compat_test_chunk(Some(&frame[split..]), Some("stop")))
+                        .unwrap(),
+                );
+                events.extend(state.finish().unwrap());
+                assert_compat_read_events(&events);
+                assert!(
+                    state.finish().unwrap().is_empty(),
+                    "successful finish is idempotent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_sse_mixed_boundaries_preserve_wire_order() {
+        let content = "<tool_call><function=read_file><parameter=path>src/测试.rs</parameter></function></tool_call>";
+        for (first_end, last_end) in [("\r\n\r\n", "\n\n"), ("\n\n", "\r\n\r\n")] {
+            let first = json!({"id":"fixture", "choices":[{"delta":{"content":content}}]});
+            let last = json!({"id":"fixture", "choices":[{"delta":{}, "finish_reason":"stop"}]});
+            let wire =
+                format!("data: {first}{first_end}data: {last}{last_end}data: [DONE]{first_end}");
+            // Cover transport cuts inside UTF-8, CRLF and every protocol marker.
+            for split in 0..=wire.len() {
+                let mut parser = OpenAiSseParser::with_context(
+                    "fixture",
+                    "fixture",
+                    OpenAiWireProtocol::Completions,
+                );
+                let mut chunks = parser.push(&wire.as_bytes()[..split]).unwrap();
+                chunks.extend(parser.push(&wire.as_bytes()[split..]).unwrap());
+                assert_eq!(
+                    chunks.len(),
+                    2,
+                    "one content and one finish chunk at cut {split}"
+                );
+                assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some(content));
+                assert_eq!(chunks[1].choices[0].finish_reason.as_deref(), Some("stop"));
+                let mut state = StreamState::new("fixture".into(), &[]);
+                let mut events = Vec::new();
+                for chunk in chunks {
+                    events.extend(state.ingest_chunk(chunk).unwrap());
+                }
+                events.extend(state.finish().unwrap());
+                assert_compat_read_events(&events);
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_finish_rejects_truncation_and_invalid_arguments_without_recovery() {
+        for (frame, class) in [
+            ("<tool_call><function=read_file></function>", "unterminated"),
+            ("<tool_call><function=read_file></tool_call>", "unterminated"),
+            ("<tool_call><function=read_file><parameter=path>src/a.rs</function></tool_call>", "unterminated"),
+            ("<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"></｜｜DSML｜｜invoke>", "unterminated"),
+            ("<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"read_file\"><｜｜DSML｜｜parameter name=\"path\" string=\"false\">{bad}</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>", "invalid_arguments"),
+            ("<tool_call>{\"name\":\"read_file\",\"arguments\":{bad}}</tool_call>", "invalid_arguments"),
+        ] {
+            let mut state = StreamState::new("fixture".into(), &[]);
+            let events = state.ingest_chunk(compat_test_chunk(Some(frame), Some("stop"))).unwrap();
+            assert!(!events.iter().any(|event| matches!(event, StreamEvent::MessageStop(_))));
+            let first = state.finish().unwrap_err();
+            let second = state.finish().expect_err("rejected finish must not become successful EOF");
+            let metadata = first.compatibility_tool_frame_metadata().unwrap();
+            assert_eq!(metadata["class"], class);
+            assert_eq!(metadata["stage"], "stream_compat_finish");
+            assert_eq!(second.compatibility_tool_frame_metadata(), Some(metadata));
+            assert_eq!(second.private_compatibility_tool_frame(), Some(frame.as_bytes()));
+        }
+    }
+
+    #[tokio::test]
+    async fn compatibility_message_stream_rejects_failed_finish_on_every_observation() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // A complete SSE event containing a genuinely truncated tool frame.
+        // [DONE] is not permission to synthesize the missing closing tag.
+        let frame = "<tool_call><function=read_file></function>";
+        let chunk = json!({"id":"fixture", "choices":[{"delta":{"content":frame}, "finish_reason":"stop"}]});
+        let wire = format!("data: {chunk}\r\n\r\ndata: [DONE]\n\n");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let byte = socket.read_u8().await.unwrap();
+                request.push(byte);
+                assert!(request.len() < 8192);
+            }
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", wire.len());
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(wire.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/fixture"))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = super::MessageStream {
+            request_id: None,
+            response,
+            parser: OpenAiSseParser::with_context(
+                "fixture",
+                "fixture",
+                OpenAiWireProtocol::Completions,
+            ),
+            pending: std::collections::VecDeque::new(),
+            done: false,
+            state: StreamState::new("fixture".into(), &[]),
+            transport_activity: None,
+        };
+        let first = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match stream.next_event().await {
+                    Ok(Some(event)) => assert!(!matches!(event, StreamEvent::MessageStop(_))),
+                    Ok(None) => panic!("truncated protocol became successful EOF"),
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(3), stream.next_event())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            first.compatibility_tool_frame_metadata().unwrap()["class"],
+            "unterminated"
+        );
+        assert_eq!(
+            second.compatibility_tool_frame_metadata(),
+            first.compatibility_tool_frame_metadata()
+        );
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     #[test]
     fn deepseek_v4_text_fixture_preserves_thinking_and_text() {
         let chunks = parse_fixture(include_str!("../../tests/fixtures/deepseek_v4/text.sse"));
