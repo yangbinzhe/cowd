@@ -294,6 +294,8 @@ class Owner:
         env.update(HOME=str(self.root / "home"), TMPDIR=str(self.root / "tmp"),
                    CARGO_HOME=str(Path.home() / ".cargo"), RUSTUP_HOME=str(Path.home() / ".rustup"),
                    CARGO_TARGET_DIR=str(TARGET), CARGO_NET_OFFLINE="true", CARGO_BUILD_JOBS="4",
+                   PGHOST="127.0.0.1", PGPORT=str(self.args.port), PGUSER="owned_test",
+                   PGDATABASE="owned_test", PGPASSWORD=self.password,
                    COWD_TEST_POSTGRES_URL=f"postgresql://owned_test:{self.password}@127.0.0.1:{self.args.port}/owned_test",
                    COWD_R6_OWNED_ROOT=str(self.root / "workspace"))
         if os.environ.get("COWD_BIN"):
