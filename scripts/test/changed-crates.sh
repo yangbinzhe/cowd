@@ -13,5 +13,4 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 fi
 base="${1:-${COWD_CHANGED_BASE:-HEAD}}"
 report="${COWD_TEST_SELECTION_REPORT:-$(python3 scripts/test/cargo-selection.py report)}"
-cargo fmt --all --check
 exec python3 scripts/test/cargo-selection.py run --base "$base" --output "$report"

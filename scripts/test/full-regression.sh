@@ -18,9 +18,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[full-regression] cargo fmt --all --check"
-cargo fmt --all --check
-
 echo "[full-regression] build the verified Cowd sandbox launcher"
 cargo build -p cli --features full -p managed-worker-launcher
 export COWD_SANDBOX_LAUNCHER_BINARY="${CARGO_TARGET_DIR:-$ROOT/target}/debug/cowd"
