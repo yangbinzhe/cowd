@@ -54,23 +54,25 @@ fn exact_graph_context(context: &SessionMessageReceiptContext, graph: &str, turn
     }
 }
 
+#[track_caller]
 fn get_owned_json(
     client: &Client,
     base: &str,
     path: &str,
     deadline: Instant,
+    evidence: &Path,
 ) -> anyhow::Result<Value> {
-    get_owned_json_recorded(client, base, path, deadline, None)
+    get_owned_json_recorded(client, base, path, deadline, evidence)
 }
 
+#[track_caller]
 fn get_owned_json_recorded(
     client: &Client,
     base: &str,
     path: &str,
     deadline: Instant,
-    evidence: Option<&Path>,
+    evidence: &Path,
 ) -> anyhow::Result<Value> {
-    use std::io::Read;
     anyhow::ensure!(path.starts_with("/api/"), "owned fixed API path");
     let left = deadline
         .checked_duration_since(Instant::now())
@@ -83,29 +85,84 @@ fn get_owned_json_recorded(
         .timeout(left.min(Duration::from_secs(10)))
         .send()?;
     let status = response.status();
-    let mut body = Vec::new();
-    response
-        .by_ref()
-        .take(256 * 1024 + 1)
-        .read_to_end(&mut body)?;
-    anyhow::ensure!(body.len() <= 256 * 1024, "R6 API response bound");
-    if !status.is_success() {
-        if let Some(root) = evidence {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            private_record(
-                &root.join(format!("r6-api-read-refused-{ordinal}.json")),
-                &json!({
-                    "method":"GET","base_url":base,"path_and_query":path,"status":status.as_u16(),
-                    "body_utf8":std::str::from_utf8(&body).ok(),"body_bytes":body,
-                    "observed_at_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis(),
-                    "caller":"finite_provider_root_program","auth_headers_recorded":false
-                }),
-            )?;
-        }
-        anyhow::bail!("R6 API read refused path={path} status={status}");
+    r356_read_response(&mut response, status, path, evidence)
+}
+
+const R6_API_BYTES: usize = 256 * 1024;
+
+#[derive(Debug)]
+struct R356PageTooLarge;
+
+impl std::fmt::Display for R356PageTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("R6 API response bound")
     }
-    Ok(serde_json::from_slice(&body)?)
+}
+
+impl std::error::Error for R356PageTooLarge {}
+
+#[track_caller]
+fn r356_read_response(
+    response: &mut impl std::io::Read,
+    status: reqwest::StatusCode,
+    path: &str,
+    evidence: &Path,
+) -> anyhow::Result<Value> {
+    use std::io::Read;
+    let mut body = Vec::new();
+    let read = response
+        .by_ref()
+        .take(R6_API_BYTES as u64 + 1)
+        .read_to_end(&mut body);
+    let parsed = serde_json::from_slice::<Value>(&body);
+    let refusal = if body.len() > R6_API_BYTES {
+        Some("R6 API response bound")
+    } else if read.is_err() {
+        Some("R6 API response read failed")
+    } else if !status.is_success() {
+        Some("R6 API read refused")
+    } else if parsed.is_err() {
+        Some("R6 API invalid JSON")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let caller = std::panic::Location::caller();
+        // Metadata is durable before rejection, including when the original
+        // read was a successful HTTP response with an oversized payload page.
+        // Never copy request headers/credentials or pretend this prefix is a
+        // complete body. The outer owner encrypts the owned evidence root.
+        let record = private_record(
+            &evidence.join(format!("r6-api-read-refused-{ordinal}.json")),
+            &json!({
+                "method":"GET","path_and_query":path,"status":status.as_u16(),
+                "read_bytes":body.len(),"limit":R6_API_BYTES,"reason":reason,
+                "complete_body":read.is_ok() && body.len()<=R6_API_BYTES,
+                "body_utf8":if body.len()<=R6_API_BYTES {std::str::from_utf8(&body).ok()} else {None},
+                "observed_at_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis(),
+                "caller":{"file":caller.file(),"line":caller.line(),"column":caller.column()},
+                "auth_headers_recorded":false
+            }),
+        );
+        if let Err(error) = record {
+            anyhow::bail!(
+                "{reason} path={path} status={status}; refusal metadata persistence failed: {error}"
+            );
+        }
+        if body.len() > R6_API_BYTES && status.is_success() && read.is_ok() {
+            return Err(anyhow::Error::new(R356PageTooLarge).context(format!(
+                "{reason} path={path} status={status} read_bytes={} limit={R6_API_BYTES}",
+                body.len()
+            )));
+        }
+        anyhow::bail!(
+            "{reason} path={path} status={status} read_bytes={} limit={R6_API_BYTES}",
+            body.len()
+        );
+    }
+    Ok(parsed?)
 }
 
 #[test]
@@ -299,8 +356,8 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
                 provider.ensure_healthy()?;
                 anyhow::ensure!(Instant::now() < deadline, "foreground terminal deadline");
                 let path = observer.message_path(&session_id);
-                let response =
-                    get_owned_json(&client, &base, &path, deadline).map_err(|e| e.to_string());
+                let response = get_owned_json(&client, &base, &path, deadline, &root)
+                    .map_err(|e| e.to_string());
                 observer
                     .observe_message_page(&path, &response, started.elapsed().as_millis() as u64)
                     .map_err(anyhow::Error::msg)?;
@@ -412,6 +469,7 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
                     "/api/runtime/agentic/programs/root?session_id={session_id}&turn_id={turn}"
                 ),
                 deadline,
+                &root,
             )?;
             let program: runtime::AgenticProgramProjection = serde_json::from_value(program)?;
             anyhow::ensure!(
@@ -1318,7 +1376,7 @@ impl RecoveryReplies {
                 binding.session, binding.turn
             ),
             binding.deadline,
-            Some(&binding.evidence_root),
+            &binding.evidence_root,
         )?;
         let p: runtime::AgenticProgramProjection = serde_json::from_value(program_value)?;
         anyhow::ensure!(
@@ -1852,24 +1910,46 @@ fn r6_session_events(
     base: &str,
     session: &str,
     deadline: Instant,
+    evidence: &Path,
 ) -> anyhow::Result<Vec<Value>> {
-    let mut rows = vec![];
-    let mut next = 0u64;
-    let mut selected = None;
-    for _ in 0..32 {
-        let limit = 100usize.min(512 - rows.len());
-        anyhow::ensure!(
-            limit > 0 && Instant::now() < deadline,
-            "bounded R6 Session event prefix exhausted"
-        );
-        let page = get_owned_json(
+    r356_session_events(session, deadline, |next, limit| {
+        get_owned_json(
             client,
             base,
             &format!(
                 "/api/sessions/{session}/events?from_seq={next}&limit={limit}&include_payload=true"
             ),
             deadline,
-        )?;
+            evidence,
+        )
+    })
+}
+
+fn r356_session_events(
+    session: &str,
+    deadline: Instant,
+    mut read_page: impl FnMut(u64, usize) -> anyhow::Result<Value>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut rows = vec![];
+    let mut next = 0u64;
+    let mut selected = None;
+    let mut page_limit = 100usize;
+    for _ in 0..32 {
+        let limit = page_limit.min(512 - rows.len());
+        anyhow::ensure!(
+            limit > 0 && Instant::now() < deadline,
+            "bounded R6 Session event prefix exhausted"
+        );
+        let page = match read_page(next, limit) {
+            Ok(page) => page,
+            Err(error) if error.downcast_ref::<R356PageTooLarge>().is_some() && limit > 1 => {
+                // No rows/cut/cursor were accepted. Re-read the same cursor
+                // with fewer events, under the original byte/request budgets.
+                page_limit = (limit / 2).max(1);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         anyhow::ensure!(
             page["session_id"] == session
                 && page["from_seq"] == next
@@ -1895,8 +1975,8 @@ fn r6_session_events(
                 .as_u64()
                 .ok_or_else(|| anyhow::anyhow!("missing event position"))?;
             anyhow::ensure!(
-                event["session_id"] == session && position >= next,
-                "foreign/nonmonotonic Session event"
+                event["session_id"] == session && position == next,
+                "foreign/noncontiguous Session event"
             );
             next = position
                 .checked_add(1)
@@ -1926,7 +2006,7 @@ fn observe_owned_active_cancel(
     use runtime::provider_runtime_client::ProviderPhysicalObservation;
     // The actor is independently read before cancellation, never inferred from
     // the returned receipt (which would make the identity check circular).
-    let leases = get_owned_json(client, base, "/api/runtime/session-leases", deadline)?;
+    let leases = get_owned_json(client, base, "/api/runtime/session-leases", deadline, root)?;
     let owned = leases["leases"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("missing original leases"))?
@@ -1952,7 +2032,7 @@ fn observe_owned_active_cancel(
         actor
             .maintain_receipt_authority()
             .map_err(anyhow::Error::msg)?;
-        let events = r6_session_events(client, base, session, deadline)?;
+        let events = r6_session_events(client, base, session, deadline, root)?;
         let found = events.iter().rev().find_map(|event| {
             if event["type"] != "context.provider_physical_observation"
                 || event["status"] != "opened"
@@ -1996,6 +2076,7 @@ fn observe_owned_active_cancel(
         base,
         &format!("/api/runtime/executions/{graph}?detail_scope=summary"),
         deadline,
+        root,
     )?;
     anyhow::ensure!(
         before.pointer("/terminal_axes/execution/phase") != Some(&json!("terminal")),
@@ -2024,6 +2105,7 @@ fn observe_owned_active_cancel(
             base,
             &format!("/api/runtime/executions/{graph}?detail_scope=summary"),
             deadline,
+            root,
         )?;
         if r6_cancel_settled(
             session,
@@ -2034,7 +2116,7 @@ fn observe_owned_active_cancel(
             &receipt,
             &projection,
         ) {
-            let events = r6_session_events(client, base, session, deadline)?;
+            let events = r6_session_events(client, base, session, deadline, root)?;
             for event in &events {
                 if event["type"] != "context.provider_physical_observation"
                     || event["status"] != "cancel_observed"
@@ -2427,6 +2509,227 @@ fn r6_saved_control_requests_obey_original_parser_without_business_progress() ->
 }
 
 #[test]
+fn r356_response_bound_records_metadata_and_cannot_mask_http_refusal() -> anyhow::Result<()> {
+    use std::io::Cursor;
+    let root = tempfile::tempdir()?;
+    let path = "/api/sessions/owned/events?from_seq=0&limit=100&include_payload=true";
+    let mut exact = b"{\"ok\":true}".to_vec();
+    exact.resize(262_144, b' ');
+    assert_eq!(
+        r356_read_response(
+            &mut Cursor::new(exact),
+            reqwest::StatusCode::OK,
+            path,
+            root.path()
+        )?,
+        json!({"ok":true})
+    );
+    assert_eq!(std::fs::read_dir(root.path())?.count(), 0);
+    let mut oversized = Cursor::new(vec![b' '; 300_000]);
+    let error =
+        r356_read_response(&mut oversized, reqwest::StatusCode::OK, path, root.path()).unwrap_err();
+    assert!(error.downcast_ref::<R356PageTooLarge>().is_some());
+    assert_eq!(oversized.position(), 262_145);
+    let files = std::fs::read_dir(root.path())?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(files.len(), 1);
+    let stored: Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
+    assert_eq!(stored["path_and_query"], path);
+    assert_eq!(stored["status"], 200);
+    assert_eq!(stored["read_bytes"], 262_145);
+    assert_eq!(stored["limit"], 262_144);
+    assert_eq!(stored["complete_body"], false);
+    assert!(stored["body_utf8"].is_null());
+    assert_eq!(stored["auth_headers_recorded"], false);
+    assert!(
+        stored["caller"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("background_coexistence_tests.rs")
+    );
+    assert!(stored["caller"]["line"].as_u64().unwrap() > 0);
+    let denied = r356_read_response(
+        &mut Cursor::new(vec![b' '; 300_000]),
+        reqwest::StatusCode::FORBIDDEN,
+        path,
+        root.path(),
+    )
+    .unwrap_err();
+    assert!(
+        denied.downcast_ref::<R356PageTooLarge>().is_none(),
+        "authorization refusal must not be retried as a smaller page"
+    );
+    Ok(())
+}
+
+#[test]
+fn r356_pages_shrink_at_same_cursor_and_preserve_the_original_cut() -> anyhow::Result<()> {
+    use std::io::Cursor;
+    let root = tempfile::tempdir()?;
+    let events: Vec<_> = (0..60).map(|n| json!({"session_id":"owned","sequence":n,"id":format!("event-{n}"),"payload":"x".repeat(5000)})).collect();
+    let mut calls = Vec::new();
+    let rows = r356_session_events(
+        "owned",
+        Instant::now() + Duration::from_secs(3),
+        |next, limit| {
+            calls.push((next, limit));
+            // Four newly appended events become visible only after the first
+            // successful page established the original 56-event cut.
+            let end = if next == 0 { 56 } else { 60 };
+            let start = next as usize;
+            let selected = &events[start..(start + limit).min(end)];
+            let page = json!({"session_id":"owned","from_seq":next,"limit":limit,"total":end-start,"events":selected,"has_more":selected.len()<end-start,"include_payload":true});
+            let path = format!(
+                "/api/sessions/owned/events?from_seq={next}&limit={limit}&include_payload=true"
+            );
+            r356_read_response(
+                &mut Cursor::new(serde_json::to_vec(&page)?),
+                reqwest::StatusCode::OK,
+                &path,
+                root.path(),
+            )
+        },
+    )?;
+    assert_eq!(calls, vec![(0, 100), (0, 50), (50, 50)]);
+    assert_eq!(rows.len(), 56);
+    for (n, row) in rows.iter().enumerate() {
+        assert_eq!(row["id"], format!("event-{n}"));
+        assert_eq!(row["sequence"], n as u64);
+    }
+    Ok(())
+}
+
+#[test]
+fn r356_paging_rejects_foreign_gaps_unknown_and_single_event_overflow() -> anyhow::Result<()> {
+    use std::io::Cursor;
+    for (session, positions) in [
+        ("foreign", vec![0, 1]),
+        ("owned", vec![0, 0]),
+        ("owned", vec![0, 2]),
+    ] {
+        let error = r356_session_events("owned", Instant::now()+Duration::from_secs(3), |from,limit| {
+            Ok(json!({"session_id":"owned","from_seq":from,"limit":limit,"total":2,"has_more":false,"include_payload":true,"events":positions.iter().map(|n|json!({"session_id":session,"sequence":n})).collect::<Vec<_>>()}))
+        }).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("foreign/noncontiguous Session event")
+        );
+    }
+    let mut calls = 0;
+    let error = r356_session_events("owned", Instant::now() + Duration::from_secs(3), |_, _| {
+        calls += 1;
+        anyhow::bail!("unknown original reader failure")
+    })
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unknown original reader failure")
+    );
+    assert_eq!(calls, 1);
+    let root = tempfile::tempdir()?;
+    for status in [
+        reqwest::StatusCode::UNAUTHORIZED,
+        reqwest::StatusCode::FORBIDDEN,
+    ] {
+        let mut requested = Vec::new();
+        let error = r356_session_events(
+            "owned",
+            Instant::now() + Duration::from_secs(3),
+            |_, limit| {
+                requested.push(limit);
+                r356_read_response(
+                    &mut Cursor::new(vec![b' '; 300_000]),
+                    status,
+                    "/api/sessions/owned/events",
+                    root.path(),
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<R356PageTooLarge>().is_none());
+        assert_eq!(
+            requested,
+            vec![100],
+            "401/403 cannot initiate a smaller-page retry"
+        );
+    }
+    let mut limits = Vec::new();
+    let error = r356_session_events(
+        "owned",
+        Instant::now() + Duration::from_secs(3),
+        |_, limit| {
+            limits.push(limit);
+            r356_read_response(
+                &mut Cursor::new(vec![b' '; 300_000]),
+                reqwest::StatusCode::OK,
+                "/api/sessions/owned/events",
+                root.path(),
+            )
+        },
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<R356PageTooLarge>().is_some());
+    assert_eq!(limits, vec![100, 50, 25, 12, 6, 3, 1]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "manual protected run355 immutable-cut witness; no PG/model or business acceptance"]
+fn r357_retained_request9_cut_replays_under_the_unchanged_byte_limit() -> anyhow::Result<()> {
+    use std::io::Cursor;
+    let path = PathBuf::from(
+        std::env::var_os("COWD_R357_CUT_PAGE")
+            .ok_or_else(|| anyhow::anyhow!("explicit protected cut fixture required"))?,
+    );
+    anyhow::ensure!(
+        std::fs::metadata(&path)?.len() == 264_289,
+        "independent original-cut size"
+    );
+    let original = std::fs::read(path)?;
+    use sha2::Digest;
+    assert_eq!(
+        format!("{:x}", sha2::Sha256::digest(&original)),
+        "1b17b9acd1f51538663675ae5603d785fa376e718e114d4b6f92591e2901c436"
+    );
+    let page: Value = serde_json::from_slice(&original)?;
+    let events = page["events"].as_array().unwrap();
+    let root = tempfile::tempdir()?;
+    let mut calls = Vec::new();
+    let rows = r356_session_events(
+        "d7b9605d-eab7-4e61-9891-bcba77d5c6ab",
+        Instant::now() + Duration::from_secs(3),
+        |next, limit| {
+            calls.push((next, limit));
+            let start = next as usize;
+            let selected = &events[start..(start + limit).min(56)];
+            let response = json!({"session_id":"d7b9605d-eab7-4e61-9891-bcba77d5c6ab","events":selected,"total":56-start,"from_seq":next,"limit":limit,"has_more":selected.len()<56-start,"include_payload":true});
+            let bytes = serde_json::to_vec(&response)?;
+            r356_read_response(
+                &mut Cursor::new(bytes),
+                reqwest::StatusCode::OK,
+                &format!(
+                    "/api/sessions/d7b9605d-eab7-4e61-9891-bcba77d5c6ab/events?from_seq={next}&limit={limit}&include_payload=true"
+                ),
+                root.path(),
+            )
+        },
+    )?;
+    assert_eq!(calls, vec![(0, 100), (0, 50), (50, 50)]);
+    assert_eq!(rows.len(), 56);
+    assert_eq!(rows.last().unwrap()["sequence"], 55);
+    assert_eq!(
+        rows.last().unwrap()["payload"]["body_sha256"],
+        "a3611636dc0a482eef1f84375d96fd823e3097a8dea110688e33d076b70aa87e"
+    );
+    assert_eq!(
+        format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&rows)?)),
+        "a1f7e6440c40d239f2daafef77386df83ce0c0747fe6a555379872dfbb27b313"
+    );
+    Ok(())
+}
+
+#[test]
 fn r6_refused_api_preserves_actual_path_status_and_body_before_return() -> anyhow::Result<()> {
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -2471,7 +2774,7 @@ fn r6_refused_api_preserves_actual_path_status_and_body_before_return() -> anyho
         &base,
         "/api/runtime/agentic/programs/root?session_id=owned&turn_id=turn",
         Instant::now() + Duration::from_secs(3),
-        Some(root.path()),
+        root.path(),
     )
     .unwrap_err();
     let request = server
@@ -3011,7 +3314,13 @@ fn r344_prove_lane(request: &ScriptRequest, owner: &ProviderBinding) -> anyhow::
         "role proof absolute deadline"
     );
     // This event is committed before HTTP dispatch, never inferred from prose.
-    let events = r6_session_events(&owner.client, &owner.base, &owner.session, owner.deadline)?;
+    let events = r6_session_events(
+        &owner.client,
+        &owner.base,
+        &owner.session,
+        owner.deadline,
+        &owner.evidence_root,
+    )?;
     let packed = r344_unique_packed(
         &events,
         &request.raw_sha256,
@@ -3089,7 +3398,7 @@ fn r344_prove_lane(request: &ScriptRequest, owner: &ProviderBinding) -> anyhow::
                 owner.session, owner.turn
             ),
             owner.deadline,
-            Some(&owner.evidence_root),
+            &owner.evidence_root,
         )?)?;
     anyhow::ensure!(
         program.session_id == owner.session
