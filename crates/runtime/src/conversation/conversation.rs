@@ -3991,6 +3991,39 @@ pub struct ModelStepResult {
     pub text_only_response: bool,
 }
 
+impl ModelStepResult {
+    /// Classify an empty completion before it can become a Goal candidate.
+    /// Reasoning-only responses retain the original bounded continuation lane.
+    pub(crate) fn into_host_result(self) -> Result<Self, RuntimeError> {
+        let empty_final =
+            matches!(&self.intent, ModelStepIntent::FinalAnswer { text } if text.trim().is_empty());
+        let has_reasoning = self
+            .assistant_message
+            .blocks
+            .iter()
+            .any(|block| match block {
+                ContentBlock::Thinking { thinking, .. } => !thinking.trim().is_empty(),
+                ContentBlock::ReasoningSummary { text } => !text.trim().is_empty(),
+                _ => false,
+            });
+        if self.input_interpretation.is_none()
+            && empty_final
+            && (self.text_only_response || !has_reasoning)
+        {
+            // Use the existing failed-step owner, including its Goal policy and
+            // receipt-aware bounded recovery. A missing usage observation must
+            // stay unknown rather than turn the aggregate's default zero into
+            // a claimed physical provider measurement.
+            return Err(RuntimeError::new(
+                "provider completed without a visible final answer or tool calls",
+            )
+            .with_provider_usage(self.assistant_message.usage)
+            .with_effect_receipts(self.early_tool_receipts));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolBatchStepResult {
     pub(crate) refused_before_dispatch: Vec<(String, String)>,

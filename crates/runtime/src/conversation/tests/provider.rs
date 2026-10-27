@@ -6519,3 +6519,137 @@ fn durable_strategy_quantity_refuses_invalid_latest_instead_of_falling_back() {
         .bind_turn_strategy_execution("quantity-turn", "quantity-root")
         .is_err());
 }
+
+#[test]
+fn empty_final_completion_is_failure_with_original_usage_not_a_goal_candidate() {
+    let usage = TokenUsage {
+        input_tokens: 19945,
+        output_tokens: 0,
+        ..Default::default()
+    };
+    let make =
+        |text: &str, blocks: Vec<ContentBlock>, text_only_response: bool| super::ModelStepResult {
+            input_interpretation: None,
+            intent: ModelStepIntent::FinalAnswer {
+                text: text.to_owned(),
+            },
+            assistant_message: ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks,
+                usage: Some(usage),
+            },
+            preflight_tool_results: vec![],
+            usage,
+            model: Some("actual-model".into()),
+            models_used: vec!["actual-model".into()],
+            first_token_latency_ms: None,
+            active_stream_duration_ms: None,
+            wall_duration_ms: 1,
+            early_tool_receipts: vec![],
+            early_tool_deferrals: vec![],
+            response_completed_at_ms: 1,
+            text_only_response,
+        };
+    // Original empty carrier and actual known usage, not a reconstructed HTTP response.
+    let empty = make(
+        "",
+        vec![ContentBlock::Text {
+            text: String::new(),
+        }],
+        false,
+    );
+    let error = empty
+        .into_host_result()
+        .expect_err("an empty completion is not a final answer");
+    assert_eq!(
+        error.to_string(),
+        "provider completed without a visible final answer or tool calls"
+    );
+    assert_eq!(error.provider_usage(), Some(usage));
+    assert!(!error.is_provider_tool_protocol_failure());
+    assert!(error.effect_receipts().is_empty());
+    assert!(make("  ", vec![], false).into_host_result().is_err());
+    let mut unknown = make("", vec![], false);
+    unknown.assistant_message.usage = None;
+    assert_eq!(
+        unknown.into_host_result().unwrap_err().provider_usage(),
+        None
+    );
+    let call = ModelToolCall {
+        binding: None,
+        id: "already-receipted".into(),
+        name: "read_file".into(),
+        input: "{}".into(),
+        depends_on: vec![],
+    };
+    let receipt = EarlyToolExecutionReceipt {
+        call: call.clone(),
+        ready_at_ms: 1,
+        started_at_ms: 2,
+        completed_at_ms: 3,
+        outcome: crate::RuntimeToolExecutionOutcome {
+            tool_use_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: crate::ToolSafetyCategory::ReadOnly,
+            output: Some("independent retained body".into()),
+            error: None,
+            evidence_ref: "original-receipt".into(),
+            observed_evidence: vec![],
+        },
+    };
+    let mut after_effect = make("", vec![], false);
+    after_effect.early_tool_receipts.push(receipt.clone());
+    assert_eq!(
+        after_effect
+            .into_host_result()
+            .unwrap_err()
+            .effect_receipts(),
+        &[receipt]
+    );
+
+    let visible = make("independent actual answer", vec![], false);
+    assert_eq!(visible.clone().into_host_result().unwrap(), visible);
+    let reasoning = make(
+        "",
+        vec![ContentBlock::Thinking {
+            thinking: "retained evidence needs another step".into(),
+            signature: None,
+        }],
+        false,
+    );
+    assert_eq!(reasoning.clone().into_host_result().unwrap(), reasoning);
+    let exhausted_terminal = make(
+        "",
+        vec![ContentBlock::ReasoningSummary {
+            text: "still no visible answer".into(),
+        }],
+        true,
+    );
+    assert!(
+        exhausted_terminal.into_host_result().is_err(),
+        "a zero-tool terminal cannot be a reasoning continuation"
+    );
+    let mut tools = make("", vec![], false);
+    tools.intent = ModelStepIntent::ToolCalls {
+        calls: vec![ModelToolCall {
+            binding: None,
+            id: "real-call".into(),
+            name: "read_file".into(),
+            input: "{}".into(),
+            depends_on: vec![],
+        }],
+    };
+    assert_eq!(
+        tools.clone().into_host_result().unwrap(),
+        tools,
+        "empty prose must not discard a tool call"
+    );
+    let mut interpretation = make("", vec![], false);
+    interpretation.input_interpretation = Some(Err("strict interpretation rejected".into()));
+    assert_eq!(
+        interpretation.clone().into_host_result().unwrap(),
+        interpretation,
+        "the dedicated control owner retains its own rejection"
+    );
+}

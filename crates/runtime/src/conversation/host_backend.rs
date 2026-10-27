@@ -2291,6 +2291,7 @@ where
                 )
                 .await
         };
+        let result = result.and_then(crate::conversation::ModelStepResult::into_host_result);
         drop(model_runtime);
         drop(step_runtime);
         runtime
