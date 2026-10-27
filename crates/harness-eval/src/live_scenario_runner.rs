@@ -82,6 +82,7 @@ fn u7_memory_checks(
     session: &str,
     response: &str,
     history: &Value,
+    case: &Value,
 ) -> Value {
     let bound_history = history.get("session_id").and_then(Value::as_str) == Some(session)
         && history.get("has_more").and_then(Value::as_bool) == Some(false);
@@ -109,7 +110,85 @@ fn u7_memory_checks(
                 })
             });
     let correct = response.contains(&fixture.warehouse) && response.contains(&fixture.passphrase);
-    json!({"passed": selected && correct, "persisted_context_memory_selected":selected,
+    // The original producer freezes and reads back this exact seed before
+    // dispatch. A correct answer alone cannot prove persistent-memory use.
+    let preparation = case["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["kind"] == "u7_preregistered_persistent_memory")
+        .map(|row| &row["evidence"]);
+    let seed_id = preparation
+        .and_then(|row| row["memory_id"].as_str())
+        .filter(|id| !id.is_empty());
+    let seed_verified = preparation.zip(seed_id).is_some_and(|(row, id)| {
+        row["input"] == json!(fixture)
+            && row["fixture_sha256"].as_str()
+                == Some(
+                    format!(
+                        "{:x}",
+                        Sha256::digest(
+                            serde_json::to_vec_pretty(fixture).expect("serializable U7 fixture")
+                        )
+                    )
+                    .as_str(),
+                )
+            && u7_persisted_record(&row["readback"], id, &fixture.content)
+    });
+    let execution = case["execution_id"].as_str().filter(|id| !id.is_empty());
+    let turn = case["turn_id"].as_str().filter(|id| !id.is_empty());
+    let retrieval = seed_verified && seed_id.zip(execution).zip(turn).is_some_and(|((id, execution), turn)| {
+        case["trace"].as_array().into_iter().flatten()
+            .filter(|row| row["channel"] == "timeline")
+            .flat_map(|row| row["response"]["events"].as_array().into_iter().flatten())
+            .any(|event| {
+                let payload = &event["payload"];
+                let binding = &payload["_runtime_activity_binding"];
+                let input = payload["input_preview"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok());
+                let preview = payload["output_preview"].as_str().unwrap_or_default();
+                event["kind"] == "tool.invocation.completed"
+                    && event["stream_id"] == format!("session:{session}")
+                    && payload["tool_name"] == "context_retrieve"
+                    && payload["status"] == "completed" && payload["is_error"] == false
+                    && payload["session_id"] == session
+                    && binding["session_id"] == session && binding["turn_id"] == turn
+                    && binding["root_execution_id"] == execution
+                    && payload["tool_call_id"].as_str().is_some_and(|call| !call.is_empty() && binding["tool_call_id"] == call)
+                    && binding["tool_contract_id"] == "context_retrieve"
+                    && input.as_ref().is_some_and(|input| input["source"] == "memory" && input["query"].as_str().is_some_and(|q| q.contains(&fixture.lookup)))
+                    // This is a retained Runtime-owned receipt preview, not a
+                    // claim to have recovered or parsed the complete raw body.
+                    && preview.starts_with("{\n  \"selected\": [\n    {")
+                    && preview.contains(&format!("\"memory_id\": {}", json!(id)))
+                    && preview.contains(&format!("\"preview\": {}", json!(&fixture.content)))
+            })
+    });
+    let terminal = execution.zip(turn).is_some_and(|(execution, turn)| {
+        let outcome = &case["business_observation"];
+        let delivery = &case["delivery_observation"];
+        case["session_id"] == session
+            && outcome["event_status"] == "succeeded"
+            && outcome["session_id"] == session
+            && outcome["turn_id"] == turn
+            && outcome["execution_id"] == execution
+            && delivery["status"] == "confirmed"
+            && delivery["fresh_context_confirmed"] == true
+            && delivery["session_id"] == session
+            && delivery["turn_id"] == turn
+            && delivery["execution_id"] == execution
+            && case["terminal_id"].as_str().is_some_and(|id| {
+                !id.is_empty()
+                    && delivery["message_id"] == id
+                    && delivery["ack"]["message_id"] == id
+            })
+            && delivery["ack"]["session_id"] == session
+    });
+    json!({"passed": seed_verified && retrieval && correct && terminal,
+        "business_passed":seed_verified && retrieval && correct && terminal,
+        "authorized_persistent_seed_verified":seed_verified, "bound_memory_retrieval_observed":retrieval,
+        "root_success_and_public_ack":terminal,
+        "retrieval_evidence_kind":"durable_bound_tool_receipt_preview", "full_result_body_verified":false,
+        "persisted_context_memory_selected":selected, "automatic_context_selection_required":false,
         "independent_business_values":correct, "history":history})
 }
 
@@ -3160,8 +3239,19 @@ impl LiveScenarioRunner {
                     session,
                     result["u7_terminal_answer"].as_str().unwrap_or_default(),
                     &history,
+                    &result,
                 ),
-                Err(error) => json!({"passed":false,"error":error}),
+                Err(error) => {
+                    let mut evidence = u7_memory_checks(
+                        fixture,
+                        session,
+                        result["u7_terminal_answer"].as_str().unwrap_or_default(),
+                        &Value::Null,
+                        &result,
+                    );
+                    evidence["automatic_context_selection_error"] = json!(error);
+                    evidence
+                }
             };
             if evidence["passed"] != true {
                 result["status"] = json!("failed");

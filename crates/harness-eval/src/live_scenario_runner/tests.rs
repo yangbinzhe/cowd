@@ -4133,16 +4133,33 @@ fn u7_literal_history() -> Value {
     }}]})
 }
 
+fn u7_literal_case(fixture: &U7MemoryFixture) -> Value {
+    let id = "00000000-0000-0000-0000-000000000001";
+    let preview = serde_json::to_string_pretty(
+        &json!({"selected":[{"memory_id":id,"preview":fixture.content}]}),
+    )
+    .unwrap();
+    json!({"session_id":"s-original","execution_id":"graph-original","turn_id":"turn-original","terminal_id":"message-original",
+    "business_observation":{"event_status":"succeeded","session_id":"s-original","execution_id":"graph-original","turn_id":"turn-original"},
+    "delivery_observation":{"status":"confirmed","fresh_context_confirmed":true,"session_id":"s-original","execution_id":"graph-original","turn_id":"turn-original","message_id":"message-original","ack":{"session_id":"s-original","message_id":"message-original"}},
+    "trace":[{"kind":"u7_preregistered_persistent_memory","evidence":{"memory_id":id,"input":fixture,"fixture_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec_pretty(fixture).unwrap())),"readback":{"entries":[{"id":id,"scope":"Global","content":fixture.content}]}}},
+    {"channel":"timeline","response":{"events":[{"kind":"tool.invocation.completed","stream_id":"session:s-original","payload":{
+        "tool_name":"context_retrieve","status":"completed","is_error":false,"session_id":"s-original","tool_call_id":"call-original",
+        "input_preview":json!({"source":"memory","query":"independent-project"}).to_string(),"output_preview":preview,
+        "_runtime_activity_binding":{"session_id":"s-original","turn_id":"turn-original","root_execution_id":"graph-original","tool_call_id":"call-original","tool_contract_id":"context_retrieve"}
+    }}]}}]})
+}
+
 #[test]
-fn u7_memory_requires_original_selected_context_and_independent_answer() {
+fn u7_memory_requires_bound_retrieval_and_answer_not_one_context_implementation() {
     let fixture = u7_literal_fixture();
     let answer = "WH-literal-527 OUT-literal-893";
     let history = u7_literal_history();
-    assert_eq!(
-        u7_memory_checks(&fixture, "s-original", answer, &history)["passed"],
-        true
-    );
-    for case in [
+    let case = u7_literal_case(&fixture);
+    let checks = u7_memory_checks(&fixture, "s-original", answer, &history, &case);
+    assert_eq!(checks["business_passed"], true);
+    assert_eq!(checks["persisted_context_memory_selected"], true);
+    for defect in [
         "foreign-session",
         "foreign-envelope",
         "wrong-source",
@@ -4150,9 +4167,10 @@ fn u7_memory_requires_original_selected_context_and_independent_answer() {
         "partial-page",
         "wrong-body",
         "wrong-intent",
+        "unavailable",
     ] {
         let mut changed = history.clone();
-        match case {
+        match defect {
             "foreign-session" => changed["session_id"] = json!("foreign"),
             "foreign-envelope" => {
                 changed["envelopes"][0]["envelope"]["identity"]["session_id"] = json!("foreign")
@@ -4160,11 +4178,7 @@ fn u7_memory_requires_original_selected_context_and_independent_answer() {
             "wrong-source" => {
                 changed["envelopes"][0]["envelope"]["selected"][0]["source"] = json!("user_request")
             }
-            "omitted" => {
-                changed["envelopes"][0]["envelope"]["omitted"] =
-                    changed["envelopes"][0]["envelope"]["selected"].clone();
-                changed["envelopes"][0]["envelope"]["selected"] = json!([]);
-            }
+            "omitted" => changed["envelopes"][0]["envelope"]["selected"] = json!([]),
             "partial-page" => changed["has_more"] = json!(true),
             "wrong-body" => {
                 changed["envelopes"][0]["envelope"]["selected"][0]["content"] =
@@ -4173,13 +4187,19 @@ fn u7_memory_requires_original_selected_context_and_independent_answer() {
             "wrong-intent" => {
                 changed["envelopes"][0]["envelope"]["intent"] = json!("other project")
             }
+            "unavailable" => changed = Value::Null,
             _ => unreachable!(),
         }
+        let checks = u7_memory_checks(&fixture, "s-original", answer, &changed, &case);
         assert_eq!(
-            u7_memory_checks(&fixture, "s-original", answer, &changed)["passed"],
-            false,
-            "{case}"
+            checks["business_passed"], true,
+            "{defect} does not invalidate separately proven retrieval"
         );
+        assert_eq!(
+            checks["persisted_context_memory_selected"], false,
+            "{defect} remains unproved"
+        );
+        assert_eq!(checks["full_result_body_verified"], false);
     }
     for wrong in [
         "",
@@ -4188,10 +4208,135 @@ fn u7_memory_requires_original_selected_context_and_independent_answer() {
         "WH-other OUT-other",
     ] {
         assert_eq!(
-            u7_memory_checks(&fixture, "s-original", wrong, &history)["passed"],
+            u7_memory_checks(&fixture, "s-original", wrong, &history, &case)["business_passed"],
             false
         );
     }
+}
+
+#[test]
+fn u7_correct_answer_without_original_seed_retrieval_or_ack_does_not_pass() {
+    let fixture = u7_literal_fixture();
+    let original = u7_literal_case(&fixture);
+    for defect in [
+        "no-seed",
+        "wrong-seed-body",
+        "wrong-seed-id",
+        "wrong-fixture",
+        "no-retrieval",
+        "foreign-session",
+        "foreign-graph",
+        "foreign-turn",
+        "foreign-call",
+        "wrong-source",
+        "failed-tool",
+        "wrong-preview",
+        "failed-root",
+        "no-ack",
+        "foreign-ack",
+    ] {
+        let mut case = original.clone();
+        match defect {
+            "no-seed" => case["trace"][0]["kind"] = json!("other"),
+            "wrong-seed-body" => {
+                case["trace"][0]["evidence"]["readback"]["entries"][0]["content"] =
+                    json!("foreign body")
+            }
+            "wrong-seed-id" => case["trace"][0]["evidence"]["memory_id"] = json!("foreign"),
+            "wrong-fixture" => {
+                case["trace"][0]["evidence"]["input"]["warehouse"] = json!("foreign")
+            }
+            "no-retrieval" => case["trace"][1]["response"]["events"] = json!([]),
+            "foreign-session" => {
+                case["trace"][1]["response"]["events"][0]["payload"]["_runtime_activity_binding"]
+                    ["session_id"] = json!("foreign")
+            }
+            "foreign-graph" => {
+                case["trace"][1]["response"]["events"][0]["payload"]["_runtime_activity_binding"]
+                    ["root_execution_id"] = json!("foreign")
+            }
+            "foreign-turn" => {
+                case["trace"][1]["response"]["events"][0]["payload"]["_runtime_activity_binding"]
+                    ["turn_id"] = json!("foreign")
+            }
+            "foreign-call" => {
+                case["trace"][1]["response"]["events"][0]["payload"]["_runtime_activity_binding"]
+                    ["tool_call_id"] = json!("foreign")
+            }
+            "wrong-source" => {
+                case["trace"][1]["response"]["events"][0]["payload"]["input_preview"] =
+                    json!(r#"{"source":"session_history","query":"independent-project"}"#)
+            }
+            "failed-tool" => {
+                case["trace"][1]["response"]["events"][0]["payload"]["is_error"] = json!(true)
+            }
+            "wrong-preview" => {
+                case["trace"][1]["response"]["events"][0]["payload"]["output_preview"] =
+                    json!("unbound prose with independent memory body 527/893")
+            }
+            "failed-root" => case["business_observation"]["event_status"] = json!("failed"),
+            "no-ack" => case["delivery_observation"]["status"] = json!("unconfirmed"),
+            "foreign-ack" => case["delivery_observation"]["ack"]["session_id"] = json!("foreign"),
+            _ => unreachable!(),
+        }
+        let result = u7_memory_checks(
+            &fixture,
+            "s-original",
+            "WH-literal-527 OUT-literal-893",
+            &u7_literal_history(),
+            &case,
+        );
+        assert_eq!(
+            result["business_passed"], false,
+            "{defect}; an automatic context is not a substitute for this hard business proof"
+        );
+    }
+}
+
+#[test]
+#[ignore = "offline original U7 case and independently frozen fixture must be provided"]
+fn u7_offline_original_case_keeps_business_and_context_observations_separate() {
+    let original =
+        std::fs::read(std::env::var("COWD_U7_ORIGINAL_CASE").expect("original case path")).unwrap();
+    let expected_sha =
+        std::env::var("COWD_U7_ORIGINAL_CASE_SHA256").expect("frozen original digest");
+    assert_eq!(format!("{:x}", Sha256::digest(&original)), expected_sha);
+    let case: Value = serde_json::from_slice(&original).unwrap();
+    let input: Value = serde_json::from_slice(
+        &std::fs::read(
+            std::env::var("COWD_U7_ORIGINAL_FIXTURE")
+                .expect("original independently frozen fixture"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(input["scope"], "global");
+    let fixture = U7MemoryFixture {
+        scope: "global",
+        lookup: input["lookup"].as_str().unwrap().into(),
+        warehouse: input["warehouse"].as_str().unwrap().into(),
+        passphrase: input["passphrase"].as_str().unwrap().into(),
+        content: input["content"].as_str().unwrap().into(),
+    };
+    let result = u7_memory_checks(
+        &fixture,
+        case["session_id"].as_str().unwrap(),
+        case["u7_terminal_answer"].as_str().unwrap(),
+        &case["u7_memory_evidence"]["history"],
+        &case,
+    );
+    assert_eq!(result["business_passed"], true);
+    assert_eq!(result["persisted_context_memory_selected"], false);
+    assert_eq!(result["automatic_context_selection_required"], false);
+    assert_eq!(
+        case["status"], "failed",
+        "immutable historical report stays failed"
+    );
+    assert_eq!(
+        case["u7_memory_evidence"]["passed"], false,
+        "the old evaluator result is historical"
+    );
+    assert_eq!(format!("{:x}", Sha256::digest(&original)), expected_sha);
 }
 
 #[test]
@@ -4227,7 +4372,8 @@ fn u7_preparation_readback_requires_same_original_id_and_full_body() {
             &u7_literal_fixture(),
             "s-original",
             "WH-literal-527 OUT-literal-893",
-            &json!({})
+            &json!({}),
+            &Value::Null,
         )["passed"],
         false,
         "CRUD/readback cannot stand in for real context consumption"
