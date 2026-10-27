@@ -493,6 +493,7 @@ pub trait ArtifactGcPort: Send + Sync {
 #[derive(Clone)]
 pub struct ArtifactStore {
     inner: Arc<ArtifactStoreInner>,
+    prepared_observation: bool,
 }
 
 struct ArtifactStoreInner {
@@ -698,6 +699,7 @@ impl ArtifactStore {
         config: ArtifactStoreConfig,
     ) -> Self {
         Self {
+            prepared_observation: false,
             inner: Arc::new(ArtifactStoreInner {
                 staging_root: blob_root.join("staging"),
                 blob_root,
@@ -718,6 +720,20 @@ impl ArtifactStore {
     #[must_use]
     pub fn config(&self) -> ArtifactStoreConfig {
         self.inner.config
+    }
+
+    /// A private read view over the same catalogue and blob generations. Only
+    /// the event-store observation binding selects this view; it grants no new
+    /// publication/adoption rights and does not replace metadata validation.
+    pub(crate) fn verified_observation_view(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            prepared_observation: true,
+        }
+    }
+
+    pub(crate) fn is_verified_observation(&self) -> bool {
+        self.prepared_observation
     }
 
     #[cfg(test)]
@@ -1081,7 +1097,7 @@ impl ArtifactStore {
         authorized_scope: &str,
         range: Option<Range<u64>>,
     ) -> Result<Vec<u8>, ArtifactError> {
-        self.read_verified_blocking(artifact, authorized_scope, range, None, false)
+        self.read_verified_blocking(artifact, authorized_scope, range, None, false, true)
             .map(|read| read.body)
     }
 
@@ -1092,7 +1108,18 @@ impl ArtifactStore {
         origin: &PreparedArtifactOrigin,
     ) -> Result<Vec<u8>, ArtifactError> {
         origin.validate().map_err(ArtifactError::Metadata)?;
-        self.read_verified_blocking(artifact, authorized_scope, None, Some(origin), false)
+        self.read_verified_blocking(artifact, authorized_scope, None, Some(origin), false, true)
+            .map(|read| read.body)
+    }
+
+    pub(crate) fn read_prepared_observation_blocking(
+        &self,
+        artifact: &ArtifactRef,
+        authorized_scope: &str,
+        origin: &PreparedArtifactOrigin,
+    ) -> Result<Vec<u8>, ArtifactError> {
+        origin.validate().map_err(ArtifactError::Metadata)?;
+        self.read_verified_blocking(artifact, authorized_scope, None, Some(origin), false, false)
             .map(|read| read.body)
     }
 
@@ -1110,7 +1137,7 @@ impl ArtifactStore {
         {
             return Err(ArtifactError::Unauthorized);
         }
-        self.read_verified_blocking(artifact, authorized_scope, None, Some(origin), true)
+        self.read_verified_blocking(artifact, authorized_scope, None, Some(origin), true, true)
     }
 
     fn read_verified_blocking(
@@ -1120,6 +1147,7 @@ impl ArtifactStore {
         range: Option<Range<u64>>,
         origin: Option<&PreparedArtifactOrigin>,
         process_closure: bool,
+        track_access: bool,
     ) -> Result<VerifiedProcessClosureRead, ArtifactError> {
         let id = parse_selector(&artifact.selector)?;
         let mut reads = 0;
@@ -1322,10 +1350,12 @@ impl ArtifactStore {
                 reads,
             });
         }
-        self.inner
-            .repository
-            .touch(id, now_ms())
-            .map_err(ArtifactError::Metadata)?;
+        if track_access {
+            self.inner
+                .repository
+                .touch(id, now_ms())
+                .map_err(ArtifactError::Metadata)?;
+        }
         Ok(VerifiedProcessClosureRead {
             body: payload,
             metadata_bytes,
@@ -2904,6 +2934,169 @@ mod tests {
     }
 
     #[test]
+    fn prepared_observation_preserves_verified_reads_without_touch_or_adoption() {
+        use super::*;
+        for compact in [8, 400_000] {
+            let root = tempfile::tempdir().unwrap();
+            let repository = Arc::new(EphemeralArtifactRepository::default());
+            let store = ArtifactStore::new(
+                root.path(),
+                repository.clone(),
+                ArtifactStoreConfig {
+                    compact_threshold_bytes: compact,
+                    ..ArtifactStoreConfig::default()
+                },
+            )
+            .unwrap();
+            let origin = PreparedArtifactOrigin::EventBody {
+                stream_id: "graph:observation".into(),
+                idempotency_key: "original".into(),
+                kind: "execution_graph.planned".into(),
+            };
+            let body = vec![b'x'; 300_000];
+            let artifact = store
+                .write_pre_pinned_blocking("session:owner", "body", &body, &origin)
+                .unwrap();
+            let id = parse_selector(&artifact.selector).unwrap();
+            repository.touch(id, 1).unwrap();
+            assert_eq!(
+                store
+                    .read_prepared_blocking(&artifact, "session:owner", &origin)
+                    .unwrap(),
+                body
+            );
+            assert!(repository.record(id).unwrap().unwrap().last_access_at_ms > 1);
+            repository.touch(id, 2).unwrap();
+            let observation = store.verified_observation_view();
+            assert_eq!(
+                observation
+                    .read_prepared_observation_blocking(&artifact, "session:owner", &origin)
+                    .unwrap(),
+                body
+            );
+            let record = repository.record(id).unwrap().unwrap();
+            assert_eq!(record.last_access_at_ms, 2);
+            assert_eq!(record.record_class, ArtifactRecordClass::PrivatePrepared);
+            assert!(
+                observation
+                    .read_prepared_observation_blocking(&artifact, "session:foreign", &origin)
+                    .is_err()
+            );
+            let foreign = PreparedArtifactOrigin::EventBody {
+                stream_id: "graph:foreign".into(),
+                idempotency_key: "original".into(),
+                kind: "execution_graph.planned".into(),
+            };
+            assert!(
+                observation
+                    .read_prepared_observation_blocking(&artifact, "session:owner", &foreign)
+                    .is_err()
+            );
+            let mut changed = artifact.clone();
+            changed.sha256 = format!("sha256:{}", "0".repeat(64));
+            assert!(
+                observation
+                    .read_prepared_observation_blocking(&changed, "session:owner", &origin)
+                    .is_err()
+            );
+            changed = artifact.clone();
+            changed.bytes += 1;
+            assert!(
+                observation
+                    .read_prepared_observation_blocking(&changed, "session:owner", &origin)
+                    .is_err()
+            );
+            changed = artifact.clone();
+            changed.selector = format!("artifact://art_{}", "0".repeat(64));
+            assert!(
+                observation
+                    .read_prepared_observation_blocking(&changed, "session:owner", &origin)
+                    .is_err()
+            );
+            // Mutate only this real repository's test fixture, not a no-op
+            // repository implementation or a new production mutation port.
+            let protection = (id.to_owned(), ARTIFACT_PREPARED_PIN_OWNER.to_owned());
+            let saved_pin = repository
+                .state
+                .lock()
+                .unwrap()
+                .pins
+                .remove(&protection)
+                .unwrap();
+            assert!(
+                observation
+                    .read_prepared_observation_blocking(&artifact, "session:owner", &origin)
+                    .is_err()
+            );
+            repository
+                .state
+                .lock()
+                .unwrap()
+                .pins
+                .insert(protection, saved_pin);
+            repository
+                .state
+                .lock()
+                .unwrap()
+                .ready
+                .remove(&artifact.sha256);
+            assert!(
+                observation
+                    .read_prepared_observation_blocking(&artifact, "session:owner", &origin)
+                    .is_err()
+            );
+            repository
+                .state
+                .lock()
+                .unwrap()
+                .ready
+                .insert(artifact.sha256.clone());
+            repository
+                .state
+                .lock()
+                .unwrap()
+                .deleting
+                .insert(artifact.sha256.clone());
+            assert!(
+                observation
+                    .read_prepared_observation_blocking(&artifact, "session:owner", &origin)
+                    .is_err()
+            );
+            repository
+                .state
+                .lock()
+                .unwrap()
+                .deleting
+                .remove(&artifact.sha256);
+            assert_eq!(
+                observation
+                    .read_prepared_observation_blocking(&artifact, "session:owner", &origin)
+                    .unwrap(),
+                body
+            );
+            if compact == 8 {
+                let object = repository.object(&artifact.sha256).unwrap().unwrap();
+                let path = store.generation_path(&object.sha256, &object.generation);
+                fs::write(&path, vec![b'y'; body.len()]).unwrap();
+                assert!(
+                    observation
+                        .read_prepared_observation_blocking(&artifact, "session:owner", &origin)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("digest")
+                );
+                fs::remove_file(path).unwrap();
+                assert!(
+                    observation
+                        .read_prepared_observation_blocking(&artifact, "session:owner", &origin)
+                        .is_err()
+                );
+            }
+            assert_eq!(repository.record(id).unwrap().unwrap().last_access_at_ms, 2);
+        }
+    }
+
+    #[test]
     fn bounded_public_ranges_verify_the_entire_source_and_never_adopt_private_prepared() {
         for compact in [8, 1024] {
             let root = tempfile::tempdir().unwrap();
@@ -3771,7 +3964,7 @@ mod tests {
         for (artifact, expected) in [(&compact, &b"12345678"[..]), (&blob, &b"0123456789"[..])] {
             let before = hash_bytes();
             let read = store
-                .read_verified_blocking(artifact, "session:s1", None, None, false)
+                .read_verified_blocking(artifact, "session:s1", None, None, false, true)
                 .unwrap();
             assert_eq!(read.body, expected);
             assert_eq!(hash_bytes() - before, expected.len() as u64);

@@ -323,7 +323,7 @@ fn goal_ack_coexistence(restart_before_ack: bool, cancel_after_open: bool) -> an
                 graph: graph.to_owned(),
                 deadline,
                 evidence_root: root.clone(),
-                role_store: Some(std::sync::Arc::new(R344RoleStore::open(deadline)?)),
+                role_store: Some(std::sync::Arc::new(R344RoleStore::open(&root, deadline)?)),
             })?;
             if cancel_after_open {
                 let cancellation = observe_owned_active_cancel(
@@ -3078,7 +3078,7 @@ struct R344RoleStore {
     events: std::sync::Arc<runtime::RuntimeEventStore>,
 }
 impl R344RoleStore {
-    fn open(deadline: Instant) -> anyhow::Result<Self> {
+    fn open(root: &Path, deadline: Instant) -> anyhow::Result<Self> {
         anyhow::ensure!(Instant::now() < deadline, "role store absolute deadline");
         let original = std::env::var("COWD_TEST_POSTGRES_URL")?;
         let mut url = reqwest::Url::parse(&original)
@@ -3128,6 +3128,26 @@ impl R344RoleStore {
             runtime_postgres::PostgresRuntimeEventStore::new(executor.clone())?
                 .into_runtime_event_store(),
         );
+        // Reuse the actual run's configured blob endpoint and durable metadata.
+        // These constructors only derive paths/register readiness; never mkdir,
+        // migrate, copy content or create a writable observer connection.
+        let workspace = root.join("workspace");
+        let config_home = root.join("config");
+        let loaded = runtime::ConfigLoader::new(&workspace, &config_home).load()?;
+        let registry = storage::StorageRegistry::postgres_for_config_home(&config_home)
+            .with_postgres_workspace(&workspace)?;
+        let blob_root = &registry.endpoint(&storage::StorageDomainId::Blobs)?.path;
+        let artifacts = runtime::ArtifactStore::new(
+            blob_root,
+            std::sync::Arc::new(
+                runtime_postgres::PostgresArtifactRepository::new(executor.clone())
+                    .map_err(anyhow::Error::msg)?,
+            ),
+            loaded.storage().artifacts.into(),
+        )?;
+        events
+            .bind_artifact_store_for_verified_observation(std::sync::Arc::new(artifacts))
+            .map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
             Instant::now() < deadline,
             "role store initialization deadline"
@@ -3799,5 +3819,202 @@ fn r350_current_graph_packet_survives_inline_parent_and_rejects_foreign_duplicat
             .to_string()
             .contains("Agent assignment duplicates conflicting execution lineage")
     );
+    Ok(())
+}
+
+// This is a deterministic metadata/content integration gate, not a Gateway,
+// provider or R6 business run. The writer below is only the original producer
+// fixture; the actual observer is composed with its sole read-only executor.
+#[test]
+#[ignore = "requires a new exclusively owned PostgreSQL database"]
+fn r361_readonly_role_store_loads_original_inline_and_blob_graphs() -> anyhow::Result<()> {
+    use harness_contract::execution_graph::{
+        ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+    };
+    use std::sync::Arc;
+    let root = PathBuf::from(std::env::var("COWD_R6_OWNED_ROOT")?);
+    let config_home = root.join("config");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&config_home)?;
+    std::fs::create_dir_all(&workspace)?;
+    std::fs::write(config_home.join("config.yaml"), b"{}")?;
+    let loaded = runtime::ConfigLoader::new(&workspace, &config_home).load()?;
+    let registry = storage::StorageRegistry::postgres_for_config_home(&config_home)
+        .with_postgres_workspace(&workspace)?;
+    let blob_root = &registry.endpoint(&storage::StorageDomainId::Blobs)?.path;
+    let resolver = storage::StaticSecretRefResolver::new([(
+        "r361-owned".into(),
+        std::env::var("COWD_TEST_POSTGRES_URL")?,
+    )]);
+    let mut config =
+        storage::PostgresConnectionConfig::new("r361-producer", "r361-owned", "r361-producer");
+    config.max_connections = 1;
+    config.min_idle_connections = Some(0);
+    config.checkout_timeout_ms = 500;
+    let writer = storage::PostgresExecutor::connect(config, &resolver)?;
+    let events = Arc::new(
+        runtime_postgres::PostgresRuntimeEventStore::new(writer.clone())?
+            .into_runtime_event_store(),
+    );
+    let artifacts = Arc::new(runtime::ArtifactStore::new(
+        blob_root,
+        Arc::new(
+            runtime_postgres::PostgresArtifactRepository::new(writer.clone())
+                .map_err(anyhow::Error::msg)?,
+        ),
+        loaded.storage().artifacts.into(),
+    )?);
+    events
+        .bind_artifact_store(artifacts)
+        .map_err(anyhow::Error::msg)?;
+    let commits = runtime::ExecutionCommitService::new(events.clone());
+    let graph = |name: &str, objective: String| {
+        let mut graph = ExecutionGraph::new(objective).with_lineage(ExecutionGraphLineage {
+            session_id: "r361-owned-session".into(),
+            turn_id: name.into(),
+            root_task_id: format!("task:{name}"),
+            task_id: format!("task:{name}"),
+            generation: 1,
+        });
+        graph.id = format!("r361:{name}");
+        graph.nodes.push(ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "{}",
+        ));
+        graph
+    };
+    let inline = commits
+        .register_graph(graph("inline", "independent inline objective".into()))?
+        .graph;
+    let large = commits
+        .register_graph(graph("blob", "x".repeat(300_000)))?
+        .graph;
+    let bare = Arc::new(
+        runtime_postgres::PostgresRuntimeEventStore::new(writer.clone())?
+            .into_runtime_event_store(),
+    );
+    let bare_reader = runtime::execution_core::graph::ExecutionGraphStateStore::new(bare);
+    assert_eq!(
+        bare_reader.load(&inline.id)?.objective,
+        "independent inline objective"
+    );
+    assert!(
+        bare_reader
+            .load(&large.id)
+            .unwrap_err()
+            .to_string()
+            .contains("MissingContentStore")
+    );
+    {
+        let mut conn = writer.checkout_critical()?;
+        assert!(
+            conn.query_one(
+                "SELECT count(*)::BIGINT FROM artifact_objects WHERE tier='blob' AND bytes>262144",
+                &[]
+            )?
+            .get::<_, i64>(0)
+                > 0
+        );
+        assert!(conn.execute("UPDATE artifact_records SET last_access_at_ms=1", &[])? > 0);
+    }
+    // The original tracked replay still updates access time.
+    assert_eq!(
+        runtime::execution_core::graph::ExecutionGraphStateStore::new(events.clone())
+            .load(&large.id)?
+            .objective
+            .len(),
+        300_000
+    );
+    {
+        let mut conn = writer.checkout_critical()?;
+        assert!(
+            conn.query_one(
+                "SELECT count(*)::BIGINT FROM artifact_records WHERE last_access_at_ms>1",
+                &[]
+            )?
+            .get::<_, i64>(0)
+                > 0
+        );
+        conn.execute("UPDATE artifact_records SET last_access_at_ms=2", &[])?;
+    }
+    drop(commits);
+    drop(events);
+    drop(bare_reader);
+    drop(writer);
+    let observer = R344RoleStore::open(&root, Instant::now() + Duration::from_secs(30))?;
+    {
+        let mut conn = observer.executor.checkout_online_read()?;
+        for (setting, expected) in [
+            ("transaction_read_only", "on"),
+            ("default_transaction_read_only", "on"),
+            ("statement_timeout", "500ms"),
+            ("lock_timeout", "200ms"),
+        ] {
+            let actual: String = conn
+                .query_one("SELECT current_setting($1)", &[&setting])?
+                .get(0);
+            assert_eq!(
+                actual, expected,
+                "actual observer connection setting {setting}"
+            );
+        }
+        let refused = conn
+            .execute("UPDATE artifact_records SET last_access_at_ms=99", &[])
+            .unwrap_err();
+        assert_eq!(
+            refused
+                .as_db_error()
+                .expect("actual PostgreSQL refusal")
+                .code()
+                .code(),
+            "25006"
+        );
+    }
+    // Control: the old tracked binding on this very same read-only pool must
+    // fail at its access-time UPDATE, after successful original validation.
+    let tracked = Arc::new(
+        runtime_postgres::PostgresRuntimeEventStore::new(observer.executor.clone())?
+            .into_runtime_event_store(),
+    );
+    let tracked_artifacts = Arc::new(runtime::ArtifactStore::new(
+        blob_root,
+        Arc::new(
+            runtime_postgres::PostgresArtifactRepository::new(observer.executor.clone())
+                .map_err(anyhow::Error::msg)?,
+        ),
+        loaded.storage().artifacts.into(),
+    )?);
+    tracked
+        .bind_artifact_store(tracked_artifacts)
+        .map_err(anyhow::Error::msg)?;
+    let old_error = runtime::execution_core::graph::ExecutionGraphStateStore::new(tracked)
+        .load(&large.id)
+        .unwrap_err();
+    // The original metadata adapter flattens the SQL error. Keep this actual
+    // failure distinct from the typed 25006 control above; observation below
+    // differs only in omitting touch, with identical metadata and content.
+    assert!(old_error.to_string().contains("db error"));
+    println!("r361 original tracked read on read-only pool rejected: {old_error}");
+    assert_eq!(
+        observer
+            .graph(&inline.id, Instant::now() + Duration::from_secs(10))?
+            .objective,
+        "independent inline objective"
+    );
+    let observed = observer.graph(&large.id, Instant::now() + Duration::from_secs(10))?;
+    assert_eq!(observed.objective, "x".repeat(300_000));
+    assert_eq!(observed.id, "r361:blob");
+    assert_eq!(observed.revision, 1);
+    {
+        let mut conn = observer.executor.checkout_online_read()?;
+        let rows = conn.query("SELECT last_access_at_ms FROM artifact_records", &[])?;
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|row| row.get::<_, i64>(0) == 2),
+            "observation must not touch or adopt"
+        );
+    }
+    drop(observer);
     Ok(())
 }

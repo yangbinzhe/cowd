@@ -1221,11 +1221,26 @@ impl RuntimeEventStore {
         Ok(record)
     }
     pub fn bind_artifact_store(&self, artifacts: Arc<crate::ArtifactStore>) -> Result<(), String> {
+        if artifacts.is_verified_observation() {
+            return Err("Cannot use an observation view as a tracked content binding".into());
+        }
         let bound = self.artifacts.get_or_init(|| Arc::clone(&artifacts));
         if !Arc::ptr_eq(bound, &artifacts) {
             return Err("Runtime content store already bound to another ArtifactStore".into());
         }
         Ok(())
+    }
+
+    /// Bind an immutable observation policy at the original binding boundary.
+    /// The original resolver and metadata/pin checks are shared; only prepared
+    /// read access-time updates are omitted. A live binding cannot be switched.
+    pub fn bind_artifact_store_for_verified_observation(
+        &self,
+        artifacts: Arc<crate::ArtifactStore>,
+    ) -> Result<(), String> {
+        self.artifacts
+            .set(Arc::new(artifacts.verified_observation_view()))
+            .map_err(|_| "Runtime content observation must be the first and only binding".into())
     }
 
     pub(crate) fn prepare_content(
@@ -1291,12 +1306,12 @@ impl RuntimeEventStore {
                     return Err("content reference identity mismatch".into());
                 }
                 let store = self.artifacts.get().ok_or("MissingContentStore")?;
-                (
-                    store
-                        .read_prepared_blocking(&artifact, scope, origin)
-                        .map_err(|error| error.to_string())?,
-                    None,
-                )
+                let read = if store.is_verified_observation() {
+                    store.read_prepared_observation_blocking(&artifact, scope, origin)
+                } else {
+                    store.read_prepared_blocking(&artifact, scope, origin)
+                };
+                (read.map_err(|error| error.to_string())?, None)
             }
         };
         if bytes.len() as u64 != envelope.bytes
@@ -2782,6 +2797,103 @@ mod checkpoint_pool_root_551_tests {
                 .prepared_content_root(&origin, &artifact)
                 .unwrap(),
             PreparedContentRoot::Absent
+        );
+    }
+}
+
+#[cfg(test)]
+mod verified_observation_tests {
+    use super::*;
+
+    #[test]
+    fn observation_binding_is_fixed_and_resolves_original_inline_and_artifact_content() {
+        let root = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(root.path()));
+        let writer = RuntimeEventStore::for_test();
+        writer.bind_artifact_store(artifacts.clone()).unwrap();
+        writer.bind_artifact_store(artifacts.clone()).unwrap();
+        let origin = PreparedArtifactOrigin::EventBody {
+            stream_id: "graph:original".into(),
+            idempotency_key: "original".into(),
+            kind: "execution_graph.planned".into(),
+        };
+        let value = serde_json::json!({"body": "x".repeat(300_000)});
+        let envelope = writer
+            .prepare_content("session:owner", "original", &value, &origin)
+            .unwrap();
+        assert_eq!(envelope["body"]["kind"], "artifact_ref");
+        let observer = RuntimeEventStore::for_test();
+        assert_eq!(
+            observer
+                .resolve_content("session:owner", &envelope, &origin)
+                .unwrap_err(),
+            "MissingContentStore"
+        );
+        observer
+            .bind_artifact_store_for_verified_observation(artifacts.clone())
+            .unwrap();
+        assert_eq!(
+            observer
+                .resolve_content("session:owner", &envelope, &origin)
+                .unwrap(),
+            value
+        );
+        assert!(observer.bind_artifact_store(artifacts.clone()).is_err());
+        assert!(
+            observer
+                .bind_artifact_store_for_verified_observation(artifacts.clone())
+                .is_err()
+        );
+        assert!(
+            writer
+                .bind_artifact_store_for_verified_observation(artifacts.clone())
+                .is_err()
+        );
+        assert_eq!(
+            writer
+                .resolve_content("session:owner", &envelope, &origin)
+                .unwrap(),
+            value
+        );
+        let small = serde_json::json!({"inline": "literal"});
+        let inline = writer
+            .prepare_content("session:owner", "small", &small, &origin)
+            .unwrap();
+        assert_eq!(
+            RuntimeEventStore::for_test()
+                .resolve_content("session:owner", &inline, &origin)
+                .unwrap(),
+            small
+        );
+        assert!(
+            observer
+                .resolve_content("session:foreign", &envelope, &origin)
+                .is_err()
+        );
+        let foreign = PreparedArtifactOrigin::EventBody {
+            stream_id: "graph:foreign".into(),
+            idempotency_key: "original".into(),
+            kind: "execution_graph.planned".into(),
+        };
+        assert!(
+            observer
+                .resolve_content("session:owner", &envelope, &foreign)
+                .is_err()
+        );
+        let mut tampered = envelope.clone();
+        tampered["bytes"] = serde_json::json!(1);
+        assert!(
+            observer
+                .resolve_content("session:owner", &tampered, &origin)
+                .is_err()
+        );
+        let mut missing = envelope;
+        missing["body"]["artifact"]["selector"] =
+            serde_json::json!(format!("artifact://art_{}", "0".repeat(64)));
+        assert!(
+            observer
+                .resolve_content("session:owner", &missing, &origin)
+                .is_err()
         );
     }
 }
