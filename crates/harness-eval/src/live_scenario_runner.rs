@@ -2420,6 +2420,23 @@ fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
     ))
 }
 
+/// The window in which the U5 consumer may collect its resource evidence.
+///
+/// The evidence collection is bounded by the scenario's own deadline. An
+/// earlier five second cap covered the whole window, so a real provider that
+/// had not yet published its first durable event exhausted the budget before
+/// any IO happened and the scenario ended with no acceptance fact at all.
+fn u5_evidence_window(scenario_deadline: Instant, u5_deadline: Option<Instant>) -> Instant {
+    u5_deadline.map_or(scenario_deadline, |global| {
+        global.min(scenario_deadline)
+    })
+}
+
+/// One timeline read stays bounded even while the collection window runs.
+fn u5_read_deadline(window: Instant) -> Instant {
+    window.min(Instant::now() + Duration::from_secs(5))
+}
+
 impl LiveScenarioRunner {
     /// Consume only the two fresh Sessions created by this composite driver.
     /// The caller supplies the original authenticated client and trusted host
@@ -2439,10 +2456,13 @@ impl LiveScenarioRunner {
         {
             return Err("U5 owner or fresh Session pair missing".into());
         }
-        let deadline = deadline.min(Instant::now() + Duration::from_secs(5));
-        let deadline = self
-            .u5_deadline
-            .map_or(deadline, |global| global.min(deadline));
+        // The collection window is the scenario's own deadline. The previous
+        // five second cap was applied to the whole window, so a real provider
+        // that had not yet produced its first durable timeline event exhausted
+        // the budget before any IO happened and the scenario ended without a
+        // single acceptance fact. The short bound belongs to one timeline
+        // read, not to the evidence collection.
+        let window_deadline = u5_evidence_window(deadline, self.u5_deadline);
         let mut bytes_left = 2 * 1024 * 1024usize;
         let mut events_left = 512usize;
         let mut pages_left = 32usize;
@@ -2453,13 +2473,19 @@ impl LiveScenarioRunner {
         for session in sessions {
             let mut observer = LiveScenarioObserver::default();
             loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() || bytes_left == 0 || events_left == 0 || pages_left == 0 {
+                let window_remaining = window_deadline.saturating_duration_since(Instant::now());
+                if window_remaining.is_zero()
+                    || bytes_left == 0
+                    || events_left == 0
+                    || pages_left == 0
+                {
                     return Err(
                         "U5 resource consumer time/byte/event/page budget exhausted before IO"
                             .into(),
                     );
                 }
+                // One read stays bounded; the window keeps running.
+                let deadline = u5_read_deadline(window_deadline);
                 if let Some(host) = &self.u5_host {
                     host.validate_live_until(deadline)?;
                 }

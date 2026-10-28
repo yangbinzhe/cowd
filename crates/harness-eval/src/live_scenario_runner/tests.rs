@@ -4930,3 +4930,39 @@ fn live_block_status_follows_the_business_scenarios_not_an_optional_subsystem() 
     assert_eq!(item("scenario_capability_status").status, "passed");
 }
 
+
+// The U5 resource consumer used to cap the whole evidence-collection window
+// at five seconds. With a real provider that publishes its first durable
+// event later than that, the consumer reported "budget exhausted before IO"
+// and the scenario ended without any acceptance fact. The window belongs to
+// the scenario; only a single read stays short.
+#[test]
+fn u5_evidence_collection_uses_the_scenario_window_and_bounds_each_read() {
+    let scenario_deadline = Instant::now() + Duration::from_secs(600);
+    let window = u5_evidence_window(scenario_deadline, None);
+    assert_eq!(
+        window, scenario_deadline,
+        "the collection window is the scenario deadline, not a five second cap"
+    );
+    let earlier = Instant::now() + Duration::from_secs(30);
+    assert_eq!(
+        u5_evidence_window(scenario_deadline, Some(earlier)),
+        earlier,
+        "a registered U5 deadline still bounds the window"
+    );
+    let read = u5_read_deadline(window);
+    assert!(
+        read <= window,
+        "one read never outlives the collection window: {read:?} vs {window:?}"
+    );
+    assert!(
+        read >= Instant::now() + Duration::from_secs(4),
+        "one read keeps its own short bound"
+    );
+    let expired = Instant::now();
+    assert_eq!(
+        u5_read_deadline(expired),
+        expired,
+        "an expired window is not extended by the per-read bound"
+    );
+}
