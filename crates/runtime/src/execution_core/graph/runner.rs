@@ -1945,9 +1945,36 @@ impl ExecutionGraphRunner {
             let (_, ticket, _) = active_wave.as_ref().ok_or_else(|| {
                 ExecutionRunnerError::Driver("atomic outcome binding missing".into())
             })?;
-            let outcome_sources = self
+            let outcome_sources = match self
                 .commit_service
-                .execution_outcome_sources(&current, ticket, &outcome)?;
+                .execution_outcome_sources(&current, ticket, &outcome)
+            {
+                Ok(sources) => sources,
+                Err(error) => {
+                    // No outcome was committed.  This exact inconsistent
+                    // source set cannot be retried as one transaction; retire
+                    // its original binding through the fenced cancellation
+                    // owner rather than leaving an apparently live owner.
+                    let source_conflict = matches!(&error,
+                        ExecutionCommitError::InvalidCommand(reason)
+                        if reason == "observation source conflicts with causal read-set");
+                    let revision = current.revision;
+                    drop(_coordination);
+                    if source_conflict {
+                        let retirement = self.command(graph_id, ExecutionGraphCommand::CancelNode {
+                            expected_revision: revision,
+                            node_id: node_id.clone(),
+                            reason: format!("original outcome preparation failed: {error}"),
+                        }).await;
+                        if let Err(retirement_error) = retirement {
+                            return Err(ExecutionRunnerError::Driver(format!(
+                                "{error}; original binding retirement failed: {retirement_error}"
+                            )));
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
             // A concurrent writer can advance this graph stream between the
             // load and the atomic outcome commit. Keep the captured outcome and
             // its original source fences while retrying instead of failing the whole
@@ -4143,6 +4170,83 @@ mod nodispatch_duration_617_tests {
             .lock()
             .await
             .contains_key(&(graph_id, ticket.node_id)));
+        assert!(runner.drain_physical_execution().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn r601_mixed_goal_cut_retires_only_original_binding_with_physical_closure() {
+        let (_workspace, services, runner, graph_id, prepared, _) = original_prepared617().await;
+        let binding = prepared.binding.clone().unwrap();
+        let (node_id, mut outcome) = runner
+            .start_and_execute_node(&graph_id, prepared.node, Some(&binding))
+            .await
+            .unwrap();
+        outcome.delivery_envelope = Some(serde_json::from_value(serde_json::json!({
+            "envelope_id":"601-envelope","revision":1,"objective_id":"601-objective","created_at_ms":1
+        })).unwrap());
+        outcome.source_revisions.insert("goal:601-conflict".into(), 1);
+        outcome.domain_events.push(crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: "goal:601-conflict".into(),
+                scope: crate::RuntimeEventScope::Goal,
+                kind: "goal.observation".into(),
+                status: None, actor: None, refs: Vec::new(),
+                payload: serde_json::json!({"goal_source":{"stream_id":"goal:601-conflict","sequence":2}}),
+            },
+            schema_version: 2,
+            idempotency_key: Some("601-conflict".into()),
+        });
+        let graph = services.graph_state_store().load(&graph_id).unwrap();
+        let stale = runner.command(&graph_id, ExecutionGraphCommand::CancelNode {
+            expected_revision: graph.revision + 1,
+            node_id: node_id.clone(),
+            reason: "r601 stale owner must not retire".into(),
+        }).await;
+        assert!(stale.is_err());
+        assert!(runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
+        let error = runner.finish_pump_node(&graph_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(binding.clone())).await.unwrap_err();
+        assert!(error.to_string().contains("observation source conflicts with causal read-set"), "{error}");
+        let retired = services.graph_state_store().load(&graph_id).unwrap();
+        assert_eq!(retired.node_statuses[&node_id], ExecutionNodeStatus::Cancelled);
+        assert!(services.graph_state_store().binding_retirement_record(&retired, &node_id, &binding).unwrap().is_some());
+        assert!(!runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
+        assert!(runner.drain_physical_execution().await.is_empty());
+        assert!(runner.recover_graph(&graph_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn r623_foreign_conflicting_outcome_cannot_retire_original_binding() {
+        let (_workspace, services, runner, graph_id, prepared, _) = original_prepared617().await;
+        let binding = prepared.binding.clone().unwrap();
+        let (node_id, mut outcome) = runner
+            .start_and_execute_node(&graph_id, prepared.node, Some(&binding))
+            .await
+            .unwrap();
+        outcome.delivery_envelope = Some(serde_json::from_value(serde_json::json!({
+            "envelope_id":"623-envelope","revision":1,"objective_id":"623-objective","created_at_ms":1
+        })).unwrap());
+        outcome.source_revisions.insert("goal:623-conflict".into(), 1);
+        outcome.domain_events.push(crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: "goal:623-conflict".into(), scope: crate::RuntimeEventScope::Goal,
+                kind: "goal.observation".into(), status: None, actor: None, refs: Vec::new(),
+                payload: serde_json::json!({"goal_source":{"stream_id":"goal:623-conflict","sequence":2}}),
+            },
+            schema_version: 2, idempotency_key: Some("623-conflict".into()),
+        });
+        let before = services.graph_state_store().load(&graph_id).unwrap();
+        let mut foreign = binding.clone();
+        foreign.attempt += 1;
+        runner.finish_pump_node(&graph_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(foreign)).await.unwrap();
+        let after = services.graph_state_store().load(&graph_id).unwrap();
+        assert_eq!(after, before);
+        assert!(runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
+        assert!(services.graph_state_store().binding_retirement_record(&after, &node_id, &binding).unwrap().is_none());
+        let retired = runner.command(&graph_id, ExecutionGraphCommand::CancelNode {
+            expected_revision: after.revision, node_id: node_id.clone(), reason: "r623 fixture cleanup".into(),
+        }).await.unwrap();
+        assert!(services.graph_state_store().binding_retirement_record(&retired, &node_id, &binding).unwrap().is_some());
+        assert!(!runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
         assert!(runner.drain_physical_execution().await.is_empty());
     }
 
