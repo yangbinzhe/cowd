@@ -3924,7 +3924,10 @@ pub(super) fn runtime_observation_identity(
         turn_id: state
             .ingress
             .as_ref()
-            .map(|ingress| ingress.turn_id.clone()),
+            .map(|ingress| ingress.turn_id.clone())
+            // Direct owned turns have no Session ingress, but Host has
+            // already checked this turn against the supplied graph lineage.
+            .or_else(|| (!state.turn_id.is_empty()).then(|| state.turn_id.clone())),
         task_id: None,
         graph_id: ticket.graph_id.clone(),
         goal_id: state.goal_id.clone(),

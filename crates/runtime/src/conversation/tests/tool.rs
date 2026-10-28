@@ -181,6 +181,84 @@ fn r1_branch_goal(services: &crate::RuntimeServices, session: &str) -> String {
     goal_id
 }
 
+#[test]
+fn r641_direct_owned_turn_uses_lineage_without_relaxing_goal_binding() {
+    let services = crate::RuntimeServices::in_memory().unwrap();
+    let session = "r641-session";
+    let (graph, ticket) =
+        r1_branch_graph(&services, session, vec![], ExecutionNodeKind::InlineModel);
+    let goal_id = "r641-goal";
+    let goal: GoalContract = serde_json::from_value(serde_json::json!({
+        "id":goal_id,"session_id":session,"objective":"answer directly",
+        "criteria":[{"id":"checked","statement":"answer checked","status":"open"}],
+        "phase":"execution","spec_revision":1,"spec_digest":"branch-spec",
+        "scope":"internal","completion":"open","revision":1,"user_sequence":1,
+        "source_intent_ref":"session_input:r641-original",
+        "execution_binding":{"objective_id":"r641-objective","session_id":session,
+            "turn_id":"r1-branch-turn","root_execution_id":graph.id,"agentic_program_id":"r641-program"}
+    })).unwrap();
+    services.goal_store().create(goal).unwrap();
+    let mut state = r1_branch_state(session, goal_id);
+    assert!(state.ingress.is_none());
+    let identity = runtime_observation_identity(&services, &state, &ticket);
+    assert_eq!(identity.turn_id.as_deref(), Some("r1-branch-turn"));
+    let observation = runtime_observation(
+        identity,
+        RuntimeObservationKind::ProviderProgress,
+        "r641-provider",
+        1,
+        "answer".into(),
+        "r641".into(),
+        ObservationResultClass::Succeeded,
+    );
+    let source = services.goal_store().projection(goal_id).unwrap().unwrap();
+    assert!(services
+        .goal_store()
+        .turn_candidate_event_at(&source, &observation, &ticket, "answer")
+        .is_ok());
+    state.ingress = Some(TurnIngressRef {
+        request_id: "r641-request".into(),
+        turn_id: "r1-branch-turn".into(),
+        message_id: "r641-message".into(),
+        session_id: session.into(),
+        primary_task_id: "r641-task".into(),
+        root_task_id: "r641-task".into(),
+        session_generation: 1,
+        input_sequence: 1,
+        claim_owner: "r641-owner".into(),
+        claim_token: "r641-claim".into(),
+        claim_revision: 1,
+        handoff_id: None,
+    });
+    let ingress_identity = runtime_observation_identity(&services, &state, &ticket);
+    assert_eq!(ingress_identity.turn_id.as_deref(), Some("r1-branch-turn"));
+    let ingress_observation = runtime_observation(
+        ingress_identity,
+        RuntimeObservationKind::ProviderProgress,
+        "r641-provider",
+        1,
+        "answer".into(),
+        "r641-ingress".into(),
+        ObservationResultClass::Succeeded,
+    );
+    assert!(services
+        .goal_store()
+        .turn_candidate_event_at(&source, &ingress_observation, &ticket, "answer")
+        .is_ok());
+    for mutate in 0..3 {
+        let mut foreign = observation.clone();
+        match mutate {
+            0 => foreign.identity.session_id = "foreign-session".into(),
+            1 => foreign.identity.turn_id = Some("foreign-turn".into()),
+            _ => foreign.identity.graph_id = "foreign-graph".into(),
+        }
+        assert!(services
+            .goal_store()
+            .turn_candidate_event_at(&source, &foreign, &ticket, "answer")
+            .is_err());
+    }
+}
+
 #[derive(Clone)]
 struct R1CapturedModelStep {
     ticket: NodeExecutionTicket,
