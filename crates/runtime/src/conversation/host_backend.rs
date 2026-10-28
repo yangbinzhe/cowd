@@ -9735,7 +9735,8 @@ where
         outcome.domain_events.push(
             self.services
                 .goal_store()
-                .observation_event(
+                .observation_event_at(
+                    &write_goal_source,
                     &observation,
                     format!("{}:goal-observation", ticket.idempotency_key),
                 )

@@ -2107,16 +2107,35 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
 struct R1ToolResultExecutor {
     inner: RecordingToolExecutor,
     failures: Vec<String>,
+    lease: tools::ToolHostLease,
+    verified_checkpoints: Arc<AtomicUsize>,
+    independent_failures: bool,
+    read_finished: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
 impl ToolExecutor for R1ToolResultExecutor {
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
-        self.inner.tool_discovery_receipt()
+        let mut receipt = self.lease.catalog_receipt();
+        receipt.descriptors.retain(|descriptor| matches!(descriptor.canonical_id.as_str(), "tool_search" | "read_file" | "edit"));
+        receipt.activation_candidates.retain(|name| matches!(name.as_str(), "tool_search" | "read_file" | "edit"));
+        receipt
+    }
+
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.lease.clone())
     }
 
     fn available_tool_names(&self) -> Vec<String> {
         self.inner.available_tool_names()
+    }
+
+    fn has_tool(&self, name: &str) -> bool {
+        if name == "checkpoint" {
+            self.lease.snapshot().catalog.canonical_name(name).as_deref() == Some(name)
+        } else {
+            self.inner.has_tool(name)
+        }
     }
 
     fn registered_tool_effect(
@@ -2124,7 +2143,44 @@ impl ToolExecutor for R1ToolResultExecutor {
         name: &str,
         input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-        self.inner.registered_tool_effect(name, input)
+        Some(self.lease.describe_effect(name, input))
+    }
+
+    async fn execute_step_authorized_invocation_output(
+        &self,
+        binding: Option<&crate::step_snapshot::StepCallBinding>,
+        invocation_id: &str,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        let binding = binding.ok_or_else(|| ToolError::new("fixture original Step missing"))?;
+        let step = binding.resolve(Some(self.lease.clone())).map_err(|error| ToolError::new(error.to_string()))?;
+        step.validate_call(&binding.origin, &binding.snapshot.identity.session_id, invocation_id,
+            name, input, chrono::Utc::now().timestamp_millis()).map_err(|error| ToolError::new(error.to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(input).map_err(|error| ToolError::new(error.to_string()))?;
+        step.lease().validate_authorization(authorization, name, &value).map_err(|error| ToolError::new(error.to_string()))?;
+        if name != "checkpoint" {
+            return self.execute_output(name, input).await;
+        }
+        let output = step.lease().execute_async(authorization, name, &value).await
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let summary: tools::checkpoint::CheckpointSummary = serde_json::from_str(&output)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let checkpoint = std::path::PathBuf::from(&summary.path);
+        if !checkpoint.starts_with(step.lease().workspace_root().join(".cowd/checkpoints")) {
+            return Err(ToolError::new("checkpoint escaped original workspace"));
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(checkpoint.join(".manifest.json"))
+            .map_err(|error| ToolError::new(error.to_string()))?).map_err(|error| ToolError::new(error.to_string()))?;
+        let target = value["paths"].as_array().and_then(|paths| paths.first()).and_then(|path| path.as_str()).ok_or_else(|| ToolError::new("checkpoint target missing"))?;
+        if !matches!(target, "src/lib.rs" | "src/other.rs")
+            || !manifest["scopes"].as_array().is_some_and(|scopes| scopes.len() == 1 && scopes[0].as_str() == Some(target))
+            || std::fs::read(checkpoint.join(target)).map_err(|error| ToolError::new(error.to_string()))? != b"fixture source\n" {
+            return Err(ToolError::new("checkpoint did not retain original scoped bytes"));
+        }
+        self.verified_checkpoints.fetch_add(1, Ordering::SeqCst);
+        Ok(harness_contract::context::ToolOutputDraft::bounded_inline(output))
     }
 
     async fn execute_output(
@@ -2132,12 +2188,26 @@ impl ToolExecutor for R1ToolResultExecutor {
         name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        if self.independent_failures && name == "edit" {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.read_finished.notified())
+                .await.map_err(|_| ToolError::new("fixture read did not enter before independent edit"))?;
+        }
         if self.failures.iter().any(|failed| failed == name) {
             self.inner.order.lock().unwrap().push(name.to_string());
             self.inner.executed.fetch_add(1, Ordering::SeqCst);
+            if self.independent_failures && name == "read_file" { self.read_finished.notify_one(); }
             return Err(ToolError::new(format!("deterministic {name} failure")));
         }
-        self.inner.execute_output(name, input).await
+        let result = if name == "tool_search" {
+            let mut receipt = self.tool_discovery_receipt();
+            receipt.query = "read and update source files".into();
+            receipt.descriptors.retain(|descriptor| descriptor.canonical_id != "tool_search");
+            receipt.activation_candidates = vec!["read_file".into(), "edit".into()];
+            Ok(harness_contract::context::ToolOutputDraft::bounded_inline(serde_json::to_string(&receipt).unwrap()))
+        } else {
+            self.inner.execute_output(name, input).await
+        };
+        result
     }
 }
 
@@ -2146,6 +2216,8 @@ struct R1ToolResultClient {
     inner: TwoToolClient,
     repeat: bool,
     response: usize,
+    lease: tools::ToolHostLease,
+    write_path: String,
 }
 
 impl ApiClient for R1ToolResultClient {
@@ -2156,13 +2228,30 @@ impl ApiClient for R1ToolResultClient {
         self.inner.configure_tool_exposure(projection);
     }
 
+    fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+        let exposure = self.inner.exposure.as_ref()?;
+        Some(self.lease.snapshot().catalog.definitions(None).into_iter()
+            .filter(|definition| exposure.active_ids.iter().chain(&exposure.bootstrap_ids).any(|id| id == &definition.name))
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            }).collect())
+    }
+
     fn stream(
         &mut self,
         request: ApiRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         self.response += 1;
         if self.response <= 2 {
-            return self.inner.stream(request);
+            let write_path = self.write_path.clone();
+            return Box::pin(self.inner.stream(request).map(move |event| event.map(|event| match event {
+                AssistantEvent::ToolUse { id, name, input: _ } if name == "edit" => AssistantEvent::ToolUse {
+                    id, name, input: serde_json::json!({"action":"write","path":write_path,"content":"updated"}).to_string(),
+                },
+                event => event,
+            })));
         }
         if self.repeat && self.response == 3 {
             return Box::pin(stream::iter(vec![
@@ -2174,7 +2263,7 @@ impl ApiClient for R1ToolResultClient {
                 Ok(AssistantEvent::ToolUse {
                     id: "write-repeat".into(),
                     name: "edit".into(),
-                    input: r#"{"path":"src/lib.rs","content":"updated"}"#.into(),
+                    input: r#"{"action":"write","path":"src/lib.rs","content":"updated"}"#.into(),
                 }),
                 Ok(AssistantEvent::MessageStop),
             ]));
@@ -2190,23 +2279,32 @@ impl ApiClient for R1ToolResultClient {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn r1_event_replay_host_tool_result_sources_are_exact() {
-    for (failures, expected, repeat) in [
-        (vec![], ObservationResultClass::Succeeded, false),
+    for (case_index, (failures, expected, repeat, blocked_same_path)) in [
+        (vec![], ObservationResultClass::Succeeded, false, false),
         (
             vec!["edit".to_string()],
             ObservationResultClass::Partial,
-            false,
+            false, false,
         ),
         (
             vec!["read_file".to_string(), "edit".to_string()],
             ObservationResultClass::Failed,
-            false,
+            false, false,
         ),
-        (vec![], ObservationResultClass::Succeeded, true),
-    ] {
+        (vec![], ObservationResultClass::Succeeded, true, false),
+        (vec!["read_file".to_string(), "edit".to_string()], ObservationResultClass::Failed, false, true),
+    ].into_iter().enumerate() {
         let services = r1_observation_services();
         let executed = Arc::new(AtomicUsize::new(0));
         let order = Arc::new(Mutex::new(Vec::new()));
+        let verified_checkpoints = Arc::new(AtomicUsize::new(0));
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), "fixture source\n").unwrap();
+        std::fs::write(workspace.path().join("src/other.rs"), "fixture source\n").unwrap();
+        let lease = tools::ToolHost::builtin("r1-original-step", workspace.path())
+            .with_authorization_lease_verifier(Arc::new(crate::AuthorizationNegotiator::verify_lease_signature))
+            .pin_snapshot();
         let client = R1ToolResultClient {
             inner: TwoToolClient {
                 requests: 0,
@@ -2217,6 +2315,8 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
             },
             repeat,
             response: 0,
+            lease: lease.clone(),
+            write_path: if case_index == 2 { "src/other.rs" } else { "src/lib.rs" }.into(),
         };
         let session = Session::new();
         let session_id = session.session_id.clone();
@@ -2230,6 +2330,10 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
                     order: order.clone(),
                 },
                 failures: failures.clone(),
+                lease,
+                verified_checkpoints: verified_checkpoints.clone(),
+                independent_failures: case_index == 2,
+                read_finished: Arc::new(tokio::sync::Notify::new()),
             },
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["use exposed dependency tools".into()],
@@ -2247,6 +2351,42 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
         )
         .await;
         result.expect("tool failure remains governed");
+        assert!(verified_checkpoints.load(Ordering::SeqCst) > 0, "real original scoped checkpoint must be verified");
+        if blocked_same_path {
+            r1_assert_tool_raw_sources(&session_store, &services, &session_id, &[
+                ("discover-tools", "tool_search", false), ("read-1", "read_file", true),
+            ]).await;
+            let raw = session_store.get_session_domain_events_by_kind_limited(&session_id, "evidence.raw.persisted", 0, 128).await.unwrap();
+            assert!(raw.len() < 128);
+            assert!(raw.iter().all(|event| session::SessionDomainEvent::from_session_event(event).unwrap().payload["tool_call_id"] != "write-1"));
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            assert_eq!(*order.lock().unwrap(), vec!["read_file"]);
+            let events = services.event_store().all_events(2048).unwrap();
+            assert!(events.len() < 2048);
+            let mut blocked_witnesses = 0;
+            for event in events.into_iter().filter(|event| matches!(event.kind.as_str(), "execution_graph.recovered" | "execution_graph.checkpoint")) {
+                let graph = services.graph_state_store().load(&event.stream_id).unwrap();
+                let resolved = services.event_store().resolve_read_record(event).unwrap();
+                for closure in resolved.payload["lease_closures"].as_array().into_iter().flatten() {
+                    let Some(calls) = closure["no_dispatch"]["calls"].as_array() else { continue };
+                    for call in calls.iter().filter(|call| call["call_id"] == "write-1") {
+                        let reason = call["reason"].as_str().unwrap();
+                        assert!(reason.contains("blocked before dispatch by predecessor `read-1`"), "{reason}");
+                        let node = closure["node_id"].as_str().unwrap();
+                        let attempt = closure["binding"]["attempt"].as_u64().unwrap() as u32;
+                        assert_eq!(closure["graph_id"], graph.id);
+                        let store = services.graph_state_store();
+                        let binding = store.current_binding(&graph, node, attempt).unwrap();
+                        assert_eq!(serde_json::to_value(&binding).unwrap(), closure["binding"]);
+                        let start = store.binding_start_position(&graph, node, &binding).unwrap().unwrap();
+                        assert!(store.binding_lease_closure(&graph, node, &binding, start).unwrap());
+                        blocked_witnesses += 1;
+                    }
+                }
+            }
+            assert_eq!(blocked_witnesses, 1, "one authenticated original NoDispatch closure");
+            continue;
+        }
         r1_assert_tool_raw_sources(
             &session_store,
             &services,
