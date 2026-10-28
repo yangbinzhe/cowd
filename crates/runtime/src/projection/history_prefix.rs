@@ -27,7 +27,21 @@ struct SourceRecord {
     metadata_bytes: usize,
 }
 
+#[cfg(test)]
+pub(super) fn r685_test_prefix(target_cursor: u64) -> HistoryPrefix {
+    HistoryPrefix { target_cursor, target_revision: 1, base_position: None, base_through: 0,
+        history_complete: false, completed_through: 0, audit_index: 0, records: Vec::new() }
+}
+
 impl HistoryPrefix {
+    pub(super) fn machine_progress(&self, fence: String, position: Option<(u64, u32)>, verified_through: u64) -> harness_contract::projection::HistoryVerificationProgress {
+        harness_contract::projection::HistoryVerificationProgress {
+            source_fence_identity: fence, target_cursor: self.target_cursor,
+            target_graph_revision: self.target_revision, position, verified_through,
+            new_prefix_committed: false,
+        }
+    }
+
     pub(super) fn progress(&self, through: u64, position: Option<(u64, u32)>,
         effects: &BTreeMap<String, HistoryEffectProof>, total: usize) -> serde_json::Value {
         serde_json::json!({

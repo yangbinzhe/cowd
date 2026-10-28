@@ -98,6 +98,24 @@ impl PendingSpan {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryProgress {
+    execution: String,
+    progress: harness_contract::projection::HistoryVerificationProgress,
+}
+
+impl HistoryProgress {
+    fn parse(summary: &Value) -> Option<Self> {
+        let root = summary.get("execution_id")?.as_str()?;
+        if root.is_empty() { return None; }
+        let value = summary.get("history_progress")?;
+        value.get("position")?; // Missing cannot establish a comparable source position.
+        let progress: harness_contract::projection::HistoryVerificationProgress =
+            serde_json::from_value(value.clone()).ok()?;
+        progress.is_valid().then_some(Self { execution: root.into(), progress })
+    }
+}
+
 /// Scenario-local reducer for public Gateway observations.
 ///
 /// Runtime and Session remain the canonical state owners. This ledger owns only
@@ -117,6 +135,7 @@ pub(crate) struct LiveScenarioObserver {
     timeline_pages: u64,
     timeline_cursor_advances: u64,
     last_root_fingerprint: Option<String>,
+    last_history_progress: Option<HistoryProgress>,
     last_live_fingerprint: Option<String>,
     root_baseline_seen: bool,
     live_baseline_seen: bool,
@@ -149,6 +168,7 @@ impl Default for LiveScenarioObserver {
             timeline_pages: 0,
             timeline_cursor_advances: 0,
             last_root_fingerprint: None,
+            last_history_progress: None,
             last_live_fingerprint: None,
             root_baseline_seen: false,
             live_baseline_seen: false,
@@ -493,6 +513,24 @@ impl LiveScenarioObserver {
             return false;
         };
         self.update_phase_from_root(summary);
+        let history_advanced = if let Some(next) = HistoryProgress::parse(summary) {
+            match &self.last_history_progress {
+                Some(previous) if previous.execution == next.execution
+                    && previous.progress.source_fence_identity == next.progress.source_fence_identity
+                    && previous.progress.target_cursor == next.progress.target_cursor
+                    && previous.progress.target_graph_revision == next.progress.target_graph_revision => {
+                    if next.progress.position >= previous.progress.position && next.progress.verified_through >= previous.progress.verified_through {
+                        let advanced = next.progress.position > previous.progress.position || next.progress.verified_through > previous.progress.verified_through;
+                        if advanced && !next.progress.new_prefix_committed { false } else {
+                            self.last_history_progress = Some(next);
+                            advanced
+                        }
+                    } else { false }
+                }
+                Some(previous) if previous.execution != next.execution => false,
+                _ => { self.last_history_progress = Some(next); false }
+            }
+        } else { false };
         let fingerprint = fingerprint.unwrap_or_default();
         let changed = self.last_root_fingerprint.as_deref() != Some(fingerprint);
         if changed {
@@ -513,6 +551,10 @@ impl LiveScenarioObserver {
                 self.last_progress_elapsed_ms = elapsed_ms;
                 false
             }
+        } else if history_advanced && self.root_baseline_seen {
+            self.mark_progress(elapsed_ms);
+            self.record_changed("root", path, "history_progress", elapsed_ms, bytes, summary.clone());
+            true
         } else {
             self.record_span(
                 "root",
@@ -1306,6 +1348,42 @@ mod tests {
         );
         assert_eq!(observer.assistant_message().unwrap()["id"], "answer");
         assert_eq!(observer.assistant_message_ids(), vec!["answer"]);
+    }
+
+    #[test]
+    fn r685_history_progress_requires_same_root_fence_cut_and_monotonic_position() {
+        let fence = format!("sha256:{}", "a".repeat(64));
+        let other_fence = format!("sha256:{}", "b".repeat(64));
+        let summary = |execution: &str, fence: &str, cut: u64, position: u64, verified: u64| json!({
+            "execution_id":execution, "terminal_state":"pending", "live_status":"calling_model",
+            "history_progress":{"source_fence_identity":fence,"new_prefix_committed":true,
+                "target_cursor":cut,"target_graph_revision":7,"position":[position,0],"verified_through":verified}
+        });
+        let mut observer = LiveScenarioObserver::default();
+        let observe = |observer: &mut LiveScenarioObserver, value: Value, time|
+            observer.observe_root("/execution", &Ok(value), Some("same-graph"), None, time);
+        assert!(!observe(&mut observer, summary("root", &fence, 100, 10, 5), 1));
+        assert!(observe(&mut observer, summary("root", &fence, 100, 11, 5), 2));
+        assert!(!observe(&mut observer, summary("root", &fence, 100, 11, 5), 3));
+        let mut not_committed = summary("root", &fence, 100, 12, 6);
+        not_committed["history_progress"]["new_prefix_committed"] = json!(false);
+        assert!(!observe(&mut observer, not_committed, 3));
+        let mut flag_only = summary("root", &fence, 100, 11, 5);
+        flag_only["history_progress"]["new_prefix_committed"] = json!(false);
+        assert!(!observe(&mut observer, flag_only, 3));
+        assert!(!observe(&mut observer, summary("root", &fence, 100, 9, 6), 4));
+        assert!(!observe(&mut observer, summary("root", &fence, 100, 10, 5), 5));
+        let mut absent = summary("root", &fence, 100, 12, 6);
+        absent["history_progress"]["source_fence_identity"] = Value::Null;
+        assert!(!observe(&mut observer, absent, 6));
+        let mut missing_position = summary("root", &fence, 100, 12, 6);
+        missing_position["history_progress"].as_object_mut().unwrap().remove("position");
+        assert!(!observe(&mut observer, missing_position, 6));
+        assert!(!observe(&mut observer, summary("foreign", &fence, 100, 90, 90), 7));
+        assert!(!observe(&mut observer, summary("root", &fence, 101, 12, 6), 8));
+        assert!(!observe(&mut observer, summary("root", &other_fence, 101, 12, 6), 9));
+        assert!(observe(&mut observer, summary("root", &other_fence, 101, 12, 7), 10));
+        assert_eq!(observer.progress_observations(), 2);
     }
 
     #[test]

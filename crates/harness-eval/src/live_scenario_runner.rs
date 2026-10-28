@@ -2365,6 +2365,15 @@ fn root_node_statuses(projection: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+// This machine contract is carried separately from redactable health details.
+fn root_history_progress(projection: &Value, execution_id: &str) -> Option<harness_contract::projection::HistoryVerificationProgress> {
+    if projection.get("execution_id")?.as_str()? != execution_id { return None; }
+    let source = projection.get("history_verification_progress")?;
+    source.get("position")?; // Missing is not the same as an explicit initial null.
+    let value = serde_json::from_value::<harness_contract::projection::HistoryVerificationProgress>(source.clone()).ok()?;
+    value.is_valid().then_some(value)
+}
+
 fn root_progress_fingerprint(projection: &Value, statuses: &[Value]) -> String {
     let live = projection.get("live").unwrap_or(&Value::Null);
     serde_json::to_string(&json!({
@@ -4602,6 +4611,9 @@ impl LiveScenarioRunner {
         let path = format!("/api/runtime/executions/{execution_id}?detail_scope=summary");
         match self.get_json(&path) {
             Ok(projection) => {
+                if projection.get("execution_id").and_then(Value::as_str) != Some(execution_id) {
+                    return Err("execution projection identity mismatch".into());
+                }
                 let response_body_bytes = serde_json::to_vec(&projection)
                     .map(|bytes| bytes.len() as u64)
                     .unwrap_or_default();
@@ -4616,6 +4628,7 @@ impl LiveScenarioRunner {
                     "revision": projection.get("revision"),
                     "cursor": projection.get("cursor"),
                     "terminal_axes": projection.get("terminal_axes"),
+                    "history_progress": root_history_progress(&projection, execution_id),
                     "terminal_state": terminal.as_str(),
                     "node_statuses": statuses,
                     "live_revision": live.get("revision"),

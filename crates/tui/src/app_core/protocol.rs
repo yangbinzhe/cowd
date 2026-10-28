@@ -710,6 +710,7 @@ mod tests {
             execution_id: "graph-a".to_string(),
             agentic_collaboration: Default::default(),
             terminal_axes: Default::default(),
+            history_verification_progress: None,
             revision: 1,
             cursor: 10,
             detail_scope: ProjectionDetailScope::Summary,

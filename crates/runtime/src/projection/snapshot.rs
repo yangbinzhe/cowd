@@ -59,7 +59,11 @@ pub async fn snapshot(
     projection.cursor = cursor;
     if budget.is_incomplete() {
         let committed = budget.has_pending_checkpoints();
+        let root_committed = budget.has_pending_history_checkpoint(execution_id);
         budget.publish(services)?;
+        if let Some(progress) = projection.history_verification_progress.as_mut() {
+            progress.new_prefix_committed = root_committed;
+        }
         for entity in &mut projection.health {
             if entity.kind == "history_verification" {
                 if let Some(detail) = entity.detail.as_mut() {
@@ -182,8 +186,10 @@ pub(super) fn materialize_snapshot(
         .get(execution_id)
         .and_then(|state| state.cancellation.clone());
     let concurrency = execution_concurrency(services, &graph, &scope);
+    let history_verification_progress = facts.get(execution_id).and_then(history::HistoryState::machine_progress);
     let mut projection = ExecutionProjection {
         terminal_axes,
+        history_verification_progress,
         schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: execution_id.to_string(),
         revision: graph.revision,

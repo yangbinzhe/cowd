@@ -323,6 +323,7 @@ mod tests {
             execution_id: "execution-a".to_string(),
             agentic_collaboration: Default::default(),
             terminal_axes: Default::default(),
+            history_verification_progress: None,
             revision,
             cursor: revision,
             detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

@@ -1058,10 +1058,35 @@ pub struct AgenticCollaborationSemanticRefsV1 {
     pub artifact_refs: Vec<String>,
 }
 
+/// Bounded machine-readable progress for an incomplete root history.
+/// It describes verification progress, not execution settlement or delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryVerificationProgress {
+    pub source_fence_identity: String,
+    pub target_cursor: u64,
+    pub target_graph_revision: u64,
+    pub position: Option<(u64, u32)>,
+    pub verified_through: u64,
+    pub new_prefix_committed: bool,
+}
+
+impl HistoryVerificationProgress {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.source_fence_identity.strip_prefix("sha256:").is_some_and(|value|
+            value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+            && self.verified_through <= self.target_cursor
+            && self.position.is_none_or(|(cursor, _)| cursor <= self.target_cursor)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionProjection {
     #[serde(default)]
     pub terminal_axes: ExecutionTerminalAxes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_verification_progress: Option<HistoryVerificationProgress>,
     pub schema_version: u32,
     pub execution_id: String,
     pub revision: u64,
