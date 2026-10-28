@@ -32,6 +32,12 @@ struct BoundedDiagnostics {
     state: Mutex<DiagnosticState>,
     json: bool,
     stderr: bool,
+    /// Diagnostic-only switch: write every event as its own record instead of
+    /// aggregating ordinary progress into counters. An aggregated log cannot
+    /// name the last step before a crash, which is exactly what a stack
+    /// overflow investigation needs. It changes no runtime behaviour and is
+    /// off unless it is explicitly requested.
+    verbose: std::sync::atomic::AtomicBool,
 }
 
 impl BoundedDiagnostics {
@@ -167,7 +173,10 @@ impl<Subscriber: tracing::Subscriber> tracing_subscriber::Layer<Subscriber> for 
         let security = ["security", "audit", "auth", "policy", "permission"]
             .iter()
             .any(|part| target.contains(part));
-        let immediate = fields.fact || security || *metadata.level() <= tracing::Level::WARN;
+        let immediate = fields.fact
+            || security
+            || self.0.verbose.load(std::sync::atomic::Ordering::Relaxed)
+            || *metadata.level() <= tracing::Level::WARN;
         let Ok(mut state) = self.0.state.lock() else {
             return;
         };
@@ -207,6 +216,9 @@ pub(crate) fn init_logging(_version: &str) -> bool {
         json: std::env::var("COWD_LOG_FORMAT")
             .is_ok_and(|value| value.eq_ignore_ascii_case("json")),
         stderr: cfg!(debug_assertions) && std::env::var("COWD_LOG_STDERR").is_ok(),
+        verbose: std::sync::atomic::AtomicBool::new(
+            std::env::var("COWD_LOG_VERBOSE").is_ok_and(|value| !value.is_empty()),
+        ),
     });
     let installed = tracing_subscriber::registry()
         .with(DiagnosticLayer(Arc::clone(&diagnostics)))
@@ -336,6 +348,7 @@ mod tests {
             }),
             json,
             stderr: false,
+            verbose: std::sync::atomic::AtomicBool::new(false),
         });
         (diagnostics, capture)
     }
@@ -373,6 +386,48 @@ mod tests {
         );
         assert!(rows.len() <= 120);
         assert_eq!(diagnostics.state.lock().unwrap().counts.len(), 8);
+    }
+
+    #[test]
+    fn verbose_diagnostics_name_every_event_instead_of_aggregating_it() {
+        use tracing_subscriber::prelude::*;
+        let (diagnostics, capture) = diagnostic_capture(true);
+        diagnostics
+            .verbose
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let subscriber =
+            tracing_subscriber::registry().with(super::DiagnosticLayer(diagnostics.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(request_id = 7, "graph checkpoint committed");
+            tracing::info!(request_id = 8, "team admission accepted");
+        });
+        diagnostics.flush();
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "every event becomes its own record: {output}"
+        );
+        for row in &rows {
+            assert_eq!(row["class"], "unsampled_fact");
+            assert!(
+                row["event"].as_str().is_some_and(|event| !event.is_empty()),
+                "a verbose record names the event site: {row}"
+            );
+            assert!(row["target"].as_str().is_some_and(|target| !target.is_empty()));
+        }
+        assert!(
+            !output.contains("normal_aggregate"),
+            "verbose mode does not aggregate ordinary progress: {output}"
+        );
+        assert!(
+            !output.contains("request_id_sha256"),
+            "the verbose record keeps the existing field discipline: {output}"
+        );
     }
 
     #[test]
