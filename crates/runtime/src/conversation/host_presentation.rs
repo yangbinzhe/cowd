@@ -4740,7 +4740,14 @@ pub(super) fn focus_acceptance_is_met(
     required_scopes: &[String],
     pending_scopes: &[String],
 ) -> bool {
-    bounded_evidence_role && !required_scopes.is_empty() && pending_scopes.is_empty()
+    // A bounded delegated role declares required scopes only when its packet
+    // carries evidence obligations. A role without any has nothing outstanding,
+    // so its acceptance is trivially met. The previous non-empty requirement
+    // made that case permanently unsatisfiable, and the saturation guard could
+    // then only ever Block such a role - including one that had already
+    // finished its work and retained the evidence.
+    let _ = required_scopes;
+    bounded_evidence_role && pending_scopes.is_empty()
 }
 
 pub(super) fn should_force_focus_synthesis(
@@ -4767,7 +4774,13 @@ pub(super) fn should_force_focus_synthesis(
     // not prove that investigation is complete. Keep discovery available
     // until the provider returns a grounded terminal answer or the existing
     // bounded novelty policy observes repeated saturation.
-    !required_scopes.is_empty() && (exact_workspace_evidence || repeated_evidence_saturation)
+    if required_scopes.is_empty() {
+        // No declared evidence obligation and repeated saturation: there is
+        // nothing left to acquire, so the role must present what it retains
+        // instead of being stopped with a Block.
+        return repeated_evidence_saturation;
+    }
+    exact_workspace_evidence || repeated_evidence_saturation
 }
 
 #[cfg(test)]

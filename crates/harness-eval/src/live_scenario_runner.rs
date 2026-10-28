@@ -2056,6 +2056,16 @@ fn health_check(name: &str, passed: bool, expected: Value, actual: Value) -> Val
     })
 }
 
+/// Whether the Evolution background worker is enabled for this instance.
+/// Unknown is treated as enabled so a Runtime that does not report the
+/// effective switch keeps the strict liveness requirement.
+fn evolution_projector_enabled(response: &Value) -> bool {
+    response
+        .pointer("/projector/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
 fn semantic_health_observation(path: &str, contract: LiveHealthContract, response: Value) -> Value {
     let checks = match contract {
         LiveHealthContract::Gateway => vec![health_check(
@@ -2148,12 +2158,18 @@ fn semantic_health_observation(path: &str, contract: LiveHealthContract, respons
             ),
         ],
         LiveHealthContract::EvolutionProjectors => vec![
+            // The Evolution background worker is an optional subsystem with its
+            // own switch. An instance that deliberately turned it off has no
+            // lane, so "worker not running" is the configured state and must not
+            // fail the scenario health contract. An enabled projector still has
+            // to be live.
             health_check(
                 "evolution_projector.worker_running",
-                response
-                    .pointer("/projector/worker_running")
-                    .and_then(Value::as_bool)
-                    == Some(true),
+                !evolution_projector_enabled(&response)
+                    || response
+                        .pointer("/projector/worker_running")
+                        .and_then(Value::as_bool)
+                        == Some(true),
                 json!(true),
                 response
                     .pointer("/projector/worker_running")

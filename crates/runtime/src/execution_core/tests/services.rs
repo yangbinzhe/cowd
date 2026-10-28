@@ -54,6 +54,39 @@ impl TestRuntimeBackends {
 }
 
 #[test]
+fn evolution_projector_health_reports_the_effective_background_switch() {
+    // A deliberately disabled Evolution background worker has no lane, so its
+    // health must say "not enabled" instead of presenting an absent worker as
+    // a broken projection. The switch is the only honest source of that
+    // distinction, and it is exactly what the isolation profile sets.
+    for evolution_enabled in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let backends = TestRuntimeBackends::new(root.path());
+        let services = backends
+            .builder(root.path().join("home"), &workspace)
+            .background_work(crate::BackgroundWorkConfig {
+                evolution: evolution_enabled,
+                growth: evolution_enabled,
+            })
+            .build()
+            .unwrap();
+        let health = services.evolution_projector_health().unwrap();
+        assert_eq!(
+            health.enabled, evolution_enabled,
+            "projector health must report the effective switch"
+        );
+        if !evolution_enabled {
+            assert!(
+                !health.worker_running,
+                "a disabled projector registers no lane and therefore no worker"
+            );
+        }
+    }
+}
+
+#[test]
 fn background_evolution_configuration_controls_real_registration_without_removing_governance() {
     for production_default in [true, false] {
         let root = tempfile::tempdir().unwrap();

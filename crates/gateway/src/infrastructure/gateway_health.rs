@@ -322,6 +322,12 @@ fn outcome_projection_healthy(health: &runtime::OutcomeProjectionHealth) -> bool
 }
 
 fn evolution_projection_healthy(health: &runtime::EvolutionProjectorHealth) -> bool {
+    // A deliberately disabled Evolution background worker is the configured
+    // state, not a broken projection. Core delivery must not be gated on an
+    // optional subsystem that this instance was told not to run.
+    if !health.enabled {
+        return true;
+    }
     health.worker_running
         && health.consecutive_failures == 0
         && (health.latest_commit_cursor == 0 || health.source_cursor > 0)
@@ -495,6 +501,7 @@ mod tests {
     #[test]
     fn evolution_projector_health_requires_a_live_progressing_worker() {
         let mut health = runtime::EvolutionProjectorHealth {
+            enabled: true,
             source_cursor: 0,
             latest_commit_cursor: 10,
             lag_commits: 10,
@@ -511,5 +518,26 @@ mod tests {
         assert!(evolution_projection_healthy(&health));
         health.consecutive_failures = 2;
         assert!(!evolution_projection_healthy(&health));
+    }
+
+    #[test]
+    fn disabled_evolution_projection_is_not_a_degraded_gateway() {
+        // The evaluation/isolation profile turns the Evolution background
+        // worker off on purpose. Its lane is then absent, so "no running
+        // worker" is the configured state and must not degrade the gateway.
+        let health = runtime::EvolutionProjectorHealth {
+            enabled: false,
+            source_cursor: 0,
+            latest_commit_cursor: 10,
+            lag_commits: 10,
+            dead_letter_count: 0,
+            worker_running: false,
+            consecutive_failures: 0,
+            scan_commit_limit: 128,
+            scan_event_limit: 10_000,
+            scan_byte_limit: 32 * 1024 * 1024,
+            scan_wall_limit_ms: 50,
+        };
+        assert!(evolution_projection_healthy(&health));
     }
 }

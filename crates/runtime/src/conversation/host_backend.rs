@@ -5495,6 +5495,50 @@ mod own865_host_saturation_tests {
     use super::*;
 
     #[test]
+    fn bounded_role_without_declared_acceptance_scopes_is_not_blocked_by_saturation() {
+        // A delegated bounded-evidence role only declares required scopes when
+        // its packet carries evidence obligations. A role without any has
+        // nothing outstanding, so its acceptance is trivially met. Requiring a
+        // non-empty required-scope list made that case permanently
+        // unsatisfiable, and the saturation guard could then only Block the
+        // role - even after its work and evidence were already retained.
+        assert!(
+            focus_acceptance_is_met(true, &[], &[]),
+            "a bounded role with no declared obligation has nothing pending"
+        );
+        assert!(
+            should_force_focus_synthesis(true, &[], true, false, false),
+            "repeated saturation with nothing to acquire must present retained evidence, not block"
+        );
+        // A declared obligation that is still pending is not acceptance.
+        assert!(!focus_acceptance_is_met(
+            true,
+            &["read:src/lib.rs".to_string()],
+            &["read:src/lib.rs".to_string()]
+        ));
+        // A declared obligation that is still pending is not acceptance, and
+        // an unmet acceptance never forces synthesis.
+        assert!(!should_force_focus_synthesis(
+            false,
+            &["read:src/lib.rs".to_string()],
+            true,
+            false,
+            false
+        ));
+        // A declared and satisfied obligation still synthesizes once the
+        // bounded novelty policy observes repeated saturation.
+        assert!(should_force_focus_synthesis(
+            true,
+            &["read:src/lib.rs".to_string()],
+            true,
+            false,
+            false
+        ));
+        // A main turn is never a bounded evidence role.
+        assert!(!focus_acceptance_is_met(false, &[], &[]));
+    }
+
+    #[test]
     fn healthy_edit_then_two_reads_does_not_repeat_873_premature_synthesis() {
         use harness_contract::context::{
             EvidenceTargetIdentity, WorkspaceAccessMode, WorkspacePriorState,

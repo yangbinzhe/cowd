@@ -100,6 +100,10 @@ struct ProjectorFailureCatalogPage {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EvolutionProjectorHealth {
+    /// Effective Evolution background-work switch for this instance. A
+    /// deliberately disabled projector has no lane and therefore no running
+    /// worker; that is the configured state, not a degraded projection.
+    pub enabled: bool,
     pub source_cursor: u64,
     pub latest_commit_cursor: u64,
     pub lag_commits: u64,
@@ -471,11 +475,12 @@ impl EvolutionSignalProjector {
 
     #[cfg(test)]
     pub(crate) fn health(&self) -> Result<EvolutionProjectorHealth, String> {
-        self.health_with_worker(false, 0)
+        self.health_with_worker(true, false, 0)
     }
 
     pub(crate) fn health_with_worker(
         &self,
+        enabled: bool,
         worker_running: bool,
         consecutive_failures: u32,
     ) -> Result<EvolutionProjectorHealth, String> {
@@ -494,6 +499,7 @@ impl EvolutionSignalProjector {
                 ))
             })?;
         Ok(EvolutionProjectorHealth {
+            enabled,
             source_cursor,
             latest_commit_cursor,
             lag_commits,

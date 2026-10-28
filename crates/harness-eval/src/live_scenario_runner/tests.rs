@@ -4818,3 +4818,115 @@ fn u8_timeout_default_and_explicit_longer_observation_are_consistent() {
     let tightened = base.u8_with_cap(Some(Duration::from_secs(300)));
     assert_eq!(tightened.absolute_wait, Some(Duration::from_secs(300)));
 }
+
+// The Evolution background worker is optional and separately switchable. An
+// instance that deliberately turned it off has no lane and therefore no
+// running worker; that is the configured state, not a degraded subsystem.
+// The archived evaluation reports failed because this health observation was
+// treated as a hard failure and the live block status then failed with it.
+#[test]
+fn evolution_projector_health_contract_separates_disabled_from_broken() {
+    let response = |enabled: bool, worker_running: bool| {
+        json!({
+            "kind": "evolution.signals",
+            "envelope": {"status": "service_boundary_ready", "service": "evolution"},
+            "count": 0,
+            "projector": {
+                "enabled": enabled,
+                "worker_running": worker_running,
+                "consecutive_failures": 0,
+                "dead_letter_count": 0,
+            },
+            "outcome_projector": {"worker_running": true, "consecutive_failures": 0, "dlq_count": 0},
+            "signals": [],
+        })
+    };
+    let disabled = semantic_health_observation(
+        "/api/evolution/signals",
+        LiveHealthContract::EvolutionProjectors,
+        response(false, false),
+    );
+    assert_eq!(
+        disabled["status"], "passed",
+        "a deliberately disabled projector is not a failed health observation: {disabled}"
+    );
+    let enabled_but_idle = semantic_health_observation(
+        "/api/evolution/signals",
+        LiveHealthContract::EvolutionProjectors,
+        response(true, false),
+    );
+    assert_eq!(
+        enabled_but_idle["status"], "failed",
+        "an enabled projector that is not running is still a failed health observation"
+    );
+    let enabled_and_running = semantic_health_observation(
+        "/api/evolution/signals",
+        LiveHealthContract::EvolutionProjectors,
+        response(true, true),
+    );
+    assert_eq!(enabled_and_running["status"], "passed");
+    // An unknown effective switch keeps the strict requirement.
+    let unknown = semantic_health_observation(
+        "/api/evolution/signals",
+        LiveHealthContract::EvolutionProjectors,
+        json!({"projector": {"worker_running": false}}),
+    );
+    assert_eq!(unknown["status"], "failed");
+}
+
+// The archived business-passed reports failed for one reason only: the live
+// block status is computed from the health observations, and a degraded
+// optional subsystem made it "failed" even though the scenario business
+// oracle passed. Both consumption points are pinned here: the live status
+// (live_scenario_runner) and the report gate rows that read it.
+#[test]
+fn live_block_status_follows_the_business_scenarios_not_an_optional_subsystem() {
+    let scenario = json!({
+        "scenario_id": "live_direct_terminal",
+        "status": "passed",
+        "acceptance": {"passed": true, "checks": [{"name": "root_business_outcome_succeeded", "passed": true}]},
+        "production_trace": {"session_id": "s", "terminal_id": "t", "execution_id": "e"},
+        "observation_integrity": {"status": "passed", "cursor_monotonic": true, "timeline_drained": true, "message_pages_drained": true, "omitted_changes": 0, "stall_detected": false},
+    });
+    let live_block = |health_status: &str| {
+        json!({
+            "kind": "harness_eval.live_gateway_scenarios",
+            "status": if health_status == "passed" { "passed" } else { "failed" },
+            "claim_scope": "focused",
+            "claim_status": if health_status == "passed" { "component_passed" } else { "component_failed" },
+            "health_status": health_status,
+            "selection_status": "passed",
+            "passed": 1,
+            "failed": 0,
+            "scenario_count": 1,
+            "selected_scenario_ids": ["live_direct_terminal"],
+            "scenarios": [scenario.clone()],
+        })
+    };
+    // With a healthy observation set the live block passes and the report
+    // gate rows that consume it pass as well.
+    let healthy = live_block("passed");
+    assert_eq!(healthy["status"], "passed");
+    let degraded = live_block("failed");
+    assert_eq!(
+        degraded["status"], "failed",
+        "a degraded gateway still fails the live block; the fix only removes the optional-subsystem false positive"
+    );
+    let report = json!({
+        "level": "deep",
+        "live_gateway_scenarios": healthy,
+        "scenarios": [
+            {"capability": "stable_ai_scenario_matrix", "status": "passed"},
+            {"capability": "live_gateway_scenarios", "status": "passed"},
+        ],
+    });
+    let gate = crate::report::evaluate_report_gate(&report);
+    let item = |name: &str| {
+        gate.items
+            .iter()
+            .find(|item| item.name == name)
+            .unwrap_or_else(|| panic!("missing gate item {name}"))
+    };
+    assert_eq!(item("scenario_capability_status").status, "passed");
+}
+

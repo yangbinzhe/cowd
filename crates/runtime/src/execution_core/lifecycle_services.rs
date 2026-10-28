@@ -668,8 +668,18 @@ impl RuntimeServices {
     pub fn evolution_projector_health(
         &self,
     ) -> Result<crate::EvolutionProjectorHealth, RuntimeServicesError> {
+        // The effective Evolution switch is the only honest answer to "should
+        // this projector be running?". A deliberately disabled instance never
+        // registers the lane, so a missing worker is the configured state and
+        // must not be reported as a broken projection.
+        let evolution_enabled = self
+            .background_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evolution;
         self.evolution_signal_projector
             .health_with_worker(
+                evolution_enabled,
                 self.event_reactor
                     .lane_health(crate::evolution::projector::PROJECTOR_ID)
                     .map_err(RuntimeServicesError::Invariant)?
