@@ -472,6 +472,13 @@ impl ToolExecutionPlane {
             session_id: session_id.map(str::to_owned),
             state: Arc::clone(&admission.state),
         };
+        // The operation future is the largest state machine on this path: the
+        // tool's own future was inlined into this frame, and the timeout and
+        // catch_unwind wrappers inlined it a second and third time. Box it
+        // first so the state lives on the heap and every frame above keeps
+        // only the pointer. The concrete `Pin<Box<Fut>>` keeps the auto
+        // traits, so Send propagation is unchanged.
+        let operation = Box::pin(operation);
         let operation =
             TOOL_EXECUTION_FRAME.scope(frame, AssertUnwindSafe(operation).catch_unwind());
         tokio::pin!(operation);
