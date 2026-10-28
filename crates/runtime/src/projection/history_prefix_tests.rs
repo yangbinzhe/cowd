@@ -1318,3 +1318,71 @@ async fn own843_hot_checkpoint_above_28k_uses_actual_publication_budget() {
     services.shutdown_execution().await;
     services.shutdown_maintenance().await;
 }
+
+#[tokio::test]
+async fn r451_summary_prepaid_large_graph_body_is_charged_once() {
+    let services = RuntimeServices::in_memory().unwrap();
+    let private_payload =
+        serde_json::json!({"rows":"PRIVATE_ORDER_ROW_451".repeat(9_000)}).to_string();
+    let mut graph = ExecutionGraph::new("r451 summary original accounting");
+    crate::test_support::attach_execution_graph_lineage(&mut graph);
+    for index in 0..3 {
+        let mut spec = ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            private_payload.clone(),
+        );
+        spec.id = format!("r451-node-{index}");
+        spec.idempotency_key = format!("r451-original-{index}");
+        graph.nodes.push(spec);
+    }
+    let graph = services
+        .commit_service()
+        .register_graph(graph)
+        .unwrap()
+        .graph;
+    let record = services
+        .event_store()
+        .latest_for_stream(&graph.id)
+        .unwrap()
+        .unwrap();
+    let body_bytes = record.payload["bytes"].as_u64().unwrap() as usize;
+    assert_eq!(record.payload["body"]["kind"], "artifact_ref");
+    assert!(body_bytes > HISTORY_REQUEST_BYTES / 2 && body_bytes < HISTORY_REQUEST_BYTES * 3 / 4);
+    let query = ProjectionQueryContext {
+        principal: "r451-reader".into(),
+        workspace_id: services.workspace_key().into(),
+        session_scopes: vec![graph.lineage.as_ref().unwrap().session_id.clone()],
+        mission_scopes: vec![],
+        visibility_grants: vec![],
+        detail_scope: ProjectionDetailScope::Summary,
+        authorization_revision: 1,
+    };
+    let actual = super::super::super::snapshot(&services, &graph.id, &query).await;
+    let stored = services.graph_state_store().load(&graph.id).unwrap();
+    services.shutdown_execution().await;
+    services.shutdown_maintenance().await;
+    let projection = actual.unwrap_or_else(|error| {
+        panic!(
+            "original summary must not double-charge prepaid original body={body_bytes}: {error}"
+        )
+    });
+    assert_eq!(projection.execution_id, graph.id);
+    assert_eq!(projection.graph.nodes.len(), 3);
+    assert_eq!(
+        stored
+            .nodes
+            .iter()
+            .map(|node| node.payload_ref.as_str())
+            .collect::<Vec<_>>(),
+        vec![private_payload.as_str(); 3]
+    );
+    assert!(
+        !serde_json::to_string(&projection)
+            .unwrap()
+            .contains("PRIVATE_ORDER_ROW_451"),
+        "summary must not expose the original private payload"
+    );
+    assert_eq!(HISTORY_REQUEST_BYTES, 1_048_576);
+    assert_eq!(HISTORY_REQUEST_RECORDS, 256);
+}

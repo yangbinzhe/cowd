@@ -560,9 +560,21 @@ pub(super) fn load(
             let metadata = serde_json::to_vec(&record)
                 .map_err(|_| invalid("metadata encoding"))?
                 .len();
-            budget.charge(1, metadata)?;
             let body = body_bytes(&record)?;
-            if body > budget.bytes.saturating_sub(reserve) {
+            // The original reader also calls charge_record. Register prepayment
+            // with that same owner so resolving this record cannot bill its body
+            // a second time. A previously read original must still match exactly.
+            let prepaid = if budget.charged_records.contains_key(&record.event_id) {
+                Some(budget.charge_record(&record)?)
+            } else {
+                None
+            };
+            if prepaid.is_none()
+                && metadata.saturating_add(body) > budget.bytes.saturating_sub(reserve)
+            {
+                // The page metadata was read even when its body must wait for
+                // the next bounded request.
+                budget.charge(1, metadata)?;
                 if metadata.saturating_add(body).saturating_add(COMMIT_BYTES)
                     > HISTORY_REQUEST_BYTES
                 {
@@ -579,9 +591,12 @@ pub(super) fn load(
             }
             let previous_state = state.clone();
             let previous_records = prefix.records.len();
-            budget.charge(0, body)?;
+            let prepaid = match prepaid {
+                Some(prepaid) => prepaid,
+                None => budget.charge_record(&record)?,
+            };
             if included {
-                let event = budget.resolve_prepaid_record(services, &record, metadata + body)?;
+                let event = budget.resolve_prepaid_record(services, &record, prepaid)?;
                 budget.remember_source_record(&record, prefix.target_cursor)?;
                 budget.remember_record(&event, prefix.target_cursor)?;
                 if event.kind == "session.cancellation_committed" {
