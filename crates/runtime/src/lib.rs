@@ -456,7 +456,7 @@ pub use execution_core::{
     ExecutionGraphHostReceipt, ExecutionGraphStateStore, ExecutionPatternCatalog,
     ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport,
     LegacyOutcomeImportReceipt, OutcomeRecordReceipt, ProcessClosurePublicationAuthority,
-    RuntimeCompileTarget, RuntimeEventReader, RuntimeEvidenceSummary, RuntimeExecutionDecision,
+    RuntimeCompileTarget, RuntimeEventReader, RuntimeTimelinePage, RuntimeEvidenceSummary, RuntimeExecutionDecision,
     RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionPatternCandidate,
     RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, RuntimeExecutionShutdownReport,
     RuntimeExecutionSupervisor, RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,

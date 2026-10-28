@@ -65,7 +65,7 @@ impl RuntimeEventService {
         session_id: &str,
         after_position: Option<(u64, u32)>,
         limit: usize,
-    ) -> Result<Vec<runtime::DurableRuntimeEvent>, String> {
+    ) -> Result<runtime::RuntimeTimelinePage, String> {
         self.reader
             .session_timeline_events(session_id, after_position, limit)
     }

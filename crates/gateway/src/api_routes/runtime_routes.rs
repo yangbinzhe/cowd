@@ -1313,6 +1313,142 @@ mod timeline_cursor_tests {
     use super::{RuntimeTimelineCursor, RuntimeTimelineRuntimePosition};
 
     #[tokio::test]
+    async fn r453_byte_short_timeline_and_message_replay_follow_real_continuations() {
+        use axum::response::IntoResponse;
+        let state = crate::api_routes::tests::test_state();
+        let services = state.services.runtime.as_ref().unwrap().runtime_services();
+        let session = "r453-gateway-timeline";
+        let mut expected = Vec::new();
+        for index in 0..2 {
+            let mut graph =
+                harness_contract::execution_graph::ExecutionGraph::new(format!("r453 Gateway {index}"))
+                    .with_lineage(harness_contract::execution_graph::ExecutionGraphLineage {
+                        session_id: session.into(),
+                        turn_id: format!("r453-turn-{index}"),
+                        root_task_id: format!("r453-task-{index}"),
+                        task_id: format!("r453-task-{index}"),
+                        generation: 1,
+                    });
+            for node in 0..3 {
+                let mut spec = harness_contract::execution_graph::ExecutionNodeSpec::new(
+                    harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
+                    "inline_model",
+                    "R453_GATEWAY_PRIVATE_ROW".repeat(8_000),
+                );
+                spec.id = format!("r453-gateway-node-{index}-{node}");
+                spec.idempotency_key = spec.id.clone();
+                graph.nodes.push(spec);
+            }
+            let graph = services
+                .commit_service()
+                .register_graph(graph)
+                .unwrap()
+                .graph;
+            expected.push(graph.id);
+        }
+        let cancellation = services
+            .commit_cancellation_receipt(harness_contract::turn::CancellationReceipt {
+                cancellation_id: "r453-cancellation".into(),
+                session_id: session.into(),
+                turn_id: "r453-cancel-turn".into(),
+                execution_id: "r453-cancel-graph".into(),
+                actor_id: "principal:local-human".into(),
+                cause: harness_contract::turn::CancellationCause::UserRequested,
+                reason: Some("r453 original cancellation".into()),
+                requested_at_ms: 100,
+                effective_at_ms: Some(101),
+                status: harness_contract::turn::CancellationStatus::Cancelled,
+                journal_sequence: 0,
+                projection_revision: 0,
+            })
+            .unwrap();
+        let first = super::get_runtime_timeline(
+            super::AxumState(state.clone()),
+            super::Query(super::RuntimeTimelineParams {
+                session_id: session.into(),
+                cursor: None,
+                limit: Some(500),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let first: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["events"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            first["has_more"], true,
+            "byte short page must not be advertised as EOF"
+        );
+        let next = first["next_cursor"].as_str().unwrap().to_string();
+        let second = super::get_runtime_timeline(
+            super::AxumState(state.clone()),
+            super::Query(super::RuntimeTimelineParams {
+                session_id: session.into(),
+                cursor: Some(next),
+                limit: Some(500),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let second: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["has_more"], false);
+        let events = first["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(second["events"].as_array().unwrap());
+        let planned: Vec<_> = events
+            .filter(|event| event["kind"] == "execution_graph.planned")
+            .map(|event| event["stream_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            planned, expected,
+            "no missing/duplicate/foreign original graph"
+        );
+        let first = crate::api_routes::message_routes::replay_materialized_terminal_events(
+            state.as_ref(),
+            session,
+            0,
+            500,
+        )
+        .await;
+        assert!(first.has_more && first.events.is_empty() && !first.requires_resync);
+        let cursor = first.last_cursor.unwrap();
+        assert!(
+            cursor < cancellation.journal_sequence,
+            "deferred cancellation cannot be skipped"
+        );
+        let second = crate::api_routes::message_routes::replay_materialized_terminal_events(
+            state.as_ref(),
+            session,
+            cursor,
+            500,
+        )
+        .await;
+        assert!(!second.has_more && !second.requires_resync);
+        assert_eq!(second.events.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&second.events[0]).unwrap();
+        assert_eq!(
+            payload["delivery"]["receipt"]["cancellation_id"],
+            "r453-cancellation"
+        );
+        assert_eq!(second.last_cursor, Some(cancellation.journal_sequence));
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
     async fn r1_event_replay_runtime_to_surface_preserves_terminal_and_evidence() {
         use runtime::ArtifactGcPort;
         let root = std::path::PathBuf::from(
@@ -1430,7 +1566,7 @@ mod timeline_cursor_tests {
             .event_reader()
             .session_timeline_events("surface-session", None, 100)
             .unwrap();
-        let surface = page
+        let surface = page.events
             .into_iter()
             .map(super::RuntimeEvent::from)
             .collect::<Vec<_>>();
@@ -1471,7 +1607,7 @@ mod timeline_cursor_tests {
             .event_reader()
             .session_timeline_events("foreign-session", None, 100)
             .unwrap()
-            .is_empty());
+            .events.is_empty());
         assert_eq!(
             super::runtime_event_error(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -2318,7 +2454,7 @@ pub(super) async fn get_runtime_timeline(
             )
         })
         .unwrap_or((0, false, Vec::new()));
-    let lifecycle_events = state
+    let lifecycle_page = state
         .services
         .runtime_events
         .session_timeline_events(
@@ -2329,8 +2465,8 @@ pub(super) async fn get_runtime_timeline(
             source_limit,
         )
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let lifecycle_total = lifecycle_events.len();
-    events.extend(lifecycle_events.into_iter().map(RuntimeEvent::from));
+    let lifecycle_total = lifecycle_page.events.len();
+    events.extend(lifecycle_page.events.into_iter().map(RuntimeEvent::from));
     events.sort_by(|left, right| {
         (
             left.created_at_ms,
@@ -2355,7 +2491,7 @@ pub(super) async fn get_runtime_timeline(
     });
     let combined_total = domain_total + lifecycle_total;
     let combined_has_more =
-        domain_has_more || lifecycle_total == source_limit.min(100) || events.len() > limit;
+        domain_has_more || lifecycle_page.has_more || events.len() > limit;
     events.truncate(limit);
     let mut next_cursor = cursor;
     for event in &events {

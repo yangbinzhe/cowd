@@ -844,7 +844,7 @@ async fn run_session_source(
             break;
         }
         cursor = cursor.max(page.last_cursor.unwrap_or(cursor));
-        if page.record_count < PAGE_SIZE {
+        if !page.has_more {
             break;
         }
     }

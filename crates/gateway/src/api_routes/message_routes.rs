@@ -1117,10 +1117,19 @@ pub(super) async fn replay_materialized_terminal_events(
             }
         }
     };
-    let record_count = records.len().max(timeline.len());
+    let records_full = records.len() == limit;
+    // A byte-short lifecycle page is not the end of the Session history.
+    // Integer Surface cursors cannot skip a partially read transaction or
+    // publish a later terminal before earlier cancellations were scanned.
+    let scan_through = timeline.complete_through_cursor;
+    let has_more = timeline.has_more || records_full;
+    let mut records = records;
+    if timeline.has_more {
+        records.retain(|record| record.commit_cursor <= scan_through);
+    }
     let mut last_cursor = None;
-    let mut ordered_events = Vec::with_capacity(records.len().saturating_add(timeline.len()));
-    let mut requires_resync = false;
+    let mut ordered_events = Vec::with_capacity(records.len().saturating_add(timeline.events.len()));
+    let mut requires_resync = timeline.has_more && scan_through <= after_cursor;
     for record in records {
         if let Some(event) =
             terminal_committed_stream_payload(runtime.runtime_services().artifact_store(), &record)
@@ -1149,8 +1158,11 @@ pub(super) async fn replay_materialized_terminal_events(
             break;
         }
     }
-    let timeline_scan_cursor = timeline.last().map(|event| event.commit_cursor);
-    for event in timeline {
+    let timeline_scan_cursor = Some(scan_through);
+    for event in timeline.events {
+        if timeline.has_more && event.commit_cursor > scan_through {
+            continue;
+        }
         if event.kind != "session.cancellation_committed" {
             continue;
         }
@@ -1192,6 +1204,7 @@ pub(super) async fn replay_materialized_terminal_events(
     }
     ordered_events.sort_by_key(|(cursor, _)| *cursor);
     ordered_events.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+    let has_more = has_more || ordered_events.len() > limit;
     ordered_events.truncate(limit);
     let events = ordered_events
         .into_iter()
@@ -1203,12 +1216,12 @@ pub(super) async fn replay_materialized_terminal_events(
     // Advancing over unrelated Runtime events is safe because terminal
     // records were queried independently by the same global commit cursor. It
     // prevents a busy Session timeline from pinning baseline replay forever.
-    if events.is_empty() {
+    if events.is_empty() && !records_full && !requires_resync {
         last_cursor = timeline_scan_cursor;
     }
     ReplayTerminalPage {
         events,
-        record_count,
+        has_more,
         last_cursor,
         requires_resync,
     }
@@ -1217,7 +1230,7 @@ pub(super) async fn replay_materialized_terminal_events(
 #[derive(Default)]
 pub(super) struct ReplayTerminalPage {
     pub(super) events: Vec<String>,
-    pub(super) record_count: usize,
+    pub(super) has_more: bool,
     pub(super) last_cursor: Option<u64>,
     pub(super) requires_resync: bool,
 }

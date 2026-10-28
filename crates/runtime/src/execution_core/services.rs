@@ -1182,6 +1182,15 @@ pub struct RuntimeEventReader {
     store: Arc<RuntimeEventStore>,
 }
 
+/// One bounded page of complete, authenticated Session lifecycle events.
+pub struct RuntimeTimelinePage {
+    pub events: Vec<DurableRuntimeEvent>,
+    pub has_more: bool,
+    /// Integer-cursor consumers may only advance through complete commits.
+    /// Tuple-position consumers can also consume a partial commit's events.
+    pub complete_through_cursor: u64,
+}
+
 impl RuntimeEventReader {
     #[must_use]
     pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -1223,11 +1232,12 @@ impl RuntimeEventReader {
         session_id: &str,
         after_position: Option<(u64, u32)>,
         limit: usize,
-    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+    ) -> Result<RuntimeTimelinePage, String> {
         let head = self
             .store
             .durable_commit_cursor()
             .map_err(|error| error.to_string())?;
+        const PAGE_BYTES: usize = 1024 * 1024;
         let events = self.store.position_page(
             RuntimeEventScope::Session,
             session_id,
@@ -1235,28 +1245,109 @@ impl RuntimeEventReader {
             after_position,
             head,
             limit.min(100),
-            1024 * 1024,
+            PAGE_BYTES,
         )?;
+        let stored_bytes = events.iter().try_fold(0usize, |total, event| {
+            serde_json::to_vec(event)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| {
+                    total
+                        .checked_add(bytes.len())
+                        .ok_or_else(|| "timeline byte budget overflow".to_string())
+                })
+        })?;
         let mut total = 0usize;
-        events
-            .into_iter()
-            .map(|event| {
-                let event = self.store.resolve_read_record(event)?;
-                let bytes = serde_json::to_vec(&event)
-                    .map_err(|error| error.to_string())?
-                    .len();
-                total = total
-                    .checked_add(bytes)
-                    .ok_or("timeline byte budget overflow")?;
-                if total > 1024 * 1024 {
-                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
-                        "timeline resolved content".into(),
-                    )
-                    .to_string());
+        let mut resolved = Vec::new();
+        let mut next_position = None;
+        for event in events {
+            let metadata = serde_json::to_vec(&event)
+                .map_err(|error| error.to_string())?
+                .len();
+            let envelope = if event.scope == RuntimeEventScope::ExecutionGraph {
+                Some(&event.payload)
+            } else if event.kind == "goal.observation" {
+                Some(&event.payload["observation_body"])
+            } else {
+                None
+            };
+            // Metadata already contains inline content and the graph binding.
+            // Reserve external content before its authenticated resolver does IO.
+            let external = envelope
+                .filter(|value| value["body"]["kind"] == "artifact_ref")
+                .map(|value| {
+                    value["bytes"]
+                        .as_u64()
+                        .ok_or("timeline body extent missing")
+                        .and_then(|bytes| {
+                            usize::try_from(bytes).map_err(|_| "timeline body extent overflow")
+                        })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let extent = metadata
+                .checked_add(external)
+                .ok_or("timeline byte budget overflow")?;
+            if !resolved.is_empty() && extent > PAGE_BYTES.saturating_sub(total) {
+                next_position = Some((event.commit_cursor, event.transaction_index));
+                break;
+            }
+            // A single record still has to fit. Resolve it once to measure its
+            // exact public representation; envelope overhead is only a bound.
+            let event = self.store.resolve_read_record(event)?;
+            let bytes = serde_json::to_vec(&event)
+                .map_err(|error| error.to_string())?
+                .len();
+            total = total
+                .checked_add(bytes)
+                .ok_or("timeline byte budget overflow")?;
+            if total > PAGE_BYTES {
+                return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                    "timeline resolved content".into(),
+                )
+                .to_string());
+            }
+            resolved.push(event);
+        }
+        let mut has_more = next_position.is_some();
+        if !has_more && !resolved.is_empty() && limit > 0 {
+            let last = resolved.last().expect("nonempty page");
+            let remaining = PAGE_BYTES.saturating_sub(stored_bytes);
+            if remaining == 0 {
+                has_more = true;
+            } else {
+                match self.store.position_page(
+                    RuntimeEventScope::Session,
+                    session_id,
+                    None,
+                    Some((last.commit_cursor, last.transaction_index)),
+                    head,
+                    1,
+                    remaining,
+                ) {
+                    Ok(next) => {
+                        next_position = next
+                            .first()
+                            .map(|event| (event.commit_cursor, event.transaction_index));
+                        has_more = next_position.is_some();
+                    }
+                    Err(error) if error.starts_with("HistoryBudgetExceeded:") => has_more = true,
+                    Err(error) => return Err(error),
                 }
-                Ok(event)
-            })
-            .collect()
+            }
+        }
+        let complete_through_cursor = match resolved.last() {
+            Some(last) if has_more && next_position.is_none_or(|next| next.0 == last.commit_cursor) => {
+                last.commit_cursor.saturating_sub(1)
+            }
+            Some(last) => last.commit_cursor,
+            None if limit == 0 => after_position.map_or(0, |position| position.0),
+            None => head,
+        };
+        Ok(RuntimeTimelinePage {
+            events: resolved,
+            has_more,
+            complete_through_cursor,
+        })
     }
 }
 

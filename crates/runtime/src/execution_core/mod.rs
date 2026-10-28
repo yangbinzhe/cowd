@@ -74,7 +74,7 @@ pub use safety_fuse::{
 pub use services::RuntimeFixtureEventPort;
 pub use services::{
     ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport,
-    RuntimeEventReader, RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,
+    RuntimeEventReader, RuntimeTimelinePage, RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,
     SessionTerminalDeliveryPort,
 };
 pub use strategy_decision::{

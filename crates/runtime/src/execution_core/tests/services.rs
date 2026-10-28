@@ -3996,7 +3996,7 @@ fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
 
     let first = reader
         .session_timeline_events("timeline-session", None, 1)
-        .expect("first page");
+        .expect("first page").events;
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].transaction_index, 0);
     let second = reader
@@ -4005,7 +4005,7 @@ fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
             Some((first[0].commit_cursor, first[0].transaction_index)),
             1,
         )
-        .expect("second page");
+        .expect("second page").events;
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].transaction_index, 1);
     assert_eq!(second[0].kind, "timeline.second");
@@ -4016,11 +4016,11 @@ fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
             1
         )
         .unwrap()
-        .is_empty());
+        .events.is_empty());
     assert!(reader
         .session_timeline_events("timeline-session", None, 0)
         .unwrap()
-        .is_empty());
+        .events.is_empty());
     assert!(reader
         .session_timeline_events("timeline-session", Some((u64::MAX, 0)), 1)
         .is_err());
@@ -4028,7 +4028,7 @@ fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
         reader
             .session_timeline_events("foreign-session", None, usize::MAX)
             .unwrap()
-            .len(),
+            .events.len(),
         100
     );
 }
@@ -4894,4 +4894,180 @@ async fn r1_423_startup_preserves_excluded_session_and_live_owner() {
         graph.revision
     );
     drop(fence);
+}
+
+#[tokio::test]
+async fn r453_timeline_expanded_bodies_continue_without_loss_or_foreign_records() {
+    let services = RuntimeServices::in_memory().unwrap();
+    let mut expected = Vec::new();
+    let body = "R453_ORIGINAL_PRIVATE_ROW".repeat(8_000);
+    for index in 0..2 {
+        let mut graph = ExecutionGraph::new(format!("r453 original graph {index}"));
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.lineage.as_mut().unwrap().session_id = "r453-timeline".into();
+        for node in 0..3 {
+            let mut spec = ExecutionNodeSpec::new(
+                ExecutionNodeKind::InlineModel,
+                "inline_model",
+                body.clone(),
+            );
+            spec.id = format!("r453-node-{index}-{node}");
+            spec.idempotency_key = spec.id.clone();
+            graph.nodes.push(spec);
+        }
+        let graph = services
+            .commit_service()
+            .register_graph(graph)
+            .unwrap()
+            .graph;
+        let record = services
+            .event_store()
+            .latest_for_stream(&graph.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.payload["body"]["kind"], "artifact_ref");
+        let bytes = record.payload["bytes"].as_u64().unwrap();
+        assert!(bytes > 524_288 && bytes < 786_432);
+        expected.push(record.event_id);
+    }
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: "r453-foreign".into(),
+            scope: crate::RuntimeEventScope::SessionInput,
+            kind: "r453.foreign".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({"not_this_session":true}),
+        })
+        .unwrap();
+    let reader = services.event_reader();
+    let result = (|| -> Result<(), String> {
+        let first = reader.session_timeline_events("r453-timeline", None, 100)?;
+        assert_eq!(
+            first.events.len(),
+            1,
+            "byte short page, not count short end"
+        );
+        assert!(first.has_more);
+        assert_eq!(first.events[0].event_id, expected[0]);
+        assert_eq!(
+            first.events[0].payload["graph"]["nodes"][0]["payload_ref"],
+            body
+        );
+        let last = first.events.last().unwrap();
+        let second = reader.session_timeline_events(
+            "r453-timeline",
+            Some((last.commit_cursor, last.transaction_index)),
+            100,
+        )?;
+        assert_eq!(second.events.len(), 1);
+        assert!(!second.has_more);
+        assert_eq!(second.events[0].event_id, expected[1]);
+        assert_eq!(
+            second.events[0].payload["graph"]["nodes"][0]["payload_ref"],
+            body
+        );
+        for page in [&first, &second] {
+            assert!(
+                page.events
+                    .iter()
+                    .map(|e| serde_json::to_vec(e).unwrap().len())
+                    .sum::<usize>()
+                    <= 1_048_576
+            );
+        }
+        let last = second.events.last().unwrap();
+        let end = reader.session_timeline_events(
+            "r453-timeline",
+            Some((last.commit_cursor, last.transaction_index)),
+            100,
+        )?;
+        assert!(end.events.is_empty() && !end.has_more);
+        assert_eq!(
+            first
+                .events
+                .into_iter()
+                .chain(second.events)
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            reader
+                .session_timeline_events("r453-other", None, 100)?
+                .events
+                .is_empty()
+        );
+        Ok(())
+    })();
+    services.shutdown_execution().await;
+    services.shutdown_maintenance().await;
+    result.expect(
+        "each complete original body fits; cumulative size must yield a continuation, not 413",
+    );
+}
+
+#[test]
+fn r453_timeline_byte_short_transaction_resumes_by_exact_position_and_rejects_single_oversize() {
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
+    let receipt =
+        store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: "r453-tied-transaction".into(),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id: "r453-tied".into(),
+                    expected_revision: 0,
+                }],
+                events: (0..2)
+                    .map(|index| {
+                        crate::RuntimeEventInput {
+            stream_id:"r453-tied".into(),scope:crate::RuntimeEventScope::SessionInput,
+            kind:format!("r453.tied.{index}"),status:None,actor:None,refs:vec![],
+            payload:serde_json::json!({"original":"z".repeat(600_000),"index":index}),
+        }.into()
+                    })
+                    .collect(),
+            })
+            .unwrap();
+    let reader = super::RuntimeEventReader {
+        store: store.clone(),
+    };
+    let first = reader
+        .session_timeline_events("r453-tied", None, 100)
+        .unwrap();
+    assert_eq!(first.events.len(), 1);
+    assert!(first.has_more);
+    assert_eq!(first.events[0].event_id, receipt.event_ids[0]);
+    assert_eq!(
+        first.complete_through_cursor,
+        receipt.commit_cursor - 1,
+        "integer replay cannot skip an unreturned event in the same commit"
+    );
+    let second = reader
+        .session_timeline_events("r453-tied", Some((receipt.commit_cursor, 0)), 100)
+        .unwrap();
+    assert_eq!(second.events.len(), 1);
+    assert!(!second.has_more);
+    assert_eq!(second.events[0].event_id, receipt.event_ids[1]);
+    assert_eq!(second.complete_through_cursor, receipt.commit_cursor);
+    store
+        .append(crate::RuntimeEventInput {
+            stream_id: "r453-oversize".into(),
+            scope: crate::RuntimeEventScope::SessionInput,
+            kind: "r453.oversize".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({"original":"q".repeat(1_048_576)}),
+        })
+        .unwrap();
+    assert!(
+        reader
+            .session_timeline_events("r453-oversize", None, 100)
+            .err()
+            .unwrap()
+            .starts_with("HistoryBudgetExceeded:")
+    );
 }

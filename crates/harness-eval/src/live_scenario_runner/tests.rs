@@ -883,7 +883,7 @@ fn u5_resource_reader_real_manager_writer_store_selected_witnesses_and_symmetric
                 let records = services
                     .event_reader()
                     .session_timeline_events(session, None, 100)
-                    .unwrap();
+                    .unwrap().events;
                 assert!(!records.is_empty());
                 assert!(records.iter().all(|r| r
                     .refs
