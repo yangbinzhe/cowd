@@ -3318,6 +3318,21 @@ fn responses_stream_frame_to_chunk(
             })
         }
         "response.output_item.added" => frame.item.and_then(|item| {
+            if matches!(item.item_type.as_str(), "message" | "reasoning")
+                && item.id.as_deref().is_some_and(|id| !id.is_empty())
+                && item.content.is_empty()
+                && item.summary.is_empty()
+                && item.call_id.is_none()
+                && item.name.is_none()
+                && item.arguments.is_none()
+            {
+                return Some(ChatCompletionChunk {
+                    id: item.id.unwrap(),
+                    model: Some(fallback_model.to_string()),
+                    choices: Vec::new(),
+                    usage: None,
+                });
+            }
             (item.item_type == "function_call").then(|| ChatCompletionChunk {
                 id: "responses_stream".to_string(),
                 model: Some(fallback_model.to_string()),
@@ -4224,6 +4239,19 @@ mod tests {
                 && message == "capacity unavailable"
                 && request_id == "resp_failed"
         ));
+    }
+
+    #[test]
+    fn responses_message_item_is_not_missing_payload_and_tool_terminal_survive() {
+        let message = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n";
+        let message = parse_responses_sse_frame(message, "MiniMax", "model").unwrap().unwrap();
+        assert_eq!(message.id, "msg_1");
+        assert!(message.choices.is_empty() && message.usage.is_none());
+        let tool = "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{}\"}}\n\n";
+        let tool = parse_responses_sse_frame(tool, "MiniMax", "model").unwrap().unwrap();
+        assert_eq!(tool.choices[0].delta.tool_calls[0].id.as_deref(), Some("call_1"));
+        assert!(parse_responses_sse_frame("data: {\"type\":\"response.output_item.added\"}\n\n", "MiniMax", "model").is_err());
+        assert!(parse_responses_sse_frame("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"untrusted_future\"}}\n\n", "MiniMax", "model").is_err());
     }
 
     #[test]
