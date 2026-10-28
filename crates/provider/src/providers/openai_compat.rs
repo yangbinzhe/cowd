@@ -3256,6 +3256,17 @@ fn responses_stream_frame_to_chunk(
             choices: Vec::new(),
             usage: None,
         }),
+        "response.in_progress" => frame.response.filter(|response| {
+            response.status.as_deref() == Some("in_progress")
+                && response.output.is_empty()
+                && response.usage.is_none()
+                && response.error.is_none()
+        }).map(|response| ChatCompletionChunk {
+            id: response.id,
+            model: response.model.or_else(|| Some(fallback_model.to_string())),
+            choices: Vec::new(),
+            usage: None,
+        }),
         "response.output_text.delta" => frame.delta.map(|delta| ChatCompletionChunk {
             id: "responses_stream".to_string(),
             model: Some(fallback_model.to_string()),
@@ -4213,6 +4224,24 @@ mod tests {
                 && message == "capacity unavailable"
                 && request_id == "resp_failed"
         ));
+    }
+
+    #[test]
+    fn responses_in_progress_preserves_stream_until_terminal_and_rejects_bad_status() {
+        let progress = parse_responses_sse_frame(
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[]}}\n\n", "MiniMax", "MiniMax-M3.1-Flash"
+        ).expect("valid progress event").expect("identity retained");
+        assert_eq!(progress.id, "resp_1");
+        assert!(progress.choices.is_empty() && progress.usage.is_none());
+        for frame in [
+            "data: {\"type\":\"response.in_progress\"}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"output\":[]}}\n\n",
+        ] { assert!(parse_responses_sse_frame(frame, "MiniMax", "model").is_err()); }
+        let terminal = parse_responses_sse_frame(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n", "MiniMax", "model"
+        ).unwrap().unwrap();
+        assert_eq!(terminal.choices[0].finish_reason.as_deref(),Some("stop"));
+        assert!(terminal.usage.is_some());
     }
 
     #[test]
