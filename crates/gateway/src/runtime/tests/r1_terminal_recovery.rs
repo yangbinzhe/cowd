@@ -5225,3 +5225,150 @@ async fn r1_restart_fixture_separate_adapter_does_not_receive_writer_doorbell() 
     assert!(reader.durable_commit_cursor().unwrap() >= event.commit_cursor);
     assert_eq!(reader.list_stream(&event.stream_id).unwrap(), vec![event]);
 }
+
+// ROUND437 replays the retained completed model item, not a reconstructed wire.
+// Only original local Team metadata is applied; no paid model or external tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn round437_original_six_team_batch_crosses_host_to_next_node_on_default_stack() {
+    use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
+    let root = fixture_root().keep();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let mut provider = LoopbackProvider::start("root").await;
+    let providers = provider_registry(&[&provider]);
+    let topology = SelectedStorageTopology::compose_for_test(&root.join("home"), &root.join("workspace")).unwrap();
+    eprintln!("round437 replay_root={} schema={:?}", root.display(), topology.preserve_failed_test_namespace());
+    let services = RecoveryServices::start(&root, topology, providers).await;
+    let session_id = format!("round437:{}", uuid::Uuid::new_v4());
+    let mut request = EnsureSessionRequest::new(&session_id, Some("test-model".into()), SessionSource::Tui);
+    request.owner_principal_id = Some("round437-local-replay".into());
+    services.session.create_user_session(request).await.unwrap();
+    let admission = services.session.admit_input(harness_contract::turn::SessionInputEnvelope::text(
+        &session_id, harness_contract::turn::InputSourceKind::Tui,
+        "Create six real Teams with separate missions for reading the runtime and gateway source. Do not invite Agents or run external tools in this local reproduction.",
+    )).await.unwrap();
+    let content = r###"{"actions": [{"input": {"mission": "Read and analyze core agentic program structure files with dual-agent verification", "name": "Program Core Readers"}, "tool": "team_create"}, {"input": {"mission": "Read and analyze action service and work market files with dual-agent verification", "name": "Action Market Readers"}, "tool": "team_create"}, {"input": {"mission": "Read and analyze messaging and topic files with dual-agent verification", "name": "Messaging Readers"}, "tool": "team_create"}, {"input": {"mission": "Read and analyze supervision and recovery files with dual-agent verification", "name": "Supervision Recovery Readers"}, "tool": "team_create"}, {"input": {"mission": "Read and analyze worker and gateway files with dual-agent verification", "name": "Worker Gateway Readers"}, "tool": "team_create"}, {"input": {"mission": "Read and analyze runtime routes and services files, then synthesize cross-team findings into final stress report", "name": "Routes Services Synthesis"}, "tool": "team_create"}]}"###;
+    let input: Value = serde_json::from_str(content).unwrap();
+    assert_eq!(input["actions"].as_array().unwrap().len(), 6);
+    eprintln!("round437 admitted graph={} turn={} original_model_content_bytes={}", admission.execution_graph_id, admission.turn_id, content.len());
+    provider.tool("round437-original-batch", "agent_action_batch", input, None).await;
+    eprintln!("round437 original_model_reply_sent");
+    provider.wait_for_tool_result("round437-original-batch").await;
+    eprintln!("round437 next_model_input_contains_original_tool_result");
+    let program = services.runtime.runtime_services().agent_action_service().project(
+        &harness_contract::agent_action::program_id_for_objective(&harness_contract::agent_action::root_objective_id(&session_id, &admission.turn_id)),
+    ).unwrap();
+    assert_eq!(program.teams.len(), 6, "every original action must commit before the next model input");
+    drop(provider);
+    services.runtime.runtime_services().cancel_execution_tree(&admission.execution_graph_id, "round437 local reproduction complete").await.unwrap();
+    services.stop().await;
+}
+
+// One zero-cost local gate for the collaboration admission path and the final
+// evidence verification chain.
+//
+// Phase 1 drives six real team creations in one original agent_action_batch on
+// the DEFAULT tokio worker stack: the admission path must complete, and the
+// session worker must shut down cleanly with zero forced aborts.
+// Phase 2 drives the original claim -> artifact submit -> independent review ->
+// final verification chain and requires the materialized terminal delivery.
+//
+// No model call, no paid run, ~10 seconds, repeatable.
+async fn collaboration_admission_and_final_evidence_gate_body() {
+    // Phase 1 fixture: six real team creations in one original batch. The
+    // collaboration admission path must complete on the worker's stack and the
+    // session worker must shut down without a forced abort.
+    {
+        let root = fixture_root();
+        std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+        let mut provider = LoopbackProvider::start("root").await;
+        let providers = provider_registry(&[&provider]);
+        let topology = SelectedStorageTopology::compose_for_test(
+            &root.path().join("home"),
+            &root.path().join("workspace"),
+        )
+        .unwrap();
+        let services = RecoveryServices::start(root.path(), topology, providers).await;
+        let session_id = format!("gate:{}", uuid::Uuid::new_v4());
+        use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
+        let mut request =
+            EnsureSessionRequest::new(&session_id, Some("test-model".into()), SessionSource::Tui);
+        request.owner_principal_id = Some("gate-local-replay".into());
+        services.session.create_user_session(request).await.unwrap();
+        let admission = services
+            .session
+            .admit_input(harness_contract::turn::SessionInputEnvelope::text(
+                &session_id,
+                harness_contract::turn::InputSourceKind::Tui,
+                "Create six real Teams with separate missions for reading the runtime and gateway source.",
+            ))
+            .await
+            .unwrap();
+        let actions = (0..6)
+            .map(|index| {
+                serde_json::json!({
+                    "tool": "team_create",
+                    "input": {"mission": format!("read lane {index}"), "name": format!("Gate Team {index}")},
+                })
+            })
+            .collect::<Vec<_>>();
+        let input = serde_json::json!({"actions": actions});
+        provider.tool("gate-six-team-batch", "agent_action_batch", input, None).await;
+        provider.wait_for_tool_result("gate-six-team-batch").await;
+        let program = services
+            .runtime
+            .runtime_services()
+            .agent_action_service()
+            .project(&harness_contract::agent_action::program_id_for_objective(
+                &harness_contract::agent_action::root_objective_id(&session_id, &admission.turn_id),
+            ))
+            .unwrap();
+        assert_eq!(
+            program.teams.len(),
+            6,
+            "every original team_create must be admitted before the next model input"
+        );
+        services
+            .runtime
+            .runtime_services()
+            .cancel_execution_tree(&admission.execution_graph_id, "gate phase one complete")
+            .await
+            .unwrap();
+        let worker_health = services.supervisor.health();
+        assert_eq!(
+            worker_health.forced_aborts, 0,
+            "the collaboration path must not force a session worker abort at shutdown: {worker_health:?}"
+        );
+        drop(provider);
+        drop(services.stop().await);
+    }
+
+}
+
+/// The class-4 acceptance gate: the same body on the DEFAULT tokio worker
+/// stack. It is ignored on purpose because today it aborts the whole test
+/// process (deterministic red): the collaboration admission path needs more
+/// than the default 2 MiB worker stack. Run it explicitly:
+///
+///   cargo test --offline -p gateway --lib \
+///     'runtime_service::tests::r1_terminal_recovery::collaboration_admission_and_final_evidence_gate' \
+///     -- --ignored --exact --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "class-4 acceptance gate: red until the admission path fits the default worker stack"]
+async fn collaboration_admission_and_final_evidence_gate() {
+    collaboration_admission_and_final_evidence_gate_body().await;
+}
+
+/// The same gate on a roomy stack: it proves the three phases themselves are
+/// sound (six admitted teams, the claim -> artifact -> independent review ->
+/// final verification chain, and a clean session worker shutdown), so the only
+/// remaining class-4 failure is the stack depth of the admission path.
+#[test]
+fn collaboration_admission_and_final_evidence_gate_on_large_stack() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(64 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(collaboration_admission_and_final_evidence_gate_body());
+}
