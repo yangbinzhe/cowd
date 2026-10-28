@@ -2784,6 +2784,13 @@ where
                 let mut write_recovery = None;
                 let mut write_goal_cut = None;
                 let mut next_model_context = None;
+                // All Goal observations and the final write checkpoint in this
+                // outcome must share one durable source cut.  The model was
+                // dispatched against `model_goal_source`; the checkpoint below
+                // may only use the newer cut when the Goal itself is unchanged.
+                let observation_source = self.services.goal_store().projection(observation.goal_id())
+                    .map_err(|reason| NodeExecutorError::Poll { node_id:ticket.node_id.clone(),reason })?
+                    .ok_or_else(|| NodeExecutorError::Poll { node_id:ticket.node_id.clone(),reason:"observation Goal source missing".into() })?;
                 let next = match intent {
                     ModelStepIntent::FinalAnswer { text } => 'final_answer: {
                         let mut text = strip_trailing_simulated_tool_markup(text);
@@ -3035,8 +3042,14 @@ where
                             state.committed_workspace_observed_evidence.as_slice(),
                             state.committed_workspace_write_observed,
                         ));
+                        if model_goal_source.goal != observation_source.goal {
+                            return Err(NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason: "final model answer saw a changed Goal".into(),
+                            });
+                        }
                         let (write_decision, cut) = self.services.goal_store().assess_write_checkpoint(
-                            &write_goal_source, ticket, self.services.path_identity_resolver(),
+                            &observation_source, ticket, self.services.path_identity_resolver(),
                             GoalWriteCheckpoint::FinalAnswer, task_focus, &[],
                         ).map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?;
                         write_goal_cut = Some(cut);
@@ -3799,9 +3812,6 @@ where
                             reason: "provider intent advanced the turn graph".to_string(),
                             framework_authored: true,
                         });
-                let observation_source = self.services.goal_store().projection(observation.goal_id())
-                    .map_err(|reason| NodeExecutorError::Poll { node_id:ticket.node_id.clone(),reason })?
-                    .ok_or_else(|| NodeExecutorError::Poll { node_id:ticket.node_id.clone(),reason:"observation Goal source missing".into() })?;
                 for (index, upstream) in upstream_observations.iter().enumerate() {
                     outcome.domain_events.push(
                         self.services

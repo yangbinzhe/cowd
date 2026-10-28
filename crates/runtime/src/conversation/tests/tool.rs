@@ -3918,6 +3918,86 @@ fn tool_receipt_projection_preserves_runtime_attested_sha256() {
 #[derive(Clone)]
 struct FinalAnswerClient;
 
+#[derive(Clone)]
+struct R612InterleavedGoalClient {
+    services: Arc<crate::RuntimeServices>,
+    observation: RuntimeObservation,
+    changed_goal: bool,
+}
+
+impl ApiClient for R612InterleavedGoalClient {
+    fn stream(
+        &mut self,
+        _request: ApiRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        if self.changed_goal {
+            let current = self.services.goal_store().projection(self.observation.goal_id()).unwrap().unwrap().goal;
+            self.services.goal_store().revise(&current.id, current.revision, current.user_sequence + 1,
+                "r612 concurrent Goal revision", |goal| {
+                    goal.constraints.push("new constraint".into());
+                    vec!["constraints".into()]
+                }).unwrap();
+        } else {
+            self.services.goal_store().record_observation(self.observation.clone()).unwrap();
+        }
+        Box::pin(stream::iter(vec![
+            Ok(AssistantEvent::TextDelta("terminal answer".to_string())),
+            Ok(AssistantEvent::MessageStop),
+        ]))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn r612_model_producer_rechecks_goal_and_uses_one_observation_cut() {
+    use crate::execution_core::graph::executors::ScopedNodeBackend;
+    for changed_goal in [false, true] {
+        let services = r1_observation_services();
+        let session = Session::new();
+        let (graph, ticket) = r1_branch_graph(&services, &session.session_id, vec![], ExecutionNodeKind::InlineModel);
+        let goal_id = format!("r612-goal-{}", uuid::Uuid::new_v4());
+        let goal: GoalContract = serde_json::from_value(serde_json::json!({
+            "id":goal_id,"session_id":session.session_id,"objective":"answer directly",
+            "criteria":[{"id":"checked","statement":"answer checked","status":"open"}],
+            "phase":"execution","spec_revision":1,"spec_digest":"branch-spec",
+            "scope":"internal","completion":"open","revision":1,"user_sequence":1,
+            "source_intent_ref":"session_input:r612-original",
+            "execution_binding":{"objective_id":"r612-objective","session_id":session.session_id,
+                "turn_id":"r1-branch-turn","root_execution_id":graph.id,"agentic_program_id":"r612-program"}
+        })).unwrap();
+        services.goal_store().create(goal).unwrap();
+        let observation: RuntimeObservation = serde_json::from_value(serde_json::json!({
+            "identity":{"workspace_id":"workspace","session_id":session.session_id,"graph_id":graph.id,
+                "goal_id":goal_id,"node_id":ticket.node_id},
+            "kind":"tool_progress","source":"r612-interleave","source_revision":1,
+            "freshness":{"observed_at_ms":1,"policy_revision":"branch-spec"},
+            "summary":"interleaved observation","fingerprint":"r612-interleave","result_class":"succeeded"
+        })).unwrap();
+        let client = R612InterleavedGoalClient { services: services.clone(), observation, changed_goal };
+        let (runtime, mut state, _scope) = r1_observation_branch_runtime(session.clone(), client, &services, &graph, &goal_id);
+        state.ingress = Some(TurnIngressRef {
+            request_id: "r612-request".into(), turn_id: "r1-branch-turn".into(),
+            message_id: "r612-message".into(), session_id: session.session_id.clone(),
+            primary_task_id: "r1-task".into(), root_task_id: "r1-task".into(),
+            session_generation: 1, input_sequence: 1, claim_owner: "r612-owner".into(),
+            claim_token: "r612-claim".into(), claim_revision: 1, handoff_id: None,
+        });
+        let backend = TurnModelStepBackend { ticket: ticket.clone(), stop: crate::CancellationToken::new(),
+            runtime, state: Arc::new(tokio::sync::Mutex::new(state)), services: services.clone() };
+        let result = backend.execute(&ticket).await;
+        if changed_goal {
+            let error = result.err().expect("a changed Goal must be rejected");
+            assert!(error.to_string().contains("final model answer saw a changed Goal"), "{error}");
+            assert_eq!(services.graph_state_store().load(&graph.id).unwrap(), graph);
+        } else {
+            let outcome = result.expect("interleaved observation is not a Goal revision");
+            let source = services.goal_store().projection(&goal_id).unwrap().unwrap();
+            assert_eq!(outcome.source_revisions.get(&format!("goal:{goal_id}")), Some(&source.stream_revision));
+            let records = r1_commit_host_outcome(&services, &graph, &ticket, outcome);
+            assert!(records.iter().any(|record| record.kind == "goal.observation"));
+        }
+    }
+}
+
 impl ApiClient for FinalAnswerClient {
     fn stream(
         &mut self,

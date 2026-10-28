@@ -6513,6 +6513,59 @@ async fn r1_450_atomic_replan_metadata_retry_and_response_loss_keep_one_outcome(
 }
 
 #[tokio::test]
+async fn r601_observation_and_original_goal_cut_cannot_commit_mixed_revisions() {
+    let (events, running, ticket, mut outcome, _) =
+        running_inline_attempt_450("601 mixed observation cut").await;
+    let goals = crate::execution_core::GoalStore::new(events.clone());
+    let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
+        "id":"601-goal","session_id":"test-session","objective":"retain original source fence",
+        "criteria":[{"id":"checked","statement":"verified","status":"open"}],
+        "phase":"execution","scope":"internal","spec_revision":1,"spec_digest":"current",
+        "completion":"open","revision":1,"user_sequence":1
+    })).unwrap();
+    goals.create(goal).unwrap();
+    let observation: harness_contract::goal::RuntimeObservation = serde_json::from_value(serde_json::json!({
+        "identity":{"workspace_id":"workspace","session_id":"test-session","graph_id":running.id,"goal_id":"601-goal","node_id":ticket.node_id},
+        "kind":"tool_progress","source":"601","source_revision":1,
+        "freshness":{"observed_at_ms":1,"policy_revision":"current"},
+        "summary":"source interleaving","fingerprint":"601-first","result_class":"succeeded"
+    })).unwrap();
+    let source = goals.projection("601-goal").unwrap().unwrap();
+    let mut intervening = observation.clone();
+    intervening.fingerprint = "601-intervening".into();
+    goals.record_observation(intervening).unwrap();
+    let latest = goals.projection("601-goal").unwrap().unwrap();
+    assert!(latest.stream_revision > source.stream_revision);
+    assert_eq!(latest.goal, source.goal);
+    outcome.source_revisions.insert("goal:601-goal".into(), source.stream_revision);
+    outcome.domain_events.push(goals.observation_event_at(&latest, &observation, "601-original".into()).unwrap());
+    let commits = ExecutionCommitService::new(events.clone());
+    let error = commits.execution_outcome_sources(&running, &ticket, &outcome).unwrap_err();
+    assert!(error.to_string().contains("observation source conflicts with causal read-set"), "{error}");
+    assert_eq!(ExecutionGraphStateStore::new(events.clone()).load(&running.id).unwrap(), running);
+    assert!(events.event_by_idempotency_key("goal:601-goal", "601-original").unwrap().is_none());
+    assert!(matches!(commits.inspect_execution_effect(&ticket).unwrap(), ExecutionEffectState::Uncertain));
+    // Re-evaluating against the same latest source used to build the event
+    // permits the original transaction; its source is still protected by CAS.
+    outcome.source_revisions.insert("goal:601-goal".into(), latest.stream_revision);
+    let sources = commits.execution_outcome_sources(&running, &ticket, &outcome).unwrap();
+    let mut later = observation.clone();
+    later.fingerprint = "601-after-prepare".into();
+    goals.record_observation(later).unwrap();
+    let error = commits.transition_execution_outcome(&running, &ticket, &outcome, &sources).err().expect("stale Goal cut must be rejected");
+    assert!(matches!(error, ExecutionCommitError::EventStore(crate::RuntimeEventStoreError::StaleRevision { ref stream_id, .. }) if stream_id == "goal:601-goal"));
+    assert_eq!(ExecutionGraphStateStore::new(events.clone()).load(&running.id).unwrap(), running);
+    assert!(events.event_by_idempotency_key("goal:601-goal", "601-original").unwrap().is_none());
+    let final_source = goals.projection("601-goal").unwrap().unwrap();
+    outcome.source_revisions.insert("goal:601-goal".into(), final_source.stream_revision);
+    outcome.domain_events[0] = goals.observation_event_at(&final_source, &observation, "601-original".into()).unwrap();
+    let sources = commits.execution_outcome_sources(&running, &ticket, &outcome).unwrap();
+    let receipt = commits.transition_execution_outcome(&running, &ticket, &outcome, &sources).unwrap();
+    assert_eq!(receipt.graph.node_results[&ticket.node_id], outcome.result);
+    assert!(events.event_by_idempotency_key("goal:601-goal", "601-original").unwrap().is_some());
+}
+
+#[tokio::test]
 async fn r1_450_readonly_cas_and_reserved_domain_never_commit_partial_node_truth() {
     let (events, running, ticket, mut outcome, calls) =
         running_inline_attempt_450("450 readonly cut").await;
