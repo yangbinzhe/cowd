@@ -27,21 +27,31 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROGRAM_EXTRACTION_RETRIES: u32 = 3;
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 const U8_HISTORY: &str = "live_u8_order_history_original_clause";
-const U8_CLAUSE: &str =
-    "原条款 U8-447：取消行不计费；未取消行按最后一次明确数量与单价计费；包装费已含，不另加税费。";
+const U8_SOURCE_LABEL: &str = "原条款 U8-447";
+const U8_CLAUSE_BODY: &str =
+    "取消行不计费；未取消行按最后一次明确数量与单价计费；包装费已含，不另加税费。";
+const U8_HISTORY_ROWS: u64 = 4096;
 
 #[derive(Clone, serde::Serialize)]
 struct U8OrderInput {
     seed: u64,
     rows: Vec<(String, u64, u64)>,
     revisions: Vec<(String, Option<u64>)>,
-    clause: String,
+    source_label: String,
+    clause_body: String,
     prompts: Vec<String>,
 }
 impl U8OrderInput {
+    #[cfg(test)]
     fn fixed() -> Self {
+        Self::with_rows(64)
+    }
+    fn long_history() -> Self {
+        Self::with_rows(U8_HISTORY_ROWS)
+    }
+    fn with_rows(count: u64) -> Self {
         let seed = 447u64;
-        let rows: Vec<_> = (1..=64u64)
+        let rows: Vec<_> = (1..=count)
             .map(|i| {
                 (
                     format!("PO447-{i:03}"),
@@ -56,17 +66,26 @@ impl U8OrderInput {
             ("PO447-003".into(), Some(4)),
             ("PO447-052".into(), Some(8)),
         ];
-        let mut initial = format!("我们分三轮核对采购订单 PO447。这是首版完整订单，所有金额单位为整数分。保留每个行ID、数量、单价和原条款用于后续修订；本轮请确认收到了64行及原条款，先不要给最终总额。不要访问外部资料，不要写文件或组队。\n原来源：PO447/initial-v1\n{U8_CLAUSE}\n行ID,数量,单价分\n");
-        for (id, quantity, price) in &rows {
+        let old_total: u64 = rows
+            .iter()
+            .map(|(_, quantity, price)| quantity * price)
+            .sum();
+        let mut initial=format!("本轮接收采购订单 PO447 首版资料。之后用户会另行给修订和最终核对问题。本轮只确认接收{count}行、财务首版合计和原条款，不交最终修订总额；保留真实原文来源供核对。金额单位为整数分，首版财务合计{old_total}分，每行可独立复核。不要访问外部资料、写文件或组队，不使用计算工具。\n原来源 PO447/initial-v1；条款来源标识 {U8_SOURCE_LABEL}，标识不是条款正文。\n行ID,数量,单价分\n");
+        let clause_row = if count > 64 { 3072 } else { 1 };
+        for (index, (id, quantity, price)) in rows.iter().enumerate() {
             initial.push_str(&format!("{id},{quantity},{price}\n"));
+            if index as u64 + 1 == clause_row {
+                initial.push_str(&format!("合同核对原文（source_label={U8_SOURCE_LABEL}）\nclause_body={U8_CLAUSE_BODY}\n"));
+            }
         }
-        let revision = "继续同一份 PO447 订单。来源 PO447/revision-v2，按以下顺序覆盖原行：PO447-003 数量改为12；PO447-017取消；随后 PO447-003 数量改为4（覆盖刚才的12）；PO447-052数量改为8。单价与其他行均不改。请确认逐条修订关系，保留首版原条款，下一轮才交最终总额；不新增业务义务、不组队。".to_owned();
-        let final_query = "请依据本Session的原始订单和后续修订完成最终核对。只返回JSON对象，字段total_cents是最新有效订单总额（整数分），original_clause是首版原条款逐字全文。不要用旧总额，不要猜原条款；若缺少必要历史，明确说明缺失。需要原文时可使用已有获准历史/原文读取。不要读取无关工作区、不要写入或组队。".to_owned();
+        let revision="继续同一份 PO447 订单。来源 PO447/revision-v2，按以下顺序覆盖原行：PO447-003 数量改为12；PO447-017取消；随后 PO447-003 数量改为4（覆盖刚才的12）；PO447-052数量改为8。单价与其他行均不改。请确认逐条修订关系，保留首版原条款，下一轮才交最终总额；不新增业务义务、不组队、不使用计算工具。".to_owned();
+        let final_query="请依据本Session的原始订单和后续修订完成最终核对。只返回JSON对象，total_cents是最新有效订单总额（整数分），original_clause是首版clause_body完整正文，source_label可选且独立于正文。不要用旧总额或猜原文；若缺必要历史就明确说明。若原文已完整可见，直接引用，不额外调用工具；否则已有合法当前Session历史接口为context_retrieve，source=session_history、scope=current、query=原条款 U8-447、limit=1，之后仅按实际返回read_request/next_request读取原文。不能超schema limit=16，不转读其他Session，不使用execute_code/tool_orchestrate、工作区操作或组队。".to_owned();
         Self {
             seed,
             rows,
             revisions,
-            clause: U8_CLAUSE.into(),
+            source_label: U8_SOURCE_LABEL.into(),
+            clause_body: U8_CLAUSE_BODY.into(),
             prompts: vec![initial, revision, final_query],
         }
     }
@@ -89,7 +108,7 @@ impl U8OrderInput {
             .sum()
     }
 }
-fn u8_answer(input: &U8OrderInput, answer: &str) -> bool {
+fn u8_answer_value(answer: &str) -> Option<Value> {
     let answer = answer.trim();
     let answer = answer
         .strip_prefix("```json\n")
@@ -97,8 +116,24 @@ fn u8_answer(input: &U8OrderInput, answer: &str) -> bool {
         .and_then(|text| text.strip_suffix("```"))
         .unwrap_or(answer)
         .trim();
-    serde_json::from_str::<Value>(answer).ok().is_some_and(|v| {
-        v["total_cents"].as_u64() == Some(input.total(true)) && v["original_clause"] == input.clause
+    serde_json::from_str(answer).ok()
+}
+fn u8_answer(input: &U8OrderInput, answer: &str) -> bool {
+    u8_answer_value(answer).is_some_and(|v| {
+        let clause = v["original_clause"].as_str().unwrap_or_default();
+        // Only the exact known presentation label is detachable. No arbitrary
+        // substring extraction, fuzzy match, or loss of any clause-body byte.
+        let prefix = format!("{}：", input.source_label);
+        let body = clause.strip_prefix(&prefix).unwrap_or(clause);
+        v["total_cents"].as_u64() == Some(input.total(true)) && body == input.clause_body
+    })
+}
+fn u8_label_matches(input: &U8OrderInput, answer: &str) -> bool {
+    u8_answer_value(answer).is_some_and(|v| {
+        v["source_label"] == input.source_label
+            || v["original_clause"]
+                .as_str()
+                .is_some_and(|clause| clause.starts_with(&format!("{}：", input.source_label)))
     })
 }
 fn u8_turn_passed(case: &Value, session: &str) -> bool {
@@ -3531,7 +3566,7 @@ impl LiveScenarioRunner {
 
     fn run_u8_order_history(&self, spec: LiveScenarioSpec, telemetry: Option<u64>) -> Value {
         let started = Instant::now();
-        let input = U8OrderInput::fixed();
+        let input = U8OrderInput::long_history();
         let mut phases = Vec::new();
         let mut actor = None;
         let operation = (|| -> Result<Value, String> {
@@ -3541,7 +3576,7 @@ impl LiveScenarioRunner {
             );
             u7_private_json(
                 &path,
-                &json!({"input":input,"independent_expected":{"total_cents":input.total(true),"old_total_cents":input.total(false),"original_clause":input.clause},"source_ids":["PO447/initial-v1","PO447/revision-v2"],"input_bytes":input.prompts.iter().map(|p|p.len()).collect::<Vec<_>>(),"size_chosen_once":true}),
+                &json!({"input":input,"independent_expected":{"total_cents":input.total(true),"old_total_cents":input.total(false),"original_clause":input.clause_body,"source_label":input.source_label},"source_ids":["PO447/initial-v1","PO447/revision-v2"],"input_bytes":input.prompts.iter().map(|p|p.len()).collect::<Vec<_>>(),"size_chosen_once":true}),
             )?;
             actor = Some(SessionActor::create(
                 &self.client,
@@ -3627,7 +3662,7 @@ impl LiveScenarioRunner {
                 Ok(v) => json!({"status":"observed","original_response":v}),
                 Err(e) => json!({"status":"unavailable","error":e}),
             };
-            result["u8_history"] = json!({"business_passed":correct,"input_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&input).map_err(|e|e.to_string())?)),"input_bytes":input.prompts.iter().map(|p|p.len()).collect::<Vec<_>>(),"row_count":input.rows.len(),"phase_results":phases,"context_observation":history_observation,"long_history_selection":"not_proven_by_business_success","history_offload":"not_proven","on_demand_original_range":"not_proven; inline availability does not require redundant reads","prepared_wire_completeness":"requires_actual_wire_source_comparison","TUI_ACK_gap_reconnect":"not_tested","size_increase_or_retry":false});
+            result["u8_history"] = json!({"business_passed":correct,"input_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&input).map_err(|e|e.to_string())?)),"input_bytes":input.prompts.iter().map(|p|p.len()).collect::<Vec<_>>(),"row_count":input.rows.len(),"source_label_observation":{"expected":input.source_label,"matches":u8_label_matches(&input,last["u8_terminal_answer"].as_str().unwrap_or_default()),"required_for_business":false},"clause_body_independent_from_label":true,"phase_results":phases,"context_observation":history_observation,"long_history_selection":"not_proven_by_business_success","history_offload":"not_proven","on_demand_original_range":"not_proven; inline availability does not require redundant reads","prepared_wire_completeness":"requires_actual_wire_source_comparison","TUI_ACK_gap_reconnect":"not_tested","size_increase_or_retry":false});
             // Every observer starts at this same Session's original cut. The
             // final metrics already deduplicate all request IDs; adding phase
             // snapshots would double count the same physical attempts.

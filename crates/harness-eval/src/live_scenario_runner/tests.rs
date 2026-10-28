@@ -4620,7 +4620,7 @@ fn u8_fixed_order_preserves_revision_order_and_independent_integer_oracle() {
     );
     assert_eq!(input.prompts.len(), 3);
     assert!(!input.prompts[2].contains("387900"));
-    assert!(!input.prompts[2].contains(U8_CLAUSE));
+    assert!(!input.prompts[2].contains(U8_CLAUSE_BODY));
     assert!(!input.prompts[2].contains("389400"));
     assert_eq!(
         serde_json::to_vec(&input).unwrap(),
@@ -4631,13 +4631,13 @@ fn u8_fixed_order_preserves_revision_order_and_independent_integer_oracle() {
 #[test]
 fn u8_answer_requires_both_latest_total_and_complete_original_clause() {
     let input = U8OrderInput::fixed();
-    let correct = json!({"total_cents":387900,"original_clause":U8_CLAUSE});
+    let correct = json!({"total_cents":387900,"original_clause":U8_CLAUSE_BODY});
     assert!(u8_answer(&input, &correct.to_string()));
     assert!(u8_answer(&input, &format!("```json\n{correct}\n```")));
     for changed in [
-        json!({"total_cents":389400,"original_clause":U8_CLAUSE}),
+        json!({"total_cents":389400,"original_clause":U8_CLAUSE_BODY}),
         json!({"total_cents":387900}),
-        json!({"total_cents":"387900","original_clause":U8_CLAUSE}),
+        json!({"total_cents":"387900","original_clause":U8_CLAUSE_BODY}),
         json!({"total_cents":387900,"original_clause":"取消行不计费"}),
         json!({"total_cents":387900,"original_clause":"foreign clause"}),
     ] {
@@ -4678,7 +4678,125 @@ fn u8_source_and_terminal_are_required_without_inventing_history_mechanism_hit()
     // Correct arithmetic alone deliberately has no history offload/range/wire claim.
     assert!(u8_answer(
         &input,
-        &json!({"total_cents":387900,"original_clause":U8_CLAUSE}).to_string()
+        &json!({"total_cents":387900,"original_clause":U8_CLAUSE_BODY}).to_string()
     ));
     assert!(case.get("history_offload").is_none());
+}
+
+
+#[test]
+fn u8_body_and_label_are_separate_without_relaxing_body_or_amount() {
+    let input = U8OrderInput::fixed();
+    let body = json!({"total_cents":387900,"original_clause":U8_CLAUSE_BODY}).to_string();
+    assert!(u8_answer(&input, &body));
+    assert!(!u8_label_matches(&input, &body));
+    let tagged=json!({"total_cents":387900,"original_clause":format!("{U8_SOURCE_LABEL}：{U8_CLAUSE_BODY}")}).to_string();
+    assert!(u8_answer(&input, &tagged));
+    assert!(u8_label_matches(&input, &tagged));
+    assert!(!u8_answer(
+        &input,
+        &json!({"total_cents":387900,"original_clause":format!("foreign：{U8_CLAUSE_BODY}")})
+            .to_string()
+    ));
+    assert!(!u8_answer(
+        &input,
+        &json!({"total_cents":389400,"original_clause":U8_CLAUSE_BODY}).to_string()
+    ));
+    assert!(!u8_answer(
+        &input,
+        &json!({"total_cents":387900,"source_label":U8_SOURCE_LABEL}).to_string()
+    ));
+    assert!(!u8_answer(
+        &input,
+        &json!({"total_cents":387900,"original_clause":"取消行不计费"}).to_string()
+    ));
+}
+
+#[test]
+fn u8_long_input_uses_original_history_compiler_with_fixed_bounded_scale() {
+    let input = U8OrderInput::long_history();
+    assert_eq!(input.rows.len(), 4096);
+    assert_eq!(input.total(false), 24_581_400);
+    assert_eq!(input.total(true), 24_579_900);
+    let offset = input.prompts[0].find(U8_CLAUSE_BODY).unwrap();
+    assert!(
+        offset > 48_000,
+        "old clause is outside a1200byte catalog preview"
+    );
+    assert!(!input.prompts[2].contains(U8_CLAUSE_BODY));
+    assert!(!input.prompts[2].contains("24579900"));
+    let mut session = runtime::Session::default();
+    let mut bases = Vec::new();
+    let compiler = runtime::PreparedRequestCompiler::new(3);
+    // Actual447 prompt-composition bytes were81979..84911, covered by a
+    // conservative100000-token allowance (more than one token per old byte),
+    // not a claim that these synthetic estimates are observed Provider usage.
+    let inventory = runtime::ProviderContextInventory {
+        tool_schema_tokens: 100_000,
+        ..Default::default()
+    };
+    for (index, prompt) in input.prompts.iter().enumerate() {
+        session
+            .push_message(runtime::ConversationMessage::user_text(
+                controlled_live_prompt(U8_HISTORY, prompt.clone(), None),
+            ))
+            .unwrap();
+        let prepared = compiler.prepare(
+            &runtime::PromptAssembly::new(vec![]),
+            &session.messages_view(),
+            inventory,
+            0,
+            "step-3.7-flash",
+        );
+        assert!(
+            prepared.fixed_input_tokens < 196_608,
+            "retain at least25percent of unchanged262144window as headroom"
+        );
+        bases.push(prepared.fixed_input_tokens);
+        if index < 2 {
+            session
+                .push_message(runtime::ConversationMessage::assistant(vec![
+                    runtime::ContentBlock::Text {
+                        text: "已接收本轮资料，等待用户下一轮输入。".into(),
+                    },
+                ]))
+                .unwrap();
+        }
+    }
+    let estimated = runtime::estimate_session_tokens(&session);
+    assert!(estimated > 30_000);
+    // Original production configuration preserves6messages. Three short
+    // assistant replies/user inputs do not ensure a compaction boundary.
+    let config = runtime::CompactionConfig {
+        preserve_recent_messages: 6,
+        max_estimated_tokens: 235_929,
+        ..Default::default()
+    };
+    assert!(!runtime::should_compact(&session, config));
+    let report = json!({"rows":input.rows.len(),"prompt_bytes":input.prompts.iter().map(|s|s.len()).collect::<Vec<_>>(),"clause_body_offset":offset,"unchanged_model_context_window":262144,"original_history_compiler_fixed_input_tokens_with_conservative100000token_overhead":bases,"original_session_estimate_tokens":estimated,"production_preserve_recent_messages":6,"automatic_compaction_predicted":false,"planned_legal_original_read":"context_retrieve/session_history/current limit1, follow actualread_request only if needed; no retryof447denied computation tools","mechanism_hit_not_guaranteed":true});
+    println!("U8_OFFLINE_PLAN {report}");
+    if let Ok(path) = std::env::var("COWD_U8_OFFLINE_PLAN") {
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "owner supplies frozen447originalcase; offline reinterpretation preserves oldreport"]
+fn u8_original447_case_is_body_correct_under_separate_label_observation() {
+    let path = std::env::var("COWD_U8_447_CASE").unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let expected = std::env::var("COWD_U8_447_CASE_SHA256").unwrap();
+    assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected);
+    let case: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(case["status"], "failed", "oldfrozenreportnotrewritten");
+    let phases = case["u8_history"]["phase_results"].as_array().unwrap();
+    assert_eq!(phases.len(), 3);
+    for p in phases {
+        assert!(u8_turn_passed(p, p["session_id"].as_str().unwrap()));
+        assert_eq!(p["u8_original_user_sources_present"], true);
+    }
+    let input = U8OrderInput::fixed();
+    let answer = case["u8_terminal_answer"].as_str().unwrap();
+    assert!(u8_answer(&input, answer));
+    assert!(!u8_label_matches(&input, answer));
 }
