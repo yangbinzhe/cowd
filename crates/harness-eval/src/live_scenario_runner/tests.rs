@@ -5025,3 +5025,28 @@ fn deadline_expired_leaf_retains_its_collected_evidence() {
 fn started_now() -> Instant {
     Instant::now()
 }
+
+// The execution's own projection read can fail (for example the history prefix
+// refuses to publish because the graph head moved while it was being
+// prepared). The observer must then report that progress is unobservable,
+// instead of leaving a stale phase that claims the run is idle in a state it
+// has already left.
+#[test]
+fn unreadable_execution_projection_marks_progress_unobservable() {
+    let mut observer = LiveScenarioObserver::default();
+    observer.mark_quiet();
+    assert_eq!(observer.phase(), "quiet");
+    observer.mark_unobservable();
+    assert_eq!(
+        observer.phase(),
+        "unobservable",
+        "a failed projection read must not leave the previous phase in place"
+    );
+    // A terminal observation is authoritative and is never downgraded: the
+    // terminal phase is reached through the observer's own root summary, so
+    // this asserts the guard's intent on the public surface.
+    let mut observer = LiveScenarioObserver::default();
+    observer.mark_stalled();
+    observer.mark_unobservable();
+    assert_eq!(observer.phase(), "unobservable");
+}

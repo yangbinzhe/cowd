@@ -4430,6 +4430,10 @@ impl LiveScenarioRunner {
                     }
                     Err(error) => {
                         observer.observe_root(&root_path, &Err(error), None, None, elapsed_ms);
+                        // The execution's own projection could not be read. Its
+                        // phase is not known from here any more, so it must not
+                        // keep reporting the last value it happened to see.
+                        observer.mark_unobservable();
                     }
                 }
             }

@@ -16,6 +16,12 @@ pub(crate) enum ObservationPhase {
     Terminal,
     Quiet,
     Stalled,
+    /// The execution's own projection could not be read (for example the
+    /// history prefix refused to publish because the graph head moved while it
+    /// was being prepared). Progress may still be happening; it is simply not
+    /// observable from here. Reporting a stale phase instead would claim the
+    /// run was idle in a state it had already left.
+    Unobservable,
 }
 
 impl ObservationPhase {
@@ -31,6 +37,7 @@ impl ObservationPhase {
             Self::Terminal => "terminal",
             Self::Quiet => "quiet",
             Self::Stalled => "stalled",
+            Self::Unobservable => "unobservable",
         }
     }
 }
@@ -638,6 +645,14 @@ impl LiveScenarioObserver {
     pub(crate) fn mark_stalled(&mut self) {
         self.phase = ObservationPhase::Stalled;
         self.stall_detected = true;
+    }
+
+    /// Record that the execution's own projection could not be read. The phase
+    /// becomes `unobservable` rather than staying at whatever was last seen.
+    pub(crate) fn mark_unobservable(&mut self) {
+        if !matches!(self.phase, ObservationPhase::Terminal) {
+            self.phase = ObservationPhase::Unobservable;
+        }
     }
 
     pub(crate) fn phase(&self) -> &'static str {

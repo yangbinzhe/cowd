@@ -2090,15 +2090,44 @@ pub(super) fn load_scope_budgeted(
             states.insert(execution.clone(), HistoryState { incomplete: true, ..Default::default() });
             continue;
         }
-        let graph = services.graph_state_store().projection(execution)?;
-        states.insert(
-            execution.clone(),
-            load_budgeted(services, scope, &graph, through, historical, budget)?,
-        );
+        // The prefix stage refuses to publish a prefix prepared from a graph
+        // revision that has since moved. That refusal is correct, but it is a
+        // race, not a verdict: a reader that gives up here reports a projection
+        // that does not exist (the Gateway maps it to 404) for an execution
+        // that is merely being written to right now. Re-read the graph and
+        // prepare the prefix for the CURRENT head instead.
+        //
+        // The bound is what keeps this honest: if the head keeps moving past
+        // the bound, the projection still fails with the original error.
+        let mut attempts = 0_u8;
+        let state = loop {
+            let graph = services.graph_state_store().projection(execution)?;
+            match load_budgeted(services, scope, &graph, through, historical, budget) {
+                Ok(state) => break state,
+                Err(error) if is_stale_graph_source(&error) && attempts < GRAPH_SOURCE_REREAD_LIMIT => {
+                    attempts = attempts.saturating_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        states.insert(execution.clone(), state);
         budget.scope_progress = true;
     }
     budget.require_captured_source(services)?;
     Ok(states)
+}
+
+/// How many times a projection may re-read its graph when the head moved while
+/// the prefix was being prepared.
+const GRAPH_SOURCE_REREAD_LIMIT: u8 = 3;
+
+/// The prefix stage's refusal to publish a prefix prepared from a graph
+/// revision that has since moved. It is matched by message, not by status,
+/// because the store surfaces it as a plain invariant string. Every other
+/// error - including every other invariant - propagates unchanged.
+fn is_stale_graph_source(error: &RuntimeServicesError) -> bool {
+    matches!(error, RuntimeServicesError::Invariant(message)
+        if message.contains("history prefix: graph source changed"))
 }
 
 #[cfg(test)]
@@ -2753,6 +2782,73 @@ mod checkpoint_pool_551_tests {
                 },
             )
             .is_err());
+        services.shutdown_execution().await;
+    }
+}
+
+#[cfg(test)]
+mod graph_source_reread_tests {
+    use super::*;
+
+    /// The prefix stage's refusal to publish a prefix prepared from a graph
+    /// revision that has since moved is a RACE, not a verdict. A projection
+    /// read re-reads the graph and prepares the prefix for the CURRENT head,
+    /// bounded, instead of reporting a projection that does not exist.
+    ///
+    /// The re-read bound and the refusal predicate are the two properties that
+    /// keep this honest, so they are asserted directly: a different invariant
+    /// must still propagate (nothing is swallowed), the stale one is the only
+    /// one retried, and the bound is finite.
+    #[test]
+    fn r1_585_only_a_moved_graph_head_is_reread_and_everything_else_propagates() {
+        let stale = RuntimeServicesError::Invariant("history prefix: graph source changed".into());
+        assert!(
+            is_stale_graph_source(&stale),
+            "the moved-head refusal is the retried one: {stale}"
+        );
+        for message in [
+            "history prefix: graph ahead of requested cut",
+            "history prefix: cannot persist a prefix without original planned Graph",
+            "history prefix made no progress",
+            "history prefix commit publication budget: required_records=3",
+            "some unrelated invariant",
+        ] {
+            let error = RuntimeServicesError::Invariant(message.into());
+            assert!(
+                !is_stale_graph_source(&error),
+                "this invariant must propagate unchanged: {error}"
+            );
+        }
+        assert!(
+            GRAPH_SOURCE_REREAD_LIMIT > 0 && GRAPH_SOURCE_REREAD_LIMIT < 16,
+            "the re-read must be bounded: {GRAPH_SOURCE_REREAD_LIMIT}"
+        );
+    }
+
+    /// A projection read still succeeds for an execution whose graph is
+    /// registered and quiet, i.e. the re-read loop does not change the normal
+    /// path.
+    #[tokio::test]
+    async fn r1_585_quiet_graph_projection_is_unchanged_by_the_reread_loop() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut graph = harness_contract::execution_graph::ExecutionGraph::new("quiet graph ".repeat(40));
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let graph = services.commit_service().register_graph(graph).expect("register").graph;
+        let through = services.event_store().durable_commit_cursor().expect("cursor");
+        let projection = harness_contract::execution_graph::project_execution_graph(&graph);
+        let mut budget = RequestBudget::default();
+        let scope = ExecutionProjectionScope::load_budgeted(
+            &services,
+            &graph.id,
+            &projection,
+            true,
+            through,
+            &mut budget,
+        )
+        .expect("scope");
+        let states = load_scope_budgeted(&services, &scope, through, false, &mut budget)
+            .expect("a quiet graph projects normally");
+        assert!(!states[&graph.id].incomplete, "the projection is complete");
         services.shutdown_execution().await;
     }
 }
