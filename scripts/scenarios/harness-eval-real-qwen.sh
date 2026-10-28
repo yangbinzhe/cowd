@@ -1075,6 +1075,13 @@ gateway_env=(
 if [[ -n "${COWD_COLLABORATION_BUDGET_SECS:-}" ]]; then
   gateway_env+=("COWD_COLLABORATION_BUDGET_SECS=$COWD_COLLABORATION_BUDGET_SECS")
 fi
+# The Gateway is launched with an explicit environment array, so a diagnostic
+# switch exported by the caller never reaches it unless it is forwarded here.
+# Without this, a reproduction that asked for verbose diagnostics silently ran
+# with the aggregated log and named nothing.
+if [[ -n "${COWD_LOG_VERBOSE:-}" ]]; then
+  gateway_env+=("COWD_LOG_VERBOSE=$COWD_LOG_VERBOSE")
+fi
 if [[ -n "$STAGED_CREDENTIAL_ENV" ]]; then
   gateway_env+=("$STAGED_CREDENTIAL_ENV=$PROVIDER_CREDENTIAL")
 fi
