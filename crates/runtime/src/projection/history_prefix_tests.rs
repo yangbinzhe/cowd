@@ -1000,6 +1000,124 @@ async fn own843_original_large_bodies_finish_across_bounded_requests_with_unrela
 }
 
 #[tokio::test]
+async fn r662_prefix_short_page_keeps_real_progress_and_never_fakes_terminal() {
+    let services = RuntimeServices::in_memory().unwrap();
+    let mut graph = ExecutionGraph::new("r662 bounded prefix");
+    crate::test_support::attach_execution_graph_lineage(&mut graph);
+    graph = services.commit_service().register_graph(graph).unwrap().graph;
+    let mut baseline_complete = false;
+    for _ in 0..8 {
+        let (mut budget, _, _, _) = read(&services, &graph);
+        let done = !budget.is_incomplete();
+        budget.publish(&services).unwrap();
+        if done { baseline_complete = true; break; }
+    }
+    assert!(baseline_complete);
+    let make = |kind: &str, payload: serde_json::Value| crate::RuntimeEventInput {
+        stream_id: "session:r662-prefix".into(),
+        scope: RuntimeEventScope::Tool,
+        kind: kind.into(),
+        status: Some("recorded".into()),
+        actor: Some("conversation_runtime".into()),
+        refs: vec![crate::RuntimeEventRef { kind: "execution_graph".into(), id: graph.id.clone() }],
+        payload,
+    };
+    let small = services.event_store().append(make("r662.small", serde_json::json!({"x":1}))).unwrap();
+    let target = services.event_store().append(make("tool.execution_plan.created", serde_json::json!({"bounded_test_material":"x".repeat(46_000)}))).unwrap();
+    let target_bytes = serde_json::to_vec(&target).unwrap().len();
+    assert!(target_bytes > 16 * 1024 && target_bytes < HISTORY_REQUEST_BYTES);
+    let through = target.commit_cursor;
+    let projected = services.graph_state_store().projection(&graph.id).unwrap();
+    for message in ["HistoryBudgetExceeded: unrelated backend invariant", "ordinary backend error"] {
+        let mut injected = RequestBudget::default();
+        injected.enable_incremental();
+        injected.capture_source_fence(&services).unwrap();
+        let scope = ExecutionProjectionScope::load_budgeted(&services, &graph.id, &projected, true, through, &mut injected).unwrap();
+        injected.r671_page_error_after = Some(((small.commit_cursor, small.transaction_index), message.to_owned()));
+        let actual = load(&services, &scope, &projected, through, &mut injected).unwrap_err();
+        assert!(actual.to_string().contains(message), "must propagate original backend error: {actual}");
+        assert!(!injected.is_incomplete());
+        assert!(injected.checkpoints.is_empty());
+    }
+    let mut budget = RequestBudget::default();
+    budget.enable_incremental();
+    budget.capture_source_fence(&services).unwrap();
+    let scope = ExecutionProjectionScope::load_budgeted(&services, &graph.id, &projected, true, through, &mut budget).unwrap();
+    budget.r662_page_cap_after = Some(((small.commit_cursor, small.transaction_index), target_bytes - 1));
+    let state = load(&services, &scope, &projected, through, &mut budget)
+        .expect("a budget-short next row after real progress must yield an incomplete prefix");
+    assert!(budget.is_incomplete() && state.incomplete);
+    assert_eq!(state.position, Some((small.commit_cursor, small.transaction_index)));
+    assert!(state.through < through);
+    let original_prefix = state.prefix.as_ref().unwrap();
+    assert_eq!(original_prefix.records.iter().filter(|record| record.position == (small.commit_cursor, small.transaction_index)).count(), 1);
+    assert!(original_prefix.records.iter().all(|record| record.position != (target.commit_cursor, target.transaction_index)));
+    let states = BTreeMap::from([(graph.id.clone(), state)]);
+    let axes = reducer_support::execution_terminal_axes(&services, &projected, &scope, &states, through, &mut budget).unwrap();
+    assert!(!axes.execution.coverage_complete);
+    assert_eq!(axes.execution.phase, harness_contract::projection::TerminalExecutionPhase::Unknown);
+    assert_eq!(axes.execution.settlement, harness_contract::projection::TerminalEffectSettlement::Unknown);
+    budget.publish(&services).unwrap();
+    let mut resumed = false;
+    for _ in 0..8 {
+        let (mut next, states, _, next_through) = read(&services, &graph);
+        let state = &states[&graph.id];
+        assert!(state.position >= Some((small.commit_cursor, small.transaction_index)));
+        if !next.is_incomplete() {
+            assert_eq!(next_through, through);
+            assert!(state.position >= Some((target.commit_cursor, target.transaction_index)));
+            resumed = true;
+        }
+        next.publish(&services).unwrap();
+        if resumed { break; }
+    }
+    assert!(resumed, "fresh budget must consume the same target without skipping");
+    let mut foreign_budget = RequestBudget::default();
+    foreign_budget.enable_incremental();
+    foreign_budget.capture_source_fence(&services).unwrap();
+    let mut foreign = ExecutionProjectionScope::load_budgeted(&services, &graph.id, &projected, true, through, &mut foreign_budget).unwrap();
+    foreign.turn_id = Some("r662-foreign-turn".into());
+    assert!(load(&services, &foreign, &projected, through, &mut foreign_budget).is_err());
+    assert!(foreign_budget.checkpoints.is_empty());
+    let next_row = services.event_store().append(make("r662.no_progress", serde_json::json!({"bounded_test_material":"x".repeat(46_000)}))).unwrap();
+    let next_bytes = serde_json::to_vec(&next_row).unwrap().len();
+    let mut no_progress = RequestBudget::default();
+    no_progress.enable_incremental();
+    no_progress.capture_source_fence(&services).unwrap();
+    let projected = services.graph_state_store().projection(&graph.id).unwrap();
+    let scope = ExecutionProjectionScope::load_budgeted(&services, &graph.id, &projected, true, next_row.commit_cursor, &mut no_progress).unwrap();
+    no_progress.r662_page_cap_after = Some(((target.commit_cursor, target.transaction_index), next_bytes - 1));
+    let error = load(&services, &scope, &projected, next_row.commit_cursor, &mut no_progress).unwrap_err();
+    assert!(error.to_string().contains("HistoryBudgetExceeded"));
+    assert!(!no_progress.is_incomplete(), "no-progress first row must not become an endless yield");
+    let (mut caught_up, states, _, _) = read(&services, &graph);
+    assert!(!caught_up.is_incomplete());
+    assert!(states[&graph.id].position >= Some((next_row.commit_cursor, next_row.transaction_index)));
+    caught_up.publish(&services).unwrap();
+    let before_absolute = services.event_store().append(make("r671.before_absolute", serde_json::json!({"x":2}))).unwrap();
+    let oversized = services.event_store().append(make("r662.absolute", serde_json::json!({"bounded_test_material":"x".repeat(HISTORY_REQUEST_BYTES + 1)}))).unwrap();
+    let mut first_absolute = RequestBudget::default();
+    first_absolute.enable_incremental();
+    first_absolute.capture_source_fence(&services).unwrap();
+    let projected = services.graph_state_store().projection(&graph.id).unwrap();
+    let scope = ExecutionProjectionScope::load_budgeted(&services, &graph.id, &projected, true, oversized.commit_cursor, &mut first_absolute).unwrap();
+    let state = load(&services, &scope, &projected, oversized.commit_cursor, &mut first_absolute).unwrap();
+    assert!(first_absolute.is_incomplete());
+    assert_eq!(state.position, Some((before_absolute.commit_cursor, before_absolute.transaction_index)));
+    first_absolute.publish(&services).unwrap();
+    let mut absolute = RequestBudget::default();
+    absolute.enable_incremental();
+    absolute.capture_source_fence(&services).unwrap();
+    let projected = services.graph_state_store().projection(&graph.id).unwrap();
+    let scope = ExecutionProjectionScope::load_budgeted(&services, &graph.id, &projected, true, oversized.commit_cursor, &mut absolute).unwrap();
+    let error = load(&services, &scope, &projected, oversized.commit_cursor, &mut absolute).unwrap_err();
+    assert!(error.to_string().contains("HistoryBudgetExceeded"));
+    assert!(!absolute.is_incomplete(), "absolute oversized first row must not loop as incomplete");
+    services.shutdown_execution().await;
+    services.shutdown_maintenance().await;
+}
+
+#[tokio::test]
 async fn own843_prefix_is_not_a_strict_fact_delta_or_activity_detail() {
     let (services, graph) = fixture();
     let (mut budget, _, scope, through) = read(&services, &graph);

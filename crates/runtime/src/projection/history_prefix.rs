@@ -519,10 +519,20 @@ pub(super) fn load(
                 safe_stop = true;
                 break;
             }
+            #[cfg(test)]
+            if let Some((position, page_bytes)) = budget.r662_page_cap_after {
+                if state.position == Some(position) {
+                    let remaining = reserve.checked_add(page_bytes).expect("test budget overflow");
+                    assert!(remaining <= budget.bytes, "test may only consume budget");
+                    budget.bytes = remaining;
+                    budget.r662_page_cap_after = None;
+                    eprintln!("r662 caller=history_prefix.position_page remaining={} reserve={} max_bytes={}", budget.bytes, reserve, page_bytes);
+                }
+            }
             budget.charge(1, 0)?;
             let page = services
                 .event_store()
-                .position_page(
+                .position_page_classified(
                     RuntimeEventScope::ExecutionGraph,
                     &graph.graph_id,
                     None,
@@ -530,8 +540,28 @@ pub(super) fn load(
                     prefix.target_cursor,
                     1,
                     budget.bytes.saturating_sub(reserve),
-                )
-                .map_err(error)?;
+                );
+            #[cfg(test)]
+            let page = if budget.r671_page_error_after.as_ref().is_some_and(|(position, _)| state.position == Some(*position)) {
+                Err(crate::PositionPageError::Other(budget.r671_page_error_after.take().unwrap().1))
+            } else { page };
+            let page = match page {
+                Ok(page) => page,
+                // A bounded page can reject its first row after this request
+                // has already advanced the original prefix.  Publish only that
+                // verified progress; a fresh request must still read the row.
+                // With no advancement, keep the original error so an oversized
+                // row cannot turn into an endless sequence of empty yields.
+                Err(crate::PositionPageError::FirstRowExceedsBudget(_))
+                    if changed && state.position > initial_position => {
+                    #[cfg(test)]
+                    { budget.prefix_stop = Some(serde_json::json!({"phase":"canonical_page_budget",
+                        "position":state.position,"available":budget.bytes,"reserve":reserve})); }
+                    safe_stop = true;
+                    break;
+                }
+                Err(message) => return Err(error(message.to_string())),
+            };
             if page.len() > 1 {
                 return Err(invalid("unbounded position page"));
             }

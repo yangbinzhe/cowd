@@ -51,6 +51,10 @@ pub(super) struct RequestBudget {
     checkpoint_records: usize,
     #[cfg(test)]
     prefix_stop: Option<serde_json::Value>,
+    #[cfg(test)]
+    r662_page_cap_after: Option<((u64, u32), usize)>,
+    #[cfg(test)]
+    r671_page_error_after: Option<((u64, u32), String)>,
     prefix_fences: BTreeMap<String, u64>,
     terminal_work: Option<TerminalWork>,
     terminal_deferred: bool,
@@ -82,6 +86,10 @@ impl Default for RequestBudget {
             checkpoint_records: prefix::COMMIT_RECORDS,
             #[cfg(test)]
             prefix_stop: None,
+            #[cfg(test)]
+            r662_page_cap_after: None,
+            #[cfg(test)]
+            r671_page_error_after: None,
             prefix_fences: BTreeMap::new(),
             terminal_work: None,
             terminal_deferred: false,

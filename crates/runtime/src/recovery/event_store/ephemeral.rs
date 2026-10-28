@@ -1166,6 +1166,20 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
         max_bytes: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         i64::try_from(through_cursor).map_err(|_| "through_cursor overflow".to_string())?;
+        self.position_page_classified(scope, identity, kind, after, through_cursor, max_events, max_bytes)
+            .map_err(|error| error.to_string())
+    }
+    fn position_page_classified(
+        &self,
+        scope: RuntimeEventScope,
+        identity: &str,
+        kind: Option<&str>,
+        after: Option<(u64, u32)>,
+        through_cursor: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, PositionPageError> {
+        i64::try_from(through_cursor).map_err(|_| "through_cursor overflow".to_string())?;
         let after = after.unwrap_or((0, 0));
         i64::try_from(after.0).map_err(|_| "after_cursor overflow".to_string())?;
         if max_events == 0 || max_bytes == 0 || after.0 > through_cursor {
@@ -1175,7 +1189,7 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
             RuntimeEventScope::Session => "session",
             RuntimeEventScope::ExecutionGraph => "root",
             RuntimeEventScope::ExecutionNode => "activity",
-            _ => return Err("unsupported position query scope".into()),
+            _ => return Err(PositionPageError::Other("unsupported position query scope".into())),
         };
         let state = self
             .state
@@ -1198,10 +1212,9 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
             let bytes = state.encoded_bytes[*position];
             if bytes > budget.saturating_sub(total) {
                 if selected.is_empty() {
-                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(
+                    return Err(PositionPageError::FirstRowExceedsBudget(
                         state.events[*position].event_id.clone(),
-                    )
-                    .to_string());
+                    ));
                 }
                 break;
             }

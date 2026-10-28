@@ -695,7 +695,7 @@ pub use runtime_event_store::{
     CheckedSourceEvidence, CheckedSourceValidator, CommittedEventBatch, CommittedStreamRevision,
     DurableRuntimeEvent, ExpectedStreamRevision, PreparedContentRoot, PreparedReconciliationReport,
     QuiescedContentRoots, RuntimeBoundedEventLookup, RuntimeEventInput, RuntimeEventRecord,
-    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
+    PositionPageError, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
     RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeProjectionCheckpoint,
     RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionScanPage,
     RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,

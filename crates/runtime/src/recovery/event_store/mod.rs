@@ -487,6 +487,13 @@ impl RuntimeEventStore {
         self.backend.fixture_evidence_page(request)
     }
 
+    pub fn position_page_classified(
+        &self, scope: RuntimeEventScope, identity: &str, kind: Option<&str>,
+        after: Option<(u64, u32)>, through_cursor: u64, max_events: usize, max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, PositionPageError> {
+        self.backend.position_page_classified(scope, identity, kind, after, through_cursor, max_events, max_bytes)
+    }
+
     pub fn position_page(
         &self,
         scope: RuntimeEventScope,

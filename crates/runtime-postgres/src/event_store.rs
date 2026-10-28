@@ -705,6 +705,19 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         max_events: usize,
         max_bytes: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.position_page_classified(scope, identity, kind, after, through_cursor, max_events, max_bytes)
+            .map_err(|error| error.to_string())
+    }
+    fn position_page_classified(
+        &self,
+        scope: RuntimeEventScope,
+        identity: &str,
+        kind: Option<&str>,
+        after: Option<(u64, u32)>,
+        through_cursor: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, PositionPageError> {
         let through =
             to_i64(through_cursor, "through_cursor").map_err(|error| error.to_string())?;
         let (cursor, index) = after.unwrap_or((0, 0));
@@ -716,7 +729,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             RuntimeEventScope::Session => "(session_id=$1 OR stream_id=$1 OR stream_id='session:'||$1 OR refs @> jsonb_build_array(jsonb_build_object('kind','session','id',$1::text)))",
             RuntimeEventScope::ExecutionGraph => "(root_execution_id=$1 OR stream_id=$1 OR refs @> jsonb_build_array(jsonb_build_object('kind','execution_graph','id',$1::text)) OR refs @> jsonb_build_array(jsonb_build_object('kind','execution','id',$1::text)))",
             RuntimeEventScope::ExecutionNode => "activity_id=$1",
-            _ => return Err("unsupported position query scope".into()),
+            _ => return Err(PositionPageError::Other("unsupported position query scope".into())),
         };
         let kind = kind.unwrap_or("");
         let limit =
@@ -737,7 +750,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 .ok_or("invalid event size metadata")?;
             if bytes > budget.saturating_sub(total) {
                 if selected.is_empty() {
-                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded(identity).to_string());
+                    return Err(PositionPageError::FirstRowExceedsBudget(identity));
                 }
                 break;
             }
@@ -759,7 +772,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 .ok_or_else(|| "event page byte overflow".to_string())
         })?;
         if events.len() != selected.len() || actual != total {
-            return Err("event position metadata changed during hydration".into());
+            return Err(PositionPageError::Other("event position metadata changed during hydration".into()));
         }
         Ok(events)
     }

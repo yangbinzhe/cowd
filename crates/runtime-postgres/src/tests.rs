@@ -1491,6 +1491,24 @@ fn r1_bounded_history_mission_metadata_precedes_payload_and_limits_driver_bytes(
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn r671_position_page_classifies_only_real_first_row_budget() {
+    let fixture = PostgresTestScope::new();
+    let backend = Arc::new(PostgresRuntimeEventStore::new(fixture.reconnect()).unwrap());
+    let store = RuntimeEventStore::from_backend(backend);
+    let mut event = input("r671-classified-page", RuntimeEventScope::Session, "r671.event");
+    event.payload = serde_json::json!({"value":"x".repeat(4096)});
+    let record = store.append(event).unwrap();
+    let bytes = serde_json::to_vec(&record).unwrap().len();
+    let through = store.durable_commit_cursor().unwrap();
+    let page = |scope, limit| store.position_page_classified(scope, "r671-classified-page", None, None, through, 1, limit);
+    assert!(matches!(page(RuntimeEventScope::Session, bytes - 1), Err(PositionPageError::FirstRowExceedsBudget(id)) if id == record.event_id));
+    assert_eq!(page(RuntimeEventScope::Session, bytes).unwrap()[0].event_id, record.event_id);
+    assert!(matches!(page(RuntimeEventScope::Goal, bytes), Err(PositionPageError::Other(_))));
+    assert_eq!(store.position_page(RuntimeEventScope::Session, "r671-classified-page", None, None, through, 1, bytes - 1).unwrap_err(), format!("HistoryBudgetExceeded: {}", record.event_id));
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn r1_bounded_history_backend_enforces_bytes_before_hydration() {
     let fixture = PostgresTestScope::new();
     let backend = Arc::new(PostgresRuntimeEventStore::new(fixture.reconnect()).unwrap());
@@ -1578,6 +1596,58 @@ fn r1_bounded_history_backend_enforces_bytes_before_hydration() {
         .list_stream_before("metadata-budget", u64::MAX, 0, 0)
         .is_err());
     assert_eq!(backend.take_sequence_read_counts(), (0, 0));
+
+    // The original Session page contract measures stored metadata, not just
+    // payload length.  Exercise a real tool-plan-sized row at its exact
+    // encoded boundary and keep the source cursor fixed across short pages.
+    let stream = "r662-tool-plan-budget";
+    let small = store.append(input(stream, RuntimeEventScope::Session, "budget.small")).unwrap();
+    let mut plan = input(stream, RuntimeEventScope::Tool, "tool.execution_plan.created");
+    plan.actor = Some("conversation_runtime".into());
+    plan.refs.push(runtime::RuntimeEventRef { kind: "session".into(), id: stream.into() });
+    plan.payload = serde_json::json!({"bounded_test_material":"x".repeat(46_000)});
+    let target = store.append(plan).unwrap();
+    let through = target.commit_cursor;
+    let head = target.sequence;
+    let connection = fixture.reconnect();
+    let mut connection = connection.checkout_critical().unwrap();
+    let mut encoded = |id: &str| -> usize {
+        let bytes: i64 = connection.query_one("SELECT encoded_bytes FROM runtime_events WHERE event_id=$1", &[&id]).unwrap().get(0);
+        usize::try_from(bytes).unwrap()
+    };
+    let small_bytes = encoded(&small.event_id);
+    let target_bytes = encoded(&target.event_id);
+    drop(connection);
+    assert!(target_bytes > small_bytes && target_bytes < 1024 * 1024);
+    backend.take_sequence_read_counts();
+    let error = store.list_stream_after(stream, small.sequence, head, 100, target_bytes - 1).unwrap_err();
+    assert!(error.contains(&target.event_id));
+    assert_eq!(backend.take_sequence_read_counts().1, 0, "oversized first row must not hydrate");
+    let position = Some((small.commit_cursor, small.transaction_index));
+    let error = store.position_page(RuntimeEventScope::Session, stream, None, position, through, 100, target_bytes - 1).unwrap_err();
+    assert!(error.contains(&target.event_id));
+    let exact = store.list_stream_after(stream, small.sequence, head, 100, target_bytes).unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].event_id, target.event_id);
+    let exact_position = store.position_page(RuntimeEventScope::Session, stream, None, position, through, 100, target_bytes).unwrap();
+    assert_eq!(exact_position.len(), 1);
+    assert_eq!(exact_position[0].event_id, target.event_id);
+    let short = store.list_stream_after(stream, 0, head, 100, small_bytes).unwrap();
+    assert_eq!(short.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![small.event_id.as_str()]);
+    let resumed = store.list_stream_after(stream, short[0].sequence, head, 100, target_bytes).unwrap();
+    assert_eq!(resumed.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
+    let short_position = store.position_page(RuntimeEventScope::Session, stream, None, None, through, 100, small_bytes).unwrap();
+    assert_eq!(short_position.len(), 1);
+    assert_eq!(short_position[0].event_id, small.event_id);
+    let resumed_position = store.position_page(RuntimeEventScope::Session, stream, None, Some((short_position[0].commit_cursor, short_position[0].transaction_index)), through, 100, target_bytes).unwrap();
+    assert_eq!(resumed_position.len(), 1);
+    assert_eq!(resumed_position[0].event_id, target.event_id);
+    assert!(store.position_page(RuntimeEventScope::Session, "foreign-session", None, None, through, 100, target_bytes).unwrap().is_empty());
+    let mut oversized = input("r662-absolute-budget", RuntimeEventScope::Session, "budget.absolute");
+    oversized.payload = serde_json::json!({"bounded_test_material":"x".repeat(1024 * 1024 + 1)});
+    let oversized = store.append(oversized).unwrap();
+    assert!(store.list_stream_after("r662-absolute-budget", 0, oversized.sequence, 1, 2 * 1024 * 1024).unwrap_err().contains(&oversized.event_id));
+    println!("r662 page_metadata target_encoded={target_bytes} small_encoded={small_bytes} tight={} exact={target_bytes} fixed_cut={through}", target_bytes - 1);
 }
 
 #[test]
