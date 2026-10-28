@@ -4966,3 +4966,62 @@ fn u5_evidence_collection_uses_the_scenario_window_and_bounds_each_read() {
         "an expired window is not extended by the per-read bound"
     );
 }
+
+// A leaf that missed its own observation deadline keeps the evidence it had
+// already collected. An empty acceptance block reads as "no evidence
+// existed"; carrying the collected integrity report plus the deadline reason
+// distinguishes that from "evidence was not collected before the deadline".
+// The leaf stays failed and the deadline itself is unchanged.
+#[test]
+fn deadline_expired_leaf_retains_its_collected_evidence() {
+    let spec = LiveScenarioSpec {
+        id: "u5-read-b",
+        prompt: "read the exact granted path",
+        acceptance: LiveAcceptance::Contains("0.10.1"),
+        timeout: LiveScenarioTimeout::tool(),
+    };
+    let diagnostics = json!({
+        "timeline": {"events": []},
+        "observation_integrity": {
+            "status": "passed",
+            "cursor_monotonic": true,
+            "timeline_drained": true,
+            "message_pages_drained": false,
+            "omitted_changes": 0,
+            "stall_detected": false,
+        },
+    });
+    let leaf = failed_scenario_with_session_execution_and_program(
+        spec,
+        started_now(),
+        Vec::new(),
+        "session-b".to_string(),
+        Some("execution-b".to_string()),
+        "receipt_observation_deadline_elapsed".to_string(),
+        diagnostics,
+        None,
+    );
+    assert_eq!(leaf["status"], "failed", "the leaf still fails");
+    assert_eq!(
+        leaf["error"], "receipt_observation_deadline_elapsed",
+        "the reason is preserved"
+    );
+    assert_eq!(
+        leaf["collected_evidence"]["terminal_reason"],
+        "evidence_collection_deadline_elapsed"
+    );
+    assert_eq!(
+        leaf["collected_evidence"]["observation_integrity"]["status"],
+        "passed",
+        "the evidence collected before the deadline is not discarded"
+    );
+    assert_eq!(
+        leaf["collected_evidence"]["observation_integrity"]["message_pages_drained"],
+        false,
+        "the evidence is carried verbatim, not restated"
+    );
+}
+
+fn started_now() -> Instant {
+    Instant::now()
+}

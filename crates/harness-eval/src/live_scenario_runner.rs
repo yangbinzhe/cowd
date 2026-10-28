@@ -7961,6 +7961,20 @@ fn failed_scenario_with_session_execution_and_program(
                 "recovered_from_durable_store_on_failure": true,
             })
         });
+    // A leaf that missed its own observation deadline is still a failed leaf,
+    // but the facts it already collected must not be discarded with it: an
+    // empty acceptance block reads as "no evidence existed", which is a
+    // different (and more misleading) claim than "evidence was not collected
+    // before the deadline". The collected evidence is carried over with the
+    // deadline reason attached, and the leaf keeps its failed status.
+    let collected_evidence = json!({
+        "observation_integrity": diagnostics
+            .pointer("/observation_integrity")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "terminal_reason": "evidence_collection_deadline_elapsed",
+        "error": error,
+    });
     json!({
         "scenario_id": spec.id,
         "status": "failed",
@@ -7971,6 +7985,7 @@ fn failed_scenario_with_session_execution_and_program(
         "metrics": metrics,
         "failure_diagnostics": diagnostics,
         "trace": trace,
+        "collected_evidence": collected_evidence,
         "production_trace": production_trace.unwrap_or(Value::Null),
     })
 }
