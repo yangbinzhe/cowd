@@ -146,6 +146,7 @@ pub enum ApiError {
         last_error: Box<ApiError>,
     },
     InvalidSseFrame(&'static str),
+    UnsupportedResponsesEvent(String),
     CompatibilityToolProtocol(CompatibilityToolProtocolFailure),
     BackoffOverflow {
         attempt: u32,
@@ -381,6 +382,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::UnsupportedResponsesEvent(_)
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
@@ -415,6 +417,7 @@ impl ApiError {
             | Self::Api { .. }
             | Self::RequestBodyTooLarge { .. }
             | Self::InvalidSseFrame(_)
+            | Self::UnsupportedResponsesEvent(_)
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. } => ProviderFailureScope::Request,
         }
@@ -482,6 +485,7 @@ impl ApiError {
             | Self::Json { .. }
             | Self::RequestBodyTooLarge { .. }
             | Self::InvalidSseFrame(_)
+            | Self::UnsupportedResponsesEvent(_)
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
@@ -515,6 +519,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::UnsupportedResponsesEvent(_)
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
@@ -546,6 +551,7 @@ impl ApiError {
             | Self::Json { .. }
             | Self::RequestBodyTooLarge { .. }
             | Self::InvalidSseFrame(_)
+            | Self::UnsupportedResponsesEvent(_)
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
@@ -568,6 +574,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::UnsupportedResponsesEvent(_)
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
@@ -595,6 +602,7 @@ impl ApiError {
             Self::Api { .. } => "provider_error",
             Self::Http(_)
             | Self::InvalidSseFrame(_)
+            | Self::UnsupportedResponsesEvent(_)
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. } => "provider_transport",
             Self::RequestBodyTooLarge { .. } => "request_too_large",
@@ -624,6 +632,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::UnsupportedResponsesEvent(_)
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
@@ -736,6 +745,7 @@ impl Display for ApiError {
                 last_error,
             } => write!(f, "api failed after {attempts} attempts: {last_error}"),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
+            Self::UnsupportedResponsesEvent(event_type) => write!(f, "invalid sse frame: unsupported OpenAI Responses event type: {event_type}"),
             Self::CompatibilityToolProtocol(failure) => {
                 write!(f, "invalid sse frame: {}", failure.message())
             }

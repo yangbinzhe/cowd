@@ -3367,9 +3367,16 @@ fn responses_stream_frame_to_chunk(
             }
         }),
         _ => {
-            return Err(ApiError::InvalidSseFrame(
-                "unsupported OpenAI Responses event type",
-            ));
+            let event_type = frame.event_type.as_str();
+            let safe = if event_type.len() <= 96
+                && event_type.starts_with("response.")
+                && event_type.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_'))
+            {
+                event_type.to_owned()
+            } else {
+                "[invalid event type]".to_owned()
+            };
+            return Err(ApiError::UnsupportedResponsesEvent(safe));
         }
     };
     chunk.map(Some).ok_or(ApiError::InvalidSseFrame(
@@ -4219,8 +4226,20 @@ mod tests {
 
         assert!(matches!(
             error,
-            ApiError::InvalidSseFrame("unsupported OpenAI Responses event type")
+            ApiError::UnsupportedResponsesEvent(ref event_type) if event_type == "response.future_event"
         ));
+    }
+
+    #[test]
+    fn responses_unknown_event_diagnostic_does_not_echo_frame_content_or_invalid_type() {
+        let error = parse_responses_sse_frame(
+            "data: {\"type\":\"response.bad secret\",\"delta\":\"PRIVATE_BODY_CANARY\"}\n\n",
+            "OpenAI", "model",
+        ).expect_err("unknown event remains rejected");
+        let text = error.to_string();
+        assert!(text.contains("[invalid event type]"));
+        assert!(!text.contains("secret") && !text.contains("PRIVATE_BODY_CANARY"));
+        assert!(!error.is_retryable());
     }
 
     #[test]
