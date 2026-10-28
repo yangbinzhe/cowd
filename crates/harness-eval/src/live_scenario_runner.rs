@@ -3569,6 +3569,7 @@ impl LiveScenarioRunner {
         let input = U8OrderInput::long_history();
         let mut phases = Vec::new();
         let mut actor = None;
+        let u8_timeout = spec.timeout.u8_with_cap(self.timeout_cap);
         let operation = (|| -> Result<Value, String> {
             let path = std::path::PathBuf::from(
                 std::env::var("COWD_EVAL_U8_FIXTURE_FILE")
@@ -3583,14 +3584,14 @@ impl LiveScenarioRunner {
                 &self.base_url,
                 self.model.as_deref(),
                 "harness-eval-live",
-                Instant::now() + Duration::from_secs(600),
+                Instant::now() + u8_timeout.absolute_wait.unwrap_or(Duration::from_secs(600)),
             )?);
             let current = actor.as_mut().ok_or("U8 actor missing")?;
             let session = current.session_id().to_string();
             let mut submitted = Vec::new();
             for (index, prompt) in input.prompts.iter().enumerate() {
                 let turn_started = Instant::now();
-                current.set_observation_deadline(turn_started + Duration::from_secs(600));
+                current.set_observation_deadline(turn_started + u8_timeout.absolute_wait.unwrap_or(Duration::from_secs(600)));
                 let source = controlled_live_prompt(U8_HISTORY, prompt.clone(), telemetry);
                 let admission=current.post_mutation(&format!("/api/sessions/{session}/messages"),json!({"content":source,"idempotency_key":format!("u8-447-{index}-{}",uuid::Uuid::new_v4())}))?;
                 let execution = admission
@@ -3617,7 +3618,7 @@ impl LiveScenarioRunner {
                 let mut phase = self.observe_admitted_scenario(
                     spec,
                     turn_started,
-                    spec.timeout.with_cap(self.timeout_cap),
+                    u8_timeout,
                     admitted,
                     current,
                 );
@@ -5981,6 +5982,18 @@ impl LiveScenarioTimeout {
             inactivity_wait: self.inactivity_wait.min(cap),
             nominal_wait: self.nominal_wait.min(cap),
             absolute_wait: Some(self.absolute_wait.map_or(cap, |wait| wait.min(cap))),
+        }
+    }
+
+    fn u8_with_cap(self, cap: Option<Duration>) -> Self {
+        match cap {
+            Some(wait) if self.absolute_wait.is_some_and(|default| wait > default) => Self {
+                initial_wait: wait,
+                inactivity_wait: wait,
+                nominal_wait: wait,
+                absolute_wait: Some(wait),
+            },
+            _ => self.with_cap(cap),
         }
     }
 

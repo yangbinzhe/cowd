@@ -4800,3 +4800,21 @@ fn u8_original447_case_is_body_correct_under_separate_label_observation() {
     assert!(u8_answer(&input, answer));
     assert!(!u8_label_matches(&input, answer));
 }
+
+#[test]
+fn u8_timeout_default_and_explicit_longer_observation_are_consistent() {
+    let base = LiveScenarioTimeout::tool();
+    let default = base.u8_with_cap(None);
+    assert_eq!(default.initial_wait, Duration::from_secs(90));
+    assert_eq!(default.inactivity_wait, Duration::from_secs(75));
+    assert_eq!(default.nominal_wait, Duration::from_secs(300));
+    assert_eq!(default.absolute_wait, Some(Duration::from_secs(600)));
+    let extended = base.u8_with_cap(Some(Duration::from_secs(900)));
+    assert_eq!(extended.inactivity_wait, Duration::from_secs(900));
+    assert_eq!(extended.nominal_wait, Duration::from_secs(900));
+    assert_eq!(extended.absolute_wait, Some(Duration::from_secs(900)));
+    let now = Instant::now();
+    assert!(extended.observation_deadline(now, now, Duration::ZERO, 1) > now + Duration::from_secs(899));
+    let tightened = base.u8_with_cap(Some(Duration::from_secs(300)));
+    assert_eq!(tightened.absolute_wait, Some(Duration::from_secs(300)));
+}
