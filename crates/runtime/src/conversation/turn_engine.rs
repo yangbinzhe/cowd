@@ -249,7 +249,7 @@ where
             model: initial_model,
             fallbacks: Arc::new(std::sync::RwLock::new(feature_config.fallbacks().to_vec())),
             cancellation_token: CancellationToken::new(),
-            turn_cancellation: None,
+            turn_cancellation_control: None,
             last_context_envelope: std::sync::Mutex::new(None),
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
             runtime_control_policy,
@@ -799,13 +799,7 @@ where
     #[must_use]
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.hook_abort_signal = self.hook_abort_signal.with_cancellation(token.clone());
-        self.cancellation_token = token.clone();
-        // The turn-level cancellation is kept apart from the step-scoped token
-        // that `scoped_model_stop` links in while a provider step runs. A
-        // provider producer's own stop (it fires on every normal producer
-        // finish) is linked into the current token and must never read as a
-        // cancellation of the turn itself.
-        self.turn_cancellation = Some(token);
+        self.cancellation_token = token;
         self
     }
 
@@ -814,24 +808,27 @@ where
         self.cancellation_token.clone()
     }
 
-    /// True only when the turn itself was cancelled. A step-scoped provider
-    /// stop is linked into the current token during a model step, so callers
-    /// that decide whether the *turn* must end (the terminal presentation)
-    /// have to test the turn token rather than the current linked one.
+    /// True only when the turn itself was cancelled. Turn-level cancellation
+    /// state lives in the shared `TurnCancellationControl`; every instance
+    /// holding that Arc answers identically, so this never depends on which
+    /// runtime instance the caller runs in. A step-scoped provider stop is not
+    /// a turn cancellation and must never reach this predicate.
     pub(crate) fn turn_cancelled(&self) -> bool {
-        match self.turn_cancellation.as_ref() {
-            Some(token) => token.is_cancelled(),
+        match self.turn_cancellation_control.as_ref() {
+            Some(control) => control.is_cancelled(),
+            // No shared home was injected (a direct owned turn): the installed
+            // per-instance token is then the only turn-level signal.
             None => self.cancellation_token.is_cancelled(),
         }
     }
 
-    /// The turn-level token itself, for callers that must inspect it after an
-    /// await without holding the runtime lock (the current token may be a
-    /// step-scoped link that a normal producer finish cancels).
+    /// The turn-level token for callers that must inspect it after an await
+    /// without holding the runtime lock.
     pub(crate) fn turn_cancellation_token(&self) -> CancellationToken {
-        self.turn_cancellation
-            .clone()
-            .unwrap_or_else(|| self.cancellation_token.clone())
+        match self.turn_cancellation_control.as_ref() {
+            Some(control) => control.token(),
+            None => self.cancellation_token.clone(),
+        }
     }
 
     pub(super) fn governed_workspace_root(&self) -> Result<PathBuf, RuntimeError> {

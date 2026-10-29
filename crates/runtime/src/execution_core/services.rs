@@ -283,6 +283,9 @@ pub struct TurnCancellationControl {
     ingress: Option<crate::TurnIngressRef>,
     token: crate::CancellationToken,
     first_cause: Mutex<TurnCancellationCause>,
+    /// Step-level wakeup on the shared home. A provider step stop wakes the
+    /// waiters here without touching the turn-level token or first cause.
+    step_wakeup: tokio::sync::Notify,
 }
 
 enum TurnCancellationCause {
@@ -636,6 +639,7 @@ impl TurnCancellationControl {
             ingress: None,
             token: crate::CancellationToken::new(),
             first_cause: Mutex::new(TurnCancellationCause::None),
+            step_wakeup: tokio::sync::Notify::new(),
         })
     }
 
@@ -685,6 +689,27 @@ impl TurnCancellationControl {
             *cause = TurnCancellationCause::Operational;
         }
         self.token.cancel();
+    }
+
+    /// Turn-level cancellation state lives here and only here: every instance
+    /// that holds this Arc answers the same question, so no caller may depend
+    /// on which runtime instance it happens to hold.
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// A provider step stopped. This wakes step-level waiters through the
+    /// shared home; it is NOT a turn cancellation and never sets first_cause.
+    pub fn notify_step_stop(&self) {
+        self.step_wakeup.notify_waiters();
+    }
+
+    /// Wait until either this turn is cancelled or a provider step stopped.
+    pub async fn cancelled_or_step_stop(&self) {
+        tokio::select! {
+            () = self.token.cancelled() => {}
+            () = self.step_wakeup.notified() => {}
+        }
     }
 }
 
@@ -3765,6 +3790,7 @@ impl RuntimeServices {
             ingress: Some(ingress.clone()),
             token: crate::CancellationToken::new(),
             first_cause: Mutex::new(TurnCancellationCause::None),
+            step_wakeup: tokio::sync::Notify::new(),
         }))
     }
 

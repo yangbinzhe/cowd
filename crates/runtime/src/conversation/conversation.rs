@@ -5084,12 +5084,19 @@ impl<C, T> ConversationRuntime<C, T> {
         &mut self,
         stop: CancellationToken,
     ) -> ScopedModelStop<'_, C, T> {
+        // Step waiters stop on either the turn-level cancellation or this
+        // step's stop, so the field stays a linked token. Turn-level
+        // predicates never read this field any more: they query the shared
+        // `TurnCancellationControl`, so a step stop firing here can no longer
+        // read as a turn cancellation.
         let previous = self.cancellation_token.clone();
         self.cancellation_token = CancellationToken::linked(previous.clone(), stop);
-        ScopedModelStop {
-            runtime: self,
-            previous,
+        // A step stop also wakes turn-level waiters through the shared home,
+        // without setting any turn-level cancellation state.
+        if let Some(control) = self.turn_cancellation_control.as_ref() {
+            control.notify_step_stop();
         }
+        ScopedModelStop { runtime: self, previous }
     }
 }
 
@@ -5098,6 +5105,10 @@ impl<C: ApiClient, T> ConversationRuntime<C, T> {
         &mut self,
         control: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
     ) -> Result<(), RuntimeError> {
+        // The shared home is kept on the runtime as well, so turn-level
+        // predicates in this instance answer from the same state as every
+        // other instance of this turn.
+        self.turn_cancellation_control = control.clone();
         self.api_client.configure_turn_cancellation(control)
     }
 }
@@ -5244,9 +5255,10 @@ pub struct ConversationRuntime<C, T> {
     fallbacks: Arc<std::sync::RwLock<Vec<String>>>,
     /// T35: Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
-    /// T35: The turn-level cancellation, kept apart from the step-scoped
-    /// token that `scoped_model_stop` links in during a provider step.
-    turn_cancellation: Option<CancellationToken>,
+    /// The shared home for turn-level cancellation state. Every instance that
+    /// holds this Arc answers the same question, so turn-level predicates
+    /// never depend on which runtime instance they run in.
+    turn_cancellation_control: Option<std::sync::Arc<crate::execution_core::services::TurnCancellationControl>>,
     /// Latest assembled context envelope used by a real turn.
     last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
     /// Active context profile used to assemble the next runtime envelope.
