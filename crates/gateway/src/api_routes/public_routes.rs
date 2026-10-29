@@ -206,10 +206,22 @@ async fn login_handler(
                 requested_capabilities,
             )
             .map_err(|error| {
+                // Liveness of the owned broker helper, not authority storage.
+                let (status, code) = if auth_broker::error_is_broker_unavailable(&error) {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authentication_broker_unavailable",
+                    )
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "authentication_authority_error",
+                    )
+                };
                 (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    status,
                     Json(ErrorResponse {
-                        error: format!("authentication_authority_error:{error}"),
+                        error: format!("{code}:{error}"),
                     }),
                 )
             })?;

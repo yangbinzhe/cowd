@@ -896,12 +896,22 @@ where
         else {
             return Ok(None);
         };
-        let advertised = self.api_client.step_tool_definitions().ok_or_else(|| {
+        let advertised = self.api_client.step_tool_definitions();
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=step_catalog lease_present=true advertised_present={}", advertised.is_some());
+        }
+        let advertised = advertised.ok_or_else(|| {
             RuntimeError::new("production provider does not expose its actual step tool contracts")
         })?;
         let discovery = self
             .tool_executor
             .tool_discovery_receipt_for_step(&lease, ceiling);
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            let all_names_match = advertised.iter().all(|definition| discovery.descriptors.iter().any(|descriptor| descriptor.canonical_id == definition.name));
+            eprintln!("r622_toolbatch phase=step_catalog_match advertised={} descriptors={} all_names_match={}", advertised.len(), discovery.descriptors.len(), all_names_match);
+        }
         if advertised.iter().any(|definition| {
             !discovery
                 .descriptors

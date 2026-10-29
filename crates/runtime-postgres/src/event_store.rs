@@ -260,6 +260,118 @@ impl PostgresRuntimeEventStore {
 }
 
 impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
+    /// Deadline-bounded reader for the fixture evidence oracle.  Without it a
+    /// PostgreSQL-backed run can never reach a business verdict: the oracle
+    /// reports "backend has no deadline-bounded fixture reader" and fails on
+    /// a harness gap instead of the product behaviour.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn fixture_evidence_page(
+        &self,
+        request: &FixtureEvidencePageRequest<'_>,
+    ) -> Result<FixtureEvidencePage, &'static str> {
+        use std::time::Instant;
+        if Instant::now() >= request.deadline {
+            return Err("Unavailable: deadline exhausted before read");
+        }
+        let after_sequence = to_i64(request.after_sequence, "after_sequence")
+            .map_err(|_| "Unavailable: sequence bound overflow")?;
+        // The oracle asks for an open-ended range; clamp instead of failing so
+        // an unbounded request still reads every event that exists.
+        let through_sequence = to_i64(
+            request.through_sequence.min(i64::MAX as u64),
+            "through_sequence",
+        )
+        .map_err(|_| "Unavailable: sequence bound overflow")?;
+        let limit = i64::try_from(request.max_events.min(100))
+            .map_err(|_| "Unavailable: page limit overflow")?;
+        let mut connection = self
+            .checkout_event_read()
+            .map_err(|_| "Unavailable: event read checkout failed")?;
+        let head = connection
+            .query(
+                "SELECT COALESCE(MAX(sequence),0) FROM runtime_events WHERE stream_id=$1",
+                &[&request.stream_id],
+            )
+            .map_err(|_| "Unavailable: stream head read failed")
+            .and_then(|rows| {
+                rows.first()
+                    .map(|row| {
+                        row.try_get::<_, i64>(0)
+                            .map_err(|_| "Unavailable: stream head read failed")
+                    })
+                    .unwrap_or(Ok(0))
+            })
+            .map_err(|_| "Unavailable: stream head read failed")?;
+        let head = from_i64(head, "head").map_err(|_| "Unavailable: stream head corrupt")?;
+        let mut page = FixtureEvidencePage {
+            head,
+            next_sequence: request.after_sequence,
+            encoded_bytes: 0,
+            records: Vec::new(),
+            stop: None,
+        };
+        let through = request.through_sequence.min(head);
+        if through <= request.after_sequence {
+            return Ok(page);
+        }
+        let rows = connection
+            .query(
+                &format!(
+                    "SELECT event_id, sequence, encoded_bytes FROM runtime_events WHERE stream_id=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence ASC LIMIT $4"
+                ),
+                &[&request.stream_id, &after_sequence, &through_sequence, &limit],
+            )
+            .map_err(|_| "Unavailable: event metadata read failed")?;
+        let budget = request.max_bytes.min(1024 * 1024);
+        let mut selected: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        for row in rows {
+            if Instant::now() >= request.deadline {
+                page.stop = Some("deadline");
+                break;
+            }
+            let identity: String = row
+                .try_get(0)
+                .map_err(|_| "Unavailable: event identity is corrupt")?;
+            let sequence: i64 = row
+                .try_get(1)
+                .map_err(|_| "Unavailable: event sequence is corrupt")?;
+            let encoded: i64 = row
+                .try_get(2)
+                .map_err(|_| "Unavailable: event encoded bytes are missing")?;
+            let bytes = usize::try_from(encoded)
+                .ok()
+                .filter(|bytes| *bytes > 0)
+                .ok_or("Unavailable: event encoded bytes are corrupt")?;
+            if bytes > budget.saturating_sub(total) {
+                page.stop = Some("bytes");
+                break;
+            }
+            total += bytes;
+            selected.push(identity);
+            page.next_sequence =
+                from_i64(sequence, "sequence").map_err(|_| "Unavailable: event sequence corrupt")?;
+        }
+        if !selected.is_empty() {
+            let events = pg(
+                connection.query(
+                    &format!(
+                        "SELECT {EVENT_COLUMNS} FROM runtime_events WHERE event_id=ANY($1) ORDER BY sequence ASC"
+                    ),
+                    &[&selected],
+                ),
+            )
+            .and_then(rows_to_events)
+            .map_err(|_| "Unavailable: event rows read failed")?;
+            page.encoded_bytes = total;
+            page.records = events;
+        }
+        if page.stop.is_none() && page.records.len() >= request.max_events.min(100) {
+            page.stop = Some("events");
+        }
+        Ok(page)
+    }
+
     fn bounded_event_by_idempotency_key(
         &self,
         stream: &str,

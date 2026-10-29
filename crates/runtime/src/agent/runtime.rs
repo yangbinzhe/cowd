@@ -1707,7 +1707,7 @@ impl AgentRuntime {
         if kind == "agent.backend_admitted"
             && self
                 .backend_append_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -1719,7 +1719,7 @@ impl AgentRuntime {
         if kind == "agent.local_exit"
             && self
                 .exit_append_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -3618,7 +3618,7 @@ impl AgentRuntime {
             if kind == "agent.command"
                 && self
                     .command_append_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()
@@ -3631,7 +3631,7 @@ impl AgentRuntime {
             if kind == "agent.cancellation_requested"
                 && self
                     .cancellation_append_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()

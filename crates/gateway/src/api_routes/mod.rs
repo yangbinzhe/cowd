@@ -343,11 +343,26 @@ async fn auth_middleware(
                 )
                 .map(|(principal, _)| principal)
                 .map_err(|error| {
+                    // A liveness failure of the broker helper the Gateway owns
+                    // is not an authority-storage failure. Reporting it as one
+                    // sent diagnosis toward the wrong layer and let an
+                    // environment race look like corrupt authority state.
+                    let (status, code) = if auth_broker::error_is_broker_unavailable(&error) {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "authentication_broker_unavailable",
+                        )
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "authentication_authority_error",
+                        )
+                    };
                     auth_error_response(
                         &state,
                         &request_path,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("authentication_authority_error:{error}"),
+                        status,
+                        format!("{code}:{error}"),
                     )
                 })?
             }
@@ -854,7 +869,7 @@ pub(super) fn validate_surface_capability_request(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn test_human_principal() -> runtime::VerifiedPrincipal {
+pub(crate) fn test_human_principal() -> runtime::VerifiedPrincipal {
     static PRINCIPAL: std::sync::OnceLock<runtime::VerifiedPrincipal> = std::sync::OnceLock::new();
     PRINCIPAL
         .get_or_init(|| {

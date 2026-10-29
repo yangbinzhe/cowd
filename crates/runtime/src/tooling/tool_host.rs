@@ -678,7 +678,23 @@ pub(crate) fn effect_file_accesses(
             )
         })
         .collect::<Vec<_>>();
-    if descriptor.spawns_process {
+    // A spawned process widens to the workspace root only when the tool's own
+    // declared effect is unbounded. `bash` always declares an unbounded `Shell`
+    // scope, so it keeps the widening. A tool that declares an explicitly
+    // bounded scope set - the read-only sandboxed `compute`, whose only file
+    // content is its declared `input_files` - runs its child inside that bound,
+    // so the process adds no access of its own. Without this distinction a
+    // bounded reduction could never be certified by a lease that covers the
+    // declared inputs.
+    // The bound that keeps a child inside it is a declared *file* scope: a
+    // targeted Tool/Session scope says nothing about which files the child
+    // touches, so a process-spawning tool that declares no bounded file scope
+    // still reads the workspace and must keep the widening.
+    let declares_bounded_file_scope = descriptor.scopes.iter().any(|scope| {
+        scope.resource == PermissionResource::File
+            && scope.target.as_deref().is_some_and(|t| !t.trim().is_empty())
+    });
+    if descriptor.spawns_process && !declares_bounded_file_scope {
         accesses.push((".".to_string(), false));
     }
     accesses.sort();
@@ -1770,10 +1786,14 @@ mod resource_projection_tests {
             PermissionOperation::Write,
             Some("out/b"),
         ));
-        projection(&process, &[(".", false), ("out/b", true)]);
+        // A declared bounded scope keeps the spawned process inside that
+        // bound, so the process adds no workspace access of its own: the
+        // lease needs exactly the declared write and nothing wider.
+        projection(&process, &[("out/b", true)]);
+        assert!(permits(&process, &["write:out/b"]));
         assert!(permits(&process, &["read:.", "write:out/b"]));
         assert!(!permits(&process, &["read:."]));
-        assert!(!permits(&process, &["write:out/b"]));
+        assert!(!permits(&process, &["read:out/b"]));
         assert!(!permits(&process, &["read:.", "read:out/b"]));
         let mut unbounded = process.clone();
         unbounded.required_permission = ToolPermissionMode::DangerFullAccess;
@@ -1869,5 +1889,82 @@ mod resource_projection_tests {
         assert!(!permits(&mixed, &[]));
         assert!(!permits(&process, &[]));
         assert!(!permits(&network, &[]));
+    }
+}
+
+#[cfg(test)]
+mod effect_file_access_tests {
+    use super::*;
+    use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+    use harness_contract::tool::ToolEffectDescriptor;
+
+    fn descriptor(scopes: Vec<PermissionScope>, spawns_process: bool) -> ToolEffectDescriptor {
+        ToolEffectDescriptor {
+            tool_id: "tool".into(),
+            descriptor_hash: "hash".into(),
+            effect_kind: harness_contract::tool::ToolEffectKind::Process,
+            idempotency: harness_contract::tool::ToolIdempotency::Unknown,
+            scopes,
+            required_permission: harness_contract::policy::PermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        }
+    }
+
+    fn scope(resource: PermissionResource, operation: PermissionOperation, target: Option<&str>) -> PermissionScope {
+        PermissionScope {
+            resource,
+            operation,
+            target: target.map(str::to_owned),
+        }
+    }
+
+    /// An unbounded host command still widens to the workspace root: the
+    /// process could touch anything, so only a whole-workspace lease certifies
+    /// it. This is the boundary the bounded-sandbox change must never weaken.
+    #[test]
+    fn an_unbounded_process_still_widens_to_the_workspace_root() {
+        let unbounded = descriptor(
+            vec![scope(
+                PermissionResource::Shell,
+                PermissionOperation::Execute,
+                None,
+            )],
+            true,
+        );
+        assert_eq!(effect_file_accesses(&unbounded), vec![(".".to_string(), false)]);
+    }
+
+    /// A descriptor that declares an explicitly bounded scope set does not gain
+    /// workspace-root access just because it spawns a process.
+    #[test]
+    fn a_bounded_process_does_not_widen_to_the_workspace_root() {
+        let bounded = descriptor(
+            vec![scope(
+                PermissionResource::File,
+                PermissionOperation::Read,
+                Some("crates/runtime/src/lib.rs"),
+            )],
+            true,
+        );
+        assert_eq!(
+            effect_file_accesses(&bounded),
+            vec![("crates/runtime/src/lib.rs".to_string(), false)]
+        );
+    }
+
+    /// A bounded root declaration (an explicit empty input set) keeps exactly
+    /// the root access it declared - the process adds nothing on top.
+    #[test]
+    fn a_bounded_root_declaration_adds_no_extra_access() {
+        let root = descriptor(
+            vec![scope(PermissionResource::File, PermissionOperation::Read, Some("."))],
+            true,
+        );
+        assert_eq!(effect_file_accesses(&root), vec![(".".to_string(), false)]);
     }
 }

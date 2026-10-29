@@ -5750,16 +5750,34 @@ fn test_tool_descriptor_for_input(
     };
 
     if tool_name == "execute_code" {
+        // Mirrors the registered contract: the kernel-hardened, network-off,
+        // read-only sandbox declares no unbounded scope. Its file scopes are
+        // exactly the declared `input_files`; an explicit empty set declares the
+        // workspace root the snapshot is materialized from.
+        let mut scopes = Vec::new();
+        match input.get("input_files").and_then(serde_json::Value::as_array) {
+            Some(paths) if !paths.is_empty() => {
+                for path in paths {
+                    let Some(path) = path.as_str() else { continue };
+                    scopes.push(PermissionScope {
+                        resource: PermissionResource::File,
+                        operation: PermissionOperation::Read,
+                        target: Some(path.to_string()),
+                    });
+                }
+            }
+            _ => scopes.push(PermissionScope {
+                resource: PermissionResource::File,
+                operation: PermissionOperation::Read,
+                target: Some(".".to_string()),
+            }),
+        }
         return Some(ToolEffectDescriptor {
             tool_id: tool_name.to_string(),
             descriptor_hash: "test-host:execute_code".to_string(),
             effect_kind: ToolEffectKind::Process,
             idempotency: ToolIdempotency::Unknown,
-            scopes: vec![PermissionScope {
-                resource: PermissionResource::Shell,
-                operation: PermissionOperation::Execute,
-                target: None,
-            }],
+            scopes,
             required_permission: ToolPermissionMode::ReadOnly,
             approval_class: ToolApprovalClass::Policy,
             uses_network: false,
@@ -6324,8 +6342,18 @@ fn permission_policy_uses_the_explicit_packet_ceiling() {
 }
 
 #[test]
-fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
+fn sandboxed_process_effect_is_bounded_by_its_declared_inputs() {
     let root = tempfile::tempdir().expect("scoped workspace");
+    // The declared input and both lease roots must exist for the path-identity
+    // resolver, which is what actually certifies a bounded scope.
+    for relative in [
+        "crates/runtime/src/lib.rs",
+        "crates/gateway/src/lib.rs",
+    ] {
+        let path = root.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create scope dir");
+        std::fs::write(&path, "// fixture\n").expect("write fixture file");
+    }
     let build = |scopes: Vec<String>| ScopedRuntimeToolExecutor {
         tool_batch: None,
         host: Arc::new(EchoRuntimeExecutionHost),
@@ -6354,16 +6382,36 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
         receipts: Mutex::new(Vec::new()),
         provider_model_obligations: Vec::new(),
     };
-    let input = r#"{"language":"python","code":"print(1)","input_files":[]}"#;
-
+    // An explicit empty input_files set declares the workspace root, because the
+    // sandbox still materializes its read-only snapshot from there. The
+    // whole-workspace lease is therefore still required, and a narrower one is
+    // still refused: this is the case the boundary existed for.
+    let no_inputs = r#"{"language":"python","code":"print(1)","input_files":[]}"#;
     let whole_workspace = build(vec!["read:.".to_string()]);
     assert!(whole_workspace.owns_durable_tool_effect("execute_code"));
     whole_workspace
-        .enforce_resource_ceiling("execute_code", input)
+        .enforce_resource_ceiling("execute_code", no_inputs)
         .expect("whole-workspace read lease admits the read-only sandbox");
     assert!(build(vec!["read:src".to_string()])
-        .enforce_resource_ceiling("execute_code", input)
+        .enforce_resource_ceiling("execute_code", no_inputs)
         .is_err());
+
+    // A declared finite input set is bounded to exactly those paths, so a lease
+    // that covers them certifies the run. This is what makes a bounded
+    // workspace-wide reduction reachable from a read-only session.
+    let declared = r#"{"language":"python","code":"print(1)","input_files":["crates/runtime/src/lib.rs"]}"#;
+    build(vec!["read:crates/runtime".to_string()])
+        .enforce_resource_ceiling("execute_code", declared)
+        .expect("a lease covering the declared inputs certifies the bounded sandbox");
+    // ...and a lease that does not cover them is still refused. The boundary is
+    // narrowed, never widened to "any lease admits".
+    assert!(build(vec!["read:crates/gateway".to_string()])
+        .enforce_resource_ceiling("execute_code", declared)
+        .is_err());
+    // The whole-workspace lease still covers a declared input, as it must.
+    build(vec!["read:.".to_string()])
+        .enforce_resource_ceiling("execute_code", declared)
+        .expect("a whole-workspace lease covers the declared inputs");
 }
 
 #[tokio::test]

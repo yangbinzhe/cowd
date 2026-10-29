@@ -237,6 +237,14 @@ impl GoalStore {
             .execution_binding
             .as_ref()
             .ok_or("goal_final_candidate_binding_missing")?;
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=goal_candidate_binding graph_match={} session_match={} turn_present={} turn_match={}",
+                binding.root_execution_id == ticket.graph_id,
+                binding.session_id == observation.identity.session_id,
+                observation.identity.turn_id.is_some(),
+                observation.identity.turn_id.as_deref() == Some(binding.turn_id.as_str()));
+        }
         if binding.root_execution_id != ticket.graph_id
             || binding.session_id != observation.identity.session_id
             || observation.identity.turn_id.as_deref() != Some(binding.turn_id.as_str())

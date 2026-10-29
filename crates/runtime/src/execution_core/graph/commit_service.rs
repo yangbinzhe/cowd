@@ -9594,6 +9594,9 @@ impl ExecutionCommitService {
         };
         let stream = format!("execution-agent-receipts:{index_graph}:{index_node}:{index_attempt}");
         let head = self.event_store.stream_revision(&stream)?;
+        #[cfg(test)]
+        let trace_leaf = std::env::var_os("COWD_R622_TRACE").is_some()
+            && spec.kind == ExecutionNodeKind::ToolBatch;
         let mut after = 0;
         let mut intents = BTreeSet::new();
         let mut receipts = BTreeSet::new();
@@ -9657,6 +9660,8 @@ impl ExecutionCommitService {
                         &format!("{key}:read-receipt"),
                     )?);
                 let Some(primary) = primary else {
+                    #[cfg(test)]
+                    if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=primary_receipt_missing"); }
                     return Ok(None);
                 };
                 let read = primary.kind == "execution.read.receipt";
@@ -9742,6 +9747,8 @@ impl ExecutionCommitService {
                     primary_sources.insert(primary_stream, primary_head);
                 }
                 if !Self::lease_recovery_process_closed(&outcome, &effect) {
+                    #[cfg(test)]
+                    if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=process_not_closed"); }
                     return Ok(None);
                 }
                 if !receipts.insert(key.to_string()) {
@@ -9761,13 +9768,39 @@ impl ExecutionCommitService {
                 );
             }
         }
+        #[cfg(test)]
+        if trace_leaf {
+            eprintln!("r622_toolbatch phase=physical_index head={} intents={} receipts={} calls={} no_dispatch={} retired={} bound={} delegated={}",
+                head, intents.len(), receipts.len(), calls.len(), no_dispatch.map_or(0, |fact| fact.calls.len()), retired, bound.is_some(), delegated.is_some());
+            if bound.is_none() {
+                if let Ok(payload) = crate::step_snapshot::decode_persisted_tool_batch_value(&spec.payload_ref) {
+                    if let Some(planned) = payload["calls"].as_array() {
+                        for call in planned.iter().take(32) {
+                            let id = call["id"].as_str().unwrap_or("unknown");
+                            let input = call["input"].as_str();
+                            let receipt = calls.get(id);
+                            let name_matches = receipt.is_some_and(|(name, _, _, _)| *name == call["name"]);
+                            let input_matches = receipt.zip(input).is_some_and(|((_, actual, _, _), input)| *actual == json!(format!("sha256:{:x}", Sha256::digest(input.as_bytes()))));
+                            let origin_matches = receipt.is_some_and(|(_, _, _, origin)| call.get("origin").is_none_or(|expected| expected == origin));
+                            let no_dispatch_match = no_dispatch.is_some_and(|fact| fact.calls.iter().any(|entry| entry.call_id == id));
+                            eprintln!("r622_toolbatch phase=physical_planned call={} name={} receipt={} name_match={} input_match={} origin_match={} no_dispatch={}",
+                                id.chars().take(96).collect::<String>(), call["name"].as_str().unwrap_or("unknown").chars().take(96).collect::<String>(), receipt.is_some(), name_matches, input_matches, origin_matches, no_dispatch_match);
+                        }
+                    }
+                }
+            }
+        }
         if !intents.is_subset(&receipts) {
+            #[cfg(test)]
+            if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=intent_without_terminal_receipt"); }
             return Ok(None);
         }
         if let Some(fact) = no_dispatch {
             fact.validate_identity(&fact.ticket)
                 .map_err(ExecutionCommitError::InvalidCommand)?;
             if self.no_dispatch_physical_sources(fact)?.is_none() {
+                #[cfg(test)]
+                if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=no_dispatch_sources"); }
                 return Ok(None);
             }
             if fact
@@ -9793,17 +9826,23 @@ impl ExecutionCommitService {
                         && *input == expected
                         && key == &request.idempotency_key
                 }) {
+                    #[cfg(test)]
+                    if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=bound_call_receipt_or_no_dispatch"); }
                     return Ok(None);
                 }
             } else {
                 let payload =
                     crate::step_snapshot::decode_persisted_tool_batch_value(&spec.payload_ref)?;
                 let Some(planned) = payload["calls"].as_array() else {
+                    #[cfg(test)]
+                    if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=planned_calls_absent"); }
                     return Ok(None);
                 };
                 if !retired
                     && calls.len() + no_dispatch.map_or(0, |fact| fact.calls.len()) != planned.len()
                 {
+                    #[cfg(test)]
+                    if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=planned_receipt_count_mismatch planned={} receipts={} no_dispatch={}", planned.len(), calls.len(), no_dispatch.map_or(0, |fact| fact.calls.len())); }
                     return Ok(None);
                 }
                 if calls.keys().any(|id| {
@@ -9811,6 +9850,8 @@ impl ExecutionCommitService {
                         .iter()
                         .any(|call| call["id"].as_str() == Some(id.as_str()))
                 }) {
+                    #[cfg(test)]
+                    if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=foreign_call_receipt"); }
                     return Ok(None);
                 }
                 let mut seen = BTreeSet::new();
@@ -9838,6 +9879,8 @@ impl ExecutionCommitService {
                             && *actual == digest
                             && call.get("origin").is_none_or(|expected| expected == origin)
                     }) {
+                        #[cfg(test)]
+                        if trace_leaf { eprintln!("r622_toolbatch phase=physical_missing reason=planned_receipt_identity_mismatch"); }
                         return Ok(None);
                     }
                 }
@@ -10430,8 +10473,14 @@ impl ExecutionCommitService {
                     && result.result_ref.as_deref()
                         == Some(format!("{}:precommitted-terminal", graph.id).as_str())
             });
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && spec.kind == ExecutionNodeKind::ToolBatch {
+            eprintln!("r622_toolbatch phase=physical_branch precommitted={} retired={} witness={} canonical_no_dispatch={}", precommitted, retired, witness.is_some(), fact.is_some());
+        }
         let leaf = if precommitted {
             if !self.committed_host_transcript(&ticket)?.messages.is_empty() {
+                #[cfg(test)]
+                if std::env::var_os("COWD_R622_TRACE").is_some() { eprintln!("r622_toolbatch phase=physical_missing reason=precommitted_transcript_nonempty"); }
                 return Ok(None);
             }
             let stream_id = format!(
@@ -10440,6 +10489,8 @@ impl ExecutionCommitService {
             );
             let expected_revision = self.event_store.stream_revision(&stream_id)?;
             if expected_revision != 0 {
+                #[cfg(test)]
+                if std::env::var_os("COWD_R622_TRACE").is_some() { eprintln!("r622_toolbatch phase=physical_missing reason=precommitted_receipt_stream_nonempty"); }
                 return Ok(None);
             }
             vec![ExpectedStreamRevision {

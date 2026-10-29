@@ -3392,6 +3392,28 @@ fn responses_stream_frame_to_chunk(
                 usage: response.usage,
             }
         }),
+        // The OpenAI Responses vocabulary gives every streamed output item and
+        // content part a structural lifecycle pair. These frames carry no
+        // model output at all - only the identity of the part that the
+        // following delta frames belong to. A provider that emits them (the
+        // MiniMax Responses endpoint emits response.content_part.added as its
+        // first part frame) must not be treated as a fatal protocol violation:
+        // rejecting them turned every model step into a provider failure
+        // before the model produced anything. The stream stays open and the
+        // terminal response.completed frame keeps its meaning.
+        "response.content_part.added"
+        | "response.content_part.done"
+        | "response.output_item.done"
+        | "response.output_text.done"
+        | "response.reasoning_text.done"
+        | "response.reasoning_summary_text.done"
+        | "response.function_call_arguments.done"
+        | "response.refusal.done" => Some(ChatCompletionChunk {
+            id: "responses_stream".to_string(),
+            model: Some(fallback_model.to_string()),
+            choices: Vec::new(),
+            usage: None,
+        }),
         _ => {
             let event_type = frame.event_type.as_str();
             let safe = if event_type.len() <= 96
@@ -4285,6 +4307,32 @@ mod tests {
             error,
             ApiError::UnsupportedResponsesEvent(ref event_type) if event_type == "response.future_event"
         ));
+    }
+
+    #[test]
+    fn responses_structural_progress_events_do_not_fail_the_stream() {
+        // MiniMax's Responses endpoint emits response.content_part.added
+        // before its first text delta. A structural part/item frame carries no
+        // model output, so it must be skipped instead of failing the turn.
+        for event in [
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.output_text.done",
+            "response.reasoning_text.done",
+            "response.reasoning_summary_text.done",
+            "response.function_call_arguments.done",
+            "response.refusal.done",
+        ] {
+            let chunk = parse_responses_sse_frame(
+                &format!("data: {{\"type\":\"{event}\"}}\n\n"),
+                "MiniMax",
+                "MiniMax-M3.1-Flash",
+            )
+            .expect("a standard structural progress event is not a protocol violation")
+            .expect("the stream frame is consumed, not dropped");
+            assert!(chunk.choices.is_empty() && chunk.usage.is_none());
+        }
     }
 
     #[test]

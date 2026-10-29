@@ -1174,16 +1174,29 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
             } else {
                 100
             };
-            script.push((
-                u5_resource_path(&sessions[0], cursor.as_deref(), limit),
-                page,
-                fault == "unknown-bytes",
-                if fault == "body-timeout" {
-                    Duration::from_millis(300)
-                } else {
-                    Duration::ZERO
-                },
-            ));
+            // A page whose known length exceeds the remaining byte budget is
+            // retried against the same cursor with a halved event limit until
+            // the smallest page still does not fit. Each retry is its own HTTP
+            // request in script order, so the fixture scripts the halving
+            // sequence for every page; a page that fits is never retried and
+            // its unused entries are simply never served.
+            let mut shrunk = limit;
+            loop {
+                script.push((
+                    u5_resource_path(&sessions[0], cursor.as_deref(), shrunk),
+                    page.clone(),
+                    fault == "unknown-bytes" && shrunk == limit,
+                    if fault == "body-timeout" && shrunk == limit {
+                        Duration::from_millis(300)
+                    } else {
+                        Duration::ZERO
+                    },
+                ));
+                if shrunk == 1 {
+                    break;
+                }
+                shrunk = (shrunk / 2).max(1);
+            }
             cursor = Some(next);
         }
         if exact {
@@ -1292,7 +1305,11 @@ impl U5SingleCaseHttpFixture {
         let server = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut requests = Vec::new();
-            for (expected, response, unknown_length, delay, status) in script {
+            let mut served = vec![false; script.len()];
+            loop {
+                if served.iter().all(|done| *done) {
+                    return requests;
+                }
                 let mut stream = loop {
                     if stopping.load(std::sync::atomic::Ordering::SeqCst)
                         || Instant::now() >= deadline
@@ -1348,23 +1365,43 @@ impl U5SingleCaseHttpFixture {
                     .strip_suffix(" HTTP/1.1")
                     .unwrap()
                     .to_string();
-                assert_eq!(request, expected, "NoRealU5 request order");
+                // A page whose known length exceeds the remaining byte budget
+                // is retried against the same cursor with a halved event
+                // limit, so one cursor is requested more than once and a
+                // strictly ordered script cannot express that sequence. Serve
+                // the first unserved entry whose path this request names; an
+                // unscripted request still fails the fixture.
+                let selected = script
+                    .iter()
+                    .enumerate()
+                    .find(|(index, (expected, ..))| !served[*index] && *expected == request)
+                    .map(|(index, _)| index);
+                let Some(index) = selected else {
+                    panic!("NoRealU5 request order: {request}");
+                };
+                served[index] = true;
+                let (_, response, unknown_length, delay, status) = &script[index];
                 requests.push((request, headers, body));
-                if status == 0 {
+                if *status == 0 {
                     return requests; // Original transport EOF, without an HTTP response.
                 }
-                let body = serde_json::to_vec(&response).unwrap();
-                let header = if unknown_length {
-                    format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+                let body = serde_json::to_vec(response).unwrap();
+                let header = if *unknown_length {
+                    format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                    )
                 } else {
-                    format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                    format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
                 };
                 // A bounded consumer may close early on size/deadline errors.
                 // Request parsing/order and all consumer assertions still fail normally.
                 if stream.write_all(header.as_bytes()).is_err() {
                     return requests;
                 }
-                let wake = Instant::now() + delay;
+                let wake = Instant::now() + *delay;
                 while Instant::now() < wake {
                     if stopping.load(std::sync::atomic::Ordering::SeqCst) {
                         return requests;
@@ -1375,7 +1412,6 @@ impl U5SingleCaseHttpFixture {
                     return requests;
                 }
             }
-            requests
         });
         Self {
             url,
@@ -1891,7 +1927,10 @@ fn u5_subinput_envelopes_keep_exact_read_grants_and_original_business_oracles() 
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(control["corpus_id"], "live-scenarios-v1");
+        // The U5 read specs carry their own fixture corpus since the
+        // evaluation-domain profiles landed; only an unregistered selector
+        // falls back to the shared default corpus.
+        assert_eq!(control["corpus_id"], "live-u5-fairness-v1");
         assert!(control["resource_scopes"]
             .as_array()
             .unwrap()
@@ -2263,7 +2302,10 @@ fn live_prompt_uses_an_optional_advisory_provider_token_telemetry_lease() {
         .strip_prefix("COWD_EVAL_CONTROL ")
         .expect("typed evaluation prefix");
     let control: Value = serde_json::from_str(encoded).expect("control JSON");
-    assert_eq!(control["corpus_id"], "live-scenarios-v1");
+    // This selector has its own fixture corpus since the evaluation-domain
+    // profiles landed; only an unregistered selector falls back to the shared
+    // default corpus.
+    assert_eq!(control["corpus_id"], "live-group-theory-v1");
     assert_eq!(control["provider_constraint"], "normal");
     assert_eq!(
         control["resource_scopes"],

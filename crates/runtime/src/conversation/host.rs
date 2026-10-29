@@ -1723,8 +1723,16 @@ where
                 )
                 .map_err(RuntimeError::new)?;
         }
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=drive_begin");
+        }
         let run_result = services.execution_supervisor()
             .drive_registered(&registered.id).await.map(|(_, report)| report);
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=drive_returned ok={}", run_result.is_ok());
+        }
         run_result.map_err(|error| RuntimeError::new(error.to_string()))?;
         // Agent-first collaboration parks the root graph on a durable
         // WaitingExternal barrier while child graphs run. Keep the ingress
@@ -1739,6 +1747,10 @@ where
             .unwrap_or(30);
         let mut last_progress_key: Option<String> = None;
         let mut stalled_checks: u32 = 0;
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=settlement_wait_begin");
+        }
         loop {
             let notify = {
                 let state = state.lock().await;
@@ -1833,6 +1845,10 @@ where
                 notify.notified(),
             )
             .await;
+        }
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=settlement_wait_end");
         }
         let mut state = state.lock().await;
         if let Some(error) = state.failure.take() {

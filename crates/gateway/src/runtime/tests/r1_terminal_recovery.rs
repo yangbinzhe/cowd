@@ -995,6 +995,22 @@ impl ReviewedTurn {
         hold_resolution: bool,
         hold_producer_until_a: bool,
     ) -> Self {
+        Self::produce_with_optional_for_owner(services, root, producer, reviewer, before_b,
+            lose_commit_response, optional, hold_resolution, hold_producer_until_a, "recovery-operator").await
+    }
+
+    async fn produce_with_optional_for_owner(
+        services: &RecoveryServices,
+        root: &mut LoopbackProvider,
+        producer: &mut LoopbackProvider,
+        reviewer: &mut LoopbackProvider,
+        before_b: bool,
+        lose_commit_response: bool,
+        optional: Option<&mut LoopbackProvider>,
+        hold_resolution: bool,
+        hold_producer_until_a: bool,
+        owner_principal: &str,
+    ) -> Self {
         use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
         let runtime = services.runtime.runtime_services();
         let producer_definition = install_native_definition(
@@ -1015,7 +1031,7 @@ impl ReviewedTurn {
         let session_id = format!("r1-recovery:{}", uuid::Uuid::new_v4());
         let mut request =
             EnsureSessionRequest::new(&session_id, Some(root.model.clone()), SessionSource::Tui);
-        request.owner_principal_id = Some("recovery-operator".into());
+        request.owner_principal_id = Some(owner_principal.into());
         services.session.create_user_session(request).await.unwrap();
         let envelope = harness_contract::turn::SessionInputEnvelope::text(
             &session_id, harness_contract::turn::InputSourceKind::Tui,
@@ -5344,6 +5360,55 @@ async fn collaboration_admission_and_final_evidence_gate_body() {
 
 }
 
+// Component-level reproduction of the *observed action shape* of round601:
+// two batches (two Teams, then four invitations), followed by another model
+// request. This does not claim to replay its unavailable response or Gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "round601 zero-model stack investigation; requires isolated Postgres"]
+async fn r604_two_team_four_invite_then_model_continuation() {
+    let root = fixture_root();
+    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let mut provider = LoopbackProvider::start("root").await;
+    let providers = provider_registry(&[&provider]);
+    let topology = SelectedStorageTopology::compose_for_test(
+        &root.path().join("home"), &root.path().join("workspace"),
+    ).unwrap();
+    let services = RecoveryServices::start(root.path(), topology, providers).await;
+    let session_id = format!("r604:{}", uuid::Uuid::new_v4());
+    use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
+    let mut request = EnsureSessionRequest::new(&session_id, Some("test-model".into()), SessionSource::Tui);
+    request.owner_principal_id = Some("r604-local-replay".into());
+    services.session.create_user_session(request).await.unwrap();
+    let admission = services.session.admit_input(harness_contract::turn::SessionInputEnvelope::text(
+        &session_id, harness_contract::turn::InputSourceKind::Tui,
+        "Create two teams, each with two independent reviewers, to examine the workspace.",
+    )).await.unwrap();
+    let program_id = harness_contract::agent_action::program_id_for_objective(
+        &harness_contract::agent_action::root_objective_id(&session_id, &admission.turn_id),
+    );
+    provider.tool("r604-teams", "agent_action_batch", json!({"actions":[
+        {"tool":"team_create","input":{"name":"R604 team A","mission":"Read workspace evidence A"}},
+        {"tool":"team_create","input":{"name":"R604 team B","mission":"Read workspace evidence B"}}
+    ]}), None).await;
+    provider.wait_for_tool_result("r604-teams").await;
+    let program = services.runtime.runtime_services().agent_action_service().project(&program_id).unwrap();
+    let teams = program.teams.keys().cloned().collect::<Vec<_>>();
+    assert_eq!(teams.len(), 2);
+    let actions = (0..4).map(|index| json!({"tool":"agent_invite","input":{
+        "team_ref":teams[index / 2], "role":format!("Reviewer {index}"),
+        "mission":format!("Independently inspect evidence for lane {index}"),
+        "required_capabilities":["read","search"], "execution_requirements":[], "expertise_hints":[]
+    }})).collect::<Vec<_>>();
+    provider.tool("r604-invites", "agent_action_batch", json!({"actions":actions}), None).await;
+    provider.wait_for_tool_result("r604-invites").await;
+    let program = services.runtime.runtime_services().agent_action_service().project(&program_id).unwrap();
+    assert_eq!(program.agents.len(), 4, "all invitations must really be admitted");
+    services.runtime.runtime_services().cancel_execution_tree(&admission.execution_graph_id, "r604 local reproduction complete").await.unwrap();
+    assert_eq!(services.supervisor.health().forced_aborts, 0);
+    drop(provider);
+    services.stop().await;
+}
+
 /// The class-4 acceptance gate: the same body on the DEFAULT tokio worker
 /// stack. It is ignored on purpose because today it aborts the whole test
 /// process (deterministic red): the collaboration admission path needs more
@@ -5372,3 +5437,6 @@ fn collaboration_admission_and_final_evidence_gate_on_large_stack() {
         .expect("runtime");
     runtime.block_on(collaboration_admission_and_final_evidence_gate_body());
 }
+
+#[path = "rc_session_receipt.rs"]
+mod rc_session_receipt;

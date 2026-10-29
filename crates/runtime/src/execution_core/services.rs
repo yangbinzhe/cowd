@@ -254,6 +254,28 @@ fn publish_requested_source(
 
 /// Original cancellation source for one installed root turn. The token only wakes
 /// work; first-cause attribution is protected independently by this short lock.
+/// Last operational turn-cancellation signal, kept so a later abort can name
+/// the scope that escalated it.  Test-fixture only: it carries no production
+/// behaviour and exists because a captured child trace keeps only its tail.
+#[cfg(feature = "test-fixtures")]
+static LAST_OPERATIONAL_CANCEL: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::string::String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn record_last_operational_cancel(site: &str) {
+    let slot = LAST_OPERATIONAL_CANCEL.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(site.to_string());
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn last_operational_cancel() -> Option<std::string::String> {
+    let slot = LAST_OPERATIONAL_CANCEL.get_or_init(|| std::sync::Mutex::new(None));
+    slot.lock().ok().and_then(|guard| guard.clone())
+}
+
 pub struct TurnCancellationControl {
     session_id: String,
     turn_id: String,
@@ -639,6 +661,22 @@ impl TurnCancellationControl {
     }
 
     pub fn signal_operational(&self) {
+        #[cfg(feature = "test-fixtures")]
+        {
+            // A turn-scoped operational cancellation can be triggered by work
+            // that does not own this turn.  Record who signalled it so the
+            // captured child trace names the escalating scope instead of
+            // leaving "the turn was cancelled" as an unexplained fact.
+            let site = format!(
+                "site={} session={} turn={} execution={}",
+                std::panic::Location::caller(),
+                self.session_id,
+                self.turn_id,
+                self.execution_id
+            );
+            eprintln!("k05_operational_cancel {site}");
+            crate::execution_core::services::record_last_operational_cancel(&site);
+        }
         let mut cause = self
             .first_cause
             .lock()

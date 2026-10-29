@@ -553,12 +553,45 @@ fn effect_assessment(properties: &EffectProperties, input: &Value) -> EffectAsse
     }
 }
 
+/// Whether this effect is a plain read-only research effect: it reads workspace
+/// content, writes nothing, touches no network and spawns no process.
+///
+/// `read_file` with an explicit path and `glob_search` with a recursive pattern
+/// both read workspace content, yet only the latter used to be classified
+/// Secret - purely because its declared scope carries no target. That
+/// inconsistency is what forced `danger-full-access` onto a read-only research
+/// tool and made a read-only session unable to enumerate the very corpus the
+/// scenario declares. Sensitivity is a property of what an effect does, not of
+/// whether its scope happens to name a target.
+fn is_read_only_research_effect(properties: &EffectProperties) -> bool {
+    properties.required_permission == ToolPermissionMode::ReadOnly
+        && !properties.uses_network
+        && !properties.spawns_process
+        && !properties.mutates_packages
+        && !properties.mutates_system
+        && matches!(properties.effect_kind, ToolEffectKind::Read)
+        && !properties.scopes.iter().any(|scope| {
+            scope.resource == PermissionResource::File
+                && matches!(
+                    scope.operation,
+                    PermissionOperation::Write | PermissionOperation::Control
+                )
+        })
+}
+
 fn data_classification(properties: &EffectProperties, input: &Value) -> DataClassification {
-    if properties.scopes.iter().any(|scope| {
-        scope.resource == PermissionResource::File
-            && scope.operation == PermissionOperation::Read
-            && scope.target.is_none()
-    }) {
+    // An unbounded read scope is only Secret when the effect is not a plain
+    // read-only research effect. Everything below still applies unchanged, so
+    // an explicit `.env` / `.ssh` / credentials target, an explicit
+    // `contains_secrets` or `data_classification` input, and any non-read-only
+    // posture still classify as before.
+    if !is_read_only_research_effect(properties)
+        && properties.scopes.iter().any(|scope| {
+            scope.resource == PermissionResource::File
+                && scope.operation == PermissionOperation::Read
+                && scope.target.is_none()
+        })
+    {
         return DataClassification::Secret;
     }
     if input
@@ -714,16 +747,20 @@ fn resolve_base_effect_properties(
             // visible to capacity accounting, but its authority is bounded
             // to the workspace sandbox rather than arbitrary host command
             // execution. Code contents cannot opt out of this posture.
+            //
+            // The effect declares NO unbounded scope. The only file content the
+            // kernel-hardened, network-off, read-only sandbox can observe is the
+            // finite `input_files` set the caller declared, so the file scopes
+            // are derived from that input by `original_static_file_scopes`.
+            // Declaring `Shell:Execute(None)` and `File:Read(None)` here is what
+            // used to classify this read-only tool as touching Secret data and
+            // demand a whole-workspace lease that no read-only ceiling could
+            // certify, which made the bounded reduction objective unreachable
+            // regardless of model behaviour. Process-ness stays declared through
+            // `effect_kind` and `spawns_process`.
             effect_kind: ToolEffectKind::Process,
             idempotency: ToolIdempotency::Unknown,
-            scopes: vec![
-                scope(
-                    PermissionResource::Shell,
-                    PermissionOperation::Execute,
-                    None,
-                ),
-                scope(PermissionResource::File, PermissionOperation::Read, None),
-            ],
+            scopes: Vec::new(),
             required_permission: ToolPermissionMode::ReadOnly,
             approval_class: ToolApprovalClass::Policy,
             uses_network: false,
@@ -1845,18 +1882,50 @@ mod tests {
 
     #[test]
     fn r1_685_directory_root_fix_preserves_unknown_and_secret_classification() {
+        // (1) Still gated, and must stay so: an explicit secret-bearing target,
+        // an explicit secret declaration, or a glob pattern that escapes the
+        // workspace. Escaping patterns are refused outright, so the effect falls
+        // back to the conservative unknown envelope, which demands
+        // danger-full-access - a stronger gate than the Secret classification
+        // it replaces, and one a read-only ceiling cannot satisfy either.
+        for (tool, input) in [
+            ("workspace_snapshot", json!({"roots":[".env"]})),
+            ("workspace_snapshot", json!({"roots":["."],"contains_secrets":true})),
+            ("workspace_snapshot", json!({"roots":["."],"data_classification":"secret"})),
+        ] {
+            let effect = resolve_registered_tool_effect(
+                &crate::builtin_effect_resolver_spec(tool), tool, &input,
+                ToolPermissionMode::ReadOnly,
+            );
+            assert_eq!(effect.assessment.data_sensitivity, DataClassification::Secret, "{tool}: {input}");
+        }
+        for (tool, input) in [
+            ("glob_search", json!({"path":".","pattern":"../*.rs"})),
+            ("glob_search", json!({"path":".","pattern":"/other/*.rs"})),
+        ] {
+            let effect = resolve_registered_tool_effect(
+                &crate::builtin_effect_resolver_spec(tool), tool, &input,
+                ToolPermissionMode::ReadOnly,
+            );
+            assert_eq!(
+                effect.required_permission,
+                ToolPermissionMode::DangerFullAccess,
+                "an escaping glob pattern must not be certifiable under a read-only ceiling: {tool}: {input}"
+            );
+        }
+        // (2) No longer Secret: a plain read-only research effect whose read
+        // scope happens to carry no target. `read_file` with an explicit path
+        // and `glob_search` with a recursive pattern both read workspace
+        // content, and classifying only the latter as Secret is what forced
+        // danger-full-access onto read-only research tools. Sensitivity follows
+        // what the effect does, not whether its scope names a target.
         for (tool, input) in [
             ("workspace_snapshot", json!({})),
             ("workspace_snapshot", json!({"roots":[null]})),
             ("workspace_snapshot", json!({"roots":[""]})),
             ("workspace_snapshot", json!({"roots":[" "]})),
             ("workspace_snapshot", json!({"roots":[".",null]})),
-            ("workspace_snapshot", json!({"roots":[".env"]})),
-            ("workspace_snapshot", json!({"roots":["."],"contains_secrets":true})),
-            ("workspace_snapshot", json!({"roots":["."],"data_classification":"secret"})),
             ("glob_search", json!({"pattern":"*.rs"})),
-            ("glob_search", json!({"path":".","pattern":"../*.rs"})),
-            ("glob_search", json!({"path":".","pattern":"/other/*.rs"})),
             ("glob_search", json!({"path":".","pattern":"nested/*.rs"})),
             ("grep_search", json!({"pattern":"needle"})),
         ] {
@@ -1864,7 +1933,11 @@ mod tests {
                 &crate::builtin_effect_resolver_spec(tool), tool, &input,
                 ToolPermissionMode::ReadOnly,
             );
-            assert_eq!(effect.assessment.data_sensitivity, DataClassification::Secret, "{tool}: {input}");
+            assert_ne!(
+                effect.assessment.data_sensitivity,
+                DataClassification::Secret,
+                "a read-only research effect must not be classified Secret: {tool}: {input}"
+            );
         }
         assert!(crate::executor::orchestrate::original_static_file_scopes(
             "edit", &json!({"action":"write","path":".","content":"never"}),
@@ -1897,15 +1970,18 @@ mod tests {
                 json!({"patterns":[{"path":"src","pattern":"*.rs"},{"path":"tests","pattern":"*.rs"}]}),
                 vec![Some("src"), Some("tests")],
             ),
+            // Escaping patterns are refused, so the effect becomes the
+            // conservative unknown envelope, which declares no File scope at
+            // all and demands danger-full-access.
             (
                 "glob_search",
                 json!({"path":"src","pattern":"../*.rs"}),
-                vec![None],
+                Vec::new(),
             ),
             (
                 "glob_search",
                 json!({"path":"src","pattern":"/other/*.rs"}),
-                vec![None],
+                Vec::new(),
             ),
             (
                 "glob_search",

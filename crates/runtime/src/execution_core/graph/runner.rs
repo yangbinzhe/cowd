@@ -1422,6 +1422,10 @@ impl ExecutionGraphRunner {
                 "callback has no canonical original outcome or retirement".into(),
             ));
         };
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=callback_enter node={} executor={} abort={}", ticket.node_id, ticket.executor_kind, disposition == CallbackDisposition::Abort);
+        }
         let result = if disposition == CallbackDisposition::Abort {
             self.cancel_and_drain_locked(graph_id, executor, ticket)
                 .await?;
@@ -1434,9 +1438,17 @@ impl ExecutionGraphRunner {
         } else {
             run_after_commit_observed(executor, ticket).await
         };
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=callback_return node={} executor={} ok={}", ticket.node_id, ticket.executor_kind, result.is_ok());
+        }
         let result = match result {
             Ok(()) => {
                 let mut changes = self.state_store.subscribe_commits();
+                #[cfg(test)]
+                if std::env::var_os("COWD_R622_TRACE").is_some() {
+                    eprintln!("r622_toolbatch phase=physical_wait_enter node={} executor={}", ticket.node_id, ticket.executor_kind);
+                }
                 let observed = tokio::time::timeout(PHYSICAL_CLOSURE_BUDGET, async {
                     loop {
                         let current = self.state_store.load_async(graph_id).await?;
@@ -1488,6 +1500,10 @@ impl ExecutionGraphRunner {
                         "physical closure unconfirmed within original cancellation budget".into(),
                     )
                 })?;
+                #[cfg(test)]
+                if std::env::var_os("COWD_R622_TRACE").is_some() {
+                    eprintln!("r622_toolbatch phase=physical_wait_return node={} executor={} ok={}", ticket.node_id, ticket.executor_kind, observed.is_ok());
+                }
                 observed
             }
             Err(error) => Err(error.into()),

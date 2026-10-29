@@ -207,6 +207,15 @@ struct AuthBrokerProcess {
     child: Child,
     socket_path: PathBuf,
     socket_generation: Option<SocketGenerationOwnership>,
+    /// Device/inode identity of the authority root this helper owns. The root
+    /// lives inside the Gateway's private config home, which an isolated
+    /// evaluation launcher places in a tmpfs runtime root; re-verifying the
+    /// identity (not merely existence) is what tells "the helper restarted"
+    /// apart from "somebody replaced the directory under us".
+    root_identity: (u64, u64),
+    /// Set once the owner retires this helper, so the liveness watchdog never
+    /// resurrects a broker the Gateway has already shut down.
+    retired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AuthBrokerProcess {
@@ -243,10 +252,16 @@ impl AuthBrokerProcess {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|error| format!("failed to spawn auth broker: {error}"))?;
+        use std::os::unix::fs::MetadataExt;
+        let root_identity = std::fs::metadata(&root)
+            .map(|meta| (meta.dev(), meta.ino()))
+            .map_err(|error| format!("failed to identify auth broker root: {error}"))?;
         let mut broker = Self {
             child,
             socket_path,
             socket_generation: None,
+            root_identity,
+            retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let startup = (|| {
             let mut stdin = broker
@@ -289,11 +304,57 @@ impl AuthBrokerProcess {
     }
 
     fn shutdown(&mut self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(generation) = self.socket_generation.take() {
             remove_socket_if_owned(&self.socket_path, &generation);
         }
+    }
+
+    /// Whether the owner has already retired this helper.
+    fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Verify the helper this process owns is still serving, by identity.
+    ///
+    /// The authority root is the Gateway's private `auth-broker` directory. An
+    /// unrelated cleanup path that reclaims the surrounding runtime root
+    /// removes that directory while the Gateway is still live, and the only
+    /// observable symptom is a vanished socket: every later authenticated
+    /// request then fails to connect. Detect the loss here - child liveness,
+    /// socket presence and kind, and root device/inode identity - so the owner
+    /// can re-establish the helper instead of answering requests forever.
+    fn ensure_live(&mut self) -> Result<(), String> {
+        if self.is_retired() {
+            return Ok(());
+        }
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .map_err(|error| format!("failed to inspect auth broker: {error}"))?
+        {
+            return Err(format!("auth broker helper exited: {status}"));
+        }
+        let socket = std::fs::symlink_metadata(&self.socket_path)
+            .map_err(|error| format!("auth broker socket vanished: {error}"))?;
+        use std::os::unix::fs::FileTypeExt;
+        if !socket.file_type().is_socket() {
+            return Err("auth broker socket is no longer a socket".to_string());
+        }
+        let root = self
+            .socket_path
+            .parent()
+            .ok_or_else(|| "auth broker socket has no authority root".to_string())?;
+        use std::os::unix::fs::MetadataExt;
+        let current = std::fs::metadata(root)
+            .map_err(|error| format!("auth broker authority root vanished: {error}"))?;
+        if (current.dev(), current.ino()) != self.root_identity {
+            return Err("auth broker authority root was replaced".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -302,6 +363,67 @@ impl Drop for AuthBrokerProcess {
         self.shutdown();
     }
 }
+
+/// Keep the owned auth-broker helper alive for the Gateway's whole lifetime.
+///
+/// The helper's authority root is a directory inside the Gateway's private
+/// config home. Nothing else on the machine owns that directory's lifetime, so
+/// an unrelated cleanup path that reclaims the surrounding runtime root can
+/// delete it while the Gateway is still serving. Before this watchdog the only
+/// symptom was a vanished socket, surfaced per request as
+/// `authority storage error: No such file or directory` - a liveness failure
+/// misreported as a storage failure, which silently killed a whole isolated
+/// evaluation round at zero model cost.
+///
+/// The watchdog re-establishes the helper when its observable liveness is lost,
+/// and stops as soon as the owner retires it, so shutdown is never undone.
+fn spawn_auth_broker_liveness_watchdog(
+    registry: Arc<tokio::sync::Mutex<Option<AuthBrokerProcess>>>,
+    approval_dir: std::path::PathBuf,
+    credential: Option<String>,
+    catalog: auth_broker::AuthorizationCatalog,
+) {
+    let Some(credential) = credential else {
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(AUTH_BROKER_LIVENESS_INTERVAL).await;
+            let mut guard = registry.lock().await;
+            let Some(broker) = guard.as_mut() else {
+                return;
+            };
+            if broker.is_retired() {
+                return;
+            }
+            if let Err(reason) = broker.ensure_live() {
+                let retired = broker.is_retired();
+                drop(guard);
+                if retired {
+                    return;
+                }
+                tracing::error!(
+                    reason = %reason,
+                    "auth broker helper lost its authority storage or socket; re-establishing"
+                );
+                match AuthBrokerProcess::start(&approval_dir, &credential, &catalog) {
+                    Ok(fresh) => {
+                        *registry.lock().await = Some(fresh);
+                        tracing::warn!("auth broker helper re-established after liveness loss");
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "auth broker re-establishment failed");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// How often the owned auth-broker helper's liveness is verified. Short enough
+/// that a request never waits on a long dead helper, long enough that the check
+/// is not a hot path.
+const AUTH_BROKER_LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 struct SocketGenerationOwnership {
@@ -1974,6 +2096,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     };
     *auth_broker.lock().await = started_auth_broker;
+    spawn_auth_broker_liveness_watchdog(
+        Arc::clone(&auth_broker),
+        approval_dir.clone(),
+        config.auth_token.clone(),
+        auth_catalog.clone(),
+    );
     let upgrade_coordinator = Arc::new(runtime::UpgradeCoordinator::new());
     let mut runtime_bootstrap = match crate::runtime_bootstrap::assemble_runtime_state_with_loader(
         &workspace_root,

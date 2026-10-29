@@ -85,6 +85,22 @@ pub(crate) fn original_static_file_scopes(
                 .map(|requests| requests.iter().collect::<Vec<_>>())
                 .unwrap_or_else(|| vec![input]);
             for request in requests {
+                // A glob pattern that escapes the workspace is not a bounded
+                // research read. Refuse it so the effect falls back to the
+                // conservative unknown envelope, which keeps the hard boundary
+                // for `../*.rs` and `/other/*.rs` intact. A workspace-bounded
+                // recursive pattern is a different thing entirely and is
+                // declared with its root below.
+                if tool_id == "glob_search" {
+                    if let Some(pattern) = request.get("pattern").and_then(Value::as_str) {
+                        let normalized = pattern.trim().replace('\\', "/");
+                        if normalized.starts_with('/')
+                            || normalized.split('/').any(|part| part == "..")
+                        {
+                            return Err("glob_search pattern escapes the workspace".into());
+                        }
+                    }
+                }
                 let target = if tool_id == "glob_search"
                     && request
                         .get("pattern")
@@ -97,6 +113,43 @@ pub(crate) fn original_static_file_scopes(
                     directory_path(request.get("path"))
                 };
                 add(read, target, ProofEffectPurpose::InputRead);
+            }
+        }
+        "execute_code" => {
+            // The kernel-hardened, network-off, read-only sandbox copies exactly
+            // the declared `input_files` and nothing else ("omitted modules fail
+            // rather than reading the live workspace"), so the declared file
+            // effect is exactly those paths. This is what makes a bounded
+            // reduction certifiable by a lease that covers the declared inputs
+            // instead of demanding a whole-workspace `read:.`.
+            //
+            // An explicit empty set means no project files at all: the sandbox
+            // still materializes its read-only snapshot from the workspace root,
+            // so the root directory read is the honest declared scope there.
+            let files = input.get("input_files").and_then(Value::as_array);
+            match files {
+                Some(paths) if !paths.is_empty() => {
+                    if paths.len() > 64 {
+                        return Err("execute_code input_files exceeds the bounded set".into());
+                    }
+                    for path in paths {
+                        let Some(path) = path.as_str() else {
+                            return Err("execute_code input_files entries must be strings".into());
+                        };
+                        let normalized = path.trim().replace('\\', "/");
+                        if normalized.is_empty()
+                            || normalized.starts_with('/')
+                            || normalized.split('/').any(|part| part == "..")
+                        {
+                            return Err(
+                                "execute_code input_files entries must be workspace-relative"
+                                    .into(),
+                            );
+                        }
+                        add(read, Some(normalized), ProofEffectPurpose::InputRead);
+                    }
+                }
+                _ => add(read, Some(".".into()), ProofEffectPurpose::InputRead),
             }
         }
         "workspace_snapshot" => {

@@ -33,12 +33,37 @@ struct CancellationState {
     notify: tokio::sync::Notify,
     parents: Vec<CancellationToken>,
     signal_window: std::sync::Mutex<Option<(Instant, Instant)>>,
+    /// Test-fixture only: where this scope was cancelled from.
+    #[cfg(feature = "test-fixtures")]
+    cancel_site: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;
 
+/// Test-fixture only: the last cancellation signals with their source line and
+/// token identity, so an unexplained turn cancellation can be attributed.
+#[cfg(feature = "test-fixtures")]
+static CANCEL_SITES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, String)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn record_cancel_site(token_id: usize, site: &str) {
+    let slot = CANCEL_SITES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut guard) = slot.lock() {
+        guard.push((token_id, site.to_string()));
+        if guard.len() > 32 {
+            guard.remove(0);
+        }
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn cancel_sites() -> Vec<(usize, String)> {
+    let slot = CANCEL_SITES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    slot.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
 #[derive(Clone, Default, Debug)]
 pub struct CancellationToken(Arc<CancellationState>);
 
@@ -58,13 +83,78 @@ impl CancellationToken {
         false
     }
 
+    #[inline(never)]
+    #[track_caller]
     pub fn cancel(&self) {
+        #[cfg(feature = "test-fixtures")]
+        {
+            let site = format!("{}", std::panic::Location::caller());
+            if let Ok(mut guard) = self.0.cancel_site.lock() {
+                if guard.is_none() {
+                    *guard = Some(site.clone());
+                }
+            }
+            // The cancel call stack is the decisive evidence: it names the
+            // scope that escalated a cancellation.  It is written at cancel
+            // time so a run that later fails in another phase still keeps it.
+            {
+                use std::io::Write as _;
+                let path = std::env::temp_dir().join("k05-cancel-diagnostic.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = writeln!(
+                        file,
+                        "cancel token_id={:x} site={site} backtrace={}",
+                        self.identity(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
         let _ = self.cancel_first_signal();
     }
 
+    /// Test-fixture only: stable identity of this cancellation scope.
+    #[cfg(feature = "test-fixtures")]
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    /// Test-fixture only: the source line that cancelled this scope.
+    #[cfg(feature = "test-fixtures")]
+    pub(crate) fn last_cancel_site(&self) -> Option<String> {
+        let own = self.0.cancel_site.lock().ok().and_then(|guard| guard.clone());
+        let parents = self
+            .0
+            .parents
+            .iter()
+            .filter_map(|parent| parent.last_cancel_site())
+            .collect::<Vec<_>>();
+        if parents.is_empty() {
+            own
+        } else {
+            Some(format!("{own:?} parents={parents:?}"))
+        }
+    }
+
+    #[inline(never)]
+    #[track_caller]
     pub(crate) fn cancel_first_signal(&self) -> bool {
         let began = Instant::now();
         if !self.0.cancelled.swap(true, Ordering::SeqCst) {
+            #[cfg(feature = "test-fixtures")]
+            {
+                // A turn's cancellation token can be cancelled from any layer
+                // that holds a clone.  Record which token was cancelled and
+                // from where, so a captured child trace can attribute an
+                // unexplained "turn cancelled" to a concrete source line.
+                let id = Arc::as_ptr(&self.0) as usize;
+                let site = format!("{}", std::panic::Location::caller());
+                crate::conversation::record_cancel_site(id, &site);
+            }
             *self
                 .0
                 .signal_window
@@ -107,6 +197,8 @@ impl CancellationToken {
             notify: tokio::sync::Notify::new(),
             parents: vec![turn, step],
             signal_window: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-fixtures")]
+            cancel_site: std::sync::Mutex::new(None),
         }))
     }
 

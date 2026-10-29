@@ -109,7 +109,7 @@ impl CacheByteBudget {
     }
     fn reserve(self: &std::sync::Arc<Self>, bytes: usize) -> Option<CacheByteReservation> {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|sum| *sum <= self.limit)
             })
             .ok()?;
@@ -558,7 +558,7 @@ impl ProviderTransportPool {
                             if state.waiters >= self.cache_limits.identity_waiters
                                 || self
                                     .cache_waiters
-                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                                    .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                                         count
                                             .checked_add(1)
                                             .filter(|sum| *sum <= self.cache_limits.waiters)

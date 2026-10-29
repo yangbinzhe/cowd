@@ -401,6 +401,17 @@ pub enum AuthBrokerError {
     InvalidCredentialState(String),
     #[error("authority storage error: {0}")]
     Storage(String),
+    /// The broker helper process is not reachable: its socket is gone, or it
+    /// refuses the connection. This is a *liveness* failure of the helper the
+    /// Gateway owns, not a storage failure of the authority itself.
+    ///
+    /// Conflating the two is what made an unavailable helper look like corrupt
+    /// authority state: a run whose isolated runtime root was cleaned by an
+    /// unrelated path reported `authority storage error: No such file or
+    /// directory` and sent diagnosis toward the storage layer, while the real
+    /// defect was that nothing re-established the helper.
+    #[error("authority broker unavailable: {0}")]
+    BrokerUnavailable(String),
     #[error("authority crypto error: {0}")]
     Crypto(String),
     #[error("serialization error: {0}")]
@@ -767,7 +778,10 @@ impl BrokerClient {
     fn request(&self, request: BrokerRequest) -> Result<BrokerResponse, AuthBrokerError> {
         use std::os::unix::net::UnixStream;
 
-        let mut stream = UnixStream::connect(&self.socket_path).map_err(storage_error)?;
+        // A missing socket file or a refused connection means the helper this
+        // client talks to is not serving. Classify it as liveness so the caller
+        // can re-establish the helper instead of reporting broken storage.
+        let mut stream = UnixStream::connect(&self.socket_path).map_err(broker_unavailable)?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .map_err(storage_error)?;
@@ -2092,8 +2106,90 @@ pub fn entitlement_confirmation_digest(
     format!("sha256:{}", hex(digest.as_ref()))
 }
 
+#[cfg(test)]
+mod broker_liveness_tests {
+    use super::*;
+
+    /// A missing socket is a liveness failure of the helper, never a storage
+    /// failure of the authority. Reporting it as storage is what sent an
+    /// environment race down the wrong diagnostic path.
+    #[test]
+    fn a_missing_broker_socket_is_reported_as_unavailable_not_storage() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-broker-liveness-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create broker root");
+        let client = BrokerClient::new(BrokerClient::default_socket(&root));
+
+        let error = client
+            .trust_metadata()
+            .expect_err("no helper is listening on this socket");
+        assert!(
+            matches!(error, AuthBrokerError::BrokerUnavailable(_)),
+            "a vanished socket must be liveness, got {error:?}"
+        );
+        assert!(
+            !matches!(error, AuthBrokerError::Storage(_)),
+            "a vanished socket must never be reported as storage: {error:?}"
+        );
+        assert!(error.to_string().contains("unavailable"));
+        assert!(error_is_broker_unavailable(&error.to_string()));
+        assert!(
+            AuthBrokerError::BrokerUnavailable("reason".to_string())
+                .to_string()
+                .starts_with(BROKER_UNAVAILABLE_ERROR_PREFIX),
+            "the classifier prefix must stay pinned to the rendered error"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory in place of the socket is still not a reachable helper.
+    #[test]
+    fn a_non_socket_path_is_not_a_reachable_helper() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-broker-liveness-dir-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create broker root");
+        std::fs::create_dir_all(BrokerClient::default_socket(&root)).expect("occupy the socket path");
+        let client = BrokerClient::new(BrokerClient::default_socket(&root));
+
+        let error = client
+            .trust_metadata()
+            .expect_err("a directory is not a broker socket");
+        assert!(
+            matches!(error, AuthBrokerError::BrokerUnavailable(_)),
+            "got {error:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 fn storage_error(error: std::io::Error) -> AuthBrokerError {
     AuthBrokerError::Storage(error.to_string())
+}
+
+/// Transport-level failure to reach the broker helper.
+fn broker_unavailable(error: std::io::Error) -> AuthBrokerError {
+    AuthBrokerError::BrokerUnavailable(error.to_string())
+}
+
+/// Prefix every `BrokerUnavailable` rendering carries.
+///
+/// Callers that erase the error type to a `String` (the Gateway's request
+/// helpers do) use this to keep helper liveness apart from authority storage.
+/// The test below pins it to the `#[error(...)]` rendering so the two can never
+/// drift apart silently.
+pub const BROKER_UNAVAILABLE_ERROR_PREFIX: &str = "authority broker unavailable";
+
+/// Whether a rendered broker error describes helper liveness rather than
+/// authority storage.
+#[must_use]
+pub fn error_is_broker_unavailable(rendered: &str) -> bool {
+    rendered.starts_with(BROKER_UNAVAILABLE_ERROR_PREFIX)
 }
 
 #[cfg(test)]

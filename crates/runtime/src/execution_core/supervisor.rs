@@ -1760,6 +1760,12 @@ async fn run_completion_pump(
         };
 
         let available = max_active_nodes_per_graph.saturating_sub(active_nodes.len());
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            for node in &snapshot.ready {
+                eprintln!("r622_toolbatch phase=pump_ready node_id={} executor={}", node.id, node.executor_kind);
+            }
+        }
         let ready = snapshot
             .ready
             .into_iter()
@@ -1820,6 +1826,11 @@ async fn run_completion_pump(
             });
         }
 
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() {
+            eprintln!("r622_toolbatch phase=pump_state active={} inflight={} deferred={} waiting={} revision={}",
+                active_nodes.len(), in_flight.len(), admission_deferred, snapshot.report.waiting, snapshot.report.revision);
+        }
         if active_nodes.is_empty() {
             if admission_deferred {
                 runner.wait_for_resource_change().await;
@@ -1849,10 +1860,14 @@ async fn run_completion_pump(
                 );
             }
             () = durable_progress.notified() => {
+                #[cfg(test)]
+                if std::env::var_os("COWD_R622_TRACE").is_some() { eprintln!("r622_toolbatch phase=pump_wake source=durable_progress"); }
                 // Durable terminal truth is already committed. Re-read it and
                 // release direct successors without waiting for unrelated work.
             }
             joined = active_nodes.join_next() => {
+                #[cfg(test)]
+                if std::env::var_os("COWD_R622_TRACE").is_some() { eprintln!("r622_toolbatch phase=pump_wake source=node_join"); }
                 let Some(joined) = joined else {
                     continue;
                 };

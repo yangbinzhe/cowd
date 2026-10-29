@@ -2161,6 +2161,39 @@ where
                 });
                 }
             }
+            // The cancelled token's cancel site is read once: re-acquiring
+            // the runtime lock for the durable copy can queue behind an
+            // unrelated holder and strand this abort inside the diagnostic.
+            #[cfg(feature = "test-fixtures")]
+            let turn_token_cancel_site = self
+                .runtime
+                .lock()
+                .await
+                .cancellation_token()
+                .last_cancel_site();
+            #[cfg(feature = "test-fixtures")]
+            eprintln!(
+                "k05_terminal_presentation_aborted site={} last_operational_cancel={:?} cancel_sites={:?} turn_token_cancel_site={:?}",
+                std::panic::Location::caller(),
+                crate::execution_core::services::last_operational_cancel(),
+                crate::conversation::cancel_sites(),
+                turn_token_cancel_site
+            );
+            #[cfg(feature = "test-fixtures")]
+            {
+                use std::io::Write as _;
+                let path = std::env::temp_dir().join("k05-cancel-diagnostic.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = writeln!(
+                        file,
+                        "abort turn_token_cancel_site={turn_token_cancel_site:?}"
+                    );
+                }
+            }
             return Err("terminal_presentation_cancelled".to_string());
         }
         observe_stage!("session_input_fence");
@@ -3918,13 +3951,22 @@ pub(super) fn runtime_observation_identity(
     state: &TurnGraphState,
     ticket: &NodeExecutionTicket,
 ) -> RuntimeObservationIdentity {
+    #[cfg(test)]
+    if std::env::var_os("COWD_R622_TRACE").is_some() {
+        eprintln!("r622_toolbatch phase=observation_turn_owner ingress_present={} state_turn_present={} ingress_turn_matches_state={}",
+            state.ingress.is_some(), !state.turn_id.is_empty(),
+            state.ingress.as_ref().is_some_and(|ingress| ingress.turn_id == state.turn_id));
+    }
     RuntimeObservationIdentity {
         workspace_id: services.workspace_key().to_string(),
         session_id: state.session_id.clone(),
         turn_id: state
             .ingress
             .as_ref()
-            .map(|ingress| ingress.turn_id.clone()),
+            .map(|ingress| ingress.turn_id.clone())
+            // Direct owned turns have no Session ingress, but Host has
+            // already checked this turn against the supplied graph lineage.
+            .or_else(|| (!state.turn_id.is_empty()).then(|| state.turn_id.clone())),
         task_id: None,
         graph_id: ticket.graph_id.clone(),
         goal_id: state.goal_id.clone(),

@@ -2495,30 +2495,44 @@ impl LiveScenarioRunner {
                 }
                 pages_left -= 1;
                 let expected_cursor = observer.timeline_cursor().map(str::to_owned);
-                let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| e.to_string())?;
-                url.set_path("/api/runtime/timeline");
-                url.set_query(None);
-                {
-                    let mut query = url.query_pairs_mut();
-                    query.append_pair("session_id", session);
-                    query.append_pair("limit", &events_left.clamp(1, 100).to_string());
-                    if let Some(cursor) = &expected_cursor {
-                        query.append_pair("cursor", cursor);
+                // One page has to fit in the remaining byte budget. A busy
+                // session produces large timeline pages, and refusing the
+                // whole read turned a readable scenario into "exceeds
+                // remaining byte budget" instead of a business verdict. The
+                // page size shrinks until the page fits; the total byte,
+                // event and page budgets still bound the whole read.
+                let mut page_limit = events_left.clamp(1, 100);
+                let (mut response, url, expected_length) = loop {
+                    let mut url = reqwest::Url::parse(&self.base_url).map_err(|e| e.to_string())?;
+                    url.set_path("/api/runtime/timeline");
+                    url.set_query(None);
+                    {
+                        let mut query = url.query_pairs_mut();
+                        query.append_pair("session_id", session);
+                        query.append_pair("limit", &page_limit.to_string());
+                        if let Some(cursor) = &expected_cursor {
+                            query.append_pair("cursor", cursor);
+                        }
                     }
-                }
-                let mut response = self
-                    .client
-                    .get(url.clone())
-                    .timeout(remaining)
-                    .send()
-                    .map_err(|e| e.to_string())?;
-                if response.url() != &url || !response.status().is_success() {
-                    return Err("U5 resource response redirected or failed".into());
-                }
-                let expected_length = response.content_length();
-                if expected_length.is_some_and(|size| size > bytes_left as u64) {
-                    return Err("U5 resource response exceeds remaining byte budget".into());
-                }
+                    let response = self
+                        .client
+                        .get(url.clone())
+                        .timeout(remaining)
+                        .send()
+                        .map_err(|e| e.to_string())?;
+                    if response.url() != &url || !response.status().is_success() {
+                        return Err("U5 resource response redirected or failed".into());
+                    }
+                    let expected_length = response.content_length();
+                    if expected_length.is_some_and(|size| size > bytes_left as u64) {
+                        if page_limit > 1 {
+                            page_limit = (page_limit / 2).max(1);
+                            continue;
+                        }
+                        return Err("U5 resource response exceeds remaining byte budget".into());
+                    }
+                    break (response, url, expected_length);
+                };
                 let mut body = Vec::new();
                 let mut buffer = [0u8; 8192];
                 loop {

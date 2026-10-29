@@ -745,12 +745,24 @@ where
     };
     let commits = services.commit_service().clone();
     let original = ticket.clone();
+    #[cfg(test)]
+    if std::env::var_os("COWD_R622_TRACE").is_some() {
+        eprintln!("r622_toolbatch phase=transcript_read_enter node={} executor={}", ticket.node_id, ticket.executor_kind);
+    }
     let document =
         tokio::task::spawn_blocking(move || commits.committed_host_transcript(&original))
             .await
             .map_err(|error| invalid(error.to_string()))?
             .map_err(|error| invalid(error.to_string()))?;
+    #[cfg(test)]
+    if std::env::var_os("COWD_R622_TRACE").is_some() {
+        eprintln!("r622_toolbatch phase=transcript_runtime_lock_enter node={} executor={}", ticket.node_id, ticket.executor_kind);
+    }
     let mut owner = runtime.lock().await;
+    #[cfg(test)]
+    if std::env::var_os("COWD_R622_TRACE").is_some() {
+        eprintln!("r622_toolbatch phase=transcript_session_lock_enter node={} executor={}", ticket.node_id, ticket.executor_kind);
+    }
     let mut session = owner.session_mut_async().await;
     apply_host_transcript_messages(
         &mut session,
@@ -760,6 +772,10 @@ where
         &document.messages,
     )
     .map_err(&invalid)?;
+    #[cfg(test)]
+    if std::env::var_os("COWD_R622_TRACE").is_some() {
+        eprintln!("r622_toolbatch phase=transcript_apply_done node={} executor={}", ticket.node_id, ticket.executor_kind);
+    }
     Ok((
         document.session_id,
         document.turn_id,
@@ -3946,6 +3962,16 @@ where
                         )
                     });
                 let reason = error.to_string();
+                #[cfg(test)]
+                if let Some(path) = std::env::var_os("COWD_R638_ERROR") {
+                    use std::io::Write as _;
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+                        let record = serde_json::json!({"node":ticket.node_id,"attempt":ticket.attempt,"protocol_failure":protocol_failure,"tool_exposure_miss":tool_exposure_miss,"route_unavailable":terminal_provider_route_failure,"reason":reason.chars().take(4096).collect::<String>()});
+                        let saved = serde_json::to_writer(&mut file, &record).is_ok() && file.flush().is_ok() && file.sync_all().is_ok();
+                        eprintln!("r622_toolbatch phase=provider_first_error_saved ok={} node={} attempt={} protocol_failure={} tool_exposure_miss={} route_unavailable={}", saved, ticket.node_id, ticket.attempt, protocol_failure, tool_exposure_miss, terminal_provider_route_failure);
+                    }
+                }
                 let protocol_failure_detail =
                     protocol_failure.then(|| reason.chars().take(512).collect::<String>());
                 let (
@@ -9735,7 +9761,8 @@ where
         outcome.domain_events.push(
             self.services
                 .goal_store()
-                .observation_event(
+                .observation_event_at(
+                    &write_goal_source,
                     &observation,
                     format!("{}:goal-observation", ticket.idempotency_key),
                 )

@@ -1746,6 +1746,10 @@ where
                 Output = Result<harness_contract::context::ToolOutputDraft, ToolError>,
             > + Send,
     {
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" {
+            eprintln!("r622_toolbatch phase=root_effect_enter call={} root={} owner={}", request.tool_use_id, root.is_some(), owner.is_some());
+        }
         if let Some(outcome) = commit
             .completed_tool_effect(request, descriptor)
             .map_err(|error| ToolError::new(error.to_string()))?
@@ -1753,7 +1757,11 @@ where
             return replay_tool_output(crate::bound_tool_batch::retained_replay_outcome(outcome));
         }
         if let Some(root) = root {
+            #[cfg(test)]
+            if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=root_preflight_enter call={}", request.tool_use_id); }
             commit.preflight_fresh_root_tool(request, descriptor, root)?;
+            #[cfg(test)]
+            if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=root_preflight_done call={}", request.tool_use_id); }
         }
         let retain_refusal = |error: ToolError| {
             // A scope/resource wait can race closure of the original owner.
@@ -1804,6 +1812,8 @@ where
         {
             commit.preflight_fresh_bound_tool(request, descriptor)?;
         }
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=scope_lock_enter call={}", request.tool_use_id); }
         let locked = lock_root_effect_scope(
             request,
             descriptor,
@@ -1812,9 +1822,13 @@ where
             executor_owns_admission,
         )
         .await?;
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=scope_lock_done call={}", request.tool_use_id); }
         self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ToolExecution)
             .await
             .map_err(|error| ToolError::new(error.to_string()))?;
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_intent_enter call={}", request.tool_use_id); }
         let state = if let Some(root) = root {
             let (owner, attempt) =
                 owner.ok_or_else(|| ToolError::new("root effect has no original caller owner"))?;
@@ -1841,6 +1855,8 @@ where
             commit.begin_bound_tool_effect(request, descriptor, &locked.scope)
         }
         .map_err(|error| retain_refusal(ToolError::new(error.to_string())))?;
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_intent_done call={}", request.tool_use_id); }
         match state {
             crate::execution_core::graph::ToolEffectState::Completed(outcome) => {
                 return replay_tool_output(crate::bound_tool_batch::retained_replay_outcome(
@@ -1863,7 +1879,11 @@ where
             .admit_host_process(request, descriptor)
             .await
             .map_err(|error| ToolError::new(error.to_string()))?;
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_dispatch_enter call={}", request.tool_use_id); }
         let execution = execute().await;
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_dispatch_done call={} ok={}", request.tool_use_id, execution.is_ok()); }
         self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ToolCommit)
             .await
             .map_err(|error| ToolError::new(error.to_string()))?;
@@ -1950,6 +1970,8 @@ where
         } else {
             commit.commit_tool_effect(request, descriptor, &outcome)
         };
+        #[cfg(test)]
+        if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_terminal_receipt call={} ok={}", request.tool_use_id, committed.is_ok()); }
         committed.map_err(|error| {
             ToolError::new(format!(
                 "tool effect completed but durable receipt failed: {error}"

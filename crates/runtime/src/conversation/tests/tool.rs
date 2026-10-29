@@ -181,6 +181,53 @@ fn r1_branch_goal(services: &crate::RuntimeServices, session: &str) -> String {
     goal_id
 }
 
+#[test]
+fn r641_direct_owned_turn_uses_lineage_without_relaxing_goal_binding() {
+    let services = crate::RuntimeServices::in_memory().unwrap();
+    let session = "r641-session";
+    let (graph, ticket) = r1_branch_graph(&services, session, vec![], ExecutionNodeKind::InlineModel);
+    let goal_id = "r641-goal";
+    let goal: GoalContract = serde_json::from_value(serde_json::json!({
+        "id":goal_id,"session_id":session,"objective":"answer directly",
+        "criteria":[{"id":"checked","statement":"answer checked","status":"open"}],
+        "phase":"execution","spec_revision":1,"spec_digest":"branch-spec",
+        "scope":"internal","completion":"open","revision":1,"user_sequence":1,
+        "source_intent_ref":"session_input:r641-original",
+        "execution_binding":{"objective_id":"r641-objective","session_id":session,
+            "turn_id":"r1-branch-turn","root_execution_id":graph.id,"agentic_program_id":"r641-program"}
+    })).unwrap();
+    services.goal_store().create(goal).unwrap();
+    let mut state = r1_branch_state(session, goal_id);
+    assert!(state.ingress.is_none());
+    let identity = runtime_observation_identity(&services, &state, &ticket);
+    assert_eq!(identity.turn_id.as_deref(), Some("r1-branch-turn"));
+    let observation = runtime_observation(identity, RuntimeObservationKind::ProviderProgress,
+        "r641-provider", 1, "answer".into(), "r641".into(), ObservationResultClass::Succeeded);
+    let source = services.goal_store().projection(goal_id).unwrap().unwrap();
+    assert!(services.goal_store().turn_candidate_event_at(&source, &observation, &ticket, "answer").is_ok());
+    state.ingress = Some(TurnIngressRef {
+        request_id: "r641-request".into(), turn_id: "r1-branch-turn".into(),
+        message_id: "r641-message".into(), session_id: session.into(),
+        primary_task_id: "r641-task".into(), root_task_id: "r641-task".into(),
+        session_generation: 1, input_sequence: 1, claim_owner: "r641-owner".into(),
+        claim_token: "r641-claim".into(), claim_revision: 1, handoff_id: None,
+    });
+    let ingress_identity = runtime_observation_identity(&services, &state, &ticket);
+    assert_eq!(ingress_identity.turn_id.as_deref(), Some("r1-branch-turn"));
+    let ingress_observation = runtime_observation(ingress_identity, RuntimeObservationKind::ProviderProgress,
+        "r641-provider", 1, "answer".into(), "r641-ingress".into(), ObservationResultClass::Succeeded);
+    assert!(services.goal_store().turn_candidate_event_at(&source, &ingress_observation, &ticket, "answer").is_ok());
+    for mutate in 0..3 {
+        let mut foreign = observation.clone();
+        match mutate {
+            0 => foreign.identity.session_id = "foreign-session".into(),
+            1 => foreign.identity.turn_id = Some("foreign-turn".into()),
+            _ => foreign.identity.graph_id = "foreign-graph".into(),
+        }
+        assert!(services.goal_store().turn_candidate_event_at(&source, &foreign, &ticket, "answer").is_err());
+    }
+}
+
 #[derive(Clone)]
 struct R1CapturedModelStep {
     ticket: NodeExecutionTicket,
@@ -2029,16 +2076,35 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
 struct R1ToolResultExecutor {
     inner: RecordingToolExecutor,
     failures: Vec<String>,
+    lease: tools::ToolHostLease,
+    verified_checkpoints: Arc<AtomicUsize>,
+    independent_failures: bool,
+    read_finished: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
 impl ToolExecutor for R1ToolResultExecutor {
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
-        self.inner.tool_discovery_receipt()
+        let mut receipt = self.lease.catalog_receipt();
+        receipt.descriptors.retain(|descriptor| matches!(descriptor.canonical_id.as_str(), "tool_search" | "read_file" | "edit"));
+        receipt.activation_candidates.retain(|name| matches!(name.as_str(), "tool_search" | "read_file" | "edit"));
+        receipt
+    }
+
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.lease.clone())
     }
 
     fn available_tool_names(&self) -> Vec<String> {
         self.inner.available_tool_names()
+    }
+
+    fn has_tool(&self, name: &str) -> bool {
+        if name == "checkpoint" {
+            self.lease.snapshot().catalog.canonical_name(name).as_deref() == Some(name)
+        } else {
+            self.inner.has_tool(name)
+        }
     }
 
     fn registered_tool_effect(
@@ -2046,7 +2112,45 @@ impl ToolExecutor for R1ToolResultExecutor {
         name: &str,
         input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-        self.inner.registered_tool_effect(name, input)
+        Some(self.lease.describe_effect(name, input))
+    }
+
+    async fn execute_step_authorized_invocation_output(
+        &self,
+        binding: Option<&crate::step_snapshot::StepCallBinding>,
+        invocation_id: &str,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        let binding = binding.ok_or_else(|| ToolError::new("fixture original Step missing"))?;
+        let step = binding.resolve(Some(self.lease.clone())).map_err(|error| ToolError::new(error.to_string()))?;
+        step.validate_call(&binding.origin, &binding.snapshot.identity.session_id, invocation_id,
+            name, input, chrono::Utc::now().timestamp_millis()).map_err(|error| ToolError::new(error.to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(input).map_err(|error| ToolError::new(error.to_string()))?;
+        step.lease().validate_authorization(authorization, name, &value).map_err(|error| ToolError::new(error.to_string()))?;
+        if name != "checkpoint" {
+            return self.execute_output(name, input).await;
+        }
+        let output = step.lease().execute_async(authorization, name, &value).await
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let summary: tools::checkpoint::CheckpointSummary = serde_json::from_str(&output)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let checkpoint = std::path::PathBuf::from(&summary.path);
+        if !checkpoint.starts_with(step.lease().workspace_root().join(".cowd/checkpoints")) {
+            return Err(ToolError::new("checkpoint escaped original workspace"));
+        }
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(checkpoint.join(".manifest.json"))
+            .map_err(|error| ToolError::new(error.to_string()))?).map_err(|error| ToolError::new(error.to_string()))?;
+        let target = value["paths"].as_array().and_then(|paths| paths.first()).and_then(|path| path.as_str()).ok_or_else(|| ToolError::new("checkpoint target missing"))?;
+        if !matches!(target, "src/lib.rs" | "src/other.rs")
+            || !manifest["scopes"].as_array().is_some_and(|scopes| scopes.len() == 1 && scopes[0].as_str() == Some(target))
+            || std::fs::read(checkpoint.join(target)).map_err(|error| ToolError::new(error.to_string()))? != b"fixture source\n" {
+            return Err(ToolError::new("checkpoint did not retain original scoped bytes"));
+        }
+        self.verified_checkpoints.fetch_add(1, Ordering::SeqCst);
+        eprintln!("r622_toolbatch phase=checkpoint_verified original_scoped_bytes=true");
+        Ok(harness_contract::context::ToolOutputDraft::bounded_inline(output))
     }
 
     async fn execute_output(
@@ -2054,12 +2158,29 @@ impl ToolExecutor for R1ToolResultExecutor {
         name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        eprintln!("r622_toolbatch phase=tool_begin name={name}");
+        if self.independent_failures && name == "edit" {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.read_finished.notified())
+                .await.map_err(|_| ToolError::new("fixture read did not enter before independent edit"))?;
+        }
         if self.failures.iter().any(|failed| failed == name) {
             self.inner.order.lock().unwrap().push(name.to_string());
             self.inner.executed.fetch_add(1, Ordering::SeqCst);
+            if self.independent_failures && name == "read_file" { self.read_finished.notify_one(); }
+            eprintln!("r622_toolbatch phase=tool_end name={name} status=fixture_failure");
             return Err(ToolError::new(format!("deterministic {name} failure")));
         }
-        self.inner.execute_output(name, input).await
+        let result = if name == "tool_search" {
+            let mut receipt = self.tool_discovery_receipt();
+            receipt.query = "read and update source files".into();
+            receipt.descriptors.retain(|descriptor| descriptor.canonical_id != "tool_search");
+            receipt.activation_candidates = vec!["read_file".into(), "edit".into()];
+            Ok(harness_contract::context::ToolOutputDraft::bounded_inline(serde_json::to_string(&receipt).unwrap()))
+        } else {
+            self.inner.execute_output(name, input).await
+        };
+        eprintln!("r622_toolbatch phase=tool_end name={name} ok={}", result.is_ok());
+        result
     }
 }
 
@@ -2068,6 +2189,8 @@ struct R1ToolResultClient {
     inner: TwoToolClient,
     repeat: bool,
     response: usize,
+    lease: tools::ToolHostLease,
+    write_path: String,
 }
 
 impl ApiClient for R1ToolResultClient {
@@ -2078,13 +2201,31 @@ impl ApiClient for R1ToolResultClient {
         self.inner.configure_tool_exposure(projection);
     }
 
+    fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+        let exposure = self.inner.exposure.as_ref()?;
+        Some(self.lease.snapshot().catalog.definitions(None).into_iter()
+            .filter(|definition| exposure.active_ids.iter().chain(&exposure.bootstrap_ids).any(|id| id == &definition.name))
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            }).collect())
+    }
+
     fn stream(
         &mut self,
         request: ApiRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         self.response += 1;
+        eprintln!("r622_toolbatch phase=provider_request ordinal={}", self.response);
         if self.response <= 2 {
-            return self.inner.stream(request);
+            let write_path = self.write_path.clone();
+            return Box::pin(self.inner.stream(request).map(move |event| event.map(|event| match event {
+                AssistantEvent::ToolUse { id, name, input: _ } if name == "edit" => AssistantEvent::ToolUse {
+                    id, name, input: serde_json::json!({"action":"write","path":write_path,"content":"updated"}).to_string(),
+                },
+                event => event,
+            })));
         }
         if self.repeat && self.response == 3 {
             return Box::pin(stream::iter(vec![
@@ -2096,7 +2237,7 @@ impl ApiClient for R1ToolResultClient {
                 Ok(AssistantEvent::ToolUse {
                     id: "write-repeat".into(),
                     name: "edit".into(),
-                    input: r#"{"path":"src/lib.rs","content":"updated"}"#.into(),
+                    input: r#"{"action":"write","path":"src/lib.rs","content":"updated"}"#.into(),
                 }),
                 Ok(AssistantEvent::MessageStop),
             ]));
@@ -2112,23 +2253,34 @@ impl ApiClient for R1ToolResultClient {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn r1_event_replay_host_tool_result_sources_are_exact() {
-    for (failures, expected, repeat) in [
-        (vec![], ObservationResultClass::Succeeded, false),
+    for (case_index, (failures, expected, repeat, blocked_same_path)) in [
+        (vec![], ObservationResultClass::Succeeded, false, false),
         (
             vec!["edit".to_string()],
             ObservationResultClass::Partial,
-            false,
+            false, false,
         ),
         (
             vec!["read_file".to_string(), "edit".to_string()],
             ObservationResultClass::Failed,
-            false,
+            false, false,
         ),
-        (vec![], ObservationResultClass::Succeeded, true),
-    ] {
+        (vec![], ObservationResultClass::Succeeded, true, false),
+        (vec!["read_file".to_string(), "edit".to_string()], ObservationResultClass::Failed, false, true),
+    ].into_iter().enumerate() {
+        eprintln!("r617_toolbatch case={case_index} phase=services_begin");
         let services = r1_observation_services();
+        eprintln!("r617_toolbatch case={case_index} phase=services_ready");
         let executed = Arc::new(AtomicUsize::new(0));
         let order = Arc::new(Mutex::new(Vec::new()));
+        let verified_checkpoints = Arc::new(AtomicUsize::new(0));
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), "fixture source\n").unwrap();
+        std::fs::write(workspace.path().join("src/other.rs"), "fixture source\n").unwrap();
+        let lease = tools::ToolHost::builtin("r1-original-step", workspace.path())
+            .with_authorization_lease_verifier(Arc::new(crate::AuthorizationNegotiator::verify_lease_signature))
+            .pin_snapshot();
         let client = R1ToolResultClient {
             inner: TwoToolClient {
                 requests: 0,
@@ -2139,10 +2291,14 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
             },
             repeat,
             response: 0,
+            lease: lease.clone(),
+            write_path: if case_index == 2 { "src/other.rs" } else { "src/lib.rs" }.into(),
         };
         let session = Session::new();
         let session_id = session.session_id.clone();
+        eprintln!("r617_toolbatch case={case_index} phase=session_begin");
         let session_store = r1_tool_session_store(&session).await;
+        eprintln!("r617_toolbatch case={case_index} phase=session_ready");
         let runtime = crate::ConversationRuntime::new(
             session,
             client,
@@ -2152,6 +2308,10 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
                     order: order.clone(),
                 },
                 failures: failures.clone(),
+                lease,
+                verified_checkpoints: verified_checkpoints.clone(),
+                independent_failures: case_index == 2,
+                read_finished: Arc::new(tokio::sync::Notify::new()),
             },
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["use exposed dependency tools".into()],
@@ -2160,6 +2320,88 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
         .with_session_journal_port(
             crate::session_runtime_port::TestSessionPortAdapter::new(session_store.clone()),
         );
+        eprintln!("r617_toolbatch case={case_index} phase=turn_begin");
+        let monitor_stop = Arc::new(tokio::sync::Notify::new());
+        let monitor_signal = monitor_stop.clone();
+        let monitor_events = services.event_store().clone();
+        let monitor_services = services.clone();
+        let monitor_executed = executed.clone();
+        let monitor = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = monitor_signal.notified() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        match monitor_events.all_events(2048) {
+                            Ok(events) => {
+                                let count = |prefix: &str| events.iter().filter(|event| event.kind.starts_with(prefix)).count();
+                                eprintln!("r622_toolbatch case={case_index} phase=progress bounded_events={} model_steps={} tool_events={} graph_events={} goal_observations={} executor_calls={}",
+                                    events.len(), count("model.step_bound"), count("tool.invocation."),
+                                    count("execution_graph."), count("goal.observation"), monitor_executed.load(Ordering::SeqCst));
+                                for event in events.iter().filter(|event| event.kind.starts_with("tool.invocation.")).take(8) {
+                                    let name = event.payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                    let call = event.payload.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                    eprintln!("r622_toolbatch case={case_index} phase=tool_event seq={} event_id={} kind={} status={} name={} call={}",
+                                        event.sequence, event.event_id, event.kind, event.status.as_deref().unwrap_or("unknown"),
+                                        name.chars().take(96).collect::<String>(), call.chars().take(96).collect::<String>());
+                                    if event.kind == "tool.invocation.failed" {
+                                        eprintln!("r622_toolbatch case={case_index} phase=tool_failure kind={} is_error={} code={}",
+                                            event.payload.get("failure_kind").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                                            event.payload.get("is_error").and_then(|v| v.as_bool()).map(|v| v.to_string()).unwrap_or_else(|| "unknown".into()),
+                                            event.payload.get("failure_code").and_then(|v| v.as_str()).unwrap_or("unknown"));
+                                        if let Some(path) = std::env::var_os("COWD_R633_PRIVATE_PROBE") {
+                                            use std::io::Write as _;
+                                            use std::os::unix::fs::OpenOptionsExt as _;
+                                            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+                                                let private = serde_json::json!({
+                                                    "failure_kind": event.payload.get("failure_kind"),
+                                                    "output_preview": event.payload.get("output_preview").and_then(|v| v.as_str()).map(|v| v.chars().take(4096).collect::<String>()),
+                                                    "model_visible_preview": event.payload.get("model_visible_preview").and_then(|v| v.as_str()).map(|v| v.chars().take(4096).collect::<String>()),
+                                                });
+                                                let written = serde_json::to_writer(&mut file, &private).is_ok() && file.flush().is_ok() && file.sync_all().is_ok();
+                                                eprintln!("r622_toolbatch case={case_index} phase=private_failure_saved ok={written}");
+                                            }
+                                        }
+                                    }
+                                }
+                                for event in events.iter().filter(|event| event.kind.starts_with("execution_graph.")).rev().take(3) {
+                                    eprintln!("r622_toolbatch case={case_index} phase=graph_event kind={} status={}",
+                                        event.kind, event.status.as_deref().unwrap_or("unknown"));
+                                }
+                                if let Some(event) = events.iter().rev().find(|event| event.kind.starts_with("execution_graph.")) {
+                                    match monitor_services.graph_state_store().load(&event.stream_id) {
+                                        Ok(graph) => {
+                                            eprintln!("r622_toolbatch case={case_index} phase=graph_snapshot node_count={} revision={}", graph.nodes.len(), graph.revision);
+                                            for node in graph.nodes.iter().take(20) {
+                                                eprintln!("r622_toolbatch case={case_index} phase=graph_node id={} kind={:?} executor={} status={:?}",
+                                                    node.id, node.kind, node.executor_kind.chars().take(96).collect::<String>(), graph.node_statuses.get(&node.id));
+                                                for edge in graph.edges.iter().filter(|edge| edge.to == node.id) {
+                                                    eprintln!("r622_toolbatch case={case_index} phase=graph_dependency from={} to={} kind={:?} from_status={:?}",
+                                                        edge.from, edge.to, edge.kind, graph.node_statuses.get(&edge.from));
+                                                }
+                                                let attempt = graph.recovery_cursor.node_attempts.get(&node.id).copied().unwrap_or(0);
+                                                if attempt != 0 {
+                                                    let store = monitor_services.graph_state_store();
+                                                    let closure = store.current_binding(&graph, &node.id, attempt)
+                                                        .and_then(|binding| store.binding_start_position(&graph, &node.id, &binding)
+                                                            .and_then(|start| match start {
+                                                                Some(start) => store.binding_lease_closure(&graph, &node.id, &binding, start).map(Some),
+                                                                None => Ok(None),
+                                                            }));
+                                                    let state = match closure { Ok(Some(true)) => "closed", Ok(Some(false)) => "not_closed", Ok(None) => "start_missing", Err(_) => "read_error" };
+                                                    eprintln!("r622_toolbatch case={case_index} phase=binding_closure node_kind={:?} attempt={} state={}", node.kind, attempt, state);
+                                                }
+                                            }
+                                        }
+                                        Err(_) => eprintln!("r622_toolbatch case={case_index} phase=graph_snapshot unavailable"),
+                                    }
+                                }
+                            }
+                            Err(_) => eprintln!("r622_toolbatch case={case_index} phase=progress events=unavailable"),
+                        }
+                    }
+                }
+            }
+        });
         let (_, result) = submit_test_owned_conversation_turn(
             runtime,
             services.clone(),
@@ -2168,7 +2410,72 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
             test_execution_lineage(),
         )
         .await;
+        monitor_stop.notify_one();
+        monitor.await.unwrap();
+        eprintln!("r617_toolbatch case={case_index} phase=turn_returned");
+        if let Some(path) = std::env::var_os("COWD_R638_SNAPSHOT") {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut path = std::path::PathBuf::from(path).into_os_string();
+            path.push(format!(".case{case_index}"));
+            if let Ok(events) = services.event_store().all_events(2048) {
+                let selected: Vec<_> = events.into_iter().filter(|event| {
+                    event.kind.starts_with("model.") || event.kind.starts_with("goal.observation")
+                        || event.kind.starts_with("execution_graph.") || event.kind.contains("provider")
+                        || event.kind.starts_with("runtime.policy.") || event.kind.starts_with("strategy.")
+                        || event.kind == "system.step_bound" || event.kind.starts_with("tool.")
+                }).take(128).collect();
+                if let Ok(bytes) = serde_json::to_vec(&selected) {
+                    if bytes.len() <= 512 * 1024 {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+                            let written = file.write_all(&bytes).is_ok() && file.sync_all().is_ok();
+                            eprintln!("r622_toolbatch case={case_index} phase=provider_snapshot_saved ok={written} records={}", selected.len());
+                        }
+                    } else {
+                        eprintln!("r622_toolbatch case={case_index} phase=provider_snapshot_oversized");
+                    }
+                }
+            }
+        }
         result.expect("tool failure remains governed");
+        assert!(verified_checkpoints.load(Ordering::SeqCst) > 0, "real original scoped checkpoint must be verified");
+        eprintln!("r617_toolbatch case={case_index} phase=receipt_begin");
+        if blocked_same_path {
+            r1_assert_tool_raw_sources(&session_store, &services, &session_id, &[
+                ("discover-tools", "tool_search", false), ("read-1", "read_file", true),
+            ]).await;
+            let raw = session_store.get_session_domain_events_by_kind_limited(&session_id, "evidence.raw.persisted", 0, 128).await.unwrap();
+            assert!(raw.len() < 128);
+            assert!(raw.iter().all(|event| session::SessionDomainEvent::from_session_event(event).unwrap().payload["tool_call_id"] != "write-1"));
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            assert_eq!(*order.lock().unwrap(), vec!["read_file"]);
+            let events = services.event_store().all_events(2048).unwrap();
+            assert!(events.len() < 2048);
+            let mut blocked_witnesses = 0;
+            for event in events.into_iter().filter(|event| matches!(event.kind.as_str(), "execution_graph.recovered" | "execution_graph.checkpoint")) {
+                let graph = services.graph_state_store().load(&event.stream_id).unwrap();
+                let resolved = services.event_store().resolve_read_record(event).unwrap();
+                for closure in resolved.payload["lease_closures"].as_array().into_iter().flatten() {
+                    let Some(calls) = closure["no_dispatch"]["calls"].as_array() else { continue };
+                    for call in calls.iter().filter(|call| call["call_id"] == "write-1") {
+                        let reason = call["reason"].as_str().unwrap();
+                        assert!(reason.contains("blocked before dispatch by predecessor `read-1`"), "{reason}");
+                        let node = closure["node_id"].as_str().unwrap();
+                        let attempt = closure["binding"]["attempt"].as_u64().unwrap() as u32;
+                        assert_eq!(closure["graph_id"], graph.id);
+                        let store = services.graph_state_store();
+                        let binding = store.current_binding(&graph, node, attempt).unwrap();
+                        assert_eq!(serde_json::to_value(&binding).unwrap(), closure["binding"]);
+                        let start = store.binding_start_position(&graph, node, &binding).unwrap().unwrap();
+                        assert!(store.binding_lease_closure(&graph, node, &binding, start).unwrap());
+                        blocked_witnesses += 1;
+                    }
+                }
+            }
+            assert_eq!(blocked_witnesses, 1, "one authenticated original NoDispatch closure");
+            eprintln!("r617_toolbatch case={case_index} phase=blocked_same_path_verified");
+            continue;
+        }
         r1_assert_tool_raw_sources(
             &session_store,
             &services,
@@ -2184,6 +2491,7 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
             ],
         )
         .await;
+        eprintln!("r617_toolbatch case={case_index} phase=receipt_first_ready");
         if repeat {
             r1_assert_tool_raw_sources(
                 &session_store,
@@ -2205,6 +2513,7 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
                 vec!["read_file", "edit"]
             }
         );
+        eprintln!("r617_toolbatch case={case_index} phase=goal_assertions_begin");
         let history = services.event_store().all_events(100_000).unwrap();
         for call_id in ["read-1", "write-1"] {
             assert_eq!(
@@ -2308,6 +2617,7 @@ async fn r1_event_replay_host_tool_result_sources_are_exact() {
                 .distinguishing_evidence_refs
                 .is_empty());
         }
+        eprintln!("r617_toolbatch case={case_index} phase=goal_assertions_done");
     }
 }
 
