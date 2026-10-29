@@ -578,16 +578,39 @@ pub(crate) fn receipt_replay_contract(
     }
     let mut stored_invocation = invocation.clone();
     stored_invocation.intent.normalized_input = serde_json::Value::Null;
-    Ok(
-        json!({"session_id":request.session_id,"parent_execution":request.parent_execution,
+    let replay = json!({"session_id":request.session_id,"parent_execution":request.parent_execution,
         "parent_execution_attempt":request.parent_execution_attempt,
         "authorization_digest":receipt_identity_digest(b"tool-effect-authorization-v1\0",&request.authorization)?,
         "authorized_scopes":request.authorized_scopes,
         "policy_revision":request.policy_revision,"sandbox_posture":request.sandbox_posture,
         "observation_wave_sequence":request.observation_wave_sequence,
         "step_snapshot_digest":receipt_step_digest(binding)?,
-        "call_id":request.tool_use_id,"origin":binding.origin,"payload_digest":payload,"invocation":stored_invocation}),
-    )
+        "call_id":request.tool_use_id,"origin":binding.origin,"payload_digest":payload,"invocation":stored_invocation});
+    Ok(replay)
+}
+
+pub(crate) fn receipt_lifecycle_anchor(
+    request: &crate::RuntimeToolExecutionRequest,
+) -> Result<Option<serde_json::Value>, ExecutionCommitError> {
+    let Some(binding) = request.step_binding.as_ref() else { return Ok(None); };
+    if let Some(anchor) = request.tool_progress.lifecycle_anchor().map_err(ExecutionCommitError::InvalidCommand)? {
+        let producer = &anchor.producer;
+        if anchor.invocation_id.is_empty()
+            || anchor.session_id != binding.snapshot.identity.session_id
+            || anchor.tool_call_id != request.tool_use_id
+            || anchor.tool_name != request.tool_name
+            || anchor.input_hash != crate::tool_invocation::stable_hash(&request.input)
+            || producer.validate().is_err()
+            || producer.session_id != binding.snapshot.identity.session_id
+            || producer.turn_id != binding.snapshot.identity.turn_id
+            || producer.tool_call_id.as_deref() != Some(request.tool_use_id.as_str())
+            || producer.tool_contract_id.as_deref() != Some(request.tool_name.as_str())
+        {
+            return Err(ExecutionCommitError::InvalidCommand("tool lifecycle anchor crosses its original request owner".into()));
+        }
+        return Ok(Some(serde_json::to_value(anchor)?));
+    }
+    Ok(None)
 }
 
 pub(super) fn receipt_payload_matches(

@@ -695,7 +695,7 @@ pub use runtime_event_store::{
     CheckedSourceEvidence, CheckedSourceValidator, CommittedEventBatch, CommittedStreamRevision,
     DurableRuntimeEvent, ExpectedStreamRevision, PreparedContentRoot, PreparedReconciliationReport,
     QuiescedContentRoots, RuntimeBoundedEventLookup, RuntimeEventInput, RuntimeEventRecord,
-    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
+    PositionPageError, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
     RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeProjectionCheckpoint,
     RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionScanPage,
     RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
@@ -705,6 +705,7 @@ pub use runtime_event_store::{
 };
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use runtime_event_store::{FixtureEvidencePage, FixtureEvidencePageRequest};
+
 #[doc(hidden)]
 pub use runtime_event_store::{
     runtime_event_request_hash, runtime_event_request_hash_with_terminal,

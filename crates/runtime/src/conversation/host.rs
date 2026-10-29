@@ -1863,6 +1863,15 @@ where
                 .load_async(&graph_id)
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+            // A physically observed, claim-authorized cancellation has no
+            // synthesized answer. Keep it distinct from missing output due to
+            // failure, and require the original committed Graph/effect and
+            // Session sources before assigning that terminal class.
+            match services.authenticated_provider_graph_cancellation(&graph) {
+                Ok(Some(_)) => return Err(RuntimeError::from_authenticated_graph_cancellation()),
+                Ok(None) => {}
+                Err(error) => return Err(RuntimeError::new(format!("original cancellation verification failed: {error}"))),
+            }
             let statuses = graph
                 .nodes
                 .iter()
@@ -2066,7 +2075,7 @@ where
                 },
             ),
             Err(error) => (
-                if error.to_string().contains("cancelled") {
+                if error.is_authenticated_graph_cancellation() || error.to_string().contains("cancelled") {
                     crate::execution_core::TurnStrategyDecisionStatus::Cancelled
                 } else {
                     crate::execution_core::TurnStrategyDecisionStatus::Failed
@@ -3783,7 +3792,47 @@ fn test_collaboration_obligation(
     }
 }
 
+// Return only user-named field labels; never include candidate values or
+// framework identities in model-facing recovery feedback.
+fn json_field_language_findings(objective: &str, fields: &serde_json::Map<String, serde_json::Value>) -> Option<Vec<String>> {
+    let mut named = false;
+    let mut missing = Vec::new();
+    for sentence in objective.split(|c: char| matches!(c, '。' | '；' | ';' | '\n')) {
+        if !sentence.contains("中文") && !sentence.to_ascii_lowercase().contains("chinese") {
+            continue;
+        }
+        for (name, value) in fields {
+            if sentence.contains(name) {
+                named = true;
+                if !value.as_str().is_some_and(|text| text.chars().any(is_cjk_character)) {
+                    if name.len() <= 80 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        missing.push(name.clone());
+                    } else {
+                        // An unrenderable user-named field must still fail the
+                        // language check; it is never copied into feedback.
+                        missing.push(String::new());
+                    }
+                }
+            }
+        }
+    }
+    named.then_some(missing)
+}
+
 fn response_language_mismatch(objective: &str, response: &str) -> bool {
+    // Machine keys and paths do not themselves declare a language obligation.
+    if objective_requires_strict_json(objective) {
+        if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(response.trim()) {
+            if let Some(missing) = json_field_language_findings(objective, &fields) {
+                return !missing.is_empty();
+            }
+            let explicitly_chinese = objective.contains("中文")
+                || objective.to_ascii_lowercase().contains("chinese");
+            return explicitly_chinese && !fields.values().any(|value| {
+                value.as_str().is_some_and(|text| text.chars().any(is_cjk_character))
+            });
+        }
+    }
     let objective_uses_cjk = objective.chars().any(is_cjk_character);
     let response_uses_cjk = response.chars().any(is_cjk_character);
     let response_uses_language_specific_text = response.chars().any(char::is_alphabetic);
@@ -5237,6 +5286,7 @@ where
             runtime: self.runtime.upgrade()?,
             state: self.state.upgrade()?,
             services: self.services.upgrade()?,
+            goal_revalidation: std::sync::Mutex::new(None),
         }))
     }
 }
@@ -5530,6 +5580,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 ),
             );
             let calls = [candidate.call.clone()];
+            let early_invocations = Arc::new(Mutex::new(HashMap::new()));
             let early_ticket = ticket;
             let started_at_ms = crate::tool_invocation::now_ms();
             let context = HostGovernedToolContext {
@@ -5538,6 +5589,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     None => return defer("runtime_tool_host_unavailable".to_string()),
                 },
                 event_bus,
+                original_producers: None,
                 calls: &calls,
                 session_id: &session_id,
                 sandbox_posture: early_execution_policy.sandbox_posture,
@@ -5558,7 +5610,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 commit_service: services.commit_service(),
                 precompleted: None,
                 idempotency_keys: Some(&idempotency_keys),
-                invocations: Arc::new(Mutex::new(HashMap::new())),
+                invocations: Arc::clone(&early_invocations),
             };
             let mut report = crate::GovernedToolExecutor.execute(&plan, &context).await;
             let completed_at_ms = crate::tool_invocation::now_ms();
@@ -5582,8 +5634,16 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 "early_tool_service_ms",
                 std::time::Duration::from_millis(completed_at_ms.saturating_sub(started_at_ms)),
             );
+            let lifecycle = early_invocations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&candidate.call.id).cloned()
+                .and_then(|record| record.original_producer.clone().map(|producer|
+                    crate::conversation::ToolLifecycleReuse::PendingOriginal { record, producer }))
+                .unwrap_or(crate::conversation::ToolLifecycleReuse::Unknown);
             crate::conversation::EarlyToolDispatchResult::Executed(
                 crate::conversation::EarlyToolExecutionReceipt {
+                    lifecycle,
                     call: candidate.call,
                     outcome: receipt,
                     ready_at_ms: candidate.ready_at_ms,
@@ -5816,6 +5876,17 @@ struct TurnToolBatchBackend<C: ApiClient, T: ToolExecutor> {
     runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: Arc<crate::RuntimeServices>,
+    goal_revalidation: std::sync::Mutex<Option<ToolGoalRevalidation>>,
+}
+
+#[derive(Clone)]
+struct ToolGoalRevalidation {
+    ticket: NodeExecutionTicket,
+    source: crate::execution_core::goal::GoalProjection,
+    observation: RuntimeObservation,
+    checkpoint: crate::execution_core::goal::GoalWriteCheckpoint,
+    original_satisfied: bool,
+    outcome: NodeExecutionOutcome,
 }
 
 async fn compact_governed_tool_messages<C, T>(
@@ -5823,6 +5894,7 @@ async fn compact_governed_tool_messages<C, T>(
     calls: &[ModelToolCall],
     raw_messages: Vec<ConversationMessage>,
     invocations: &HashMap<String, ToolInvocationRecord>,
+    precompleted: &BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>,
 ) -> Result<Vec<ConversationMessage>, RuntimeError>
 where
     C: ApiClient,
@@ -5835,6 +5907,11 @@ where
     let runtime = runtime.lock().await;
     let mut messages = Vec::with_capacity(raw_messages.len());
     runtime.remember_native_tool_calls(calls)?;
+    for call in calls {
+        if let Some(receipt) = precompleted.get(&call.id) {
+            runtime.restore_native_root_owner_from_replay(call, receipt)?;
+        }
+    }
     for raw_message in raw_messages {
         let Some((tool_use_id, tool_name, output, is_error)) =
             raw_message.blocks.iter().find_map(|block| match block {
@@ -5856,6 +5933,21 @@ where
             continue;
         };
         let input = call_inputs.get(tool_use_id).copied().unwrap_or_default();
+        #[cfg(test)]
+        if tool_use_id == "ra-read" {
+            let pending = precompleted.get(tool_use_id).map(|receipt| match &receipt.lifecycle {
+                crate::conversation::ToolLifecycleReuse::PendingOriginal { .. } => "pending_original",
+                crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: Some(_) } => "durable_original",
+                crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: None } => "durable_unknown",
+                crate::conversation::ToolLifecycleReuse::Unknown => "unknown",
+            }).unwrap_or("none");
+            eprintln!("ra_lifecycle_compactor call=ra-read precompleted={pending} invocation_present={} producer_present={}",
+                invocations.contains_key(tool_use_id), invocations.get(tool_use_id).is_some_and(|record| record.original_producer.is_some()));
+        }
+        #[cfg(feature = "test-fixtures")]
+        if std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some() && tool_use_id == "recovery-complete" {
+            eprintln!("rc_completion_stage before_compactor_item");
+        }
         messages.push(
             runtime
                 .prepare_governed_tool_result_with_invocation(
@@ -5868,6 +5960,10 @@ where
                 )
                 .await?,
         );
+        #[cfg(feature = "test-fixtures")]
+        if std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some() && tool_use_id == "recovery-complete" {
+            eprintln!("rc_completion_stage after_compactor_item");
+        }
     }
     Ok(messages)
 }
@@ -5878,6 +5974,7 @@ where
 /// receives fully-bound individual requests.  Results are returned in model
 /// call order even when their execution is concurrent.
 struct GovernedToolBatchResult {
+    refused_before_dispatch: Vec<crate::conversation::PreDispatchRefusal>,
     messages: Vec<ConversationMessage>,
     invocations: HashMap<String, ToolInvocationRecord>,
     observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
@@ -5888,6 +5985,7 @@ struct GovernedToolBatchResult {
 struct HostGovernedToolContext<'a> {
     host: Arc<dyn crate::RuntimeExecutionHost>,
     event_bus: Option<crate::CowdEventBus>,
+    original_producers: Option<&'a HashMap<String, harness_contract::projection::RuntimeActivityBinding>>,
     calls: &'a [ModelToolCall],
     session_id: &'a str,
     sandbox_posture: harness_contract::policy::SandboxPosture,
@@ -6182,7 +6280,11 @@ async fn execute_fenced_runtime_tool(
                     };
                 }
             };
-            let mut outcome = host.execute_runtime_tool(request).await;
+            let mut outcome = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                crate::bound_tool_batch::with_outer_read_receipt_owner(request, host.execute_runtime_tool(request)).await
+            } else {
+                host.execute_runtime_tool(request).await
+            };
             // A process-class effect owns a physical process tree, so its
             // durable receipt must carry the honest quiescence proof. The
             // host shell is not a sandbox process: it can prove that the
@@ -6657,12 +6759,13 @@ fn qualified_root_answer(
     {
         return false;
     }
-    if trimmed.starts_with('{') {
-        return envelope.user_answer_contract.format
-            == harness_contract::outcome::UserAnswerFormat::StrictJson
-            && serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+    if envelope.user_answer_contract.format == harness_contract::outcome::UserAnswerFormat::StrictJson {
+        return serde_json::from_str::<serde_json::Value>(trimmed)
+            .is_ok_and(|value| value.is_object());
     }
-    envelope.user_answer_contract.format != harness_contract::outcome::UserAnswerFormat::StrictJson
+    // Human-facing contracts do not require a machine format. In particular,
+    // a valid JSON-shaped answer is not itself a presentation failure.
+    true
 }
 
 /// Deterministic fail-closed checks for a root collaboration presentation.

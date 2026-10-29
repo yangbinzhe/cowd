@@ -657,6 +657,7 @@ fn pinned_stream_events(
                     event.kind.as_str(),
                     crate::context_evidence::NATIVE_DELIVERY_KIND
                         | crate::context_evidence::PROCESS_DELIVERY_KIND
+                        | "context.nested_read_model_observed"
                 ) {
                     events.push(event);
                 }
@@ -730,6 +731,201 @@ pub(crate) struct VerifiedReadDelivery {
     pub original_scope: Option<harness_contract::goal::ProofEffectScope>,
 }
 
+pub(crate) struct VerifiedNestedRead {
+    pub parent: crate::context_evidence::ReadDeliveryMaterial,
+    pub event: crate::DurableRuntimeEvent,
+    pub primary: crate::DurableRuntimeEvent,
+    pub index: crate::DurableRuntimeEvent,
+    pub body: crate::context_evidence::ReadBodySeal,
+    pub extent: crate::context_evidence::ReadExtent,
+    pub target: harness_contract::goal::ProofEffectTarget,
+    pub step_index: u64,
+    pub position: u64,
+}
+
+/// Re-authenticate a child delivery against its original parent admission,
+/// atomic receipt pair, exact child scope and Runtime-observed wire record.
+pub(crate) fn nested_parent_material(payload: &serde_json::Value) -> Result<crate::context_evidence::ReadDeliveryMaterial, String> {
+    use crate::context_evidence::{ReadDeliveryGrade, ReadDeliveryRecipient, ReadDeliveryTransport};
+    let mut parent = payload["parent"].clone();
+    let object = parent.as_object_mut().ok_or("nested parent identity invalid")?;
+    if object.contains_key("body") { return Err("nested parent must not claim a read body".into()); }
+    object.insert("body".into(), payload["child"]["body"].clone());
+    let seal = crate::context_evidence::decode_read_acquisition(&parent).map_err(str::to_string)?;
+    let recipient: ReadDeliveryRecipient = serde_json::from_value(payload["recipient"].clone()).map_err(|e| e.to_string())?;
+    let transport: ReadDeliveryTransport = serde_json::from_value(payload["transport"].clone()).map_err(|e| e.to_string())?;
+    let material = crate::context_evidence::ReadDeliveryMaterial {
+        schema_version:1, grade:ReadDeliveryGrade::ProviderModelObserved, acquisition:seal.clone(),
+        acquisition_event_id:payload["parent_event_id"].as_str().ok_or("nested primary missing")?.into(),
+        acquisition_cursor:payload["parent_cursor"].as_u64().ok_or("nested cursor missing")?,
+        index_event_id:payload["index_event_id"].as_str().ok_or("nested index missing")?.into(),
+        session_id:seal.session_id.clone(), execution_id:seal.graph_id.clone(), turn_id:seal.step.turn_id.clone(),
+        tool_invocation_id:seal.invocation_id.clone(), recipient, presentation_sha256:payload["presentation_sha256"].as_str().ok_or("nested presentation missing")?.into(),
+        presentation_bytes:payload["presentation_bytes"].as_u64().ok_or("nested presentation size missing")?,
+        body_omitted:true, delivered_extent:None, transport,
+    };
+    crate::context_evidence::decode_read_delivery(&serde_json::to_value(&material).map_err(|e| e.to_string())?).map_err(str::to_string)?;
+    Ok(material)
+}
+
+pub(crate) fn verify_nested_read(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    event: &crate::DurableRuntimeEvent,
+    session: &str,
+    turn: &str,
+    root: Option<&str>,
+    packet: Option<&harness_contract::agent::AgentTaskPacket>,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<Option<VerifiedNestedRead>, String> {
+    use crate::context_evidence::{ReadDeliveryRecipient, ReadDeliveryTransport, ReadExtent};
+    if event.kind != "context.nested_read_model_observed" || event.schema_version != 1
+        || event.scope != crate::RuntimeEventScope::Session || event.actor.as_deref() != Some("conversation_runtime")
+        || event.status.as_deref() != Some("confirmed") || event.payload["schema_version"] != 1 { return Ok(None); }
+    let payload = &event.payload;
+    let material = nested_parent_material(payload)?;
+    let seal = &material.acquisition;
+    if seal.tool_name != "tool_orchestrate" || seal.session_id != session || seal.step.turn_id != turn
+        || event.stream_id != format!("session:{session}") { return Ok(None); }
+    let ReadDeliveryTransport::NativeProviderContinuation { raw_ref, .. } = &material.transport else { return Ok(None); };
+    let owner_event = match (&material.recipient, packet) {
+        (ReadDeliveryRecipient::Root { owner, .. }, None) => {
+            if root != Some(seal.graph_id.as_str()) { return Ok(None); }
+            let owner_ref = harness_contract::goal::ProofInputEvent { stream_id:owner.stream_id.clone(), sequence:owner.sequence,
+                event_id:owner.event_id.clone(), payload_digest:owner.payload_digest.clone() };
+            let owner_event = verify_material_event_with_reader(reader, &owner_ref, sources)?;
+            if !crate::context_evidence::root_read_owner_matches(owner, &owner_event, &seal)
+                || owner_event.payload["full_output_ref"] != format!("tool://{}", raw_ref.id()) { return Ok(None); }
+            Some(owner_event)
+        }
+        (ReadDeliveryRecipient::AgentTask { identity }, Some(packet)) => {
+            if *identity != packet.assignment.execution_identity || seal.graph_id != packet.graph_id()
+                || seal.node_id != packet.node_id() || seal.attempt != packet.attempt
+                || seal.step.run_ref.as_deref() != Some(packet.run_id())
+                || seal.step.actor_ref.as_deref() != Some(packet.agent_id())
+                || !packet.allowed_tools.contains(&"tool_orchestrate".to_string())
+                || !packet.allowed_tools.contains(&"read_file".to_string())
+                || !packet.binding.as_ref().is_some_and(|b| b.tool_contract_refs.contains(&"tool_orchestrate".to_string())
+                    && b.tool_contract_refs.contains(&"read_file".to_string())) { return Ok(None); }
+            None
+        }
+        _ => return Ok(None),
+    };
+    let primary = reader.event_by_idempotency_key(&seal.primary_stream, &seal.primary_key)?.ok_or("nested primary absent")?;
+    let index = reader.event_by_idempotency_key(&seal.index_stream, &seal.index_key)?.ok_or("nested index absent")?;
+    let key = seal.primary_key.strip_suffix(":read-receipt").ok_or("nested key invalid")?;
+    let origin: harness_contract::step::CallOrigin = serde_json::from_value(seal.origin.clone()).map_err(|e| e.to_string())?;
+    if !matches!(origin.source, harness_contract::step::CallSource::Provider { ref attempt_id } if !attempt_id.is_empty())
+        || seal.primary_stream != format!("execution-effect:{key}")
+        || seal.index_stream != format!("execution-agent-receipts:{}:{}:{}",seal.graph_id,seal.node_id,seal.attempt)
+        || seal.index_key != format!("agent-tool-receipt:{key}")
+        || primary.idempotency_key.as_deref() != Some(seal.primary_key.as_str())
+        || index.idempotency_key.as_deref() != Some(seal.index_key.as_str())
+        || primary.payload["tool_use_id"] != seal.invocation_id || primary.payload["tool_name"] != seal.tool_name
+        || primary.payload["input_sha256"] != seal.input_sha256
+        || primary.payload["replay"]["session_id"] != seal.session_id
+        || primary.payload["replay"]["call_id"] != seal.invocation_id
+        || primary.payload["replay"]["origin"] != seal.origin
+        || !primary.refs.iter().any(|r| r.kind == "execution_graph" && r.id == seal.graph_id)
+        || !primary.refs.iter().any(|r| r.kind == "execution_node" && r.id == seal.node_id)
+        || !primary.refs.iter().any(|r| r.kind == "agent_attempt" && r.id == seal.attempt.to_string())
+    { return Err("nested parent binding invalid".into()); }
+    if primary.kind != "execution.read.receipt" || index.kind != "execution.agent_tool.receipt"
+        || primary.actor.as_deref() != Some("governed_tool") || index.actor != primary.actor
+        || primary.event_id != material.acquisition_event_id || primary.commit_cursor != material.acquisition_cursor
+        || index.event_id != material.index_event_id || event.commit_cursor <= primary.commit_cursor
+        || primary.payload["outcome"]["status"] != "executed"
+        || primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] != index.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD]
+    { return Err("nested receipt pair invalid".into()); }
+    let descriptor = crate::context_evidence::native_acquisition_descriptor(&primary, &seal).map_err(str::to_string)?;
+    if owner_event.as_ref().is_some_and(|owner| owner.commit_cursor <= primary.commit_cursor || event.commit_cursor <= owner.commit_cursor) {
+        return Err("nested owner order invalid".into());
+    }
+    if primary.payload["replay"]["parent_execution"].is_null() {
+        if owner_event.is_none() { return Err("root nested owner absent".into()); }
+        let intent = reader.event_by_idempotency_key(&seal.primary_stream, &format!("{key}:read-intent"))?.ok_or("nested intent absent")?;
+        crate::context_evidence::authenticate_root_read_intent(&intent, &primary, &index, &seal).map_err(str::to_string)?;
+        let graph = reader.transaction_stream_revision_exact(&intent.transaction_id, &seal.graph_id)?.ok_or("nested graph admission absent")?;
+        if Some(graph.expected_revision) != intent.payload["root_effect_owner"]["graph_revision"].as_u64()
+            || graph.expected_revision != graph.committed_revision { return Err("nested graph admission changed".into()); }
+    } else if primary.transaction_id != index.transaction_id || primary.commit_cursor != index.commit_cursor
+        || index.transaction_index <= primary.transaction_index
+        || primary.payload["replay"]["parent_execution"]["execution_id"] != seal.graph_id
+        || primary.payload["replay"]["parent_execution"]["node_id"] != seal.node_id
+        || primary.payload["replay"]["parent_execution_attempt"] != seal.attempt
+        || primary.payload["replay"]["origin"] != seal.origin
+        || primary.payload["outcome"] != index.payload["outcome"]
+        || primary.payload["effect"] != index.payload["effect"]
+        || primary.payload["resolved_effect_scope"] != index.payload["resolved_effect_scope"]
+        || !index.refs.iter().any(|r| r.kind == "agent_attempt" && r.id == seal.attempt.to_string())
+    { return Err("nested delegated receipt mismatch".into()); }
+    let child = &payload["child"];
+    let children = primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].as_array().ok_or("nested children absent")?;
+    if children.iter().filter(|candidate| *candidate == child).count() != 1 || child["schema_version"] != 1
+        || child["parent_tool_use_id"] != seal.invocation_id || child["parent_idempotency_key"] != key
+        || child["parent_descriptor_hash"] != descriptor.descriptor_hash || child["tool_name"] != "read_file" { return Err("nested child is foreign".into()); }
+    let step_index = child["step_index"].as_u64().ok_or("nested step missing")?;
+    let position = child["position"].as_u64().ok_or("nested position missing")?;
+    if children.iter().filter(|other| other["step_index"] == step_index && other["position"] == position).count() != 1 { return Err("ambiguous nested position".into()); }
+    let original_input = primary.payload["original_input"].as_str().ok_or("nested original input absent")?;
+    let source_input = payload["source_input"].as_str().ok_or("nested source input absent")?;
+    if crate::context_evidence::read_sha256(original_input.as_bytes()) != seal.input_sha256
+        || owner_event.as_ref().is_some_and(|owner| owner.payload["input_hash"] != crate::tool_invocation::stable_hash(source_input))
+    { return Err("nested original input changed".into()); }
+    let parent_input: serde_json::Value = serde_json::from_str(original_input).map_err(|e| e.to_string())?;
+    let strict_input = harness_contract::step::parse_strict_json(original_input).map_err(|e| e.to_string())?;
+    let strict_source = harness_contract::step::parse_strict_json(source_input).map_err(|e| e.to_string())?;
+    if primary.payload["replay"]["payload_digest"]
+        != harness_contract::step::canonical_digest("tool-effect-payload", &strict_input).map_err(|e| e.to_string())?
+        || strict_source != strict_input
+        || !primary.payload["replay"]["invocation"]["intent"]["normalized_input"].is_null()
+        || primary.payload["replay"]["invocation"]["origin"] != seal.origin
+        || primary.payload["replay"]["invocation"]["invocation_id"] != seal.invocation_id
+    { return Err("nested original compiled input mismatch".into()); }
+    let step = parent_input["steps"].as_array().and_then(|steps| steps.get(step_index as usize)).ok_or("nested step absent")?;
+    let call = step["calls"].as_array().and_then(|calls| calls.get(position as usize)).ok_or("nested call absent")?;
+    if step["id"] != child["step_id"] || step["op"] != "batch" || call["tool"] != "read_file" || call["input"] != child["input"]
+        || crate::context_evidence::read_sha256(&serde_json::to_vec(&child["input"]).map_err(|e| e.to_string())?) != child["input_sha256"] { return Err("nested original input mismatch".into()); }
+    let effect: harness_contract::tool::ToolEffectDescriptor = serde_json::from_value(child["effect"].clone()).map_err(|e| e.to_string())?;
+    if effect.tool_id != "read_file" || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read || effect.scopes.len() != 1
+        || !descriptor.scopes.contains(&effect.scopes[0]) { return Err("nested child descriptor invalid".into()); }
+    let scope: harness_contract::goal::ProofEffectScope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).map_err(|e| e.to_string())?;
+    let mut targets = scope.targets.iter().filter(|target| target.declared_scope == effect.scopes[0]);
+    let target = targets.next().ok_or("nested child scope absent")?.clone();
+    if !scope.complete || targets.next().is_some() || !target.exact || !target.alias_checked
+        || target.access_mode != harness_contract::context::WorkspaceAccessMode::Read
+        || target.coverage != harness_contract::context::EvidenceCoverageKind::ScopedContent
+        || target.declared_scope.resource != harness_contract::policy::PermissionResource::File
+        || target.declared_scope.operation != harness_contract::policy::PermissionOperation::Read
+        || target.path.object_kind != harness_contract::context::WorkspaceObjectKind::File { return Err("nested child scope invalid".into()); }
+    let body: crate::context_evidence::ReadBodySeal = serde_json::from_value(child["body"].clone()).map_err(|e| e.to_string())?;
+    let extent: ReadExtent = serde_json::from_value(payload["delivered_extent"].clone()).map_err(|e| e.to_string())?;
+    let ReadExtent::FileLines {start_line,line_count,total_lines,ends_with_newline,body_sha256,body_bytes,source_omitted} = &extent else { return Err("nested extent invalid".into()); };
+    let ReadExtent::FileLines {start_line: original_start,line_count: original_count,total_lines: original_total,source_omitted: original_omitted,ends_with_newline: original_newline,body_sha256: original_hash,body_bytes: original_bytes} = &body.extent else { return Err("nested source extent invalid".into()); };
+    let prefixes = child["prefixes"].as_array().ok_or("nested prefix seals absent")?;
+    let full = *line_count == *original_count && body_sha256 == original_hash
+        && *body_bytes == *original_bytes && ends_with_newline == original_newline;
+    if *start_line != *original_start || *total_lines != *original_total || (*line_count == 0 && !full) || *line_count > *original_count
+        || (!source_omitted && (*original_omitted || *line_count != *original_count))
+        || (!full && prefixes.iter().filter(|p| p["line_count"] == *line_count && p["bytes"] == *body_bytes
+            && p["sha256"] == *body_sha256 && p["ends_with_newline"] == *ends_with_newline).count() != 1) { return Err("nested delivered prefix mismatch".into()); }
+    for source in [&seal.primary_stream,&seal.index_stream,&seal.graph_id] {
+        let revision=reader.stream_revision(source)?;
+        if sources.insert(source.clone(),revision).is_some_and(|old| old != revision) { return Err("nested source moved".into()); }
+    }
+    Ok(Some(VerifiedNestedRead { parent:material,event:event.clone(),primary,index,body,extent,target,step_index,position }))
+}
+
+#[cfg(test)]
+pub(crate) fn verify_nested_read_for_test(
+    store: &RuntimeEventStore, event: &crate::DurableRuntimeEvent,
+    session: &str, turn: &str, root: Option<&str>,
+    packet: Option<&harness_contract::agent::AgentTaskPacket>,
+) -> Result<bool, String> {
+    let mut reader = super::read_source::StoreReadSource(store);
+    let mut sources = std::collections::BTreeMap::new();
+    Ok(verify_nested_read(&mut reader, event, session, turn, root, packet, &mut sources)?.is_some())
+}
+
 impl VerifiedReadDelivery {
     pub(crate) fn receipt_reference(&self) -> String {
         match &self.material.recipient {
@@ -756,6 +952,7 @@ impl VerifiedReadDelivery {
 
 pub(crate) struct ReviewDeliverySnapshot {
     pub reads: Vec<VerifiedReadDelivery>,
+    pub nested_reads: Vec<VerifiedNestedRead>,
     pub sources: std::collections::BTreeMap<String, u64>,
 }
 
@@ -1010,7 +1207,14 @@ pub(crate) fn read_delivery_snapshot_for_scope(
         READ_ACQUISITION_FIELD,
     };
     let mut reads = Vec::new();
+    let mut nested_reads = Vec::new();
     for event in events {
+        if event.kind == "context.nested_read_model_observed" {
+            if let Some(nested) = verify_nested_read(reader, &event, session_id, turn_id, root_execution_id, packet, &mut sources)? {
+                nested_reads.push(nested);
+            }
+            continue;
+        }
         let expected = match event.kind.as_str() {
             NATIVE_DELIVERY_KIND => ("conversation_runtime", "confirmed"),
             PROCESS_DELIVERY_KIND => ("runtime.process_jsonl", "sent"),
@@ -1232,7 +1436,7 @@ pub(crate) fn read_delivery_snapshot_for_scope(
             return Err("read delivery source moved during validation".into());
         }
     }
-    Ok(ReviewDeliverySnapshot { reads, sources })
+    Ok(ReviewDeliverySnapshot { reads, nested_reads, sources })
 }
 
 #[cfg(test)]
@@ -5360,6 +5564,7 @@ fn proof_input_snapshot_for_phase(
                 *pinned,
                 current,
                 reviewer_delivery_packet.as_ref(),
+                &mut sources,
             )?
         {
             return Err(format!(

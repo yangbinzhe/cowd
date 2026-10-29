@@ -794,9 +794,74 @@ fn send_response(request: RequestBuilder, deadline: Instant) -> Result<Response,
         })?;
     remaining_until(deadline)?;
     if !response.status().is_success() {
-        return Err(format!("http_status_{}", response.status().as_u16()));
+        let status = response.status().as_u16();
+        // Only expose a small, fixed classification. Gateway error text can
+        // contain private Session data and must never enter a public report.
+        let code = if status == 500 {
+            use std::io::Read;
+            let mut body = Vec::new();
+            if response.take(4097).read_to_end(&mut body).is_ok() && body.len() <= 4096 {
+                capture_private_http_error(&body);
+                cancellation_error_code(&body)
+            } else {
+                "unknown"
+            }
+        } else {
+            "unknown"
+        };
+        return Err(if code == "unknown" {
+            format!("http_status_{status}")
+        } else {
+            format!("http_status_{status}:{code}")
+        });
     }
     Ok(response)
+}
+
+// Optional diagnostic for an explicitly supplied, private owner directory.
+// Raw bodies never enter the report or logs; failure to capture leaves the
+// original HTTP error unchanged.
+fn capture_private_http_error(body: &[u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let Some(dir) = std::env::var_os("COWD_EVAL_PRIVATE_HTTP_ERROR_DIR") else { return };
+        let dir = std::path::Path::new(&dir);
+        let Ok(metadata) = std::fs::symlink_metadata(dir) else { return };
+        let Ok(process) = std::fs::metadata("/proc/self") else { return };
+        if !metadata.is_dir() || metadata.mode() & 0o777 != 0o700 || metadata.uid() != process.uid() {
+            return;
+        }
+        let path = dir.join(format!("http-error-{}.json", uuid::Uuid::new_v4()));
+        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+            let _ = file.write_all(body);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = body;
+}
+
+fn cancellation_error_code(body: &[u8]) -> &'static str {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return "unknown",
+    };
+    let Some(error) = parsed.get("error").and_then(Value::as_str) else {
+        return "unknown";
+    };
+    for (prefix, code) in [
+        ("failed to read cancellation receipt:", "cancel_read_receipt"),
+        ("failed to reconcile cancellation receipt:", "cancel_reconcile_receipt"),
+        ("failed to commit cancellation intent:", "cancel_commit_intent"),
+        ("failed to cancel descendant execution graphs:", "cancel_descendant_graphs"),
+        ("failed to resolve cancellation receipt:", "cancel_resolve_receipt"),
+    ] {
+        if error.starts_with(prefix) {
+            return code;
+        }
+    }
+    "unknown"
 }
 
 fn decode_response<Output: DeserializeOwned>(response: Response) -> Result<Output, String> {
@@ -849,6 +914,13 @@ mod tests {
     };
 
     const CLIENT_ID: &str = "a1111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn cancellation_http_error_classification_never_exposes_private_body() {
+        assert_eq!(cancellation_error_code(br#"{"error":"failed to cancel descendant execution graphs: private details"}"#), "cancel_descendant_graphs");
+        assert_eq!(cancellation_error_code(br#"{"error":"private details"}"#), "unknown");
+        assert_eq!(cancellation_error_code(b"not json"), "unknown");
+    }
 
     #[test]
     fn terminal_selection_ignores_stale_latest_text_and_rejects_real_ambiguity() {

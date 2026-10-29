@@ -640,6 +640,13 @@ pub struct ArtifactWriteDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolOutputDraft {
+    /// Ephemeral evidence owned by the in-process tool executor. It is never
+    /// serialized and must be authenticated before a durable receipt is made.
+    #[serde(skip)]
+    InProcess {
+        content: String,
+        evidence: InProcessToolEvidence,
+    },
     ObservedArtifact {
         summary: String,
         artifact_ref: ArtifactRef,
@@ -652,6 +659,23 @@ pub enum ToolOutputDraft {
         summary: String,
         artifact_ref: ArtifactRef,
     },
+}
+
+#[derive(Clone)]
+pub struct InProcessToolEvidence(std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for InProcessToolEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InProcessToolEvidence(..)")
+    }
+}
+impl PartialEq for InProcessToolEvidence {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for InProcessToolEvidence {}
+impl InProcessToolEvidence {
+    pub fn new<T: std::any::Any + Send + Sync>(value: T) -> Self { Self(std::sync::Arc::new(value)) }
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> { self.0.downcast_ref::<T>() }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -723,7 +747,7 @@ impl ToolOutputDraft {
     #[must_use]
     pub fn model_text(&self) -> &str {
         match self {
-            Self::BoundedInline { content } => content,
+            Self::BoundedInline { content } | Self::InProcess { content, .. } => content,
             Self::StagedArtifact { summary, .. } | Self::ObservedArtifact { summary, .. } => {
                 summary
             }
@@ -733,7 +757,7 @@ impl ToolOutputDraft {
     #[must_use]
     pub const fn artifact_ref(&self) -> Option<&ArtifactRef> {
         match self {
-            Self::BoundedInline { .. } => None,
+            Self::BoundedInline { .. } | Self::InProcess { .. } => None,
             Self::StagedArtifact { artifact_ref, .. }
             | Self::ObservedArtifact { artifact_ref, .. } => Some(artifact_ref),
         }
@@ -1979,6 +2003,20 @@ fn estimate_tokens(content: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn in_process_tool_evidence_is_never_serialized() {
+        let draft = super::ToolOutputDraft::InProcess {
+            content: "receipt".into(),
+            evidence: super::InProcessToolEvidence::new(7u64),
+        };
+        assert_eq!(draft.model_text(), "receipt");
+        assert!(serde_json::to_value(&draft).is_err());
+        assert!(serde_json::from_str::<super::ToolOutputDraft>(r#"{"kind":"in_process","content":"receipt","evidence":7}"#).is_err());
+        if let super::ToolOutputDraft::InProcess { evidence, .. } = draft {
+            assert_eq!(evidence.downcast_ref::<u64>(), Some(&7));
+            assert!(evidence.downcast_ref::<String>().is_none());
+        } else { panic!("lost in-process evidence"); }
+    }
     use super::*;
 
     #[test]

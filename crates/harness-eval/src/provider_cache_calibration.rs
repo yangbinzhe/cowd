@@ -153,6 +153,7 @@ pub fn run_provider_cache_calibration(
             budget: budget.clone(),
             preparation: Default::default(),
             provider_evidence_context: Some(runtime::ProviderRequestEvidenceContext {
+            graph_owner: None,
                 session_id: session_id.clone(),
                 execution_id: format!("{session_id}:execution"),
                 turn_id: format!("{session_id}:turn"),
@@ -485,6 +486,7 @@ mod tests {
         );
         budget.set_context_window_source("configured");
         let context = runtime::ProviderRequestEvidenceContext {
+            graph_owner: None,
             session_id: "calibration-standalone".into(),
             execution_id: "calibration-execution".into(),
             turn_id: "calibration-turn".into(),

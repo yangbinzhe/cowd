@@ -386,9 +386,15 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     Some(step_lease),
                 )
                 .await
-                .map(|output| {
+                .and_then(|output| {
                     typed_observations = output.observations().to_vec();
-                    output.model_text().to_string()
+                    if let harness_contract::context::ToolOutputDraft::InProcess { evidence, .. } = &output {
+                        if let Some(reads) = evidence.downcast_ref::<Vec<tools::OrchestratedRead>>() {
+                            request.tool_progress.record_child_reads(reads.clone())
+                                .map_err(ToolError::new)?;
+                        }
+                    }
+                    Ok(output.model_text().to_string())
                 })
             }
         } else {

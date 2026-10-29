@@ -1181,6 +1181,21 @@ fn u5_stage_usage_inner(leaves: &[Value], cancellation: bool) -> Result<Value, S
     Ok(Value::Object(result))
 }
 
+// The three-piece row also records the optional goal observation. Its two
+// required pieces must still be explicitly true when that observation is absent.
+fn u5_acceptance_checks_pass(checks: &[Value]) -> bool {
+    !checks.is_empty()
+        && checks.iter().all(|check| {
+            check["passed"] == true
+                || (check["passed"] == false
+                    && check["name"] == "terminal_three_piece_complete"
+                    && check["missing"] == json!(["goal_verified"])
+                    && check["pieces"]["goal_verified"] == false
+                    && check["pieces"]["business_outcome"] == true
+                    && check["pieces"]["user_visible_delivery"] == true)
+        })
+}
+
 fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
     let live = &report["live_gateway_scenarios"];
     let pairs = live["scenarios"].as_array();
@@ -1196,9 +1211,7 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
                     && v.pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
                     && v.pointer("/acceptance/checks")
                         .and_then(Value::as_array)
-                        .is_some_and(|checks| {
-                            !checks.is_empty() && checks.iter().all(|c| c["passed"] == true)
-                        })
+                        .is_some_and(|checks| u5_acceptance_checks_pass(checks))
             })
     });
     let identities = leaves.is_some_and(|l| {
@@ -1223,9 +1236,7 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
             && l[1]
                 .pointer("/acceptance/checks")
                 .and_then(Value::as_array)
-                .is_some_and(|checks| {
-                    !checks.is_empty() && checks.iter().all(|c| c["passed"] == true)
-                })
+                .is_some_and(|checks| u5_acceptance_checks_pass(checks))
     });
     let usage = leaves.and_then(|l| {
         if cancellation {
@@ -3877,6 +3888,39 @@ pub(crate) mod u5_stage_tests {
                     .status,
                 "failed"
             );
+        }
+    }
+
+    #[test]
+    fn u5_optional_goal_observation_preserves_required_facts() {
+        let optional = json!({"name":"terminal_three_piece_complete", "passed":false,
+            "missing":["goal_verified"], "pieces":{"goal_verified":false,
+            "business_outcome":true,"user_visible_delivery":true}});
+        for mut stage in [original_stage(), original_cancel_stage()] {
+            let checks = stage
+                .pointer_mut("/live_gateway_scenarios/scenarios/0/sessions/1/acceptance/checks")
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
+            checks.push(optional.clone());
+            assert_eq!(evaluate_report_gate(&stage).status, "pending_outer_cleanup");
+            for (path, bad) in [
+                ("/pieces/business_outcome", json!(false)),
+                ("/pieces/user_visible_delivery", Value::Null),
+                ("/pieces/goal_verified", Value::Null),
+                ("/missing", json!(["goal_verified", "business_outcome"])),
+                ("/passed", Value::Null),
+            ] {
+                let mut rejected = stage.clone();
+                let check = &mut rejected["live_gateway_scenarios"]["scenarios"][0]["sessions"][1]
+                    ["acceptance"]["checks"][1];
+                *check.pointer_mut(path).unwrap() = bad;
+                assert_eq!(evaluate_report_gate(&rejected).status, "failed", "{path}");
+            }
+            let mut rejected = stage.clone();
+            rejected["live_gateway_scenarios"]["scenarios"][0]["sessions"][1]["acceptance"]
+                ["checks"][0]["passed"] = json!(false);
+            assert_eq!(evaluate_report_gate(&rejected).status, "failed");
         }
     }
 

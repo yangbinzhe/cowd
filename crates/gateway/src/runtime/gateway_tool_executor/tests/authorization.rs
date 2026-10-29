@@ -317,6 +317,35 @@
     }
 
     #[tokio::test]
+    async fn nested_child_gateway_channel_requires_original_grant() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "alpha\n").unwrap();
+        let host = Arc::new(tools::ToolHost::builtin("gateway-nested-test", workspace.path())
+            .with_authorization_lease_verifier(Arc::new(runtime::AuthorizationNegotiator::verify_lease_signature)));
+        let executor = GatewayToolExecutor::from_tool_host(None, false, host);
+        let input = json!({"steps":[{"id":"reads","op":"batch","calls":[
+            {"tool":"read_file","input":{"path":"a.txt","complete":true}}
+        ]}]});
+        let auth = signed_test_authorization(&executor, "tool_orchestrate", &input, 1);
+        let output = executor.execute_authorized_output_with_progress(
+            &auth, "tool_orchestrate", &input.to_string(), None, Some(executor.tool_host.pin_snapshot()),
+        ).await.unwrap();
+        let harness_contract::context::ToolOutputDraft::InProcess { content, evidence } = output else {
+            panic!("missing private child channel")
+        };
+        let children = evidence.downcast_ref::<Vec<tools::OrchestratedRead>>().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!((children[0].step_index(), children[0].position()), (0, 0));
+        assert_eq!(children[0].parent_authorization(), &auth);
+        assert!(content.contains("alpha"));
+        let mut forged = auth.clone();
+        forged.authorization_lease.signature = "forged".into();
+        assert!(executor.execute_authorized_output_with_progress(
+            &forged, "tool_orchestrate", &input.to_string(), None, Some(executor.tool_host.pin_snapshot()),
+        ).await.is_err());
+    }
+
+    #[tokio::test]
     async fn bound_mcp_dispatch_retains_the_original_service_after_host_replacement() {
         let registry = GatewayToolRegistry::builtin().with_runtime_tools(vec![RuntimeToolDefinition {
             name: "mcp_tool".into(), description: None, input_schema: json!({"type":"object","additionalProperties":true}),

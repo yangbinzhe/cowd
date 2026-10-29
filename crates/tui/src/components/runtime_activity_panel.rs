@@ -1447,6 +1447,7 @@ mod tests {
             execution_id: "execution-547".to_string(),
             agentic_collaboration: Default::default(),
             terminal_axes: Default::default(),
+            history_verification_progress: None,
             revision: 4,
             cursor: 4,
             detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,

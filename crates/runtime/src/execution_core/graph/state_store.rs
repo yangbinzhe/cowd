@@ -654,7 +654,7 @@ impl ExecutionGraphStateStore {
         )>,
         ExecutionStateStoreError,
     > {
-        self.binding_start_ticket(graph, node, binding)?;
+        let (original_ticket, _) = self.binding_start_ticket(graph, node, binding)?;
         let corrupt = |reason: String| ExecutionStateStoreError::Corrupt {
             graph_id: graph.id.clone(),
             reason,
@@ -707,6 +707,24 @@ impl ExecutionGraphStateStore {
                     }
                     ExecutionGraphEvent::NodesTransitioned { node_ids, .. } => {
                         node_ids.iter().any(|id| id == node)
+                    }
+                    candidate if matches!(candidate, ExecutionGraphEvent::CommandApplied { command, .. }
+                        if matches!(command.as_str(), "cancel" | "cancel_node"))
+                        || matches!(candidate, ExecutionGraphEvent::Checkpoint { cause, .. }
+                            if cause == "execution_graph.command_applied"
+                                && ["cancel", "cancel_node"].iter().any(|command|
+                                    record.transaction_id == format!("{}:command:{}:{}", graph.id, command, record.sequence))) => {
+                        let stream = super::events::ExecutionNodeBinding::effect_stream_id(&original_ticket);
+                        let intent = self.event_store.event_by_idempotency_key(&stream, &format!("{}:intent", original_ticket.idempotency_key)).map_err(|error| corrupt(error.to_string()))?;
+                        let receipt = self.event_store.event_by_idempotency_key(&stream, &format!("{}:receipt", original_ticket.idempotency_key)).map_err(|error| corrupt(error.to_string()))?;
+                        if let Some(receipt) = receipt.as_ref() {
+                            let outcome = super::events::ExecutionNodeBinding::validate_effect_records(
+                                &original_ticket, intent.as_ref(), Some(receipt), record.commit_cursor).map_err(&corrupt)?;
+                            receipt.transaction_id == record.transaction_id
+                                && receipt.commit_cursor == record.commit_cursor
+                                && receipt.transaction_index > record.transaction_index
+                                && outcome.as_ref().is_some_and(|outcome| next.node_results.get(node) == Some(&outcome.result))
+                        } else { false }
                     }
                     ExecutionGraphEvent::Checkpoint { cause, .. } => matches!(
                         cause.as_str(),

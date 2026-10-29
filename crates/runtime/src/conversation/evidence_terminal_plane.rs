@@ -2405,10 +2405,28 @@ where
         scope: RuntimeEventScope,
         kind: &'static str,
         status: Option<String>,
-        mut refs: Vec<RuntimeEventRef>,
+        refs: Vec<RuntimeEventRef>,
         payload: serde_json::Value,
     ) {
+        self.append_execution_runtime_event_guarded(scope, kind, status, refs, payload, None);
+    }
+
+    pub(crate) fn append_execution_runtime_event_guarded(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &'static str,
+        status: Option<String>,
+        mut refs: Vec<RuntimeEventRef>,
+        payload: serde_json::Value,
+        original_producer: Option<&harness_contract::projection::RuntimeActivityBinding>,
+    ) {
+        #[cfg(test)]
+        let ra_trace = payload["tool_call_id"] == "ra-read" && kind.starts_with("tool.invocation.");
+        #[cfg(test)]
+        if ra_trace { eprintln!("ra_lifecycle_append call=ra-read kind={kind} entry producer_present={}", original_producer.is_some()); }
         let Some(store) = self.runtime_event_store.as_ref() else {
+            #[cfg(test)]
+            if ra_trace { eprintln!("ra_lifecycle_append call=ra-read kind={kind} rejected=no_store"); }
             return;
         };
         let session_id = self.session_id().to_string();
@@ -2462,6 +2480,8 @@ where
                     ) {
                         Ok(owner) => owner,
                         Err(error) => {
+                            #[cfg(test)]
+                            if ra_trace { eprintln!("ra_lifecycle_append call=ra-read kind={kind} rejected=remembered_owner"); }
                             tracing::warn!(%error, event_kind = kind, "Native tool lifecycle source rejected");
                             return;
                         }
@@ -2469,6 +2489,8 @@ where
                     let Some(binding) = remembered
                         .or_else(|| bus.current_tool_activity_binding(&tool_call_id, tool_name))
                     else {
+                        #[cfg(test)]
+                        if ra_trace { eprintln!("ra_lifecycle_append call=ra-read kind={kind} rejected=no_activity"); }
                         tracing::warn!(
                             session_id,
                             event_kind = kind,
@@ -2476,9 +2498,23 @@ where
                         );
                         return;
                     };
+                    if original_producer.is_some_and(|original| original != &binding) {
+                        #[cfg(test)]
+                        if ra_trace {
+                            let old = serde_json::to_value(original_producer).unwrap_or_default();
+                            let new = serde_json::to_value(&binding).unwrap_or_default();
+                            let fields = old.as_object().into_iter().flat_map(|map| map.keys())
+                                .filter(|field| old.get(field.as_str()) != new.get(field.as_str())).cloned().collect::<Vec<_>>();
+                            eprintln!("ra_lifecycle_append call=ra-read kind={kind} rejected=producer_mismatch differing_fields={fields:?}");
+                        }
+                        tracing::warn!(session_id, event_kind = kind, "retained tool lifecycle producer differs from the original owner");
+                        return;
+                    }
                     match input.with_activity_binding(binding) {
                         Ok(bound) => input = bound,
                         Err(error) => {
+                            #[cfg(test)]
+                            if ra_trace { eprintln!("ra_lifecycle_append call=ra-read kind={kind} rejected=activity_binding"); }
                             tracing::warn!(
                                 %error,
                                 session_id,
@@ -2490,6 +2526,8 @@ where
                     }
                 }
             } else {
+                #[cfg(test)]
+                if ra_trace { eprintln!("ra_lifecycle_append call=ra-read kind={kind} rejected=no_bus"); }
                 tracing::warn!(
                     session_id,
                     event_kind = kind,
@@ -2567,7 +2605,66 @@ where
                 return;
             }
         }
-        if let Err(error) = store.append(input) {
+        #[cfg(test)]
+        if kind == "tool.invocation.completed"
+            && input.payload["tool_call_id"].as_str().is_some_and(|call|
+                take_lifecycle_append_failure(&session_id, call))
+        {
+            // Simulate the original writer failing before the durable append;
+            // the effect receipt, if any, is left untouched.
+            return;
+        }
+        // A retained original invocation can reach this writer again after a
+        // retry. Key its original lifecycle, not the tool call label, so two
+        // owners cannot append duplicate audit facts for the same invocation.
+        let lifecycle_id = (scope == RuntimeEventScope::Tool && kind.starts_with("tool.invocation."))
+            .then(|| input.payload["invocation_id"].as_str().map(str::to_owned))
+            .flatten().filter(|id| !id.is_empty());
+        if let Some(invocation_id) = lifecycle_id {
+            let key = format!("tool-lifecycle:{invocation_id}:{kind}");
+            let transaction_id = format!("{session_id}:{key}");
+            let stream_id = input.stream_id.clone();
+            for _ in 0..3 {
+                match store.event_by_idempotency_key(&stream_id, &key) {
+                    Ok(Some(existing)) => {
+                        if existing.scope != input.scope || existing.kind != input.kind
+                            || existing.status != input.status || existing.actor != input.actor
+                            || existing.refs != input.refs || existing.payload != input.payload
+                        {
+                            tracing::warn!(session_id, event_kind = kind, "original tool lifecycle conflicts with its retained identity");
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, session_id, event_kind = kind, "tool lifecycle identity lookup failed");
+                        return;
+                    }
+                    Ok(None) => {}
+                }
+                let revision = match store.stream_revision(&stream_id) {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        tracing::warn!(%error, session_id, event_kind = kind, "tool lifecycle stream revision unavailable");
+                        return;
+                    }
+                };
+                let append = crate::AppendTransactionRequest {
+                    transaction_id: transaction_id.clone(),
+                    expected_streams: vec![crate::ExpectedStreamRevision { stream_id: stream_id.clone(), expected_revision: revision }],
+                    events: vec![crate::RuntimeTransactionEventInput {
+                        event: input.clone(), idempotency_key: Some(key.clone()), schema_version: 1,
+                    }],
+                };
+                if store.append_transaction(append).is_ok() {
+                    #[cfg(test)]
+                    if ra_trace { eprintln!("ra_lifecycle_append call=ra-read kind={kind} committed"); }
+                    return;
+                }
+            }
+            #[cfg(test)]
+            if ra_trace { eprintln!("ra_lifecycle_append call=ra-read kind={kind} rejected=append_unconfirmed"); }
+            tracing::warn!(session_id, event_kind = kind, "tool lifecycle append could not be confirmed");
+        } else if let Err(error) = store.append(input) {
             tracing::warn!(%error, session_id, event_kind = kind, "execution runtime event append failed");
         }
     }

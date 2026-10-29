@@ -666,6 +666,23 @@ pub struct FixtureEvidencePage {
     pub stop: Option<&'static str>,
 }
 
+/// Classification local to bounded position-page reads. Backends that cannot
+/// prove the first-row condition retain the original error as Other.
+#[derive(Debug, thiserror::Error)]
+pub enum PositionPageError {
+    #[error("HistoryBudgetExceeded: {0}")]
+    FirstRowExceedsBudget(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for PositionPageError {
+    fn from(value: String) -> Self { Self::Other(value) }
+}
+impl From<&str> for PositionPageError {
+    fn from(value: &str) -> Self { Self::Other(value.to_owned()) }
+}
+
 pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
     #[cfg(any(test, feature = "test-fixtures"))]
     fn fixture_evidence_page(
@@ -831,6 +848,13 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>>;
     fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64>;
     fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn position_page_classified(
+        &self, scope: RuntimeEventScope, identity: &str, kind: Option<&str>,
+        after: Option<(u64, u32)>, through_cursor: u64, max_events: usize, max_bytes: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, PositionPageError> {
+        self.position_page(scope, identity, kind, after, through_cursor, max_events, max_bytes)
+            .map_err(PositionPageError::Other)
+    }
     fn position_page(
         &self,
         scope: RuntimeEventScope,

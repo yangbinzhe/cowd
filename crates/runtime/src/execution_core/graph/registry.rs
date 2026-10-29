@@ -125,6 +125,19 @@ pub trait NodeExecutor: Send + Sync {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError>;
+    /// Revalidate a post-tool Goal observation using the original owner. This
+    /// must never dispatch or replay the physical operation. Unknown remains
+    /// unknown and leaves the original source fence in force.
+    async fn revalidate_goal_source(
+        &self,
+        _ticket: &NodeExecutionTicket,
+        _outcome: &NodeExecutionOutcome,
+        _stale_stream: &str,
+        _expected: u64,
+        _actual: u64,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        Ok(None)
+    }
     /// Run process-local publication only after the canonical graph transition
     /// and its domain events have committed successfully.
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
@@ -236,6 +249,13 @@ impl NodeExecutorRegistry {
         self.get("tool_batch")
             .filter(|registered| Arc::ptr_eq(registered, &expected))?;
         Some(owner)
+    }
+
+    pub(crate) fn is_builtin_tool_batch(&self, executor: &Arc<dyn NodeExecutor>) -> bool {
+        self.builtin_tool_batch().is_some_and(|owner| {
+            let canonical: Arc<dyn NodeExecutor> = owner;
+            Arc::ptr_eq(&canonical, executor)
+        })
     }
 
     pub(super) fn observe_builtin_binding(

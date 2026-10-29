@@ -20,6 +20,54 @@ use crate::execution_core::hot_state::{HotResidentClass, RuntimeHotStatePlane};
 use crate::runtime_event_store::{DurableRuntimeEvent, RuntimeProjectionCheckpoint};
 use crate::{CowdEvent, RuntimeEventStore};
 
+#[path = "semantic_progress.rs"]
+mod semantic_progress;
+
+/// Narrow, opt-in integration probe for the real stream reducer, bus and live projection.
+#[cfg(feature = "test-fixtures")]
+pub fn k02_semantic_progress_fixture() -> Result<(), String> {
+    use crate::conversation::AssistantEvent;
+    let store = Arc::new(ExecutionLiveStore::with_hot_state(Arc::new(RuntimeEventStore::for_test()), Arc::new(RuntimeHotStatePlane::default())));
+    let context = crate::CowdExecutionContext { execution_id: "k02-fixture-exec".into(), session_id: "k02-fixture-session".into(), turn_id: "k02-fixture-turn".into() };
+    store.record_queued(&context.session_id, context.execution_id.clone(), context.turn_id.clone());
+    let generation = store.allocate_model_usage_generation(&context.execution_id)?;
+    let bus = crate::CowdEventBus::new();
+    let observer = Arc::clone(&store);
+    bus.bind_live_telemetry_observer(generation, move |event| {
+        if let Some(context) = event.execution_context() {
+            observer.observe_event_with_generation(&context.session_id, event, generation);
+        }
+    });
+    let _scope = bus.enter_execution(context.clone());
+    let mut surface = bus.subscribe();
+    let before = store.execution_live(&context.execution_id).ok_or("missing initial projection")?;
+    crate::conversation::k02_apply_fixture_event(&bus, AssistantEvent::PrivateReasoningDelta(String::new()))?;
+    let empty = store.execution_live(&context.execution_id).ok_or("missing empty projection")?;
+    if empty.revision != before.revision { return Err("empty event advanced revision".into()); }
+    while surface.try_recv().is_ok() {}
+    crate::conversation::k02_apply_fixture_event(&bus, AssistantEvent::PrivateReasoningDelta("fixture-private-content".into()))?;
+    let progressed = store.execution_live(&context.execution_id).ok_or("missing progressed projection")?;
+    if progressed.revision <= empty.revision || progressed.output_bytes != 0 || progressed.output_preview.is_some() { return Err("private progress missing or exposed".into()); }
+    while let Ok(event) = surface.try_recv() {
+        if serde_json::to_string(&event).map_err(|error| error.to_string())?.contains("fixture-private-content") { return Err("private content escaped to Surface".into()); }
+    }
+    let scoped = |sequence| CowdEvent::ExecutionScoped { context: context.clone(), activity_binding: None, event: Box::new(CowdEvent::RuntimeSemanticProgress { sequence }) };
+    store.observe_event_with_generation(&context.session_id, &scoped(1), generation);
+    store.observe_event_with_generation(&context.session_id, &scoped(2), 0);
+    if store.execution_live(&context.execution_id).ok_or("missing replay projection")?.revision != progressed.revision { return Err("replay or generation zero advanced".into()); }
+    let next_generation = store.allocate_model_usage_generation(&context.execution_id)?;
+    let current = store.execution_live(&context.execution_id).ok_or("missing generation projection")?.revision;
+    store.observe_event_with_generation(&context.session_id, &scoped(2), generation);
+    if store.execution_live(&context.execution_id).ok_or("missing stale projection")?.revision != current { return Err("stale generation advanced".into()); }
+    store.observe_event_with_generation(&context.session_id, &scoped(1), next_generation);
+    if store.execution_live(&context.execution_id).ok_or("missing new generation projection")?.revision <= current { return Err("new generation did not advance".into()); }
+    if !store.cancel(&context.execution_id, "fixture cancel".into())? { return Err("fixture cancellation failed".into()); }
+    let terminal = store.execution_live(&context.execution_id).ok_or("missing terminal projection")?.revision;
+    store.observe_event_with_generation(&context.session_id, &scoped(2), next_generation);
+    if store.execution_live(&context.execution_id).ok_or("missing final projection")?.revision != terminal { return Err("terminal revision changed".into()); }
+    Ok(())
+}
+
 const LIVE_PROJECTION_PREFIX: &str = "execution-live:";
 
 // Typed, non-spoofable markers for live-checkpoint persistence outcomes. The
@@ -70,6 +118,11 @@ struct LiveExecutionRecord {
     live: ExecutionLiveState,
     #[serde(default)]
     tool_ids: BTreeSet<String>,
+    /// Content-free, generation-fenced semantic stream progress.
+    #[serde(default)]
+    semantic_progress_generation: u64,
+    #[serde(default)]
+    semantic_progress_sequence: u64,
     #[serde(default)]
     approval_keys: BTreeSet<String>,
     #[serde(default)]
@@ -147,6 +200,8 @@ impl LiveExecutionRecord {
                 error: None,
             },
             tool_ids: BTreeSet::new(),
+            semantic_progress_generation: 0,
+            semantic_progress_sequence: 0,
             approval_keys: BTreeSet::new(),
             file_touch_keys: BTreeSet::new(),
             context_item_ids: BTreeSet::new(),
@@ -883,6 +938,24 @@ impl ExecutionLiveStore {
                     false
                 }
             }
+            CowdEvent::RuntimeSemanticProgress { sequence } => {
+                if record.live.status.is_terminal()
+                    || model_usage_generation == 0
+                    || model_usage_generation < record.model_usage_generation
+                {
+                    false
+                } else if semantic_progress::admit(
+                    &mut record.semantic_progress_generation,
+                    &mut record.semantic_progress_sequence,
+                    model_usage_generation,
+                    *sequence,
+                ) {
+                    record.touch();
+                    true
+                } else {
+                    false
+                }
+            }
             CowdEvent::ItemCompleted {
                 kind: crate::CausalItemKind::Text,
                 ..
@@ -1077,7 +1150,7 @@ impl ExecutionLiveStore {
         let checkpoint = changed
             && !matches!(
                 event.domain_event(),
-                CowdEvent::TextDelta { .. } | CowdEvent::ToolProgress { .. }
+                CowdEvent::TextDelta { .. } | CowdEvent::ToolProgress { .. } | CowdEvent::RuntimeSemanticProgress { .. }
             );
         let lifecycle_boundary = matches!(
             event.domain_event(),
@@ -3443,6 +3516,36 @@ mod tests {
         assert_eq!(recovered.metrics.tool_calls, 8);
         assert_eq!(recovered.status, ExecutionLiveStatus::CallingModel);
         assert!(event_store.all_events(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn semantic_progress_is_generation_fenced_replay_safe_and_content_free() {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let store = ExecutionLiveStore::new(event_store);
+        let context = CowdExecutionContext { execution_id: "semantic-exec".into(), session_id: "semantic-session".into(), turn_id: "semantic-turn".into() };
+        store.record_queued(&context.session_id, context.execution_id.clone(), context.turn_id.clone());
+        let generation1 = store.allocate_model_usage_generation(&context.execution_id).unwrap();
+        let event = |sequence| CowdEvent::ExecutionScoped { context: context.clone(), activity_binding: None, event: Box::new(CowdEvent::RuntimeSemanticProgress { sequence }) };
+        let initial = store.execution_live(&context.execution_id).unwrap();
+        store.observe_event_with_generation(&context.session_id, &event(1), generation1);
+        let first = store.execution_live(&context.execution_id).unwrap();
+        assert!(first.revision > initial.revision);
+        assert_eq!(first.output_bytes, 0);
+        assert!(first.output_preview.is_none());
+        store.observe_event_with_generation(&context.session_id, &event(1), generation1);
+        store.observe_event_with_generation(&context.session_id, &event(0), generation1);
+        store.observe_event_with_generation(&context.session_id, &event(2), 0);
+        assert_eq!(store.execution_live(&context.execution_id).unwrap().revision, first.revision);
+        let generation2 = store.allocate_model_usage_generation(&context.execution_id).unwrap();
+        let revision = store.execution_live(&context.execution_id).unwrap().revision;
+        store.observe_event_with_generation(&context.session_id, &event(2), generation1);
+        assert_eq!(store.execution_live(&context.execution_id).unwrap().revision, revision);
+        store.observe_event_with_generation(&context.session_id, &event(1), generation2);
+        assert!(store.execution_live(&context.execution_id).unwrap().revision > revision);
+        assert!(store.cancel(&context.execution_id, "cancelled".into()).unwrap());
+        let terminal = store.execution_live(&context.execution_id).unwrap().revision;
+        store.observe_event_with_generation(&context.session_id, &event(2), generation2);
+        assert_eq!(store.execution_live(&context.execution_id).unwrap().revision, terminal);
     }
 
     #[test]

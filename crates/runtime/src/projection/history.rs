@@ -51,6 +51,10 @@ pub(super) struct RequestBudget {
     checkpoint_records: usize,
     #[cfg(test)]
     prefix_stop: Option<serde_json::Value>,
+    #[cfg(test)]
+    r662_page_cap_after: Option<((u64, u32), usize)>,
+    #[cfg(test)]
+    r671_page_error_after: Option<((u64, u32), String)>,
     prefix_fences: BTreeMap<String, u64>,
     terminal_work: Option<TerminalWork>,
     terminal_deferred: bool,
@@ -82,6 +86,10 @@ impl Default for RequestBudget {
             checkpoint_records: prefix::COMMIT_RECORDS,
             #[cfg(test)]
             prefix_stop: None,
+            #[cfg(test)]
+            r662_page_cap_after: None,
+            #[cfg(test)]
+            r671_page_error_after: None,
             prefix_fences: BTreeMap::new(),
             terminal_work: None,
             terminal_deferred: false,
@@ -308,6 +316,10 @@ impl RequestBudget {
 
     pub(super) fn has_pending_checkpoints(&self) -> bool {
         !self.checkpoints.is_empty()
+    }
+
+    pub(super) fn has_pending_history_checkpoint(&self, execution_id: &str) -> bool {
+        self.checkpoints.contains_key(&format!("projection-history:{execution_id}"))
     }
 
     #[cfg(test)]
@@ -1281,6 +1293,16 @@ pub(super) fn effect_proof_identity(
 }
 
 impl HistoryState {
+    pub(super) fn machine_progress(&self) -> Option<harness_contract::projection::HistoryVerificationProgress> {
+        let prefix = self.prefix.as_ref()?;
+        let encoded = serde_json::to_vec(self.source_fence.as_ref()?).ok()?;
+        let mut digest = Sha256::new();
+        digest.update(b"cowd-history-source-fence-v1\0");
+        digest.update(encoded);
+        let progress = prefix.machine_progress(format!("sha256:{:x}", digest.finalize()), self.position, self.through);
+        progress.is_valid().then_some(progress)
+    }
+
     pub(super) fn progress(&self) -> serde_json::Value {
         let mut progress = self.prefix.as_ref().map_or_else(
             || serde_json::json!({"status": if self.incomplete { "not_started" } else { "complete" }, "verified_through": self.through, "position": self.position}),
@@ -2783,6 +2805,28 @@ mod checkpoint_pool_551_tests {
             )
             .is_err());
         services.shutdown_execution().await;
+    }
+}
+
+#[cfg(test)]
+mod r685_source_fence_identity_tests {
+    use super::*;
+
+    #[test]
+    fn progress_identity_is_stable_and_bound_to_actual_source_fence() {
+        let fence = crate::RuntimeSourceMutationFence { incarnation: "private-incarnation".into(), mutation_epoch: 7 };
+        let mut state = HistoryState { source_fence: Some(fence), ..Default::default() };
+        // Use the original prefix constructor from the sibling test module.
+        state.prefix = Some(prefix::r685_test_prefix(12));
+        let first = state.machine_progress().unwrap();
+        let token = first.source_fence_identity.as_str();
+        assert!(token.starts_with("sha256:") && token.len() == 71);
+        assert!(!token.contains("private-incarnation"));
+        assert_eq!(first, state.machine_progress().unwrap());
+        state.source_fence.as_mut().unwrap().mutation_epoch += 1;
+        assert_ne!(token, state.machine_progress().unwrap().source_fence_identity);
+        state.source_fence = None;
+        assert!(state.machine_progress().is_none());
     }
 }
 

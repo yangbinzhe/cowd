@@ -3736,6 +3736,77 @@ impl PublicationFixture {
         }
     }
 
+    // Build the original Goal/model candidate transaction before exercising
+    // the production Synthesize backend. This does not pre-mark Goal success.
+    fn with_original_candidate(answer: &str) -> Self {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("COWD_TEST_FIXTURE_ROOT").expect("explicit private fixture root"),
+        ).join(format!("rb-candidate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = Arc::new(EphemeralRuntimeEventStore::new());
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(root.join("artifacts")));
+        let services = Self::services_at(&root, backend.clone(), artifacts.clone());
+        let mut session = Session::new();
+        session.extend_messages([ConversationMessage::user_text("answer directly")]);
+        let goal_id = format!("rb-goal-{}", uuid::Uuid::new_v4());
+        let mut graph = ExecutionGraph::new("answer directly");
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: session.session_id.clone(), turn_id: "471-turn".into(),
+            root_task_id: "471-task".into(), task_id: "471-task".into(), generation: 1,
+        });
+        let objective = harness_contract::agent_action::root_objective_id(&session.session_id, "471-turn");
+        let program = harness_contract::agent_action::program_id_for_objective(&objective);
+        let goal: GoalContract = serde_json::from_value(serde_json::json!({
+            "id":goal_id,"session_id":session.session_id,"objective":"answer directly",
+            "criteria":[{"id":"checked","statement":"answer checked","status":"satisfied"}],
+            "phase":"execution","spec_revision":1,"spec_digest":"rb-spec",
+            "scope":"internal","completion":"open","revision":1,"user_sequence":1,
+            "source_intent_ref":"session_message:original",
+            "execution_binding":{"objective_id":objective,"session_id":session.session_id,
+                "turn_id":"471-turn","root_execution_id":graph.id,"agentic_program_id":program}
+        })).unwrap();
+        services.goal_store().create(goal).unwrap();
+        let model = ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "{}");
+        graph.nodes.push(model.clone());
+        graph = services.commit_service().register_graph(graph).unwrap().graph;
+        graph = services.commit_service().transition_node(&graph, &model.id, ExecutionNodeStatus::Ready, None, vec![]).unwrap().graph;
+        let model_ticket = NodeExecutionTicket {
+            graph_id: graph.id.clone(), node_id: model.id.clone(), executor_kind: model.executor_kind.clone(),
+            service_class: graph.service_class, attempt: 1, idempotency_key: model.idempotency_key.clone(), payload_ref: model.payload_ref.clone(),
+        };
+        graph = services.commit_service().bind_and_start_node(&graph, &model.id, ExecutionNodeBinding {
+            executor_kind:model_ticket.executor_kind.clone(), ticket_idempotency_key:model_ticket.idempotency_key.clone(),
+            attempt:1, resource_lease_refs:vec![], scope_lease_ref:None, worktree_lease_ref:None,
+        }).unwrap().graph;
+        let state = publication_state(&session.session_id, &goal_id);
+        let identity = runtime_observation_identity(&services, &state, &model_ticket);
+        let source = services.goal_store().projection(&goal_id).unwrap().unwrap();
+        let observation = runtime_observation(identity, RuntimeObservationKind::GraphProgress,
+            "runtime.model_step", source.stream_revision, "original candidate".into(),
+            "rb-original-candidate".into(), ObservationResultClass::Informational);
+        let event = services.goal_store().turn_candidate_event_at(&source, &observation, &model_ticket, answer).unwrap();
+        let mut synth = ExecutionNodeSpec::new(ExecutionNodeKind::Synthesize, "synthesize", "{}");
+        synth.id = format!("{}:synthesize", graph.id);
+        synth.idempotency_key = format!("{}:original", synth.id);
+        let result = harness_contract::execution_graph::ExecutionNodeResult {
+            status:ExecutionNodeStatus::Completed,
+            result_ref:Some(format!("assistant_json:{}", serde_json::to_string(answer).unwrap())),
+            summary:None, wait_class:None, evidence_refs:vec![], failure:None,
+            usage:ExecutionUsage::default(), finished_at_ms:1,
+        };
+        graph = services.commit_service().transition_node_with_replan(&graph, &model.id, result,
+            vec![event], vec![synth.clone()], vec![], "original candidate".into(), true).unwrap().graph;
+        graph = services.commit_service().transition_node(&graph, &synth.id, ExecutionNodeStatus::Ready, None, vec![]).unwrap().graph;
+        let ticket = NodeExecutionTicket { graph_id:graph.id.clone(), node_id:synth.id.clone(),
+            executor_kind:synth.executor_kind.clone(), service_class:graph.service_class, attempt:1,
+            idempotency_key:synth.idempotency_key.clone(), payload_ref:synth.payload_ref.clone() };
+        graph = services.commit_service().bind_and_start_nodes(&graph, BTreeMap::from([(synth.id.clone(), ExecutionNodeBinding {
+            executor_kind:ticket.executor_kind.clone(), ticket_idempotency_key:ticket.idempotency_key.clone(),
+            attempt:1, resource_lease_refs:vec![], scope_lease_ref:None, worktree_lease_ref:None,
+        })]), vec![ticket.clone()]).unwrap().graph;
+        Self { root, backend, artifacts, services, session, goal_id, graph, ticket, calls:Arc::new(AtomicUsize::new(0)) }
+    }
+
     fn services_at(
         root: &std::path::Path,
         backend: Arc<EphemeralRuntimeEventStore>,
@@ -3988,7 +4059,7 @@ async fn real_host_471_cli_original_terminal_recovers_after_owner_restart() {
 #[tokio::test]
 async fn real_host_213_strict_json_survives_synthesize_commit_and_recovery() {
     const ANSWER: &str = "  {\"summary\":\"literal data\",\"package_name\":\"runtime\",\"path\":\"crates/runtime/Cargo.toml\"}\n";
-    let fixture = PublicationFixture::new();
+    let fixture = PublicationFixture::with_original_candidate(ANSWER);
     let hot = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
     {
         let mut state = hot.state.lock().await;
@@ -4062,6 +4133,141 @@ async fn real_host_213_strict_json_survives_synthesize_commit_and_recovery() {
     );
     assert_eq!(messages(&cold).await, published);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn rb_machine_json_preserves_explicit_field_language_requirements() {
+    let objective = "请读取文件，最终只返回 JSON 对象，path 为仓库路径。";
+    assert!(!response_language_mismatch_for_role(objective, r#"{"path":"crates/runtime/Cargo.toml"}"#, false));
+    let chinese = "只返回 JSON 对象；summary 字段必须使用中文。";
+    assert!(response_language_mismatch_for_role(chinese, r#"{"summary":"done","path":"x"}"#, false));
+    assert!(!response_language_mismatch_for_role(chinese, r#"{"summary":"完成","path":"x"}"#, false));
+    assert!(response_language_mismatch_for_role("请用中文回答。", "completed", false));
+}
+
+#[tokio::test]
+async fn rb_actual_api_request_recovery_visibility_and_once() {
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<crate::ApiRequest>>>);
+    impl ApiClient for Capture {
+        fn stream(&mut self, request: crate::ApiRequest) -> Pin<Box<dyn Stream<Item = Result<crate::AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.0.lock().unwrap().push(request);
+            Box::pin(stream::iter(vec![Ok(crate::AssistantEvent::TextDelta("ok".into())), Ok(crate::AssistantEvent::MessageStop)]))
+        }
+    }
+    async fn capture_once(feedback_item: Option<ContextItem>) -> Vec<crate::ApiRequest> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let original = "请只返回 JSON 对象，summary 字段使用中文。";
+        let old_feedback = "Runtime terminal contract recovery: the previous presentation was rejected.";
+        let content = if feedback_item.is_some() { original.to_string() } else { format!("{original}\n\n{old_feedback}") };
+        let mut session = Session::new();
+        session.extend_messages([ConversationMessage::user_text(original)]);
+        let mut runtime = crate::ConversationRuntime::new(session, Capture(seen.clone()), NoReplayTools,
+            PermissionPolicy::new(harness_contract::policy::PermissionMode::ReadOnly), vec!["system".into()]).without_memory();
+        runtime.set_active_model("qwen3.8-max");
+        runtime.begin_turn_strategy("rb-contract-visibility", original).unwrap();
+        if let Some(item) = feedback_item {
+            runtime.push_next_model_context_item(item);
+        }
+        runtime.execute_model_step(&content, false).await.unwrap();
+        runtime.execute_model_step(&content, false).await.unwrap();
+        let requests = seen.lock().unwrap().clone();
+        requests
+    }
+    fn wire_text(request: &crate::ApiRequest) -> String {
+        let mut sections = request.prompt.trusted_system.clone();
+        sections.extend(request.prompt.contextual_messages());
+        sections.push(format!("{:?}", request.messages));
+        sections.join("\n")
+    }
+    let candidate = r#"{"summary":"done"}"#;
+    let fixture = PublicationFixture::with_original_candidate(candidate);
+    let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
+    {
+        let mut state = host.state.lock().await;
+        state.content = "请只返回 JSON 对象；summary 字段使用中文。".into();
+        state.terminal_override = Some((GoalCompletion::Satisfied, candidate.into()));
+    }
+    let outcome = host.synthesize(&fixture.ticket).await.unwrap();
+    assert!(outcome.replan.is_some());
+    let item = {
+        let state = host.state.lock().await;
+        assert_eq!(state.terminal_recovery_attempts, 1, "feedback must use the existing bounded recovery");
+        state.pending_next_model_context.iter()
+            .find(|item| item.id.starts_with("terminal-contract-recovery:"))
+            .expect("original Host recovery feedback").clone()
+    };
+    assert!(item.content.contains("summary"));
+    assert!(!item.content.contains(&fixture.ticket.idempotency_key));
+    assert!(!item.content.contains(&fixture.session.session_id));
+    let original = capture_once(None).await;
+    let once = capture_once(Some(item)).await;
+    assert_eq!(original.len(), 2);
+    assert_eq!(once.len(), 2);
+    assert!(once.iter().all(|request| wire_text(request).contains("summary 字段使用中文")),
+        "the original user contract must remain in the captured request");
+    let original_counts = original.iter().map(|r| wire_text(r).matches("Runtime terminal contract recovery: the previous presentation was rejected.").count()).collect::<Vec<_>>();
+    let once_counts = once.iter().map(|r| wire_text(r).matches("explicit language requirement for field(s) summary").count()).collect::<Vec<_>>();
+    println!("RB_ORIGINAL_CONTENT_COUNTS={original_counts:?} RB_ONE_SHOT_COUNTS={once_counts:?}");
+    assert!(once_counts[0] > 0 && once_counts[1] == 0, "one-shot feedback must not persist into a later request");
+}
+
+#[tokio::test]
+async fn rb_real_host_rejects_invalid_strict_terminal_before_goal_commit() {
+    let candidate = "```json\n{}\n```";
+    let fixture = PublicationFixture::with_original_candidate(candidate);
+    let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
+    {
+        let mut state = host.state.lock().await;
+        state.content = "只返回 JSON 对象。".into();
+        state.terminal_override = Some((GoalCompletion::Satisfied, candidate.into()));
+    }
+    let before = messages(&host).await;
+    let goal_before = fixture.services.goal_store().get(&fixture.goal_id).unwrap().unwrap();
+    let outcome = host.synthesize(&fixture.ticket).await.unwrap();
+    assert!(outcome.replan.is_some(), "invalid root producer must replan");
+    assert!(outcome.terminal_presentation.is_none());
+    assert_eq!(messages(&host).await, before);
+    assert_eq!(fixture.services.goal_store().get(&fixture.goal_id).unwrap().unwrap(), goal_before);
+    let state = host.state.lock().await;
+    assert!(state.committed_terminal_answer.is_none());
+    let feedback = state.pending_next_model_context.iter()
+        .filter(|item| item.id.starts_with("terminal-contract-recovery:"))
+        .collect::<Vec<_>>();
+    assert_eq!(feedback.len(), 1);
+    assert!(feedback[0].content.contains("not a JSON object"));
+    assert!(!feedback[0].content.contains(&fixture.ticket.idempotency_key));
+    assert!(!feedback[0].content.contains(&fixture.session.session_id));
+    drop(state);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rb_human_answer_does_not_require_json() {
+    let fixture = PublicationFixture::with_original_candidate(ORIGINAL_ANSWER);
+    let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
+    let outcome = host.synthesize(&fixture.ticket).await.unwrap();
+    assert!(outcome.replan.is_none());
+    fixture.commit(&outcome);
+    host.after_commit(&fixture.ticket).await.unwrap();
+    assert_eq!(host.state.lock().await.summary.as_ref().unwrap().final_answer, ORIGINAL_ANSWER);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rb_goal_bound_candidate_cannot_be_replaced() {
+    let fixture = PublicationFixture::with_original_candidate(r#"{"path":"original"}"#);
+    let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
+    {
+        let mut state = host.state.lock().await;
+        state.content = "只返回 JSON 对象。".into();
+        state.terminal_override = Some((GoalCompletion::Satisfied, r#"{"path":"foreign"}"#.into()));
+    }
+    let before = messages(&host).await;
+    let result = host.synthesize(&fixture.ticket).await;
+    assert!(result.is_err(), "a different answer cannot borrow the original Goal candidate");
+    assert_eq!(messages(&host).await, before);
+    assert!(host.state.lock().await.committed_terminal_answer.is_none());
 }
 
 #[tokio::test]

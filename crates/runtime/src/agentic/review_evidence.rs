@@ -18,7 +18,9 @@ pub(crate) use policy::{
     validate_applied_proof_inputs, validate_proof_inputs, validate_proof_inputs_for_action,
     CompletionAdmissionContext, ProofInputSnapshot,
 };
-pub(crate) use policy::read_delivery_snapshot_for_scope;
+pub(crate) use policy::{nested_parent_material, read_delivery_snapshot_for_scope};
+#[cfg(test)]
+pub(crate) use policy::verify_nested_read_for_test;
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -40,7 +40,7 @@ use runtime::{
     AppendTransactionRequest, CheckedAppendReceipt, CheckedAppendRequest, CheckedSourceEvidence,
     CheckedSourceValidator, CommittedEventBatch, CommittedStreamRevision, DurableRuntimeEvent,
     ExpectedStreamRevision, MissionOrganizationDecision, MissionOrganizationStatus,
-    RuntimeEventInput, RuntimeEventRecord, RuntimeEventScope, RuntimeEventStore,
+    PositionPageError, RuntimeEventInput, RuntimeEventRecord, RuntimeEventScope, RuntimeEventStore,
     RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
     RuntimeProjectionCheckpoint, RuntimeProjectionInterest, RuntimeProjectionScanPage, RuntimeSourceMutationFence,
     RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
@@ -50,6 +50,7 @@ use runtime::{
 };
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use runtime::{FixtureEvidencePage, FixtureEvidencePageRequest};
+
 use serde_json::Value;
 #[cfg(test)]
 use storage::PostgresConnectionConfig;

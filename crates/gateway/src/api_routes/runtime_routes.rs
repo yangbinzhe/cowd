@@ -683,6 +683,7 @@ mod read_evidence_api_tests {
             .map(move |path| (corpus, path))
         })
         .chain([
+            "Cargo.toml",
             "crates/tools/src/lib.rs",
             "crates/runtime/src/lib.rs",
             "crates/memory/src/lib.rs",
@@ -895,6 +896,7 @@ mod read_evidence_api_tests {
                                 "crates/gateway/src/main.rs", "crates/gateway/src/api_routes/runtime_routes.rs"].contains(&path))
                         || (corpus == "live-batchread-v1"
                             && [
+                                "Cargo.toml",
                                 "crates/tools/src/lib.rs",
                                 "crates/runtime/src/lib.rs",
                                 "crates/memory/src/lib.rs",

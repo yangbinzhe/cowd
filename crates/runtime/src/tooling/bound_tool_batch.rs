@@ -66,6 +66,21 @@ impl BoundToolStop {
         }
     }
 }
+// Only the actual outer read committer may suppress a nested adapter receipt.
+// Task-local scope prevents unrelated Process or concurrent calls inheriting it.
+tokio::task_local! { static OUTER_READ_RECEIPT_OWNER: (String, String, String, Option<String>, Option<crate::step_snapshot::StepCallBinding>); }
+pub(crate) async fn with_outer_read_receipt_owner<T>(
+    request: &crate::RuntimeToolExecutionRequest,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    OUTER_READ_RECEIPT_OWNER.scope((request.idempotency_key.clone(), request.tool_use_id.clone(), request.tool_name.clone(), request.session_id.clone(), request.step_binding.clone()), work).await
+}
+pub(crate) fn outer_read_receipt_owned(request: &crate::RuntimeToolExecutionRequest) -> bool {
+    OUTER_READ_RECEIPT_OWNER.try_with(|(key, call, tool, session, binding)|
+        binding.is_some() && key == &request.idempotency_key && call == &request.tool_use_id
+            && tool == &request.tool_name && session == &request.session_id && binding == &request.step_binding
+    ).unwrap_or(false)
+}
 tokio::task_local! { static ORIGINAL_TOOL_STOP: BoundToolStop; }
 pub(crate) fn current_tool_stop() -> Option<BoundToolStop> {
     ORIGINAL_TOOL_STOP.try_with(Clone::clone).ok()
@@ -84,6 +99,34 @@ fn check_tool_stop() -> Result<(), ToolError> {
 mod resource_frame_tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn outer_read_owner_is_scoped_to_original_call_and_not_inherited_by_process_task() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("outer-read-owner", workspace.path());
+        let request = super::scope_admission_tests::bound_request(&host, "read_file", serde_json::json!({"path":"one.txt"}));
+        assert!(!outer_read_receipt_owned(&request));
+        with_outer_read_receipt_owner(&request, async {
+            assert!(outer_read_receipt_owned(&request));
+            let mut foreign = request.clone();
+            foreign.tool_use_id.push_str("-foreign");
+            assert!(!outer_read_receipt_owned(&foreign));
+            foreign = request.clone();
+            foreign.idempotency_key.push_str("-foreign");
+            assert!(!outer_read_receipt_owned(&foreign));
+            foreign = request.clone();
+            foreign.session_id = Some("foreign-session".into());
+            assert!(!outer_read_receipt_owned(&foreign));
+            foreign = request.clone();
+            let binding = foreign.step_binding.as_mut().unwrap();
+            std::sync::Arc::make_mut(&mut binding.snapshot).identity.attempt = Some(999);
+            assert!(!outer_read_receipt_owned(&foreign));
+            let detached = request.clone();
+            assert!(!tokio::spawn(async move { outer_read_receipt_owned(&detached) }).await.unwrap(),
+                "a Process task must not inherit a caller's receipt ownership");
+        }).await;
+        assert!(!outer_read_receipt_owned(&request));
+    }
 
     #[tokio::test]
     async fn r1_composite_effect_workspace_leaf_locks_cover_descendants_and_mutations() {
@@ -2254,7 +2297,11 @@ async fn execute_bound_agent_tool_observed_inner(
                 stop.effect_entered
                     .store(true, std::sync::atomic::Ordering::Release);
             }
-            let outcome = host.execute_runtime_tool(&request).await;
+            let outcome = if commit_service.is_some() && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                with_outer_read_receipt_owner(&request, host.execute_runtime_tool(&request)).await
+            } else {
+                host.execute_runtime_tool(&request).await
+            };
             (outcome, true, admission)
         }
     };

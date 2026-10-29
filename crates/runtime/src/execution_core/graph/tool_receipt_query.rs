@@ -702,10 +702,62 @@ impl ExecutionCommitService {
                 evidence.provenance =
                     harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
             }
+            let lifecycle = if let Some(value) = receipt.payload.get("lifecycle_anchor").filter(|value| !value.is_null()) {
+                use sha2::{Digest, Sha256};
+                let anchor: crate::tool_host::ToolLifecycleAnchor = serde_json::from_value(value.clone())?;
+                let producer = &anchor.producer;
+                if anchor.invocation_id.is_empty()
+                    || anchor.session_id != query.session_id
+                    || anchor.tool_call_id != query.tool_use_id
+                    || anchor.tool_name != query.tool_name
+                    || producer.validate().is_err()
+                    || producer.session_id != query.session_id
+                    || producer.turn_id != binding.snapshot.identity.turn_id
+                    || graph.lineage.as_ref().is_none_or(|lineage|
+                        producer.root_task_id != lineage.root_task_id
+                            || producer.task_id != lineage.task_id
+                            || producer.generation != lineage.generation)
+                    || (graph.parent_execution.is_none() && producer.root_execution_id != graph.id)
+                    || producer.tool_call_id.as_deref() != Some(query.tool_use_id)
+                    || producer.tool_contract_id.as_deref() != Some(query.tool_name)
+                {
+                    return Err(ExecutionCommitError::InvalidCommand("stored lifecycle anchor identity conflict".into()));
+                }
+                let stream = format!("session:{}", query.session_id);
+                let key = format!("tool-lifecycle:{}:tool.invocation.completed", anchor.invocation_id);
+                match self.event_store.event_by_idempotency_key(&stream, &key)? {
+                    Some(event) if !outcome.model_feedback_is_error()
+                        && receipt.payload["outcome_truncated"] != true
+                        && outcome.output.is_some() => {
+                        let raw = &event.payload["runtime_raw_content_v1"];
+                        let body = outcome.output.as_deref().unwrap_or_default();
+                        let body_hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+                        if event.kind != "tool.invocation.completed"
+                            || event.scope != crate::RuntimeEventScope::Tool
+                            || event.status.as_deref() != Some("completed")
+                            || event.actor.as_deref() != Some("conversation_runtime")
+                            || event.activity_binding().as_ref() != Some(producer)
+                            || event.payload["invocation_id"] != anchor.invocation_id
+                            || event.payload["tool_call_id"] != query.tool_use_id
+                            || event.payload["tool_name"] != query.tool_name
+                            || event.payload["input_hash"] != anchor.input_hash
+                            || raw["tool_call_id"] != query.tool_use_id
+                            || raw["visibility_scope"] != format!("session:{}", query.session_id)
+                            || raw["byte_count"] != body.len() as u64
+                            || raw["sha256"].as_str().map(|hash| hash.strip_prefix("sha256:").unwrap_or(hash)) != Some(body_hash.as_str())
+                        {
+                            return Err(ExecutionCommitError::InvalidCommand("original tool lifecycle conflicts with its receipt anchor".into()));
+                        }
+                        Some(event)
+                    }
+                    _ => None,
+                }
+            } else { None };
             return Ok(Some(ToolReceiptReplay {
                 invocation,
                 outcome,
                 completed_at_ms: receipt.created_at_ms,
+                lifecycle,
             }));
         }
         if self

@@ -170,6 +170,8 @@ pub enum CowdEvent {
         identity: CausalItemIdentity,
         event: Box<CowdEvent>,
     },
+    /// Internal, content-free Runtime stream progress. Never broadcast.
+    RuntimeSemanticProgress { sequence: u64 },
     ModelStepStarted {
         model_step_id: String,
     },
@@ -462,6 +464,7 @@ pub struct CowdEventBus {
     activity_binding: Arc<Mutex<Option<harness_contract::projection::RuntimeActivityBinding>>>,
     model_step_sequence: Arc<AtomicU64>,
     causal_sequence: Arc<AtomicU64>,
+    semantic_progress_sequence: Arc<AtomicU64>,
     latest_model_step_id: Arc<Mutex<Option<String>>>,
     tool_identities: Arc<Mutex<HashMap<String, CausalItemIdentity>>>,
     /// Synchronous Runtime-owned usage reducer. Provider/tool event delivery
@@ -495,6 +498,7 @@ impl CowdEventBus {
             activity_binding: Arc::new(Mutex::new(None)),
             model_step_sequence: Arc::new(AtomicU64::new(0)),
             causal_sequence: Arc::new(AtomicU64::new(0)),
+            semantic_progress_sequence: Arc::new(AtomicU64::new(0)),
             latest_model_step_id: Arc::new(Mutex::new(None)),
             tool_identities: Arc::new(Mutex::new(HashMap::new())),
             live_telemetry_observer: Arc::new(Mutex::new(None)),
@@ -610,7 +614,7 @@ impl CowdEventBus {
     }
 
     fn observe_live_telemetry(slot: &LiveTelemetryObserverSlot, event: &CowdEvent) {
-        if !matches!(event.domain_event(), CowdEvent::RunModelTelemetry { .. }) {
+        if !matches!(event.domain_event(), CowdEvent::RunModelTelemetry { .. } | CowdEvent::RuntimeSemanticProgress { .. }) {
             return;
         }
         let observer = slot
@@ -647,6 +651,15 @@ impl CowdEventBus {
             context,
             binding,
         }
+    }
+
+    /// Notify only the bound Runtime projection owner; no Surface event or
+    /// private model content crosses this boundary.
+    pub(crate) fn observe_semantic_progress(&self) {
+        let Some(context) = self.current_execution_context() else { return; };
+        let sequence = self.semantic_progress_sequence.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let event = CowdEvent::ExecutionScoped { context, activity_binding: None, event: Box::new(CowdEvent::RuntimeSemanticProgress { sequence }) };
+        Self::observe_live_telemetry(&self.live_telemetry_observer, &event);
     }
 
     pub fn emit(&self, event: CowdEvent) {

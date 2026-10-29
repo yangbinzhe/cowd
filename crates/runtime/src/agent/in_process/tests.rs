@@ -3587,7 +3587,16 @@ impl RuntimeExecutionHost for DiscoveryTestHost {
             Err(error) => Err(error),
             Ok((step, input)) => {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                if request.tool_name == "working_context" {
+                if request.tool_name == "evidence_retrieve" {
+                    // Synthetic bytes exercise the real Process bridge and receipt
+                    // owner; this fixture does not claim an ArtifactStore read.
+                    let content = "synthetic-process-evidence";
+                    Ok(serde_json::json!({"kind":"evidence_retrieve","available":true,
+                        "evidence_ref":input["evidence_ref"],
+                        "sha256":crate::context_evidence::read_sha256(content.as_bytes()),
+                        "bytes":content.len(),"total_chunks":1,
+                        "chunks":[{"index":0,"content":content}]}).to_string())
+                } else if request.tool_name == "working_context" {
                     let services = self.services.lock().unwrap().upgrade();
                     match services.zip(request.memory_context.as_ref()) {
                         Some((services, context))
@@ -3698,8 +3707,21 @@ fn discovery_configured_services(
     std::fs::write(workspace.join("src/a.rs"), "narrow-read-proof").unwrap();
     std::fs::write(workspace.join("src/sibling.rs"), "untouched-sibling").unwrap();
     let host = Arc::new(DiscoveryTestHost::new(&workspace));
-    if controls {
-        discovery_replace_runtime(&host, vec![discovery_control_definition()]);
+    if controls || names.contains(&"evidence_retrieve") {
+        let mut definitions = Vec::new();
+        if controls { definitions.push(discovery_control_definition()); }
+        if names.contains(&"evidence_retrieve") {
+            definitions.push(tools::RuntimeToolDefinition {
+                name:"evidence_retrieve".into(), description:Some("Read immutable evidence".into()),
+                input_schema:serde_json::json!({"type":"object","properties":{"evidence_ref":{"type":"string"}},
+                    "required":["evidence_ref"],"additionalProperties":false}),
+                required_permission:PermissionMode::ReadOnly,
+                effect_resolver:harness_contract::tool::ToolEffectResolverSpec {
+                    resolver_id:"runtime.readonly".into(), resolver_version:1,
+                },
+            });
+        }
+        discovery_replace_runtime(&host, definitions);
     }
     let services = RuntimeServices::test_builder(root.join("home"), &workspace)
         .tool_execution_host(host.clone())
@@ -5911,6 +5933,32 @@ async fn runtime_artifact_materialization_uses_registered_write_classification()
         .execute_delegated_runtime_tool("artifact_materialize", input, authorization, None)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn process_step_evidence_read_commits_once_and_rejects_changed_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let (services, host, packet) = discovery_configured_services(root.path(), true,
+        &["evidence_retrieve"], PermissionMode::ReadOnly, vec![], false);
+    let selection = AgentModelSelection { model:packet.model_lease.clone(),
+        provider:"local-discovery".into(), registry_revision:0 };
+    let bridge = ProcessJsonlToolSession::prepare(&services, &packet, &selection).unwrap();
+    let step = bridge.begin_step().unwrap();
+    let step_id = step["step"]["identity"]["step_id"].as_str().unwrap();
+    let input = r#"{"evidence_ref":"artifact://synthetic"}"#;
+    let first = bridge.execute_step_tool(step_id, 1, "process-evidence", "evidence_retrieve", input).await.unwrap();
+    assert!(first.contains("synthetic-process-evidence"));
+    assert_eq!(bridge.execute_step_tool(step_id, 1, "process-evidence", "evidence_retrieve", input).await.unwrap(), first);
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    assert!(bridge.execute_step_tool(step_id, 1, "process-evidence", "evidence_retrieve",
+        r#"{"evidence_ref":"artifact://foreign"}"#).await.is_err());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    let receipts = services.event_store().all_events(4096).unwrap().into_iter().filter(|event|
+        event.kind == "execution.read.receipt" && event.payload["tool_use_id"] == "process-evidence"
+    ).collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1, "Process direct owner must persist exactly one original read");
+    assert_eq!(receipts[0].payload["outcome"]["status"], "executed");
+    assert!(!receipts[0].payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null());
 }
 
 #[test]

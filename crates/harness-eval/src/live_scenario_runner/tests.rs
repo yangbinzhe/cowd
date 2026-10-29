@@ -107,6 +107,7 @@ fn u5_fixture_physical_events() -> Vec<Value> {
         RequestedCancellationReference,
     };
     let identity = ProviderPhysicalIdentity {
+            graph_owner: None,
         session_id: "session-a".into(),
         turn_id: "turn-a".into(),
         execution_id: "root-a".into(),
@@ -352,6 +353,30 @@ fn r202_session_reader_retains_actual_payload_and_rejects_foreign_or_truncated_p
         }
         assert_eq!(fixture.finish().len(), 1);
     }
+}
+
+#[test]
+fn k05_session_reader_retries_concurrent_append_without_accepting_bad_page() {
+    let original = u5_fixture_physical_events();
+    let mut raced = json!({"session_id":"session-a","from_seq":0,"limit":100,
+        "total":2,"has_more":false,"include_payload":true,"events":original});
+    let stable = json!({"session_id":"session-a","from_seq":0,"limit":100,
+        "total":3,"has_more":false,"include_payload":true,"events":original});
+    let path = "GET /api/sessions/session-a/events?from_seq=0&limit=100&include_payload=true";
+    let mut fixture = U5SingleCaseHttpFixture::start_wire(vec![
+        (path.into(), raced.clone(), false, Duration::ZERO),
+        (path.into(), stable, false, Duration::ZERO),
+    ]);
+    let runner = u5_fixture_runner(&fixture.url);
+    assert_eq!(runner.read_u5_session_events("session-a", Instant::now() + Duration::from_secs(2)).unwrap(), original);
+    assert_eq!(fixture.finish().len(), 2);
+
+    // Persistent mismatch still fails closed within the same three-page cap.
+    raced["total"] = json!(1);
+    let mut fixture = U5SingleCaseHttpFixture::start_wire((0..3).map(|_| (path.into(), raced.clone(), false, Duration::ZERO)).collect());
+    let runner = u5_fixture_runner(&fixture.url);
+    assert!(runner.read_u5_session_events("session-a", Instant::now() + Duration::from_secs(2)).is_err());
+    assert_eq!(fixture.finish().len(), 3);
 }
 
 #[test]
@@ -643,6 +668,30 @@ fn u5_fixture_runner(url: &str) -> LiveScenarioRunner {
 }
 
 #[test]
+fn u5_cancel_summary_preserves_stage_and_fails_closed_on_http_or_deadline() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let n = stream.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /api/runtime/executions/root-a?detail_scope=summary "));
+        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    });
+    let runner = u5_fixture_runner(&format!("http://{address}"));
+    let id = u5_fixture_id("a");
+    let error = runner.u5_cancel_projection(&id, "after_cancel_post", Instant::now() + Duration::from_secs(3)).unwrap_err();
+    assert!(error.contains("after_cancel_post") && error.contains("503"));
+    server.join().unwrap();
+    let error = runner.u5_cancel_projection(&id, "before_cancel_post", Instant::now()).unwrap_err();
+    assert!(error.contains("before_cancel_post") && error.contains("deadline"));
+}
+
+#[test]
 fn u5_live_missing_evidence_is_refused_before_any_actor_or_HTTP() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -719,6 +768,35 @@ fn u5_scoped_pair_runs_both_branches_and_honors_pre_dispatch_deadline() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     assert_eq!(a.report, b.report);
     assert_eq!(runner.observation_poll_delay(), Duration::ZERO);
+}
+
+#[test]
+fn u5_cancel_resource_observation_runs_before_slow_actor_reaches_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let serial_deadline = Instant::now() + Duration::from_millis(25);
+    let serial_outcome = || U5ActorOutcome { report: json!({"status":"fixture-only"}), cancellation: None };
+    let _ = u5_parallel(serial_deadline, || {
+        thread::sleep(serial_deadline.saturating_duration_since(Instant::now()));
+        serial_outcome()
+    }, serial_outcome);
+    assert!(Instant::now() >= serial_deadline, "the original post-join reader has no IO budget");
+    let observed = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let outcome = || U5ActorOutcome { report: json!({"status":"fixture-only"}), cancellation: None };
+    let (a, b, evidence) = u5_parallel_with_observer(deadline, |opened| {
+        opened.send(()).unwrap();
+        while !observed.load(Ordering::SeqCst) && Instant::now() < deadline { thread::yield_now(); }
+        assert!(observed.load(Ordering::SeqCst), "observer must run while A is in flight");
+        outcome()
+    }, outcome, || {
+        observed.store(true, Ordering::SeqCst);
+        Ok("original-resource-prefix")
+    });
+    assert_eq!(a.report["status"], "fixture-only");
+    assert_eq!(b.report["status"], "fixture-only");
+    assert_eq!(evidence.unwrap(), "original-resource-prefix");
+    let (_, _, missing) = u5_parallel_with_observer(Instant::now() + Duration::from_secs(1), |_opened| outcome(), outcome, || Ok("forbidden"));
+    assert!(missing.unwrap_err().contains("physical start unavailable"));
 }
 
 // This maps real store records to the existing Gateway wire shape. It is a
@@ -1608,6 +1686,7 @@ fn u5_event_first_observation_case(case: &str) -> Result<(Value, U5CancelContext
             now
         },
         "fixture-cancel",
+        None,
     );
     let cleanup = actor.finish();
     let requests = fixture.finish();
@@ -1910,6 +1989,7 @@ fn u5_subinput_envelopes_keep_exact_read_grants_and_original_business_oracles() 
         r#"{"package_name":"wrong","path":"crates/runtime/Cargo.toml"}"#,
         r#"{"path":"crates/runtime/Cargo.toml"}"#,
         r#"{"package_name":"runtime","path":"Cargo.toml"}"#,
+        r#"{"package_name":"runtime","path":"/workspace/crates/runtime/Cargo.toml"}"#,
     ] {
         assert!(!u5_package_answer(wrong), "{wrong}");
     }
@@ -2483,6 +2563,66 @@ fn root_terminal_reports_terminal_failure_without_synthesis() {
 }
 
 #[test]
+fn r685_original_runtime_prefix_advances_through_harness_without_forging_terminal() {
+    u5_local_job(async {
+    use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage};
+    use harness_contract::projection::{ProjectionDetailScope, ProjectionQueryContext};
+    let services = runtime::RuntimeServices::in_memory().unwrap();
+    let mut graph = ExecutionGraph::new("r685 bounded original history");
+    graph.lineage = Some(ExecutionGraphLineage { session_id:"r685-session".into(), turn_id:"r685-turn".into(), root_task_id:"r685-task".into(), task_id:"r685-task".into(), generation:1 });
+    graph = services.commit_service().register_graph(graph).unwrap().graph;
+    for _ in 0..700 {
+        graph = services.commit_service().apply_command(&graph, &ExecutionGraphCommand::Start { expected_revision: graph.revision }).unwrap().graph;
+    }
+    eprintln!("r685 graph_revision={}", graph.revision);
+    let context = ProjectionQueryContext { principal:"r685-reader".into(), workspace_id:services.workspace_key().into(), session_scopes:vec!["r685-session".into()], mission_scopes:vec![], visibility_grants:vec![], detail_scope:ProjectionDetailScope::Summary, authorization_revision:1 };
+    let mut observer = crate::live_scenario_observer::LiveScenarioObserver::default();
+    let mut expected_cut = None;
+    let mut expected_fence = None;
+    let mut previous = None;
+    let mut incomplete_count = 0;
+    let mut complete = false;
+    for round in 0..32 {
+        let projection = runtime::execution_projection::snapshot(&services, &graph.id, &context).await.unwrap();
+        let raw = serde_json::to_value(&projection).unwrap();
+        let cut = projection.cursor;
+        eprintln!("r685 round={round} cut={cut} id={} health={:?} progress={}", graph.id, raw["health"].as_array().unwrap().iter().map(|h| (&h["id"],&h["kind"],&h["status"],&h["detail"])).collect::<Vec<_>>(), root_history_progress(&raw, &graph.id).is_some());
+        assert_eq!(*expected_cut.get_or_insert(cut), cut);
+        if let Some(progress) = root_history_progress(&raw, &graph.id) {
+            incomplete_count += 1;
+            let fence = progress.source_fence_identity.clone();
+            assert_eq!(expected_fence.get_or_insert(fence.clone()), &fence);
+            assert_eq!(progress.target_cursor, cut);
+            let position = progress.position;
+            eprintln!("r690 round={round} target={} position={position:?} verified={} committed={}", progress.target_cursor, progress.verified_through, progress.new_prefix_committed);
+            assert!(previous.is_none_or(|old| position >= Some(old)));
+            previous = position;
+            assert_eq!(raw["terminal_axes"]["execution"]["coverage_complete"], false);
+            assert_eq!(raw["terminal_axes"]["execution"]["phase"], "unknown");
+            assert_eq!(raw["terminal_axes"]["execution"]["settlement"], "unknown");
+            let summary = json!({"execution_id":graph.id,"terminal_state":"pending","live_status":"calling_model","history_progress":progress});
+            observer.observe_root("/execution", &Ok(summary), Some("constant-graph"), None, round);
+        } else { complete = true; break; }
+    }
+    assert!(incomplete_count >= 2 && complete, "must observe actual prefix continuation and completion: incomplete={incomplete_count} complete={complete}");
+    assert!(observer.progress_observations() > 0, "same-source committed prefix advancement must reach observer");
+    services.shutdown_execution().await;
+    services.shutdown_maintenance().await;
+    });
+}
+
+#[test]
+fn r685_history_source_must_be_valid_and_match_requested_execution() {
+    let fence = format!("sha256:{}", "a".repeat(64));
+    let source = json!({"source_fence_identity":fence,"target_cursor":100,"target_graph_revision":7,"position":[10,0],"verified_through":5,"new_prefix_committed":true});
+    let projection = json!({"execution_id":"root","history_verification_progress":source});
+    assert!(root_history_progress(&projection, "root").is_some());
+    assert!(root_history_progress(&projection, "foreign").is_none());
+    let invalid = json!({"execution_id":"root","history_verification_progress":{"source_fence_identity":"invalid","target_cursor":100,"target_graph_revision":7,"position":[10,0],"verified_through":5,"new_prefix_committed":true}});
+    assert!(root_history_progress(&invalid, "root").is_none());
+}
+
+#[test]
 fn root_progress_fingerprint_tracks_streaming_output_without_graph_changes() {
     let first = json!({
         "revision": 7,
@@ -2516,6 +2656,25 @@ fn root_progress_fingerprint_tracks_streaming_output_without_graph_changes() {
         root_progress_fingerprint(&first, &first_statuses),
         root_progress_fingerprint(&second, &second_statuses)
     );
+}
+
+#[test]
+fn semantic_live_revision_renews_inactivity_but_unchanged_polls_do_not() {
+    let timeout = LiveScenarioTimeout::tool();
+    let mut observer = LiveScenarioObserver::default();
+    let sample = |revision| json!({"execution_id":"root", "live_revision":revision, "live_status":"calling_model", "live_output_bytes":0, "live_last_progress_at_ms":revision});
+    let observe = |observer: &mut LiveScenarioObserver, revision, at| {
+        let summary = sample(revision);
+        let fingerprint = serde_json::to_string(&summary).unwrap();
+        observer.observe_live("/live", &Ok(summary), Some(&fingerprint), None, at)
+    };
+    assert!(!observe(&mut observer, 1, 0));
+    assert!(observe(&mut observer, 2, 80_000));
+    assert!(!observe(&mut observer, 2, 150_000));
+    assert!(!timeout.should_abort_for_inactivity(Duration::from_secs(150), Duration::from_millis(observer.since_last_progress_ms(150_000)), observer.progress_observations() as usize));
+    assert!(!observe(&mut observer, 2, 155_000));
+    assert!(timeout.should_abort_for_inactivity(Duration::from_secs(155), Duration::from_millis(observer.since_last_progress_ms(155_000)), observer.progress_observations() as usize));
+    assert!(timeout.should_abort_for_absolute_wait(Duration::from_secs(600)));
 }
 
 #[test]

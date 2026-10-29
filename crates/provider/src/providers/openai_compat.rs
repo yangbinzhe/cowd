@@ -676,9 +676,17 @@ impl MessageStream {
             match self.response.chunk().await? {
                 Some(chunk) => {
                     if let Some(activity) = &self.transport_activity {
-                        activity.observe();
+                        activity.observe_chunk(chunk.len());
                     }
-                    for parsed in self.parser.push(&chunk)? {
+                    let frames_before = self.parser.frame_count;
+                    let parsed = self.parser.push(&chunk);
+                    if let Some(activity) = &self.transport_activity {
+                        activity.observe_frames(self.parser.frame_count.saturating_sub(frames_before));
+                        if let Ok(chunks) = &parsed {
+                            activity.observe_decoded(chunks.len());
+                        }
+                    }
+                    for parsed in parsed? {
                         self.pending.extend(self.state.ingest_chunk(parsed)?);
                     }
                 }
@@ -693,6 +701,7 @@ impl MessageStream {
 #[derive(Debug, Default)]
 struct OpenAiSseParser {
     buffer: Vec<u8>,
+    frame_count: usize,
     provider: String,
     model: String,
     wire_protocol: OpenAiWireProtocol,
@@ -713,6 +722,7 @@ impl OpenAiSseParser {
     ) -> Self {
         Self {
             buffer: Vec::new(),
+            frame_count: 0,
             provider: provider.into(),
             model: model.into(),
             wire_protocol,
@@ -737,6 +747,7 @@ impl OpenAiSseParser {
                 .buffer
                 .drain(..position + separator_len)
                 .collect::<Vec<_>>();
+            self.frame_count = self.frame_count.saturating_add(1);
             let frame_len = frame.len().saturating_sub(separator_len);
             let frame = String::from_utf8_lossy(&frame[..frame_len]).into_owned();
             self.scan_cursor = 0;
@@ -4628,6 +4639,32 @@ mod tests {
             .push(&chunk)
             .expect_err("a frame without a terminator must not grow without bound");
         assert!(matches!(error, ApiError::InvalidSseFrame(_)));
+    }
+
+    #[test]
+    fn k02_sse_fragment_heartbeat_and_empty_frames_are_not_semantic_events() {
+        let mut parser = OpenAiSseParser::with_context("fixture", "fixture", OpenAiWireProtocol::Completions);
+        let mut state = StreamState::new("fixture".into(), &[]);
+        assert!(parser.push(b": keep").unwrap().is_empty());
+        assert_eq!(parser.frame_count, 0);
+        assert!(parser.push(b"alive\n\n").unwrap().is_empty());
+        assert_eq!(parser.frame_count, 1);
+        let empty = b"data: {\"id\":\"x\",\"choices\":[]}\n\n";
+        let parsed = parser.push(empty).unwrap();
+        assert_eq!(parser.frame_count, 2);
+        assert_eq!(parsed.len(), 1);
+        let nonsemantic = state.ingest_chunk(parsed.into_iter().next().unwrap()).unwrap();
+        assert!(nonsemantic.iter().all(|event| matches!(event, StreamEvent::MessageStart(_))));
+        let frame = b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
+        assert!(parser.push(&frame[..7]).unwrap().is_empty());
+        let chunks = parser.push(&frame[7..]).unwrap();
+        assert_eq!(parser.frame_count, 3);
+        assert_eq!(chunks.len(), 1);
+        assert!(!state.ingest_chunk(chunks.into_iter().next().unwrap()).unwrap().is_empty());
+        assert!(parser.push(b"data: [DONE]\n\n").unwrap().is_empty());
+        assert_eq!(parser.frame_count, 4);
+        assert!(parser.push(b"data: {broken}\n\n").is_err());
+        assert_eq!(parser.frame_count, 5);
     }
 
     fn compat_test_chunk(content: Option<&str>, finish: Option<&str>) -> ChatCompletionChunk {

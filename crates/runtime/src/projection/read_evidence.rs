@@ -318,6 +318,45 @@ fn fail(page: &mut ReadEvidencePage, reason: ReadEvidenceIncompleteReason) {
     page.reads.clear();
 }
 
+async fn verify_nested_wire(
+    services: &RuntimeServices, budget: &mut RequestBudget, session: &str,
+    parent_input: &str, event: &DurableRuntimeEvent,
+    material: &context_evidence::ReadDeliveryMaterial,
+) -> Result<(), String> {
+    use context_evidence::ReadDeliveryTransport;
+    let ReadDeliveryTransport::NativeProviderContinuation {
+        request_id, step_render, wire_body_sha256, wire_artifact, packed_sequence, outcome_sequence, ..
+    } = &material.transport else { return Err("nested wire transport missing".into()); };
+    if wire_artifact.bytes > 4 * 1024 * 1024 || wire_artifact.visibility_scope != format!("session:{session}") {
+        return Err("nested wire artifact scope or size invalid".into());
+    }
+    budget.charge(2, usize::try_from(wire_artifact.bytes).map_err(|_| "wire size overflow")?)
+        .map_err(|_| "nested wire budget exhausted".to_string())?;
+    let history = services.session_query_port().and_then(|port| port.history_reader()).ok_or("session history unavailable")?;
+    let packed = history.domain_events_page(session, packed_sequence.saturating_sub(1), 2).await.map_err(|e| e.to_string())?;
+    let outcome = history.domain_events_page(session, outcome_sequence.saturating_sub(1), 2).await.map_err(|e| e.to_string())?;
+    let packed = packed.events.iter().find(|entry| entry.sequence == *packed_sequence).ok_or("original packed wire missing")?;
+    let outcome = outcome.events.iter().find(|entry| entry.sequence == *outcome_sequence).ok_or("original provider outcome missing")?;
+    if packed.kind != "context.provider_request_packed" || outcome.kind != "context.provider_attempt_outcome"
+        || packed.payload["request_id"] != *request_id || outcome.payload["request_id"] != *request_id
+        || packed.payload["body_sha256"] != *wire_body_sha256 || outcome.payload["terminal_status"] != "completed"
+        || packed.payload["step_render"] != serde_json::to_value(step_render).map_err(|e| e.to_string())?
+        || outcome_sequence <= packed_sequence { return Err("original wire journal mismatch".into()); }
+    let bytes = services.artifact_store().read(wire_artifact, &format!("session:{session}"), None)
+        .await.map_err(|e| e.to_string())?;
+    if bytes.len() as u64 != wire_artifact.bytes { return Err("wire artifact length changed".into()); }
+    let artifact: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let wire: provider::ProviderWireRequest = serde_json::from_value(artifact["provider_request"]["wire_request"].clone()).map_err(|e| e.to_string())?;
+    if wire.body_sha256 != *wire_body_sha256 { return Err("wire body identity changed".into()); }
+    let presentation = context_evidence::wire_tool_result_text(&wire, &material.tool_invocation_id).ok_or("wire tool result absent")?;
+    if context_evidence::read_sha256(presentation.as_bytes()) != material.presentation_sha256
+        || presentation.len() as u64 != material.presentation_bytes { return Err("wire presentation changed".into()); }
+    let extent = context_evidence::child_read_presented_extent(parent_input, presentation, &event.payload["child"])
+        .ok_or("child bytes absent from actual wire")?;
+    if extent != event.payload["delivered_extent"] { return Err("child wire extent changed".into()); }
+    Ok(())
+}
+
 pub async fn read_evidence(
     services: &RuntimeServices,
     execution_id: &str,
@@ -443,12 +482,15 @@ pub async fn read_evidence(
             || !matches!(
                 record.kind.as_str(),
                 context_evidence::NATIVE_DELIVERY_KIND | context_evidence::PROCESS_DELIVERY_KIND
+                    | "context.nested_read_model_observed"
             )
         {
             page.next_after_sequence = record.sequence;
             continue;
         }
-        let material = match context_evidence::decode_read_delivery(&record.payload) {
+        let nested = record.kind == "context.nested_read_model_observed";
+        let material = match if nested { review_evidence::nested_parent_material(&record.payload) }
+            else { context_evidence::decode_read_delivery(&record.payload).map_err(str::to_string) } {
             Ok(material) => material,
             Err(_) => {
                 fail(
@@ -518,6 +560,55 @@ pub async fn read_evidence(
                 break;
             }
         };
+        if nested {
+            if snapshot.nested_reads.len() != 1 {
+                fail(&mut page, ReadEvidenceIncompleteReason::AuthenticationFailed);
+                break;
+            }
+            let read = &snapshot.nested_reads[0];
+            let Some(parent_input) = read.primary.payload["original_input"].as_str() else {
+                fail(&mut page, ReadEvidenceIncompleteReason::AuthenticationFailed); break;
+            };
+            if let Err(error) = verify_nested_wire(services, reader.budget, session, parent_input, record, &read.parent).await {
+                fail(&mut page, if error == "nested wire budget exhausted" { ReadEvidenceIncompleteReason::Budget }
+                    else { ReadEvidenceIncompleteReason::AuthenticationFailed });
+                break;
+            }
+            let target = &read.target;
+            if target.path.workspace_id == page.workspace_id && target.exact && target.alias_checked
+                && target.path.object_kind == harness_contract::context::WorkspaceObjectKind::File
+                && target.declared_scope.resource == harness_contract::policy::PermissionResource::File
+                && target.declared_scope.operation == harness_contract::policy::PermissionOperation::Read
+                && super::snapshot::strategy_ref_visible(&target.path.workspace_relative_path, context, Some("read"))
+            {
+                let recipient = match &read.parent.recipient {
+                    ReadDeliveryRecipient::Root { owner, .. } => ReadEvidenceRecipient::Root { binding:owner.binding.clone() },
+                    ReadDeliveryRecipient::AgentTask { identity } => ReadEvidenceRecipient::Agent {
+                        identity:identity.clone(), graph_id:read.parent.acquisition.graph_id.clone(),
+                        node_id:read.parent.acquisition.node_id.clone(),
+                        run_id:packet.as_ref().expect("authenticated Agent packet").run_id().into(),
+                        attempt:read.parent.acquisition.attempt,
+                    },
+                };
+                let identity = format!("{}#child:{}:{}", read.parent.tool_invocation_id, read.step_index, read.position);
+                page.reads.push(VerifiedReadEvidence {
+                    path:target.path.clone(), scope:harness_contract::policy::PermissionScope {
+                        resource:target.declared_scope.resource.clone(), operation:target.declared_scope.operation.clone(),
+                        target:Some(target.path.workspace_relative_path.clone()),
+                    }, recipient,
+                    step:read.parent.acquisition.step.clone(), call_id:read.parent.tool_invocation_id.clone(),
+                    tool_name:"read_file".into(), invocation_id:identity,
+                    delivery:event_ref(record), acquisition:event_ref(&read.primary), index:event_ref(&read.index),
+                    source_sha256:read.body.source_sha256.clone(), source_bytes:read.body.source_bytes,
+                    delivered_extent:Some(extent(&read.extent)), grade:ReadEvidenceGrade::ProviderModelObserved,
+                    body_delivered:true,
+                });
+                sources = snapshot.sources;
+            }
+            candidates += 1;
+            page.next_after_sequence = record.sequence;
+            continue;
+        }
         if snapshot.reads.len() != 1 {
             fail(
                 &mut page,

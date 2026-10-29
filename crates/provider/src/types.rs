@@ -17,6 +17,13 @@ pub struct TransportActivity {
 #[derive(Debug, Default)]
 struct TransportActivityInner {
     generation: AtomicU64,
+    bytes: AtomicU64,
+    frames: AtomicU64,
+    decoded: AtomicU64,
+    first_byte_ms: AtomicU64,
+    first_frame_ms: AtomicU64,
+    first_decoded_ms: AtomicU64,
+    first_consumed_ms: AtomicU64,
     changed: tokio::sync::Notify,
 }
 
@@ -31,6 +38,32 @@ impl TransportActivity {
         self.inner.changed.notify_waiters();
     }
 
+    /// Transport counters only; never retain payload bytes.
+    pub fn observe_chunk(&self, bytes: usize) {
+        if bytes > 0 { set_first_timestamp(&self.inner.first_byte_ms); }
+        self.inner.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.observe();
+    }
+
+    pub fn observe_frames(&self, frames: usize) {
+        if frames > 0 { set_first_timestamp(&self.inner.first_frame_ms); }
+        self.inner.frames.fetch_add(frames as u64, Ordering::Relaxed);
+    }
+
+    pub fn observe_decoded(&self, decoded: usize) {
+        if decoded > 0 { set_first_timestamp(&self.inner.first_decoded_ms); }
+        self.inner.decoded.fetch_add(decoded as u64, Ordering::Relaxed);
+    }
+
+    pub fn observe_consumer_event(&self) {
+        set_first_timestamp(&self.inner.first_consumed_ms);
+    }
+
+    #[must_use]
+    pub fn counters(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+        (self.generation(), self.inner.bytes.load(Ordering::Relaxed), self.inner.frames.load(Ordering::Relaxed), self.inner.decoded.load(Ordering::Relaxed), self.inner.first_byte_ms.load(Ordering::Relaxed), self.inner.first_frame_ms.load(Ordering::Relaxed), self.inner.first_decoded_ms.load(Ordering::Relaxed), self.inner.first_consumed_ms.load(Ordering::Relaxed))
+    }
+
     pub async fn changed_since(&self, generation: u64) {
         loop {
             let notified = self.inner.changed.notified();
@@ -38,6 +71,15 @@ impl TransportActivity {
                 return;
             }
             notified.await;
+        }
+    }
+}
+
+fn set_first_timestamp(target: &AtomicU64) {
+    if target.load(Ordering::Relaxed) == 0 {
+        if let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            let time = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX).max(1);
+            let _ = target.compare_exchange(0, time, Ordering::Relaxed, Ordering::Relaxed);
         }
     }
 }

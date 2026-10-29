@@ -152,6 +152,7 @@ impl ToolHost {
         let bounded_root = bounded_workspace_directory(path_policy.workspace_root());
         ToolHostLease {
             local_network_trace: None,
+            orchestrated_read_trace: None,
             workspace_id: self.workspace_id.clone(),
             workspace_root: self.workspace_root.clone(),
             path_policy,
@@ -217,6 +218,7 @@ fn bounded_workspace_directory(root: &Path) -> Option<Arc<std::fs::File>> {
 #[derive(Clone)]
 pub struct ToolHostLease {
     local_network_trace: Option<Arc<std::sync::Mutex<local_network::LocalNetworkTrace>>>,
+    orchestrated_read_trace: Option<Arc<std::sync::Mutex<OrchestratedReadTrace>>>,
     workspace_id: String,
     workspace_root: PathBuf,
     path_policy: Arc<WorkspacePathPolicy>,
@@ -227,6 +229,72 @@ pub struct ToolHostLease {
     read_cache_authority_digest: Option<String>,
     authorization_lease_verifier:
         Option<Arc<dyn Fn(&AuthorizationLease) -> bool + Send + Sync + 'static>>,
+}
+
+/// Captured at the actual child executor boundary, never parsed from the
+/// model-visible orchestration result. This is an acquisition candidate, not
+/// proof of commit or delivery to a model.
+#[derive(Clone, PartialEq)]
+pub struct OrchestratedRead {
+    ordinal: usize,
+    step_index: usize,
+    step_id: String,
+    position: usize,
+    parent_request_id: String,
+    parent_descriptor_hash: String,
+    parent_authorization: ToolExecutionAuthorization,
+    input: Value,
+    output: String,
+    effect: ToolEffectDescriptor,
+}
+
+impl std::fmt::Debug for OrchestratedRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratedRead").field("step_index", &self.step_index)
+            .field("position", &self.position).finish_non_exhaustive()
+    }
+}
+
+impl OrchestratedRead {
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+    pub fn step_index(&self) -> usize {
+        self.step_index
+    }
+    pub fn step_id(&self) -> &str {
+        &self.step_id
+    }
+    pub fn position(&self) -> usize {
+        self.position
+    }
+    pub fn parent_request_id(&self) -> &str {
+        &self.parent_request_id
+    }
+    pub fn parent_descriptor_hash(&self) -> &str {
+        &self.parent_descriptor_hash
+    }
+    pub fn parent_authorization(&self) -> &ToolExecutionAuthorization { &self.parent_authorization }
+    pub fn input(&self) -> &Value {
+        &self.input
+    }
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+    pub fn effect(&self) -> &ToolEffectDescriptor {
+        &self.effect
+    }
+}
+
+#[derive(Default)]
+struct OrchestratedReadTrace {
+    reads: Vec<OrchestratedRead>,
+    bytes: usize,
+    overflow: bool,
+    parent_request_id: String,
+    parent_descriptor_hash: String,
+    parent_authorization: Option<ToolExecutionAuthorization>,
+    authorized_scopes: Vec<harness_contract::policy::PermissionScope>,
 }
 
 impl std::fmt::Debug for ToolHostLease {
@@ -245,6 +313,90 @@ impl std::fmt::Debug for ToolHostLease {
 mod local_network;
 
 impl ToolHostLease {
+    /// Execute under the original parent authorization while retaining actual
+    /// successful child reads in a private, per-invocation trace. A caller must
+    /// still bind these candidates to the original transaction and verify
+    /// wire delivery before treating any of them as observed evidence.
+    pub fn execute_with_orchestrated_read_trace(
+        &self,
+        authorization: &ToolExecutionAuthorization,
+        input: &Value,
+    ) -> Result<(String, Option<Vec<OrchestratedRead>>), ToolHostError> {
+        if self.orchestrated_read_trace.is_some() {
+            return Err(ToolHostError::Execution("nested read trace owner".into()));
+        }
+        let (canonical, value) =
+            self.authorize_and_canonicalize(authorization, "tool_orchestrate", input)?;
+        let mut lease = self.for_authorized_read_cache(authorization)?;
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
+            authorized_scopes: authorization.authorization_lease.scopes.clone(),
+            parent_request_id: authorization.request_id.clone(),
+            parent_descriptor_hash: authorization.descriptor_hash.clone(),
+            parent_authorization: Some(authorization.clone()),
+            ..OrchestratedReadTrace::default()
+        }));
+        lease.orchestrated_read_trace = Some(Arc::clone(&trace));
+        let output = lease.dispatch_sync(&canonical, value)?;
+        let mut trace = trace
+            .lock()
+            .map_err(|_| ToolHostError::Execution("read trace poisoned".into()))?;
+        let reads = (!trace.overflow).then(|| std::mem::take(&mut trace.reads));
+        Ok((output, reads))
+    }
+
+    pub(crate) fn record_orchestrated_read(
+        &self,
+        step_index: usize,
+        step_id: &str,
+        position: usize,
+        input: &Value,
+        output: &str,
+    ) -> Result<(), String> {
+        let Some(trace) = &self.orchestrated_read_trace else {
+            return Ok(());
+        };
+        let effect = self.describe_effect("read_file", input);
+        let mut trace = trace.lock().map_err(|_| "read trace poisoned")?;
+        if effect.scopes.is_empty()
+            || !effect
+                .scopes
+                .iter()
+                .all(|scope| trace.authorized_scopes.contains(scope))
+        {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(input)
+            .map_err(|error| error.to_string())?
+            .len()
+            .saturating_add(output.len());
+        if trace.reads.len() >= 400 || trace.bytes.saturating_add(bytes) > 4 * 1024 * 1024 {
+            trace.overflow = true;
+            trace.reads.clear();
+            return Ok(());
+        }
+        if trace.overflow {
+            return Ok(());
+        }
+        trace.bytes += bytes;
+        let ordinal = trace.reads.len() + 1;
+        let parent_request_id = trace.parent_request_id.clone();
+        let parent_descriptor_hash = trace.parent_descriptor_hash.clone();
+        let parent_authorization = trace.parent_authorization.clone().ok_or("read trace parent authorization missing")?;
+        trace.reads.push(OrchestratedRead {
+            ordinal,
+            step_index,
+            step_id: step_id.into(),
+            position,
+            parent_request_id,
+            parent_descriptor_hash,
+            parent_authorization,
+            input: input.clone(),
+            output: output.into(),
+            effect,
+        });
+        Ok(())
+    }
+
     pub(crate) fn read_cache_authority_digest(&self) -> Option<&str> {
         self.read_cache_authority_digest.as_deref()
     }
@@ -1490,6 +1642,114 @@ mod tests {
     }
 
     #[test]
+    fn orchestrated_trace_records_actual_successes_under_parent_grant() {
+        let root = std::env::temp_dir().join(format!("cowd-child-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta\n").unwrap();
+        let lease = test_host("child-read", &root).pin_snapshot();
+        let input = json!({"steps":[{"id":"reads","op":"batch","on_error":"collect","calls":[
+            {"tool":"read_file","input":{"path":"a.txt"},"as":"a"},
+            {"tool":"read_file","input":{"path":"b.txt"},"as":"b"},
+            {"tool":"read_file","input":{"path":"missing.txt"},"as":"missing"}
+        ]}]});
+        let effect = lease.describe_effect("tool_orchestrate", &input);
+        let auth = authorization(&effect, None);
+        let (output, reads) = lease
+            .execute_with_orchestrated_read_trace(&auth, &input)
+            .unwrap();
+        let reads = reads.unwrap();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(
+            reads
+                .iter()
+                .map(|read| read.ordinal)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1, 2].into_iter().collect()
+        );
+        for read in &reads {
+            let path = read.input["path"].as_str().unwrap();
+            assert!(matches!(path, "a.txt" | "b.txt"));
+            assert_eq!(read.step_id, "reads");
+            assert_eq!(read.step_index, 0);
+            assert_eq!(read.parent_request_id(), auth.request_id);
+            assert_eq!(read.parent_descriptor_hash(), auth.descriptor_hash);
+            assert_eq!(read.position, if path == "a.txt" { 0 } else { 1 });
+            assert_eq!(read.effect, lease.describe_effect("read_file", &read.input));
+            assert!(read
+                .effect
+                .scopes
+                .iter()
+                .all(|scope| auth.authorization_lease.scopes.contains(scope)));
+            let parsed: Value = serde_json::from_str(&read.output).unwrap();
+            assert_eq!(parsed["type"], "text");
+            assert!(output.contains(parsed["file"]["content"].as_str().unwrap().trim()));
+        }
+        let mut invalid = auth.clone();
+        invalid.authorization_lease.scopes.clear();
+        assert!(lease
+            .execute_with_orchestrated_read_trace(&invalid, &input)
+            .is_err());
+        let (_, next) = lease
+            .execute_with_orchestrated_read_trace(&auth, &input)
+            .unwrap();
+        assert_eq!(next.unwrap().len(), 2, "traces are invocation-local");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn orchestrated_trace_duplicate_step_names_have_distinct_positions() {
+        let root = std::env::temp_dir().join(format!("cowd-child-steps-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        let lease = test_host("child-steps", &root).pin_snapshot();
+        let input = json!({"steps":[
+            {"id":"same","op":"call","tool":"read_file","input":{"path":"a.txt"}},
+            {"id":"same","op":"call","tool":"read_file","input":{"path":"a.txt"}}
+        ]});
+        let auth = authorization(&lease.describe_effect("tool_orchestrate", &input), None);
+        let (_, reads) = lease
+            .execute_with_orchestrated_read_trace(&auth, &input)
+            .unwrap();
+        let reads = reads.unwrap();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(
+            reads
+                .iter()
+                .map(|read| (read.step_index, read.position))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 0)]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn orchestrated_trace_overflow_discards_all_candidates() {
+        let root = std::env::temp_dir();
+        let mut lease = test_host("trace-bound", &root).pin_snapshot();
+        let input = json!({"path":"a.txt"});
+        let effect = lease.describe_effect("read_file", &input);
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
+            authorized_scopes: effect.scopes.clone(),
+            parent_authorization: Some(authorization(&effect, None)),
+            ..OrchestratedReadTrace::default()
+        }));
+        lease.orchestrated_read_trace = Some(Arc::clone(&trace));
+        lease
+            .record_orchestrated_read(0, "reads", 0, &input, "small")
+            .unwrap();
+        lease
+            .record_orchestrated_read(0, "reads", 1, &input, &"x".repeat(4 * 1024 * 1024))
+            .unwrap();
+        lease
+            .record_orchestrated_read(0, "reads", 2, &input, "later")
+            .unwrap();
+        let trace = trace.lock().unwrap();
+        assert!(trace.overflow);
+        assert!(trace.reads.is_empty());
+    }
+
+    #[test]
     fn bounded_host_preserves_original_unknown_grant_and_intersects_timeout() {
         use harness_contract::context::{
             ArtifactRef, ToolExecutionBinding, ToolExecutionStopReason, ToolExecutionTerminal,
@@ -2215,10 +2475,12 @@ mod tests {
             // only an escaping pattern or unknown input widens to the workspace.
             for target in &read_targets {
                 assert!(
-                    effect.scopes.iter().any(|scope| scope.resource
-                        == PermissionResource::File
-                        && scope.operation == PermissionOperation::Read
-                        && scope.target.as_deref() == Some(*target)),
+                    effect
+                        .scopes
+                        .iter()
+                        .any(|scope| scope.resource == PermissionResource::File
+                            && scope.operation == PermissionOperation::Read
+                            && scope.target.as_deref() == Some(*target)),
                     "{tool}: read {target}"
                 );
             }

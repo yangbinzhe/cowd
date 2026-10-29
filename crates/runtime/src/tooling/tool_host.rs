@@ -8,8 +8,47 @@ use crate::tool_orchestrator::ToolSafetyCategory;
 /// In-process progress sink for long-running tools such as bash (T4). The
 /// wrapper keeps the request struct's derives (Debug/PartialEq) valid while
 /// serde always skips the callback; only its presence is ever compared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolLifecycleAnchor {
+    pub invocation_id: String,
+    pub session_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub input_hash: String,
+    pub producer: harness_contract::projection::RuntimeActivityBinding,
+}
+
 #[derive(Clone, Default)]
-pub struct ToolProgressSink(pub Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>);
+pub struct ToolProgressSink(
+    pub Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    std::sync::Arc<std::sync::Mutex<Option<Vec<tools::OrchestratedRead>>>>,
+    std::sync::Arc<std::sync::Mutex<Option<ToolLifecycleAnchor>>>,
+);
+
+impl ToolProgressSink {
+    pub fn new(callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) -> Self {
+        Self(callback, Default::default(), Default::default())
+    }
+    pub fn record_child_reads(&self, reads: Vec<tools::OrchestratedRead>) -> Result<(), String> {
+        let mut slot = self.1.lock().map_err(|_| "child read channel poisoned")?;
+        if slot.is_some() { return Err("child read channel already populated".into()); }
+        *slot = Some(reads);
+        Ok(())
+    }
+    pub(crate) fn child_reads(&self) -> Result<Option<Vec<tools::OrchestratedRead>>, String> {
+        Ok(self.1.lock().map_err(|_| "child read channel poisoned")?.clone())
+    }
+    pub(crate) fn record_lifecycle_anchor(&self, anchor: ToolLifecycleAnchor) -> Result<(), String> {
+        let mut slot = self.2.lock().map_err(|_| "tool lifecycle channel poisoned")?;
+        if slot.is_some() { return Err("tool lifecycle anchor already populated".into()); }
+        *slot = Some(anchor);
+        Ok(())
+    }
+    pub(crate) fn lifecycle_anchor(&self) -> Result<Option<ToolLifecycleAnchor>, String> {
+        Ok(self.2.lock().map_err(|_| "tool lifecycle channel poisoned")?.clone())
+    }
+}
 
 impl std::fmt::Debug for ToolProgressSink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

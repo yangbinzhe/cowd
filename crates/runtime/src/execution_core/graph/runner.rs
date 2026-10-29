@@ -32,6 +32,108 @@ use super::resources::{
 use super::state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
 use super::PHYSICAL_CLOSURE_BUDGET;
 
+// The semantic owner may rebuild post-tool observations and the next plan,
+// but cannot rewrite the physical outcome or discard any other read fence.
+fn accepts_goal_revalidation(
+    original: &NodeExecutionOutcome,
+    candidate: &NodeExecutionOutcome,
+    original_sources: &BTreeMap<String, u64>,
+    candidate_sources: &BTreeMap<String, u64>,
+    stream: &str,
+    expected: u64,
+    actual: u64,
+) -> bool {
+    stream.starts_with("goal:")
+        && actual > expected
+        && original_sources.get(stream) == Some(&expected)
+        && candidate_sources.get(stream) == Some(&actual)
+        && original.result == candidate.result
+        && original.delivery_envelope == candidate.delivery_envelope
+        && original.terminal_presentation == candidate.terminal_presentation
+        && original.no_dispatch == candidate.no_dispatch
+        && original_sources.iter().all(|(key, value)| {
+            key == stream || candidate_sources.get(key) == Some(value)
+        })
+}
+
+// Opt-in diagnostic for the original synthetic completion call. The writer
+// is deliberately separate: tracing must never perform persistent I/O while
+// the graph or shared active-owner lock is held.
+#[cfg(feature = "test-fixtures")]
+fn k05_completion_trace_enabled(ticket: &NodeExecutionTicket) -> bool {
+    std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some()
+        && crate::host::decode_tool_batch(&ticket.payload_ref).is_ok_and(|(calls, _)| {
+            calls.iter().any(|call| {
+                call.id == "recovery-complete" && call.name == "objective_complete_request"
+            })
+        })
+}
+
+#[cfg(feature = "test-fixtures")]
+fn k05_trace_emit(line: String) {
+    use std::sync::{mpsc, OnceLock};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SENDER: OnceLock<Option<mpsc::SyncSender<String>>> = OnceLock::new();
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+    let sender = SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<String>(128);
+        std::thread::Builder::new().name("k05-stage-observer".into()).spawn(move || {
+            while let Ok(line) = receiver.recv() { eprintln!("{line}"); }
+        }).ok().map(|_| sender)
+    });
+    let line = format!("{line} dropped={}", DROPPED.load(Ordering::Relaxed));
+    if sender.as_ref().is_none_or(|sender| sender.try_send(line).is_err()) {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn k05_completion_trace(ticket: &NodeExecutionTicket, stage: &'static str, revision: Option<u64>, ok: Option<bool>) {
+    use sha2::{Digest, Sha256};
+    k05_trace_emit(format!(
+        "k05_runner_stage graph_sha256={:x} node_sha256={:x} attempt={} stage={} revision={:?} ok={:?}",
+        Sha256::digest(ticket.graph_id.as_bytes()), Sha256::digest(ticket.node_id.as_bytes()),
+        ticket.attempt, stage, revision, ok,
+    ));
+}
+
+#[cfg(feature = "test-fixtures")]
+fn k05_completion_cas_error(ticket: &NodeExecutionTicket, error: &ExecutionCommitError) {
+    use sha2::{Digest, Sha256};
+    let (category, stream, expected, actual) = match error {
+        ExecutionCommitError::EventStore(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision { stream_id, expected, actual }) =>
+            ("event_store_stale_revision", Some(stream_id.as_str()), Some(*expected), Some(*actual)),
+        ExecutionCommitError::StaleRevision { graph_id, expected, actual } =>
+            ("graph_stale_revision", Some(graph_id.as_str()), Some(*expected), Some(*actual)),
+        ExecutionCommitError::EventStore(_) => ("event_store_other", None, None, None),
+        ExecutionCommitError::Transition(_) => ("transition", None, None, None),
+        ExecutionCommitError::Serialization(_) => ("serialization", None, None, None),
+        ExecutionCommitError::InvalidCommand(_) => ("invalid_command", None, None, None),
+        ExecutionCommitError::AlreadyAppliedSame { .. } => ("already_applied_same", None, None, None),
+        ExecutionCommitError::GraphStreamCollision(_) => ("graph_stream_collision", None, None, None),
+        ExecutionCommitError::MissingDomainIdempotency(_) => ("missing_domain_idempotency", None, None, None),
+        ExecutionCommitError::ProtectedDomainScope(_) => ("protected_domain_scope", None, None, None),
+        ExecutionCommitError::BlockingTask(_) => ("blocking_task", None, None, None),
+        ExecutionCommitError::InvalidReplan(_) => ("invalid_replan", None, None, None),
+    };
+    let source_kind = stream.map(|id| {
+        if id == ticket.graph_id.as_str() { "graph" }
+        else if id.starts_with("execution-agent-receipts:") { "agent_receipts" }
+        else if id.starts_with("execution-effect:") { "effect" }
+        else if id.starts_with("agentic-program:") { "program" }
+        else if id.starts_with("goal:") { "goal" }
+        else if id.starts_with("session:") { "session" }
+        else { "other" }
+    }).unwrap_or("unknown");
+    let source_sha = stream.map(|id| format!("{:x}", Sha256::digest(id.as_bytes())));
+    k05_trace_emit(format!(
+        "k05_runner_cas_error graph_sha256={:x} node_sha256={:x} attempt={} category={} source_kind={} source_sha256={:?} expected={:?} actual={:?} same_graph={}",
+        Sha256::digest(ticket.graph_id.as_bytes()), Sha256::digest(ticket.node_id.as_bytes()),
+        ticket.attempt, category, source_kind, source_sha, expected, actual,
+        stream == Some(ticket.graph_id.as_str()),
+    ));
+}
+
 #[derive(Debug, Error)]
 pub enum ExecutionRunnerError {
     #[error(transparent)]
@@ -97,6 +199,18 @@ pub(crate) struct ExecutionPreparedPumpNode {
     startup_error: Option<ExecutionRunnerError>,
 }
 
+#[derive(Default)]
+struct CancelOutcomeHandoff {
+    state: StdMutex<CancelOutcomeState>,
+    ready: Notify,
+}
+#[derive(Default)]
+struct CancelOutcomeState {
+    polled: bool,
+    finished: bool,
+    outcome: Option<NodeExecutionOutcome>,
+}
+
 struct ActiveNode {
     executor: Arc<dyn NodeExecutor>,
     ticket: NodeExecutionTicket,
@@ -105,7 +219,14 @@ struct ActiveNode {
     resource_started: std::time::Instant,
     effect_state: ExecutionEffectState,
     effect_receipt_required: bool,
-    _resources: NodeResourceGuards,
+    cancel_outcome: Arc<CancelOutcomeHandoff>,
+    // Identity and callback state remain visible without taking the owner's
+    // resource lock. The table retains the Arc across a cancelled waiter.
+    binding: ExecutionNodeBinding,
+    resources: Arc<StdMutex<NodeResourceGuards>>,
+    release_blocked: bool,
+    callback_completed: bool,
+    drain_completed: bool,
     callback_gate: Arc<Mutex<()>>,
     no_dispatch: Option<Arc<super::executors::agent_tool::NoDispatchObservation>>,
 }
@@ -146,9 +267,6 @@ struct NodeResourceGuards {
     worktree: Option<WorktreeLease>,
     original_binding: Option<ExecutionNodeBinding>,
     admission_pending: bool,
-    release_blocked: bool,
-    callback_completed: bool,
-    drain_completed: bool,
     owner_fence: Option<super::resources::BindingOwnerFence>,
 }
 
@@ -208,6 +326,10 @@ pub(crate) struct ExecutionGraphRunner {
     coordination: Arc<StdMutex<BTreeMap<String, Weak<Mutex<()>>>>>,
     command_intents: Arc<StdMutex<BTreeMap<String, Arc<Notify>>>>,
     mutation_gate: Arc<RwLock<Option<MutationGate>>>,
+    #[cfg(test)]
+    closure_probe: Arc<StdMutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
+    #[cfg(test)]
+    closure_finished_probe: Arc<StdMutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
 }
 
 type MutationGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
@@ -347,6 +469,10 @@ impl ExecutionGraphRunner {
             coordination: Arc::new(StdMutex::new(BTreeMap::new())),
             command_intents: Arc::new(StdMutex::new(BTreeMap::new())),
             mutation_gate: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            closure_probe: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            closure_finished_probe: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -404,7 +530,7 @@ impl ExecutionGraphRunner {
             .iter()
             .filter(|((active_graph, _), _)| active_graph == graph_id)
             .map(|((_, node_id), active)| {
-                (node_id.clone(), active._resources.binding(&active.ticket))
+                (node_id.clone(), active.binding.clone())
             })
             .collect::<Vec<_>>();
         let graph = self.state_store.load_async(graph_id).await?;
@@ -1038,13 +1164,18 @@ impl ExecutionGraphRunner {
                         (start.ticket.graph_id.clone(), start.ticket.node_id.clone()),
                         ActiveNode {
                             executor: start.executor,
+                            binding: start.resources.binding(&start.ticket),
                             ticket: start.ticket,
                             resource_kind: start.resource_kind,
                             resource_queue_wait: start.resource_queue_wait,
                             resource_started: start.resource_started,
                             effect_state: start.effect_state,
                             effect_receipt_required: start.effect_receipt_required,
-                            _resources: start.resources,
+                            cancel_outcome: Arc::new(CancelOutcomeHandoff::default()),
+                            resources: Arc::new(StdMutex::new(start.resources)),
+                            release_blocked: true,
+                            callback_completed: false,
+                            drain_completed: false,
                             callback_gate: Arc::new(Mutex::new(())),
                             no_dispatch,
                         },
@@ -1070,7 +1201,7 @@ impl ExecutionGraphRunner {
                     .map(|(_, active)| {
                         (
                             active.ticket.clone(),
-                            active._resources.binding(&active.ticket),
+                            active.binding.clone(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -1093,7 +1224,7 @@ impl ExecutionGraphRunner {
                             .get(&(graph_id.to_string(), ticket.node_id.clone()))
                             .filter(|original| {
                                 original.ticket == *ticket
-                                    && original._resources.binding(ticket) == *binding
+                                    && original.binding.clone() == *binding
                             })
                             .ok_or_else(|| {
                                 ExecutionRunnerError::Driver(
@@ -1117,7 +1248,7 @@ impl ExecutionGraphRunner {
                     drop(active);
                     drop(coordination);
                     for mut start in aborted {
-                        start._resources.admission_pending = false;
+                        start.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).admission_pending = false;
                         self.record_resource_terminal(
                             start.resource_kind.as_ref(),
                             start.resource_queue_wait,
@@ -1179,6 +1310,19 @@ impl ExecutionGraphRunner {
     ) -> Result<(), ExecutionRunnerError> {
         let expected_binding = prepared.binding.clone();
         let node_id = prepared.node.id.clone();
+        #[cfg(feature = "test-fixtures")]
+        let mut diagnostic_ticket = None;
+        let handoff = self.active.lock().await.get(&(graph_id.to_string(), node_id.clone()))
+            .filter(|active| Some(&active.binding) == expected_binding.as_ref())
+            .map(|active| {
+                #[cfg(feature = "test-fixtures")]
+                { diagnostic_ticket = Some(active.ticket.clone()); }
+                Arc::clone(&active.cancel_outcome)
+            });
+        #[cfg(feature = "test-fixtures")]
+        let diagnostic_ticket = diagnostic_ticket.filter(k05_completion_trace_enabled);
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "start_and_execute_enter", None, None); }
         let result = match prepared.startup_error {
             Some(error) => Err(error),
             None => {
@@ -1186,14 +1330,33 @@ impl ExecutionGraphRunner {
                     .await
             }
         };
-        if !self
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "start_and_execute_return", None, Some(result.is_ok())); }
+        if let Some(handoff) = handoff {
+            let mut state = handoff.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.finished = true;
+            state.outcome = result.as_ref().ok().map(|(_, outcome)| outcome.clone());
+            drop(state);
+            handoff.ready.notify_one();
+        }
+        let binding_matches = self
             .active_binding_matches(graph_id, &node_id, expected_binding.as_ref())
-            .await
-        {
+            .await;
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "binding_checked", None, Some(binding_matches)); }
+        if !binding_matches {
             return Ok(());
         }
-        self.finish_pump_node(graph_id, result, durable_progress, expected_binding)
-            .await
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "finish_pump_enter", None, None); }
+        // Keep the large terminal-transition future out of its caller's
+        // async frame. Its ownership, cancellation and fences are unchanged.
+        let result = Box::pin(self.finish_pump_node(
+            graph_id, result, durable_progress, expected_binding,
+        )).await;
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "finish_pump_return", None, Some(result.is_ok())); }
+        result
     }
 
     #[cfg(test)]
@@ -1221,12 +1384,12 @@ impl ExecutionGraphRunner {
         let Some(owner) = active.get(&key) else {
             return Ok(false);
         };
-        let actual = owner._resources.binding(&owner.ticket);
+        let actual = owner.binding.clone();
         if Some(&actual) != binding
             || !actual.resource_lease_refs.is_empty()
             || actual.scope_lease_ref.is_some()
             || actual.worktree_lease_ref.is_some()
-            || owner._resources.callback_completed
+            || owner.callback_completed
         {
             return Err(ExecutionRunnerError::Driver(
                 "test crash injection cannot drop nonempty or closed owner".into(),
@@ -1246,7 +1409,7 @@ impl ExecutionGraphRunner {
             .lock()
             .await
             .get(&(graph_id.to_string(), node_id.to_string()))
-            .map(|active| active._resources.binding(&active.ticket))
+            .map(|active| active.binding.clone())
             .as_ref()
             == expected_binding
     }
@@ -1261,7 +1424,7 @@ impl ExecutionGraphRunner {
             .await
             .get(&(ticket.graph_id.clone(), ticket.node_id.clone()))
             .filter(|active| active.ticket == *ticket)
-            .map(|active| active._resources.binding(&active.ticket))
+            .map(|active| active.binding.clone())
     }
 
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -1304,7 +1467,7 @@ impl ExecutionGraphRunner {
             .lock()
             .await
             .get(&(graph_id.to_string(), ticket.node_id.clone()))
-            .is_some_and(|active| active.ticket == *ticket && active._resources.drain_completed)
+            .is_some_and(|active| active.ticket == *ticket && active.drain_completed)
         {
             return Ok(());
         }
@@ -1344,7 +1507,7 @@ impl ExecutionGraphRunner {
             .get_mut(&(graph_id.to_string(), ticket.node_id.clone()))
         {
             if active.ticket == *ticket {
-                active._resources.drain_completed = true;
+                active.drain_completed = true;
             }
         }
         Ok(())
@@ -1367,7 +1530,7 @@ impl ExecutionGraphRunner {
             .await
             .get(&(graph_id.to_string(), ticket.node_id.clone()))
             .filter(|active| active.ticket == *ticket)
-            .map(|active| active._resources.binding(ticket));
+            .map(|active| active.binding.clone());
         let Some(binding) = binding else {
             return Ok(());
         };
@@ -1399,8 +1562,8 @@ impl ExecutionGraphRunner {
             .filter(|active| active.ticket == *ticket)
             .map(|active| {
                 (
-                    active._resources.binding(ticket),
-                    active._resources.callback_completed,
+                    active.binding.clone(),
+                    active.callback_completed,
                     active.no_dispatch.clone(),
                 )
             });
@@ -1515,8 +1678,8 @@ impl ExecutionGraphRunner {
             .get_mut(&(graph_id.to_string(), ticket.node_id.clone()))
         {
             if active.ticket == *ticket {
-                active._resources.callback_completed = result.is_ok();
-                active._resources.release_blocked = result.is_err();
+                active.callback_completed = result.is_ok();
+                active.release_blocked = result.is_err();
             }
         }
         result
@@ -1541,26 +1704,29 @@ impl ExecutionGraphRunner {
         &self,
         graph_id: &str,
         node_id: &str,
-        finished: &mut ActiveNode,
+        ticket: &NodeExecutionTicket,
+        binding: &ExecutionNodeBinding,
+        resources: &mut NodeResourceGuards,
+        no_dispatch: Option<&Arc<super::executors::agent_tool::NoDispatchObservation>>,
     ) -> Result<(), ExecutionRunnerError> {
-        if finished._resources.release_blocked || !finished._resources.callback_completed {
-            return Err(ExecutionRunnerError::Driver(
-                "original callback has not positively completed; binding release blocked".into(),
-            ));
-        }
-        let binding = finished._resources.binding(&finished.ticket);
-        if !ExecutionBindingLeaseClosure::required(&binding) {
+        if !ExecutionBindingLeaseClosure::required(binding) {
             return Ok(());
+        }
+        #[cfg(test)]
+        {
+            let probe = self.closure_probe.lock().unwrap().clone();
+            if let Some(probe) = probe {
+                probe(graph_id);
+            }
         }
         for retry in 0..8 {
             let graph = self.state_store.load(graph_id)?;
             let position = self
                 .state_store
-                .binding_start_position(&graph, node_id, &binding)?
+                .binding_start_position(&graph, node_id, binding)?
                 .ok_or_else(|| {
                     ExecutionRunnerError::Driver("original lease start missing".into())
                 })?;
-            let resources = &mut finished._resources;
             let owner = resources.owner_fence.as_mut().ok_or_else(|| {
                 ExecutionRunnerError::Driver("original binding owner capability missing".into())
             })?;
@@ -1568,7 +1734,7 @@ impl ExecutionGraphRunner {
                 .release_original(
                     &graph,
                     node_id,
-                    &binding,
+                    binding,
                     position,
                     &mut resources.resource,
                     &mut resources.scope,
@@ -1578,9 +1744,9 @@ impl ExecutionGraphRunner {
                 .map_err(ExecutionRunnerError::Driver)?;
             if self
                 .state_store
-                .binding_lease_closure(&graph, node_id, &binding, position)?
+                .binding_lease_closure(&graph, node_id, binding, position)?
             {
-                self.registry.forget_builtin_binding(&finished.ticket);
+                self.registry.forget_builtin_binding(ticket);
                 return Ok(());
             }
             match self
@@ -1588,14 +1754,12 @@ impl ExecutionGraphRunner {
                 .commit_binding_lease_closure_with_witness(
                     &graph,
                     &released,
-                    finished
-                        .no_dispatch
-                        .as_ref()
+                    no_dispatch
                         .and_then(|observation| observation.witness())
                         .as_ref(),
                 ) {
                 Ok(_) => {
-                    self.registry.forget_builtin_binding(&finished.ticket);
+                    self.registry.forget_builtin_binding(ticket);
                     return Ok(());
                 }
                 Err(ExecutionCommitError::EventStore(
@@ -1621,9 +1785,7 @@ impl ExecutionGraphRunner {
             .lock()
             .await
             .get(&key)
-            .filter(|active| {
-                Some(active._resources.binding(&active.ticket)).as_ref() == expected_binding
-            })
+            .filter(|active| Some(active.binding.clone()).as_ref() == expected_binding)
             .map(|active| {
                 (
                     active.callback_gate.clone(),
@@ -1638,21 +1800,70 @@ impl ExecutionGraphRunner {
         self.complete_callback_locked(graph_id, &executor, &ticket, None)
             .await?;
         let _coordination = self.graph_coordination(graph_id).await;
-        let mut active = self.active.lock().await;
-        if active
-            .get(&key)
-            .map(|active| active._resources.binding(&active.ticket))
-            .as_ref()
-            != expected_binding
-        {
-            return Ok(None);
-        }
-        let Some(finished) = active.get_mut(&key) else {
-            return Ok(None);
+        let (resources, binding, no_dispatch) = {
+            let active = self.active.lock().await;
+            let Some(finished) = active.get(&key).filter(|finished| {
+                Some(&finished.binding) == expected_binding && finished.ticket == ticket
+            }) else {
+                return Ok(None);
+            };
+            if finished.release_blocked || !finished.callback_completed {
+                return Err(ExecutionRunnerError::Driver(
+                    "original callback has not positively completed; binding release blocked"
+                        .into(),
+                ));
+            }
+            (
+                Arc::clone(&finished.resources),
+                finished.binding.clone(),
+                finished.no_dispatch.clone(),
+            )
         };
-        self.close_active_binding_leases(graph_id, node_id, finished)?;
-        drop(finished._resources.owner_fence.take());
-        Ok(active.remove(&key))
+        // The table retains this exact owner and its fence while the lock is
+        // released. A cancelled waiter therefore cannot drop the leases.
+        {
+            let mut original = resources.lock().map_err(|_| {
+                ExecutionRunnerError::Driver(
+                    "original binding resource owner poisoned; release blocked".into(),
+                )
+            })?;
+            self.close_active_binding_leases(
+                graph_id,
+                node_id,
+                &ticket,
+                &binding,
+                &mut original,
+                no_dispatch.as_ref(),
+            )?;
+        }
+        #[cfg(test)]
+        {
+            let probe = self.closure_finished_probe.lock().unwrap().clone();
+            if let Some(probe) = probe {
+                probe(graph_id);
+            }
+        }
+        let mut active = self.active.lock().await;
+        if !active.get(&key).is_some_and(|finished| {
+            finished.ticket == ticket
+                && finished.binding == binding
+                && Arc::ptr_eq(&finished.resources, &resources)
+        }) {
+            return Err(ExecutionRunnerError::Driver(
+                "original binding owner changed during closure".into(),
+            ));
+        }
+        let mut original = resources.lock().map_err(|_| {
+            ExecutionRunnerError::Driver(
+                "original binding resource owner poisoned after closure".into(),
+            )
+        })?;
+        let fence = original.owner_fence.take();
+        let finished = active.remove(&key);
+        drop(active);
+        drop(original);
+        drop(fence);
+        Ok(finished)
     }
 
     async fn commit_terminal_wave(
@@ -1710,7 +1921,7 @@ impl ExecutionGraphRunner {
                                             pending.transition.node_id.clone(),
                                         ))
                                         .is_some_and(|active| {
-                                            active._resources.binding(&active.ticket) == *binding
+                                            active.binding.clone() == *binding
                                         })
                             })
                         {
@@ -1804,7 +2015,7 @@ impl ExecutionGraphRunner {
         durable_progress: Arc<Notify>,
         expected_binding: Option<ExecutionNodeBinding>,
     ) -> Result<(), ExecutionRunnerError> {
-        let Some((node_id, outcome)) = self
+        let Some((node_id, mut outcome)) = self
             .resolve_pump_result(
                 graph_id,
                 result,
@@ -1815,6 +2026,14 @@ impl ExecutionGraphRunner {
         else {
             return Ok(());
         };
+        #[cfg(feature = "test-fixtures")]
+        let diagnostic_ticket = if std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some() {
+            self.active.lock().await.get(&(graph_id.to_string(), node_id.clone()))
+                .filter(|active| Some(&active.binding) == expected_binding.as_ref())
+                .map(|active| active.ticket.clone()).filter(k05_completion_trace_enabled)
+        } else { None };
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "resolve_pump_return", None, None); }
         let deadline_terminal = outcome
             .result
             .failure
@@ -1842,8 +2061,14 @@ impl ExecutionGraphRunner {
                 return Err(error.into());
             }
         }
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "intent_wait_check", None, None); }
         if let Some(waiter) = self.command_intent_waiter(graph_id) {
+            #[cfg(feature = "test-fixtures")]
+            if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "intent_wait_enter", None, None); }
             waiter.await;
+            #[cfg(feature = "test-fixtures")]
+            if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "intent_wait_return", None, None); }
         }
         let active_wave = self
             .active
@@ -1851,7 +2076,7 @@ impl ExecutionGraphRunner {
             .await
             .get(&(graph_id.to_string(), node_id.clone()))
             .filter(|active| {
-                Some(active._resources.binding(&active.ticket)).as_ref()
+                Some(active.binding.clone()).as_ref()
                     == expected_binding.as_ref()
             })
             .map(|active| {
@@ -1861,6 +2086,8 @@ impl ExecutionGraphRunner {
                     active.effect_receipt_required,
                 )
             });
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "active_wave_checked", None, Some(active_wave.is_some())); }
         if active_wave.is_none() {
             return Ok(());
         }
@@ -1873,6 +2100,8 @@ impl ExecutionGraphRunner {
                     "batchable active wave has no execution binding".to_string(),
                 ));
             };
+            #[cfg(feature = "test-fixtures")]
+            if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "terminal_wave_enter", None, None); }
             let disposition = self
                 .commit_terminal_wave(
                     graph_id,
@@ -1884,6 +2113,8 @@ impl ExecutionGraphRunner {
                     expected_binding.as_ref(),
                 )
                 .await?;
+            #[cfg(feature = "test-fixtures")]
+            if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "terminal_wave_return", None, None); }
             match disposition {
                 TerminalCommitDisposition::Committed => {
                     durable_progress.notify_one();
@@ -1931,8 +2162,14 @@ impl ExecutionGraphRunner {
         // Commit terminal graph truth before waking the pump or publishing
         // process-local executor output.
         let committed_executor = {
-            let _coordination = self.graph_coordination_without_command(graph_id).await;
+            #[cfg(feature = "test-fixtures")]
+            if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "coordination_enter", None, None); }
+            let mut coordination = self.graph_coordination_without_command(graph_id).await;
+            #[cfg(feature = "test-fixtures")]
+            if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "coordination_acquired", None, None); }
             let mut current = self.state_store.load_async(graph_id).await?;
+            #[cfg(feature = "test-fixtures")]
+            if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "graph_loaded", Some(current.revision), None); }
             if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running)
                 || !expected_binding.as_ref().is_some_and(|binding| {
                     current.recovery_cursor.node_attempts.get(&node_id) == Some(&binding.attempt)
@@ -1944,7 +2181,7 @@ impl ExecutionGraphRunner {
                 let aborted = active_wave
                     .as_ref()
                     .map(|(executor, ticket, _)| (Arc::clone(executor), ticket.clone()));
-                drop(_coordination);
+                drop(coordination);
                 if let Some((executor, ticket)) = aborted {
                     self.complete_callback_observed(
                         graph_id,
@@ -1961,7 +2198,7 @@ impl ExecutionGraphRunner {
             let (_, ticket, _) = active_wave.as_ref().ok_or_else(|| {
                 ExecutionRunnerError::Driver("atomic outcome binding missing".into())
             })?;
-            let outcome_sources = match self
+            let mut outcome_sources = match self
                 .commit_service
                 .execution_outcome_sources(&current, ticket, &outcome)
             {
@@ -1975,7 +2212,7 @@ impl ExecutionGraphRunner {
                         ExecutionCommitError::InvalidCommand(reason)
                         if reason == "observation source conflicts with causal read-set");
                     let revision = current.revision;
-                    drop(_coordination);
+                    drop(coordination);
                     if source_conflict {
                         let retirement = self.command(graph_id, ExecutionGraphCommand::CancelNode {
                             expected_revision: revision,
@@ -1987,6 +2224,21 @@ impl ExecutionGraphRunner {
                                 "{error}; original binding retirement failed: {retirement_error}"
                             )));
                         }
+                    } else if let Err(settlement_error) = self
+                        .isolate_node_failure(
+                            graph_id,
+                            &node_id,
+                            expected_binding.as_ref(),
+                            format!("original outcome preparation failed: {error}"),
+                        )
+                        .await
+                    {
+                        // The settlement itself failed, so the node may still
+                        // look live.  Report both errors instead of losing the
+                        // original cause behind an unsettled binding.
+                        return Err(ExecutionRunnerError::Driver(format!(
+                            "{error}; original binding settlement failed: {settlement_error}"
+                        )));
                     }
                     return Err(error.into());
                 }
@@ -1997,8 +2249,11 @@ impl ExecutionGraphRunner {
             // execution driver with a raw `revision mismatch`.
             const MAX_TRANSITION_ATTEMPTS: usize = 8;
             let mut attempt = 0;
+            let mut owner_superseded = false;
             let transition = loop {
                 attempt += 1;
+                #[cfg(feature = "test-fixtures")]
+                if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "terminal_cas_enter", Some(current.revision), None); }
                 let result = self
                     .commit_service
                     .transition_execution_outcome_async(
@@ -2008,13 +2263,67 @@ impl ExecutionGraphRunner {
                         outcome_sources.clone(),
                     )
                     .await;
+                #[cfg(feature = "test-fixtures")]
+                if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "terminal_cas_return", Some(current.revision), Some(result.is_ok())); }
+                #[cfg(feature = "test-fixtures")]
+                if let (Some(ticket), Err(error)) = (&diagnostic_ticket, &result) { k05_completion_cas_error(ticket, error); }
                 match result {
                     Ok(receipt) => break Ok(receipt),
-                    Err(ExecutionCommitError::EventStore(
-                        crate::runtime_event_store::RuntimeEventStoreError::StaleRevision {
-                            ..
-                        },
+                    Err(error @ ExecutionCommitError::EventStore(
+                        crate::runtime_event_store::RuntimeEventStoreError::StaleRevision { .. },
                     )) if attempt < MAX_TRANSITION_ATTEMPTS => {
+                        let (stream, expected, actual) = match &error {
+                            ExecutionCommitError::EventStore(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision { stream_id, expected, actual }) => (stream_id.clone(), *expected, *actual),
+                            _ => unreachable!(),
+                        };
+                        if stream != graph_id {
+                            let (executor, original_ticket, _) = active_wave.as_ref().expect("checked active binding");
+                            if !self.registry.is_builtin_tool_batch(executor)
+                                || outcome_sources.get(&stream) != Some(&expected)
+                                || !stream.starts_with("goal:")
+                            {
+                                break Err(error);
+                            }
+                            // The original owner may do bounded persistent reads;
+                            // never hold graph coordination across that work.
+                            drop(coordination);
+                            let rebuilt = executor.revalidate_goal_source(
+                                original_ticket, &outcome, &stream, expected, actual,
+                            ).await;
+                            coordination = self.graph_coordination_without_command(graph_id).await;
+                            current = self.state_store.load_async(graph_id).await?;
+                            let original_owner_live = self.active.lock().await
+                                .get(&(graph_id.to_string(), node_id.clone()))
+                                .is_some_and(|owner| {
+                                    Some(&owner.binding) == expected_binding.as_ref()
+                                        && owner.ticket == *original_ticket
+                                        && Arc::ptr_eq(&owner.executor, executor)
+                                        && !owner.callback_completed
+                                });
+                            if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running)
+                                || !expected_binding.as_ref().is_some_and(|binding| current.recovery_cursor.node_attempts.get(&node_id) == Some(&binding.attempt))
+                                || !original_owner_live
+                            {
+                                owner_superseded = !original_owner_live;
+                                break Err(ExecutionCommitError::InvalidCommand("node transition superseded during Goal revalidation".into()));
+                            }
+                            let Ok(Some(candidate)) = rebuilt else { break Err(error); };
+                            if validate_outcome(&node_id, &candidate).is_err()
+                                || candidate.replan.as_ref().is_some_and(|plan| self.registry.validate_nodes(&plan.nodes).is_err())
+                            {
+                                break Err(error);
+                            }
+                            let candidate_sources = match self.commit_service.execution_outcome_sources(&current, original_ticket, &candidate) {
+                                Ok(sources) => sources,
+                                Err(source_error) => break Err(source_error),
+                            };
+                            if !accepts_goal_revalidation(&outcome, &candidate, &outcome_sources, &candidate_sources, &stream, expected, actual) {
+                                break Err(error);
+                            }
+                            outcome_sources = candidate_sources;
+                            outcome = candidate;
+                            continue;
+                        }
                         current = self.state_store.load_async(graph_id).await?;
                         if current.node_statuses.get(&node_id)
                             != Some(&ExecutionNodeStatus::Running)
@@ -2039,6 +2348,11 @@ impl ExecutionGraphRunner {
                 }
             };
             if let Err(error) = transition {
+                if owner_superseded {
+                    // A same-key replacement is not the original owner. Do
+                    // not call its callback or release its leases.
+                    return Err(error.into());
+                }
                 #[cfg(test)]
                 if self
                     .drop_injected_empty_bound_owner(
@@ -2057,11 +2371,11 @@ impl ExecutionGraphRunner {
                     .await
                     .get(&(graph_id.to_string(), node_id.clone()))
                     .filter(|active| {
-                        Some(active._resources.binding(&active.ticket)).as_ref()
+                        Some(active.binding.clone()).as_ref()
                             == expected_binding.as_ref()
                     })
                     .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
-                drop(_coordination);
+                drop(coordination);
                 if let Some((executor, ticket)) = aborted {
                     self.complete_callback_observed(
                         graph_id,
@@ -2080,7 +2394,7 @@ impl ExecutionGraphRunner {
                 .await
                 .get(&(graph_id.to_string(), node_id.clone()))
                 .filter(|active| {
-                    Some(active._resources.binding(&active.ticket)).as_ref()
+                    Some(active.binding.clone()).as_ref()
                         == expected_binding.as_ref()
                 })
                 .map(|active| (Arc::clone(&active.executor), active.ticket.clone()))
@@ -2122,7 +2436,7 @@ impl ExecutionGraphRunner {
                     .await
                     .get(&(graph_id.to_string(), node_id.clone()))
                     .filter(|active| {
-                        Some(active._resources.binding(&active.ticket)).as_ref() == expected_binding
+                        Some(active.binding.clone()).as_ref() == expected_binding
                     })
                     .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
                 if let Some((executor, ticket)) = running {
@@ -2268,7 +2582,7 @@ impl ExecutionGraphRunner {
         let active = self.active.lock().await;
         let prepared = active.get(&(graph_id.to_string(), node.id.clone()));
         if prepared
-            .map(|active| active._resources.binding(&active.ticket))
+            .map(|active| active.binding.clone())
             .as_ref()
             != expected_binding
         {
@@ -2336,6 +2650,17 @@ impl ExecutionGraphRunner {
                 .into());
             }
             ExecutionEffectState::Fresh => {}
+        }
+        {
+            let active = self.active.lock().await;
+            let Some(owner) = active.get(&(graph_id.to_string(), ticket.node_id.clone()))
+                .filter(|owner| owner.ticket == ticket && Some(&owner.binding) == expected_binding) else {
+                return Err(ExecutionRunnerError::CommandSuperseded { node_id: ticket.node_id.clone() });
+            };
+            if self.command_intent_waiter(graph_id).is_some() {
+                return Err(ExecutionRunnerError::CommandSuperseded { node_id: ticket.node_id.clone() });
+            }
+            owner.cancel_outcome.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).polled = true;
         }
         let outcome = if let Some(deadline_at_ms) = deadline_at_ms {
             let remaining = Duration::from_millis(deadline_at_ms.saturating_sub(now_ms()));
@@ -2479,9 +2804,6 @@ impl ExecutionGraphRunner {
                 worktree: None,
                 original_binding: None,
                 admission_pending: false,
-                release_blocked: true,
-                callback_completed: false,
-                drain_completed: false,
                 owner_fence: None,
             });
         }
@@ -2666,9 +2988,6 @@ impl ExecutionGraphRunner {
             worktree,
             original_binding: None,
             admission_pending: false,
-            release_blocked: true,
-            callback_completed: false,
-            drain_completed: false,
             owner_fence: None,
         })
     }
@@ -2686,7 +3005,7 @@ impl ExecutionGraphRunner {
             .await
             .get(&(graph_id.to_string(), node_id.to_string()))
             .filter(|active| {
-                Some(active._resources.binding(&active.ticket)).as_ref() == expected_binding
+                Some(active.binding.clone()).as_ref() == expected_binding
             })
             .map(|active| (Arc::clone(&active.executor), active.ticket.clone()));
         if let Some((executor, ticket)) = running.as_ref() {
@@ -2839,7 +3158,7 @@ impl ExecutionGraphRunner {
             (
                 Arc::clone(&active.executor),
                 active.ticket.clone(),
-                active._resources.binding(&active.ticket),
+                active.binding.clone(),
             )
         });
         if running.as_ref().map(|(_, _, binding)| binding) != expected_binding {
@@ -2867,7 +3186,7 @@ impl ExecutionGraphRunner {
                     .lock()
                     .await
                     .get(&key)
-                    .is_some_and(|active| active._resources.binding(&active.ticket) == *binding)
+                    .is_some_and(|active| active.binding.clone() == *binding)
             {
                 return Err(ExecutionRunnerError::CommandSuperseded {
                     node_id: node_id.to_owned(),
@@ -3014,6 +3333,14 @@ impl ExecutionGraphRunner {
                 )
                 .into());
             }
+            let handoffs = if matches!(command, ExecutionGraphCommand::Cancel { .. } | ExecutionGraphCommand::CancelNode { .. }) {
+                let table = self.active.lock().await;
+                active.iter().filter_map(|(node_id, _, ticket)| {
+                    table.get(&(graph_id.to_string(), node_id.clone()))
+                        .filter(|owner| owner.ticket == *ticket && owner.effect_receipt_required)
+                        .map(|owner| (node_id.clone(), ticket.clone(), Arc::clone(&owner.cancel_outcome)))
+                }).collect::<Vec<_>>()
+            } else { Vec::new() };
             let cancellation_finalizer = CancellationFinalizationOwner::new(active);
             drop(coordination);
 
@@ -3037,12 +3364,41 @@ impl ExecutionGraphRunner {
                 }
             }
 
-            let coordination = self.graph_coordination(graph_id).await;
-            let current = self.state_store.load_async(graph_id).await?;
             if let Some((_, error)) = cancellation_errors.into_iter().next() {
-                drop(coordination);
                 return Err(error);
             }
+            let mut cancelled_outcomes = Vec::new();
+            for (node_id, ticket, handoff) in handoffs {
+                let deadline = tokio::time::Instant::now() + PHYSICAL_CLOSURE_BUDGET;
+                let outcome = loop {
+                    let ready = handoff.ready.notified();
+                    let snapshot = {
+                        let state = handoff.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        (state.polled, state.finished, state.outcome.clone())
+                    };
+                    if !snapshot.0 { break None; }
+                    if snapshot.1 {
+                        let Some(outcome) = snapshot.2 else { break None; };
+                        // A completed operation remains completed. An error,
+                        // nonterminal result or outcome requiring another
+                        // domain transition remains unknown to this command.
+                        if !matches!(outcome.result.status, ExecutionNodeStatus::Cancelled | ExecutionNodeStatus::Completed)
+                            || outcome.replan.is_some() || outcome.delivery_envelope.is_some()
+                            || outcome.terminal_presentation.is_some() || outcome.no_dispatch.is_some() {
+                            break None;
+                        }
+                        break Some(outcome);
+                    }
+                    if tokio::time::timeout_at(deadline, ready).await.is_err() {
+                        return Err(ExecutionRunnerError::Driver("original cancelled executor outcome remains pending".into()));
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    cancelled_outcomes.push(ExecutionTerminalCommit { node_id, outcome, effect_ticket:Some(ticket) });
+                }
+            }
+            let coordination = self.graph_coordination(graph_id).await;
+            let current = self.state_store.load_async(graph_id).await?;
             // The intent gate prevents node transitions while cancellation is
             // in flight. Re-validating the original caller revision here is
             // the CAS that prevents a delayed command from overwriting a
@@ -3056,7 +3412,7 @@ impl ExecutionGraphRunner {
             }
             let result = self
                 .commit_service
-                .apply_command_async(current, command.clone())
+                .apply_command_with_cancelled_outcomes_async(current, command.clone(), cancelled_outcomes)
                 .await;
             drop(coordination);
             if result.is_ok() {
@@ -3071,7 +3427,7 @@ impl ExecutionGraphRunner {
                         .lock()
                         .await
                         .get(&(graph_id.to_string(), node_id.clone()))
-                        .map(|active| active._resources.binding(&active.ticket));
+                        .map(|active| active.binding.clone());
                     self.take_bound_active_node(graph_id, &node_id, binding.as_ref())
                         .await?;
                 }
@@ -3532,6 +3888,10 @@ async fn run_after_commit_observed(
     ticket: &NodeExecutionTicket,
 ) -> Result<(), NodeExecutorError> {
     let started = std::time::Instant::now();
+    #[cfg(feature = "test-fixtures")]
+    let k05_trace = k05_completion_trace_enabled(ticket);
+    #[cfg(feature = "test-fixtures")]
+    if k05_trace { k05_completion_trace(ticket, "after_commit_enter", None, None); }
     tracing::info!(
         target: "cowd::graph_runner",
         graph_id = ticket.graph_id,
@@ -3542,6 +3902,8 @@ async fn run_after_commit_observed(
         "node post-commit hook entered"
     );
     let result = executor.after_commit(ticket).await;
+    #[cfg(feature = "test-fixtures")]
+    if k05_trace { k05_completion_trace(ticket, "after_commit_return", None, Some(result.is_ok())); }
     tracing::info!(
         target: "cowd::graph_runner",
         graph_id = ticket.graph_id,
@@ -3812,6 +4174,30 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
+mod goal_revalidation_fence_tests {
+    use super::*;
+
+    #[test]
+    fn goal_revalidation_preserves_physical_fact_and_every_other_source() {
+        let original = deadline_exceeded_outcome("node", 42);
+        let old = BTreeMap::from([("goal:one".to_owned(), 62), ("effect:one".to_owned(), 7)]);
+        let next = BTreeMap::from([("goal:one".to_owned(), 63), ("effect:one".to_owned(), 7)]);
+        let candidate = original.clone();
+        assert!(accepts_goal_revalidation(&original, &candidate, &old, &next, "goal:one", 62, 63));
+        assert!(!accepts_goal_revalidation(&original, &candidate, &old, &next, "goal:foreign", 62, 63));
+        assert!(!accepts_goal_revalidation(&original, &candidate, &old, &next, "goal:one", 62, 64));
+        let mut changed = candidate.clone();
+        changed.result.summary = Some("rewritten physical result".into());
+        assert!(!accepts_goal_revalidation(&original, &changed, &old, &next, "goal:one", 62, 63));
+        let mut changed_sources = next.clone();
+        changed_sources.remove("effect:one");
+        assert!(!accepts_goal_revalidation(&original, &candidate, &old, &changed_sources, "goal:one", 62, 63));
+        changed_sources.insert("effect:one".into(), 8);
+        assert!(!accepts_goal_revalidation(&original, &candidate, &old, &changed_sources, "goal:one", 62, 63));
+    }
+}
+
+#[cfg(test)]
 mod nodispatch_duration_617_tests {
     use super::super::executors::{
         ScopedNodeBackend, ScopedNodeBackendResolver, ScopedNodeExecutor,
@@ -3822,10 +4208,32 @@ mod nodispatch_duration_617_tests {
     struct RefusedBackend617 {
         owner: Weak<ScopedNodeExecutor>,
         calls: AtomicUsize,
+        revalidation: std::sync::Mutex<Option<Arc<GoalRevalidationProbe>>>,
+    }
+
+    struct GoalRevalidationProbe {
+        entered: Notify,
+        resume: Notify,
+        calls: AtomicUsize,
+        accept: bool,
     }
 
     #[async_trait::async_trait]
     impl ScopedNodeBackend for RefusedBackend617 {
+        async fn revalidate_goal_source(
+            &self, _ticket: &NodeExecutionTicket, outcome: &NodeExecutionOutcome,
+            stream: &str, _expected: u64, actual: u64,
+        ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+            let probe = self.revalidation.lock().unwrap().clone();
+            let Some(probe) = probe else { return Ok(None); };
+            if probe.calls.fetch_add(1, Ordering::SeqCst) != 0 { return Ok(None); }
+            probe.entered.notify_one();
+            probe.resume.notified().await;
+            if !probe.accept { return Ok(None); }
+            let mut rebuilt = outcome.clone();
+            rebuilt.source_revisions.insert(stream.into(), actual);
+            Ok(Some(rebuilt))
+        }
         async fn execute(
             &self,
             ticket: &NodeExecutionTicket,
@@ -3850,6 +4258,537 @@ mod nodispatch_duration_617_tests {
     }
 
     struct Resolver617(Arc<RefusedBackend617>);
+
+    struct ClosureProbeExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for ClosureProbeExecutor {
+        fn kind(&self) -> &str {
+            "k05-closure-probe"
+        }
+        fn validate(
+            &self,
+            _: &harness_contract::execution_graph::ExecutionNodeSpec,
+        ) -> Result<(), NodeExecutorError> {
+            Ok(())
+        }
+        async fn start(
+            &self,
+            context: NodeExecutionContext,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            Ok(NodeExecutionTicket {
+                graph_id: context.graph.id.clone(),
+                node_id: context.node.id.clone(),
+                executor_kind: self.kind().into(),
+                service_class: context.graph.service_class,
+                attempt: context.attempt,
+                idempotency_key: format!("{}:{}", context.node.idempotency_key, context.attempt),
+                payload_ref: context.node.payload_ref.clone(),
+            })
+        }
+        async fn poll_or_await(
+            &self,
+            _: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: None,
+                wait_class: None,
+                summary: Some("k05 closure probe".into()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            }))
+        }
+    }
+
+    struct CancelOutcomeProbeK05 {
+        entered: Notify,
+        stop: Notify,
+        finished: Notify,
+        returned: std::sync::atomic::AtomicBool,
+        completed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for CancelOutcomeProbeK05 {
+        fn kind(&self) -> &str { "k05-cancel-outcome-probe" }
+        fn validate(&self, _: &harness_contract::execution_graph::ExecutionNodeSpec) -> Result<(), NodeExecutorError> { Ok(()) }
+        async fn start(&self, context: NodeExecutionContext) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            Ok(NodeExecutionTicket { graph_id:context.graph.id.clone(), node_id:context.node.id.clone(),
+                executor_kind:self.kind().into(), service_class:context.graph.service_class,
+                attempt:context.attempt, idempotency_key:context.node.idempotency_key.clone(),
+                payload_ref:context.node.payload_ref.clone() })
+        }
+        async fn poll_or_await(&self, _: &NodeExecutionTicket) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            self.entered.notify_one();
+            self.stop.notified().await;
+            self.returned.store(true, Ordering::SeqCst);
+            self.finished.notify_one();
+            Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status:if self.completed { ExecutionNodeStatus::Completed } else { ExecutionNodeStatus::Cancelled }, result_ref:None, wait_class:None,
+                summary:Some("original executor cancellation outcome".into()), evidence_refs:Vec::new(),
+                failure:None, usage:Default::default(), finished_at_ms:1,
+            }))
+        }
+        async fn cancel(&self, _: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            self.stop.notify_one();
+            self.finished.notified().await;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn k05_host_transcript_command_requires_original_node_attempt_status_and_transaction() {
+        use super::super::commit_service::host_transcript_cancel_command_result as extract;
+        use super::super::events::{ExecutionGraphDelta, ExecutionGraphEvent};
+        let mut before = ExecutionGraph::new("cancel transcript source");
+        let node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::InlineModel, "inline_model", "model");
+        let node_id = node.id.clone();
+        before.nodes.push(node);
+        before.revision = 4;
+        before.node_statuses.insert(node_id.clone(), ExecutionNodeStatus::Running);
+        before.recovery_cursor.node_attempts.insert(node_id.clone(), 1);
+        let ticket = NodeExecutionTicket { graph_id:before.id.clone(), node_id:node_id.clone(),
+            executor_kind:"inline_model".into(), service_class:before.service_class,
+            attempt:1, idempotency_key:"original-ticket".into(), payload_ref:"original-payload".into() };
+        let mut after = before.clone();
+        after.revision = 5;
+        after.node_statuses.insert(node_id.clone(), ExecutionNodeStatus::Cancelled);
+        after.node_results.insert(node_id.clone(), ExecutionNodeResult { status:ExecutionNodeStatus::Cancelled,
+            result_ref:None, wait_class:None, summary:None, evidence_refs:Vec::new(), failure:None,
+            usage:Default::default(), finished_at_ms:1 });
+        let delta = ExecutionGraphDelta::between(&before, &after);
+        let transaction = format!("{}:command:cancel:5", before.id);
+        let event = ExecutionGraphEvent::CommandApplied { command:"cancel".into(), reason:None, delta:delta.clone() };
+        assert_eq!(extract(&event, &ticket, &transaction).unwrap().status, ExecutionNodeStatus::Cancelled);
+        let mut foreign = ticket.clone(); foreign.attempt = 2;
+        assert!(extract(&event, &foreign, &transaction).is_none());
+        foreign = ticket.clone(); foreign.node_id = "foreign".into();
+        assert!(extract(&event, &foreign, &transaction).is_none());
+        assert!(extract(&event, &ticket, &format!("{}:command:cancel:6", before.id)).is_none());
+        let wrong_command = ExecutionGraphEvent::CommandApplied { command:"pause".into(), reason:None, delta:delta.clone() };
+        assert!(extract(&wrong_command, &ticket, &transaction).is_none());
+        let mut wrong_delta = delta.clone();
+        wrong_delta.node_status_updates.insert(node_id.clone(), ExecutionNodeStatus::Completed);
+        let wrong_status = ExecutionGraphEvent::CommandApplied { command:"cancel".into(), reason:None, delta:wrong_delta };
+        assert!(extract(&wrong_status, &ticket, &transaction).is_none());
+        let checkpoint = ExecutionGraphEvent::Checkpoint { cause:"execution_graph.command_applied".into(),
+            graph:after, bindings:Default::default(), lease_closures:Vec::new() };
+        assert!(extract(&checkpoint, &ticket, &transaction).is_some());
+        assert!(extract(&checkpoint, &ticket, "foreign:command:cancel:5").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k05_host_transcript_original_cancel_command_is_atomic_and_foreign_rejected() {
+        let (_workspace, services, runner, initial_graph, initial_node, _) = original_prepared617().await;
+        runner.execute_prepared_pump_node(&initial_graph, initial_node, Arc::new(Notify::new())).await.unwrap();
+        let mut source = ExecutionGraph::new("original inline model transcript cancellation");
+        source.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id:"session-617".into(), turn_id:"turn-617".into(),
+            root_task_id:"task-617".into(), task_id:"task-617".into(), generation:1 });
+        source.nodes.push(harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::InlineModel, "inline_model", "original-model"));
+        let graph_id = runner.register(source).await.unwrap().id;
+        let snapshot = runner.pump_snapshot(&graph_id, &Default::default()).await.unwrap();
+        let prepared = runner.prepare_ready_wave(&graph_id, snapshot.ready).await.unwrap().remove(0);
+        let node_id = prepared.node.id.clone();
+        let ticket = runner.active.lock().await.get(&(graph_id.clone(), node_id.clone())).unwrap().ticket.clone();
+        let graph = runner.state_store.load(&graph_id).unwrap();
+        let event = services.commit_service().prepare_host_transcript(&ticket, "session-617", "turn-617", 0,
+            format!("sha256:{}", "0".repeat(64)), Vec::new(), None).unwrap();
+        let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult { status:ExecutionNodeStatus::Cancelled,
+            result_ref:None, wait_class:None, summary:None, evidence_refs:Vec::new(), failure:None,
+            usage:Default::default(), finished_at_ms:1 });
+        let mut missing_session_proof = outcome.result.clone();
+        missing_session_proof.summary = Some("original local provider response observed authorized cancellation".into());
+        missing_session_proof.result_ref = Some(format!("session:session-617:physical:5:sha256:{}", "0".repeat(64)));
+        assert!(services.commit_service().validate_cold_provider_cancellation(&ticket, &missing_session_proof).is_err());
+        super::super::commit_service::ExecutionCommitService::attach_host_transcript(&mut outcome, event).unwrap();
+        let command = ExecutionGraphCommand::Cancel { expected_revision:graph.revision, reason:"original cancellation".into() };
+        let mut foreign = outcome.clone();
+        foreign.domain_events[0].event.payload["attempt"] = serde_json::json!(ticket.attempt + 1);
+        assert!(services.commit_service().apply_command_with_cancelled_outcomes(&graph, &command,
+            vec![ExecutionTerminalCommit {node_id:node_id.clone(), outcome:foreign, effect_ticket:Some(ticket.clone())}]).is_err());
+        assert!(matches!(services.commit_service().inspect_execution_effect(&ticket).unwrap(), ExecutionEffectState::Uncertain));
+        services.commit_service().apply_command_with_cancelled_outcomes(&graph, &command,
+            vec![ExecutionTerminalCommit {node_id:node_id.clone(), outcome, effect_ticket:Some(ticket.clone())}]).unwrap();
+        assert!(services.commit_service().committed_host_transcript(&ticket).unwrap().messages.is_empty());
+        let effects = services.event_store().list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket)).unwrap();
+        let receipt = effects.iter().find(|event| event.kind == "execution.effect.receipt").unwrap();
+        let graph_events = services.event_store().list_stream(&graph_id).unwrap();
+        assert!(graph_events.iter().any(|event| event.transaction_id == receipt.transaction_id && event.commit_cursor == receipt.commit_cursor));
+    }
+
+    // Original runner/cancel command counterexample: the physical executor
+    // returned its actual outcome, but cancel removed the original binding
+    // before the pump could publish the effect receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn k05_original_cancel_drops_actual_executor_outcome_before_effect_receipt() {
+        let (_workspace, services, runner, initial_graph, initial_node, _) = original_prepared617().await;
+        runner.execute_prepared_pump_node(&initial_graph, initial_node, Arc::new(Notify::new())).await.unwrap();
+        let executor = Arc::new(CancelOutcomeProbeK05 { entered:Notify::new(), stop:Notify::new(),
+            finished:Notify::new(), returned:std::sync::atomic::AtomicBool::new(false), completed:false });
+        services.executor_registry().register(executor.clone()).unwrap();
+        let mut graph = ExecutionGraph::new("k05 real cancellation effect handoff");
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id:"k05-cancel-session".into(), turn_id:"k05-cancel-turn".into(),
+            root_task_id:"k05-cancel-task".into(), task_id:"k05-cancel-task".into(), generation:1 });
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::Verify, "k05-cancel-outcome-probe", "probe");
+        node.resource_scopes.push("write:k05-cancel".into());
+        graph.nodes.push(node);
+        let registered = runner.register(graph).await.unwrap();
+        let snapshot = runner.pump_snapshot(&registered.id, &Default::default()).await.unwrap();
+        let prepared = runner.prepare_ready_wave(&registered.id, snapshot.ready).await.unwrap().remove(0);
+        let node_id = prepared.node.id.clone();
+        let binding = prepared.binding.clone().unwrap();
+        let ticket = runner.active.lock().await.get(&(registered.id.clone(), node_id.clone())).unwrap().ticket.clone();
+        let worker_runner = runner.clone(); let worker_graph = registered.id.clone();
+        let worker = tokio::spawn(async move { worker_runner.execute_prepared_pump_node(&worker_graph, prepared, Arc::new(Notify::new())).await });
+        tokio::time::timeout(Duration::from_secs(3), executor.entered.notified()).await.unwrap();
+        let current = runner.state_store.load_async(&registered.id).await.unwrap();
+        let command = ExecutionGraphCommand::Cancel { expected_revision:current.revision, reason:"controlled original cancellation".into() };
+        let fixture_outcome = NodeExecutionOutcome::new(ExecutionNodeResult { status:ExecutionNodeStatus::Cancelled,
+            result_ref:None, wait_class:None, summary:Some("original executor cancellation outcome".into()),
+            evidence_refs:Vec::new(), failure:None, usage:Default::default(), finished_at_ms:1 });
+        let mut foreign = ticket.clone(); foreign.attempt += 1;
+        let rejected = ExecutionTerminalCommit { node_id:node_id.clone(), outcome:fixture_outcome.clone(), effect_ticket:Some(foreign) };
+        assert!(services.commit_service().apply_command_with_cancelled_outcomes(&current, &command, vec![rejected]).is_err());
+        let mut noncancel = fixture_outcome.clone(); noncancel.result.status = ExecutionNodeStatus::Failed;
+        let rejected = ExecutionTerminalCommit { node_id:node_id.clone(), outcome:noncancel, effect_ticket:Some(ticket.clone()) };
+        assert!(services.commit_service().apply_command_with_cancelled_outcomes(&current, &command, vec![rejected]).is_err());
+        assert!(matches!(services.commit_service().inspect_execution_effect(&ticket).unwrap(), ExecutionEffectState::Uncertain));
+        runner.command(&registered.id, command.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker).await.unwrap().unwrap().unwrap();
+        assert!(executor.returned.load(Ordering::SeqCst));
+        let graph = runner.state_store.load(&registered.id).unwrap();
+        let start = runner.state_store.binding_start_position(&graph, &node_id, &binding).unwrap().unwrap();
+        assert!(runner.state_store.binding_lease_closure(&graph, &node_id, &binding, start).unwrap());
+        let actual_outcome = match services.commit_service().inspect_execution_effect(&ticket).unwrap() {
+            ExecutionEffectState::Completed(outcome) => outcome,
+            _ => panic!("the original executor outcome must be atomically recorded with cancellation"),
+        };
+        assert_eq!(actual_outcome.result.status, ExecutionNodeStatus::Cancelled);
+        assert_eq!(actual_outcome.result.summary, fixture_outcome.result.summary);
+        assert!(actual_outcome.result.usage.duration_ms >= 1);
+        let effects = services.event_store().list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket)).unwrap();
+        assert_eq!(effects.len(), 2);
+        let receipt = effects.iter().find(|event| event.kind == "execution.effect.receipt").unwrap();
+        let graph_events = services.event_store().list_stream(&registered.id).unwrap();
+        let command_event = graph_events.iter().find(|event| event.transaction_id == receipt.transaction_id).unwrap();
+        assert_eq!(command_event.commit_cursor, receipt.commit_cursor);
+        assert!(services.commit_service().apply_command_with_cancelled_outcomes(&graph, &command,
+            vec![ExecutionTerminalCommit {node_id:node_id.clone(), outcome:fixture_outcome.clone(), effect_ticket:Some(ticket.clone())}]).is_err());
+        assert_eq!(services.event_store().list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket)).unwrap().len(), 2);
+        let cold_store = ExecutionGraphStateStore::new(Arc::clone(services.event_store()));
+        let replayed = cold_store.load(&registered.id).unwrap();
+        assert_eq!(replayed.node_statuses.get(&node_id), Some(&ExecutionNodeStatus::Cancelled));
+        assert_eq!(replayed.node_results.get(&node_id), Some(&actual_outcome.result));
+        let cold_commits = super::super::commit_service::ExecutionCommitService::new(Arc::clone(services.event_store()));
+        assert!(matches!(cold_commits.inspect_execution_effect(&ticket).unwrap(),
+            ExecutionEffectState::Completed(outcome) if outcome == actual_outcome));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn k05_cancel_preserves_actual_completed_outcome_in_atomic_receipt() {
+        let (_workspace, services, runner, initial_graph, initial_node, _) = original_prepared617().await;
+        runner.execute_prepared_pump_node(&initial_graph, initial_node, Arc::new(Notify::new())).await.unwrap();
+        let executor = Arc::new(CancelOutcomeProbeK05 { entered:Notify::new(), stop:Notify::new(),
+            finished:Notify::new(), returned:std::sync::atomic::AtomicBool::new(false), completed:true });
+        services.executor_registry().register(executor.clone()).unwrap();
+        let mut graph = ExecutionGraph::new("k05 real cancellation effect handoff");
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id:"k05-cancel-session".into(), turn_id:"k05-cancel-turn".into(),
+            root_task_id:"k05-cancel-task".into(), task_id:"k05-cancel-task".into(), generation:1 });
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::Verify, "k05-cancel-outcome-probe", "probe");
+        node.resource_scopes.push("write:k05-cancel".into());
+        graph.nodes.push(node);
+        let registered = runner.register(graph).await.unwrap();
+        let snapshot = runner.pump_snapshot(&registered.id, &Default::default()).await.unwrap();
+        let prepared = runner.prepare_ready_wave(&registered.id, snapshot.ready).await.unwrap().remove(0);
+        let node_id = prepared.node.id.clone();
+        let binding = prepared.binding.clone().unwrap();
+        let ticket = runner.active.lock().await.get(&(registered.id.clone(), node_id.clone())).unwrap().ticket.clone();
+        let worker_runner = runner.clone(); let worker_graph = registered.id.clone();
+        let worker = tokio::spawn(async move { worker_runner.execute_prepared_pump_node(&worker_graph, prepared, Arc::new(Notify::new())).await });
+        tokio::time::timeout(Duration::from_secs(3), executor.entered.notified()).await.unwrap();
+        let current = runner.state_store.load_async(&registered.id).await.unwrap();
+        let command = ExecutionGraphCommand::Cancel { expected_revision:current.revision, reason:"controlled original cancellation".into() };
+        let fixture_outcome = NodeExecutionOutcome::new(ExecutionNodeResult { status:ExecutionNodeStatus::Completed,
+            result_ref:None, wait_class:None, summary:Some("original executor cancellation outcome".into()),
+            evidence_refs:Vec::new(), failure:None, usage:Default::default(), finished_at_ms:1 });
+        let mut foreign = ticket.clone(); foreign.attempt += 1;
+        let rejected = ExecutionTerminalCommit { node_id:node_id.clone(), outcome:fixture_outcome.clone(), effect_ticket:Some(foreign) };
+        assert!(services.commit_service().apply_command_with_cancelled_outcomes(&current, &command, vec![rejected]).is_err());
+        let mut noncancel = fixture_outcome.clone(); noncancel.result.status = ExecutionNodeStatus::Failed;
+        let rejected = ExecutionTerminalCommit { node_id:node_id.clone(), outcome:noncancel, effect_ticket:Some(ticket.clone()) };
+        assert!(services.commit_service().apply_command_with_cancelled_outcomes(&current, &command, vec![rejected]).is_err());
+        assert!(matches!(services.commit_service().inspect_execution_effect(&ticket).unwrap(), ExecutionEffectState::Uncertain));
+        runner.command(&registered.id, command.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker).await.unwrap().unwrap().unwrap();
+        assert!(executor.returned.load(Ordering::SeqCst));
+        let graph = runner.state_store.load(&registered.id).unwrap();
+        let start = runner.state_store.binding_start_position(&graph, &node_id, &binding).unwrap().unwrap();
+        assert!(runner.state_store.binding_lease_closure(&graph, &node_id, &binding, start).unwrap());
+        let actual_outcome = match services.commit_service().inspect_execution_effect(&ticket).unwrap() {
+            ExecutionEffectState::Completed(outcome) => outcome,
+            _ => panic!("the original executor outcome must be atomically recorded with cancellation"),
+        };
+        assert_eq!(actual_outcome.result.status, ExecutionNodeStatus::Completed);
+        assert_eq!(actual_outcome.result.summary, fixture_outcome.result.summary);
+        assert!(actual_outcome.result.usage.duration_ms >= 1);
+        let effects = services.event_store().list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket)).unwrap();
+        assert_eq!(effects.len(), 2);
+        let receipt = effects.iter().find(|event| event.kind == "execution.effect.receipt").unwrap();
+        let graph_events = services.event_store().list_stream(&registered.id).unwrap();
+        let command_event = graph_events.iter().find(|event| event.transaction_id == receipt.transaction_id).unwrap();
+        assert_eq!(command_event.commit_cursor, receipt.commit_cursor);
+        assert!(services.commit_service().apply_command_with_cancelled_outcomes(&graph, &command,
+            vec![ExecutionTerminalCommit {node_id:node_id.clone(), outcome:fixture_outcome.clone(), effect_ticket:Some(ticket.clone())}]).is_err());
+        assert_eq!(services.event_store().list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket)).unwrap().len(), 2);
+        let cold_store = ExecutionGraphStateStore::new(Arc::clone(services.event_store()));
+        let replayed = cold_store.load(&registered.id).unwrap();
+        assert_eq!(replayed.node_statuses.get(&node_id), Some(&ExecutionNodeStatus::Completed));
+        assert_eq!(replayed.node_results.get(&node_id), Some(&actual_outcome.result));
+        let cold_commits = super::super::commit_service::ExecutionCommitService::new(Arc::clone(services.event_store()));
+        assert!(matches!(cold_commits.inspect_execution_effect(&ticket).unwrap(),
+            ExecutionEffectState::Completed(outcome) if outcome == actual_outcome));
+    }
+
+    async fn prepare_scoped_k05(
+        runner: &ExecutionGraphRunner,
+        session: &str,
+        path: &str,
+    ) -> (String, ExecutionPreparedPumpNode) {
+        let mut graph = ExecutionGraph::new("k05 scoped closure");
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: session.into(),
+            turn_id: format!("{session}-turn"),
+            root_task_id: format!("{session}-task"),
+            task_id: format!("{session}-task"),
+            generation: 1,
+        });
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::Verify,
+            "k05-closure-probe",
+            "k05",
+        );
+        node.resource_scopes.push(format!("write:{path}"));
+        graph.nodes.push(node);
+        let registered = runner.register(graph).await.unwrap();
+        let snapshot = runner
+            .pump_snapshot(&registered.id, &Default::default())
+            .await
+            .unwrap();
+        let mut ready = runner
+            .prepare_ready_wave(&registered.id, snapshot.ready)
+            .await
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        let prepared = ready.remove(0);
+        assert!(prepared.binding.as_ref().unwrap().scope_lease_ref.is_some());
+        (registered.id, prepared)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn k05_shared_runner_slow_original_closure_does_not_block_other_session() {
+        let (_workspace, services, runner, graph_a, prepared_a, _) = original_prepared617().await;
+        // Retire the fixture's original unpolled owner before creating two scoped
+        // leaf graphs on the very same runner and resource managers.
+        runner
+            .execute_prepared_pump_node(&graph_a, prepared_a, Arc::new(Notify::new()))
+            .await
+            .unwrap();
+        services
+            .executor_registry()
+            .register(Arc::new(ClosureProbeExecutor))
+            .unwrap();
+        let (a, a_node) = prepare_scoped_k05(&runner, "k05-session-a", "a").await;
+        let (b, b_node) = prepare_scoped_k05(&runner, "k05-session-b", "b").await;
+        let a_binding = a_node.binding.clone().unwrap();
+        let b_binding = b_node.binding.clone().unwrap();
+        let a_id = a_node.node.id.clone();
+        let b_id = b_node.node.id.clone();
+        let entered = Arc::new(Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = StdMutex::new(release_rx);
+        let probe_graph = a.clone();
+        let probe_entered = entered.clone();
+        *runner.closure_probe.lock().unwrap() = Some(Arc::new(move |graph| {
+            if graph == probe_graph {
+                probe_entered.notify_one();
+                // A bounded fallback guarantees that a broken assertion cannot
+                // leave the original owner holding the shared lock indefinitely.
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15));
+            }
+        }));
+        let a_runner = runner.clone();
+        let a_graph = a.clone();
+        let task_a = tokio::spawn(async move {
+            a_runner
+                .execute_prepared_pump_node(&a_graph, a_node, Arc::new(Notify::new()))
+                .await
+        });
+        let hit = tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .is_ok();
+        let b_runner = runner.clone();
+        let b_graph = b.clone();
+        let mut task_b = tokio::spawn(async move {
+            b_runner
+                .execute_prepared_pump_node(&b_graph, b_node, Arc::new(Notify::new()))
+                .await
+        });
+        let progress = if hit {
+            tokio::time::timeout(Duration::from_secs(2), &mut task_b)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let b_progressed = progress.is_some();
+        let _ = release_tx.send(());
+        let result_a = task_a.await.unwrap();
+        let result_b = match progress {
+            Some(result) => result.unwrap(),
+            None => task_b.await.unwrap(),
+        };
+        *runner.closure_probe.lock().unwrap() = None;
+        result_a.unwrap();
+        result_b.unwrap();
+        for (graph, node, binding) in [(&a, &a_id, &a_binding), (&b, &b_id, &b_binding)] {
+            let state = runner.state_store.load(graph).unwrap();
+            let position = runner
+                .state_store
+                .binding_start_position(&state, node, binding)
+                .unwrap()
+                .unwrap();
+            assert!(runner
+                .state_store
+                .binding_lease_closure(&state, node, binding, position)
+                .unwrap());
+            assert!(
+                !runner
+                    .active_binding_matches(graph, node, Some(binding))
+                    .await
+            );
+        }
+        assert!(runner.drain_physical_execution().await.is_empty());
+        assert!(hit, "original A closure barrier was not reached");
+        assert!(
+            b_progressed,
+            "independent B could not finish while A held the original closure barrier"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn k05_cancelled_closure_waiter_retains_original_owner_until_retry() {
+        let (_workspace, services, runner, original_graph, original_node, _) =
+            original_prepared617().await;
+        runner
+            .execute_prepared_pump_node(&original_graph, original_node, Arc::new(Notify::new()))
+            .await
+            .unwrap();
+        services
+            .executor_registry()
+            .register(Arc::new(ClosureProbeExecutor))
+            .unwrap();
+        let (graph, node) = prepare_scoped_k05(&runner, "k05-cancel-session", "cancel").await;
+        let binding = node.binding.clone().unwrap();
+        let node_id = node.node.id.clone();
+        let mut foreign = binding.clone();
+        foreign.attempt += 1;
+        assert!(runner
+            .take_bound_active_node(&graph, &node_id, Some(&foreign))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            runner
+                .active_binding_matches(&graph, &node_id, Some(&binding))
+                .await
+        );
+        let entered = Arc::new(Notify::new());
+        let completed = Arc::new(Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = StdMutex::new(release_rx);
+        let probe_graph = graph.clone();
+        let probe_entered = entered.clone();
+        *runner.closure_probe.lock().unwrap() = Some(Arc::new(move |id| {
+            if id == probe_graph {
+                probe_entered.notify_one();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15));
+            }
+        }));
+        let completed_graph = graph.clone();
+        let completed_notify = completed.clone();
+        *runner.closure_finished_probe.lock().unwrap() = Some(Arc::new(move |id| {
+            if id == completed_graph {
+                completed_notify.notify_one();
+            }
+        }));
+        let task_runner = runner.clone();
+        let task_graph = graph.clone();
+        let task = tokio::spawn(async move {
+            task_runner
+                .execute_prepared_pump_node(&task_graph, node, Arc::new(Notify::new()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        // Hold the table only after the closure has left it; this forces the
+        // first waiter to suspend after durable closure while the entry and
+        // original fence remain owned by the table.
+        let active = runner.active.lock().await;
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
+        let retained = active.get(&(graph.clone(), node_id.clone())).unwrap();
+        assert_eq!(retained.binding, binding);
+        assert!(retained.resources.lock().unwrap().owner_fence.is_some());
+        drop(active);
+        *runner.closure_probe.lock().unwrap() = None;
+        *runner.closure_finished_probe.lock().unwrap() = None;
+        assert!(runner
+            .take_bound_active_node(&graph, &node_id, Some(&binding))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(runner
+            .take_bound_active_node(&graph, &node_id, Some(&binding))
+            .await
+            .unwrap()
+            .is_none());
+        let state = runner.state_store.load(&graph).unwrap();
+        let position = runner
+            .state_store
+            .binding_start_position(&state, &node_id, &binding)
+            .unwrap()
+            .unwrap();
+        assert!(runner
+            .state_store
+            .binding_lease_closure(&state, &node_id, &binding, position)
+            .unwrap());
+        assert!(runner.drain_physical_execution().await.is_empty());
+    }
 
     impl ScopedNodeBackendResolver for Resolver617 {
         fn resolve(&self, _: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
@@ -4062,6 +5001,7 @@ mod nodispatch_duration_617_tests {
         let backend = Arc::new(RefusedBackend617 {
             owner: Arc::downgrade(services.tool_batch_executor()),
             calls: AtomicUsize::new(0),
+            revalidation: std::sync::Mutex::new(None),
         });
         services
             .tool_batch_executor()
@@ -4115,6 +5055,64 @@ mod nodispatch_duration_617_tests {
             prepared.remove(0),
             backend,
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k05_original_runner_goal_revalidation_releases_coordination_and_keeps_fences() {
+        for mode in ["accept", "unknown", "source_advances", "binding_changes", "ticket_changes", "executor_changes"] {
+            let (_workspace, services, runner, graph_id, prepared, backend) = original_prepared617().await;
+            let probe = Arc::new(GoalRevalidationProbe {
+                entered: Notify::new(), resume: Notify::new(), calls: AtomicUsize::new(0),
+                accept: mode != "unknown",
+            });
+            *backend.revalidation.lock().unwrap() = Some(probe.clone());
+            let binding = prepared.binding.clone().unwrap();
+            let (node_id, mut outcome) = runner.start_and_execute_node(&graph_id, prepared.node, Some(&binding)).await.unwrap();
+            outcome.delivery_envelope = Some(serde_json::from_value(serde_json::json!({
+                "envelope_id":"k05-envelope","revision":1,"objective_id":"k05-objective","created_at_ms":1
+            })).unwrap());
+            let goal = format!("goal:k05-revalidation-{mode}");
+            outcome.source_revisions.insert(goal.clone(), 0);
+            let append_goal = || services.event_store().append(crate::RuntimeEventInput {
+                stream_id: goal.clone(), scope: crate::RuntimeEventScope::Goal,
+                kind: "test.k05_goal_advance".into(), status: None, actor: None,
+                refs: Vec::new(), payload: serde_json::json!({}),
+            }).unwrap();
+            append_goal();
+            let task_runner = runner.clone();
+            let task_graph = graph_id.clone();
+            let task_node = node_id.clone();
+            let task = tokio::spawn(async move {
+                task_runner.finish_pump_node(&task_graph, Ok((task_node, outcome)), Arc::new(Notify::new()), Some(binding)).await
+            });
+            tokio::time::timeout(Duration::from_secs(5), probe.entered.notified()).await.unwrap();
+            // A competing graph operation must be able to acquire the actual
+            // coordination guard while the original backend is held here.
+            let guard = tokio::time::timeout(Duration::from_secs(5), runner.graph_coordination_without_command(&graph_id)).await.unwrap();
+            assert!(runner.active_binding_matches(&graph_id, &node_id, Some(&prepared.binding.unwrap())).await);
+            if mode == "source_advances" { append_goal(); }
+            if mode == "binding_changes" {
+                runner.active.lock().await.get_mut(&(graph_id.clone(), node_id.clone())).unwrap().binding.attempt += 1;
+            }
+            if mode == "ticket_changes" {
+                runner.active.lock().await.get_mut(&(graph_id.clone(), node_id.clone())).unwrap().ticket.payload_ref = "foreign".into();
+            }
+            if mode == "executor_changes" {
+                runner.active.lock().await.get_mut(&(graph_id.clone(), node_id.clone())).unwrap().executor = Arc::new(ClosureProbeExecutor);
+            }
+            drop(guard);
+            probe.resume.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+            if mode == "accept" { assert!(result.is_ok(), "{result:?}"); }
+            else { assert!(result.is_err(), "{mode} unexpectedly committed"); }
+            if matches!(mode, "binding_changes" | "ticket_changes" | "executor_changes") {
+                assert!(runner.active.lock().await.contains_key(&(graph_id.clone(), node_id.clone())), "foreign owner must not be released");
+            }
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1, "physical tool must not replay");
+            let graph = services.graph_state_store().load(&graph_id).unwrap();
+            if mode == "accept" { assert_eq!(graph.node_statuses[&node_id], ExecutionNodeStatus::Completed); }
+            else { assert_ne!(graph.node_statuses[&node_id], ExecutionNodeStatus::Completed); }
+        }
     }
 
     #[tokio::test]

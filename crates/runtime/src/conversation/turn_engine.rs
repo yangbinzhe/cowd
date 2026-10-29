@@ -249,6 +249,7 @@ where
             model: initial_model,
             fallbacks: Arc::new(std::sync::RwLock::new(feature_config.fallbacks().to_vec())),
             cancellation_token: CancellationToken::new(),
+            turn_cancellation: None,
             last_context_envelope: std::sync::Mutex::new(None),
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
             runtime_control_policy,
@@ -798,13 +799,39 @@ where
     #[must_use]
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.hook_abort_signal = self.hook_abort_signal.with_cancellation(token.clone());
-        self.cancellation_token = token;
+        self.cancellation_token = token.clone();
+        // The turn-level cancellation is kept apart from the step-scoped token
+        // that `scoped_model_stop` links in while a provider step runs. A
+        // provider producer's own stop (it fires on every normal producer
+        // finish) is linked into the current token and must never read as a
+        // cancellation of the turn itself.
+        self.turn_cancellation = Some(token);
         self
     }
 
     #[must_use]
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancellation_token.clone()
+    }
+
+    /// True only when the turn itself was cancelled. A step-scoped provider
+    /// stop is linked into the current token during a model step, so callers
+    /// that decide whether the *turn* must end (the terminal presentation)
+    /// have to test the turn token rather than the current linked one.
+    pub(crate) fn turn_cancelled(&self) -> bool {
+        match self.turn_cancellation.as_ref() {
+            Some(token) => token.is_cancelled(),
+            None => self.cancellation_token.is_cancelled(),
+        }
+    }
+
+    /// The turn-level token itself, for callers that must inspect it after an
+    /// await without holding the runtime lock (the current token may be a
+    /// step-scoped link that a normal producer finish cancels).
+    pub(crate) fn turn_cancellation_token(&self) -> CancellationToken {
+        self.turn_cancellation
+            .clone()
+            .unwrap_or_else(|| self.cancellation_token.clone())
     }
 
     pub(super) fn governed_workspace_root(&self) -> Result<PathBuf, RuntimeError> {
