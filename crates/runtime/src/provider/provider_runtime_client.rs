@@ -476,6 +476,13 @@ pub struct ProviderRequestContext {
     pub attempt: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGraphOwner {
+    pub activity: harness_contract::projection::RuntimeActivityBinding,
+    pub attempt: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderRequestEvidenceContext {
     pub session_id: String,
@@ -484,6 +491,7 @@ pub struct ProviderRequestEvidenceContext {
     /// Turn epoch that owns this physical Provider attempt.
     pub turn_id: String,
     pub request_sequence: usize,
+    pub graph_owner: Option<Box<ProviderGraphOwner>>,
     pub request_compiler_cache_hit: bool,
     pub budget: crate::context_ledger::RequestBudgetReport,
     /// Monotonic Runtime-owned attempt within this model-step operation.
@@ -530,6 +538,8 @@ pub struct ProviderPhysicalIdentity {
     pub step: harness_contract::step::StepIdentity,
     pub provider_attempt: harness_contract::step::ProviderAttemptIdentity,
     pub resource_lease: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_owner: Option<Box<ProviderGraphOwner>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,6 +554,29 @@ pub struct ProviderPhysicalReceipt {
 /// reference this cannot be deserialized or supplied by a model/client DTO.
 pub struct AcknowledgedProviderPhysicalObservation {
     receipt: ProviderPhysicalReceipt,
+}
+
+// Live capability: only the original writer-acknowledged physical observation
+// can construct this value. It is never deserialized from an external DTO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuthenticatedProviderCancellation {
+    observation: ProviderPhysicalObservation,
+    receipt: ProviderPhysicalReceipt,
+}
+impl AuthenticatedProviderCancellation {
+    pub(crate) fn matches_original(&self, owner: &ProviderGraphOwner, ticket: &crate::execution_core::NodeExecutionTicket) -> bool {
+        let ProviderPhysicalObservation::CancellationObserved { identity, .. } = &self.observation else { return false; };
+        identity.graph_owner.as_deref() == Some(owner)
+            && owner.attempt == ticket.attempt && owner.activity.node_id.as_deref() == Some(ticket.node_id.as_str())
+            && owner.activity.root_execution_id == ticket.graph_id && identity.execution_id == ticket.graph_id
+            && identity.session_id == owner.activity.session_id && identity.turn_id == owner.activity.turn_id
+            && self.receipt.identity == *identity
+            && self.receipt.observation_digest == self.observation.digest().unwrap_or_default()
+    }
+    pub(crate) fn durable_reference(&self) -> String {
+        format!("session:{}:physical:{}:{}", self.receipt.identity.session_id,
+            self.receipt.session_sequence, self.receipt.observation_digest)
+    }
 }
 
 impl AcknowledgedProviderPhysicalObservation {
@@ -610,6 +643,7 @@ impl ProviderPhysicalObservation {
             || id.execution_id != context.execution_id
             || id.turn_id != context.turn_id
             || id.request_sequence != context.request_sequence
+            || id.graph_owner != context.graph_owner
             || id.logical_attempt != context.attempt
             || id.request_id.is_empty()
             || id.response_id.is_empty()
@@ -629,6 +663,14 @@ impl ProviderPhysicalObservation {
             return Err(RuntimeError::new(
                 "physical Provider identity does not match its original Step",
             ));
+        }
+        if let Some(owner) = &id.graph_owner {
+            if owner.attempt == 0 || owner.activity.validate().is_err()
+                || owner.activity.root_execution_id != id.execution_id
+                || owner.activity.session_id != id.session_id || owner.activity.turn_id != id.turn_id
+                || owner.activity.node_id.as_deref().is_none_or(str::is_empty) {
+                return Err(RuntimeError::new("physical Provider graph owner does not match its original activity"));
+            }
         }
         if let Self::CancellationObserved {
             opened, requested, ..
@@ -736,6 +778,7 @@ impl ProviderAttemptControl {
             step: step.snapshot().identity.clone(),
             provider_attempt: step.snapshot().provider_attempt.clone(),
             resource_lease: lease.projection_reference(),
+            graph_owner: context.graph_owner.clone(),
         };
         ProviderPhysicalObservation::ResponseOpened {
             identity: id.clone(),
@@ -748,22 +791,22 @@ impl ProviderAttemptControl {
         &self,
         writer: Option<&dyn ProviderWireEvidenceWriter>,
         opened: Option<&AcknowledgedProviderPhysicalObservation>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<Option<AuthenticatedProviderCancellation>, RuntimeError> {
         // Freeze once in the original producer, not on each persistence retry.
         let observed_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
             .map_err(|_| RuntimeError::new("physical cancellation clock is invalid"))?;
         let (Some(turn), Some(caller), Some(context), Some(opened)) =
             (&self.turn, &self.caller, &self.context, opened)
         else {
-            return Ok(());
+            return Ok(None);
         };
         if !turn.matches_target(&context.session_id, &context.turn_id, &context.execution_id)
             || !turn.token().precedes_other_signals(caller, &self.stop)
         {
-            return Ok(());
+            return Ok(None);
         }
         let Some(source) = turn.requested_source() else {
-            return Ok(());
+            return Ok(None);
         };
         source.verify_current().await.map_err(RuntimeError::new)?;
         let lease = self
@@ -809,7 +852,7 @@ impl ProviderAttemptControl {
                 "cancel observation acknowledgement belongs to another physical response",
             ));
         }
-        Ok(())
+        Ok(Some(AuthenticatedProviderCancellation { observation, receipt: ack.receipt }))
     }
 }
 #[async_trait::async_trait]
@@ -2406,7 +2449,7 @@ async fn forward_provider_attempt(
         let terminal_status = match &stream_result {
             Ok(ForwardedProviderStream::Completed) => "completed",
             Ok(ForwardedProviderStream::ConsumerDropped) => "consumer_dropped",
-            Ok(ForwardedProviderStream::Stopped) => "cancelled",
+            Ok(ForwardedProviderStream::Stopped | ForwardedProviderStream::UserCancelled(_)) => "cancelled",
             Err(_) => "failed",
         };
         if let Err(error) = writer
@@ -2433,13 +2476,10 @@ async fn forward_provider_attempt(
     // the cold request and committed its prefix.  Publishing Warm here would
     // let followers stampede into a cache entry that may never have existed.
     let provider_completed = matches!(stream_result, Ok(ForwardedProviderStream::Completed));
-    let local_exit = if matches!(
-        stream_result,
-        Ok(ForwardedProviderStream::Stopped | ForwardedProviderStream::ConsumerDropped)
-    ) {
-        crate::conversation::ProviderLocalExit::Stopped
-    } else {
-        crate::conversation::ProviderLocalExit::Completed
+    let local_exit = match &stream_result {
+        Ok(ForwardedProviderStream::UserCancelled(proof)) => crate::conversation::ProviderLocalExit::UserCancelled(proof.clone()),
+        Ok(ForwardedProviderStream::Stopped | ForwardedProviderStream::ConsumerDropped) => crate::conversation::ProviderLocalExit::Stopped,
+        _ => crate::conversation::ProviderLocalExit::Completed,
     };
     // `MessageStop` is the Runtime consumer's terminal boundary. Publishing
     // it before the Provider outcome and cache-persistence barrier are
@@ -2623,11 +2663,12 @@ fn evaluation_request_temperature() -> Option<f64> {
     .flatten()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ForwardedProviderStream {
     Completed,
     ConsumerDropped,
     Stopped,
+    UserCancelled(Box<AuthenticatedProviderCancellation>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2789,6 +2830,54 @@ impl std::fmt::Display for ProviderStreamError {
     }
 }
 
+// Opt-in, bounded, private diagnostics: metadata only, never request/response
+// bytes, headers, tokens or errors. A missing/unusable file cannot alter the
+// provider path. The launcher creates the owned 0600 file in its 0700 root.
+struct ProviderStreamDiag {
+    file: Option<std::fs::File>,
+    request: String,
+    response: String,
+    transport_records: u8,
+    activity: provider::TransportActivity,
+}
+impl ProviderStreamDiag {
+    fn new(request: &str, response: &str, activity: provider::TransportActivity) -> Self {
+        let file = std::env::var_os("COWD_PROVIDER_STREAM_DIAG_FILE").and_then(|path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+                let path = std::path::Path::new(&path);
+                let parent = std::fs::symlink_metadata(path.parent()?).ok()?;
+                if !parent.is_dir() || parent.uid() != unsafe { libc::geteuid() } || parent.mode() & 0o777 != 0o700 { return None; }
+                let file = std::fs::OpenOptions::new().append(true).custom_flags(libc::O_NOFOLLOW).open(path).ok()?;
+                let meta = file.metadata().ok()?;
+                if !meta.is_file() || meta.uid() != parent.uid() || meta.mode() & 0o777 != 0o600 || meta.len() >= 1_048_576 { return None; }
+                Some(file)
+            }
+            #[cfg(not(unix))]
+            { let _ = path; None }
+        });
+        Self { file, request: request.to_owned(), response: response.to_owned(), transport_records: 0, activity }
+    }
+    fn record(&mut self, stage: &str, activity: &provider::TransportActivity) {
+        let Some(file) = self.file.as_mut() else { return; };
+        if stage == "transport" {
+            if self.transport_records >= 8 { return; }
+            self.transport_records += 1;
+        }
+        let (chunks, bytes, frames, decoded, first_byte_ms, first_frame_ms, first_decoded_ms, first_consumed_ms) = activity.counters();
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis());
+        let row = serde_json::json!({"request_id":self.request,"response_id":self.response,"stage":stage,"at_ms":at,"chunks":chunks,"bytes":bytes,"frames":frames,"decoded_chunks":decoded,"first_byte_ms":first_byte_ms,"first_frame_ms":first_frame_ms,"first_decoded_ms":first_decoded_ms,"first_consumed_ms":first_consumed_ms});
+        if let Ok(mut data) = serde_json::to_vec(&row) { data.push(b'\n'); let _ = file.write_all(&data); }
+    }
+}
+impl Drop for ProviderStreamDiag {
+    fn drop(&mut self) {
+        let activity = self.activity.clone();
+        self.record("producer_future_dropped", &activity);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn forward_provider_stream(
     client: &ProviderClient,
@@ -2811,10 +2900,12 @@ async fn forward_provider_stream(
         result = client.stream_prepared_message(message_request, prepared_wire) => result.map_err(ProviderStreamError::unbound)?,
         () = control.cancelled() => return Ok(ForwardedProviderStream::Stopped),
     };
-    stream.set_transport_activity(transport_activity);
+    stream.set_transport_activity(transport_activity.clone());
     let identity = control
         .physical_identity(request_id)
         .map_err(ProviderStreamError::physical)?;
+    let mut diag = ProviderStreamDiag::new(request_id, identity.as_ref().map_or("", |id| id.response_id.as_str()), transport_activity.clone());
+    diag.record("response_opened", &transport_activity);
     let opened = if let Some(identity) = identity {
         let context = control
             .context
@@ -2833,8 +2924,10 @@ async fn forward_provider_stream(
             () = control.cancelled() => {
                 // No current-read observation yet: stop IO, retain the original
                 // writer future, and never turn historical open into active C.
+                diag.record("cancel_during_open_ack_start", &transport_activity);
                 drop(stream);
                 persistence.await.map_err(ProviderStreamError::physical)?;
+                diag.record("cancel_during_open_ack_done", &transport_activity);
                 return Ok(ForwardedProviderStream::Stopped);
             }
         };
@@ -2852,28 +2945,50 @@ async fn forward_provider_stream(
     } else {
         None
     };
+    diag.record("opened_ack", &transport_activity);
+    let mut transport_generation = transport_activity.generation();
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut saw_stop = false;
     let mut emitted = false;
     let mut provider_model_emitted = false;
+    let mut semantic_recorded = false;
     let mut pending_text = String::new();
     let mut cumulative_usage = None;
 
     loop {
         let next = tokio::select! {
             biased;
-            next = stream.next_event() => next.map_err(|error| ProviderStreamError::after_open(error, control, request_id, opened.as_ref()))?,
+            next = stream.next_event() => match next {
+                Ok(next) => next,
+                Err(error) => { diag.record("stream_error", &transport_activity); return Err(ProviderStreamError::after_open(error, control, request_id, opened.as_ref())); }
+            },
+            () = transport_activity.changed_since(transport_generation), if diag.file.is_some() => {
+                transport_generation = transport_activity.generation();
+                diag.record("transport", &transport_activity);
+                continue;
+            },
             () = control.cancelled() => {
+                diag.record("cancel_start", &transport_activity);
                 drop(stream);
-                if saw_stop { return Ok(ForwardedProviderStream::Completed); }
-                control.record_cancel(writer, opened.as_ref()).await.map_err(ProviderStreamError::physical)?;
-                return Ok(ForwardedProviderStream::Stopped);
+                if saw_stop { diag.record("cancel_after_finish", &transport_activity); return Ok(ForwardedProviderStream::Completed); }
+                let proof = control.record_cancel(writer, opened.as_ref()).await.map_err(ProviderStreamError::physical)?;
+                diag.record("cancel_recorded", &transport_activity);
+                return Ok(match proof {
+                    Some(proof) => ForwardedProviderStream::UserCancelled(Box::new(proof)),
+                    None => ForwardedProviderStream::Stopped,
+                });
             }
         };
         let Some(event) = next else {
+            diag.record("stream_eof", &transport_activity);
             break;
         };
+        if !provider_model_emitted { diag.record("first_decoded_event", &transport_activity); }
+        if matches!(&event, ApiStreamEvent::MessageStop(_)) { diag.record("decoded_finish", &transport_activity); }
+        let first_semantic = !semantic_recorded && matches!(&event, ApiStreamEvent::ContentBlockDelta(_) | ApiStreamEvent::ContentBlockStart(_));
+        if first_semantic { diag.record("first_content_event", &transport_activity); }
         if !provider_model_emitted {
+            diag.record("runtime_queue_send_start", &transport_activity);
             if !forward_event(
                 sender,
                 AssistantEvent::ProviderModel {
@@ -2885,8 +3000,10 @@ async fn forward_provider_stream(
             )
             .await
             {
+                diag.record("runtime_queue_send_dropped", &transport_activity);
                 return Ok(ForwardedProviderStream::ConsumerDropped);
             }
+            diag.record("runtime_queue_send_accepted", &transport_activity);
             provider_model_emitted = true;
         }
         match event {
@@ -3117,6 +3234,7 @@ async fn forward_provider_stream(
                 // persistence. See `forward_provider_attempt`.
             }
         }
+        if first_semantic { diag.record("first_content_handler_complete", &transport_activity); semantic_recorded = true; }
     }
 
     if !flush_pending_text(
@@ -4008,6 +4126,7 @@ mod tests {
         let context = request.provider_evidence_context.as_ref().unwrap();
         let step = request.bound_step.as_ref().unwrap().snapshot();
         let identity = super::ProviderPhysicalIdentity {
+            graph_owner: None,
             session_id: context.session_id.clone(),
             execution_id: context.execution_id.clone(),
             turn_id: context.turn_id.clone(),
@@ -4251,6 +4370,7 @@ mod tests {
         let context = request.provider_evidence_context.as_ref().unwrap();
         let step = request.bound_step.as_ref().unwrap().snapshot();
         let identity = super::ProviderPhysicalIdentity {
+            graph_owner: None,
             session_id: context.session_id.clone(),
             execution_id: context.execution_id.clone(),
             turn_id: context.turn_id.clone(),
@@ -4353,6 +4473,7 @@ mod tests {
         step_identity.turn_id = context.turn_id.clone();
         step_identity.execution_id = Some(context.execution_id.clone());
         let identity = super::ProviderPhysicalIdentity {
+            graph_owner: None,
             session_id: context.session_id.clone(),
             execution_id: context.execution_id.clone(),
             turn_id: context.turn_id.clone(),
@@ -4516,6 +4637,34 @@ mod tests {
             let open_failure = condition == "open_failure";
             let root = tempfile::tempdir().unwrap();
             let (services, turn, original_receipt, ingress, store) = crate::execution_core::services::requested_cancellation_source_tests::live_requested_fixture_with_store(root.path()).await;
+            // For the user-cancel branch, bind the real Session/SDK producer
+            // to an actual original Graph attempt, then reconstruct its effect
+            // through a fresh commit service and Session reader below.
+            let cold_graph = if condition == "user_cancel" {
+                use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec};
+                let runner = ExecutionGraphRunner::new(
+                    services.executor_registry().clone(), services.graph_state_store().clone(),
+                    services.commit_service().clone(), Arc::new(ExecutionResourceManager::new([])),
+                    Arc::new(ScopeLockManager::persistent(root.path().join("k05-cold-scopes")).unwrap()),
+                    Arc::new(WorktreeLeaseManager::open(root.path().join("k05-cold-leases.json")).unwrap()),
+                    "k05-cold-sdk", root.path());
+                let mut graph = ExecutionGraph::new("original SDK cancellation cold replay");
+                graph.id = original_receipt.execution_id.clone();
+                graph.lineage = Some(ExecutionGraphLineage { session_id:ingress.session_id.clone(),
+                    turn_id:ingress.turn_id.clone(), root_task_id:ingress.root_task_id.clone(),
+                    task_id:ingress.primary_task_id.clone(), generation:ingress.session_generation });
+                let node = ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "cold-sdk-model");
+                let node_id = node.id.clone(); graph.nodes.push(node);
+                runner.register(graph).await.unwrap();
+                let snapshot = runner.pump_snapshot(&original_receipt.execution_id, &Default::default()).await.unwrap();
+                let prepared = runner.prepare_ready_wave(&original_receipt.execution_id, snapshot.ready).await.unwrap();
+                assert_eq!(prepared.len(), 1);
+                let current = services.graph_state_store().load(&original_receipt.execution_id).unwrap();
+                let binding = services.graph_state_store().current_binding(&current, &node_id, 1).unwrap();
+                let (ticket, _) = services.graph_state_store().binding_start_ticket(&current, &node_id, &binding).unwrap();
+                let owner = services.commit_service().k05_test_original_provider_owner(&ticket).unwrap();
+                Some((runner, prepared, ticket, owner))
+            } else { None };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -4561,6 +4710,7 @@ mod tests {
             context.session_id = ingress.session_id.clone();
             context.turn_id = ingress.turn_id.clone();
             context.execution_id = original_receipt.execution_id.clone();
+            if let Some((_, _, _, owner)) = &cold_graph { context.graph_owner = Some(Box::new(owner.clone())); }
             let original_step = request.bound_step.take().unwrap();
             let mut identity = original_step.snapshot().identity.clone();
             identity.session_id = ingress.session_id.clone();
@@ -4663,20 +4813,48 @@ mod tests {
             .await
             .unwrap();
             assert!(consumer.is_ok());
+            let mut original_cancel_reference = None;
             if open_failure {
                 assert!(physical
                     .unwrap_err()
                     .to_string()
                     .contains("injected physical open persistence failure"));
             } else {
-                assert_eq!(
-                    physical.unwrap(),
-                    if eof_first {
-                        crate::conversation::ProviderLocalExit::Completed
-                    } else {
-                        crate::conversation::ProviderLocalExit::Stopped
-                    }
-                );
+                let actual = physical.unwrap();
+                if eof_first {
+                    assert!(matches!(actual, crate::conversation::ProviderLocalExit::Completed));
+                } else if operational_first {
+                    assert!(matches!(actual, crate::conversation::ProviderLocalExit::Stopped));
+                } else {
+                    let crate::conversation::ProviderLocalExit::UserCancelled(proof) = actual else { panic!("original user cancellation proof missing") };
+                    original_cancel_reference = Some(proof.durable_reference());
+                }
+            }
+            if let Some((_runner, _prepared, ticket, _owner)) = cold_graph {
+                use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeStatus};
+                let current = services.graph_state_store().load(&ticket.graph_id).unwrap();
+                let result = ExecutionNodeResult { status:ExecutionNodeStatus::Cancelled,
+                    result_ref:original_cancel_reference, summary:Some("original local provider response observed authorized cancellation".into()),
+                    wait_class:None, evidence_refs:Vec::new(), failure:None, usage:Default::default(), finished_at_ms:1 };
+                let command = ExecutionGraphCommand::Cancel { expected_revision:current.revision, reason:"original requested cancellation".into() };
+                services.commit_service().apply_command_with_cancelled_outcomes(&current, &command,
+                    vec![ExecutionTerminalCommit { node_id:ticket.node_id.clone(), outcome:NodeExecutionOutcome::new(result.clone()), effect_ticket:Some(ticket.clone()) }]).unwrap();
+                let committed_graph = services.graph_state_store().load(&ticket.graph_id).unwrap();
+                assert_eq!(services.authenticated_provider_graph_cancellation(&committed_graph).unwrap().unwrap().0, "after-real-open");
+                let mut failed_graph = committed_graph.clone();
+                failed_graph.node_statuses.insert(ticket.node_id.clone(), ExecutionNodeStatus::Failed);
+                assert!(services.authenticated_provider_graph_cancellation(&failed_graph).unwrap().is_none());
+                failed_graph.node_statuses.insert(ticket.node_id.clone(), ExecutionNodeStatus::Blocked);
+                assert!(services.authenticated_provider_graph_cancellation(&failed_graph).unwrap().is_none());
+                let slot = Arc::new(std::sync::OnceLock::new());
+                let query: Arc<dyn crate::SessionRuntimeQueryPort> = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
+                assert!(slot.set(query).is_ok());
+                let cold = ExecutionCommitService::new(Arc::clone(services.event_store())).with_session_query_slot(slot);
+                assert!(matches!(cold.inspect_execution_effect(&ticket).unwrap(), ExecutionEffectState::Completed(_)));
+                let mut forged = result.clone(); forged.result_ref = Some(format!("session:{}:physical:1:sha256:{}", ingress.session_id, "0".repeat(64)));
+                assert!(cold.validate_cold_provider_cancellation(&ticket, &forged).is_err());
+                let mut foreign = ticket.clone(); foreign.attempt += 1;
+                assert!(!matches!(cold.inspect_execution_effect(&foreign), Ok(ExecutionEffectState::Completed(_))));
             }
             assert_eq!(
                 delivered.load(Ordering::SeqCst),
@@ -5031,6 +5209,7 @@ mod tests {
             budget: budget.clone(),
             preparation: Default::default(),
             provider_evidence_context: Some(super::ProviderRequestEvidenceContext {
+            graph_owner: None,
                 session_id: "wire-session".into(),
                 execution_id: "wire-execution".into(),
                 turn_id: "wire-turn".into(),
@@ -6310,6 +6489,7 @@ mod tests {
     #[test]
     fn runtime_attempt_is_propagated_and_never_zero() {
         let context = super::ProviderRequestEvidenceContext {
+            graph_owner: None,
             session_id: "session-1".to_string(),
             execution_id: "execution-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -6324,6 +6504,7 @@ mod tests {
         assert_eq!(provider_attempt(None), 1);
         assert_eq!(
             provider_attempt(Some(&super::ProviderRequestEvidenceContext {
+            graph_owner: None,
                 attempt: 0,
                 ..context
             })),

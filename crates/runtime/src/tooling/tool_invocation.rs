@@ -87,6 +87,10 @@ pub struct ToolOutputRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationRecord {
+    /// In-process guard for an unpublished early result; never part of the
+    /// model, storage, or tool protocol.
+    #[serde(skip)]
+    pub(crate) original_producer: Option<harness_contract::projection::RuntimeActivityBinding>,
     pub contract_version: u32,
     pub invocation_id: String,
     #[serde(default)]
@@ -159,6 +163,7 @@ impl ToolInvocationRecord {
         let input_preview = preview(input, INPUT_PREVIEW_CHARS);
         let registration_id = registration_id(&tool_name, safety_category);
         Self {
+            original_producer: None,
             contract_version: TOOL_CONTRACT_VERSION,
             invocation_id: format!("tool-inv-{}", Uuid::new_v4()),
             governed_plan_id: None,

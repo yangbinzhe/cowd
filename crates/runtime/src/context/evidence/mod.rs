@@ -12,6 +12,10 @@ pub use harness_contract::context::EvidenceAuditProjection as AuditProjection;
 pub use projection::audit_projection;
 
 pub(crate) const READ_ACQUISITION_FIELD: &str = "read_acquisition_v1";
+pub(crate) const CHILD_READ_ACQUISITIONS_FIELD: &str = "child_read_acquisitions_v1";
+pub(crate) fn native_read_candidate_tool(name: &str) -> bool {
+    matches!(name, "read_file" | "read_ref" | "evidence_retrieve" | "tool_orchestrate")
+}
 pub(crate) const NATIVE_DELIVERY_KIND: &str = "context.model_input_observed";
 pub(crate) const PROCESS_DELIVERY_KIND: &str = "context.agent_channel_sent";
 
@@ -478,6 +482,148 @@ pub(crate) fn read_body_seal(tool_name: &str, output: &str) -> Option<ReadBodySe
     })
 }
 
+/// Candidate child acquisitions are accepted only from the in-process host
+/// capability, under the parent grant and its already-resolved scope. These
+/// records are not delivery evidence.
+pub(crate) fn child_read_acquisitions(
+    request: &crate::RuntimeToolExecutionRequest,
+    scope: &harness_contract::goal::ProofEffectScope,
+    children: &[tools::OrchestratedRead],
+) -> Option<Vec<serde_json::Value>> {
+    let auth = request.authorization.as_ref()?;
+    let parent = request.compiled_invocation.as_ref()?;
+    if request.tool_name != "tool_orchestrate" || !scope.complete
+        || parent.effect.tool_id != "tool_orchestrate"
+        || parent.effect.descriptor_hash != auth.descriptor_hash || auth.request_id.is_empty()
+        || parent.invocation_id != request.tool_use_id
+        || request.step_binding.as_ref().is_none_or(|binding| binding.origin.call_id != request.tool_use_id
+            || parent.origin.as_ref() != Some(&binding.origin)
+            || Some(binding.snapshot.identity.session_id.as_str()) != request.session_id.as_deref())
+    { return None; }
+    let mut positions = std::collections::BTreeSet::new();
+    let mut records = Vec::new();
+    let mut prefix_count = 0usize;
+    for child in children {
+        let effect = child.effect();
+        if child.parent_request_id() != auth.request_id
+            || child.parent_descriptor_hash() != auth.descriptor_hash
+            || child.parent_authorization() != auth
+            || !positions.insert((child.step_index(), child.position()))
+            || effect.tool_id != "read_file"
+            || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
+            || effect.uses_network || effect.spawns_process || effect.mutates_packages || effect.mutates_system
+            || effect.scopes.is_empty()
+            || !effect.scopes.iter().all(|s| auth.authorization_lease.scopes.contains(s)
+                && parent.effect.scopes.contains(s)
+                && scope.targets.iter().filter(|t| &t.declared_scope == s).count() == 1)
+        { return None; }
+        let body = read_body_seal("read_file", child.output())?;
+        let output: serde_json::Value = serde_json::from_str(child.output()).ok()?;
+        let content = output["file"]["content"].as_str()?;
+        let mut prefixes = Vec::new();
+        let mut hash = Sha256::new();
+        let mut bytes = 0usize;
+        for (index, line) in content.split('\n').enumerate() {
+            if index >= 16 { break; }
+            if output["file"]["numLines"].as_u64()? == 0 { break; }
+            let next = bytes.checked_add(line.len())?.checked_add(usize::from(index != 0))?;
+            if next > 4096 { break; }
+            if index != 0 { hash.update(b"\n"); }
+            hash.update(line.as_bytes());
+            bytes = next;
+            prefixes.push(serde_json::json!({"line_count":index + 1,"bytes":bytes,"ends_with_newline":output["file"]["endsWithNewline"],
+                "sha256":format!("sha256:{:x}",hash.clone().finalize())}));
+        }
+        prefix_count = prefix_count.checked_add(prefixes.len())?;
+        if prefix_count > 16384 { return None; }
+        let input = serde_json::to_vec(child.input()).ok()?;
+        records.push(serde_json::json!({
+            "schema_version": 1,
+            "parent_tool_use_id": request.tool_use_id,
+            "parent_idempotency_key": request.idempotency_key,
+            "parent_descriptor_hash": auth.descriptor_hash,
+            "step_index": child.step_index(), "step_id": child.step_id(), "position": child.position(),
+            "tool_name": "read_file", "input": child.input(), "input_sha256": read_sha256(&input),
+            "effect": effect, "body": body, "prefixes": prefixes,
+        }));
+    }
+    Some(records)
+}
+
+/// Match only a literal batch member at its original program location. This
+/// function proves bytes in the supplied presentation, not its wire delivery;
+/// the caller must first bind the whole presentation to the accepted wire.
+pub(crate) fn child_read_presented_extent(
+    parent_input: &str,
+    presentation: &str,
+    child: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let input: serde_json::Value = serde_json::from_str(parent_input).ok()?;
+    let steps = input["steps"].as_array()?;
+    let index = usize::try_from(child["step_index"].as_u64()?).ok()?;
+    let position = usize::try_from(child["position"].as_u64()?).ok()?;
+    let step = steps.get(index)?;
+    let id = step["id"].as_str()?;
+    if child["step_id"] != id || step["op"] != "batch"
+        || steps.iter().filter(|step| step["id"] == id).count() != 1 { return None; }
+    let calls = step["calls"].as_array()?;
+    let call = calls.get(position)?;
+    if call["tool"] != "read_file" { return None; }
+    let alias = call["as"].as_str().map(str::to_string)
+        .unwrap_or_else(|| format!("read_file[{position}]"));
+    if calls.iter().enumerate().filter(|(i, call)| {
+        call["as"].as_str().map(str::to_string)
+            .unwrap_or_else(|| format!("{}[{i}]", call["tool"].as_str().unwrap_or(""))) == alias
+    }).count() != 1 { return None; }
+    let prefix = format!("Tool `tool_orchestrate` completed. Evidence: tool://");
+    let tail = presentation.strip_prefix(&prefix)?;
+    let (_, mut body) = tail.split_once(". ")?;
+    if body.starts_with("JSON object with ") { body = body.split_once(". ")?.1; }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let partial = value["kind"] == "orchestration_partial_receipt";
+    let selected = input.get("return").and_then(serde_json::Value::as_str);
+    if selected.is_some_and(|selected| selected != format!("${id}")) { return None; }
+    let result = &value["result"];
+    let batch = if selected.is_some() || (partial && steps.len() == 1) { result } else { &result[id] };
+    let member = &batch[&alias];
+    let output = if partial {
+        if member["source_tool"] != "read_file" || member["ok"] != true { return None; }
+        &member["output"]
+    } else if step["on_error"] == "collect" {
+        if member["ok"] != true { return None; }
+        &member["output"]
+    } else { member };
+    let file = &output["file"];
+    let content = file["content"].as_str()?;
+    if file["content_omitted"] == true
+        && !(file["preview"] == true && file["source_omitted"] == true)
+    { return None; }
+    let extent = &child["body"]["extent"];
+    let lines = file["numLines"].as_u64()?;
+    if extent["kind"] != "file_lines" || file["startLine"] != extent["start_line"]
+        || file["totalLines"] != extent["total_lines"]
+        || (lines == 0 && !(content.is_empty() && extent["line_count"] == 0))
+        || (lines > 0 && content.split('\n').count() as u64 != lines)
+        || (file["preview"] == true && (lines > 16 || content.len() > 4096
+            || file["sourceNumLines"] != extent["line_count"]
+            || file["byteLength"] != child["body"]["source_bytes"]
+            || file["sha256"].as_str()?.trim_start_matches("sha256:")
+                != child["body"]["source_sha256"].as_str()?.trim_start_matches("sha256:")))
+        || file["filePath"] != child["body"]["source_ref"] { return None; }
+    let hash = read_sha256(content.as_bytes());
+    let full = lines == extent["line_count"].as_u64()? && content.len() as u64 == extent["body_bytes"].as_u64()?
+        && hash == extent["body_sha256"].as_str()?;
+    let matched = child["prefixes"].as_array()?.iter().find(|prefix| {
+        prefix["line_count"] == lines && prefix["bytes"] == content.len() as u64 && prefix["sha256"] == hash
+    });
+    if !full && matched.is_none() { return None; }
+    Some(serde_json::json!({"kind":"file_lines", "start_line":extent["start_line"],
+        "line_count":lines, "total_lines":extent["total_lines"],
+        "body_sha256":hash,"body_bytes":content.len(),"ends_with_newline":extent["ends_with_newline"].as_bool()?,
+        "source_omitted":file["preview"] == true || extent["source_omitted"] == true
+            || lines != extent["line_count"].as_u64()?}))
+}
+
 pub(crate) fn read_acquisition_seal(
     request: &crate::RuntimeToolExecutionRequest,
     output: &str,
@@ -827,6 +973,24 @@ pub(crate) fn wire_tool_result_seals(
     Some(seals)
 }
 
+pub(crate) fn wire_tool_result_text<'a>(wire: &'a provider::ProviderWireRequest, id: &str) -> Option<&'a str> {
+    let seals = wire_tool_result_seals(wire)?;
+    if seals.iter().filter(|seal| seal.invocation_id == id && !seal.is_error).count() != 1 { return None; }
+    match wire.protocol.as_str() {
+        "openai_chat_completions" => wire.body["messages"].as_array()?.iter()
+            .find(|item| item["role"] == "tool" && item["tool_call_id"] == id)?["content"].as_str(),
+        "openai_responses" => wire.body["input"].as_array()?.iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == id)?["output"].as_str(),
+        "anthropic_messages" => {
+            let item = wire.body["messages"].as_array()?.iter().filter(|message| message["role"] == "user")
+                .flat_map(|message| message["content"].as_array().into_iter().flatten())
+                .find(|item| item["type"] == "tool_result" && item["tool_use_id"] == id)?;
+            item["content"].as_str().or_else(|| item["content"].as_array().and_then(|items| items.first()).and_then(|item| item["text"].as_str()))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelReceipt {
     pub evidence_ref: EvidenceRef,
@@ -838,6 +1002,12 @@ pub struct ModelReceipt {
     pub truncated: bool,
 }
 
+/// Opt-in fixture exercises the same receipt builder as the production tool path.
+#[cfg(feature = "test-fixtures")]
+pub fn k02_fixture_orchestration_receipt(output: &str, raw_id: &str, token_budget: u64, durable: bool, input: Option<&str>) -> ModelReceipt {
+    build_tool_receipt_for_delivery("tool_orchestrate", output, false, EvidenceRef::observed("tool", raw_id), token_budget, false, durable, input)
+}
+
 #[must_use]
 pub fn build_tool_receipt(
     tool_name: &str,
@@ -846,7 +1016,7 @@ pub fn build_tool_receipt(
     evidence_ref: EvidenceRef,
     token_budget: u64,
 ) -> ModelReceipt {
-    build_tool_receipt_for_delivery(tool_name, output, is_error, evidence_ref, token_budget, false)
+    build_tool_receipt_for_delivery(tool_name, output, is_error, evidence_ref, token_budget, false, false, None)
 }
 
 pub(crate) fn build_tool_receipt_for_delivery(
@@ -856,6 +1026,8 @@ pub(crate) fn build_tool_receipt_for_delivery(
     evidence_ref: EvidenceRef,
     token_budget: u64,
     preserve_complete_read: bool,
+    durable_recovery: bool,
+    original_input: Option<&str>,
 ) -> ModelReceipt {
     let content_kind = classify_content(output, is_error);
     let raw_tokens = estimate_text_tokens(output);
@@ -873,7 +1045,26 @@ pub(crate) fn build_tool_receipt_for_delivery(
         // still decide whether these actual bytes reach the model.
         (output.to_string(), false)
     } else {
-        summarize_body(tool_name, output, content_kind, body_budget, raw_tokens, raw_lines)
+        let recover_ref = (durable_recovery && tool_name == "tool_orchestrate")
+            .then(|| format!("tool://{}", evidence_ref.id()));
+        let compact = recover_ref.as_deref().and_then(|reference| {
+            if tool_name == "tool_orchestrate" && !is_error && raw_tokens > body_budget {
+                compact_orchestrated_batch(output, reference, body_budget, original_input)
+            } else {
+                None
+            }
+        });
+        compact.map_or_else(
+            || {
+                if let Some(reference) = recover_ref.as_deref().filter(|_| !is_error && raw_tokens > body_budget) {
+                    // Unknown or oversized shapes remain explicitly incomplete;
+                    // never silently splice a JSON head and tail into a result.
+                    if let Some(fallback) = bounded_orchestration_fallback(reference, body_budget) { return (fallback, true); }
+                }
+                summarize_body(tool_name, output, content_kind, body_budget, raw_tokens, raw_lines, recover_ref.as_deref())
+            },
+            |body| (body, true),
+        )
     };
     let summary = format!("{fixed_prefix}{body}");
     let receipt_tokens = estimate_text_tokens(&summary);
@@ -908,6 +1099,198 @@ fn classify_content(output: &str, is_error: bool) -> EvidenceContentKind {
     }
 }
 
+fn bounded_orchestration_fallback(reference: &str, token_budget: u64) -> Option<String> {
+    let fallback = format!("Partial orchestration output omitted; read_ref({}) and follow its cursor, or repeat a narrower original request if unavailable.", serde_json::json!({"reference":reference}));
+    (estimate_text_tokens(&fallback) <= token_budget).then_some(fallback)
+}
+
+/// Preserve small, independently meaningful batch metadata instead of cutting
+/// through a large JSON document. The raw artifact remains authoritative;
+/// omitted bodies and incomplete child scans are explicitly identified.
+fn compact_orchestrated_batch(output: &str, reference: &str, token_budget: u64, original_input: Option<&str>) -> Option<String> {
+    let raw: serde_json::Value = serde_json::from_str(output).ok()?;
+    let calls = raw.get("calls")?.as_array()?;
+    let mut items = raw.get("result")?.as_object()?;
+    // The default return is the complete step map, not the selected batch.
+    // Unwrap only one literal batch step with a matching successful trace and
+    // identical result/step objects; ambiguous multi-step programs fail closed.
+    let request = original_input.and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok());
+    let mut default_fail_batch = false;
+    if let Some(input) = request.as_ref() {
+        if input.get("return").is_none() {
+            let steps = input.get("steps")?.as_array()?;
+            if steps.len() > 1 {
+                // Preserve the default result's step hierarchy. Each batch is
+                // compacted through the same validated path, rather than
+                // guessing flattened aliases across independent steps.
+                if steps.len() > 32 || calls.len() != steps.len()
+                    || items.len() != steps.len() || raw.get("steps")?.as_object()?.len() != steps.len()
+                    || raw.get("result")? != raw.get("steps")? { return None; }
+                let mut tree = serde_json::Map::new();
+                for step in steps {
+                    let id = step.get("id")?.as_str()?;
+                    if tree.contains_key(id) || step.get("op")?.as_str()? != "batch" { return None; }
+                    let mut traces = calls.iter().filter(|trace| trace.get("stepId").and_then(serde_json::Value::as_str) == Some(id));
+                    let trace = traces.next()?;
+                    if traces.next().is_some() { return None; }
+                    let value = items.get(id)?;
+                    let child_raw = serde_json::json!({"calls":[trace],"steps":{id:value},"result":{id:value}});
+                    let child_input = serde_json::json!({"steps":[step]});
+                    let compact = compact_orchestrated_batch(&child_raw.to_string(), reference, token_budget, Some(&child_input.to_string()))?;
+                    let child: serde_json::Value = serde_json::from_str(&compact).ok()?;
+                    tree.insert(id.to_owned(), child.get("result")?.clone());
+                }
+                let value = serde_json::json!({"kind":"orchestration_partial_receipt", "complete":false,
+                    "raw_reference":reference, "recovery":{"when_available_and_authorized":{"name":"read_ref","input":{"reference":reference}},
+                    "continuation":"Use the returned cursor with the same reference until complete; otherwise repeat a narrower original request."},
+                    "calls":calls,"result":tree});
+                let body = serde_json::to_string(&value).ok()?;
+                return (estimate_text_tokens(&body) <= token_budget).then_some(body);
+            }
+            if steps.len() != 1 { return None; }
+            let step = &steps[0];
+            let id = step.get("id")?.as_str()?;
+            let entries = step.get("calls")?.as_array()?;
+            if step.get("op")?.as_str()? != "batch" || calls.len() != 1
+                || calls[0].get("stepId")?.as_str()? != id
+                || calls[0].get("op")?.as_str()? != "batch"
+                || calls[0].get("status")?.as_str()? != "ok"
+                || calls[0].get("calls")?.as_u64()? != entries.len() as u64
+                || items.len() != 1 || raw.get("steps")?.as_object()?.len() != 1
+                || items.get(id)? != raw.get("steps")?.get(id)? { return None; }
+            default_fail_batch = step.get("on_error").is_none()
+                || step.get("on_error").and_then(serde_json::Value::as_str) == Some("fail");
+            items = items.get(id)?.as_object()?;
+        } else if let Some(selected) = input.get("return").and_then(serde_json::Value::as_str).and_then(|s| s.strip_prefix('$')) {
+            let steps = input.get("steps")?.as_array()?;
+            let mut matching = steps.iter().filter(|step| step.get("id").and_then(serde_json::Value::as_str) == Some(selected));
+            if let Some(step) = matching.next() {
+                let mut traces = calls.iter().filter(|trace| trace.get("stepId").and_then(serde_json::Value::as_str) == Some(selected));
+                let trace = traces.next();
+                if matching.next().is_none() && step.get("op").and_then(serde_json::Value::as_str) == Some("batch")
+                    && (step.get("on_error").is_none() || step.get("on_error").and_then(serde_json::Value::as_str) == Some("fail"))
+                    && traces.next().is_none()
+                    && trace.is_some_and(|trace| trace.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+                        && trace.get("op").and_then(serde_json::Value::as_str) == Some("batch")
+                        && trace.get("calls").and_then(serde_json::Value::as_u64) == step.get("calls").and_then(serde_json::Value::as_array).map(|v| v.len() as u64))
+                    && raw.get("steps").and_then(|steps| steps.get(selected)) == raw.get("result") {
+                    default_fail_batch = true;
+                }
+            }
+        }
+    }
+    if calls.len() > 32 || items.is_empty() || items.len() > 32 { return None; }
+    // Bind aliases only to the exact literal batch and complete result key set.
+    let source_tools = request.as_ref().and_then(|input| {
+        let steps = input.get("steps")?.as_array()?;
+        let selected = match input.get("return") {
+            Some(value) => value.as_str()?.strip_prefix('$')?,
+            None if steps.len() == 1 => steps[0].get("id")?.as_str()?,
+            None => return None,
+        };
+        let mut matching = steps.iter().filter(|step| step.get("id").and_then(serde_json::Value::as_str) == Some(selected));
+        let step = matching.next()?;
+        if matching.next().is_some() || step.get("op")?.as_str()? != "batch" { return None; }
+        let mut map = std::collections::BTreeMap::new();
+        for (index, call) in step.get("calls")?.as_array()?.iter().enumerate() {
+            let tool = call.get("tool")?.as_str()?;
+            if tool.is_empty() || tool.len() > 128 || !tool.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')) { return None; }
+            let alias = call.get("as").and_then(serde_json::Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("{tool}[{index}]"));
+            if alias.len() > 128 || map.insert(alias, tool.to_owned()).is_some() { return None; }
+        }
+        (map.len() == items.len() && items.keys().all(|key| map.contains_key(key))).then_some(map)
+    });
+    let mut results = serde_json::Map::new();
+    for (name, item) in items {
+        if name.len() > 128 { return None; }
+        let item = item.as_object()?;
+        // Fail-mode batch items are direct tool outputs; collect-mode items
+        // contain explicit per-item status. Never infer a direct success unless
+        // the unique default batch was authenticated by its successful trace.
+        let direct = default_fail_batch && !item.contains_key("status") && !item.contains_key("ok");
+        if direct && source_tools.is_none() { return None; }
+        let status = if direct { "success" } else { item.get("status")?.as_str()? };
+        if status.len() > 64 { return None; }
+        let ok = if direct { true } else { item.get("ok")?.as_bool()? };
+        let output = if direct { Some(item) } else { item.get("output").and_then(serde_json::Value::as_object) };
+        let mut entry = serde_json::Map::new();
+        if let Some(tool) = source_tools.as_ref().and_then(|map| map.get(name)) {
+            entry.insert("source_tool".into(), serde_json::json!(tool));
+        }
+        entry.insert("ok".into(), serde_json::json!(ok));
+        entry.insert("status".into(), serde_json::json!(status));
+        if let Some(error) = item.get("error").and_then(serde_json::Value::as_str) {
+            if error.len() > 512 { return None; }
+            entry.insert("error".into(), serde_json::json!(error));
+        }
+        if let Some(object) = output {
+            let mut result = serde_json::Map::new();
+            for key in ["type", "truncated", "scanComplete", "numFiles", "numLines", "numMatches", "appliedLimit", "appliedOffset", "coverage", "next_request", "continuationCursor", "omissions", "filenames"] {
+                if let Some(value) = object.get(key) {
+                    if serde_json::to_vec(value).ok()?.len() > 4096 { return None; }
+                    result.insert(key.into(), value.clone());
+                }
+            }
+            if object.contains_key("content") { result.insert("content_omitted".into(), serde_json::json!(true)); }
+            if let Some(file) = object.get("file").and_then(serde_json::Value::as_object) {
+                let mut compact_file = serde_json::Map::new();
+                for key in ["filePath", "byteLength", "sha256", "endsWithNewline", "startLine", "numLines", "totalLines"] {
+                    if let Some(value) = file.get(key) { compact_file.insert(key.into(), value.clone()); }
+                }
+                if let Some(content) = file.get("content").and_then(serde_json::Value::as_str) {
+                    if content.len() <= 4096 { compact_file.insert("content".into(), serde_json::json!(content)); }
+                    else {
+                        // A preview contains only real complete leading lines.
+                        // It is data, not proof of authenticated delivery: the
+                        // receipt/consumer must verify its exact extent and hash.
+                        let original_lines = file.get("numLines").and_then(serde_json::Value::as_u64);
+                        let start = file.get("startLine").and_then(serde_json::Value::as_u64);
+                        let total = file.get("totalLines").and_then(serde_json::Value::as_u64);
+                        let valid = original_lines.zip(start).zip(total).is_some_and(|((lines, start), total)|
+                            start > 0 && start.checked_sub(1).and_then(|v| v.checked_add(lines)).is_some_and(|end| end <= total)
+                                && content.split('\n').count() as u64 == lines);
+                        let mut preview = String::new();
+                        let mut lines = 0u64;
+                        if valid {
+                            for line in content.split('\n').take(16) {
+                                let extra = line.len() + usize::from(lines > 0);
+                                if preview.len().saturating_add(extra) > 4096 { break; }
+                                if lines > 0 { preview.push('\n'); }
+                                preview.push_str(line);
+                                lines += 1;
+                            }
+                        }
+                        compact_file.insert("content_omitted".into(), serde_json::json!(true));
+                        if lines > 0 && !preview.is_empty() && original_lines.is_some_and(|count| lines < count) {
+                            compact_file.insert("content".into(), serde_json::json!(preview));
+                            compact_file.insert("preview".into(), serde_json::json!(true));
+                            compact_file.insert("source_omitted".into(), serde_json::json!(true));
+                            compact_file.insert("sourceNumLines".into(), serde_json::json!(original_lines));
+                            compact_file.insert("numLines".into(), serde_json::json!(lines));
+                            result.insert("source_truncated".into(), object.get("truncated").cloned().unwrap_or(serde_json::Value::Null));
+                            result.insert("truncated".into(), serde_json::json!(true));
+                        }
+                    }
+                } else if file.contains_key("content") { return None; }
+                result.insert("file".into(), serde_json::Value::Object(compact_file));
+            }
+            let omitted_fields = object.keys().filter(|key| !result.contains_key(*key) && key.as_str() != "content" && key.as_str() != "file").cloned().collect::<Vec<_>>();
+            if omitted_fields.len() > 32 || omitted_fields.iter().any(|key| key.len() > 128) { return None; }
+            if !omitted_fields.is_empty() { result.insert("omitted_fields".into(), serde_json::json!(omitted_fields)); }
+            entry.insert("output".into(), serde_json::Value::Object(result));
+        } else if item.get("output").is_some_and(|v| !v.is_null()) {
+            entry.insert("output_omitted".into(), serde_json::json!(true));
+        }
+        results.insert(name.clone(), serde_json::Value::Object(entry));
+    }
+    let value = serde_json::json!({"kind":"orchestration_partial_receipt", "complete":false, "raw_reference":reference,
+        "recovery":{"when_available_and_authorized":{"name":"read_ref","input":{"reference":reference}},
+            "continuation":"Use the returned cursor with the same reference until complete; otherwise repeat a narrower original request."},
+        "calls":calls, "result":results});
+    let body = serde_json::to_string(&value).ok()?;
+    (estimate_text_tokens(&body) <= token_budget).then_some(body)
+}
+
 fn summarize_body(
     tool_name: &str,
     output: &str,
@@ -915,6 +1298,7 @@ fn summarize_body(
     token_budget: u64,
     raw_tokens: u64,
     raw_lines: usize,
+    recover_ref: Option<&str>,
 ) -> (String, bool) {
     if output.is_empty() {
         return ("No output.".to_string(), false);
@@ -936,7 +1320,7 @@ fn summarize_body(
         EvidenceContentKind::Text | EvidenceContentKind::Media => output.to_string(),
     };
     let (body, clipped) =
-        truncate_head_tail(tool_name, &normalized, token_budget, raw_tokens, raw_lines);
+        truncate_head_tail(tool_name, &normalized, token_budget, raw_tokens, raw_lines, recover_ref);
     (body, normalized_omits || clipped)
 }
 
@@ -1046,6 +1430,7 @@ fn truncate_head_tail(
     max_tokens: u64,
     raw_tokens: u64,
     raw_lines: usize,
+    recover_ref: Option<&str>,
 ) -> (String, bool) {
     if estimate_text_tokens(value) <= max_tokens {
         return (value.to_string(), false);
@@ -1067,14 +1452,18 @@ fn truncate_head_tail(
     // "truncated output (original token count: N) / Total output lines: M").
     let kept_tokens = estimate_text_tokens(&format!("{head_text}\n{tail_text}"));
     let omitted_tokens = raw_tokens.saturating_sub(kept_tokens);
-    // The recovery instruction must be an action the model can actually take.
-    // A bare "retrieve by evidence ref" is not: there is no model-facing tool
-    // that resolves a `tool://` URI, so the model concludes the evidence is
-    // unreachable and repeats the same call. Name the concrete call instead.
-    let recovery = if matches!(tool_name, "read_file" | "tool_orchestrate") {
-        "re-read the needed window with read_file(path, offset=nextOffset, limit=...) instead of re-reading the same range"
+    // A composite result may contain multiple paths and search pages, so a
+    // single read_file nextOffset cannot recover it. Only offer the scoped
+    // durable reference when the producer supplied an authenticated access ref.
+    let recovery = if tool_name == "tool_orchestrate" && recover_ref.is_some() {
+        let reference = serde_json::to_string(recover_ref.unwrap()).unwrap_or_default();
+        format!("if available and authorized, call read_ref({{\"reference\":{reference}}}) and follow its cursor; otherwise repeat a narrower original request")
+    } else if tool_name == "tool_orchestrate" {
+        "repeat a narrower original request; do not treat this partial result as complete".to_string()
+    } else if tool_name == "read_file" {
+        "re-read the needed window with read_file(path, offset=nextOffset, limit=...) instead of re-reading the same range".to_string()
     } else {
-        "narrow the query (concrete path/pattern, smaller head_limit) or read the persisted output by range instead of repeating this call"
+        "narrow the query (concrete path/pattern, smaller head_limit) or read the persisted output by range instead of repeating this call".to_string()
     };
     (format!(
         "{head_text}\n...[omitted {omitted_tokens} of {raw_tokens} tokens; {raw_lines} total lines; {recovery}]...\n{tail_text}"
@@ -1083,6 +1472,72 @@ fn truncate_head_tail(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn child_preview_requires_original_position_and_exact_content() {
+        let input = serde_json::json!({"steps":[{"id":"r","op":"batch","calls":[{"tool":"read_file","input":{"path":"a"}}]}]}).to_string();
+        let child = serde_json::json!({"step_index":0,"step_id":"r","position":0,
+            "body":{"source_ref":"a","source_bytes":2,"source_sha256":"sha256:abc","extent":{"kind":"file_lines","start_line":1,"line_count":2,"total_lines":2,"ends_with_newline":true}},
+            "prefixes":[{"line_count":1,"bytes":1,"sha256":super::read_sha256(b"a")}]});
+        let mut value = serde_json::json!({"kind":"orchestration_partial_receipt","result":{
+            "read_file[0]":{"source_tool":"read_file","ok":true,"output":{"file":{
+                "filePath":"a","content":"a","startLine":1,"numLines":1,"totalLines":2
+            }}}}});
+        let show = |value: &serde_json::Value| format!("Tool `tool_orchestrate` completed. Evidence: tool://original. {value}");
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_some());
+        let generic = format!("Tool `tool_orchestrate` completed. Evidence: tool://original. JSON object with 2 keys: kind, result. {value}");
+        assert!(super::child_read_presented_extent(&input, &generic, &child).is_some());
+        value["result"]["read_file[0]"]["output"]["file"]["content"] = serde_json::json!("b");
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_none());
+        value["result"]["read_file[0]"]["output"]["file"]["content"] = serde_json::json!("a");
+        value["result"]["read_file[0]"]["output"]["file"]["content_omitted"] = serde_json::json!(true);
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_none());
+        value["result"]["read_file[0]"]["output"]["file"]["preview"] = serde_json::json!(true);
+        value["result"]["read_file[0]"]["output"]["file"]["source_omitted"] = serde_json::json!(true);
+        value["result"]["read_file[0]"]["output"]["file"]["sourceNumLines"] = serde_json::json!(2);
+        value["result"]["read_file[0]"]["output"]["file"]["byteLength"] = serde_json::json!(2);
+        value["result"]["read_file[0]"]["output"]["file"]["sha256"] = serde_json::json!("abc");
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_some());
+        value["result"]["read_file[0]"]["output"]["file"]["sourceNumLines"] = serde_json::json!(3);
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_none());
+        value["result"]["read_file[0]"]["output"]["file"]["sourceNumLines"] = serde_json::json!(2);
+        value["result"]["read_file[0]"]["output"]["file"]["sha256"] = serde_json::json!("foreign");
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_none());
+        value["result"]["read_file[0]"]["output"]["file"]["sha256"] = serde_json::json!("abc");
+        let duplicate = serde_json::json!({"steps":[{"id":"r","op":"batch","calls":[{"tool":"read_file"}]},{"id":"r","op":"batch","calls":[]}]}).to_string();
+        assert!(super::child_read_presented_extent(&duplicate, &show(&value), &child).is_none());
+    }
+
+    #[test]
+    fn child_small_complete_body_can_exceed_prefix_line_limit() {
+        let body = (0..58).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let input = serde_json::json!({"steps":[{"id":"r","op":"batch","calls":[{"tool":"read_file","input":{"path":"a"}}]}]}).to_string();
+        let child = serde_json::json!({"step_index":0,"step_id":"r","position":0,"body":{"source_ref":"a",
+            "extent":{"kind":"file_lines","start_line":1,"line_count":58,"total_lines":58,
+                "body_bytes":body.len(),"body_sha256":super::read_sha256(body.as_bytes()),
+                "ends_with_newline":false,"source_omitted":false}},"prefixes":[]});
+        let mut value = serde_json::json!({"kind":"orchestration_partial_receipt","result":{
+            "read_file[0]":{"source_tool":"read_file","ok":true,"output":{"file":{
+                "filePath":"a","content":body,"startLine":1,"numLines":58,"totalLines":58}}}}});
+        let show = |value: &serde_json::Value| format!("Tool `tool_orchestrate` completed. Evidence: tool://original. {value}");
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_some());
+        value["result"]["read_file[0]"]["output"]["file"]["content"] = serde_json::json!("forged\n".repeat(57) + "forged");
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_none());
+    }
+
+    #[test]
+    fn child_empty_complete_body_is_distinct_from_omission() {
+        let input = serde_json::json!({"steps":[{"id":"r","op":"batch","calls":[{"tool":"read_file","input":{"path":"empty"}}]}]}).to_string();
+        let child = serde_json::json!({"step_index":0,"step_id":"r","position":0,"body":{"source_ref":"empty",
+            "extent":{"kind":"file_lines","start_line":1,"line_count":0,"total_lines":0,"body_bytes":0,
+                "body_sha256":super::read_sha256(b""),"ends_with_newline":false,"source_omitted":false}},"prefixes":[]});
+        let mut value = serde_json::json!({"kind":"orchestration_partial_receipt","result":{
+            "read_file[0]":{"source_tool":"read_file","ok":true,"output":{"file":{
+                "filePath":"empty","content":"","startLine":1,"numLines":0,"totalLines":0}}}}});
+        let show = |value: &serde_json::Value| format!("Tool `tool_orchestrate` completed. Evidence: tool://original. {value}");
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_some());
+        value["result"]["read_file[0]"]["output"]["file"]["content_omitted"] = serde_json::json!(true);
+        assert!(super::child_read_presented_extent(&input, &show(&value), &child).is_none());
+    }
     use super::*;
 
     fn root_delivery_fixture() -> (
@@ -1711,6 +2166,130 @@ mod tests {
             "a non-read truncation must name a narrower query or a ranged read: {}",
             search.summary
         );
+    }
+
+    #[test]
+    fn composite_durable_omission_names_exact_scoped_reader_and_ephemeral_does_not() {
+        let big = format!("{{\"calls\":[{{\"status\":\"ok\"}}],\"result\":\"{}\"}}", "a".repeat(20000));
+        let durable = build_tool_receipt_for_delivery("tool_orchestrate", &big, false, EvidenceRef::observed("tool", "raw-composite"), 80, false, true, None);
+        assert!(durable.truncated);
+        assert!(durable.summary.contains(r#"read_ref({"reference":"tool://raw-composite"})"#));
+        assert!(durable.summary.contains("follow its cursor"));
+        let transient = build_tool_receipt_for_delivery("tool_orchestrate", &big, false, EvidenceRef::observed("tool", "raw-composite"), 80, false, false, None);
+        assert!(transient.truncated);
+        assert!(!transient.summary.contains("read_ref("));
+    }
+
+    #[test]
+    fn bounded_composite_receipt_preserves_results_and_never_hides_incomplete_children() {
+        let raw = serde_json::json!({"calls":[{"stepId":"b","op":"batch","status":"ok","calls":2}],"result":{
+            "complete":{"ok":true,"status":"success","output":{"type":"read_file","truncated":false,"file":{"filePath":"Cargo.toml","content":"[workspace]\nmembers = []\n","startLine":1,"numLines":2,"totalLines":2}}},
+            "partial":{"ok":true,"status":"success","output":{"truncated":true,"scanComplete":false,"numLines":100,"next_request":{"cursor":"continuation"},"content":"large".repeat(20000)}}}}).to_string();
+        let receipt = build_tool_receipt_for_delivery("tool_orchestrate", &raw, false, EvidenceRef::observed("tool", "raw-composite"), 10000, false, true, None);
+        assert!(receipt.truncated);
+        assert!(receipt.summary.contains("orchestration_partial_receipt"));
+        assert!(receipt.summary.contains("\"partial\""));
+        assert!(receipt.summary.contains("\"scanComplete\":false"));
+        assert!(receipt.summary.contains("continuation"));
+        assert!(receipt.summary.contains("tool://raw-composite"));
+        assert!(receipt.summary.contains("members = []"));
+        assert!(!receipt.summary.contains(&"large".repeat(100)));
+        let tiny = build_tool_receipt_for_delivery("tool_orchestrate", &raw, false, EvidenceRef::observed("tool", "raw-composite"), 40, false, true, None);
+        assert!(tiny.truncated && tiny.summary.contains("read_ref("));
+    }
+
+    #[test]
+    fn default_batch_receipt_preserves_direct_children_and_rejects_ambiguous_sources() {
+        let input = serde_json::json!({"steps":[{"id":"read_all","op":"batch","calls":[
+            {"tool":"read_file","input":{"path":"a.rs"}},
+            {"tool":"read_file","input":{"path":"b.rs"}}
+        ]}]}).to_string();
+        let items = serde_json::json!({
+            "read_file[0]":{"type":"text","truncated":false,"file":{"filePath":"a.rs","content":"small","startLine":1,"numLines":1,"totalLines":1}},
+            "read_file[1]":{"type":"text","truncated":false,"file":{"filePath":"b.rs","content":"large".repeat(10000),"startLine":1,"numLines":1,"totalLines":1}}
+        });
+        let mut raw = serde_json::json!({"calls":[{"stepId":"read_all","op":"batch","status":"ok","calls":2}],
+            "steps":{"read_all":items},"result":{"read_all":items}});
+        let compact = compact_orchestrated_batch(&raw.to_string(), "tool://raw", 10000, Some(&input)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        assert_eq!(body["complete"], false);
+        assert_eq!(body["result"]["read_file[0]"]["source_tool"], "read_file");
+        assert_eq!(body["result"]["read_file[0]"]["output"]["file"]["content"], "small");
+        assert_eq!(body["result"]["read_file[1]"]["output"]["file"]["content_omitted"], true);
+        assert_eq!(body["recovery"]["when_available_and_authorized"]["input"]["reference"], "tool://raw");
+        let mut selected_input: serde_json::Value = serde_json::from_str(&input).unwrap();
+        selected_input["return"] = "$read_all".into();
+        let mut selected_raw = raw.clone();
+        selected_raw["result"] = selected_raw["steps"]["read_all"].clone();
+        let selected = compact_orchestrated_batch(&selected_raw.to_string(), "tool://raw", 10000, Some(&selected_input.to_string())).unwrap();
+        let selected: serde_json::Value = serde_json::from_str(&selected).unwrap();
+        assert_eq!(selected["result"]["read_file[0]"]["source_tool"], "read_file");
+        raw["calls"][0]["status"] = "error".into();
+        assert!(compact_orchestrated_batch(&raw.to_string(), "tool://raw", 10000, Some(&input)).is_none());
+        raw["calls"][0]["status"] = "ok".into();
+        raw["steps"]["read_all"]["read_file[0]"]["truncated"] = true.into();
+        assert!(compact_orchestrated_batch(&raw.to_string(), "tool://raw", 10000, Some(&input)).is_none());
+        raw["steps"]["read_all"]["read_file[0]"]["truncated"] = false.into();
+        let wrong = input.replace("read_file", "grep_search");
+        assert!(compact_orchestrated_batch(&raw.to_string(), "tool://raw", 10000, Some(&wrong)).is_none());
+    }
+
+    #[test]
+    fn default_multiple_batches_remain_bounded_and_keep_step_identity() {
+        let input = serde_json::json!({"steps":[
+            {"id":"a","op":"batch","calls":[{"tool":"read_file","input":{"path":"a.rs"}}]},
+            {"id":"b","op":"batch","calls":[{"tool":"read_file","input":{"path":"b.rs"}}]}
+        ]});
+        let a = serde_json::json!({"read_file[0]":{"type":"text","truncated":false,"file":{"filePath":"a.rs","content":"a"}}});
+        let b = serde_json::json!({"read_file[0]":{"type":"text","truncated":false,"file":{"filePath":"b.rs","content":"b"}}});
+        let mut raw = serde_json::json!({"calls":[{"stepId":"a","op":"batch","status":"ok","calls":1},
+            {"stepId":"b","op":"batch","status":"ok","calls":1}],
+            "steps":{"a":a,"b":b},"result":{"a":a,"b":b}});
+        let compact = compact_orchestrated_batch(&raw.to_string(), "tool://raw", 10000, Some(&input.to_string())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        assert_eq!(v["complete"], false);
+        assert_eq!(v["result"]["a"]["read_file[0]"]["output"]["file"]["content"], "a");
+        assert_eq!(v["result"]["b"]["read_file[0]"]["output"]["file"]["content"], "b");
+        raw["calls"][1]["stepId"] = "a".into();
+        assert!(compact_orchestrated_batch(&raw.to_string(), "tool://raw", 10000, Some(&input.to_string())).is_none());
+    }
+
+    #[test]
+    fn unknown_or_oversized_orchestration_is_explicit_and_reference_scoped() {
+        let fallback = bounded_orchestration_fallback("tool://raw", 1000).unwrap();
+        assert!(fallback.contains("Partial orchestration output omitted"));
+        assert!(fallback.contains(r#"read_ref({"reference":"tool://raw"})"#));
+        assert!(bounded_orchestration_fallback("tool://raw", 1).is_none());
+    }
+
+    #[test]
+    fn batch_file_preview_is_exact_complete_lines_and_preserves_source_extent() {
+        let content = (0..1000).map(|i| format!("line-{i}-数据")).collect::<Vec<_>>().join("\n");
+        let input = serde_json::json!({"steps":[{"id":"read_all","op":"batch","calls":[{"tool":"read_file","input":{"path":"a.rs"}}]}]}).to_string();
+        let value = serde_json::json!({"read_file[0]":{"type":"text","truncated":false,"file":{"filePath":"a.rs","content":content,"startLine":1,"numLines":1000,"totalLines":1000,"sha256":"original","byteLength":12345}}});
+        let mut raw = serde_json::json!({"calls":[{"stepId":"read_all","op":"batch","status":"ok","calls":1}],"steps":{"read_all":value},"result":{"read_all":value}});
+        let output = compact_orchestrated_batch(&raw.to_string(), "tool://raw", 12000, Some(&input)).unwrap();
+        let v:serde_json::Value = serde_json::from_str(&output).unwrap();
+        let file = &v["result"]["read_file[0]"]["output"]["file"];
+        let preview = file["content"].as_str().unwrap();
+        assert!(content.starts_with(preview));
+        assert_eq!(content.as_bytes()[preview.len()], b'\n');
+        assert!(preview.len() <= 4096);
+        assert_eq!(file["numLines"], 16);
+        assert_eq!(file["sourceNumLines"], 1000);
+        assert_eq!(file["totalLines"], 1000);
+        assert_eq!(file["sha256"], "original");
+        assert_eq!(file["preview"], true);
+        assert_eq!(file["source_omitted"], true);
+        assert_eq!(file["content_omitted"], true);
+        assert_eq!(v["result"]["read_file[0]"]["output"]["source_truncated"], false);
+        assert_eq!(v["result"]["read_file[0]"]["output"]["truncated"], true);
+        raw["steps"]["read_all"]["read_file[0]"]["file"]["numLines"] = 999.into();
+        raw["result"] = raw["steps"].clone();
+        let malformed = compact_orchestrated_batch(&raw.to_string(), "tool://raw", 12000, Some(&input)).unwrap();
+        let malformed:serde_json::Value = serde_json::from_str(&malformed).unwrap();
+        assert!(malformed["result"]["read_file[0]"]["output"]["file"]["preview"].is_null());
+        assert!(malformed["result"]["read_file[0]"]["output"]["file"]["content"].is_null());
     }
 
     #[test]

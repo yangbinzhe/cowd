@@ -25,6 +25,8 @@ pub mod resources;
 pub(crate) const PHYSICAL_CLOSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(crate) use commit_service::{process_closure_document, receipt_replay_contract, TerminalScopeReader};
+#[cfg(test)]
+pub(crate) use commit_service::receipt_lifecycle_anchor;
 pub use commit_service::{
     DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
     ExecutionEffectState, ProcessClosurePublicationAuthority, ToolEffectState,
@@ -52,6 +54,8 @@ pub use resources::{
 };
 #[cfg(test)]
 pub(crate) use runner::validate_worktree_path;
+#[cfg(test)]
+pub(crate) use commit_service::ExecutionTerminalCommit;
 pub(crate) use runner::ExecutionGraphRunner;
 pub use runner::{ExecutionRunReport, ExecutionRunnerError};
 pub use state_store::{graph_id_for_lookup, ExecutionGraphStateStore, ExecutionStateStoreError};

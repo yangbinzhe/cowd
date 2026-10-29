@@ -703,6 +703,9 @@ pub use runtime_event_store::{
     RuntimeTransactionEventInput, SessionTerminalInput, SourceCheckBudget,
     SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
 };
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use runtime_event_store::{FixtureEvidencePage, FixtureEvidencePageRequest};
+
 #[doc(hidden)]
 pub use runtime_event_store::{
     runtime_event_request_hash, runtime_event_request_hash_with_terminal,

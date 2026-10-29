@@ -48,6 +48,9 @@ use runtime::{
     SessionTerminalInput, TaskKind, TaskMissionAssignment, TaskMissionAssignmentCommand,
     TaskMissionAssignmentReceipt, VerifiedDecisionLease,
 };
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use runtime::{FixtureEvidencePage, FixtureEvidencePageRequest};
+
 use serde_json::Value;
 #[cfg(test)]
 use storage::PostgresConnectionConfig;

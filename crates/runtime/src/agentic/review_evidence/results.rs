@@ -7627,6 +7627,7 @@ mod tests {
             &runs[1],
             &super::super::policy::ReviewDeliverySnapshot {
                 reads: Vec::new(),
+                nested_reads: Vec::new(),
                 sources: Default::default(),
             }
         )

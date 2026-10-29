@@ -995,6 +995,22 @@ impl ReviewedTurn {
         hold_resolution: bool,
         hold_producer_until_a: bool,
     ) -> Self {
+        Self::produce_with_optional_for_owner(services, root, producer, reviewer, before_b,
+            lose_commit_response, optional, hold_resolution, hold_producer_until_a, "recovery-operator").await
+    }
+
+    async fn produce_with_optional_for_owner(
+        services: &RecoveryServices,
+        root: &mut LoopbackProvider,
+        producer: &mut LoopbackProvider,
+        reviewer: &mut LoopbackProvider,
+        before_b: bool,
+        lose_commit_response: bool,
+        optional: Option<&mut LoopbackProvider>,
+        hold_resolution: bool,
+        hold_producer_until_a: bool,
+        owner_principal: &str,
+    ) -> Self {
         use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
         let runtime = services.runtime.runtime_services();
         let producer_definition = install_native_definition(
@@ -1015,7 +1031,7 @@ impl ReviewedTurn {
         let session_id = format!("r1-recovery:{}", uuid::Uuid::new_v4());
         let mut request =
             EnsureSessionRequest::new(&session_id, Some(root.model.clone()), SessionSource::Tui);
-        request.owner_principal_id = Some("recovery-operator".into());
+        request.owner_principal_id = Some(owner_principal.into());
         services.session.create_user_session(request).await.unwrap();
         let envelope = harness_contract::turn::SessionInputEnvelope::text(
             &session_id, harness_contract::turn::InputSourceKind::Tui,
@@ -5372,3 +5388,6 @@ fn collaboration_admission_and_final_evidence_gate_on_large_stack() {
         .expect("runtime");
     runtime.block_on(collaboration_admission_and_final_evidence_gate_body());
 }
+
+#[path = "rc_session_receipt.rs"]
+mod rc_session_receipt;

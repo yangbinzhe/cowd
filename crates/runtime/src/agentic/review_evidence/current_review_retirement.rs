@@ -239,6 +239,7 @@ pub(crate) fn graph_tail_is_own_review_retirement(
     pinned: u64,
     current: u64,
     packet: Option<&AgentTaskPacket>,
+    proof_sources: &mut std::collections::BTreeMap<String, u64>,
 ) -> Result<bool, String> {
     let Some(packet) = packet.filter(|packet| packet.graph_id() == source) else {
         #[cfg(test)]
@@ -380,7 +381,7 @@ pub(crate) fn graph_tail_is_own_review_retirement(
         "before_revision":before.revision,"before_cursor":before.recovery_cursor.commit_cursor,
         "tail":tail.iter().map(|(record,_)| record).collect::<Vec<_>>() }),
     );
-    if !retirement_delta_preserves_work(&before, &tail[0].1, &tail[1].1, packet.node_id())? {
+    if !retirement_delta_preserves_work(&before, &tail[0].1, &tail[1].1, packet.node_id(), packet.run_id())? {
         #[cfg(test)]
         obs1120::record(
             "retirement.first_false",
@@ -406,6 +407,23 @@ pub(crate) fn graph_tail_is_own_review_retirement(
             serde_json::json!({"predicate":"closure_key_order","source":source,"pinned":pinned,"current":current}),
         );
         return Ok(false);
+    }
+    // A cancellation can publish the original Agent's empty cancelled
+    // terminal result in the same Graph command. Authenticate physical exit
+    // for that exact packet and pin its lifecycle source in the proof CAS.
+    let cancelled_graph = tail[0].1.project(Some(before.clone()))?;
+    if !before.node_results.contains_key(packet.node_id()) && cancelled_graph.node_results.contains_key(packet.node_id()) {
+        let Some((_, lifecycle_sources)) = crate::agent_runtime::confirmed_run_exit(store, packet)? else { return Ok(false); };
+        let agent_stream = format!("agent:{}", packet.agent_id());
+        let Some(exit) = store.event_by_idempotency_key(&agent_stream, &format!("agent.local_exit:{}", packet.run_id()))
+            .map_err(|error| error.to_string())? else { return Ok(false); };
+        if exit.payload["phase"] != "cancelled" || exit.payload["backend"] != "in_process"
+            || exit.commit_cursor >= tail[0].0.commit_cursor { return Ok(false); }
+        for source in lifecycle_sources {
+            if proof_sources.insert(source.stream_id, source.expected_revision).is_some_and(|prior| prior != source.expected_revision) {
+                return Err("review retirement lifecycle source changed during validation".into());
+            }
+        }
     }
     let result = graphs
         .binding_lease_closure(&before, packet.node_id(), &binding, start)
@@ -452,6 +470,7 @@ fn retirement_delta_preserves_work(
     command: &ExecutionGraphEvent,
     recovery: &ExecutionGraphEvent,
     node: &str,
+    run_id: &str,
 ) -> Result<bool, String> {
     if !matches!(command, ExecutionGraphEvent::CommandApplied { command, .. } if command == "cancel")
         || !matches!(recovery, ExecutionGraphEvent::Recovered { recovered_nodes, blocked_nodes, lease_closures, .. }
@@ -470,6 +489,29 @@ fn retirement_delta_preserves_work(
     expected
         .node_statuses
         .insert(node.to_owned(), ExecutionNodeStatus::Cancelled);
+    if !before.node_results.contains_key(node) {
+        if let Some(result) = cancelled.node_results.get(node) {
+            let failure_ok = result.failure.as_ref().is_some_and(|failure|
+                failure.kind == "agent_backend" && failure.message == crate::agent_runtime::CANCELLED_BY_COMMAND
+                    && !failure.retryable && failure.evidence_refs.is_empty());
+            let snapshot = crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+                result.usage.required_acceptance.clone(),
+                result.usage.observed_acceptance.satisfied_criteria.clone(),
+                result.usage.observed_acceptance.observed_evidence.clone(),
+            );
+            let (_, expected_acceptance) = crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_snapshot(snapshot);
+            if result.status != ExecutionNodeStatus::Cancelled
+                || result.result_ref.as_deref() != Some(format!("agent-return:{run_id}").as_str())
+                || result.wait_class.is_some() || result.summary.is_some() || !result.evidence_refs.is_empty()
+                || !failure_ok || !result.usage.required_acceptance.is_empty()
+                || !result.usage.observed_acceptance.is_empty()
+                || !result.usage.runtime_write_attempt_paths.is_empty()
+                || !result.usage.runtime_observed_resource_scopes.is_empty()
+                || result.usage.acceptance_evaluation.as_ref() != Some(&expected_acceptance)
+            { return Ok(false); }
+            expected.node_results.insert(node.to_owned(), result.clone());
+        }
+    }
     if cancelled != expected {
         #[cfg(test)]
         obs1120::record(
@@ -686,8 +728,48 @@ mod tests {
         let command: ExecutionGraphEvent = serde_json::from_value(command_json.clone()).unwrap();
         let recovery: ExecutionGraphEvent = serde_json::from_value(recovery_json.clone()).unwrap();
         assert!(
-            retirement_delta_preserves_work(&graph, &command, &recovery, "review-node").unwrap()
+            retirement_delta_preserves_work(&graph, &command, &recovery, "review-node", "review-run").unwrap()
         );
+        let mut cancelled_result = command_json.clone();
+        cancelled_result["delta"]["node_result_updates"] = serde_json::json!({"review-node":{
+            "status":"cancelled", "result_ref":"agent-return:review-run", "evidence_refs":[],
+            "failure":{"kind":"agent_backend", "message":crate::agent_runtime::CANCELLED_BY_COMMAND,
+                "retryable":false,"evidence_refs":[]},
+            "usage":harness_contract::execution_graph::ExecutionUsage::default(), "finished_at_ms":1
+        }});
+        let snapshot = crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+            harness_contract::context::RequiredAcceptance::default(), vec![], vec![]);
+        let (_, evaluation) = crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_snapshot(snapshot);
+        cancelled_result["delta"]["node_result_updates"]["review-node"]["usage"]["acceptance_evaluation"] = serde_json::to_value(evaluation).unwrap();
+        let terminal: ExecutionGraphEvent = serde_json::from_value(cancelled_result.clone()).unwrap();
+        assert!(retirement_delta_preserves_work(&graph, &terminal, &recovery, "review-node", "review-run").unwrap());
+        for (field, replacement) in [
+            ("result_ref", serde_json::json!("agent-return:foreign-run")),
+            ("status", serde_json::json!("completed")),
+            ("summary", serde_json::json!("new business work")),
+            ("evidence_refs", serde_json::json!([{"ref_id":"foreign"}])),
+        ] {
+            let mut foreign = cancelled_result.clone();
+            foreign["delta"]["node_result_updates"]["review-node"][field] = replacement;
+            if let Ok(event) = serde_json::from_value(foreign) {
+                assert!(!retirement_delta_preserves_work(&graph, &event, &recovery, "review-node", "review-run").unwrap(), "foreign {field}");
+            } // malformed references are rejected by the original decoder
+        }
+        let mut missing_verdict = cancelled_result.clone();
+        missing_verdict["delta"]["node_result_updates"]["review-node"]["usage"].as_object_mut().unwrap().remove("acceptance_evaluation");
+        assert!(!retirement_delta_preserves_work(&graph, &serde_json::from_value(missing_verdict).unwrap(), &recovery, "review-node", "review-run").unwrap(),
+            "missing acceptance evidence remains unknown");
+        let mut forged_verdict = cancelled_result.clone();
+        let snapshot = crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+            harness_contract::context::RequiredAcceptance::default(), vec![], vec![]);
+        let (_, mut evaluation) = crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_snapshot(snapshot);
+        evaluation.receipt_set_digest = "foreign-receipts".into();
+        forged_verdict["delta"]["node_result_updates"]["review-node"]["usage"]["acceptance_evaluation"] = serde_json::to_value(evaluation).unwrap();
+        assert!(!retirement_delta_preserves_work(&graph, &serde_json::from_value(forged_verdict).unwrap(), &recovery, "review-node", "review-run").unwrap(),
+            "an empty derived list does not authenticate a foreign verdict");
+        let mut different_failure = cancelled_result.clone();
+        different_failure["delta"]["node_result_updates"]["review-node"]["failure"]["message"] = serde_json::json!("foreign cancellation");
+        assert!(!retirement_delta_preserves_work(&graph, &serde_json::from_value(different_failure).unwrap(), &recovery, "review-node", "review-run").unwrap());
         for (field, value) in [
             (
                 "objective",
@@ -706,7 +788,7 @@ mod tests {
             mutated["delta"][field] = value;
             let foreign: ExecutionGraphEvent = serde_json::from_value(mutated).unwrap();
             assert!(
-                !retirement_delta_preserves_work(&graph, &foreign, &recovery, "review-node")
+                !retirement_delta_preserves_work(&graph, &foreign, &recovery, "review-node", "review-run")
                     .unwrap(),
                 "{field} remains business relevant"
             );
@@ -717,7 +799,7 @@ mod tests {
             &graph,
             &serde_json::from_value(foreign_command).unwrap(),
             &recovery,
-            "review-node"
+            "review-node", "review-run"
         )
         .unwrap());
         let mut foreign_recovery = recovery_json;
@@ -726,7 +808,7 @@ mod tests {
             &graph,
             &command,
             &serde_json::from_value(foreign_recovery).unwrap(),
-            "review-node"
+            "review-node", "review-run"
         )
         .unwrap());
     }

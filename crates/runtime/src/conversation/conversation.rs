@@ -33,11 +33,38 @@ struct CancellationState {
     notify: tokio::sync::Notify,
     parents: Vec<CancellationToken>,
     signal_window: std::sync::Mutex<Option<(Instant, Instant)>>,
+    /// Test-fixture only: where this scope was cancelled from.
+    #[cfg(feature = "test-fixtures")]
+    cancel_site: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;
+
+
+/// Test-fixture only: the last cancellation signals with their source line and
+/// token identity, so an unexplained turn cancellation can be attributed.
+#[cfg(feature = "test-fixtures")]
+static CANCEL_SITES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, String)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn record_cancel_site(token_id: usize, site: &str) {
+    let slot = CANCEL_SITES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut guard) = slot.lock() {
+        guard.push((token_id, site.to_string()));
+        if guard.len() > 32 {
+            guard.remove(0);
+        }
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn cancel_sites() -> Vec<(usize, String)> {
+    let slot = CANCEL_SITES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    slot.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
 
 #[derive(Clone, Default, Debug)]
 pub struct CancellationToken(Arc<CancellationState>);
@@ -45,6 +72,12 @@ pub struct CancellationToken(Arc<CancellationState>);
 impl CancellationToken {
     pub fn new() -> Self {
         Self(Arc::new(CancellationState::default()))
+    }
+
+    /// Test-fixture only: stable identity of this cancellation scope.
+    #[cfg(feature = "test-fixtures")]
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -58,13 +91,72 @@ impl CancellationToken {
         false
     }
 
+    #[inline(never)]
+    #[track_caller]
     pub fn cancel(&self) {
+        #[cfg(feature = "test-fixtures")]
+        {
+            let site = format!("{}", std::panic::Location::caller());
+            if let Ok(mut guard) = self.0.cancel_site.lock() {
+                if guard.is_none() {
+                    *guard = Some(site.clone());
+                }
+            }
+            // The cancel call stack is the decisive evidence: it names the
+            // scope that escalated a cancellation.  It is written at cancel
+            // time so a run that later fails in another phase still keeps it.
+            {
+                use std::io::Write as _;
+                let path = std::env::temp_dir().join("k05-cancel-diagnostic.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = writeln!(
+                        file,
+                        "cancel token_id={:x} site={site} backtrace={}",
+                        self.identity(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
         let _ = self.cancel_first_signal();
     }
 
+    /// Test-fixture only: the source line that cancelled this scope.
+    #[cfg(feature = "test-fixtures")]
+    pub(crate) fn last_cancel_site(&self) -> Option<String> {
+        let own = self.0.cancel_site.lock().ok().and_then(|guard| guard.clone());
+        let parents = self
+            .0
+            .parents
+            .iter()
+            .filter_map(|parent| parent.last_cancel_site())
+            .collect::<Vec<_>>();
+        if parents.is_empty() {
+            own
+        } else {
+            Some(format!("{own:?} parents={parents:?}"))
+        }
+    }
+
+    #[inline(never)]
+    #[track_caller]
     pub(crate) fn cancel_first_signal(&self) -> bool {
         let began = Instant::now();
         if !self.0.cancelled.swap(true, Ordering::SeqCst) {
+            #[cfg(feature = "test-fixtures")]
+            {
+                // A turn's cancellation token can be cancelled from any layer
+                // that holds a clone.  Record which token was cancelled and
+                // from where, so a captured child trace can attribute an
+                // unexplained "turn cancelled" to a concrete source line.
+                let id = Arc::as_ptr(&self.0) as usize;
+                let site = format!("{}", std::panic::Location::caller());
+                crate::conversation::record_cancel_site(id, &site);
+            }
             *self
                 .0
                 .signal_window
@@ -107,6 +199,8 @@ impl CancellationToken {
             notify: tokio::sync::Notify::new(),
             parents: vec![turn, step],
             signal_window: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-fixtures")]
+            cancel_site: std::sync::Mutex::new(None),
         }))
     }
 
@@ -1157,8 +1251,39 @@ pub(crate) struct EarlyToolCandidate {
     pub ready_at_ms: u64,
 }
 
+#[cfg(test)]
+fn lifecycle_append_failure_set() -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>> {
+    static FAILURE: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<(String, String)>>> = std::sync::OnceLock::new();
+    FAILURE.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn arm_lifecycle_append_failure(session: &str, call: &str) {
+    lifecycle_append_failure_set().lock().unwrap().insert((session.into(), call.into()));
+}
+
+#[cfg(test)]
+fn take_lifecycle_append_failure(session: &str, call: &str) -> bool {
+    lifecycle_append_failure_set().lock().unwrap().remove(&(session.into(), call.into()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolLifecycleReuse {
+    /// The actual early execution owner retained its record before publication.
+    PendingOriginal {
+        record: crate::ToolInvocationRecord,
+        producer: harness_contract::projection::RuntimeActivityBinding,
+    },
+    /// The effect is recovered from its original durable receipt. No new
+    /// invocation lifecycle may be manufactured for it.
+    DurableEffectReplay { original_lifecycle: Option<crate::DurableRuntimeEvent> },
+    /// The actual lifecycle owner could not be recovered; never invent one.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EarlyToolExecutionReceipt {
+    pub lifecycle: ToolLifecycleReuse,
     pub call: ModelToolCall,
     pub outcome: crate::RuntimeToolExecutionOutcome,
     pub ready_at_ms: u64,
@@ -1253,6 +1378,12 @@ impl ModelStepToolPlan {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn k02_apply_fixture_event(bus: &crate::CowdEventBus, event: AssistantEvent) -> Result<(), String> {
+    let mut reducer = ModelStreamReducer::new(Some(Arc::new(bus.clone())), None, "fixture-session".into());
+    reducer.apply(event, Instant::now()).map(|_| ()).map_err(|error| error.to_string())
 }
 
 impl ModelStreamReducer {
@@ -1610,6 +1741,7 @@ impl ModelStreamReducer {
                 false
             }
             AssistantEvent::TextDelta(delta) => {
+                if !delta.is_empty() { if let Some(bus) = &self.bus { bus.observe_semantic_progress(); } }
                 self.first_text_at.get_or_insert(observed_at);
                 self.text.push_str(&delta);
                 let index = self.ensure_active(AssistantItemKind::Text);
@@ -1617,12 +1749,14 @@ impl ModelStreamReducer {
                 false
             }
             AssistantEvent::ReasoningSummaryDelta(delta) => {
+                if !delta.is_empty() { if let Some(bus) = &self.bus { bus.observe_semantic_progress(); } }
                 self.public_reasoning.push_str(&delta);
                 let index = self.ensure_active(AssistantItemKind::PublicReasoning);
                 self.append_public_delta(index, &delta, true);
                 false
             }
             AssistantEvent::PrivateReasoningDelta(delta) => {
+                if !delta.is_empty() { if let Some(bus) = &self.bus { bus.observe_semantic_progress(); } }
                 self.private_reasoning.push_str(&delta);
                 let index = self.ensure_active(AssistantItemKind::PrivateReasoning);
                 if let Some(item) = self.items.get_mut(&index) {
@@ -1932,6 +2066,15 @@ async fn consume_owned_provider_stream(
         failure: Some(RuntimeError::new("provider consumer panicked")),
         resource_result_class: crate::execution_core::graph::ResourceResultClass::Failed,
     });
+    if let Ok(ProviderLocalExit::UserCancelled(proof)) = &producer_result {
+        if run.resource_result_class == crate::execution_core::graph::ResourceResultClass::Cancelled || run.failure.is_none() {
+            let error = run.failure.take().unwrap_or_else(|| RuntimeError::with_provider_failure_metadata(
+                "provider operation stopped by original authorized cancellation", None, false,
+                crate::execution_core::graph::ResourceResultClass::Cancelled));
+            run.failure = Some(error.with_authenticated_provider_cancellation((**proof).clone()));
+            run.resource_result_class = crate::execution_core::graph::ResourceResultClass::Cancelled;
+        }
+    }
     if matches!(producer_result, Ok(ProviderLocalExit::Stopped)) && run.failure.is_none() {
         run.failure = Some(RuntimeError::with_provider_failure_metadata(
             "provider operation stopped",
@@ -2077,6 +2220,11 @@ async fn consume_provider_stream_inner(
         let Some(event) = next else {
             break;
         };
+        if event.is_ok() {
+            if let Some(activity) = &transport_activity {
+                activity.observe_consumer_event();
+            }
+        }
         match event {
             Ok(event) => {
                 // Accumulate raw content until a step boundary resets it. A peer
@@ -2825,10 +2973,11 @@ pub struct ApiClientStream<'a> {
 /// The single physical future stays outside the consumer. It is never spawned
 /// or handed to a Drop reaper. A retained backend can continue polling it after
 /// its receiver, or its original caller, has gone away.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProviderLocalExit {
     Completed,
     Stopped,
+    UserCancelled(Box<crate::provider_runtime_client::AuthenticatedProviderCancellation>),
 }
 
 pub(crate) struct ProviderExecution<'a> {
@@ -2941,10 +3090,14 @@ impl<'a> ApiClientStream<'a> {
                     execution.poll_work(cx);
                     if matches!(
                         execution.result,
-                        Some(Err(_)) | Some(Ok(ProviderLocalExit::Stopped))
+                        Some(Err(_)) | Some(Ok(ProviderLocalExit::Stopped | ProviderLocalExit::UserCancelled(_)))
                     ) {
                         let error = match execution.result.take().unwrap() {
                             Err(error) => error,
+                            Ok(ProviderLocalExit::UserCancelled(proof)) => {
+                                RuntimeError::with_provider_failure_metadata("provider operation stopped by original authorized cancellation", None, false,
+                                    crate::execution_core::graph::ResourceResultClass::Cancelled).with_authenticated_provider_cancellation(*proof)
+                            }
                             Ok(ProviderLocalExit::Stopped) => {
                                 RuntimeError::with_provider_failure_metadata(
                                     "provider operation stopped",
@@ -3042,6 +3195,7 @@ struct GeneratedModelReceipt {
     omitted_tokens: u64,
     complete: bool,
     presentation_bytes: u64,
+    presentation: String,
     source: Option<NativeToolSource>,
     read_body: Option<crate::context_evidence::ReadBodySeal>,
 }
@@ -3638,6 +3792,8 @@ pub struct RuntimeError {
     /// Runtime already answered this exact malformed frame in-step and the
     /// model re-sent it unchanged.
     repeated_tool_frame_refusal: bool,
+    authenticated_provider_cancellation: Option<Box<crate::provider_runtime_client::AuthenticatedProviderCancellation>>,
+    authenticated_graph_cancellation: bool,
 }
 
 impl RuntimeError {
@@ -3687,6 +3843,8 @@ impl RuntimeError {
             provider_usage: None,
             effect_receipts: Vec::new(),
             repeated_tool_frame_refusal: false,
+            authenticated_provider_cancellation: None,
+            authenticated_graph_cancellation: false,
         }
     }
 
@@ -3710,6 +3868,8 @@ impl RuntimeError {
             provider_usage: None,
             effect_receipts: Vec::new(),
             repeated_tool_frame_refusal: false,
+            authenticated_provider_cancellation: None,
+            authenticated_graph_cancellation: false,
         }
     }
 
@@ -3775,6 +3935,8 @@ impl RuntimeError {
             provider_usage: None,
             effect_receipts: Vec::new(),
             repeated_tool_frame_refusal: false,
+            authenticated_provider_cancellation: None,
+            authenticated_graph_cancellation: false,
         }
     }
 
@@ -3797,7 +3959,27 @@ impl RuntimeError {
             provider_usage: None,
             effect_receipts: Vec::new(),
             repeated_tool_frame_refusal: false,
+            authenticated_provider_cancellation: None,
+            authenticated_graph_cancellation: false,
         }
+    }
+
+    pub(crate) fn authenticated_provider_cancellation(&self) -> Option<&crate::provider_runtime_client::AuthenticatedProviderCancellation> {
+        self.authenticated_provider_cancellation.as_deref()
+    }
+
+    pub(crate) fn from_authenticated_graph_cancellation() -> Self {
+        let mut error = Self::new("original authorized execution cancelled");
+        error.authenticated_graph_cancellation = true;
+        error
+    }
+
+    pub(crate) fn is_authenticated_graph_cancellation(&self) -> bool {
+        self.authenticated_graph_cancellation
+    }
+    fn with_authenticated_provider_cancellation(mut self, proof: crate::provider_runtime_client::AuthenticatedProviderCancellation) -> Self {
+        self.authenticated_provider_cancellation = Some(Box::new(proof));
+        self
     }
 
     #[must_use]
@@ -4024,9 +4206,29 @@ impl ModelStepResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreDispatchRefusalSource {
+    Compiler,
+    Strategy,
+    LegacyOwner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreDispatchRefusal {
+    pub(crate) call_id: String,
+    pub(crate) reason: String,
+    pub(crate) source: PreDispatchRefusalSource,
+}
+
+impl From<(String, String)> for PreDispatchRefusal {
+    fn from((call_id, reason): (String, String)) -> Self {
+        Self { call_id, reason, source: PreDispatchRefusalSource::LegacyOwner }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolBatchStepResult {
-    pub(crate) refused_before_dispatch: Vec<(String, String)>,
+    pub(crate) refused_before_dispatch: Vec<PreDispatchRefusal>,
     pub messages: Vec<ConversationMessage>,
     pub failed: usize,
     pub max_concurrency_observed: usize,
@@ -5044,6 +5246,9 @@ pub struct ConversationRuntime<C, T> {
     fallbacks: Arc<std::sync::RwLock<Vec<String>>>,
     /// T35: Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
+    /// T35: The turn-level cancellation, kept apart from the step-scoped
+    /// token that `scoped_model_stop` links in during a provider step.
+    turn_cancellation: Option<CancellationToken>,
     /// Latest assembled context envelope used by a real turn.
     last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
     /// Active context profile used to assemble the next runtime envelope.

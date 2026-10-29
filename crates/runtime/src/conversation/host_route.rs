@@ -193,6 +193,29 @@ where
         cancellation_token: crate::CancellationToken,
         hook_abort_signal: HookAbortSignal,
     ) {
+        #[cfg(feature = "test-fixtures")]
+        eprintln!(
+            "k05_turn_control_installed token_id={:x} site={}",
+            cancellation_token.identity(),
+            std::panic::Location::caller()
+        );
+        #[cfg(feature = "test-fixtures")]
+        {
+            use std::io::Write as _;
+            let path = std::env::temp_dir().join("k05-cancel-diagnostic.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(
+                    file,
+                    "install token_id={:x} site={}",
+                    cancellation_token.identity(),
+                    std::panic::Location::caller()
+                );
+            }
+        }
         let runtime = self
             .runtime
             .take()

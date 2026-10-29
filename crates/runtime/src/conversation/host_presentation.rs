@@ -825,6 +825,16 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 self.idempotency_keys
                     .and_then(|keys| keys.get(task.tool_call_id.as_str())),
             );
+            let start = self.invocations.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&call.id).cloned();
+            let producer = start.as_ref().and_then(|record| record.original_producer.clone());
+            if let (Some(record), Some(producer)) = (start, producer) {
+                request.tool_progress.record_lifecycle_anchor(crate::tool_host::ToolLifecycleAnchor {
+                    invocation_id: record.invocation_id, session_id: record.session_id,
+                    tool_call_id: record.tool_call_id, tool_name: record.tool_name,
+                    input_hash: record.input_hash, producer,
+                })?;
+            }
             let plane = Arc::clone(self.execution_plane);
             let demand = task.resource_demand.clone();
             let service_class = self.ticket.service_class;
@@ -906,45 +916,14 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
         // but its invocation map is intentionally task-local. Rehydrate the
         // terminal fact here so the finalized DAG can persist the same tool
         // lifecycle beside its durable message/result without re-executing it.
-        let input = self
-            .calls
-            .get(task.original_call_index)
-            .map_or("", |call| call.input.as_str());
-        let summary = receipt
-            .outcome
-            .output
-            .as_deref()
-            .or(receipt.outcome.error.as_deref())
-            .unwrap_or("early tool completed without output");
-        let started = ToolInvocationRecord::started(
-            self.session_id,
-            0,
-            task.tool_call_id.clone(),
-            task.tool_name.clone(),
-            input,
-            task.safety_category,
-            receipt.started_at_ms,
-        )
-        .with_governed_plan(self.plan_id, self.plan_revision);
-        let record = match receipt.outcome.status {
-            crate::RuntimeToolExecutionStatus::Executed if !receipt.outcome.model_feedback_is_error() => {
-                started.completed(summary, receipt.completed_at_ms)
+        if let Some(call) = self.calls.get(task.original_call_index) {
+            if let Some(record) = replayed_governed_invocation(self.session_id, call, receipt) {
+                self.invocations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(task.tool_call_id.clone(), record);
             }
-            crate::RuntimeToolExecutionStatus::BlockedPermission => started.failed(
-                ToolFailureKind::PermissionDenied,
-                summary,
-                receipt.completed_at_ms,
-            ),
-            _ => started.failed(
-                ToolFailureKind::ExecutionError,
-                summary,
-                receipt.completed_at_ms,
-            ),
-        };
-        self.invocations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(task.tool_call_id.clone(), record);
+        }
         let terminal = if !receipt.outcome.model_feedback_is_error() {
             crate::GovernedToolTaskTerminal::Succeeded(receipt.outcome.clone())
         } else {
@@ -999,7 +978,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             .calls
             .get(task.original_call_index)
             .map_or("", |call| call.input.as_str());
-        let record = ToolInvocationRecord::started(
+        let mut record = ToolInvocationRecord::started(
             self.session_id,
             0,
             task.tool_call_id.clone(),
@@ -1009,6 +988,12 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             crate::tool_invocation::now_ms(),
         )
         .with_governed_plan(self.plan_id, self.plan_revision);
+        record.original_producer = match self.original_producers {
+            Some(producers) if crate::context_evidence::native_read_candidate_tool(&task.tool_name) =>
+                producers.get(&task.tool_call_id).cloned(),
+            _ => self.event_bus.as_ref().and_then(|bus|
+                bus.current_tool_activity_binding(&task.tool_call_id, &task.tool_name)),
+        };
         self.invocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1092,6 +1077,45 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
     }
 }
 
+fn replayed_governed_invocation(
+    session_id: &str,
+    call: &ModelToolCall,
+    receipt: &crate::conversation::EarlyToolExecutionReceipt,
+) -> Option<ToolInvocationRecord> {
+    let crate::conversation::ToolLifecycleReuse::PendingOriginal { record, producer } = &receipt.lifecycle else {
+        // The durable effect receipt is sufficient to replay the tool result,
+        // but is not an invocation lifecycle identity. Preserve any existing
+        // lifecycle and never append an invented or duplicate one.
+        return None;
+    };
+    if producer.validate().is_err()
+        || producer.session_id != session_id
+        || producer.tool_call_id.as_deref() != Some(receipt.call.id.as_str())
+        || producer.tool_contract_id.as_deref() != Some(receipt.call.name.as_str())
+        || record.session_id != session_id
+        || record.tool_call_id != receipt.call.id
+        || record.tool_name != receipt.call.name
+        || record.input_hash != crate::tool_invocation::stable_hash(&receipt.call.input)
+        || record.input_hash != crate::tool_invocation::stable_hash(&call.input)
+        || record.is_error != Some(receipt.outcome.model_feedback_is_error())
+        || record.ended_at_ms.is_none()
+    {
+        #[cfg(test)]
+        if call.id == "ra-read" {
+            eprintln!("ra_lifecycle_rehydrate call=ra-read rejected=identity producer_valid={} session={} call={} tool={} receipt_input={} current_input={} outcome={} ended={}",
+                producer.validate().is_ok(), record.session_id == session_id,
+                record.tool_call_id == receipt.call.id, record.tool_name == receipt.call.name,
+                record.input_hash == crate::tool_invocation::stable_hash(&receipt.call.input),
+                record.input_hash == crate::tool_invocation::stable_hash(&call.input),
+                record.is_error == Some(receipt.outcome.model_feedback_is_error()), record.ended_at_ms.is_some());
+        }
+        return None;
+    }
+    let mut original = record.clone();
+    original.original_producer = Some(producer.clone());
+    Some(original)
+}
+
 pub(super) async fn execute_governed_runtime_tool_batch(
     host: Arc<dyn crate::RuntimeExecutionHost>,
     event_bus: Option<crate::CowdEventBus>,
@@ -1122,44 +1146,59 @@ pub(super) async fn execute_governed_runtime_tool_batch(
     physical_owner: &Arc<crate::execution_core::graph::executors::ScopedNodeExecutor>,
     commit_service: &crate::execution_core::graph::ExecutionCommitService,
     precompleted: &BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>,
+    original_producers: &HashMap<String, harness_contract::projection::RuntimeActivityBinding>,
 ) -> GovernedToolBatchResult {
+    let mut refused_before_dispatch = Vec::new();
     let compilation = match compilation {
         Ok(compilation) => compilation,
         Err(error) => {
             let reason = format!("governed tool DAG rejected before execution: {error}");
-            return GovernedToolBatchResult {
-                messages: calls
-                    .iter()
-                    .map(|call| {
-                        tool_outcome_message(failed_governed_tool_outcome(
-                            call,
-                            crate::ToolSafetyCategory::Destructive,
-                            reason.clone(),
-                        ))
-                    })
-                    .collect(),
-                invocations: rejected_tool_invocations(
-                    session_id,
-                    calls,
-                    crate::ToolSafetyCategory::Destructive,
-                    None,
-                    0,
-                    &reason,
-                ),
-                observed_evidence: Vec::new(),
-                max_concurrency_observed: 0,
-                parallel_batches: 0,
-            };
+            let mut messages = Vec::with_capacity(calls.len());
+            let mut invocations = HashMap::new();
+            let mut observed_evidence = Vec::new();
+            for call in calls {
+                if let Some(receipt) = precompleted.get(&call.id) {
+                    messages.push(early_tool_receipt_message(receipt));
+                    observed_evidence.extend(receipt.outcome.observed_evidence.iter().cloned());
+                    if let Some(record) = replayed_governed_invocation(session_id, call, receipt) {
+                        invocations.insert(call.id.clone(), record);
+                    }
+                } else {
+                    refused_before_dispatch.push(crate::conversation::PreDispatchRefusal {
+                        call_id: call.id.clone(), reason: reason.clone(),
+                        source: crate::conversation::PreDispatchRefusalSource::Compiler,
+                    });
+                    messages.push(tool_outcome_message(failed_governed_tool_outcome(
+                        call, crate::ToolSafetyCategory::Destructive, reason.clone(),
+                    )));
+                    invocations.extend(rejected_tool_invocations(
+                        session_id, std::slice::from_ref(call), crate::ToolSafetyCategory::Destructive, None, 0, &reason,
+                    ));
+                }
+            }
+            return GovernedToolBatchResult { refused_before_dispatch, messages, invocations, observed_evidence, max_concurrency_observed: 0, parallel_batches: 0 };
         }
     };
     let mut messages_by_call = std::collections::HashMap::new();
     let mut invocation_records = HashMap::new();
+    let mut replayed_observed_evidence = Vec::new();
     for rejection in compilation.rejected {
         if let Some(call) = calls.iter().find(|call| call.id == rejection.tool_call_id) {
+            if let Some(receipt) = precompleted.get(&call.id) {
+                messages_by_call.insert(call.id.clone(), early_tool_receipt_message(receipt));
+                replayed_observed_evidence.extend(receipt.outcome.observed_evidence.iter().cloned());
+                if let Some(record) = replayed_governed_invocation(session_id, call, receipt) {
+                    invocation_records.insert(call.id.clone(), record);
+                }
+                continue;
+            }
             let reason = format!(
                 "governed tool node rejected before execution: {}",
                 rejection.reason
             );
+            if !precompleted.contains_key(&call.id) {
+                refused_before_dispatch.push(crate::conversation::PreDispatchRefusal { call_id: call.id.clone(), reason: reason.clone(), source: crate::conversation::PreDispatchRefusalSource::Compiler });
+            }
             messages_by_call.insert(
                 call.id.clone(),
                 tool_outcome_message(failed_governed_tool_outcome(
@@ -1180,12 +1219,13 @@ pub(super) async fn execute_governed_runtime_tool_batch(
     }
     let Some(plan) = compilation.plan else {
         return GovernedToolBatchResult {
+            refused_before_dispatch,
             messages: calls
                 .iter()
                 .filter_map(|call| messages_by_call.remove(&call.id))
                 .collect(),
             invocations: invocation_records,
-            observed_evidence: Vec::new(),
+            observed_evidence: replayed_observed_evidence,
             max_concurrency_observed: 0,
             parallel_batches: 0,
         };
@@ -1203,6 +1243,17 @@ pub(super) async fn execute_governed_runtime_tool_batch(
         );
         for task in &plan.tasks {
             let call = &calls[task.original_call_index];
+            if let Some(receipt) = precompleted.get(&call.id) {
+                messages_by_call.insert(call.id.clone(), early_tool_receipt_message(receipt));
+                replayed_observed_evidence.extend(receipt.outcome.observed_evidence.iter().cloned());
+                if let Some(record) = replayed_governed_invocation(session_id, call, receipt) {
+                    invocation_records.insert(call.id.clone(), record);
+                }
+                continue;
+            }
+            if !precompleted.contains_key(&call.id) {
+                refused_before_dispatch.push(crate::conversation::PreDispatchRefusal { call_id: call.id.clone(), reason: reason.clone(), source: crate::conversation::PreDispatchRefusalSource::Strategy });
+            }
             messages_by_call.insert(
                 call.id.clone(),
                 tool_outcome_message(failed_governed_tool_outcome(
@@ -1221,12 +1272,13 @@ pub(super) async fn execute_governed_runtime_tool_batch(
             ));
         }
         return GovernedToolBatchResult {
+            refused_before_dispatch,
             messages: calls
                 .iter()
                 .filter_map(|call| messages_by_call.remove(&call.id))
                 .collect(),
             invocations: invocation_records,
-            observed_evidence: Vec::new(),
+            observed_evidence: replayed_observed_evidence,
             max_concurrency_observed: 0,
             parallel_batches: 0,
         };
@@ -1235,6 +1287,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
     let context = HostGovernedToolContext {
         host,
         event_bus,
+        original_producers: Some(original_producers),
         calls,
         session_id,
         sandbox_posture,
@@ -1260,7 +1313,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
     let report = crate::GovernedToolExecutor.execute(&plan, &context).await;
     let max_concurrency_observed = report.max_active;
     let parallel_batches = usize::from(report.max_active > 1);
-    let mut observed_evidence = Vec::new();
+    let mut observed_evidence = replayed_observed_evidence;
     for (index, outcome) in report.outcomes.into_iter().enumerate() {
         let task = &plan.tasks[index];
         let call = &calls[task.original_call_index];
@@ -1296,6 +1349,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
         })
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     GovernedToolBatchResult {
+        refused_before_dispatch,
         messages,
         invocations,
         observed_evidence,
@@ -1485,7 +1539,9 @@ where
         // Provider dispatch.
         let cancellation = {
             let runtime = self.runtime.lock().await;
-            runtime.cancellation_token()
+            // Capture the turn-level token: the current token may be a
+            // step-scoped link whose producer stop a normal finish cancels.
+            runtime.turn_cancellation_token()
         };
         let narration = {
             let mut runtime = self.runtime.lock().await;
@@ -1530,6 +1586,8 @@ where
             Err(error) => {
                 self.record_terminal_provider_failure(&error).await;
                 if cancellation.is_cancelled() {
+                    #[cfg(feature = "test-fixtures")]
+                    eprintln!("k06_cancel_site=narrator_arm turn_cancelled=true");
                     return Err("terminal_presentation_cancelled".to_string());
                 }
                 tracing::warn!(
@@ -1717,13 +1775,12 @@ where
                 }
                 Err(error) => {
                     self.record_terminal_provider_failure(&error).await;
-                    if self
-                        .runtime
-                        .lock()
-                        .await
-                        .cancellation_token()
-                        .is_cancelled()
-                    {
+                    // Only a turn-level cancellation may end this turn: a
+                    // provider producer's own stop is linked into the current
+                    // token while a step runs and is not a turn cancellation.
+                    if self.runtime.lock().await.turn_cancelled() {
+                        #[cfg(feature = "test-fixtures")]
+                        eprintln!("k06_cancel_site=repair_loop turn_cancelled=true");
                         return Err("terminal_presentation_cancelled".to_string());
                     }
                     last_error = Some(error.to_string());
@@ -1963,11 +2020,7 @@ where
             _ => None,
         }
         .filter(|answer| {
-            if delegated_leaf {
-                !answer.trim().is_empty() && !answer.starts_with("<synthesized_terminal")
-            } else {
-                qualified_root_answer(answer, &envelope)
-            }
+            !answer.trim().is_empty() && !answer.starts_with("<synthesized_terminal")
         });
         let reusable_origin = projection
             .terminal_presentation
@@ -2142,13 +2195,12 @@ where
                 &envelope,
             );
         }
-        if self
-            .runtime
-            .lock()
-            .await
-            .cancellation_token()
-            .is_cancelled()
-        {
+        // Only a turn-level cancellation aborts the terminal presentation:
+        // a step-scoped provider stop is linked into the current token while
+        // a model step runs and must not read as a turn cancellation.
+        if self.runtime.lock().await.turn_cancelled() {
+            #[cfg(feature = "test-fixtures")]
+            eprintln!("k06_cancel_site=main_check turn_cancelled=true");
             if !delegated_leaf {
                 if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
                     bus.emit(CowdEvent::TerminalDelivery {
@@ -2159,6 +2211,45 @@ where
                             reason: "user_cancelled".to_string(),
                         },
                 });
+                }
+            }
+            #[cfg(feature = "test-fixtures")]
+            // Read the cancelled token's identity and cancel site once: every
+            // extra acquisition of the runtime lock inside this abort path can
+            // queue behind an unrelated holder and strand the turn task before
+            // it reaches its Err return, which would leave the node without a
+            // terminal outcome.
+            let (turn_token_id, turn_token_cancel_site) = {
+                let token = self.runtime.lock().await.cancellation_token();
+                (token.identity(), token.last_cancel_site())
+            };
+            #[cfg(feature = "test-fixtures")]
+            eprintln!(
+                "k05_terminal_presentation_aborted site={} last_operational_cancel={:?} cancel_sites={:?} turn_token_id={:x} turn_token_cancel_site={:?}",
+                std::panic::Location::caller(),
+                crate::execution_core::services::last_operational_cancel(),
+                crate::conversation::cancel_sites(),
+                turn_token_id,
+                turn_token_cancel_site
+            );
+            #[cfg(feature = "test-fixtures")]
+            {
+                use std::io::Write as _;
+                let path = std::env::temp_dir().join("k05-cancel-diagnostic.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = writeln!(
+                        file,
+                        "abort site={} turn_token_id={:x} turn_token_cancel_site={:?} last_operational={:?} cancel_sites={:?}",
+                        std::panic::Location::caller(),
+                        turn_token_id,
+                        turn_token_cancel_site,
+                        crate::execution_core::services::last_operational_cancel(),
+                        crate::conversation::cancel_sites()
+                    );
                 }
             }
             return Err("terminal_presentation_cancelled".to_string());
@@ -2206,6 +2297,99 @@ where
                     "{} newer durable Session input(s) superseded the terminal presentation before commit",
                     late_inputs.len()
                 ),
+                framework_authored: true,
+            }));
+        }
+        // An ordinary Goal conclusion is authorized for the committed model
+        // candidate and its original attempt, not for a later replacement.
+        // The original prepared Goal/Graph read set is attached below to the
+        // terminal transaction, so a changed source cannot reuse this cut.
+        if !delegated_leaf && completion == GoalCompletion::Satisfied && ordinary_conclusion.is_some()
+            && envelope.user_answer_contract.format == harness_contract::outcome::UserAnswerFormat::StrictJson
+        {
+            let original = committed_terminal_answer(&projection, &ticket.graph_id)?;
+            if original != final_answer {
+                return Err("terminal answer differs from the original Goal-bound candidate".into());
+            }
+        }
+        // Every root producer converges here before its presentation or Goal
+        // conclusion is committed. The format contract is not a business
+        // verdict: preserve the original Goal and receipt cuts on recovery.
+        let contract_rejected = !delegated_leaf && (
+            !qualified_root_answer(&final_answer, &envelope)
+                || (envelope.user_answer_contract.format
+                    == harness_contract::outcome::UserAnswerFormat::StrictJson
+                    && response_language_mismatch(&objective, &final_answer))
+        );
+        if contract_rejected && completion != GoalCompletion::Satisfied {
+            // A partial/failed explanation is not a successful structured
+            // business answer. Keep its honest diagnostic and invalid status.
+            terminal_validation.invalid = true;
+            terminal_validation.findings.push("terminal explanation does not satisfy the declared output contract".into());
+        }
+        if contract_rejected && completion == GoalCompletion::Satisfied {
+            if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                bus.emit(CowdEvent::TerminalDelivery {
+                    delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationSuperseded {
+                        presentation_id: presentation_id.clone(),
+                        attempt_id: committed_attempt_id.clone(),
+                        reason: "terminal_answer_contract_rejected".to_string(),
+                    },
+                });
+            }
+            let mut state = self.state.lock().await;
+            state.terminal_recovery_attempts = state.terminal_recovery_attempts.saturating_add(1);
+            let budget = terminal_recovery_retry_budget(&state.safety_lease).min(1);
+            if state.terminal_recovery_attempts > budget {
+                return Err("terminal answer did not satisfy the declared output contract after bounded recovery".to_string());
+            }
+            state.terminal_override = None;
+            state.terminal_failure_narration = None;
+            state.force_text_only_next_model = true;
+            let reason = if !qualified_root_answer(&final_answer, &envelope) {
+                if envelope.user_answer_contract.format == harness_contract::outcome::UserAnswerFormat::StrictJson {
+                    "The previous answer is not a JSON object in the requested format. Return the requested object without Markdown fences, using only the original request and committed evidence.".to_string()
+                } else {
+                    "The previous answer was empty or contained tool protocol markup. Return a user-facing answer using the original request and committed evidence.".to_string()
+                }
+            } else {
+                let fields = serde_json::from_str::<serde_json::Value>(&final_answer).ok()
+                    .and_then(|value| value.as_object().cloned())
+                    .and_then(|fields| json_field_language_findings(&objective, &fields))
+                    .unwrap_or_default().into_iter().filter(|name| !name.is_empty()).take(8)
+                    .collect::<Vec<_>>();
+                let field = if fields.is_empty() { "the requested field".to_string() }
+                    else { format!("field(s) {}", fields.join(", ")) };
+                format!("The previous JSON answer did not meet the original request's explicit language requirement for {field}. Correct only that requirement using committed evidence.")
+            };
+            // Normal continuation does not append state.content as a new user
+            // message. Hand the existing bounded recovery feedback to the same
+            // one-shot context path used by other Host interventions.
+            let mut item = ContextItem::new(
+                format!("terminal-contract-recovery:{}", state.iterations),
+                ContextSourceKind::Task,
+                ContextRole::Instruction,
+                reason,
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            state.pending_next_model_context.push(item);
+            let next = dynamic_node(
+                ticket,
+                state.iterations,
+                "root-terminal-contract-recovery-model",
+                ExecutionNodeKind::InlineModel,
+                "inline_model",
+                "inline_model",
+            );
+            drop(state);
+            return Ok(NodeExecutionOutcome::new(completed_result(
+                Some(format!("{}:terminal-contract-rejected", ticket.graph_id)),
+                ExecutionUsage::default(),
+            )).with_replan(ExecutionGraphReplan {
+                nodes: vec![next.clone()],
+                edges: dynamic_edges(&ticket.node_id, &[next]),
+                reason: "root terminal presentation did not satisfy its declared output contract".to_string(),
                 framework_authored: true,
             }));
         }
@@ -4344,9 +4528,14 @@ pub(super) fn normalize_terminal_answer_with_evidence(
     text: &str,
     _tool_results: &[ConversationMessage],
     _workspace_root: &std::path::Path,
-    _objective: &str,
+    objective: &str,
 ) -> String {
     let trimmed = text.trim();
+    if objective_requires_strict_json(objective)
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|value| value.is_object())
+    {
+        return text.to_string();
+    }
     if serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|value| value.is_object()) {
         // Delegated roles and evaluation Judges own exact machine-readable
         // output contracts. Appending prose evidence to a valid JSON object

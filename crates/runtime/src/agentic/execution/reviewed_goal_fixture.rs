@@ -10634,12 +10634,12 @@ impl RootReviewRuntime {
                 .filter(|call| matches!(call.name.as_str(), "read_file" | "edit" | "execute_code"))
             {
                 let key = call.binding.as_ref().unwrap().effect_idempotency_key();
-                if let Some((_, reason)) = result
+                if let Some(refusal) = result
                     .refused_before_dispatch
                     .iter()
-                    .find(|(refused, _)| refused == &call.id)
+                    .find(|refusal| refusal.call_id == call.id)
                 {
-                    assert!(!reason.trim().is_empty());
+                    assert!(!refusal.reason.trim().is_empty());
                     for phase in ["receipt", "read-receipt"] {
                         assert!(self.services.event_store().event_by_idempotency_key(
                             &format!("execution-effect:{key}"),

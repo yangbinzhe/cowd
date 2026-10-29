@@ -33,6 +33,17 @@ pub trait ScopedNodeBackend: Send + Sync {
     ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
         Ok(None)
     }
+    /// Reassess only the already executed original backend; never dispatch.
+    async fn revalidate_goal_source(
+        &self,
+        _ticket: &NodeExecutionTicket,
+        _outcome: &NodeExecutionOutcome,
+        _stale_stream: &str,
+        _expected: u64,
+        _actual: u64,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        Ok(None)
+    }
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         Ok(())
     }
@@ -520,13 +531,25 @@ impl NodeExecutor for ScopedNodeExecutor {
                         reason: "original physical admission closed".into(),
                     });
                 }
+                if entry.original_binding
+                    && entry.observation.as_ref().is_some_and(|o| o.ticket_matches(ticket))
+                    && entry.backend.is_none()
+                {
+                    entry.backend = Some(backend.clone());
+                }
                 entry.observation.clone()
             };
-            return super::agent_tool::finish_observed_outcome(
-                ticket,
-                observation.as_deref(),
-                backend.execute(ticket).await,
-            );
+            #[cfg(feature = "test-fixtures")]
+            let trace_completion = std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some()
+                && crate::host::decode_tool_batch(&ticket.payload_ref).is_ok_and(|(calls, _)|
+                    calls.iter().any(|call| call.id == "recovery-complete" && call.name == "objective_complete_request"));
+            let result = backend.execute(ticket).await;
+            #[cfg(feature = "test-fixtures")]
+            if trace_completion { eprintln!("rc_completion_stage scoped_backend_returned"); }
+            let result = super::agent_tool::finish_observed_outcome(ticket, observation.as_deref(), result);
+            #[cfg(feature = "test-fixtures")]
+            if trace_completion { eprintln!("rc_completion_stage scoped_finish_returned ok={}", result.is_ok()); }
+            return result;
         }
         let key = Self::physical_key(ticket, "");
         let work: Option<PhysicalWork> = {
@@ -591,6 +614,27 @@ impl NodeExecutor for ScopedNodeExecutor {
             }),
         }
     }
+    async fn revalidate_goal_source(
+        &self,
+        ticket: &NodeExecutionTicket,
+        outcome: &NodeExecutionOutcome,
+        stale_stream: &str,
+        expected: u64,
+        actual: u64,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        let original = {
+            let physical = self.physical.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            physical.get(&Self::physical_key(ticket, "")).filter(|entry| {
+                entry.original_binding && !entry.closed
+                    && entry.observation.as_ref().is_some_and(|o| o.ticket_matches(ticket))
+            }).and_then(|entry| entry.backend.clone())
+        };
+        match original {
+            Some(backend) => backend.revalidate_goal_source(ticket, outcome, stale_stream, expected, actual).await,
+            None => Ok(None),
+        }
+    }
+
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         let published = {
             let physical = self

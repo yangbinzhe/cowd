@@ -3555,6 +3555,7 @@ impl EarlyToolDispatcher for RecordingEarlyDispatcher {
             let started_at_ms = super::now_ms();
             tokio::time::sleep(Duration::from_millis(5)).await;
             EarlyToolDispatchResult::Executed(EarlyToolExecutionReceipt {
+                lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
                 outcome: crate::RuntimeToolExecutionOutcome {
                     tool_use_id: candidate.call.id.clone(),
                     tool_name: candidate.call.name.clone(),

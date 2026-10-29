@@ -990,7 +990,7 @@ where
             // model cannot act on.
             return Ok((
                 ToolBatchStepResult {
-                    refused_before_dispatch,
+                    refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                     failed: refusal_messages.len(),
                     messages: refusal_messages,
                     max_concurrency_observed: 0,
@@ -1067,12 +1067,11 @@ where
                     if !replays.contains_key(&call.id) {
                         refused_before_dispatch.push((call.id.clone(), reason.clone()));
                     }
-                    let message = ConversationMessage::tool_result(
-                        call.id.clone(),
-                        call.name.clone(),
-                        reason.clone(),
-                        true,
-                    );
+                    let message = if let Some(receipt) = replays.get(&call.id) {
+                        self.prepare_replayed_tool_result(call, receipt).await?
+                    } else {
+                        ConversationMessage::tool_result(call.id.clone(), call.name.clone(), reason.clone(), true)
+                    };
                     self.session
                         .write()
                         .await
@@ -1085,7 +1084,7 @@ where
                 }
                 return Ok((
                     ToolBatchStepResult {
-                        refused_before_dispatch,
+                        refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                         failed: messages.len(),
                         messages,
                         max_concurrency_observed: 0,
@@ -1109,15 +1108,16 @@ where
                     ),
                 ));
             }
-            let message = ConversationMessage::tool_result(
-                rejected.tool_call_id.clone(),
-                rejected.tool_name.clone(),
-                format!(
-                    "governed tool node rejected before execution: {}",
-                    rejected.reason
-                ),
-                true,
-            );
+            let message = if let Some(receipt) = replays.get(&rejected.tool_call_id) {
+                let call = calls.iter().find(|call| call.id == rejected.tool_call_id)
+                    .ok_or_else(|| RuntimeError::new("replayed rejection has no original call"))?;
+                self.prepare_replayed_tool_result(call, receipt).await?
+            } else {
+                ConversationMessage::tool_result(
+                    rejected.tool_call_id.clone(), rejected.tool_name.clone(),
+                    format!("governed tool node rejected before execution: {}", rejected.reason), true,
+                )
+            };
             self.session
                 .write()
                 .await
@@ -1156,7 +1156,7 @@ where
             let failed = count_failed_tool_results(&messages);
             return Ok((
                 ToolBatchStepResult {
-                    refused_before_dispatch,
+                    refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                     failed,
                     messages,
                     max_concurrency_observed: 0,
@@ -1172,6 +1172,18 @@ where
         // rather than letting it disappear the way mon6's objective_review did.
         let swallowed = unaccounted_calls(&pending, &plan, &compilation.rejected);
         for (call_id, tool_name) in &swallowed {
+            if let Some(receipt) = replays.get(call_id) {
+                let call = calls.iter().find(|call| call.id == *call_id)
+                    .ok_or_else(|| RuntimeError::new("replayed dropped call has no original identity"))?;
+                let message = self.prepare_replayed_tool_result(call, receipt).await?;
+                self.session.write().await.push_message(message.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let sequence = self.session_head().await.message_count.wrapping_sub(1);
+                self.record_message_event(&message, sequence);
+                self.remember_tool_trace_from_message(&message);
+                preflight_messages.push(message);
+                continue;
+            }
             if !replays.contains_key(call_id) {
                 refused_before_dispatch.push((
                     call_id.clone(),
@@ -1246,22 +1258,7 @@ where
             let mut precompleted = BTreeMap::new();
             for call in calls {
                 if let Some(receipt) = replays.get(&call.id) {
-                    let output = receipt
-                        .outcome
-                        .output
-                        .as_deref()
-                        .or(receipt.outcome.error.as_deref())
-                        .unwrap_or_default();
-                    let message = self
-                        .prepare_governed_tool_result_with_invocation(
-                            &call.id,
-                            &call.name,
-                            &call.input,
-                            output,
-                            receipt.outcome.model_feedback_is_error(),
-                            None,
-                        )
-                        .await?;
+                    let message = self.prepare_replayed_tool_result(call, receipt).await?;
                     precompleted
                         .insert(call.id.clone(), self.collect_tool_result_message(message).1);
                 }
@@ -1303,12 +1300,11 @@ where
                 if !replays.contains_key(&call.id) {
                     refused_before_dispatch.push((call.id.clone(), reason.clone()));
                 }
-                let message = ConversationMessage::tool_result(
-                    call.id.clone(),
-                    call.name.clone(),
-                    reason.clone(),
-                    true,
-                );
+                let message = if let Some(receipt) = replays.get(&call.id) {
+                    self.prepare_replayed_tool_result(call, receipt).await?
+                } else {
+                    ConversationMessage::tool_result(call.id.clone(), call.name.clone(), reason.clone(), true)
+                };
                 self.session
                     .write()
                     .await
@@ -1328,7 +1324,7 @@ where
         let failed = count_failed_tool_results(&messages);
         Ok((
             ToolBatchStepResult {
-                refused_before_dispatch,
+                refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                 messages,
                 failed,
                 max_concurrency_observed,
@@ -1916,6 +1912,19 @@ where
         // A read-class effect has no settlement stream for a process terminal,
         // so it keeps its plain read receipt and the witness stays honestly
         // unproven for it.
+        if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+            if let Some(children) = execution.as_ref().ok().and_then(|draft| match draft {
+                harness_contract::context::ToolOutputDraft::InProcess { evidence, .. } =>
+                    evidence.downcast_ref::<Vec<tools::OrchestratedRead>>().map(Vec::as_slice),
+                _ => None,
+            }) {
+                match request.tool_progress.child_reads().map_err(ToolError::new)? {
+                    Some(existing) if existing.as_slice() != children => return Err(ToolError::new("conflicting child read channel")),
+                    Some(_) => {},
+                    None => request.tool_progress.record_child_reads(children.to_vec()).map_err(ToolError::new)?,
+                }
+            }
+        }
         let committed = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
             if host_process_terminal {
                 commit
@@ -1956,7 +1965,11 @@ where
             ))
         })?;
         drop(locked);
-        execution
+        execution.map(|draft| match draft {
+            harness_contract::context::ToolOutputDraft::InProcess { content, .. } =>
+                harness_contract::context::ToolOutputDraft::bounded_inline(content),
+            draft => draft,
+        })
     }
 
     pub(super) async fn execute_single_tool(
@@ -2194,7 +2207,7 @@ where
                     execution_decision: None,
                     evaluation_isolated: false,
                     managed_invocation: None,
-                    tool_progress: crate::ToolProgressSink(self.cowd_bus.as_ref().map(|bus| {
+                    tool_progress: crate::ToolProgressSink::new(self.cowd_bus.as_ref().map(|bus| {
                         let bus = bus.clone();
                         let id = tool_use_id.to_string();
                         let name = tool_name.to_string();
@@ -2311,7 +2324,7 @@ where
                                 let effect_commit = effect_commit.ok_or_else(|| {
                                     ToolError::new("tool execution lost its durable ledger")
                                 })?;
-                                boxed_tool_future(|| self.execute_scoped_root_effect(
+                                let work = boxed_tool_future(|| self.execute_scoped_root_effect(
                                     effect_commit,
                                     effect_request,
                                     &task.effect,
@@ -2319,8 +2332,12 @@ where
                                     root_owner,
                                     executor_owns_admission,
                                     execute,
-                                ))
-                                .await
+                                ));
+                                if task.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                                    crate::bound_tool_batch::with_outer_read_receipt_owner(effect_request, work).await
+                                } else {
+                                    work.await
+                                }
                             }
                         });
                         let (execution, admission) = if executor_owns_admission {
@@ -2670,6 +2687,59 @@ where
     /// The graph remains responsible for publication; this method persists
     /// raw evidence, updates context governance, and applies Runtime-owned
     /// capability discovery before the next model request.
+    pub(crate) async fn prepare_replayed_tool_result(
+        &self,
+        call: &ModelToolCall,
+        receipt: &EarlyToolExecutionReceipt,
+    ) -> Result<ConversationMessage, RuntimeError> {
+        if receipt.call.id != call.id
+            || receipt.call.name != call.name
+            || receipt.outcome.tool_use_id != call.id
+            || receipt.outcome.tool_name != call.name
+            || receipt.call.binding != call.binding
+            || receipt.call.depends_on != call.depends_on
+            || harness_contract::step::parse_strict_json(&receipt.call.input).ok()
+                .zip(harness_contract::step::parse_strict_json(&call.input).ok())
+                .is_none_or(|(original, current)| original != current)
+        {
+            return Err(RuntimeError::new("replayed tool result crosses its original call identity"));
+        }
+        let output = receipt.outcome.output.as_deref()
+            .or(receipt.outcome.error.as_deref()).unwrap_or_default();
+        let invocation = match &receipt.lifecycle {
+            crate::conversation::ToolLifecycleReuse::PendingOriginal { record, producer }
+                if producer.validate().is_ok()
+                    && producer.session_id == self.session_id()
+                    && producer.tool_call_id.as_deref() == Some(call.id.as_str())
+                    && producer.tool_contract_id.as_deref() == Some(call.name.as_str())
+                    && record.session_id == self.session_id()
+                    && record.tool_call_id == call.id
+                    && record.tool_name == call.name
+                    && record.input_hash == crate::tool_invocation::stable_hash(&receipt.call.input)
+                    && record.is_error == Some(receipt.outcome.model_feedback_is_error())
+                    && record.ended_at_ms.is_some() => {
+                        if record.input_hash != crate::tool_invocation::stable_hash(&call.input) {
+                            // Canonically equivalent JSON may differ bytewise;
+                            // retain the result but do not claim this lifecycle.
+                            None
+                        } else {
+                            let mut original = record.clone();
+                            original.original_producer = Some(producer.clone());
+                            Some(original)
+                        }
+                    },
+            crate::conversation::ToolLifecycleReuse::PendingOriginal { .. } => {
+                return Err(RuntimeError::new("replayed tool lifecycle conflicts with its original outcome"));
+            }
+            crate::conversation::ToolLifecycleReuse::DurableEffectReplay { .. }
+            | crate::conversation::ToolLifecycleReuse::Unknown => None,
+        };
+        self.prepare_governed_tool_result_with_invocation(
+            &call.id, &call.name, &call.input, output,
+            receipt.outcome.model_feedback_is_error(), invocation,
+        ).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn prepare_governed_tool_result(
         &self,
@@ -3238,6 +3308,8 @@ where
             raw_ref.clone(),
             granted.max(24),
             preserve_complete_read,
+            access.is_some(),
+            Some(input),
         );
         if access.is_none() {
             if receipt.summary.starts_with("Tool `") {
@@ -3311,6 +3383,10 @@ where
         _sequence: usize,
         raw_access: Option<&harness_contract::context::EvidenceAccessRef>,
     ) {
+        #[cfg(test)]
+        if record.tool_call_id == "ra-read" {
+            eprintln!("ra_lifecycle_writer call=ra-read kind={kind} raw_access={} producer_present={}", raw_access.is_some(), record.original_producer.is_some());
+        }
         let mut payload = serde_json::to_value(record).unwrap_or_else(
             |error| serde_json::json!({ "serialization_error": error.to_string() }),
         );
@@ -3333,6 +3409,8 @@ where
                 || digest.len() != 64
                 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
+                #[cfg(test)]
+                if record.tool_call_id == "ra-read" { eprintln!("ra_lifecycle_writer call=ra-read kind={kind} rejected=raw_identity"); }
                 tracing::warn!("Tool terminal raw identity failed its original writer binding");
                 return;
             }
@@ -3344,10 +3422,7 @@ where
             });
         }
         let owner_cut = (kind == "tool.invocation.completed"
-            && matches!(
-                record.tool_name.as_str(),
-                "read_file" | "read_ref" | "evidence_retrieve"
-            ))
+            && crate::context_evidence::native_read_candidate_tool(&record.tool_name))
         .then(|| {
             self.runtime_event_store.as_ref().and_then(|store| {
                 store
@@ -3374,12 +3449,13 @@ where
         }
         #[cfg(test)]
         self.apply_raw_origin_encoding_for_test(record, kind, &mut payload);
-        self.append_execution_runtime_event(
+        self.append_execution_runtime_event_guarded(
             RuntimeEventScope::Tool,
             kind,
             Some(record.status.as_str().to_string()),
             refs,
             payload.clone(),
+            record.original_producer.as_ref(),
         );
         if let Some(after_sequence) = owner_cut {
             if let Err(error) = self.capture_native_root_owner(record, &payload, after_sequence) {

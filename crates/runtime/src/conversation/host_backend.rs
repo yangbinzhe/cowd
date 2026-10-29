@@ -2227,6 +2227,10 @@ where
             .map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(), reason: error.to_string(),
             })?;
+        let original_provider_owner = if root {
+            model_runtime.root_effect_owner_for_ticket(ticket).ok().map(|(activity, attempt)|
+                crate::provider_runtime_client::ProviderGraphOwner { activity, attempt })
+        } else { None };
         let early_dispatcher: Option<Arc<dyn crate::conversation::EarlyToolDispatcher>> =
             if clean_terminal_synthesis || force_text_only_response {
                 None
@@ -3926,6 +3930,17 @@ where
                 Ok(outcome)
             }
             Err(error) => {
+                if let (Some(proof), Some(owner)) = (error.authenticated_provider_cancellation(), original_provider_owner.as_ref()) {
+                    if error.effect_receipts().is_empty() && proof.matches_original(owner, ticket) {
+                        return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                            status: ExecutionNodeStatus::Cancelled,
+                            result_ref: Some(proof.durable_reference()), wait_class: None,
+                            summary: Some("original local provider response observed authorized cancellation".into()),
+                            evidence_refs: Vec::new(),
+                            failure: None, usage: ExecutionUsage::default(), finished_at_ms: user_application_clock(),
+                        }));
+                    }
+                }
                 // A provider failure is execution evidence, not an implicit
                 // graph terminal. Preserve it and let the same Goal policy
                 // that governs tools decide whether the next node retries,
@@ -7676,6 +7691,26 @@ fn precommitted_terminal_outcome(ticket: &NodeExecutionTicket) -> NodeExecutionO
     })
 }
 
+// Keep the saved projection, observation and outcome construction out of the
+// tool batch future: every tool batch carries that future even when it is not
+// a completion request. This does not change the lifetime or authority of the
+// original physical backend.
+#[inline(never)]
+fn remember_tool_goal_revalidation<C: ApiClient, T: ToolExecutor>(
+    backend: &TurnToolBatchBackend<C, T>,
+    ticket: &NodeExecutionTicket,
+    source: &crate::execution_core::goal::GoalProjection,
+    observation: &RuntimeObservation,
+    checkpoint: GoalWriteCheckpoint,
+    original_satisfied: bool,
+    outcome: &NodeExecutionOutcome,
+) {
+    *backend.goal_revalidation.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ToolGoalRevalidation {
+        ticket: ticket.clone(), source: source.clone(), observation: observation.clone(),
+        checkpoint, original_satisfied, outcome: outcome.clone(),
+    });
+}
+
 #[async_trait]
 impl<C, T> ScopedNodeBackend for TurnToolBatchBackend<C, T>
 where
@@ -7772,6 +7807,11 @@ where
                 node_id: ticket.node_id.clone(),
                 reason: format!("tool batch persistent payload is invalid: {error}"),
             })?;
+        #[cfg(feature = "test-fixtures")]
+        let rc_completion_trace = std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some()
+            && calls.iter().any(|call| call.id == "recovery-complete" && call.name == "objective_complete_request");
+        #[cfg(feature = "test-fixtures")]
+        if rc_completion_trace { eprintln!("rc_completion_stage decoded"); }
         let admitted_turn = self.state.lock().await.turn_id.clone();
         if calls.iter().any(|call| {
             call.binding.as_ref().is_some_and(|binding| {
@@ -7898,6 +7938,7 @@ where
                     precompleted.insert(
                         call.id.clone(),
                         crate::conversation::EarlyToolExecutionReceipt {
+                            lifecycle: crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: replay.lifecycle },
                             call: call.clone(),
                             outcome: replay.outcome,
                             ready_at_ms: replay.completed_at_ms,
@@ -7957,6 +7998,7 @@ where
                     precompleted.insert(
                         call.id.clone(),
                         crate::conversation::EarlyToolExecutionReceipt {
+                            lifecycle: crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: None },
                             call: call.clone(),
                             outcome,
                             ready_at_ms: completed_at_ms,
@@ -8142,8 +8184,19 @@ where
                 node_id: ticket.node_id.clone(),
                 reason: "governed ToolHost is missing its compiled execution bundle".to_string(),
             })?;
-            let (event_bus, memory_context, reality_context, execution_policy) = {
+            let (event_bus, memory_context, reality_context, execution_policy, original_producers) = {
                 let runtime = self.runtime.lock().await;
+                let mut original_producers = HashMap::new();
+                for call in &calls {
+                    if crate::context_evidence::native_read_candidate_tool(&call.name) {
+                        let input_hash = crate::tool_invocation::stable_hash(&call.input);
+                        if let Some(owner) = runtime.native_tool_activity_owner(&call.id, &call.name, &input_hash)
+                            .map_err(|error| NodeExecutorError::Poll { node_id: ticket.node_id.clone(),
+                                reason: format!("original model tool owner: {error}") })? {
+                            original_producers.insert(call.id.clone(), owner);
+                        }
+                    }
+                }
                 if let Ok(compilation) = &governed_compilation {
                     if let Some(plan) = &compilation.plan {
                         runtime.record_governed_tool_plan(plan).map_err(|error| {
@@ -8164,6 +8217,7 @@ where
                         .permission_policy()
                         .execution_policy_control()
                         .snapshot(),
+                    original_producers,
                 )
             };
             let governed = execute_governed_runtime_tool_batch(
@@ -8187,9 +8241,13 @@ where
                 self.services.tool_batch_executor(),
                 self.services.commit_service(),
                 &precompleted,
+                &original_producers,
             )
             .await;
+            #[cfg(feature = "test-fixtures")]
+            if rc_completion_trace { eprintln!("rc_completion_stage governed_returned"); }
             let GovernedToolBatchResult {
+                refused_before_dispatch,
                 messages: governed_messages,
                 invocations,
                 observed_evidence,
@@ -8220,15 +8278,18 @@ where
                 &calls,
                 governed_messages,
                 &invocations,
+                &precompleted,
             )
             .await
             .map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
                 reason: format!("tool evidence durability barrier failed: {error}"),
             })?;
+            #[cfg(feature = "test-fixtures")]
+            if rc_completion_trace { eprintln!("rc_completion_stage compactor_returned"); }
             (
                 crate::conversation::ToolBatchStepResult {
-                    refused_before_dispatch: Vec::new(),
+                    refused_before_dispatch,
                     failed: messages
                         .iter()
                         .flat_map(|message| &message.blocks)
@@ -8324,8 +8385,8 @@ where
             .tool_batch_executor()
             .binding_observation(ticket)
         {
-            for (call_id, reason) in &result.refused_before_dispatch {
-                observation.refuse(call_id, reason.clone());
+            for refusal in &result.refused_before_dispatch {
+                observation.refuse(&refusal.call_id, refusal.reason.clone());
             }
         }
         let tool_calls = result.messages.len() as u64;
@@ -8352,6 +8413,8 @@ where
                 state.execution_role.is_delegated_leaf(),
             )
         };
+        #[cfg(feature = "test-fixtures")]
+        if rc_completion_trace { eprintln!("rc_completion_stage before_program_wait"); }
         let agentic_program_wait_request = if delegated {
             None
         } else if let Some(program) =
@@ -8389,6 +8452,8 @@ where
         } else {
             None
         };
+        #[cfg(feature = "test-fixtures")]
+        if rc_completion_trace { eprintln!("rc_completion_stage after_program_wait"); }
         let closed_delegated_protocol = calls.iter().any(|call| {
             successful_call_ids.contains(&call.id)
                 && (call
@@ -9111,6 +9176,12 @@ where
             state.committed_workspace_observed_evidence.as_slice(),
             state.committed_workspace_write_observed,
         ));
+        let revalidation_checkpoint = GoalWriteCheckpoint::ToolProgress {
+            bounded_role: bounded_evidence_role,
+            saturated: repeated_evidence_saturation,
+            write_attempted: !state.write_attempt_paths.is_empty(),
+        };
+        let root_write_checkpoint = task_focus.is_none();
         let (write_decision, write_goal_cut) = self
             .services
             .goal_store()
@@ -9118,11 +9189,7 @@ where
                 &write_goal_source,
                 ticket,
                 self.services.path_identity_resolver(),
-                GoalWriteCheckpoint::ToolProgress {
-                    bounded_role: bounded_evidence_role,
-                    saturated: repeated_evidence_saturation,
-                    write_attempted: !state.write_attempt_paths.is_empty(),
-                },
+                revalidation_checkpoint,
                 task_focus,
                 &successful_observed_evidence,
             )
@@ -9130,6 +9197,8 @@ where
                 node_id: ticket.node_id.clone(),
                 reason,
             })?;
+        let original_satisfied = matches!(&write_decision, GoalWriteDisposition::Satisfied);
+        let revalidation_disposition = matches!(&write_decision, GoalWriteDisposition::Satisfied | GoalWriteDisposition::Pending);
         let write_recovery = match write_decision {
             GoalWriteDisposition::Recover(recovery) => Some(recovery),
             GoalWriteDisposition::Satisfied | GoalWriteDisposition::Pending => None,
@@ -9725,6 +9794,8 @@ where
             };
             node
         };
+        #[cfg(feature = "test-fixtures")]
+        if rc_completion_trace { eprintln!("rc_completion_stage outcome_constructed"); }
         let mut outcome = NodeExecutionOutcome::new(completed_result(
             Some(format!("{}:tool-results:{tool_calls}", ticket.graph_id)),
             ExecutionUsage {
@@ -9827,6 +9898,8 @@ where
         if runtime_authored_tool_batch(&calls) {
             messages.insert(0, runtime_authored_tool_call_message(&calls));
         }
+        #[cfg(feature = "test-fixtures")]
+        if rc_completion_trace { eprintln!("rc_completion_stage before_transcript"); }
         stage_host_transcript(
             &self.runtime,
             &self.services,
@@ -9838,7 +9911,108 @@ where
             &mut outcome,
         )
         .await?;
+        // Retain the exact original post-tool computation in this physical
+        // backend only. This does not grant authority to dispatch again.
+        if root_write_checkpoint && revalidation_disposition
+            && calls.iter().any(|call| call.name == "objective_complete_request")
+            && outcome.domain_events.iter().filter(|e| e.event.stream_id == format!("goal:{}", write_goal_source.goal.id)).count() == 1
+            && outcome.domain_events.iter().any(|e| e.event.kind == "goal.observation" && e.event.stream_id == format!("goal:{}", write_goal_source.goal.id))
+        {
+            remember_tool_goal_revalidation(self, ticket, &write_goal_source, &observation,
+                revalidation_checkpoint, original_satisfied, &outcome);
+        }
+        #[cfg(feature = "test-fixtures")]
+        if rc_completion_trace { eprintln!("rc_completion_stage executor_return"); }
         Ok(outcome)
+    }
+
+    async fn revalidate_goal_source(
+        &self,
+        ticket: &NodeExecutionTicket,
+        outcome: &NodeExecutionOutcome,
+        stale_stream: &str,
+        expected: u64,
+        actual: u64,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        let saved = self.goal_revalidation.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let Some(saved) = saved else { return Ok(None) };
+        let fail = |reason: String| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason };
+        let mut original = outcome.clone();
+        if original.result.usage.duration_ms < saved.outcome.result.usage.duration_ms { return Ok(None); }
+        original.result.usage.duration_ms = saved.outcome.result.usage.duration_ms;
+        original.no_dispatch = saved.outcome.no_dispatch.clone();
+        if saved.ticket != *ticket || original != saved.outcome
+            || stale_stream != format!("goal:{}", saved.source.goal.id)
+            || saved.source.stream_revision != expected
+            || outcome.source_revisions.get(stale_stream) != Some(&expected)
+            || expected.checked_add(1) != Some(actual)
+        { return Ok(None); }
+        let Some(current) = self.services.goal_store().projection(&saved.source.goal.id).map_err(&fail)? else { return Ok(None) };
+        if current.stream_revision != actual || saved.source.goal.completion != GoalCompletion::Open
+            || saved.source.goal.terminal.is_some() || current.goal.completion != GoalCompletion::Satisfied
+            || current.goal.phase != "completed"
+            || current.goal.revision != saved.source.goal.revision.saturating_add(1)
+            || !saved.source.goal.evidence_refs.iter().all(|e| current.goal.evidence_refs.contains(e))
+        { return Ok(None); }
+        let Some(terminal) = current.goal.terminal.as_ref() else { return Ok(None) };
+        if terminal.kind != harness_contract::goal::ObjectiveTerminalKind::Satisfied { return Ok(None); }
+        // Compare every contractual field, allowing only the terminal owner's
+        // completion, phase, revision and additive evidence to advance.
+        let mut comparable = current.goal.clone();
+        comparable.completion = saved.source.goal.completion;
+        comparable.phase = saved.source.goal.phase.clone();
+        comparable.revision = saved.source.goal.revision;
+        comparable.terminal = saved.source.goal.terminal.clone();
+        comparable.evidence_refs = saved.source.goal.evidence_refs.clone();
+        if comparable != saved.source.goal { return Ok(None); }
+        let Some(binding) = current.goal.execution_binding.as_ref() else { return Ok(None) };
+        if binding.root_execution_id != ticket.graph_id || binding.session_id != current.goal.session_id { return Ok(None); }
+        let store = self.services.event_store();
+        let events = store.list_stream_after(stale_stream, expected, actual, 2, 1024 * 1024).map_err(&fail)?;
+        let [completed] = events.as_slice() else { return Ok(None) };
+        if completed.sequence != actual || completed.kind != "goal.completed"
+            || completed.actor.as_deref() != Some("runtime.objective_supervisor")
+        { return Ok(None); }
+        let program_stream = format!("agentic-program:{}", binding.agentic_program_id);
+        let program_revision = store.stream_revision(&program_stream).map_err(|e| fail(e.to_string()))?;
+        let actions = crate::AgentActionService::new(Arc::clone(store));
+        let Some(program) = actions.project_if_exists(&binding.agentic_program_id).map_err(|e| fail(e.to_string()))? else { return Ok(None) };
+        let Some(verdict) = program.objective_verdict.as_ref() else { return Ok(None) };
+        if program.objective_id != binding.objective_id || program.session_id != binding.session_id
+            || program.turn_id != binding.turn_id || program.root_execution_id.as_deref() != Some(ticket.graph_id.as_str())
+            || verdict.goal_id != current.goal.id || verdict.goal_revision != current.goal.revision
+            || verdict.terminal_fence != terminal.terminal_fence || verdict.authority_revision != terminal.authority_revision
+            || verdict.kind != terminal.kind
+        { return Ok(None); }
+        let bound_verdict = store.event_by_idempotency_key(&program_stream, &format!("agentic-objective-verdict:{}", verdict.terminal_fence)).map_err(|e| fail(e.to_string()))?;
+        let conclusion = store.event_by_idempotency_key(&program_stream, &format!("program-conclusion:{}", verdict.authority_revision)).map_err(|e| fail(e.to_string()))?;
+        let verdict_event = match (bound_verdict, conclusion) {
+            (Some(first), Some(second)) if first != second => return Ok(None),
+            (Some(event), _) | (_, Some(event)) => event,
+            (None, None) => return Ok(None),
+        };
+        if verdict_event.kind != "agentic.objective_verdict_bound"
+            || verdict_event.transaction_id != completed.transaction_id
+            || verdict_event.payload["program_id"] != binding.agentic_program_id
+            || verdict_event.payload["verdict"] != serde_json::to_value(verdict).map_err(|e| fail(e.to_string()))?
+            || store.stream_revision(&program_stream).map_err(|e| fail(e.to_string()))? != program_revision
+            || outcome.source_revisions.get(&program_stream).is_some_and(|r| *r != program_revision)
+        { return Ok(None); }
+        let (decision, cut) = self.services.goal_store().assess_write_checkpoint(
+            &current, ticket, self.services.path_identity_resolver(), saved.checkpoint, None,
+            &saved.observation.observed_evidence,
+        ).map_err(&fail)?;
+        if cut.stream_id != stale_stream || cut.expected_revision != actual
+            || !matches!((&decision, saved.original_satisfied), (GoalWriteDisposition::Satisfied, true) | (GoalWriteDisposition::Pending, false))
+        { return Ok(None); }
+        let Some(index) = outcome.domain_events.iter().position(|e| e.event.stream_id == stale_stream && e.event.kind == "goal.observation") else { return Ok(None) };
+        let Some(key) = outcome.domain_events[index].idempotency_key.clone() else { return Ok(None) };
+        let event = self.services.goal_store().observation_event_at(&current, &saved.observation, key).map_err(&fail)?;
+        let mut rebuilt = outcome.clone();
+        rebuilt.domain_events[index] = event;
+        rebuilt.source_revisions.insert(stale_stream.to_owned(), actual);
+        rebuilt.source_revisions.insert(program_stream, program_revision);
+        Ok(Some(rebuilt))
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {

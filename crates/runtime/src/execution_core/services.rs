@@ -113,7 +113,7 @@ pub enum RuntimeServicesError {
     Invariant(String),
 }
 
-fn read_original_requested_event(
+pub(crate) fn read_original_requested_event(
     store: &RuntimeEventStore,
     receipt: &harness_contract::turn::CancellationReceipt,
 ) -> Result<
@@ -254,6 +254,28 @@ fn publish_requested_source(
 
 /// Original cancellation source for one installed root turn. The token only wakes
 /// work; first-cause attribution is protected independently by this short lock.
+/// Last operational turn-cancellation signal, kept so a later abort can name
+/// the scope that escalated it.  Test-fixture only: it carries no production
+/// behaviour and exists because a captured child trace keeps only its tail.
+#[cfg(feature = "test-fixtures")]
+static LAST_OPERATIONAL_CANCEL: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::string::String>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn record_last_operational_cancel(site: &str) {
+    let slot = LAST_OPERATIONAL_CANCEL.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(site.to_string());
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn last_operational_cancel() -> Option<std::string::String> {
+    let slot = LAST_OPERATIONAL_CANCEL.get_or_init(|| std::sync::Mutex::new(None));
+    slot.lock().ok().and_then(|guard| guard.clone())
+}
+
 pub struct TurnCancellationControl {
     session_id: String,
     turn_id: String,
@@ -639,6 +661,22 @@ impl TurnCancellationControl {
     }
 
     pub fn signal_operational(&self) {
+        #[cfg(feature = "test-fixtures")]
+        {
+            // A turn-scoped operational cancellation can be triggered by work
+            // that does not own this turn.  Record who signalled it so the
+            // captured child trace names the escalating scope instead of
+            // leaving "the turn was cancelled" as an unexplained fact.
+            let site = format!(
+                "site={} session={} turn={} execution={}",
+                std::panic::Location::caller(),
+                self.session_id,
+                self.turn_id,
+                self.execution_id
+            );
+            eprintln!("k05_operational_cancel {site}");
+            crate::execution_core::services::record_last_operational_cancel(&site);
+        }
         let mut cause = self
             .first_cause
             .lock()
@@ -4137,6 +4175,230 @@ impl RuntimeServices {
         self.resolve_requested_cancellation(&original.cancellation_id)
     }
 
+    /// Recognize only an original, atomically committed provider cancellation.
+    /// A raw token, cancelled status, missing effect, foreign Session or any
+    /// failed/blocked graph node is insufficient to attribute this outcome.
+    pub(crate) fn authenticated_provider_graph_cancellation(
+        &self,
+        graph: &ExecutionGraph,
+    ) -> Result<Option<(String, super::graph::NodeExecutionTicket)>, RuntimeServicesError> {
+        if graph.nodes.iter().any(|node| graph.node_statuses.get(&node.id).is_none_or(|status|
+            !status.is_terminal() || matches!(status, ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked))) {
+            return Ok(None);
+        }
+        let mut matching = graph.nodes.iter().filter(|node| {
+            node.kind == ExecutionNodeKind::InlineModel && node.executor_kind == "inline_model"
+                && graph.node_results.get(&node.id).is_some_and(|result|
+                    result.status == ExecutionNodeStatus::Cancelled
+                    && result.summary.as_deref() == Some("original local provider response observed authorized cancellation"))
+        });
+        let Some(node) = matching.next() else { return Ok(None) };
+        if matching.next().is_some() { return Ok(None); }
+        let attempt = *graph.recovery_cursor.node_attempts.get(&node.id)
+            .ok_or_else(|| RuntimeServicesError::Invariant("cancelled model attempt missing".into()))?;
+        let binding = self.graph_state_store.current_binding(graph, &node.id, attempt)?;
+        let (ticket, _) = self.graph_state_store.binding_start_ticket(graph, &node.id, &binding)?;
+        let Some((result, _)) = self.commit_service.committed_node_attempt(graph, &node.id, &binding)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))? else { return Ok(None) };
+        if graph.node_results.get(&node.id) != Some(&result) { return Ok(None); }
+        let cancellation_id = self.commit_service.validate_cold_provider_cancellation(&ticket, &result)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        Ok(cancellation_id.map(|id| (id, ticket)))
+    }
+
+    /// Hand a committed Session cancellation to its original ordinary Goal.
+    /// The Goal write is fenced against the exact Graph, effect and receipt
+    /// heads; a Team Program retains its own independent terminal owner.
+    fn settle_authenticated_provider_cancel_goal(
+        &self,
+        receipt: &harness_contract::turn::CancellationReceipt,
+    ) -> Result<bool, RuntimeServicesError> {
+        use harness_contract::goal::GoalCompletion;
+        if receipt.status != harness_contract::turn::CancellationStatus::Cancelled {
+            return Ok(true);
+        }
+        let graph = match self.graph_state_store.load(&receipt.execution_id) {
+            Ok(graph) => graph,
+            Err(ExecutionStateStoreError::NotFound { .. }) => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        if graph.lineage.as_ref().is_none_or(|lineage|
+            lineage.session_id != receipt.session_id || lineage.turn_id != receipt.turn_id) {
+            return Ok(true);
+        }
+        let Some((cancellation_id, ticket)) = self.authenticated_provider_graph_cancellation(&graph)? else { return Ok(true) };
+        if cancellation_id != receipt.cancellation_id { return Ok(true); }
+        let goal_id = format!("goal:{}", graph.id);
+        let Some(projection) = self.goal_store.projection(&goal_id).map_err(RuntimeServicesError::Invariant)? else { return Ok(true) };
+        let goal = projection.goal;
+        let Some(binding) = goal.execution_binding.as_ref() else { return Ok(true) };
+        if binding.root_execution_id != graph.id || binding.session_id != receipt.session_id || binding.turn_id != receipt.turn_id {
+            return Ok(true);
+        }
+        if self.agent_action_service().project_if_exists(&binding.agentic_program_id)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?.is_some() {
+            return Ok(true);
+        }
+        // Never overwrite a prior winning terminal or turn a cancellation
+        // into an answer. Existing terminal facts retain their own owner.
+        if goal.completion != GoalCompletion::Open { return Ok(true); }
+        let goal_stream = format!("goal:{goal_id}");
+        let cancellation_stream = format!("cancellation:{}", receipt.cancellation_id);
+        let effect_stream = super::graph::ExecutionNodeBinding::effect_stream_id(&ticket);
+        // TurnStrategy owns a distinct `turn:<decision_id>` Outcome; its
+        // original Session strategy event supplies the Graph-to-Outcome link.
+        let strategy_stream = format!("session:{}", receipt.session_id);
+        let strategy_head = self.event_store.stream_revision(&strategy_stream)?;
+        if strategy_head == 0 { return Ok(false); }
+        if strategy_head > 4096 {
+            return Err(RuntimeServicesError::Invariant("cancelled Goal strategy evidence budget exhausted".into()));
+        }
+        let mut after = 0;
+        let mut decisions = BTreeSet::new();
+        let mut bytes = 0usize;
+        while after < strategy_head {
+            let page = self.event_store.list_stream_after(&strategy_stream, after, strategy_head, 100, 1024 * 1024)
+                .map_err(RuntimeServicesError::Invariant)?;
+            if page.is_empty() { return Err(RuntimeServicesError::Invariant("original strategy history gap".into())); }
+            for source in page {
+                bytes = bytes.saturating_add(serde_json::to_vec(&source)
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?.len());
+                if bytes > 8 * 1024 * 1024 {
+                    return Err(RuntimeServicesError::Invariant("cancelled Goal strategy byte budget exhausted".into()));
+                }
+                if source.sequence != after + 1 || source.stream_id != strategy_stream {
+                    return Err(RuntimeServicesError::Invariant("original strategy history position mismatch".into()));
+                }
+                after = source.sequence;
+                if source.kind == "runtime.strategy.outcome"
+                    && source.payload["session_ref"] == receipt.session_id
+                    && source.payload["turn_ref"] == receipt.turn_id
+                    && source.payload["execution_graph_ref"] == graph.id {
+                    if source.scope != RuntimeEventScope::Session
+                        || source.actor.as_deref() != Some("conversation_runtime.strategy_owner") {
+                        return Err(RuntimeServicesError::Invariant("original strategy outcome owner mismatch".into()));
+                    }
+                    let decision = source.payload["decision_id"].as_str()
+                        .filter(|value| !value.is_empty()).ok_or_else(|| RuntimeServicesError::Invariant("original strategy decision missing".into()))?;
+                    let status = source.status.as_deref().filter(|value| !value.is_empty())
+                        .ok_or_else(|| RuntimeServicesError::Invariant("original strategy terminal status missing".into()))?;
+                    decisions.insert((decision.to_owned(), status.to_owned()));
+                }
+            }
+        }
+        if decisions.is_empty() { return Ok(false); }
+        // Multiple durable owners are a terminal conflict, not missing work
+        // to retry forever. Preserve their original facts for their owner.
+        if decisions.len() != 1 { return Ok(true); }
+        let (decision, strategy_status) = decisions.into_iter().next().expect("one decision checked");
+        let outcome_stream = format!("outcome:turn:{decision}");
+        let outcome_head = self.event_store.stream_revision(&outcome_stream)?;
+        if outcome_head == 0 { return Ok(false); }
+        if outcome_head != 1 {
+            return Ok(true);
+        }
+        let outcome_event = self.event_store.list_stream_after(&outcome_stream, 0, outcome_head, 1, 1024 * 1024)
+            .map_err(RuntimeServicesError::Invariant)?.into_iter().next()
+            .ok_or_else(|| RuntimeServicesError::Invariant("original execution outcome missing".into()))?;
+        let outcome: harness_contract::outcome::ExecutionOutcome = serde_json::from_value(outcome_event.payload.clone())
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        if outcome_event.kind != crate::execution_core::outcome_service::OUTCOME_EVENT_KIND
+            || outcome_event.actor.as_deref() != Some("runtime.outcome_service")
+            || outcome_event.status.as_deref() != Some(outcome.terminal.class_name())
+            || outcome.identity.execution_scope != harness_contract::outcome::OutcomeExecutionScope::Session
+            || outcome.identity.execution_id != format!("turn:{decision}")
+            || outcome.identity.execution_graph_ref.as_deref() != Some(graph.id.as_str())
+            || outcome.strategy.decision_id != decision || outcome.identity.session_id != receipt.session_id
+            || outcome.identity.turn_id != receipt.turn_id {
+            return Err(RuntimeServicesError::Invariant("original execution outcome identity mismatch".into()));
+        }
+        if strategy_status != outcome.terminal.class_name() {
+            // Both incompatible terminal facts are durable; neither can be
+            // made true by polling them repeatedly or overwriting the Goal.
+            return Ok(true);
+        }
+        let (completion, reason) = match outcome.terminal {
+            harness_contract::outcome::OutcomeTerminalClass::Cancelled(_) => (GoalCompletion::Cancelled, "original Session-authorized provider cancellation"),
+            harness_contract::outcome::OutcomeTerminalClass::Failed(_) => (GoalCompletion::Failed, "original execution outcome failed"),
+            harness_contract::outcome::OutcomeTerminalClass::Blocked(_) => (GoalCompletion::Blocked, "original execution outcome blocked"),
+            // A durable success/partial belongs to its original terminal
+            // owner. Do not fabricate cancellation or keep a retry alive for
+            // an already committed conflicting outcome.
+            _ => return Ok(true),
+        };
+        let goal_head = self.event_store.stream_revision(&goal_stream)?;
+        let cancellation_head = self.event_store.stream_revision(&cancellation_stream)?;
+        let effect_head = self.event_store.stream_revision(&effect_stream)?;
+        if cancellation_head != receipt.projection_revision || effect_head != 2 {
+            return Err(RuntimeServicesError::Invariant("cancelled Goal source heads changed".into()));
+        }
+        let fence = format!("session-cancellation:{}", receipt.cancellation_id);
+        let already_applied = || -> Result<bool, RuntimeServicesError> {
+            let existing = self.event_store.event_by_idempotency_key(&goal_stream, &fence)?;
+            Ok(existing.is_some_and(|event| event.kind == "goal.completed"
+                && event.actor.as_deref() == Some("runtime.session_cancellation")
+                && event.payload["goal"]["terminal"]["terminal_fence"] == fence
+                && event.payload["goal"]["completion"] == serde_json::to_value(completion).unwrap_or_default()))
+        };
+        let mut event = match self.goal_store.terminal_event(&goal_id, completion,
+            vec![format!("cancellation:{}", receipt.cancellation_id), effect_stream.clone(), outcome_stream.clone()],
+            reason.into(), fence.clone()) {
+                Ok(event) => event,
+                Err(_error) if already_applied()? => return Ok(true),
+                Err(error) => return Err(RuntimeServicesError::Invariant(error)),
+            };
+        if event.event.payload["goal"]["revision"].as_u64() != goal.revision.checked_add(1)
+            || event.event.payload["goal"]["execution_binding"] != serde_json::to_value(binding)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))? {
+            return Err(RuntimeServicesError::Invariant("cancelled Goal owner or revision changed".into()));
+        }
+        event.event.actor = Some("runtime.session_cancellation".into());
+        let applied = self.event_store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("goal-cancellation:{goal_id}:{}", receipt.cancellation_id),
+            expected_streams: vec![
+                crate::ExpectedStreamRevision { stream_id:goal_stream.clone(), expected_revision:goal_head },
+                crate::ExpectedStreamRevision { stream_id:graph.id.clone(), expected_revision:graph.revision },
+                crate::ExpectedStreamRevision { stream_id:cancellation_stream, expected_revision:cancellation_head },
+                crate::ExpectedStreamRevision { stream_id:effect_stream, expected_revision:effect_head },
+                crate::ExpectedStreamRevision { stream_id:strategy_stream, expected_revision:strategy_head },
+                crate::ExpectedStreamRevision { stream_id:outcome_stream, expected_revision:outcome_head },
+            ],
+            events:vec![event],
+        });
+        if let Err(error) = applied {
+            if already_applied()? { return Ok(true); }
+            return Err(error.into());
+        }
+        Ok(true)
+    }
+
+    // The existing settled-graph lane owns retry and its durable per-graph
+    // pending cursor. Either the Graph, the Session receipt, the Outcome or
+    // the Goal event can arrive last; each carries this same graph identity.
+    fn reconcile_provider_cancel_goal(&self, graph_id: &str) -> Result<(), String> {
+        let graph = match self.graph_state_store.load(graph_id) {
+            Ok(graph) => graph,
+            Err(ExecutionStateStoreError::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let Some((cancellation_id, _)) = self.authenticated_provider_graph_cancellation(&graph)
+            .map_err(|error| error.to_string())? else { return Ok(()) };
+        let Some(receipt) = self.cancellation_receipt(&cancellation_id).map_err(|error| error.to_string())? else {
+            return Err("original Session cancellation receipt pending".into());
+        };
+        match receipt.status {
+            harness_contract::turn::CancellationStatus::Requested => Err("original Session cancellation receipt pending".into()),
+            harness_contract::turn::CancellationStatus::AlreadyTerminal => Ok(()),
+            harness_contract::turn::CancellationStatus::Cancelled => {
+                if self.settle_authenticated_provider_cancel_goal(&receipt).map_err(|error| error.to_string())? {
+                    Ok(())
+                } else {
+                    Err("original execution Outcome pending".into())
+                }
+            }
+        }
+    }
+
     // Internal terminal-arbitration kernel. Cross-crate callers must present
     // Session authorization or restrict themselves to already-final replay.
     pub(crate) fn resolve_requested_cancellation(
@@ -4161,6 +4423,7 @@ impl RuntimeServices {
         if receipt.status != harness_contract::turn::CancellationStatus::Requested {
             if receipt.status == harness_contract::turn::CancellationStatus::Cancelled {
                 self.finalize_committed_cancellation(&receipt)?;
+                self.settle_authenticated_provider_cancel_goal(&receipt)?;
             }
             return Ok(Some(receipt));
         }
@@ -4222,6 +4485,7 @@ impl RuntimeServices {
         if finalize_cancellation {
             self.finalize_committed_cancellation(&receipt)?;
         }
+        self.settle_authenticated_provider_cancel_goal(&receipt)?;
         Ok(Some(receipt))
     }
 
@@ -6184,6 +6448,39 @@ fn agentic_settled_graph_resolution_interest() -> crate::RuntimeProjectionIntere
     ])
 }
 
+// Failed event-derived graphs must survive advancing the event cursor. A
+// rotating bounded retry window prevents a permanently failing key from
+// monopolising the pending directory. The directory is durable checkpoint
+// data, not an assertion that a graph has settled.
+fn settled_pending_window(
+    pending: &BTreeMap<String, String>,
+    after: &str,
+    limit: usize,
+) -> Vec<String> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    pending
+        .range::<str, _>((Excluded(after), Unbounded))
+        .chain(pending.range::<str, _>((Unbounded, std::ops::Bound::Included(after))))
+        .take(limit.max(1))
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn settled_record_graph_result(
+    pending: &mut BTreeMap<String, String>,
+    graph_id: &str,
+    errors: Vec<String>,
+) -> Option<String> {
+    if errors.is_empty() {
+        pending.remove(graph_id);
+        None
+    } else {
+        let error = errors.join("; ");
+        pending.insert(graph_id.to_owned(), error.clone());
+        Some(format!("graph {graph_id}: {error}"))
+    }
+}
+
 fn agentic_settled_graph_resolution_lane(
     event_store: Arc<RuntimeEventStore>,
     graph_store: ExecutionGraphStateStore,
@@ -6227,6 +6524,23 @@ fn agentic_settled_graph_resolution_lane(
                     .services()
                     .ok_or("Agent exit reconciliation lane has no bound RuntimeServices")?;
                 let mut touched_graphs = BTreeSet::new();
+                let mut pending_graphs: BTreeMap<String, String> = checkpoint
+                    .as_ref()
+                    .and_then(|c| c.payload.get("pending_graphs"))
+                    .map(|value| {
+                        serde_json::from_value(value.clone()).map_err(|error| error.to_string())
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let pending_after = checkpoint
+                    .as_ref()
+                    .and_then(|c| c.payload.get("pending_after"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let retry_graphs =
+                    settled_pending_window(&pending_graphs, pending_after, batch_size);
+                let next_pending_after = retry_graphs.last().cloned();
+                touched_graphs.extend(retry_graphs);
                 for batch in &page.batches {
                     for event in &batch.events {
                         if event.scope == RuntimeEventScope::ExecutionGraph {
@@ -6245,6 +6559,19 @@ fn agentic_settled_graph_resolution_lane(
                             .get("graph_id")
                             .and_then(serde_json::Value::as_str)
                         {
+                            touched_graphs.insert(graph_id.to_string());
+                        }
+                        // Terminal owners can commit in either order. Feed the
+                        // original linked Graph back into the existing durable,
+                        // rotating per-Graph pending lane for either arrival.
+                        let terminal_graph = match event.kind.as_str() {
+                            "session.cancellation_committed" => event.payload.get("execution_id"),
+                            "runtime.strategy.outcome" => event.payload.get("execution_graph_ref"),
+                            "runtime.outcome.recorded.v1" => event.payload.pointer("/identity/execution_graph_ref"),
+                            "goal.created" | "goal.completed" => event.payload.pointer("/goal/execution_binding/root_execution_id"),
+                            _ => None,
+                        };
+                        if let Some(graph_id) = terminal_graph.and_then(serde_json::Value::as_str) {
                             touched_graphs.insert(graph_id.to_string());
                         }
                     }
@@ -6283,30 +6610,37 @@ fn agentic_settled_graph_resolution_lane(
                 // linked Agent children so either event order closes the barrier.
                 let mut exit_errors = managed_errors;
                 for graph_id in &touched_graphs {
+                    let mut graph_errors = Vec::new();
+                    if let Err(error) = services.reconcile_provider_cancel_goal(graph_id) {
+                        graph_errors.push(error);
+                    }
                     if let Err(error) =
                         super::goal::reconcile_user_goal_applications(services.as_ref(), graph_id)
                             .await
                     {
-                        exit_errors.push(error);
+                        graph_errors.push(error);
                     }
-                    crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
-                    graph_id,
-                    &actions,
-                    &graph_store,
-                    supervisor.as_ref(),
-                )
-                .await?;
-                    for link in graph_store
-                        .child_links(graph_id)
-                        .map_err(|error| error.to_string())?
+                    if let Err(error) = crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
+                        graph_id, &actions, &graph_store, supervisor.as_ref(),
+                    ).await {
+                        graph_errors.push(error);
+                    }
+                    match graph_store.child_links(graph_id) {
+                        Ok(links) => {
+                            for link in links {
+                                if let Err(error) = crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
+                                &link.child_execution_id, &actions, &graph_store, supervisor.as_ref(),
+                            ).await {
+                                graph_errors.push(format!("child {}: {error}", link.child_execution_id));
+                            }
+                            }
+                        }
+                        Err(error) => graph_errors.push(error.to_string()),
+                    }
+                    if let Some(error) =
+                        settled_record_graph_result(&mut pending_graphs, graph_id, graph_errors)
                     {
-                        crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
-                        &link.child_execution_id,
-                        &actions,
-                        &graph_store,
-                        supervisor.as_ref(),
-                    )
-                    .await?;
+                        exit_errors.push(error);
                     }
                 }
                 let mut recovery_cursor: crate::agentic::execution::dispatch::AgenticRecoveryCursor =
@@ -6328,17 +6662,56 @@ fn agentic_settled_graph_resolution_lane(
                     .and_then(|checkpoint| checkpoint.payload.get("structured_after"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                let next_structured_after = services
-                    .recover_structured_task_page(structured_after, batch_size.max(1))
-                    .await?;
-                // Preserve every existing position; an event cursor is independent
-                // of the durable pending-work directory. On read failure do not
-                // consume events, but persist the address rotation for fairness.
-                let committed_cursor = if exit_errors.is_empty() {
-                    page.scanned_through_cursor
-                } else {
-                    source_cursor
+                let next_structured_after = match services
+                    .task_aggregate_service()
+                    .structured_recovery_candidates(
+                        structured_after,
+                        batch_size.max(1).saturating_add(1),
+                    ) {
+                    Ok(tasks) => {
+                        let backlog = tasks.len() > batch_size.max(1);
+                        let mut last = None;
+                        for task in tasks.into_iter().take(batch_size.max(1)) {
+                            last = Some(task.task_id.clone());
+                            if event_store.is_session_recovery_excluded(&task.origin_session_id) {
+                                continue;
+                            }
+                            let result = match services
+                                .register_structured_task(&task.task_id)
+                                .await
+                            {
+                                Ok(_) => services.reconcile_structured_task(&task.task_id).await,
+                                Err(error) => Err(format!(
+                                    "structured Task {} registration: {error}",
+                                    task.task_id
+                                )),
+                            };
+                            if let Err(error) = result {
+                                // The original structured candidate remains durable;
+                                // rotate this directory even when one item fails.
+                                exit_errors
+                                    .push(format!("structured Task {}: {error}", task.task_id));
+                            }
+                        }
+                        if backlog {
+                            last
+                        } else {
+                            None
+                        }
+                    }
+                    Err(error) => {
+                        exit_errors.push(error);
+                        if structured_after.is_empty() {
+                            None
+                        } else {
+                            Some(structured_after.to_owned())
+                        }
+                    }
                 };
+                // Event-derived failures and the cursor are committed in the
+                // same checkpoint. A failed checkpoint leaves the old cursor
+                // replayable, so no graph obligation is lost.
+                let committed_cursor = page.scanned_through_cursor;
                 let mut payload = checkpoint
                     .as_ref()
                     .map(|checkpoint| checkpoint.payload.clone())
@@ -6346,33 +6719,42 @@ fn agentic_settled_graph_resolution_lane(
                 let fields = payload
                     .as_object_mut()
                     .ok_or("invalid settled lane checkpoint payload")?;
-                if exit_errors.is_empty() {
-                    fields.insert("source_cursor".into(), serde_json::json!(committed_cursor));
-                    fields.insert(
-                        "resolved_graphs".into(),
-                        serde_json::json!(touched_graphs.len()),
-                    );
-                    fields.insert(
-                        "managed_after".into(),
-                        serde_json::json!(next_managed_after),
-                    );
-                    fields.insert(
-                        "structured_after".into(),
-                        serde_json::json!(next_structured_after),
-                    );
-                    fields.insert(
-                        "last_exit_retry_ms".into(),
-                        serde_json::json!(last_exit_retry_ms),
-                    );
-                }
+                fields.insert("source_cursor".into(), serde_json::json!(committed_cursor));
+                fields.insert(
+                    "resolved_graphs".into(),
+                    serde_json::json!(touched_graphs.len()),
+                );
+                fields.insert(
+                    "managed_after".into(),
+                    serde_json::json!(next_managed_after),
+                );
+                fields.insert(
+                    "structured_after".into(),
+                    serde_json::json!(next_structured_after),
+                );
+                fields.insert(
+                    "last_exit_retry_ms".into(),
+                    serde_json::json!(last_exit_retry_ms),
+                );
+                fields.insert(
+                    "pending_graphs".into(),
+                    serde_json::to_value(&pending_graphs).map_err(|error| error.to_string())?,
+                );
+                fields.insert(
+                    "pending_after".into(),
+                    serde_json::json!(next_pending_after),
+                );
                 fields.insert(
                     "agentic_recovery".into(),
                     serde_json::to_value(recovery_cursor).map_err(|error| error.to_string())?,
                 );
                 event_store
-                    .put_projection_checkpoint_retrying(
+                    .compare_and_put_projection_checkpoint(
                         AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID,
                         committed_cursor,
+                        checkpoint
+                            .as_ref()
+                            .map_or(0, |checkpoint| checkpoint.revision),
                         &payload,
                         now_ms(),
                     )
@@ -6383,8 +6765,10 @@ fn agentic_settled_graph_resolution_lane(
                 let mut pass =
                     crate::RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
                         .with_matches(page.matched_events);
-                pass.backlog |=
-                    managed_backlog || next_structured_after.is_some() || recovery_backlog;
+                pass.backlog |= managed_backlog
+                    || next_structured_after.is_some()
+                    || recovery_backlog
+                    || !pending_graphs.is_empty();
                 Ok(pass)
             })
         },
@@ -6394,6 +6778,125 @@ fn agentic_settled_graph_resolution_lane(
 #[cfg(test)]
 mod exact_exit_lane_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn k05_failed_graph_is_checkpointed_and_healthy_keys_rotate_then_retry() {
+        let services = RuntimeServices::in_memory().unwrap();
+        let store = services.event_store();
+        let projection = "test:k05:settled-pending";
+        let mut pending = BTreeMap::new();
+        assert!(
+            settled_record_graph_result(&mut pending, "a", vec!["original failure".into()])
+                .is_some()
+        );
+        assert!(settled_record_graph_result(&mut pending, "b", vec![]).is_none());
+        assert_eq!(
+            pending.get("a").map(String::as_str),
+            Some("original failure")
+        );
+        // The cursor and the failed identity are one durable checkpoint.
+        store
+            .put_projection_checkpoint_retrying(
+                projection,
+                42,
+                &serde_json::json!({"pending_graphs":pending}),
+                now_ms(),
+            )
+            .unwrap();
+        let checkpoint = store.projection_checkpoint(projection).unwrap().unwrap();
+        assert_eq!(checkpoint.source_cursor, 42);
+        let mut reopened: BTreeMap<String, String> =
+            serde_json::from_value(checkpoint.payload["pending_graphs"].clone()).unwrap();
+        reopened.insert("c".into(), "another failure".into());
+        assert_eq!(settled_pending_window(&reopened, "", 1), vec!["a"]);
+        assert_eq!(settled_pending_window(&reopened, "a", 1), vec!["c"]);
+        assert_eq!(settled_pending_window(&reopened, "c", 1), vec!["a"]);
+        assert!(
+            settled_record_graph_result(&mut reopened, "a", vec!["still failing".into()]).is_some()
+        );
+        assert_eq!(reopened["a"], "still failing");
+        assert!(settled_record_graph_result(&mut reopened, "a", vec![]).is_none());
+        assert!(!reopened.contains_key("a"));
+        assert!(reopened.contains_key("c"));
+    }
+
+    #[tokio::test]
+    async fn k05_original_lane_keeps_bad_graph_and_processes_healthy_graph() {
+        let services = RuntimeServices::in_memory().unwrap();
+        let stopped = services.event_reactor.shutdown().await;
+        assert!(stopped.timed_out_lanes.is_empty());
+        assert!(stopped.join_errors.is_empty());
+        let mut graph = harness_contract::execution_graph::ExecutionGraph::new("k05 healthy graph");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph
+            .nodes
+            .push(harness_contract::execution_graph::ExecutionNodeSpec::new(
+                harness_contract::execution_graph::ExecutionNodeKind::Verify,
+                "verify",
+                "k05",
+            ));
+        let graph = services
+            .execution_supervisor()
+            .register_graph(graph)
+            .await
+            .unwrap();
+        let store = services.event_store();
+        let id = AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID;
+        let before = store.projection_checkpoint(id).unwrap();
+        let cursor = before
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.source_cursor);
+        let mut payload = before
+            .as_ref()
+            .map(|checkpoint| checkpoint.payload.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        payload["pending_graphs"] = serde_json::json!({ "k05-missing-graph": "injected failure" });
+        payload["pending_graphs"][&graph.id] = serde_json::json!("retry healthy graph");
+        store
+            .compare_and_put_projection_checkpoint(
+                id,
+                cursor,
+                before.as_ref().map_or(0, |c| c.revision),
+                &payload,
+                now_ms(),
+            )
+            .unwrap();
+        let lane = agentic_settled_graph_resolution_lane(
+            Arc::clone(store),
+            services.graph_state_store().clone(),
+            Arc::clone(services.execution_supervisor()),
+            services.agent_action_service(),
+            Arc::clone(services.agent_runtime()),
+        )
+        .unwrap();
+        let reactor =
+            Arc::new(crate::RuntimeEventReactor::sealed(Arc::clone(store), [lane]).unwrap());
+        reactor.start().unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let checkpoint = store.projection_checkpoint(id).unwrap().unwrap();
+                let pending = &checkpoint.payload["pending_graphs"];
+                if pending.get("k05-missing-graph").is_some()
+                    && pending.get(&graph.id).is_none()
+                    && checkpoint.source_cursor > cursor
+                {
+                    break checkpoint;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let stopped = reactor.shutdown().await;
+        assert!(stopped.timed_out_lanes.is_empty());
+        assert!(stopped.join_errors.is_empty());
+        let checkpoint =
+            observed.expect("healthy graph did not progress while the bad graph was retained");
+        assert!(checkpoint.payload["pending_graphs"]["k05-missing-graph"]
+            .as_str()
+            .unwrap()
+            .contains("k05-missing-graph"));
+        assert!(services.shutdown_execution().await.errors.is_empty());
+    }
 
     #[test]
     fn exact_exit_lane_declares_both_orders_and_excludes_command_ack() {

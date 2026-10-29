@@ -756,6 +756,7 @@ mod r1_rejected_batch_regressions {
             services.tool_batch_executor(),
             services.commit_service(),
             &BTreeMap::new(),
+            &HashMap::new(),
         )
         .await;
         let executed_ids = executed.lock().unwrap().clone();
@@ -834,6 +835,7 @@ mod r1_rejected_batch_regressions {
                     &calls,
                     governed.messages.clone(),
                     &hostile,
+                    &BTreeMap::new(),
                 )
                 .await
                 .expect_err("explicit hostile clone must fail the original consumer");
@@ -877,6 +879,7 @@ mod r1_rejected_batch_regressions {
             &calls,
             governed.messages,
             &governed.invocations,
+            &BTreeMap::new(),
         )
         .await
         .expect("unaltered real batch must cross original compactor");
@@ -1583,6 +1586,7 @@ async fn governed_runtime_tool_batch_fans_out_many_independent_reads_and_keeps_o
         services.tool_batch_executor(),
         services.commit_service(),
         &BTreeMap::new(),
+        &HashMap::new(),
     )
     .await;
     let invocations = governed.invocations.clone();
@@ -3125,6 +3129,14 @@ async fn authenticated_host_application_window(window: HostInputFaultWindow) {
             .expect("bounded original cancel")
             .unwrap()
             .unwrap();
+        let effect = services.commit_service().inspect_execution_effect(&ticket).unwrap();
+        if cancel_before_commit {
+            assert!(matches!(effect, crate::execution_core::graph::ExecutionEffectState::Uncertain),
+                "an original Host error remains unknown and must not fabricate a cancellation receipt");
+        } else {
+            assert!(matches!(effect, crate::execution_core::graph::ExecutionEffectState::Completed(_)),
+                "an already completed Host effect must retain its original durable receipt");
+        }
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let current = store

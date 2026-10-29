@@ -2901,3 +2901,179 @@ fn bound_step_refusal_carries_the_existing_pinned_schema_example() {
         "the refused original input is not rewritten or broadcast"
     );
 }
+
+#[tokio::test]
+async fn k02_orchestration_partial_receipt_recovers_same_session_bounded_pages() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = Arc::new(crate::pg_test_support::session_store());
+    let session_id = "k02-recovery-owner";
+    for id in [session_id, "k02-recovery-foreign"] {
+        store.create_session(&session::SessionRecord {
+            session_id: id.into(), platform: "test".into(), chat_id: id.into(), user_id: None,
+            model: None, created_at: "2026-10-29T00:00:00Z".into(), last_activity: "2026-10-29T00:00:00Z".into(),
+            message_count: 0, reset_policy: "manual".into(), metadata_json: None,
+            input_tokens: 0, output_tokens: 0, status: "active".into(),
+        }).await.unwrap();
+    }
+    let repository = Arc::new(crate::services::session_service::repository::SessionRepository::new(
+        Arc::new(crate::active_session::ActiveSessionDirectory::new()), Some(Arc::clone(&store)),
+        crate::event_bus::SessionProjectionHub::new()));
+    let presence = Arc::new(crate::services::session_service::presence::SessionPresenceLedger::with_store(Arc::clone(&store)));
+    let port = crate::session_runtime_data_port::GatewaySessionRuntimePort::new_for_test(repository, presence);
+    let services = runtime::RuntimeServices::builder(temporary.path().join("home"), &workspace)
+        .runtime_event_store(Arc::new(runtime::RuntimeEventStore::for_test()))
+        .task_aggregate_service(Arc::new(runtime::TaskAggregateService::for_test()))
+        .artifact_store(Arc::new(runtime::ArtifactStore::for_test_default(temporary.path().join("artifacts"))))
+        .build().unwrap();
+    services.install_session_ports(port.clone(), port.clone(), port.clone(), port).unwrap();
+    let synthetic_raw = serde_json::json!({"calls":[{"stepId":"batch","op":"batch","status":"ok","calls":2}],"result":{
+        "cargo":{"ok":true,"status":"success","output":{"truncated":false,"file":{"filePath":"Cargo.toml","content":"[workspace]\\nmembers = []\\n","startLine":1,"numLines":2,"totalLines":2}}},
+        "runtime":{"ok":true,"status":"success","output":{"truncated":true,"scanComplete":false,"numLines":100,"next_request":{"cursor":"next-search-page"},"content":"x".repeat(20000)}}}}).to_string();
+    let fixture_path = std::env::var_os("K02_BATCH_RAW_FIXTURE");
+    let raw = fixture_path.as_ref().map_or_else(|| synthetic_raw.clone(), |path| std::fs::read_to_string(path).expect("original private raw"));
+    let real_original = fixture_path.is_some();
+    if real_original { assert_eq!(format!("{:x}", Sha256::digest(raw.as_bytes())), "19b54274f071f26f941633685c8d8e5597abda57254e95722e49842add78c91a"); }
+    let evidence_id = "tool-raw-k02-recovery";
+    let artifact = services.artifact_store().write_bytes(harness_contract::context::ArtifactWriteDescriptor {
+        media_type: "text/plain".into(), visibility_scope: format!("session:{session_id}"),
+        expected_bytes: Some(raw.len() as u64), original_name: Some("raw".into()),
+    }, raw.as_bytes()).await.unwrap();
+    store.append_session_domain_event_allocating_sequence(&session::SessionDomainEvent::new(
+        session_id, 0, session::SessionDomainScope::Tool, runtime::RuntimeSessionEventKind::EvidenceRawPersisted.as_str(),
+        serde_json::json!({"evidence_id":evidence_id,"content_hash":artifact.sha256,"byte_count":artifact.bytes,
+            "media_type":artifact.media_type,"artifact_selector":artifact.selector,"visibility_scope":artifact.visibility_scope}), 1)).await.unwrap();
+    let fixture_input = if real_original {
+        let path = std::env::var_os("K02_BATCH_SCENARIO_FIXTURE").expect("private scenario path");
+        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        report["failure_diagnostics"]["timeline"]["events"].as_array().unwrap().iter()
+            .find(|event| event["kind"] == "model.item_completed" && event["payload"]["tool_call_id"] == "chatcmpl-tool-90aac7f46052e856")
+            .unwrap()["payload"]["content"].as_str().unwrap().to_owned()
+    } else {
+        serde_json::json!({"steps":[{"id":"batch","op":"batch","calls":[{"as":"cargo","tool":"read_file","input":{"path":"Cargo.toml"}},{"as":"runtime","tool":"grep_search","input":{"path":"src"}}]}],"return":"$batch"}).to_string()
+    };
+    let runtime_key = if real_original { "runtime_mods" } else { "runtime" };
+    let receipt = runtime::context_evidence::k02_fixture_orchestration_receipt(&raw, evidence_id, 4000, true, Some(&fixture_input));
+    assert!(receipt.truncated && receipt.omitted_tokens > 0 && receipt.receipt_tokens <= 4000);
+    let summary: serde_json::Value = serde_json::from_str(&receipt.summary[receipt.summary.find('{').unwrap()..]).unwrap();
+    assert_eq!(summary["complete"], false);
+    assert_eq!(summary["result"][runtime_key]["source_tool"], "grep_search");
+    assert_eq!(summary["result"][runtime_key]["output"]["scanComplete"], false);
+    assert!(summary["result"][runtime_key]["output"]["next_request"]["cursor"].is_string());
+    // The production OpenAI-compatible wire compiler retains the exact
+    // bounded receipt under the same tool call identity.
+    let provider_request = provider::MessageRequest {
+        model: "fixture-model".into(), max_tokens: 32,
+        messages: vec![provider::InputMessage { role: "assistant".into(), content: vec![provider::InputContentBlock::ToolUse { id: "fixture-call".into(), name: "tool_orchestrate".into(), input: serde_json::json!({"steps":[]}) }] },
+            provider::InputMessage::user_tool_result("fixture-call", receipt.summary.clone(), false)],
+        ..Default::default()
+    };
+    let wire = provider::OpenAiCompatClient::new("fixture-key", provider::OpenAiCompatConfig::openai()).wire_request(&provider_request).unwrap();
+    let delivered = wire.body["messages"].as_array().unwrap().iter().find(|m| m["tool_call_id"] == "fixture-call").unwrap();
+    assert!(delivered["content"].as_str() == Some(receipt.summary.as_str()), "provider wire did not preserve the bounded receipt");
+    let request = summary["recovery"]["when_available_and_authorized"]["input"].clone();
+    assert_eq!(request["reference"], format!("tool://{evidence_id}"));
+    let registry = GatewayToolRegistry::builtin().with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions()).unwrap();
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    executor.bind_runtime_services(&services).unwrap();
+    let binding = RuntimeToolExecutionBinding { tool_lease: None, action_id: None, session_id: Some(session_id), authorized_scopes: &[], memory_context: None, reality_context: None, model_lease: Some("test"), parent_execution: None, execution_decision: None, permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly };
+    let foreign = RuntimeToolExecutionBinding { session_id: Some("k02-recovery-foreign"), ..binding.clone() };
+    let foreign_out = executor.execute_runtime_tool_with_binding("read_ref", request.clone(), foreign).await;
+    assert!(foreign_out.is_err() || serde_json::from_str::<serde_json::Value>(&foreign_out.unwrap()).unwrap()["available"] != true);
+    let invalid = executor.execute_runtime_tool_with_binding("read_ref", serde_json::json!({"reference":format!("tool://{evidence_id}"),"cursor":"not-a-valid-cursor"}), binding.clone()).await;
+    assert!(invalid.is_err() || serde_json::from_str::<serde_json::Value>(&invalid.unwrap()).unwrap()["available"] != true);
+    let mut request = request; request["limit"] = serde_json::json!(16); let mut restored = Vec::new(); let mut pages = 0;
+    loop {
+        let page: serde_json::Value = serde_json::from_str(&executor.execute_runtime_tool_with_binding("read_ref", request.clone(), binding.clone()).await.unwrap()).unwrap();
+        assert_eq!(page["available"], true);
+        assert_eq!(page["sha256"], artifact.sha256);
+        for chunk in page["chunks"].as_array().unwrap() {
+            let content = chunk["content"].as_str().unwrap();
+            if chunk["encoding"] == "base64" {
+                restored.extend(base64::engine::general_purpose::STANDARD.decode(content).unwrap());
+            } else {
+                assert_eq!(chunk["encoding"], "utf8");
+                restored.extend_from_slice(content.as_bytes());
+            }
+        }
+        pages += 1; assert!(pages < 128);
+        if pages == 1 {
+            assert_eq!(page["coverage"]["complete"], false);
+            assert!(restored.len() < raw.len(), "a one-page budget cannot claim complete evidence");
+            assert!(!page["next_request"].is_null());
+        }
+        if page["next_request"].is_null() { break; }
+        let cursor = page["next_request"]["cursor"].as_str().unwrap();
+        request = serde_json::json!({"reference":format!("tool://{evidence_id}"),"cursor":cursor,"limit":16});
+    }
+    assert!(pages > 1);
+    assert!(restored == raw.as_bytes(), "restored content mismatch: recovered_bytes={} expected_bytes={} recovered_sha256={:x} expected_sha256={:x}", restored.len(), raw.len(), Sha256::digest(&restored), Sha256::digest(raw.as_bytes()));
+    assert_eq!(format!("sha256:{:x}", Sha256::digest(&restored)), artifact.sha256);
+    let wrong_input = serde_json::json!({"steps":[{"id":"batch","op":"batch","calls":[{"as":"different","tool":"read_file","input":{}}]}],"return":"$batch"}).to_string();
+    let wrong=runtime::context_evidence::k02_fixture_orchestration_receipt(&raw,evidence_id,4000,true,Some(&wrong_input));
+    let wrong_summary: serde_json::Value = serde_json::from_str(&wrong.summary[wrong.summary.find('{').unwrap()..]).unwrap();
+    assert!(wrong_summary["result"][runtime_key].get("source_tool").is_none());
+    let tiny=runtime::context_evidence::k02_fixture_orchestration_receipt(&raw,evidence_id,40,true,None);
+    assert!(tiny.truncated && tiny.summary.contains("read_ref("));
+    let transient=runtime::context_evidence::k02_fixture_orchestration_receipt(&raw,evidence_id,40,false,None);
+    assert!(transient.truncated && !transient.summary.contains("read_ref("));
+    // A consumer must not treat a partially scanned search as a complete fact.
+    let recovered: serde_json::Value = serde_json::from_slice(&restored).unwrap();
+    assert_eq!(recovered["result"][runtime_key]["output"]["scanComplete"], false);
+}
+
+#[test]
+fn k02_default_batch_original_preview_survives_provider_wire() {
+    use sha2::{Digest, Sha256};
+    let raw_path = std::env::var_os("K02_DEFAULT_BATCH_RAW_FIXTURE").expect("private original raw fixture");
+    let input_path = std::env::var_os("K02_DEFAULT_BATCH_INPUT_FIXTURE").expect("private original input fixture");
+    let raw = std::fs::read_to_string(raw_path).unwrap();
+    let input = std::fs::read_to_string(input_path).unwrap();
+    assert_eq!(format!("{:x}", Sha256::digest(raw.as_bytes())), "9b269e0d11d4c35b80c17ad0199aa4190e0a4f6317463abdb2791d98edc085ce");
+    let original: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let receipt = runtime::context_evidence::k02_fixture_orchestration_receipt(&raw, "tool-raw-k02-default", 12000, true, Some(&input));
+    assert!(receipt.truncated && receipt.omitted_tokens > 0 && receipt.receipt_tokens <= 12000);
+    let body: serde_json::Value = serde_json::from_str(&receipt.summary[receipt.summary.find('{').unwrap()..]).unwrap();
+    assert_eq!(body["kind"], "orchestration_partial_receipt");
+    assert_eq!(body["complete"], false);
+    assert_eq!(body["result"].as_object().unwrap().len(), 6);
+    for i in 0..6 {
+        let key = format!("read_file[{i}]");
+        let child = &body["result"][&key];
+        let file = &child["output"]["file"];
+        let source = &original["result"]["read_all"][&key]["file"];
+        assert_eq!(child["source_tool"], "read_file");
+        let shown = file["content"].as_str().expect("actual sample has bounded content or preview");
+        let original_text = source["content"].as_str().unwrap();
+        assert!(original_text.starts_with(shown), "child {i} must be an original content prefix");
+        if file["preview"] == true {
+            assert!(shown.len() <= 4096);
+            assert_eq!(original_text.as_bytes().get(shown.len()), Some(&b'\n'));
+            assert_eq!(file["numLines"].as_u64(), Some(shown.split('\n').count() as u64));
+            assert_eq!(file["sourceNumLines"], source["numLines"]);
+            assert_eq!(file["source_omitted"], true);
+            assert_eq!(file["content_omitted"], true);
+            assert_eq!(child["output"]["truncated"], true);
+        } else {
+            assert!(shown == original_text, "child {i} must be complete if not marked preview");
+        }
+        assert_eq!(file["sha256"], source["sha256"]);
+        assert_eq!(file["byteLength"], source["byteLength"]);
+    }
+    let provider_request = provider::MessageRequest {
+        model: "fixture-model".into(), max_tokens: 32,
+        messages: vec![provider::InputMessage { role: "assistant".into(), content: vec![provider::InputContentBlock::ToolUse { id: "fixture-default-call".into(), name: "tool_orchestrate".into(), input: serde_json::json!({"steps":[]}) }] },
+            provider::InputMessage::user_tool_result("fixture-default-call", receipt.summary.clone(), false)],
+        ..Default::default()
+    };
+    let wire = provider::OpenAiCompatClient::new("fixture-key", provider::OpenAiCompatConfig::openai()).wire_request(&provider_request).unwrap();
+    let delivered = wire.body["messages"].as_array().unwrap().iter().find(|m| m["tool_call_id"] == "fixture-default-call").unwrap();
+    assert!(delivered["content"].as_str() == Some(receipt.summary.as_str()), "provider wire must preserve the exact partial receipt");
+    let wrong = input.replace("read_file", "grep_search");
+    let rejected = runtime::context_evidence::k02_fixture_orchestration_receipt(&raw, "tool-raw-k02-default", 12000, true, Some(&wrong));
+    assert!(rejected.truncated && rejected.summary.contains("Partial orchestration output omitted"));
+    assert!(!rejected.summary.contains("orchestration_partial_receipt"));
+}

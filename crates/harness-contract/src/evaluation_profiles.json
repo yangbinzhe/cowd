@@ -45,6 +45,7 @@
         "live_minimal_batch_read"
       ],
       "observer_resource_grants": [
+        "read:Cargo.toml",
         "read:crates/tools/src/lib.rs",
         "read:crates/runtime/src/lib.rs",
         "read:crates/memory/src/lib.rs",

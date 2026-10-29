@@ -33,7 +33,7 @@ mod local_network;
 #[path = "tool_receipt_query.rs"]
 mod tool_receipt_query;
 pub(crate) use commit_pipeline::execution_lineage_stream_id;
-pub(crate) use commit_pipeline::receipt_replay_contract;
+pub(crate) use commit_pipeline::{receipt_lifecycle_anchor, receipt_replay_contract};
 use commit_pipeline::*;
 pub(crate) use tool_receipt_query::ToolReceiptQuery;
 
@@ -222,6 +222,39 @@ impl PreEffectRefusal {
             && self.effect_key == binding.effect_idempotency_key())
         .then_some(self.reason.as_str())
     }
+}
+
+// A cancellation command may carry the actual original executor result in
+// the same Graph transaction. Recognize only its exact command transaction,
+// node, attempt and status; the caller additionally validates the original
+// start, activity, Graph CAS, node transition, transcript and effect receipt.
+pub(super) fn host_transcript_cancel_command_result<'a>(
+    event: &'a ExecutionGraphEvent,
+    ticket: &super::registry::NodeExecutionTicket,
+    transaction_id: &str,
+) -> Option<&'a ExecutionNodeResult> {
+    let matches_transaction = |command: &str, revision: u64| {
+        matches!(command, "cancel" | "cancel_node")
+            && transaction_id == format!("{}:command:{command}:{revision}", ticket.graph_id)
+    };
+    let result = match event {
+        ExecutionGraphEvent::CommandApplied { command, delta, .. }
+            if matches_transaction(command, delta.revision)
+                && delta.recovery_cursor.node_attempts.get(&ticket.node_id) == Some(&ticket.attempt) => {
+            let result = delta.node_result_updates.get(&ticket.node_id)?;
+            (delta.node_status_updates.get(&ticket.node_id) == Some(&result.status)).then_some(result)?
+        }
+        ExecutionGraphEvent::Checkpoint { graph, cause, .. }
+            if cause == "execution_graph.command_applied"
+                && graph.id == ticket.graph_id
+                && (matches_transaction("cancel", graph.revision) || matches_transaction("cancel_node", graph.revision))
+                && graph.recovery_cursor.node_attempts.get(&ticket.node_id) == Some(&ticket.attempt) => {
+            let result = graph.node_results.get(&ticket.node_id)?;
+            (graph.node_statuses.get(&ticket.node_id) == Some(&result.status)).then_some(result)?
+        }
+        _ => return None,
+    };
+    matches!(result.status, ExecutionNodeStatus::Cancelled | ExecutionNodeStatus::Completed).then_some(result)
 }
 
 fn validate_node_ticket_start(
@@ -2970,6 +3003,9 @@ pub(crate) struct ToolReceiptReplay {
     pub invocation: harness_contract::tool::GovernedToolInvocation,
     pub outcome: crate::RuntimeToolExecutionOutcome,
     pub completed_at_ms: u64,
+    /// Original durable tool lifecycle, only when its receipt anchor and
+    /// producer-bound event were both authenticated. Older receipts may omit it.
+    pub lifecycle: Option<crate::DurableRuntimeEvent>,
 }
 
 /// Canonical ToolHost receipt indexed by the immutable delegated Agent
@@ -3388,7 +3424,7 @@ impl ExecutionCommitService {
             crate::RuntimeToolExecutionOutcome,
         )],
     ) -> Result<(), ExecutionCommitError> {
-        self.commit_readonly_tool_receipts_scoped(receipts, None, None, false)
+        self.commit_readonly_tool_receipts_scoped(receipts, None, None, false, None)
     }
 
     pub(crate) fn commit_bound_readonly_tool_receipt(
@@ -3398,12 +3434,25 @@ impl ExecutionCommitService {
         effect: &ToolEffectDescriptor,
         scope: &harness_contract::goal::ProofEffectScope,
     ) -> Result<(), ExecutionCommitError> {
+        let children = request.tool_progress.child_reads().map_err(ExecutionCommitError::InvalidCommand)?;
+        self.commit_bound_readonly_tool_receipt_with_children(request, outcome, effect, scope, children.as_deref())
+    }
+
+    fn commit_bound_readonly_tool_receipt_with_children(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+        effect: &ToolEffectDescriptor,
+        scope: &harness_contract::goal::ProofEffectScope,
+        children: Option<&[tools::OrchestratedRead]>,
+    ) -> Result<(), ExecutionCommitError> {
         Self::validate_bound_effect_scope(effect, scope)?;
         self.commit_readonly_tool_receipts_scoped(
             &[(request.clone(), outcome.clone())],
             Some(scope),
             None,
             false,
+            children,
         )
     }
 
@@ -3424,6 +3473,7 @@ impl ExecutionCommitService {
             Some(scope),
             None,
             true,
+            None,
         )
     }
 
@@ -3436,6 +3486,7 @@ impl ExecutionCommitService {
         scope: Option<&harness_contract::goal::ProofEffectScope>,
         root_intent: Option<&crate::DurableRuntimeEvent>,
         host_process: bool,
+        children: Option<&[tools::OrchestratedRead]>,
     ) -> Result<(), ExecutionCommitError> {
         self.commit_readonly_tool_receipts_with_closure(
             receipts,
@@ -3443,6 +3494,7 @@ impl ExecutionCommitService {
             root_intent,
             host_process,
             None,
+            children,
         )
     }
 
@@ -3460,6 +3512,7 @@ impl ExecutionCommitService {
         root_intent: Option<&crate::DurableRuntimeEvent>,
         host_process: bool,
         closure: Option<&serde_json::Value>,
+        children: Option<&[tools::OrchestratedRead]>,
     ) -> Result<(), ExecutionCommitError> {
         for (_, outcome) in receipts {
             Self::reject_public_process_facts(outcome, host_process)?;
@@ -3478,7 +3531,7 @@ impl ExecutionCommitService {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.commit_readonly_tool_receipts_once(receipts, scope, root_intent, closure) {
+            match self.commit_readonly_tool_receipts_once(receipts, scope, root_intent, closure, children) {
                 Ok(()) => return Ok(()),
                 Err(ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision {
                     ..
@@ -3497,6 +3550,7 @@ impl ExecutionCommitService {
         scope: Option<&harness_contract::goal::ProofEffectScope>,
         root_intent: Option<&crate::DurableRuntimeEvent>,
         closure: Option<&serde_json::Value>,
+        children: Option<&[tools::OrchestratedRead]>,
     ) -> Result<(), ExecutionCommitError> {
         if receipts.is_empty() {
             return Ok(());
@@ -3610,6 +3664,11 @@ impl ExecutionCommitService {
                 })
             })
             .flatten();
+            let child_acquisitions = children.and_then(|children| {
+                if receipts.len() != 1 || outcome.status != crate::RuntimeToolExecutionStatus::Executed
+                    || outcome.error.is_some() { return None; }
+                crate::context_evidence::child_read_acquisitions(request, scope?, children)
+            });
             let mut read_payload = local_network::receipt_payload(
                 &self.event_store,
                 request,
@@ -3630,8 +3689,14 @@ impl ExecutionCommitService {
                     "process_closure": closure.cloned(),
                 }),
             )?;
-            if acquisition.is_some() {
+            if let Some(anchor) = receipt_lifecycle_anchor(request)? {
+                read_payload["lifecycle_anchor"] = anchor;
+            }
+            if acquisition.is_some() || child_acquisitions.is_some() {
                 read_payload["original_input"] = json!(request.input);
+            }
+            if let Some(child_acquisitions) = &child_acquisitions {
+                read_payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] = json!(child_acquisitions);
             }
             events.push(RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
@@ -3686,6 +3751,9 @@ impl ExecutionCommitService {
                 agent_receipt.event.payload["resolved_effect_scope"] = serde_json::to_value(scope)?;
                 agent_receipt.event.payload[crate::context_evidence::READ_ACQUISITION_FIELD] =
                     serde_json::to_value(&acquisition)?;
+                if let Some(child_acquisitions) = &child_acquisitions {
+                    agent_receipt.event.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] = json!(child_acquisitions);
+                }
                 self.allocate_receipt_sequence(&mut agent_receipt, &mut expected_streams, &events)?;
                 events.push(agent_receipt);
             }
@@ -3717,7 +3785,7 @@ impl ExecutionCommitService {
                     )
                     .is_ok_and(|receipt| receipt.is_some())
             }) {
-                return self.commit_readonly_tool_receipts_once(receipts, scope, root_intent, None);
+                return self.commit_readonly_tool_receipts_once(receipts, scope, root_intent, None, children);
             }
             return Err(error.into());
         }
@@ -4599,6 +4667,7 @@ impl ExecutionCommitService {
             root_intent,
             true,
             Some(&closure),
+            None,
         )
     }
 
@@ -5506,6 +5575,19 @@ impl ExecutionCommitService {
         root: &crate::CowdExecutionContext,
         scope: &harness_contract::goal::ProofEffectScope,
     ) -> Result<(), ExecutionCommitError> {
+        let children = request.tool_progress.child_reads().map_err(ExecutionCommitError::InvalidCommand)?;
+        self.commit_root_read_acquisition_with_children(request, outcome, effect, root, scope, children.as_deref())
+    }
+
+    fn commit_root_read_acquisition_with_children(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+        effect: &ToolEffectDescriptor,
+        root: &crate::CowdExecutionContext,
+        scope: &harness_contract::goal::ProofEffectScope,
+        children: Option<&[tools::OrchestratedRead]>,
+    ) -> Result<(), ExecutionCommitError> {
         Self::validate_bound_effect_scope(effect, scope)?;
         if let Some(original) = self.completed_tool_effect(request, effect)? {
             if serde_json::to_value(original)?
@@ -5534,6 +5616,7 @@ impl ExecutionCommitService {
             Some(scope),
             Some(&intent),
             false,
+            children,
         )
     }
 
@@ -6119,6 +6202,9 @@ impl ExecutionCommitService {
             idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
             schema_version: 1,
         }];
+        if let Some(anchor) = receipt_lifecycle_anchor(request)? {
+            events[0].event.payload["lifecycle_anchor"] = anchor;
+        }
         if let ProcessTerminalAuthority::BoundedProcess(closure)
         | ProcessTerminalAuthority::HostProcess(closure) = authority
         {
@@ -6210,6 +6296,9 @@ impl ExecutionCommitService {
         if let Some(intent) = intent.as_ref() {
             let original = serde_json::from_value(intent.payload.clone())?;
             self.validate_execution_effect_start(&original, Some(intent))?;
+            if let Some(outcome) = outcome.as_ref() {
+                self.validate_cold_provider_cancellation(ticket, &outcome.result)?;
+            }
             Ok(outcome.map_or(
                 ExecutionEffectState::Uncertain,
                 ExecutionEffectState::Completed,
@@ -6217,6 +6306,125 @@ impl ExecutionCommitService {
         } else {
             Ok(ExecutionEffectState::Fresh)
         }
+    }
+
+    // The Host's special cancelled result names a Session journal receipt. A
+    // cold effect replay must recover the original Session facts, not accept
+    // the result_ref or a Graph/Host transcript as proof of physical exit.
+    pub(crate) fn validate_cold_provider_cancellation(
+        &self,
+        ticket: &super::registry::NodeExecutionTicket,
+        result: &ExecutionNodeResult,
+    ) -> Result<Option<String>, ExecutionCommitError> {
+        use crate::provider_runtime_client::ProviderPhysicalObservation;
+        let named_physical_receipt = result.result_ref.as_deref().is_some_and(|reference|
+            reference.starts_with("session:") && reference.contains(":physical:"));
+        if result.status != ExecutionNodeStatus::Cancelled
+            || (!named_physical_receipt && result.summary.as_deref() != Some("original local provider response observed authorized cancellation")) {
+            return Ok(None);
+        }
+        let invalid = |reason: &str| ExecutionCommitError::InvalidCommand(format!("cold provider cancellation: {reason}"));
+        let reference = result.result_ref.as_deref().ok_or_else(|| invalid("Session receipt reference missing"))?;
+        let (session_id, tail) = reference.strip_prefix("session:")
+            .and_then(|s| s.split_once(":physical:"))
+            .ok_or_else(|| invalid("Session receipt reference invalid"))?;
+        let (sequence, digest) = tail.split_once(':').ok_or_else(|| invalid("Session receipt sequence missing"))?;
+        let sequence: usize = sequence.parse().map_err(|_| invalid("Session receipt sequence invalid"))?;
+        if session_id.is_empty() || !digest.starts_with("sha256:") {
+            return Err(invalid("Session receipt identity invalid"));
+        }
+        let history = self.proof_session_queries.as_ref().and_then(|queries| queries.get())
+            .and_then(|query| query.history_reader())
+            .ok_or_else(|| invalid("original Session history reader unavailable"))?;
+        let physical = |at: usize| -> Result<session::SessionDomainEvent, ExecutionCommitError> {
+            let events = history.domain_events_by_kind_blocking(session_id, "context.provider_physical_observation", at, 1)
+                .map_err(|error| invalid(&error.to_string()))?;
+            let event = events.into_iter().next().ok_or_else(|| invalid("original Session physical event missing"))?;
+            if event.session_id != session_id || event.sequence != at {
+                return Err(invalid("original Session physical position mismatch"));
+            }
+            Ok(event)
+        };
+        let event = physical(sequence)?;
+        let observation: ProviderPhysicalObservation = serde_json::from_value(event.payload.clone())
+            .map_err(|_| invalid("original Session physical payload invalid"))?;
+        let ProviderPhysicalObservation::CancellationObserved { identity, opened, requested, .. } = &observation else {
+            return Err(invalid("original Session physical event is not cancellation"));
+        };
+        if event.status.as_deref() != Some("cancel_observed")
+            || observation.digest().map_err(|error| invalid(&error.to_string()))? != digest
+            || event.event_id != format!("provider-physical:{digest}")
+            || opened.session_sequence >= sequence || opened.identity != *identity {
+            return Err(invalid("original Session cancellation receipt mismatch"));
+        }
+        let open_event = physical(opened.session_sequence)?;
+        let opened_observation: ProviderPhysicalObservation = serde_json::from_value(open_event.payload)
+            .map_err(|_| invalid("original Session open payload invalid"))?;
+        if open_event.status.as_deref() != Some("opened")
+            || opened_observation != (ProviderPhysicalObservation::ResponseOpened { identity: identity.clone() })
+            || opened_observation.digest().map_err(|error| invalid(&error.to_string()))? != opened.observation_digest {
+            return Err(invalid("original Session open receipt mismatch"));
+        }
+        let start = validate_node_ticket_start(&self.event_store, ticket, None)?;
+        let activity = node_activity_binding(&start, &ticket.node_id)?;
+        let owner = identity.graph_owner.as_deref().ok_or_else(|| invalid("original Graph owner missing"))?;
+        if owner.activity != activity || owner.attempt != ticket.attempt || identity.execution_id != ticket.graph_id
+            || identity.session_id != session_id || identity.session_id != activity.session_id
+            || identity.turn_id != activity.turn_id {
+            return Err(invalid("original Graph attempt/activity mismatch"));
+        }
+        let authorizations = history.domain_events_by_kind_blocking(session_id, session::SESSION_CANCELLATION_AUTHORIZATION_KIND, 0, 4096)
+            .map_err(|error| invalid(&error.to_string()))?;
+        if authorizations.len() == 4096 && authorizations.last().is_some_and(|last| last.sequence < sequence) {
+            return Err(invalid("Session authorization evidence budget exhausted"));
+        }
+        let mut matches = authorizations.into_iter().filter_map(|event| {
+            let payload: session::SessionCancellationAuthorizationPayload = serde_json::from_value(event.payload.clone()).ok()?;
+            (event.sequence < sequence && payload.cancellation_id == requested.cancellation_id).then_some((event, payload))
+        });
+        let (authorization, payload) = matches.next().ok_or_else(|| invalid("original Session authorization missing"))?;
+        if matches.next().is_some() { return Err(invalid("ambiguous Session authorization")); }
+        let (requested_event, receipt) = crate::execution_core::services::read_original_requested_event(&self.event_store, &payload.receipt)
+            .map_err(|error| invalid(&error.to_string()))?;
+        let event_digest = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&requested_event)?));
+        let binding = &payload.claim_binding;
+        let unsigned = json!({"schema_version":1,"cancellation_id":payload.cancellation_id,
+            "receipt":payload.receipt,"claim_binding":payload.claim_binding,"requested_ref":payload.requested_ref});
+        let expected_digest = harness_contract::step::canonical_digest("session-cancel-authorization-payload:v1",
+            &json!({"kind":session::SESSION_CANCELLATION_AUTHORIZATION_KIND,"session_id":session_id,
+                "turn_id":identity.turn_id,"payload":unsigned})).map_err(|error| invalid(&error.to_string()))?;
+        let expected_key = harness_contract::step::canonical_digest("session-cancel-authorization-key:v1",
+            &json!({"session_id":session_id,"request_id":binding.request_id,"input_sequence":binding.input_sequence,
+                "session_generation":binding.session_generation,"claim_owner":binding.claim_owner,
+                "claim_fence_epoch":binding.claim_fence_epoch,"claim_token_digest":binding.claim_token_digest,
+                "cancellation_id":payload.cancellation_id})).map_err(|error| invalid(&error.to_string()))?;
+        if payload.schema_version != 1 || authorization.session_id != session_id
+            || authorization.scope != session::SessionDomainScope::Turn || authorization.status.as_deref() != Some("authorized")
+            || authorization.event_id != format!("session-cancel-authorization:v1:{expected_key}")
+            || authorization.created_at_ms != receipt.requested_at_ms || payload.authorization_digest != expected_digest
+            || binding.session_generation != activity.generation || binding.claim_fence_epoch == 0
+            || binding.ingress_message_id.is_empty() || binding.claim_owner.is_empty() || binding.request_id.is_empty()
+            || crate::session_ingress_graph_id(session_id, &binding.request_id, &identity.turn_id) != ticket.graph_id
+            || receipt.session_id != session_id || receipt.turn_id != identity.turn_id || receipt.execution_id != ticket.graph_id
+            || payload.requested_ref.event_id != requested_event.event_id
+            || payload.requested_ref.stream_id != requested.stream_id || payload.requested_ref.event_sequence != requested.event_sequence
+            || payload.requested_ref.commit_cursor != requested.commit_cursor || payload.requested_ref.payload_digest != requested.payload_digest
+            || requested_event.sequence != requested.event_sequence || requested_event.commit_cursor != requested.commit_cursor
+            || event_digest != requested.payload_digest {
+            return Err(invalid("original authorization/Requested source mismatch"));
+        }
+        Ok(Some(requested.cancellation_id.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn k05_test_original_provider_owner(
+        &self,
+        ticket: &super::registry::NodeExecutionTicket,
+    ) -> Result<crate::provider_runtime_client::ProviderGraphOwner, ExecutionCommitError> {
+        let start = validate_node_ticket_start(&self.event_store, ticket, None)?;
+        Ok(crate::provider_runtime_client::ProviderGraphOwner {
+            activity: node_activity_binding(&start, &ticket.node_id)?, attempt: ticket.attempt,
+        })
     }
 
     fn validate_execution_effect_start(
@@ -6932,7 +7140,7 @@ impl ExecutionCommitService {
             {
                 graph.node_results.get(&ticket.node_id)
             }
-            _ => None,
+            _ => host_transcript_cancel_command_result(&graph_event, ticket, &request.transaction_id),
         }
         .ok_or_else(|| invalid("Host transcript has no original Graph result transition"))?;
         super::runner::validate_outcome(
@@ -6951,7 +7159,8 @@ impl ExecutionCommitService {
             ),
             ExecutionGraphEvent::NodeTransitioned { delta, .. }
             | ExecutionGraphEvent::NodeTransitionedAndReplanned { delta, .. }
-            | ExecutionGraphEvent::NodesTransitioned { delta, .. } => (
+            | ExecutionGraphEvent::NodesTransitioned { delta, .. }
+            | ExecutionGraphEvent::CommandApplied { delta, .. } => (
                 delta.revision,
                 delta
                     .recovery_cursor
@@ -7041,7 +7250,8 @@ impl ExecutionCommitService {
             }
             ExecutionGraphEvent::NodeTransitioned { delta, .. }
             | ExecutionGraphEvent::NodeTransitionedAndReplanned { delta, .. }
-            | ExecutionGraphEvent::NodesTransitioned { delta, .. } => delta
+            | ExecutionGraphEvent::NodesTransitioned { delta, .. }
+            | ExecutionGraphEvent::CommandApplied { delta, .. } => delta
                 .parent_execution
                 .as_ref()
                 .is_none_or(|parent| parent == &original_start.parent_execution),
@@ -7590,7 +7800,7 @@ impl ExecutionCommitService {
         Ok(())
     }
 
-    fn committed_node_attempt(
+    pub(crate) fn committed_node_attempt(
         &self,
         graph: &ExecutionGraph,
         node: &str,
@@ -8603,6 +8813,15 @@ impl ExecutionCommitService {
         graph: &ExecutionGraph,
         command: &ExecutionGraphCommand,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        self.apply_command_with_cancelled_outcomes(graph, command, Vec::new())
+    }
+
+    // The original attempt's actual outcome and the command transition must
+    // commit at the same graph revision. Unknown never becomes a receipt.
+    pub(crate) fn apply_command_with_cancelled_outcomes(
+        &self, graph: &ExecutionGraph, command: &ExecutionGraphCommand,
+        outcomes: Vec<ExecutionTerminalCommit>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let expected = command_revision(command);
         if expected != graph.revision {
             return Err(ExecutionCommitError::StaleRevision {
@@ -8610,6 +8829,43 @@ impl ExecutionCommitService {
                 expected,
                 actual: graph.revision,
             });
+        }
+        if !outcomes.is_empty() && !matches!(command, ExecutionGraphCommand::Cancel { .. } | ExecutionGraphCommand::CancelNode { .. }) {
+            return Err(ExecutionCommitError::InvalidCommand("effect handoff requires an original cancellation command".into()));
+        }
+        let mut originals = BTreeMap::new();
+        let mut outcome_sources = BTreeMap::new();
+        for transition in &outcomes {
+            if originals.contains_key(&transition.node_id)
+                || graph.node_statuses.get(&transition.node_id) != Some(&ExecutionNodeStatus::Running)
+                || !matches!(transition.outcome.result.status, ExecutionNodeStatus::Cancelled | ExecutionNodeStatus::Completed)
+                || transition.outcome.replan.is_some()
+                || transition.outcome.delivery_envelope.is_some()
+                || transition.outcome.terminal_presentation.is_some()
+                || transition.outcome.no_dispatch.is_some()
+                || matches!(command, ExecutionGraphCommand::CancelNode { node_id, .. } if node_id != &transition.node_id)
+            {
+                return Err(ExecutionCommitError::InvalidCommand("cancelled effect handoff does not match the original running node".into()));
+            }
+            validate_executor_domain_events(&transition.outcome.domain_events)?;
+            merge_outcome_source_revisions(&mut outcome_sources, &transition.outcome.source_revisions)?;
+            super::runner::validate_outcome(&transition.node_id, &transition.outcome)
+                .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+            let spec = graph.nodes.iter().find(|node| node.id == transition.node_id)
+                .ok_or_else(|| ExecutionCommitError::InvalidCommand("cancelled effect original node missing".into()))?;
+            let attempt = *graph.recovery_cursor.node_attempts.get(&transition.node_id)
+                .ok_or_else(|| ExecutionCommitError::InvalidCommand("cancelled effect attempt missing".into()))?;
+            let binding = ExecutionGraphStateStore::new(self.event_store.clone())
+                .current_binding(graph, &transition.node_id, attempt)
+                .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+            let original = super::registry::NodeExecutionTicket { graph_id:graph.id.clone(), node_id:spec.id.clone(),
+                executor_kind:binding.executor_kind, service_class:graph.service_class,
+                attempt:binding.attempt, idempotency_key:binding.ticket_idempotency_key, payload_ref:spec.payload_ref.clone() };
+            if transition.effect_ticket.as_ref() != Some(&original) {
+                return Err(ExecutionCommitError::InvalidCommand("cancelled effect ticket does not match the original binding".into()));
+            }
+            self.validate_execution_effect_receipt(&original)?;
+            originals.insert(transition.node_id.clone(), transition);
         }
         let (command_name, reason) = command_metadata(command);
         let mut next = graph.clone();
@@ -8774,21 +9030,30 @@ impl ExecutionCommitService {
                 ));
             }
         }
+        for (node_id, transition) in &originals {
+            next.node_statuses.insert(node_id.clone(), transition.outcome.result.status);
+            next.node_results.insert(node_id.clone(), transition.outcome.result.clone());
+        }
         next.revision = next.revision.saturating_add(1);
         validate_execution_graph(&next).map_err(|error| {
             ExecutionCommitError::InvalidCommand(format!(
                 "graph command violates execution invariants: {error}"
             ))
         })?;
-        let mut expected_domain_revisions = BTreeMap::new();
+        let mut expected_domain_revisions = outcome_sources;
         let mut node_events: Vec<RuntimeTransactionEventInput> = next
             .node_statuses
             .iter()
             .filter_map(|(node_id, to)| {
                 let from = graph.node_statuses[node_id];
-                (from != *to).then(|| node_transition_event(&next, node_id, from, *to, None))
+                (from != *to).then(|| node_transition_event(&next, node_id, from, *to,
+                    originals.get(node_id).map(|item| item.outcome.result.clone())))
             })
             .collect::<Result<_, _>>()?;
+        for transition in originals.values() {
+            node_events.extend(transition.outcome.domain_events.clone());
+            node_events.push(execution_effect_receipt_event(transition.effect_ticket.as_ref().expect("validated original effect ticket"), &transition.outcome)?);
+        }
         if let Some((node_id, result_ref, correlation_id)) = external_resolution {
             node_events.push(RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
@@ -8855,6 +9120,15 @@ impl ExecutionCommitService {
             node_events,
             &expected_domain_revisions,
         )
+    }
+
+    pub(crate) async fn apply_command_with_cancelled_outcomes_async(
+        &self, graph: ExecutionGraph, command: ExecutionGraphCommand,
+        outcomes: Vec<ExecutionTerminalCommit>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.apply_command_with_cancelled_outcomes(&graph, &command, outcomes))
+            .await.map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
     }
 
     pub(crate) fn validate_command_revision(

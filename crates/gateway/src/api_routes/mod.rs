@@ -854,7 +854,7 @@ pub(super) fn validate_surface_capability_request(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn test_human_principal() -> runtime::VerifiedPrincipal {
+pub(crate) fn test_human_principal() -> runtime::VerifiedPrincipal {
     static PRINCIPAL: std::sync::OnceLock<runtime::VerifiedPrincipal> = std::sync::OnceLock::new();
     PRINCIPAL
         .get_or_init(|| {

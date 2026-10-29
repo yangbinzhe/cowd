@@ -1258,6 +1258,7 @@ where
                     .as_ref()
                     .and_then(|bus| bus.current_execution_context());
                 request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
+            graph_owner: self.root_effect_owner().ok().map(|(activity, attempt)| Box::new(crate::provider_runtime_client::ProviderGraphOwner { activity, attempt })),
                     session_id: self.session_id().to_string(),
                     execution_id: execution_epoch
                         .as_ref()
@@ -1435,6 +1436,7 @@ where
                     self.reconcile_provider_context_usage(observed);
                 }
                 if let Some(error) = stream_run.failure {
+                    if error.authenticated_provider_cancellation().is_some() { return Err(error); }
                     let error = error
                         .with_provider_account_key(provider_account_key.clone())
                         .with_provider_usage(billed_usage_observed.then_some(billed_usage));
@@ -2608,6 +2610,7 @@ where
                 .as_ref()
                 .and_then(|bus| bus.current_execution_context());
             request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
+            graph_owner: self.root_effect_owner().ok().map(|(activity, attempt)| Box::new(crate::provider_runtime_client::ProviderGraphOwner { activity, attempt })),
                 session_id: self.session_id().to_string(),
                 execution_id: execution_epoch
                     .as_ref()
@@ -2784,6 +2787,9 @@ where
                 .reconcile(observed_usage)
                 .map_err(|error| error.with_effect_receipts(early_tool_receipts.clone()))?;
             if let Some(error) = stream_run.failure {
+                if error.authenticated_provider_cancellation().is_some() {
+                    return Err(if early_tool_receipts.is_empty() { error } else { error.with_effect_receipts(early_tool_receipts) });
+                }
                 let error = error.with_provider_account_key(provider_account_key.clone());
                 if provider_retry_is_fenced(provider_retry_fenced, early_tool_receipts.len()) {
                     return Err(if early_tool_receipts.is_empty() {

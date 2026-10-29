@@ -484,6 +484,7 @@ struct AdmittedLiveScenario {
     execution_id: String,
     turn_id: String,
     expected_reads: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
+    numeric_oracle: Option<crate::facet_gate::numeric_oracle::Snapshot>,
     trace: Vec<Value>,
 }
 
@@ -1096,7 +1097,7 @@ fn u5_inputs() -> [LiveScenarioSpec; 2] {
         },
         LiveScenarioSpec {
             id: "u5-read-b",
-            prompt: "请通过只读工具读取 crates/runtime/Cargo.toml，不要猜测。最终只返回 JSON 对象，package_name 字段为实际 package name，path 字段为读取的文件路径。",
+            prompt: "请通过只读工具读取 crates/runtime/Cargo.toml，不要猜测。最终只返回 JSON 对象，package_name 字段为实际 package name，path 字段必须是仓库相对路径，且精确等于 crates/runtime/Cargo.toml。",
             acceptance: LiveAcceptance::Facet {
                 facet_id: "u5-name",
                 capability: "read original package name",
@@ -1525,6 +1526,40 @@ where
             .join()
             .unwrap_or_else(|_| U5ActorOutcome::failed("U5 peer panicked"));
         (a, b)
+    })
+}
+// For active cancellation, collect the pair's original resource prefix once
+// B has finished and A's actual physical response has opened. Waiting for A's
+// terminal projection first can consume the entire shared deadline.
+fn u5_parallel_with_observer<T, L, R, O>(
+    deadline: Instant, left: L, right: R, observe: O,
+) -> (U5ActorOutcome, U5ActorOutcome, Result<T, String>)
+where
+    T: Send,
+    L: FnOnce(std::sync::mpsc::Sender<()>) -> U5ActorOutcome + Send,
+    R: FnOnce() -> U5ActorOutcome + Send,
+    O: FnOnce() -> Result<T, String> + Send,
+{
+    std::thread::scope(|scope| {
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (right_tx, right_rx) = std::sync::mpsc::channel();
+        let observer = scope.spawn(move || {
+            opened_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| "U5 physical start unavailable before observation deadline".to_string())?;
+            right_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| "U5 peer completion unavailable before observation deadline".to_string())?;
+            if Instant::now() >= deadline {
+                return Err("U5 observation deadline reached before resource IO".into());
+            }
+            observe()
+        });
+        let (a, b) = u5_parallel(deadline, || left(opened_tx), || {
+            let outcome = right();
+            let _ = right_tx.send(());
+            outcome
+        });
+        let evidence = observer.join().unwrap_or_else(|_| Err("U5 resource observer panicked".into()));
+        (a, b, evidence)
     })
 }
 const GROUP_THEORY_SCENARIO_ID: &str = "live_group_theory_ai_research_simulation";
@@ -2488,10 +2523,10 @@ impl LiveScenarioRunner {
                     || events_left == 0
                     || pages_left == 0
                 {
-                    return Err(
-                        "U5 resource consumer time/byte/event/page budget exhausted before IO"
-                            .into(),
-                    );
+                    return Err(format!(
+                        "U5 resource consumer budget exhausted before IO: time={}, bytes={}, events={}, pages={}",
+                        window_remaining.is_zero(), bytes_left == 0, events_left == 0, pages_left == 0
+                    ));
                 }
                 // One read stays bounded; the window keeps running.
                 let deadline = u5_read_deadline(window_deadline);
@@ -2740,30 +2775,23 @@ impl LiveScenarioRunner {
         }
         let right_reads = reads.pop().expect("two preregistered inputs");
         let left_reads = reads.pop().expect("two preregistered inputs");
-        let (left, right) = u5_parallel(
-            deadline,
-            || {
-                runner.run_u5_actor(
-                    mode, inputs[0], telemetry, started, timeout, a, left_reads, source, &owner,
-                    &sessions,
-                )
-            },
-            || {
-                runner.run_u5_actor(
-                    U5Mode::Fairness,
-                    inputs[1],
-                    telemetry,
-                    started,
-                    timeout,
-                    b,
-                    right_reads,
-                    source,
-                    &owner,
-                    &sessions,
-                )
-            },
+        let run_left = |opened| runner.run_u5_actor(
+            mode, inputs[0], telemetry, started, timeout, a, left_reads, source, &owner,
+            &sessions, opened,
         );
-        let evidence = runner.read_u5_resource_witnesses(&owner, &sessions, deadline);
+        let run_right = || runner.run_u5_actor(
+            U5Mode::Fairness, inputs[1], telemetry, started, timeout, b, right_reads, source,
+            &owner, &sessions, None,
+        );
+        let (left, right, evidence) = if mode == U5Mode::Cancel {
+            u5_parallel_with_observer(deadline, |opened| run_left(Some(opened)), run_right, || {
+                runner.read_u5_resource_witnesses(&owner, &sessions, deadline)
+            })
+        } else {
+            let (left, right) = u5_parallel(deadline, || run_left(None), run_right);
+            let evidence = runner.read_u5_resource_witnesses(&owner, &sessions, deadline);
+            (left, right, evidence)
+        };
         let internal = match evidence {
             Ok(evidence) => u5_pair_acceptance(
                 mode,
@@ -2797,6 +2825,7 @@ impl LiveScenarioRunner {
         source: &dyn U5EvidenceReader,
         owner: &U5Owner,
         sessions: &[String; 2],
+        opened: Option<std::sync::mpsc::Sender<()>>,
     ) -> U5ActorOutcome {
         let mut active_identity = None;
         let mut cancellation = None;
@@ -2824,6 +2853,7 @@ impl LiveScenarioRunner {
                             &mut actor,
                             started,
                             &cancellation_id,
+                            opened,
                         ) {
                             Ok((result, request)) => {
                                 cancellation = Some(request);
@@ -2837,7 +2867,7 @@ impl LiveScenarioRunner {
                                     json!({"cancellation_id":cancellation_id,
                                         "expected_execution_id":identity.root,"expected_turn_id":identity.turn}),
                                 );
-                                json!({"status":"failed","error":error,"cancellation_cleanup":cleanup,
+                                json!({"scenario_id":spec.id,"status":"failed","error":error,"cancellation_id":cancellation_id,"cancellation_cleanup":cleanup,
                                 "session_id":identity.session,"turn_id":identity.turn,"execution_id":identity.root})
                             }
                         }
@@ -2865,7 +2895,7 @@ impl LiveScenarioRunner {
                         );
                     }
                 }
-                json!({"status":"failed","reason":"U5 actor panicked; original evidence must be retained"})
+                json!({"scenario_id":spec.id,"status":"failed","reason":"U5 actor panicked; original evidence must be retained"})
             }
         };
         let cleanup = actor.finish();
@@ -2955,7 +2985,30 @@ impl LiveScenarioRunner {
                 .append_pair("from_seq", &next.to_string())
                 .append_pair("limit", &limit.to_string())
                 .append_pair("include_payload", "true");
-            let page = self.read_u5_json(url, deadline, &mut bytes_left)?;
+            // Session counts and lists are separate reads. A concurrent append
+            // can make the returned list longer than its earlier count; retry
+            // the same page within the existing deadline and byte budget.
+            let mut attempt = 0;
+            let page = loop {
+                let page = self.read_u5_json(url.clone(), deadline, &mut bytes_left)?;
+                if page["session_id"] != session || page["from_seq"] != next
+                    || page["include_payload"] != true || page["limit"] != limit {
+                    return Err("U5 Session evidence page identity mismatch".into());
+                }
+                let total = page["total"].as_u64().ok_or("U5 missing Session event count")?;
+                let rows = page["events"].as_array().ok_or("U5 Session events missing")?;
+                if rows.len() > limit || page["has_more"].as_bool() != Some((rows.len() as u64) < total) {
+                    return Err(format!("U5 Session pagination contract mismatch: rows={} limit={} total={} has_more={:?}", rows.len(), limit, total, page["has_more"].as_bool()));
+                }
+                if total < rows.len() as u64 {
+                    attempt += 1;
+                    if attempt >= 3 {
+                        return Err(format!("U5 Session pagination contract mismatch: count remained below rows after {attempt} bounded reads; rows={} total={total}", rows.len()));
+                    }
+                    continue;
+                }
+                break page;
+            };
             if page["session_id"] != session
                 || page["from_seq"] != next
                 || page["include_payload"] != true
@@ -3015,6 +3068,7 @@ impl LiveScenarioRunner {
         actor: &mut SessionActor<'_>,
         started: Instant,
         cancellation_id: &str,
+        opened_signal: Option<std::sync::mpsc::Sender<()>>,
     ) -> Result<(Value, U5CancelContext), String> {
         let deadline = self
             .u5_deadline
@@ -3042,10 +3096,8 @@ impl LiveScenarioRunner {
                     .min(start_deadline.saturating_duration_since(Instant::now())),
             );
         };
-        let projection = self.get_json(&format!(
-            "/api/runtime/executions/{}?detail_scope=summary",
-            identity.root
-        ))?;
+        if let Some(signal) = opened_signal { let _ = signal.send(()); }
+        let projection = self.u5_cancel_projection(identity, "before_cancel_post", deadline)?;
         if projection
             .pointer("/terminal_axes/execution/phase")
             .and_then(Value::as_str)
@@ -3063,25 +3115,40 @@ impl LiveScenarioRunner {
             opened_event,
         };
         let body = json!({"cancellation_id":cancellation_id,"expected_execution_id":identity.root,"expected_turn_id":identity.turn});
+        let mut last_observation = Value::Null;
         loop {
             if Instant::now() >= deadline {
-                return Err("U5 cancellation remains unproven at the original deadline".into());
+                return Err(format!("U5 cancellation remains unproven at the original deadline; last_observation={last_observation}"));
             }
             actor.maintain_receipt_authority()?;
-            let raw = actor.post_mutation(
-                &format!("/api/sessions/{}/cancel", identity.session),
-                body.clone(),
-            )?;
+            let raw = actor
+                .post_mutation(
+                    &format!("/api/sessions/{}/cancel", identity.session),
+                    body.clone(),
+                )
+                .map_err(|error| format!("cancel_post: {error}"))?;
             let receipt: harness_contract::turn::CancellationReceipt =
                 serde_json::from_value(raw).map_err(|e| e.to_string())?;
             if receipt.status == harness_contract::turn::CancellationStatus::AlreadyTerminal {
                 return Err("U5 AlreadyTerminal does not cover active cancellation".into());
             }
-            let projection = self.get_json(&format!(
-                "/api/runtime/executions/{}?detail_scope=summary",
-                identity.root
-            ))?;
-            if u5_cancel_settled(identity, owner, &cancellation_id, &receipt, &projection) {
+            let projection = self.u5_cancel_projection(identity, "after_cancel_post", deadline)?;
+            let settled = u5_cancel_settled(identity, owner, &cancellation_id, &receipt, &projection);
+            last_observation = json!({
+                "receipt_status": receipt.status,
+                "receipt_identity_matches": receipt.cancellation_id == cancellation_id
+                    && receipt.session_id == identity.session && receipt.turn_id == identity.turn
+                    && receipt.execution_id == identity.root && receipt.actor_id == owner.principal_actor,
+                "receipt_cause": receipt.cause,
+                "receipt_journal_sequence": receipt.journal_sequence,
+                "receipt_effective_at_ms": receipt.effective_at_ms,
+                "projection_identity_matches": projection["execution_id"] == identity.root
+                    && projection["session_id"] == identity.session && projection["turn_id"] == identity.turn,
+                "terminal_axes": projection.get("terminal_axes"),
+                "settled": settled,
+                "physical_evidence": "not_yet_proven"
+            });
+            if settled {
                 let events = self.read_u5_session_events(&identity.session, deadline)?;
                 let resources = self.read_u5_resource_witnesses(owner, sessions, deadline)?;
                 if let Some(physical) =
@@ -3189,12 +3256,13 @@ impl LiveScenarioRunner {
             // Required facts are pinned per file so completion is unambiguous.
             LiveScenarioSpec {
                 id: "live_minimal_batch_read",
-                prompt: "请读取以下 6 个源码文件，并对每个文件给出一个可核验的事实（文件路径 + 事实）。crates/tools/src/lib.rs —— workspace 的成员 crate 数量。crates/runtime/src/lib.rs —— 顶层 `pub mod` / `pub use` 的数量。crates/memory/src/lib.rs —— 记忆 crate 的模块数量。crates/gateway/src/main.rs —— main.rs 的行数。crates/provider/src/lib.rs —— provider crate 的公开导出条数。crates/harness-eval/src/lib.rs —— harness-eval 的行数。只使用只读工具，不要调用 bash 或任何写工具；读不到就保留 unresolved，不要凭先验知识作答。",
+                prompt: "请读取以下 6 个源码文件，并对每个文件给出一个可核验的事实（文件路径 + 事实）。crates/tools/src/lib.rs —— 行首 pub mod 声明数；workspace 的成员 crate 数量从根 Cargo.toml 读取。crates/runtime/src/lib.rs —— 顶层 `pub mod` / `pub use` 的数量。crates/memory/src/lib.rs —— 记忆 crate 的模块数量。crates/gateway/src/main.rs —— main.rs 的行数。crates/provider/src/lib.rs —— provider crate 的公开导出条数。crates/harness-eval/src/lib.rs —— harness-eval 的行数。声明数量按源码行首声明计数：runtime 的 pub mod 与 pub use 声明总数；memory 的 mod、pub mod 与 pub(crate) mod 声明总数；provider 的 pub use 声明总数（分组 use 算一条）。行数按 UTF-8 行迭代计数，末行无换行也算一行。回答契约 k02-numeric-v4：给出 JSON 对象，键为 Cargo.toml 和上述六个完整路径，值分别为对应整数；也接受每行一条“路径: 整数”或两列表格。不要加入互相矛盾的内容。只使用只读工具，不要调用 bash 或任何写工具；读不到就保留 unresolved，不要凭先验知识作答。",
                 acceptance: LiveAcceptance::Facet {
                     facet_id: "read_six_named_files",
                     capability: "read every named file and report one verifiable fact from it",
                     required_read_paths: &[
                         "crates/tools/src/lib.rs",
+                        "Cargo.toml",
                         "crates/runtime/src/lib.rs",
                         "crates/memory/src/lib.rs",
                         "crates/gateway/src/main.rs",
@@ -3215,7 +3283,7 @@ impl LiveScenarioRunner {
             // we know there is no AST extractor.
             LiveScenarioSpec {
                 id: "live_minimal_compute_reduce",
-                prompt: "请统计本 workspace 中 Rust 源码的总行数、以及 `.rs` 文件的数量，并给出 `crates/` 下哪一个 crate 的 `.rs` 文件最多（给出 crate 名与文件数）。只使用只读工具，不要调用 bash 或任何写工具；不要逐个人工累加文件内容。",
+                prompt: "请统计本 workspace 中 Rust 源码的总行数、以及 `.rs` 文件的数量，并给出 `crates/` 下哪一个 crate 的 `.rs` 文件最多（给出 crate 名与文件数）。范围是工作区内实际 .rs 文件，越界符号链接不跟随；UTF-8 按行迭代，末行无换行也计一行；crate 按最近的 Cargo.toml package 名归属，如有并列任报一个。回答契约 k02-numeric-v4：可用 JSON 对象 total_lines、rs_files、top_crate、top_crate_files（数值为整数），也接受每行“总行数/文件数/最多crate/最多crate文件数: 值”或同义英文键及两列表格。不要加入互相矛盾的内容。请实际使用只读编排 compute 完成归约；compute 步骤的返回值应是与最终答案相同字段的 JSON 对象，供核验证据。只使用只读工具，不要调用 bash 或任何写工具；不要逐个人工累加文件内容。",
                 acceptance: LiveAcceptance::Facet {
                     facet_id: "deterministic_reduction_outside_the_model",
                     capability: "aggregate across files without moving their bodies into context",
@@ -3662,6 +3730,7 @@ impl LiveScenarioRunner {
                     execution_id: execution,
                     turn_id: turn,
                     expected_reads: BTreeMap::new(),
+                    numeric_oracle: None,
                     trace: vec![
                         json!({"kind":"u8_original_input_admission","phase":index,"source_sha256":format!("{:x}",Sha256::digest(source.as_bytes())),"source_bytes":source.len(),"admission":admission}),
                     ],
@@ -4035,6 +4104,64 @@ impl LiveScenarioRunner {
                 ));
             }
         };
+        // Freeze independently before dispatch; resumed runs have no trustworthy
+        // pre-dispatch snapshot and must not acquire a new oracle after the fact.
+        let numeric_oracle = if matches!(
+            spec.id,
+            "live_minimal_batch_read" | "live_minimal_compute_reduce"
+        ) {
+            if resume_session.is_some() {
+                return Err(failed_scenario_with_session(
+                    spec,
+                    started,
+                    trace,
+                    session_id,
+                    "numeric oracle cannot be preregistered for a resumed run".into(),
+                    Value::Null,
+                ));
+            }
+            let root = std::env::var_os("COWD_EVAL_WORKSPACE")
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::current_dir().ok());
+            match root
+                .ok_or_else(|| "workspace unavailable".to_string())
+                .and_then(|root| {
+                    let snapshot = crate::facet_gate::numeric_oracle::Snapshot::capture(&root)?;
+                    let dir = std::env::var_os("COWD_EVAL_K02_ORACLE_DIR")
+                        .map(std::path::PathBuf::from)
+                        .ok_or("COWD_EVAL_K02_ORACLE_DIR is required before dispatch")?;
+                    let file = dir.join(format!("{}-{}.json", spec.id, uuid::Uuid::new_v4()));
+                    crate::facet_gate::numeric_oracle::persist_preregistration(&file, &root, &snapshot)?;
+                    trace.push(json!({"kind":"k02_preregistration_persisted", "path":file, "version":crate::facet_gate::numeric_oracle::VERSION}));
+                    Ok(snapshot)
+                })
+            {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    return Err(failed_scenario_with_session(
+                        spec,
+                        started,
+                        trace,
+                        session_id,
+                        format!("numeric oracle preregistration: {error}"),
+                        Value::Null,
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(snapshot) = &numeric_oracle {
+            trace.push(json!({
+                "kind": "k02_numeric_oracle_preregistered",
+                "version": crate::facet_gate::numeric_oracle::VERSION,
+                "files": snapshot.files,
+                "file_count": snapshot.file_count,
+                "total_lines": snapshot.total_lines,
+                "top": snapshot.top,
+                "batch_facts": snapshot.facts,
+            }));
+        }
         let (execution_id, turn_id) = if resume_session.is_some() {
             match self.execution_live_observation(&session_id) {
                 Ok(observation) => {
@@ -4136,6 +4263,7 @@ impl LiveScenarioRunner {
             execution_id: execution_id_ref.to_string(),
             turn_id: turn_id_ref.to_string(),
             expected_reads,
+            numeric_oracle,
             trace,
         })
     }
@@ -4153,6 +4281,7 @@ impl LiveScenarioRunner {
             execution_id,
             turn_id,
             expected_reads,
+            numeric_oracle,
             mut trace,
         } = admitted;
         let execution_id = Some(execution_id);
@@ -4217,6 +4346,7 @@ impl LiveScenarioRunner {
         let descendant_wait = self.wait_for_descendant_team_acceptance(
             spec.acceptance,
             &expected_reads,
+            numeric_oracle.as_ref(),
             &response_text,
             &session_id,
             turn_id_ref,
@@ -4864,6 +4994,7 @@ impl LiveScenarioRunner {
         &self,
         acceptance: LiveAcceptance,
         expected_reads: &BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
+        numeric_oracle: Option<&crate::facet_gate::numeric_oracle::Snapshot>,
         response_text: &str,
         session_id: &str,
         turn_id: &str,
@@ -4930,6 +5061,7 @@ impl LiveScenarioRunner {
                     session_id,
                     turn_id,
                     expected_reads.clone(),
+                    if matches!(acceptance, LiveAcceptance::Facet { facet_id: "read_six_named_files", .. }) { 1 } else { 16 },
                     deadline,
                     trace,
                     actor,
@@ -4952,6 +5084,66 @@ impl LiveScenarioRunner {
                 agentic_program.as_ref(),
                 root_execution_id,
             );
+            if let Some(expected) = numeric_oracle {
+                let stable = std::env::var_os("COWD_EVAL_WORKSPACE")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| std::env::current_dir().ok())
+                    .and_then(|root| {
+                        crate::facet_gate::numeric_oracle::Snapshot::capture(&root).ok()
+                    })
+                    .is_some_and(|actual| &actual == expected);
+                let correct = match acceptance {
+                    LiveAcceptance::Facet {
+                        facet_id: "read_six_named_files",
+                        ..
+                    } => crate::facet_gate::numeric_oracle::batch_answer(expected, response_text),
+                    LiveAcceptance::Facet {
+                        facet_id: "deterministic_reduction_outside_the_model",
+                        ..
+                    } => crate::facet_gate::numeric_oracle::compute_answer(expected, response_text),
+                    _ => false,
+                };
+                // evaluate() intentionally fails closed without an oracle. Replace
+                // only that requirement, keeping all original receipt gates.
+                if let Some(check) = result
+                    .checks
+                    .iter_mut()
+                    .find(|c| c["name"] == "independent_numeric_oracle")
+                {
+                    check["passed"] = json!(stable && correct);
+                    check["oracle_version"] = json!(crate::facet_gate::numeric_oracle::VERSION);
+                    check["input_files"] = json!(expected.files);
+                    check["input_stable"] = json!(stable);
+                }
+                if matches!(acceptance, LiveAcceptance::Facet { facet_id: "read_six_named_files", .. }) {
+                    let frozen = expected.files.iter().cloned().collect::<BTreeMap<_,_>>();
+                    let paths = crate::facet_gate::collect_read_paths_frozen(&timeline["read_evidence"], Some(&frozen));
+                    let all = acceptance.read_obligations().iter().all(|required| paths.iter().any(|p| p.as_str() == *required));
+                    result.checks.push(json!({"name":"frozen_content_read_receipts", "passed":all, "paths":paths}));
+                }
+                if matches!(acceptance, LiveAcceptance::Facet { facet_id: "deterministic_reduction_outside_the_model", .. }) {
+                    let refs = crate::facet_gate::numeric_oracle::compute_refs(&timeline, session_id, turn_id, root_execution_id);
+                    let deadline = timeout.observation_deadline(scenario_started, wait_started, Duration::from_millis(observer.since_last_progress_ms(scenario_started.elapsed().as_millis() as u64)), observer.progress_observations() as usize);
+                    let mut resolved = Vec::new();
+                    for reference in refs.iter().take(16) {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() { break; }
+                        if actor.maintain_receipt_authority().is_err() { break; }
+                        let response = self.client.get(format!("{}/api/evidence/resolve", self.base_url))
+                            .query(&[("ref", reference.as_str()), ("session_id", session_id), ("snippet_bytes", "16384")])
+                            .timeout(remaining.min(Duration::from_secs(15)))
+                            .send().map_err(|error| error.to_string()).and_then(response_json);
+                        trace.push(json!({"kind":"k02_raw_compute_resolve", "ref":reference, "available":response.as_ref().ok().and_then(|v| v["available"].as_bool()), "error":response.as_ref().err()}));
+                        if let Ok(value) = response { resolved.push(value); }
+                    }
+                    let verified = crate::facet_gate::numeric_oracle::compute_result_verified(expected, response_text, session_id, &refs, &resolved);
+                    result.checks.push(json!({"name":"authenticated_compute_result", "passed":verified, "status": if verified { "verified" } else { "unknown" }, "references":refs}));
+                }
+                result.passed = result.checks.iter().all(|c| c["passed"] == true);
+                if matches!(acceptance, LiveAcceptance::Facet { facet_id: "deterministic_reduction_outside_the_model", .. }) {
+                    trace.push(json!({"kind":"compute_complete_input_consumption", "required":false, "status":"unknown", "reason":"no authenticated complete compute input-to-result evidence"}));
+                }
+            }
             observations = observations.saturating_add(1);
 
             if let Some(error) = timeline_error {
@@ -5097,6 +5289,44 @@ impl LiveScenarioRunner {
         })
     }
 
+    // Retry only idempotent summary reads on classified transport failures,
+    // within the original shared deadline. HTTP and JSON failures remain facts.
+    fn u5_cancel_projection(
+        &self,
+        identity: &U5Identity,
+        stage: &str,
+        deadline: Instant,
+    ) -> Result<Value, String> {
+        let url = format!(
+            "{}/api/runtime/executions/{}?detail_scope=summary",
+            self.base_url, identity.root
+        );
+        for attempt in 0..3 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("{stage}: U5 observation deadline reached"));
+            }
+            match self
+                .client
+                .get(&url)
+                .timeout(remaining.min(Duration::from_secs(15)))
+                .send()
+            {
+                Ok(response) => {
+                    return response_json(response).map_err(|error| format!("{stage}: {error}"))
+                }
+                Err(error) if attempt < 2 && (error.is_connect() || error.is_timeout()) => {
+                    thread::sleep(
+                        Duration::from_millis(200)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => return Err(format!("{stage}: {error}")),
+            }
+        }
+        Err(format!("{stage}: summary read retries exhausted"))
+    }
+
     fn get_json(&self, path: &str) -> Result<Value, String> {
         let mut request = self.client.get(format!("{}{}", self.base_url, path));
         if let Some(deadline) = self.u5_deadline {
@@ -5116,6 +5346,7 @@ impl LiveScenarioRunner {
         session: &str,
         turn: &str,
         expected: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
+        page_limit: usize,
         deadline: Instant,
         trace: &mut Vec<Value>,
         actor: &mut SessionActor<'_>,
@@ -5137,7 +5368,7 @@ impl LiveScenarioRunner {
             let path = format!("/api/runtime/executions/{execution}/read-evidence");
             let mut query = vec![
                 ("after_sequence", evidence.next_after_sequence().to_string()),
-                ("limit", "16".to_string()),
+                ("limit", page_limit.to_string()),
             ];
             if let Some(through) = evidence.through() {
                 query.push(("through", through.to_string()));

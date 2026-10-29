@@ -991,7 +991,10 @@ impl ScopedRuntimeToolExecutor {
             }
             self.host.execute_runtime_tool(&request).await
         };
-        if tool_name == "evidence_retrieve" {
+        // Process direct calls have no outer receipt owner, even when they
+        // carry a Step. Only suppress this commit inside the exact matching
+        // outer governed read's task-local ownership scope.
+        if tool_name == "evidence_retrieve" && !crate::bound_tool_batch::outer_read_receipt_owned(&request) {
             if let Some(commit) = &self.commit_service {
                 commit
                     .commit_readonly_tool_receipts(&[(request.clone(), outcome.clone())])

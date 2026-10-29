@@ -102,7 +102,11 @@ pub(crate) fn original_static_file_scopes(
         "workspace_snapshot" => {
             if let Some(roots) = input.get("roots").and_then(Value::as_array) {
                 for root in roots {
-                    add(read, directory_path(Some(root)), ProofEffectPurpose::InputRead);
+                    add(
+                        read,
+                        directory_path(Some(root)),
+                        ProofEffectPurpose::InputRead,
+                    );
                 }
             } else {
                 add(read, None, ProofEffectPurpose::InputRead);
@@ -450,12 +454,14 @@ pub(crate) fn run_orchestrate(lease: &ToolHostLease, input: &Value) -> Result<St
     let mut state: State = BTreeMap::new();
     let mut total_calls = 0usize;
     let mut calls_trace: Vec<Value> = Vec::new();
-    for step in &parsed.steps {
+    for (step_index, step) in parsed.steps.iter().enumerate() {
         let before = total_calls;
         let started = std::time::Instant::now();
         let (op, tool) = step_descriptor(&step.kind);
         match evaluate(
             lease,
+            step_index,
+            &step.id,
             &step.kind,
             &state,
             &mut total_calls,
@@ -691,6 +697,8 @@ fn parse_preflight(input: &Value) -> Result<(OrchestrateInput, Vec<PreflightCall
 
 fn evaluate(
     lease: &ToolHostLease,
+    step_index: usize,
+    step_id: &str,
     kind: &StepKind,
     state: &State,
     total_calls: &mut usize,
@@ -699,7 +707,7 @@ fn evaluate(
     match kind {
         StepKind::Call { tool, input } => {
             let resolved = resolve_value(input, state, None)?;
-            call_tool(lease, tool, &resolved, total_calls)
+            call_tool(lease, step_index, step_id, 0, tool, &resolved, total_calls)
         }
         StepKind::Batch { calls, on_error } => {
             if calls.len() > MAX_MAP_ITEMS {
@@ -714,22 +722,23 @@ fn evaluate(
                 ));
             }
             let mut prepared = Vec::with_capacity(calls.len());
-            for call in calls {
+            for (position, call) in calls.iter().enumerate() {
                 prepared.push((
                     call.alias.clone(),
                     call.tool.clone(),
                     resolve_value(&call.input, state, None)?,
+                    position,
                 ));
             }
             let items = prepared.clone();
             let results = crate::executor::run_ordered_batch(prepared, max_concurrency, |call| {
-                call_tool_uncounted(lease, &call.1, &call.2)
+                call_tool_uncounted(lease, step_index, step_id, call.3, &call.1, &call.2)
             });
             *total_calls += items.len();
             let collect = matches!(on_error, Some(OnError::Collect));
             let mut object = Map::new();
             for (index, result) in results.into_iter().enumerate() {
-                let (alias, tool, _) = &items[index];
+                let (alias, tool, _, _) = &items[index];
                 let key = alias.clone().unwrap_or_else(|| format!("{tool}[{index}]"));
                 if collect {
                     object.insert(key, batch_item_value(&result));
@@ -772,10 +781,11 @@ fn evaluate(
                 ));
             }
             // Bounded parallel fan-out, matching `read_many`/`grep_many`.
+            let indexed = items.iter().cloned().enumerate().collect::<Vec<_>>();
             let results =
-                crate::executor::run_ordered_batch(items.clone(), max_concurrency, |item| {
+                crate::executor::run_ordered_batch(indexed, max_concurrency, |(position, item)| {
                     let resolved = resolve_value(input, state, Some(&item))?;
-                    call_tool_uncounted(lease, tool, &resolved)
+                    call_tool_uncounted(lease, step_index, step_id, position, tool, &resolved)
                 });
             *total_calls += items.len();
             let collect = matches!(on_error, Some(OnError::Collect));
@@ -852,7 +862,7 @@ fn evaluate(
         } => {
             if eval_condition(condition, state, None)? {
                 let resolved = resolve_value(input, state, None)?;
-                call_tool(lease, tool, &resolved, total_calls)
+                call_tool(lease, step_index, step_id, 0, tool, &resolved, total_calls)
             } else {
                 Ok(Value::Null)
             }
@@ -869,12 +879,20 @@ fn evaluate(
                 ));
             }
             let mut last = Value::Null;
-            for _ in 0..*max {
+            for position in 0..*max {
                 if !eval_condition(condition, state, None)? {
                     break;
                 }
                 let resolved = resolve_value(input, state, None)?;
-                last = call_tool(lease, tool, &resolved, total_calls)?;
+                last = call_tool(
+                    lease,
+                    step_index,
+                    step_id,
+                    position,
+                    tool,
+                    &resolved,
+                    total_calls,
+                )?;
             }
             Ok(last)
         }
@@ -893,23 +911,36 @@ fn bump(total_calls: &mut usize) -> Result<(), String> {
 
 fn call_tool(
     lease: &ToolHostLease,
+    step_index: usize,
+    step_id: &str,
+    position: usize,
     tool: &str,
     input: &Value,
     total_calls: &mut usize,
 ) -> Result<Value, String> {
     bump(total_calls)?;
-    call_tool_uncounted(lease, tool, input)
+    call_tool_uncounted(lease, step_index, step_id, position, tool, input)
 }
 
 /// Dispatch one allowed sub-call without touching the shared call counter, so
 /// the `map` step can fan out in parallel and count once.
-fn call_tool_uncounted(lease: &ToolHostLease, tool: &str, input: &Value) -> Result<Value, String> {
+fn call_tool_uncounted(
+    lease: &ToolHostLease,
+    step_index: usize,
+    step_id: &str,
+    position: usize,
+    tool: &str,
+    input: &Value,
+) -> Result<Value, String> {
     if !is_allowed_orchestration_tool(tool) {
         return Err(format!(
             "tool_orchestrate cannot dispatch `{tool}`: not an allowed orchestration tool"
         ));
     }
     let output = execute_with_lease(lease, tool, input)?;
+    if tool == "read_file" {
+        lease.record_orchestrated_read(step_index, step_id, position, input, &output)?;
+    }
     Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
 }
 
@@ -1684,13 +1715,13 @@ mod tests {
         )
         .unwrap();
         let mut calls = 0;
-        assert!(evaluate(&lease, &map, &state, &mut calls, None)
+        assert!(evaluate(&lease, 0, "map", &map, &state, &mut calls, None)
             .unwrap_err()
             .contains("over the limit"));
         assert_eq!(calls, 0);
         state.insert("items".into(), json!(["a", "b"]));
         calls = MAX_TOTAL_CALLS - 1;
-        assert!(evaluate(&lease, &map, &state, &mut calls, None)
+        assert!(evaluate(&lease, 0, "map", &map, &state, &mut calls, None)
             .unwrap_err()
             .contains("total sub-call limit"));
         assert_eq!(calls, MAX_TOTAL_CALLS - 1);

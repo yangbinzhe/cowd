@@ -296,6 +296,7 @@ async fn outcome_append_failure_leaves_packed_attempt_unknown() {
         native_wire_receipts: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let context = crate::ProviderRequestEvidenceContext {
+            graph_owner: None,
         session_id: "session-fail".to_string(),
         execution_id: "execution-fail".to_string(),
         turn_id: "turn-fail".to_string(),
@@ -390,6 +391,7 @@ fn r304_diagnostic_request_fixture(
     crate::provider_runtime_client::ProviderPhysicalIdentity,
 ) {
     let identity = crate::provider_runtime_client::ProviderPhysicalIdentity {
+            graph_owner: None,
         session_id: context.session_id.clone(),
         execution_id: context.execution_id.clone(),
         turn_id: context.turn_id.clone(),
@@ -711,6 +713,7 @@ async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
         .unwrap()
         .begin_epoch(Some(epoch), std::collections::BTreeMap::new());
     let context = crate::ProviderRequestEvidenceContext {
+            graph_owner: None,
         session_id: session_id.clone(),
         execution_id: "execution-evidence".to_string(),
         turn_id: "turn-evidence".to_string(),
@@ -1291,6 +1294,7 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
             candidates,
             "qwen3.8-max-effective",
             &crate::ProviderRequestEvidenceContext {
+            graph_owner: None,
                 session_id: runtime.session_id().into(),
                 execution_id: "unobserved-execution".into(),
                 turn_id: "unobserved-turn".into(),
@@ -5005,6 +5009,7 @@ mod r1_native_real_wire {
 
     struct WireServer {
         endpoint: String,
+        first_call: Arc<Mutex<serde_json::Value>>,
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
         disconnect: Arc<AtomicBool>,
         reject_output: Arc<AtomicBool>,
@@ -5025,6 +5030,9 @@ mod r1_native_real_wire {
             let captured = requests.clone();
             let disconnect = Arc::new(AtomicBool::new(false));
             let reject_output = Arc::new(AtomicBool::new(false));
+            let first_call = Arc::new(Mutex::new(serde_json::json!({"name":"read_file","arguments":
+                serde_json::json!({"path":"target.txt","complete":true}).to_string()})));
+            let first_call_for_server = first_call.clone();
             let disconnected = disconnect.clone();
             let rejected_output = reject_output.clone();
             let task = tokio::spawn(async move {
@@ -5068,8 +5076,7 @@ mod r1_native_real_wire {
                     let delta = if ordinal == 1 {
                         serde_json::json!({"role":"assistant","tool_calls":[{
                             "index":0,"id":"native-read","type":"function",
-                            "function":{"name":"read_file","arguments":
-                                serde_json::json!({"path":"target.txt","complete":true}).to_string()}
+                            "function":first_call_for_server.lock().unwrap().clone()
                         }]})
                     } else if rejected_output.load(Ordering::SeqCst) {
                         // The output frame names a tool this request never
@@ -5106,6 +5113,7 @@ mod r1_native_real_wire {
             });
             Self {
                 endpoint,
+                first_call,
                 requests,
                 disconnect,
                 reject_output,
@@ -5218,14 +5226,22 @@ mod r1_native_real_wire {
             let binding = request.step_binding.as_ref().unwrap();
             let step = binding.resolve(Some(self.host.pin_snapshot())).unwrap();
             let input = serde_json::from_str(&request.input).unwrap();
-            let result = step
-                .lease()
+            let result = if request.tool_name == "tool_orchestrate" {
+                step.lease().execute_with_orchestrated_read_trace(request.authorization.as_ref().unwrap(), &input)
+                    .and_then(|(output, reads)| {
+                        if let Some(reads) = reads {
+                            request.tool_progress.record_child_reads(reads)
+                                .map_err(tools::ToolHostError::Execution)?;
+                        }
+                        Ok(output)
+                    })
+            } else { step.lease()
                 .execute_async(
                     request.authorization.as_ref().unwrap(),
                     &request.tool_name,
                     &input,
                 )
-                .await;
+                .await };
             let (status, output, error) = match result {
                 Ok(output) => (
                     crate::RuntimeToolExecutionStatus::Executed,
@@ -5258,7 +5274,7 @@ mod r1_native_real_wire {
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["read_file".into()]
+            vec!["read_file".into(), "tool_orchestrate".into()]
         }
 
         fn registered_tool_effect(
@@ -5292,6 +5308,7 @@ mod r1_native_real_wire {
         owner: harness_contract::projection::RuntimeActivityBinding,
         execution: crate::CowdExecutionContext,
         registry: Arc<crate::ProviderRegistry>,
+        services: Option<Arc<crate::RuntimeServices>>,
         _workspace: tempfile::TempDir,
     }
 
@@ -5442,7 +5459,7 @@ mod r1_native_real_wire {
                 .catalog
                 .definitions(None)
                 .into_iter()
-                .filter(|definition| definition.name == "read_file")
+                .filter(|definition| matches!(definition.name.as_str(), "read_file" | "tool_orchestrate"))
                 .map(|definition| crate::ProviderToolDefinition {
                     name: definition.name,
                     description: definition.description,
@@ -5489,6 +5506,7 @@ mod r1_native_real_wire {
                 owner,
                 execution,
                 registry,
+                services: None,
                 _workspace: workspace,
             }
         }
@@ -5560,8 +5578,8 @@ mod r1_native_real_wire {
                 )
                 .unwrap()
             });
-            self.runtime
-                .require_next_model_tool_action(["read_file".to_string()]);
+            let required = self.server.first_call.lock().unwrap()["name"].as_str().unwrap().to_string();
+            self.runtime.require_next_model_tool_action([required]);
             let runtime = self
                 .runtime
                 .with_checkpoint_identity(services.workspace_key(), identity);
@@ -5591,14 +5609,17 @@ mod r1_native_real_wire {
             .unwrap();
             self.runtime = runtime;
             result.unwrap();
-            let source = self
-                .runtime
-                .turn_native_tool_sources
-                .lock()
-                .unwrap()
-                .get("native-read")
-                .unwrap()
-                .clone();
+            let sources = self.runtime.turn_native_tool_sources.lock().unwrap();
+            let source = sources.get("native-read").unwrap_or_else(|| {
+                let kinds = self.store.list_stream(&format!("session:{}",self.runtime.session_id()))
+                    .unwrap().iter().map(|event| (event.kind.clone(),event.status.clone(),event.payload["tool_name"].clone())).collect::<Vec<_>>();
+                let requests = self.server.requests.lock().unwrap();
+                let tools = requests.first().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                    .and_then(|body| body["tools"].as_array().map(|tools| tools.iter().map(|tool| tool["function"]["name"].clone()).collect::<Vec<_>>()));
+                panic!("native fixture source missing; sources={:?}; wire_requests={}; exposed_tools={tools:?}; session_events={kinds:?}",
+                    sources.keys().collect::<Vec<_>>(),requests.len());
+            }).clone();
+            drop(sources);
             let call = source.call.clone();
             self.execution = source.execution;
             self.owner = source
@@ -5650,6 +5671,7 @@ mod r1_native_real_wire {
                         .is_some_and(|parent| parent.execution_id == self.execution.execution_id)));
             services.shutdown_execution().await;
             services.shutdown_maintenance().await;
+            self.services = Some(services.clone());
             self.journal
                 .reject_continuation_outcomes
                 .store(false, Ordering::SeqCst);
@@ -5905,6 +5927,155 @@ mod r1_native_real_wire {
                     .trim_start_matches("sha256:")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn nested_read_real_host_wire_emits_only_actual_children() {
+        let fixture = NativeFixture::new(Some("alpha\nbeta\n"), "none").await;
+        fs::write(fixture._workspace.path().join("other.txt"), "gamma\ndelta\n").unwrap();
+        let program = serde_json::json!({"steps":[{"id":"reads","op":"batch","calls":[
+            {"tool":"read_file","input":{"path":"target.txt","complete":true}},
+            {"tool":"read_file","input":{"path":"other.txt","complete":true}}
+        ]}]});
+        *fixture.server.first_call.lock().unwrap() = serde_json::json!({"name":"tool_orchestrate","arguments":program.to_string()});
+        let (fixture, call) = fixture.run_root_host(false).await;
+        let primary = fixture.acquisition(&call);
+        assert!(primary.payload["replay"]["parent_execution"].is_object());
+        assert!(primary.payload["root_effect_owner"].is_null());
+        let children = primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].as_array().unwrap_or_else(|| {
+            let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
+            let request = requests.iter().find(|request| request.tool_use_id == call.id).unwrap();
+            let captured = request.tool_progress.child_reads().unwrap();
+            let scope = serde_json::from_value::<harness_contract::goal::ProofEffectScope>(primary.payload["resolved_effect_scope"].clone()).ok();
+            let validated = captured.as_ref().zip(scope.as_ref()).and_then(|(children, scope)|
+                crate::context_evidence::child_read_acquisitions(request, scope, children)).map(|children| children.len());
+            let body_seals = captured.as_ref().map(|children| children.iter().map(|child|
+                crate::context_evidence::read_body_seal("read_file", child.output()).is_some()).collect::<Vec<_>>());
+            let child_bindings = captured.as_ref().map(|children| children.iter().map(|child| {
+                let effect = child.effect();
+                let auth = request.authorization.as_ref();
+                let compiled = request.compiled_invocation.as_ref();
+                (effect.tool_id.clone(), format!("{:?}", effect.effect_kind), effect.scopes.len(),
+                    auth.is_some_and(|auth| child.parent_authorization() == auth && effect.scopes.iter().all(|s| auth.authorization_lease.scopes.contains(s))),
+                    compiled.is_some_and(|parent| effect.scopes.iter().all(|s| parent.effect.scopes.contains(s))),
+                    scope.as_ref().is_some_and(|scope| effect.scopes.iter().all(|s| scope.targets.iter().filter(|t| &t.declared_scope == s).count() == 1)))
+            }).collect::<Vec<_>>());
+            panic!("actual child candidates absent; host_count={:?}; direct_validation={validated:?}; body_seals={body_seals:?}; child_bindings={child_bindings:?}; scope_complete={}; scopes={}; status={}; error={}; request_id_matches={}; descriptor_matches={}",
+                captured.as_ref().map(Vec::len), primary.payload["resolved_effect_scope"]["complete"],
+                primary.payload["resolved_effect_scope"]["targets"].as_array().map_or(0,Vec::len),
+                primary.payload["outcome"]["status"],primary.payload["outcome"]["error"],
+                request.authorization.as_ref().is_some_and(|auth| auth.request_id == request.tool_use_id),
+                request.authorization.as_ref().zip(request.compiled_invocation.as_ref()).is_some_and(|(auth, invocation)| auth.descriptor_hash == invocation.effect.descriptor_hash));
+        });
+        assert_eq!(children.len(), 2);
+        let request = fixture.runtime.tool_executor.requests.lock().unwrap().iter()
+            .find(|request| request.tool_use_id == call.id).unwrap().clone();
+        let captured = request.tool_progress.child_reads().unwrap().unwrap();
+        let scope: harness_contract::goal::ProofEffectScope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).unwrap();
+        assert_ne!(request.authorization.as_ref().unwrap().request_id, request.tool_use_id);
+        assert!(crate::context_evidence::child_read_acquisitions(&request, &scope, &captured).is_some());
+        let mut wrong = request.clone();
+        wrong.authorization.as_mut().unwrap().authorization_lease.signature = "foreign".into();
+        assert!(crate::context_evidence::child_read_acquisitions(&wrong, &scope, &captured).is_none());
+        let mut wrong = request.clone();
+        wrong.tool_use_id = "foreign-call".into();
+        assert!(crate::context_evidence::child_read_acquisitions(&wrong, &scope, &captured).is_none());
+        let mut wrong = request.clone();
+        wrong.session_id = Some("foreign-session".into());
+        assert!(crate::context_evidence::child_read_acquisitions(&wrong, &scope, &captured).is_none());
+        let events = fixture.store.list_stream(&format!("session:{}",fixture.runtime.session_id())).unwrap();
+        let deliveries = events.iter().filter(|event| event.kind == "context.nested_read_model_observed").collect::<Vec<_>>();
+        if deliveries.len() != 2 {
+            let sources = fixture.runtime.turn_native_tool_sources.lock().unwrap();
+            let source = sources.get(&call.id).unwrap();
+            let generated = fixture.runtime.turn_generated_model_receipts.lock().unwrap();
+            let receipt = generated.iter().find(|receipt| receipt.provider_invocation_id == call.id);
+            let parent = fixture.runtime.native_child_parent_acquisition(source);
+            let matched = receipt.map(|receipt| children.iter().map(|child|
+                crate::context_evidence::child_read_presented_extent(&call.input, &receipt.presentation, child).is_some()).collect::<Vec<_>>());
+            let wires = fixture.runtime.native_wire_receipts.lock().unwrap();
+            let _owner = fixture.bus.enter_execution_with_activity(fixture.execution.clone(), Some(fixture.owner.clone()));
+            let recipient = match (&parent, receipt, wires.last()) {
+                (Ok(Some((parent,_))), Some(receipt), Some(wire)) =>
+                    fixture.runtime.native_read_recipient(source, parent, &receipt.raw_ref, &wire.context).map(|r| r.is_some()),
+                _ => Ok(false),
+            };
+            let owner_count = fixture.runtime.turn_native_root_owners.lock().unwrap().len();
+            panic!("nested wire delivery missing; count={}; generated={}; parent={:?}; matched={matched:?}; wire_count={}; wire_result_counts={:?}; recipient={recipient:?}; root_owners={owner_count}; source_activity={}; source_tool_owner={}",
+                deliveries.len(), receipt.is_some(), parent.as_ref().map(|p| p.as_ref().map(|(_,c)|c.len())).map_err(|e|e.to_string()),
+                wires.len(), wires.iter().map(|w|(w.results.len(),w.outcome_sequence.is_some(),w.step_render.is_some())).collect::<Vec<_>>(),
+                source.activity_owner.is_some(),source.tool_owner.is_some());
+        }
+        let delivery = *deliveries.iter().find(|event| event.payload["child"]["position"] == 0).unwrap();
+        assert_eq!(delivery.payload["recipient"]["kind"], "root");
+        assert!(children.iter().any(|child| *child == delivery.payload["child"]));
+        assert!(delivery.payload["parent"].get("body").is_none());
+        assert_eq!(delivery.payload["delivered_extent"]["line_count"], 2);
+        let requests = fixture.server.requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        let wire: serde_json::Value = serde_json::from_slice(&requests[1]).unwrap();
+        assert!(wire.to_string().contains("alpha"));
+        assert_eq!(delivery.payload["transport"]["wire_body_sha256"],
+            format!("{:x}", Sha256::digest(serde_json::to_vec(&wire).unwrap())));
+        drop(requests);
+        let material = crate::agentic::review_evidence::nested_parent_material(&delivery.payload).unwrap();
+        let ReadDeliveryTransport::NativeProviderContinuation { wire_artifact, .. } = &material.transport else { panic!("native wire required") };
+        let bytes = fixture.runtime.artifact_store.as_ref().unwrap().read(
+            wire_artifact, &format!("session:{}", fixture.runtime.session_id()), None).await.unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let actual: provider::ProviderWireRequest = serde_json::from_value(artifact["provider_request"]["wire_request"].clone()).unwrap();
+        let text = crate::context_evidence::wire_tool_result_text(&actual, &call.id).expect("exact original wire result");
+        assert_eq!(read_sha256(text.as_bytes()), material.presentation_sha256);
+        let mut missing = actual.clone();
+        missing.body["messages"].as_array_mut().unwrap().retain(|m| m["tool_call_id"] != call.id);
+        missing.body_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&missing.body).unwrap()));
+        assert!(crate::context_evidence::wire_tool_result_text(&missing, &call.id).is_none());
+        let mut forged_wire = actual.clone();
+        forged_wire.body["messages"].as_array_mut().unwrap().iter_mut()
+            .find(|m| m["tool_call_id"] == call.id).unwrap()["content"] = serde_json::json!("forged");
+        assert!(crate::context_evidence::wire_tool_result_text(&forged_wire, &call.id).is_none());
+        let session = fixture.runtime.session_id();
+        let turn = delivery.payload["parent"]["step"]["turn_id"].as_str().unwrap();
+        let root = delivery.payload["parent"]["graph_id"].as_str().unwrap();
+        let verify = |event: &DurableRuntimeEvent, session: &str| crate::agentic::review_evidence::verify_nested_read_for_test(
+            &fixture.store, event, session, turn, Some(root), None);
+        assert!(verify(delivery, session).unwrap());
+        assert!(!verify(delivery, "foreign-session").unwrap());
+        let mut bad = (*delivery).clone();
+        bad.payload["parent"]["body"] = children[0]["body"].clone();
+        assert!(verify(&bad, session).is_err());
+        let mut bad = (*delivery).clone();
+        bad.payload["child"]["position"] = serde_json::json!(1);
+        assert!(verify(&bad, session).is_err());
+        let mut bad = (*delivery).clone();
+        bad.payload["source_input"] = serde_json::json!("{\"steps\":[]}");
+        assert!(verify(&bad, session).is_err());
+        let mut bad = (*delivery).clone();
+        bad.payload["child"]["body"] = children.iter().find(|child| child["position"] == 1).unwrap()["body"].clone();
+        assert!(verify(&bad, session).is_err());
+        let mut bad = (*delivery).clone();
+        bad.payload["child"]["body"]["source_sha256"] = serde_json::json!("sha256:forged");
+        assert!(verify(&bad, session).is_err());
+        let mut bad = (*delivery).clone();
+        bad.payload["delivered_extent"]["body_sha256"] = serde_json::json!("sha256:forged");
+        assert!(verify(&bad, session).is_err());
+        let mut bad = (*delivery).clone();
+        bad.payload["transport"]["wire_body_sha256"] = serde_json::json!("");
+        assert!(verify(&bad, session).is_err());
+        let mut bad = (*delivery).clone();
+        bad.actor = Some("foreign".into());
+        assert!(!verify(&bad, session).unwrap());
+        let services = fixture.services.as_ref().unwrap();
+        let context = harness_contract::projection::ProjectionQueryContext {
+            principal:"nested-test".into(), workspace_id:services.workspace_key().into(),
+            session_scopes:vec![session.into()], mission_scopes:vec![],
+            visibility_grants:vec![format!("workspace:{}", services.workspace_key()),"resource:*".into()],
+            detail_scope:harness_contract::projection::ProjectionDetailScope::Full, authorization_revision:1,
+        };
+        let page = crate::execution_projection::read_evidence(services, root, &context, Default::default()).await.unwrap();
+        assert!(!page.incomplete, "{page:?}");
+        assert_eq!(page.reads.len(), 2);
+        assert!(page.reads.iter().all(|read| read.body_delivered && read.tool_name == "read_file"));
     }
 
     #[tokio::test]
@@ -6583,6 +6754,7 @@ fn empty_final_completion_is_failure_with_original_usage_not_a_goal_candidate() 
         depends_on: vec![],
     };
     let receipt = EarlyToolExecutionReceipt {
+        lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
         call: call.clone(),
         ready_at_ms: 1,
         started_at_ms: 2,

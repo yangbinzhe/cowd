@@ -42,6 +42,9 @@ use harness_contract::{
 };
 use serde_json::{json, Value};
 
+#[path = "facet_numeric_oracle.rs"]
+pub(crate) mod numeric_oracle;
+
 /// What one capability facet must have produced to pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FacetAcceptance {
@@ -246,6 +249,10 @@ impl ReadEvidencePages {
     }
 
     pub(crate) fn paths(&self) -> Vec<String> {
+        self.paths_with_frozen(None)
+    }
+
+    fn paths_with_frozen(&self, frozen: Option<&BTreeMap<String, String>>) -> Vec<String> {
         if self.failure.is_some() {
             return Vec::new();
         }
@@ -310,7 +317,13 @@ impl ReadEvidencePages {
                                 }
                                 None => false,
                             };
+                            let same_content = frozen.is_none_or(|digests| {
+                                digests.get(name).is_some_and(|digest| {
+                                    read.source_sha256.trim_start_matches("sha256:") == digest
+                                })
+                            });
                             same_path
+                                && same_content
                                 && read.body_delivered
                                 && grade_valid
                                 && extent_valid
@@ -358,6 +371,13 @@ impl ReadEvidencePages {
 /// Consume saved typed pages with independently registered path identities.
 /// Neither timeline previews nor projection activities participate in reads.
 pub(crate) fn collect_read_paths(observation: &Value) -> Vec<String> {
+    collect_read_paths_frozen(observation, None)
+}
+
+pub(crate) fn collect_read_paths_frozen(
+    observation: &Value,
+    frozen: Option<&BTreeMap<String, String>>,
+) -> Vec<String> {
     let (Some(execution), Some(session), Some(turn)) = (
         observation.get("execution_id").and_then(Value::as_str),
         observation.get("session_id").and_then(Value::as_str),
@@ -385,7 +405,7 @@ pub(crate) fn collect_read_paths(observation: &Value) -> Vec<String> {
             return Vec::new();
         }
     }
-    collection.paths()
+    collection.paths_with_frozen(frozen)
 }
 
 /// Gate one facet's outcome.
@@ -394,7 +414,34 @@ pub(crate) fn collect_read_paths(observation: &Value) -> Vec<String> {
 /// is what makes a facet's result comparable across builds.
 #[must_use]
 pub fn evaluate_facet(acceptance: &FacetAcceptance, outcome: &FacetOutcome) -> FacetVerdict {
+    evaluate_facet_with_numeric(acceptance, outcome, None)
+}
+
+pub(crate) fn evaluate_facet_with_numeric(
+    acceptance: &FacetAcceptance,
+    outcome: &FacetOutcome,
+    oracle: Option<&numeric_oracle::Snapshot>,
+) -> FacetVerdict {
     let mut requirements = Vec::new();
+
+    if matches!(
+        acceptance.facet_id.as_str(),
+        "read_six_named_files" | "deterministic_reduction_outside_the_model"
+    ) {
+        let passed = oracle.is_some_and(|snapshot| match acceptance.facet_id.as_str() {
+            "read_six_named_files" => numeric_oracle::batch_answer(snapshot, &outcome.answer),
+            _ => numeric_oracle::compute_answer(snapshot, &outcome.answer),
+        });
+        requirements.push(FacetRequirement {
+            requirement: "independent_numeric_oracle".to_string(),
+            passed,
+            observed: if passed {
+                numeric_oracle::VERSION.to_string()
+            } else {
+                "missing oracle or answer does not match frozen facts".to_string()
+            },
+        });
+    }
 
     // (1) An answer must exist. A facet that produced nothing has not
     // demonstrated its capability, whatever the evidence says.
@@ -454,6 +501,28 @@ pub fn evaluate_facet(acceptance: &FacetAcceptance, outcome: &FacetOutcome) -> F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_facet_requires_oracle_and_correct_answer() {
+        let mut spec = acceptance();
+        spec.facet_id = "deterministic_reduction_outside_the_model".into();
+        spec.required_read_paths.clear();
+        spec.answer_contains.clear();
+        let oracle = numeric_oracle::Snapshot {
+            files: vec![],
+            contents: vec![],
+            file_count: 2,
+            total_lines: 42,
+            top: [("alpha".to_string(), 2)].into_iter().collect(),
+            facts: [0; 7],
+        };
+        let mut result = outcome();
+        result.answer = "lines: 42\nfiles: 2\ntop crate: alpha\ntop crate files: 2".into();
+        assert!(!evaluate_facet(&spec, &result).passed);
+        assert!(evaluate_facet_with_numeric(&spec, &result, Some(&oracle)).passed);
+        result.answer = "lines: 43\nfiles: 2\ntop crate: alpha\ntop crate files: 2".into();
+        assert!(!evaluate_facet_with_numeric(&spec, &result, Some(&oracle)).passed);
+    }
 
     fn acceptance() -> FacetAcceptance {
         FacetAcceptance {
@@ -639,6 +708,20 @@ pub(crate) mod read_proof_tests {
         let report = proof.report();
         assert_eq!(report["history_complete"], false);
         assert_eq!(collect_read_paths(&report), vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn frozen_content_gate_requires_the_same_authenticated_read_digest() {
+        let mut proof = collection();
+        proof.accept(page()).unwrap();
+        let report = proof.report();
+        let good = BTreeMap::from([("src/a.rs".into(), "source-digest".into())]);
+        let bad = BTreeMap::from([("src/a.rs".into(), "foreign-digest".into())]);
+        assert_eq!(
+            collect_read_paths_frozen(&report, Some(&good)),
+            vec!["src/a.rs"]
+        );
+        assert!(collect_read_paths_frozen(&report, Some(&bad)).is_empty());
     }
 
     #[test]

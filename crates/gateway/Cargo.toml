@@ -115,6 +115,7 @@ required-features = ["test-support"]
 unsafe_code = "allow"
 
 [dev-dependencies]
+runtime-postgres = { path = "../runtime-postgres", features = ["test-fixtures"] }
 cowd-app-host = { path = "../app-host", features = ["test-support"] }
 auth-broker = { path = "../auth-broker", features = ["test-support"] }
 runtime = { path = "../runtime", features = ["test-fixtures"] }

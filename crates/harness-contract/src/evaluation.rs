@@ -86,6 +86,11 @@ mod fixture_profile_tests {
             Some("live-u5-fairness-v1"));
         assert_eq!(evaluation_fixture_corpus("live_minimal_batch_read").as_deref(),
             Some("live-batchread-v1"));
+        assert_eq!(evaluation_fixture_profile("live-batchread-v1").unwrap().observer_resource_grants,
+            ["read:Cargo.toml", "read:crates/tools/src/lib.rs",
+             "read:crates/runtime/src/lib.rs", "read:crates/memory/src/lib.rs",
+             "read:crates/gateway/src/main.rs", "read:crates/provider/src/lib.rs",
+             "read:crates/harness-eval/src/lib.rs"]);
     }
 }
 

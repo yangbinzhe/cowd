@@ -3181,6 +3181,7 @@ async fn r1_event_replay_host_tool_repeated_gain_and_saturation_are_real() {
             runtime,
             state: state.clone(),
             services: services.clone(),
+            goal_revalidation: std::sync::Mutex::new(None),
         };
         for attempt in 1..=2 {
             state.lock().await.iterations = attempt;
@@ -3350,6 +3351,7 @@ async fn expired_replay_is_seeded_into_the_existing_dag_before_a_fresh_dependent
         )),
     };
     let receipt = crate::conversation::EarlyToolExecutionReceipt {
+        lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
         call: call.clone(),
         ready_at_ms: 1,
         started_at_ms: 1,
@@ -8056,4 +8058,619 @@ fn tool_batch_413_actual_producer_consumer_preserves_calls_and_dependencies() {
     assert_eq!(restored[0].input, calls[0].input);
     assert_eq!(restored[0].depends_on, calls[0].depends_on);
     assert_eq!(ticket_session_id(&payload).as_deref(), Some("session-413"));
+}
+
+// Real Host regression: a compiler rejection must leave an authenticated
+// no-dispatch fact before the dependent model receives the error.
+#[derive(Clone)]
+struct RaRejectedHost {
+    host: Arc<tools::ToolHost>,
+    dispatched: Arc<AtomicUsize>,
+    captures: Arc<Mutex<Vec<(crate::RuntimeToolExecutionRequest, crate::RuntimeToolExecutionOutcome)>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::RuntimeExecutionHost for RaRejectedHost {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.host.pin_snapshot())
+    }
+
+    fn delegated_tool_effect_descriptor(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        Some(self.host.pin_snapshot().describe_effect(name, input))
+    }
+
+    async fn execute_runtime_tool(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> crate::RuntimeToolExecutionOutcome {
+        if request.tool_name == "tool_orchestrate" {
+            self.dispatched.fetch_add(1, Ordering::SeqCst);
+        }
+        let input = serde_json::from_str(&request.input).unwrap();
+        let result = self.host.pin_snapshot().execute_async(
+            request.authorization.as_ref().unwrap(), &request.tool_name, &input,
+        ).await;
+        let (status, output, error) = match result {
+            Ok(output) => (crate::RuntimeToolExecutionStatus::Executed, Some(output), None),
+            Err(error) => (crate::RuntimeToolExecutionStatus::Failed, None, Some(error.to_string())),
+        };
+        let outcome = crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(), tool_name: request.tool_name.clone(),
+            status, category: request.category, output, error,
+            evidence_ref: format!("tool-effect:{}", request.idempotency_key), observed_evidence: vec![],
+        };
+        self.captures.lock().unwrap().push((request.clone(), outcome.clone()));
+        outcome
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor for RaRejectedHost {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.host.pin_snapshot())
+    }
+    fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
+        self.host.pin_snapshot().catalog_receipt()
+    }
+    fn available_tool_names(&self) -> Vec<String> {
+        vec!["tool_search".into(), "read_file".into(), "tool_orchestrate".into()]
+    }
+    fn registered_tool_effect(&self, name: &str, input: &serde_json::Value) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        Some(self.host.pin_snapshot().describe_effect(name, input))
+    }
+    async fn execute_output(&self, _: &str, _: &str) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
+        Err(crate::ToolError::new("original governed host required"))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RaFixtureCase { Rejected, Mixed, Normal }
+
+#[derive(Clone)]
+struct RaRejectClient {
+    requests: usize,
+    lease: tools::ToolHostLease,
+    exposure: Option<harness_contract::tool::ToolExposureProjection>,
+    feedback: Arc<AtomicUsize>,
+    case: RaFixtureCase,
+}
+impl ApiClient for RaRejectClient {
+    fn configure_tool_exposure(&mut self, projection: harness_contract::tool::ToolExposureProjection) {
+        self.exposure = Some(projection);
+    }
+    fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+        let exposure = self.exposure.as_ref()?;
+        Some(self.lease.snapshot().catalog.definitions(None).into_iter()
+            .filter(|definition| exposure.active_ids.iter().chain(&exposure.bootstrap_ids).any(|id| id == &definition.name))
+            .map(|definition| crate::ProviderToolDefinition { name: definition.name, description: definition.description, input_schema: definition.input_schema }).collect())
+    }
+    fn stream(&mut self, request: crate::ApiRequest) -> Pin<Box<dyn Stream<Item = Result<crate::AssistantEvent, RuntimeError>> + Send + '_>> {
+        self.requests += 1;
+        let events = match self.requests {
+            1 => vec![Ok(crate::AssistantEvent::ToolUse { id: "ra-discover".into(), name: "tool_search".into(), input: r#"{"query":"select:read_file,tool_orchestrate"}"#.into() }), Ok(crate::AssistantEvent::MessageStop)],
+            2 => {
+                let mut events = Vec::new();
+                if self.case != RaFixtureCase::Normal {
+                    events.push(Ok(crate::AssistantEvent::ToolUse { id: "ra-rejected".into(), name: "tool_orchestrate".into(), input: serde_json::json!({"steps":[{"id":"compute","op":"compute","input":{"language":"python","code":"print(1)"}}]}).to_string() }));
+                }
+                if self.case != RaFixtureCase::Rejected {
+                    events.push(Ok(crate::AssistantEvent::ToolUse { id: "ra-read".into(), name: "read_file".into(), input: r#"{"path":"target.txt"}"#.into() }));
+                }
+                events.push(Ok(crate::AssistantEvent::MessageStop));
+                events
+            },
+            _ => {
+                let received = request.messages.iter().flat_map(|m| &m.blocks).any(|block| matches!(block,
+                    ContentBlock::ToolResult { tool_use_id, output, is_error: true, .. }
+                    if tool_use_id == "ra-rejected" && output.contains("governed tool node rejected before execution")));
+                if received { self.feedback.fetch_or(1, Ordering::SeqCst); }
+                let read_received = request.messages.iter().flat_map(|m| &m.blocks).any(|block| matches!(block,
+                    ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "ra-read"));
+                if read_received { self.feedback.fetch_or(2, Ordering::SeqCst); }
+                vec![Ok(crate::AssistantEvent::TextDelta("done".into())), Ok(crate::AssistantEvent::MessageStop)]
+            }
+        };
+        Box::pin(stream::iter(events))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ra_original_governed_rejection_closes_and_next_model_receives_error() {
+    let root = tempfile::tempdir().unwrap();
+    let host = Arc::new(tools::ToolHost::builtin("ra-reject", root.path())
+        .with_authorization_lease_verifier(Arc::new(crate::AuthorizationNegotiator::verify_lease_signature)));
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let feedback = Arc::new(AtomicUsize::new(0));
+    let executor = RaRejectedHost { host: host.clone(), dispatched: dispatched.clone(), captures: Arc::new(Mutex::new(Vec::new())) };
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
+    let services = crate::RuntimeServices::test_builder(root.path().join("home"), root.path())
+        .runtime_event_store(store.clone())
+        .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(root.path().join("artifacts"))))
+        .tool_execution_host(Arc::new(executor.clone()))
+        .build().unwrap();
+    let session = Session::new().with_workspace_root(root.path());
+    let session_id = session.session_id.clone();
+    let session_store = r1_tool_session_store(&session).await;
+    let runtime = crate::ConversationRuntime::new(session, RaRejectClient {
+        requests: 0, lease: host.pin_snapshot(), exposure: None, feedback: feedback.clone(), case: RaFixtureCase::Rejected,
+    }, executor, PermissionPolicy::new(crate::PermissionMode::ReadOnly), vec!["read files".into()])
+        .without_memory().with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(session_store));
+    let (_, result) = submit_test_owned_conversation_turn(runtime, services, "inspect source files", &SharedPrompter::none(), test_execution_lineage()).await;
+    result.expect("rejected tool must reach a continuation or terminal");
+    assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    assert!(feedback.load(Ordering::SeqCst) > 0, "dependent actual provider request must contain the original refusal");
+    let events = store.all_events(4096).unwrap();
+    let facts: Vec<_> = events.iter().filter(|e| e.kind == "execution_node.transitioned")
+        .filter_map(|e| e.payload.get("no_dispatch"))
+        .flat_map(|fact| fact["calls"].as_array().into_iter().flatten())
+        .filter(|call| call["call_id"] == "ra-rejected").collect();
+    assert_eq!(facts.len(), 1, "one original NoDispatch fact for the rejected call");
+    assert!(facts[0]["reason"].as_str().unwrap().contains("governed tool node rejected"));
+    let closure_found = events.iter().filter(|event| matches!(event.kind.as_str(), "execution_graph.recovered" | "execution_graph.checkpoint"))
+        .map(|event| store.resolve_read_record(event.clone()).unwrap())
+        .any(|event| event.payload["lease_closures"].as_array().into_iter().flatten().any(|closure|
+            closure["no_dispatch"]["calls"].as_array().into_iter().flatten().any(|call| call["call_id"] == "ra-rejected")));
+    assert!(closure_found, "the original binding must have a durable physical closure");
+    assert!(events.iter().all(|e| e.kind != "execution.effect.intent" || !e.payload.to_string().contains("ra-rejected")));
+    assert!(!session_id.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ra_original_governed_mixed_read_receipt_and_rejection_close() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("target.txt"), "original mixed read\n").unwrap();
+    let host = Arc::new(tools::ToolHost::builtin("ra-reject", root.path())
+        .with_authorization_lease_verifier(Arc::new(crate::AuthorizationNegotiator::verify_lease_signature)));
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let feedback = Arc::new(AtomicUsize::new(0));
+    let executor = RaRejectedHost { host: host.clone(), dispatched: dispatched.clone(), captures: Arc::new(Mutex::new(Vec::new())) };
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
+    let services = crate::RuntimeServices::test_builder(root.path().join("home"), root.path())
+        .runtime_event_store(store.clone())
+        .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(root.path().join("artifacts"))))
+        .tool_execution_host(Arc::new(executor.clone()))
+        .build().unwrap();
+    let session = Session::new().with_workspace_root(root.path());
+    let session_id = session.session_id.clone();
+    let session_store = r1_tool_session_store(&session).await;
+    let runtime = crate::ConversationRuntime::new(session, RaRejectClient {
+        requests: 0, lease: host.pin_snapshot(), exposure: None, feedback: feedback.clone(), case: RaFixtureCase::Mixed,
+    }, executor, PermissionPolicy::new(crate::PermissionMode::ReadOnly), vec!["read files".into()])
+        .without_memory().with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(session_store));
+    let (_, result) = submit_test_owned_conversation_turn(runtime, services, "inspect source files", &SharedPrompter::none(), test_execution_lineage()).await;
+    result.expect("rejected tool must reach a continuation or terminal");
+    assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    assert_eq!(feedback.load(Ordering::SeqCst) & 3, 3, "dependent model must receive both the real read and the refusal");
+    let events = store.all_events(4096).unwrap();
+    let facts: Vec<_> = events.iter().filter(|e| e.kind == "execution_node.transitioned")
+        .filter_map(|e| e.payload.get("no_dispatch"))
+        .flat_map(|fact| fact["calls"].as_array().into_iter().flatten())
+        .filter(|call| call["call_id"] == "ra-rejected").collect();
+    assert_eq!(facts.len(), 1, "one original NoDispatch fact for the rejected call");
+    assert!(facts[0]["reason"].as_str().unwrap().contains("governed tool node rejected"));
+    let closure_found = events.iter().filter(|event| matches!(event.kind.as_str(), "execution_graph.recovered" | "execution_graph.checkpoint"))
+        .map(|event| store.resolve_read_record(event.clone()).unwrap())
+        .any(|event| event.payload["lease_closures"].as_array().into_iter().flatten().any(|closure|
+            closure["no_dispatch"]["calls"].as_array().into_iter().flatten().any(|call| call["call_id"] == "ra-rejected")));
+    assert!(closure_found, "the original binding must have a durable physical closure");
+    assert!(events.iter().all(|e| e.kind != "execution.effect.intent" || !e.payload.to_string().contains("ra-rejected")));
+    assert!(events.iter().any(|e| e.kind == "execution.read.receipt" && e.payload.to_string().contains("ra-read")), "accepted original read must have a genuine receipt");
+    assert!(events.iter().filter_map(|e| e.payload.get("no_dispatch"))
+        .flat_map(|fact| fact["calls"].as_array().into_iter().flatten())
+        .all(|call| call["call_id"] != "ra-read"), "successful read cannot be certified as undispatched");
+    assert!(!session_id.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ra_original_governed_normal_read_keeps_its_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("target.txt"), "original mixed read\n").unwrap();
+    let host = Arc::new(tools::ToolHost::builtin("ra-reject", root.path())
+        .with_authorization_lease_verifier(Arc::new(crate::AuthorizationNegotiator::verify_lease_signature)));
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let feedback = Arc::new(AtomicUsize::new(0));
+    let executor = RaRejectedHost { host: host.clone(), dispatched: dispatched.clone(), captures: Arc::new(Mutex::new(Vec::new())) };
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
+    let services = crate::RuntimeServices::test_builder(root.path().join("home"), root.path())
+        .runtime_event_store(store.clone())
+        .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(root.path().join("artifacts"))))
+        .tool_execution_host(Arc::new(executor.clone()))
+        .build().unwrap();
+    let session = Session::new().with_workspace_root(root.path());
+    let session_id = session.session_id.clone();
+    let session_store = r1_tool_session_store(&session).await;
+    let runtime = crate::ConversationRuntime::new(session, RaRejectClient {
+        requests: 0, lease: host.pin_snapshot(), exposure: None, feedback: feedback.clone(), case: RaFixtureCase::Normal,
+    }, executor, PermissionPolicy::new(crate::PermissionMode::ReadOnly), vec!["read files".into()])
+        .without_memory().with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(session_store));
+    let (_, result) = submit_test_owned_conversation_turn(runtime, services, "inspect source files", &SharedPrompter::none(), test_execution_lineage()).await;
+    result.expect("rejected tool must reach a continuation or terminal");
+    assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    assert_eq!(feedback.load(Ordering::SeqCst) & 3, 2, "dependent model must receive the real read");
+    let events = store.all_events(4096).unwrap();
+    assert!(events.iter().any(|e| e.kind == "execution.read.receipt" && e.payload.to_string().contains("ra-read")), "accepted original read must have a genuine receipt");
+    assert!(events.iter().filter_map(|e| e.payload.get("no_dispatch"))
+        .flat_map(|fact| fact["calls"].as_array().into_iter().flatten())
+        .all(|call| call["call_id"] != "ra-read"), "successful read cannot be certified as undispatched");
+    assert!(!session_id.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ra_original_completed_read_replayed_through_compiler_rejection() {
+    Box::pin(ra_original_completed_read_replay_body()).await;
+}
+
+async fn ra_original_completed_read_replay_body() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("target.txt"), "original replay source\n").unwrap();
+    let host = Arc::new(tools::ToolHost::builtin("ra-replay", root.path())
+        .with_authorization_lease_verifier(Arc::new(crate::AuthorizationNegotiator::verify_lease_signature)));
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let captures = Arc::new(Mutex::new(Vec::new()));
+    let executor = RaRejectedHost { host: host.clone(), dispatched, captures: captures.clone() };
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
+    let services = crate::RuntimeServices::test_builder(root.path().join("home"), root.path())
+        .runtime_event_store(store.clone())
+        .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(root.path().join("artifacts"))))
+        .tool_execution_host(Arc::new(executor.clone()))
+        .build().unwrap();
+    let session = Session::new().with_workspace_root(root.path());
+    let session_id = session.session_id.clone();
+    let session_store = r1_tool_session_store(&session).await;
+    let runtime = crate::ConversationRuntime::new(session, RaRejectClient {
+        requests: 0, lease: host.pin_snapshot(), exposure: None,
+        feedback: Arc::new(AtomicUsize::new(0)), case: RaFixtureCase::Normal,
+    }, executor.clone(), PermissionPolicy::new(crate::PermissionMode::ReadOnly), vec!["read files".into()])
+        .without_memory().with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(session_store));
+    let (runtime, result) = Box::pin(submit_test_owned_conversation_turn(runtime, services.clone(), "inspect source files", &SharedPrompter::none(), test_execution_lineage())).await;
+    result.expect("original read must complete");
+    let (request, original) = captures.lock().unwrap().iter().find(|(request, _)| request.tool_use_id == "ra-read").unwrap().clone();
+    assert_eq!(original.status, crate::RuntimeToolExecutionStatus::Executed);
+    let parent = request.parent_execution.as_ref().unwrap();
+    let attempt = request.parent_execution_attempt.unwrap();
+    let graph = services.graph_state_store().load(&parent.execution_id).unwrap();
+    let binding = services.graph_state_store().current_binding(&graph, &parent.node_id, attempt).unwrap();
+    let (ticket, _) = services.graph_state_store().binding_start_ticket(&graph, &parent.node_id, &binding).unwrap();
+    let original_receipts: Vec<_> = store.all_events(4096).unwrap().into_iter()
+        .filter(|event| event.kind == "execution.read.receipt" && event.payload.to_string().contains("ra-read")).collect();
+    assert_eq!(original_receipts.len(), 1, "replay requires the original durable receipt");
+    let original_dispatches = captures.lock().unwrap().len();
+    let call = ModelToolCall { id: request.tool_use_id.clone(), name: request.tool_name.clone(),
+        input: request.input.clone(), depends_on: vec![], binding: request.step_binding.clone() };
+    let lifecycle_events = store.all_events(4096).unwrap();
+    let lifecycle = lifecycle_events.iter()
+        .find(|event| event.kind == "tool.invocation.completed" && event.payload["tool_call_id"] == call.id)
+        .cloned();
+    if lifecycle.is_none() {
+        // Synthetic fixture only: retain metadata for the first missing edge,
+        // without publishing input, output, or unrelated event payloads.
+        let facts = lifecycle_events.iter().filter(|event|
+            (event.kind.starts_with("tool.invocation.") && event.payload["tool_call_id"] == call.id)
+            || (event.kind == "execution.read.receipt" && event.payload["tool_use_id"] == call.id)
+        ).map(|event| serde_json::json!({
+            "kind":event.kind, "status":event.status, "cursor":event.commit_cursor,
+            "anchor_present":!event.payload["lifecycle_anchor"].is_null(),
+            "invocation_id_present":event.payload["invocation_id"].as_str().is_some(),
+            "failure_kind":event.payload["failure_kind"],
+        })).collect::<Vec<_>>();
+        eprintln!("ra_replay_missing_lifecycle {}", serde_json::json!({"call_id":call.id,"events":facts}));
+    }
+    let lifecycle = lifecycle.expect("original read invocation lifecycle");
+    let started_at_ms = lifecycle.payload["started_at_ms"].as_u64().expect("original start time");
+    let completed_at_ms = lifecycle.payload["ended_at_ms"].as_u64().expect("original completion time");
+    let anchor = &original_receipts[0].payload["lifecycle_anchor"];
+    assert_eq!(anchor["invocation_id"], lifecycle.payload["invocation_id"],
+        "the original effect transaction must retain the actual producer UUID");
+    assert!(anchor.get("input_preview").is_none() && anchor.get("output").is_none(),
+        "the identity anchor must not duplicate private tool payloads");
+    let actual_anchor = request.tool_progress.lifecycle_anchor().unwrap().expect("actual Host producer anchor");
+    let items = store.all_events(4096).unwrap().into_iter().filter(|event|
+        event.kind == "model.item_completed" && event.payload["tool_call_id"] == call.id
+            && event.payload["tool_name"] == call.name && event.stream_id == format!("session:{session_id}")
+            && event.commit_cursor < original_receipts[0].commit_cursor).collect::<Vec<_>>();
+    assert_eq!(items.len(), 1, "one original session model item must precede this effect");
+    let item = &items[0];
+    assert_eq!(original_receipts[0].payload["replay"]["origin"],
+        serde_json::to_value(&call.binding.as_ref().unwrap().origin).unwrap());
+    assert_eq!(request.step_binding, call.binding);
+    assert_eq!(call.binding.as_ref().unwrap().snapshot.identity.session_id, session_id);
+    assert_eq!(harness_contract::step::parse_strict_json(item.payload["content"].as_str().unwrap()).unwrap(),
+        harness_contract::step::parse_strict_json(&call.input).unwrap());
+    let original_model_owner = item.activity_binding().expect("original model node owner");
+    assert_eq!(actual_anchor.producer.parent_activity_id.as_deref(), Some(original_model_owner.activity_id.as_str()));
+    assert_eq!(actual_anchor.producer.initiator_activity_id.as_deref(), Some(original_model_owner.activity_id.as_str()));
+    assert_eq!(actual_anchor.producer.activity_id, crate::cowd_event::owned_child_activity_id(
+        &original_model_owner, "tool", &format!("{}:{}", item.payload["model_step_id"].as_str().unwrap(), call.id)),
+        "the effect and lifecycle must retain the exact original model-item producer");
+    let source_bus = runtime.cowd_bus().cloned().expect("original root bus");
+    let source_scope = source_bus.enter_execution_with_activity(crate::CowdExecutionContext {
+        execution_id: original_model_owner.root_execution_id.clone(), session_id: session_id.clone(),
+        turn_id: original_model_owner.turn_id.clone(),
+    }, Some(original_model_owner.clone()));
+    assert_eq!(runtime.native_tool_activity_owner(&call.id, &call.name, &crate::tool_invocation::stable_hash(&call.input)).unwrap(),
+        Some(actual_anchor.producer.clone()));
+    assert!(runtime.native_tool_activity_owner(&call.id, &call.name, "foreign-input-hash").is_err());
+    assert!(runtime.native_tool_activity_owner("foreign-call", &call.name, &crate::tool_invocation::stable_hash(&call.input)).unwrap().is_none());
+    drop(source_scope);
+    for field in ["session", "call", "input", "producer", "missing_id"] {
+        let mut forged = request.clone();
+        forged.tool_progress = crate::ToolProgressSink::default();
+        let mut changed = actual_anchor.clone();
+        match field {
+            "session" => changed.session_id = "foreign-session".into(),
+            "call" => changed.tool_call_id = "foreign-call".into(),
+            "input" => changed.input_hash = "foreign-input".into(),
+            "producer" => changed.producer.session_id = "foreign-session".into(),
+            "missing_id" => changed.invocation_id.clear(),
+            _ => unreachable!(),
+        }
+        forged.tool_progress.record_lifecycle_anchor(changed).unwrap();
+        assert!(crate::execution_core::graph::receipt_lifecycle_anchor(&forged).is_err(), "forged {field} anchor");
+    }
+    let mut legacy = request.clone();
+    legacy.tool_progress = crate::ToolProgressSink::default();
+    assert!(crate::execution_core::graph::receipt_lifecycle_anchor(&legacy).unwrap().is_none(),
+        "older receipts with no anchor remain valid without manufacturing one");
+    let step_binding = request.step_binding.as_ref().expect("original Step binding");
+    let query = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding, parent_execution: parent, session_id: &session_id,
+        policy_revision: request.policy_revision, idempotency_key: &request.idempotency_key,
+        tool_use_id: &call.id, tool_name: &call.name, input: &call.input,
+    };
+    let replay = services.commit_service().query_completed_tool_effect(&query).unwrap().expect("original authenticated receipt");
+    assert_eq!(replay.lifecycle.as_ref(), Some(&lifecycle), "query must authenticate the exact original lifecycle");
+    assert_eq!(replay.outcome.output, original.output);
+    let consumer_node = graph.nodes.iter().find(|node| node.id != parent.node_id)
+        .expect("original graph must contain another real consumer node");
+    let consumer = harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: parent.execution_id.clone(), node_id: consumer_node.id.clone(),
+    };
+    let cross_query = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding, parent_execution: &consumer, session_id: &session_id,
+        policy_revision: request.policy_revision, idempotency_key: &request.idempotency_key,
+        tool_use_id: &call.id, tool_name: &call.name, input: &call.input,
+    };
+    let cross = services.commit_service().query_completed_tool_effect(&cross_query).unwrap().expect("same graph cross-node consumer");
+    assert_eq!(cross.lifecycle.as_ref(), Some(&lifecycle), "consumer node must retain the original producer event");
+    assert_eq!(cross.outcome.output, original.output);
+    let mut foreign_step = step_binding.clone();
+    foreign_step.origin.origin_step_id.push_str("-foreign-step");
+    let wrong_step = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding: &foreign_step, parent_execution: &consumer, session_id: &session_id,
+        policy_revision: request.policy_revision, idempotency_key: &request.idempotency_key,
+        tool_use_id: &call.id, tool_name: &call.name, input: &call.input,
+    };
+    assert!(services.commit_service().query_completed_tool_effect(&wrong_step).is_err(),
+        "the same call cannot acquire a different original Step");
+    let mut foreign_attempt = step_binding.clone();
+    std::sync::Arc::make_mut(&mut foreign_attempt.snapshot).identity.attempt = Some(999);
+    let wrong_attempt = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding: &foreign_attempt, parent_execution: &consumer, session_id: &session_id,
+        policy_revision: request.policy_revision, idempotency_key: &request.idempotency_key,
+        tool_use_id: &call.id, tool_name: &call.name, input: &call.input,
+    };
+    assert!(services.commit_service().query_completed_tool_effect(&wrong_attempt).is_err(),
+        "the same call cannot acquire a different original Step attempt");
+    let wrong_input = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding, parent_execution: &consumer, session_id: &session_id,
+        policy_revision: request.policy_revision, idempotency_key: &request.idempotency_key,
+        tool_use_id: &call.id, tool_name: &call.name, input: r#"{"path":"other.txt"}"#,
+    };
+    assert!(services.commit_service().query_completed_tool_effect(&wrong_input).is_err(), "foreign input cannot recover the original lifecycle");
+    let wrong_session = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding, parent_execution: &consumer, session_id: "foreign-session",
+        policy_revision: request.policy_revision, idempotency_key: &request.idempotency_key,
+        tool_use_id: &call.id, tool_name: &call.name, input: &call.input,
+    };
+    assert!(services.commit_service().query_completed_tool_effect(&wrong_session).is_err(), "foreign session cannot recover the original lifecycle");
+    let receipt = crate::conversation::EarlyToolExecutionReceipt { lifecycle: crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: replay.lifecycle }, call: call.clone(), outcome: replay.outcome,
+        ready_at_ms: started_at_ms, started_at_ms, completed_at_ms };
+    let precompleted = BTreeMap::from([(call.id.clone(), receipt)]);
+    let decision = request.execution_decision.as_ref().unwrap();
+    let authorizations = HashMap::new();
+    let gaps = HashMap::new();
+    let prepared = HashMap::new();
+    let replay_empty_owner = HashMap::new();
+    let replay_once = || Box::pin(execute_governed_runtime_tool_batch(
+        Arc::new(executor.clone()), None, std::slice::from_ref(&call), &session_id,
+        request.sandbox_posture, request.policy_revision, None, None, None, &ticket, 1,
+        &authorizations, &gaps, &prepared,
+        Err(crate::GovernedToolCompileError::InvalidNormalizedScope {
+            task_id: call.id.clone(), scope: "unknown".into(), reason: "controlled replay rejection".into(),
+        }), decision, services.tool_execution_plane(), services.tool_batch_executor(),
+        services.commit_service(), &precompleted, &replay_empty_owner,
+    ));
+    let (result, concurrent) = tokio::join!(replay_once(), replay_once());
+    assert!(concurrent.refused_before_dispatch.is_empty());
+    assert!(concurrent.invocations.is_empty(), "same-key concurrent replay must not manufacture another lifecycle");
+    assert!(result.refused_before_dispatch.is_empty(), "completed original must not be certified as undispatched");
+    assert_eq!(captures.lock().unwrap().len(), original_dispatches, "replay cannot dispatch again");
+    assert_eq!(result.observed_evidence, original.observed_evidence);
+    assert!(result.messages.iter().flat_map(|m| &m.blocks).any(|block| matches!(block,
+        ContentBlock::ToolResult { tool_use_id, tool_name, output, is_error: false, .. }
+        if tool_use_id == &call.id && tool_name == &call.name && Some(output) == original.output.as_ref())));
+    assert!(!result.invocations.contains_key(&call.id),
+        "durable effect replay must not mint or reappend a lifecycle");
+    let mut missing = precompleted.clone();
+    missing.get_mut(&call.id).unwrap().lifecycle = crate::conversation::ToolLifecycleReuse::Unknown;
+    let unknown_result = Box::pin(execute_governed_runtime_tool_batch(
+        Arc::new(executor.clone()), None, std::slice::from_ref(&call), &session_id,
+        request.sandbox_posture, request.policy_revision, None, None, None, &ticket, 1,
+        &authorizations, &gaps, &prepared,
+        Err(crate::GovernedToolCompileError::InvalidNormalizedScope {
+            task_id: call.id.clone(), scope: "unknown".into(), reason: "controlled missing lifecycle".into(),
+        }), decision, services.tool_execution_plane(), services.tool_batch_executor(),
+        services.commit_service(), &missing, &HashMap::new(),
+    )).await;
+    assert!(unknown_result.invocations.is_empty(), "missing lifecycle must remain unknown");
+    assert!(unknown_result.refused_before_dispatch.is_empty());
+    assert_eq!(captures.lock().unwrap().len(), original_dispatches);
+    let original_lifecycle_count = store.all_events(4096).unwrap().into_iter()
+        .filter(|event| event.kind.starts_with("tool.invocation.") && event.payload["tool_call_id"] == call.id).count();
+    let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
+    // Recover the original producer on a different *actual* node of the same
+    // graph after discarding only the test's in-memory projections.
+    let node_event = store.all_events(4096).unwrap().into_iter()
+        .find(|event| event.kind == "execution_node.transitioned"
+            && event.status.as_deref() == Some("running")
+            && event.payload["node_id"] == consumer.node_id)
+        .expect("actual consumer node transition");
+    let consumer_owner = node_event.activity_binding().expect("actual consumer node owner");
+    let original_owner = lifecycle.activity_binding().expect("actual original tool producer");
+    assert_ne!(consumer_owner.activity_id, original_owner.activity_id);
+    let bus = runtime.lock().await.cowd_bus().cloned().expect("original Runtime event bus");
+    let consumer_scope = bus.enter_execution_with_activity(crate::CowdExecutionContext {
+        execution_id: parent.execution_id.clone(), session_id: session_id.clone(),
+        turn_id: step_binding.snapshot.identity.turn_id.clone(),
+    }, Some(consumer_owner));
+    {
+        let owner = runtime.lock().await;
+        owner.clear_native_replay_cache_for_test();
+        owner.remember_native_tool_calls(std::slice::from_ref(&call)).unwrap();
+        owner.restore_native_root_owner_from_replay(&call, precompleted.get(&call.id).unwrap()).unwrap();
+        let restored = owner.native_root_owner_for_test(&step_binding.effect_idempotency_key()).expect("authenticated original root owner");
+        assert_eq!(restored.event_id, lifecycle.event_id);
+        assert_eq!(restored.binding, original_owner);
+        for field in ["root", "attempt"] {
+            owner.clear_native_replay_cache_for_test();
+            owner.remember_native_tool_calls(std::slice::from_ref(&call)).unwrap();
+            let mut foreign = precompleted.get(&call.id).unwrap().clone();
+            if let crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: Some(event) } = &mut foreign.lifecycle {
+                if field == "root" { event.payload["_runtime_activity_binding"]["root_execution_id"] = "foreign-root".into(); }
+                else { let fence = event.payload["_runtime_activity_binding"]["fence"].as_u64().unwrap(); event.payload["_runtime_activity_binding"]["fence"] = (fence + 1).into(); }
+            }
+            assert!(owner.restore_native_root_owner_from_replay(&call, &foreign).is_err(), "foreign {field} original owner");
+            assert!(owner.native_root_owner_for_test(&step_binding.effect_idempotency_key()).is_none());
+        }
+        owner.clear_native_replay_cache_for_test();
+        owner.remember_native_tool_calls(std::slice::from_ref(&call)).unwrap();
+        let mut no_anchor = precompleted.get(&call.id).unwrap().clone();
+        no_anchor.lifecycle = crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: None };
+        owner.restore_native_root_owner_from_replay(&call, &no_anchor).unwrap();
+        assert!(owner.native_root_owner_for_test(&step_binding.effect_idempotency_key()).is_none(),
+            "older receipt without an authenticated lifecycle stays unknown");
+        owner.clear_native_replay_cache_for_test();
+        owner.remember_native_tool_calls(std::slice::from_ref(&call)).unwrap();
+        let mut changed = call.clone();
+        changed.input = r#"{"path":"other.txt"}"#.into();
+        assert!(owner.restore_native_root_owner_from_replay(&changed, precompleted.get(&call.id).unwrap()).is_err());
+        assert!(owner.native_root_owner_for_test(&step_binding.effect_idempotency_key()).is_none());
+    }
+    drop(consumer_scope);
+    let delivered = Box::pin(compact_governed_tool_messages(&runtime, std::slice::from_ref(&call), result.messages.clone(), &result.invocations, &precompleted)).await.unwrap();
+    assert!(delivered.iter().flat_map(|m| &m.blocks).any(|block| matches!(block,
+        ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == &call.id)));
+    assert_eq!(store.all_events(4096).unwrap().into_iter()
+        .filter(|event| event.kind.starts_with("tool.invocation.") && event.payload["tool_call_id"] == call.id).count(), original_lifecycle_count,
+        "the real compactor cannot append a duplicate invocation lifecycle");
+    let persisted_lifecycle: Vec<_> = store.all_events(4096).unwrap().into_iter()
+        .filter(|event| event.kind == "tool.invocation.completed" && event.payload["tool_call_id"] == call.id)
+        .collect();
+    assert_eq!(persisted_lifecycle, vec![lifecycle.clone()], "the original invocation UUID and lifecycle must remain unchanged");
+    let after: Vec<_> = store.all_events(4096).unwrap().into_iter()
+        .filter(|event| event.kind == "execution.read.receipt" && event.payload.to_string().contains("ra-read")).collect();
+    assert_eq!(after, original_receipts, "original durable read receipt cannot be replaced or duplicated");
+
+    // Exercise the same real owner record reaching the compactor twice.  The
+    // existing keyed lifecycle remains the only durable terminal fact.
+    let original_record: crate::ToolInvocationRecord = serde_json::from_value(lifecycle.payload.clone()).unwrap();
+    let key = format!("tool-lifecycle:{}:tool.invocation.completed", original_record.invocation_id);
+    let stream = format!("session:{session_id}");
+    let keyed = store.event_by_idempotency_key(&stream, &key).unwrap().expect("original lifecycle writer must index its real identity");
+    assert_eq!(keyed.event_id, lifecycle.event_id);
+    let original_producer = lifecycle.activity_binding().expect("original tool lifecycle owner");
+    let bus = runtime.lock().await.cowd_bus().cloned().expect("original Runtime event bus");
+    let _scope = enter_owned_root_scope(&services, &bus, &graph, None).unwrap();
+    let mut pending = precompleted.clone();
+    pending.get_mut(&call.id).unwrap().lifecycle = crate::conversation::ToolLifecycleReuse::PendingOriginal { record: original_record, producer: original_producer };
+    let pending_result = Box::pin(execute_governed_runtime_tool_batch(
+        Arc::new(executor.clone()), Some(bus.clone()), std::slice::from_ref(&call), &session_id,
+        request.sandbox_posture, request.policy_revision, None, None, None, &ticket, 1,
+        &authorizations, &gaps, &prepared,
+        Err(crate::GovernedToolCompileError::InvalidNormalizedScope {
+            task_id: call.id.clone(), scope: "unknown".into(), reason: "controlled replay rejection".into(),
+        }), decision, services.tool_execution_plane(), services.tool_batch_executor(),
+        services.commit_service(), &pending, &HashMap::new(),
+    )).await;
+    assert_eq!(pending_result.invocations[&call.id].invocation_id, lifecycle.payload["invocation_id"].as_str().unwrap());
+    for _ in 0..2 {
+        Box::pin(compact_governed_tool_messages(&runtime, std::slice::from_ref(&call), pending_result.messages.clone(), &pending_result.invocations, &pending)).await.unwrap();
+    }
+    let terminal_events: Vec<_> = store.all_events(4096).unwrap().into_iter()
+        .filter(|event| event.kind == "tool.invocation.completed" && event.payload["tool_call_id"] == call.id).collect();
+    assert_eq!(terminal_events, vec![lifecycle], "same original invocation cannot gain a duplicate lifecycle");
+    assert_eq!(captures.lock().unwrap().len(), original_dispatches);
+    let mut conflicting = pending.clone();
+    if let crate::conversation::ToolLifecycleReuse::PendingOriginal { producer, .. } = &mut conflicting.get_mut(&call.id).unwrap().lifecycle {
+        producer.session_id = "foreign-session".into();
+    }
+    let conflict_result = Box::pin(execute_governed_runtime_tool_batch(
+        Arc::new(executor.clone()), Some(bus), std::slice::from_ref(&call), &session_id,
+        request.sandbox_posture, request.policy_revision, None, None, None, &ticket, 1,
+        &authorizations, &gaps, &prepared,
+        Err(crate::GovernedToolCompileError::InvalidNormalizedScope {
+            task_id: call.id.clone(), scope: "unknown".into(), reason: "controlled foreign producer".into(),
+        }), decision, services.tool_execution_plane(), services.tool_batch_executor(),
+        services.commit_service(), &conflicting, &HashMap::new(),
+    )).await;
+    assert!(conflict_result.invocations.is_empty(), "governed host must not publish a foreign producer");
+    assert!(runtime.lock().await.prepare_replayed_tool_result(&call, conflicting.get(&call.id).unwrap()).await.is_err(),
+        "legacy host must reject the same foreign producer");
+    assert_eq!(captures.lock().unwrap().len(), original_dispatches);
+    drop(_scope);
+    Box::pin(ra_lifecycle_append_failure_probe()).await;
+}
+
+// The effect commits before this injected lifecycle-writer failure.  Recovery
+// must reuse that exact effect while leaving the missing producer proof unknown.
+async fn ra_lifecycle_append_failure_probe() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("target.txt"), "append fault source\n").unwrap();
+    let host = Arc::new(tools::ToolHost::builtin("ra-append-fault", root.path())
+        .with_authorization_lease_verifier(Arc::new(crate::AuthorizationNegotiator::verify_lease_signature)));
+    let captures = Arc::new(Mutex::new(Vec::new()));
+    let executor = RaRejectedHost { host: host.clone(), dispatched: Arc::new(AtomicUsize::new(0)), captures: captures.clone() };
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
+    let services = crate::RuntimeServices::test_builder(root.path().join("home"), root.path())
+        .runtime_event_store(store.clone())
+        .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(root.path().join("artifacts"))))
+        .tool_execution_host(Arc::new(executor.clone())).build().unwrap();
+    let session = Session::new().with_workspace_root(root.path());
+    let session_id = session.session_id.clone();
+    crate::conversation::arm_lifecycle_append_failure(&session_id, "ra-read");
+    let session_store = r1_tool_session_store(&session).await;
+    let runtime = crate::ConversationRuntime::new(session, RaRejectClient {
+        requests: 0, lease: host.pin_snapshot(), exposure: None,
+        feedback: Arc::new(AtomicUsize::new(0)), case: RaFixtureCase::Normal,
+    }, executor.clone(), PermissionPolicy::new(crate::PermissionMode::ReadOnly), vec!["read files".into()])
+        .without_memory().with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(session_store));
+    let (_runtime, _result) = submit_test_owned_conversation_turn(runtime, services.clone(), "inspect source files", &SharedPrompter::none(), test_execution_lineage()).await;
+    let calls = captures.lock().unwrap();
+    assert_eq!(calls.iter().filter(|(request, _)| request.tool_use_id == "ra-read").count(), 1,
+        "append failure cannot cause a second physical read");
+    let (request, original) = calls.iter().find(|(request, _)| request.tool_use_id == "ra-read").unwrap().clone();
+    drop(calls);
+    let events = store.all_events(4096).unwrap();
+    assert!(events.iter().any(|event| event.kind == "execution.read.receipt" && event.payload.to_string().contains("ra-read")),
+        "the original physical effect must already be durable");
+    assert!(!events.iter().any(|event| event.kind == "tool.invocation.completed" && event.payload["tool_call_id"] == "ra-read"),
+        "the injected writer failure must leave no fabricated lifecycle");
+    assert!(!events.iter().any(|event| event.kind == "context.model_input_observed" && event.payload["tool_invocation_id"] == "ra-read"),
+        "missing producer lifecycle cannot become independent read proof");
+    let parent = request.parent_execution.as_ref().unwrap();
+    let call = ModelToolCall { id: request.tool_use_id.clone(), name: request.tool_name.clone(), input: request.input.clone(),
+        depends_on: vec![], binding: request.step_binding.clone() };
+    let query = crate::execution_core::graph::ToolReceiptQuery {
+        step_binding: request.step_binding.as_ref().unwrap(), parent_execution: parent, session_id: &session_id,
+        policy_revision: request.policy_revision, idempotency_key: &request.idempotency_key,
+        tool_use_id: &call.id, tool_name: &call.name, input: &call.input,
+    };
+    let recovered = services.commit_service().query_completed_tool_effect(&query).unwrap().expect("original read receipt");
+    assert!(recovered.lifecycle.is_none(), "absent event must stay unknown");
+    assert_eq!(recovered.outcome.output, original.output, "recovery retains the real receipt output");
+    assert_eq!(captures.lock().unwrap().iter().filter(|(request, _)| request.tool_use_id == "ra-read").count(), 1);
 }
