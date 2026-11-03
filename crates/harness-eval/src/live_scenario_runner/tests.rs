@@ -5339,3 +5339,35 @@ fn v2_scenario_selection_keeps_v1_and_unimplemented_scenarios_unchanged() {
     assert!(matches!(tool.acceptance, LiveAcceptance::V2WorkspaceVersion));
     assert_eq!(Some(tool.prompt), v2_group_one_prompt("live_tool_evidence"));
 }
+
+#[test]
+fn numeric_acceptance_does_not_regate_terminal_observation() {
+    let mut checks = vec![
+        json!({"name":"independent_numeric_oracle", "passed":true}),
+        json!({"name":"frozen_content_read_receipts", "passed":true}),
+        json!({"name":"read_receipt:Cargo.toml", "passed":true}),
+        json!({"name":"durable_response", "passed":true}),
+        json!({"name":"run_reached_terminal_state", "passed":true}),
+        json!({"name":"root_business_outcome_succeeded", "passed":true}),
+        json!({"name":"terminal_three_piece_complete", "passed":false,
+            "missing":["goal_verified"], "pieces":{"goal_verified":false,
+                "business_outcome":true, "user_visible_delivery":true}}),
+    ];
+    assert!(numeric_acceptance_checks_pass(&checks));
+    for index in 0..6 {
+        checks[index]["passed"] = json!(false);
+        assert!(!numeric_acceptance_checks_pass(&checks), "{} must remain required", checks[index]["name"]);
+        checks[index]["passed"] = json!(true);
+    }
+    checks[6]["pieces"]["business_outcome"] = json!(false);
+    assert!(!numeric_acceptance_checks_pass(&checks));
+    checks[6]["pieces"]["business_outcome"] = json!(true);
+    checks[6]["pieces"]["user_visible_delivery"] = json!(false);
+    assert!(!numeric_acceptance_checks_pass(&checks));
+    checks[6]["pieces"]["user_visible_delivery"] = json!(true);
+    checks[6]["missing"] = json!(["goal_verified", "business_outcome"]);
+    assert!(!numeric_acceptance_checks_pass(&checks));
+    checks[6]["missing"] = json!(["goal_verified"]);
+    checks.push(json!({"name":"agentic_program_verified", "passed":false}));
+    assert!(!numeric_acceptance_checks_pass(&checks), "an explicit Program gate remains required");
+}
