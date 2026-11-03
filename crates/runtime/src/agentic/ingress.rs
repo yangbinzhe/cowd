@@ -551,8 +551,9 @@ impl RuntimeServices {
                     crate::tool_host::OriginalMemberUnboundCommit { handle, reason: "original committed member awaits owner reconciliation".into() }))),
             OriginalIngressResult::PreparedMember(PreparedMemberChecked::NoCommittedReceipt(observation)) =>
                 Outcome::Stopped(make_stop(coordinate, Stop::UnknownNoReceipt(observation))),
-            OriginalIngressResult::PreparedMember(PreparedMemberChecked::Error(error)) =>
-                Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeError(error))),
+            OriginalIngressResult::PreparedMember(PreparedMemberChecked::Error(error)) => {
+                Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeError(error)))
+            },
             _ => Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeUnknown("unexpected original member result".into()))),
         }
     }
@@ -759,25 +760,39 @@ impl RuntimeServices {
                     let committed = candidate.commit_checked(self, &streams, |held, sources, member, authority, reservation, effect_fence| {
                         let (control, claim, cursor, outer_hook) = if let Some(host) = member.host() {
                             let (control, claim, cursor) = host.locked_commit_context()
-                                .map_err(crate::AgentActionServiceError::MemberUnknown)?;
+                                .map_err(|error| {
+                                    crate::AgentActionServiceError::MemberUnknown(error)
+                                })?;
                             let hook = host.original_outer_hook_owner()
-                                .map_err(crate::AgentActionServiceError::MemberUnknown)?;
+                                .map_err(|error| {
+                                    crate::AgentActionServiceError::MemberUnknown(error)
+                                })?;
                             (control, claim, cursor, Some(hook))
                         } else if let Some(process) = member.process() {
                             let (control, claim, cursor) = process.locked_commit_context()
-                                .map_err(crate::AgentActionServiceError::MemberUnknown)?;
+                                .map_err(|error| {
+                                    crate::AgentActionServiceError::MemberUnknown(error)
+                                })?;
                             (control, claim, cursor, None)
                         } else {
                             return Err(crate::AgentActionServiceError::MemberUnknown(
                                 "original member owner is unavailable".into()));
                         };
                         let authorization = authority.staged_authorization_for_original_action()
-                            .map_err(crate::AgentActionServiceError::MemberUnknown)?.authorization;
+                            .map_err(|error| {
+                                crate::AgentActionServiceError::MemberUnknown(error)
+                            })?.authorization;
                         // New authority events are part of A's checked append;
                         // there are no prior consumed member events to invent.
-                        match actions.apply_member_locked(envelope, goal, verification, sources, held, control,
-                            &claim, cursor, member.prepared(), &authorization, member.ticket(), &[], authority, reservation, effect_fence, outer_hook.as_ref())? {
-                            super::action_service::OriginalMemberSubmission::Committed(handle) => Ok(handle),
+                        let applied = actions.apply_member_locked(envelope, goal, verification, sources, held, control,
+                            &claim, cursor, member.prepared(), &authorization, member.ticket(), &[], authority, member, reservation, effect_fence, outer_hook.as_ref())
+                            .map_err(|error| {
+                                error
+                            })?;
+                        match applied {
+                            super::action_service::OriginalMemberSubmission::Committed(handle) => {
+                                Ok(handle)
+                            },
                             super::action_service::OriginalMemberSubmission::NoCommittedReceipt(observation) => {
                                 *no_receipt.borrow_mut() = Some(observation);
                                 Err(crate::AgentActionServiceError::MemberUnknown("original member has no committed receipt".into()))

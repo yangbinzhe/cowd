@@ -611,34 +611,37 @@ impl GatewayToolExecutor {
         let mut results = Vec::with_capacity(actions.len());
         for (index, entry) in actions.iter().enumerate() {
             let member_result: Result<(String, String), ToolError> = async {
-                let owner = original.tool_progress.batch_policy_owner().map_err(ToolError::unknown)?
-                    .ok_or_else(|| ToolError::unknown("batch original member policy owner missing"))?;
+                let owner = original.tool_progress.batch_policy_owner().map_err(|error| {
+                    ToolError::unknown(error)
+                })?.ok_or_else(|| {
+                    ToolError::unknown("batch original member policy owner missing")
+                })?;
                 match owner.prepare_member_pregrant(original, index).await {
                 runtime::tool_host::AgentBatchMemberPregrant::Replay(member) => {
-                    let tool = entry.get("tool").and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| ToolError::unknown("replayed original member tool unavailable"))?.to_string();
-                    let output = match member.delivery() {
-                        runtime::tool_host::BatchMemberDelivery::Complete(outcome)
-                            if outcome.status == runtime::RuntimeToolExecutionStatus::Executed => outcome.output.clone(),
-                        _ => None,
-                    };
+                    entry.get("tool").and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| ToolError::unknown("replayed original member tool unavailable"))?;
                     original.tool_progress.record_original_member(index, std::sync::Arc::new(
                         runtime::tool_host::OriginalMemberSubmitOutcome::Committed(member)));
-                    output.map(|output| (tool, output))
-                        .ok_or_else(|| ToolError::unknown("original member committed; Host delivery incomplete"))
+                    Err(ToolError::unknown("original member committed; Host delivery incomplete"))
                 }
                 runtime::tool_host::AgentBatchMemberPregrant::Candidate(candidate) => {
                     let mut candidate = Some(candidate);
                     let result: Result<(String, String), ToolError> = async {
                         let inner_tool = entry.get("tool").and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| ToolError::new(format!("agent_action_batch action[{index}] needs a tool")))?;
-                        let prepared = candidate.as_ref().ok_or_else(|| ToolError::unknown("original candidate missing"))?;
+                            .ok_or_else(|| {
+                                ToolError::new(format!("agent_action_batch action[{index}] needs a tool"))
+                            })?;
+                        let prepared = candidate.as_ref().ok_or_else(|| {
+                            ToolError::unknown("original candidate missing")
+                        })?;
                         if !is_agent_action_tool(inner_tool) || prepared.tool() != inner_tool || prepared.index() != index {
                             return Err(ToolError::new("original member tool or index mismatch"));
                         }
                         let inner_input = prepared.normalized_member_input().clone();
                         let member_ceiling = prepared.member_permission_ceiling()
-                            .map_err(|error| ToolError::unknown(error.to_string()))?;
+                            .map_err(|error| {
+                                ToolError::unknown(error.to_string())
+                            })?;
                         let action_id = format!("{parent_action_id}:{index}");
                         let mut inner_binding = binding.for_batch_action(action_id.as_str());
                         inner_binding.permission_ceiling = member_ceiling;
@@ -760,17 +763,21 @@ impl GatewayToolExecutor {
                             .then(|| root_agent_action_actor(binding))
                         })
                         .transpose()
-                        .map_err(ToolError::new)?;
+                        .map_err(|error| {
+                            ToolError::new(error)
+                        })?;
                     services
                         .resolve_agent_action_actor_for_attempt(
                             parent,
-                            original_root.as_ref().map(|p| p.attempt).or(binding.parent_execution_attempt).ok_or_else(|| ToolError::new(
-                                "Agent actions require the original node attempt",
-                            ))?,
+                            original_root.as_ref().map(|p| p.attempt).or(binding.parent_execution_attempt).ok_or_else(|| {
+                                ToolError::new("Agent actions require the original node attempt")
+                            })?,
                             trusted_root,
                         )
                         .await
-                        .map_err(ToolError::new)?
+                        .map_err(|error| {
+                            ToolError::new(error)
+                        })?
                 }
                 None => {
                     return Err(ToolError::new(
@@ -810,7 +817,9 @@ impl GatewayToolExecutor {
                 }
             }
             let action = parse_agent_action(tool_name, value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
+                .map_err(|error| {
+                    self.input_contract_error(tool_name, error)
+                })?;
             let resolved_content_ref = match &action {
                 harness_contract::agent_action::AgentAction::ArtifactCommit(input) => {
                     Some(input.content_ref.clone())
@@ -821,9 +830,9 @@ impl GatewayToolExecutor {
                 action_id: binding
                     .action_id
                     .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| ToolError::new(
-                        "Agent action requires a durable Runtime invocation id; payload hashes are not action identities",
-                    ))?
+                    .ok_or_else(|| {
+                        ToolError::new("Agent action requires a durable Runtime invocation id; payload hashes are not action identities")
+                    })?
                     .to_string(),
                 actor,
                 expected_revision,
@@ -831,8 +840,12 @@ impl GatewayToolExecutor {
             };
             let mut observation = match member.as_deref_mut() {
                 Some(candidate) => {
-                    let (sink, index) = member_results.ok_or_else(|| ToolError::unknown("original member result carrier unavailable"))?;
-                    let capability = candidate.take().ok_or_else(|| ToolError::unknown("original member candidate unavailable"))?;
+                    let (sink, index) = member_results.ok_or_else(|| {
+                        ToolError::unknown("original member result carrier unavailable")
+                    })?;
+                    let capability = candidate.take().ok_or_else(|| {
+                        ToolError::unknown("original member candidate unavailable")
+                    })?;
                     match services.submit_agent_action_member(&envelope, capability).await {
                         runtime::tool_host::PreparedMemberSubmitOutcome::Committed(committed) => {
                             let observation = match committed.observation() {
@@ -843,10 +856,11 @@ impl GatewayToolExecutor {
                                 runtime::tool_host::OriginalMemberSubmitOutcome::Committed(committed)));
                             observation.ok_or_else(|| ToolError::unknown("original member committed; observation unavailable"))?
                         }
-                        runtime::tool_host::PreparedMemberSubmitOutcome::Stopped(publication) =>
+                        runtime::tool_host::PreparedMemberSubmitOutcome::Stopped(publication) => {
                             return Err(original_member_stop_error(
                                 sink, publication, "original member checked outcome unresolved",
-                            )),
+                            ));
+                        },
                     }
                 },
                 None => {

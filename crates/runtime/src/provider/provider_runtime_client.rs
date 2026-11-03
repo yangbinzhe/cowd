@@ -3122,233 +3122,117 @@ async fn forward_provider_stream(
             diag.record("runtime_queue_send_accepted", &transport_activity);
             provider_model_emitted = true;
         }
-        match event {
-            ApiStreamEvent::MessageStart(start) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                let mut events = Vec::new();
-                for (index, block) in start.message.content.into_iter().enumerate() {
-                    let Ok(index) = u32::try_from(index) else {
-                        break;
-                    };
-                    push_provider_output_block(block, index, &mut events, &mut pending_tools, true);
-                }
-                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted)
-                    .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                if start.message.usage_observed {
-                    let usage = merge_provider_usage_max(
-                        cumulative_usage,
-                        start.message.usage.token_usage(),
-                    );
-                    cumulative_usage = Some(usage);
-                    *attempt_usage = Some(usage);
-                    *attempt_cache_dimensions_observed |= start.message.cache_dimensions_observed;
-                }
-            }
-            ApiStreamEvent::ContentBlockStart(start) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                let mut events = Vec::new();
-                push_provider_output_block(
-                    start.content_block,
-                    start.index,
-                    &mut events,
-                    &mut pending_tools,
-                    true,
-                );
-                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted)
-                    .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-            }
-            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                ContentBlockDelta::TextDelta { text } => {
-                    if !text.is_empty()
-                        && !forward_text_delta(
-                            sender,
-                            text,
-                            &mut pending_text,
-                            emit_output,
-                            &stream_callback,
-                            &mut emitted,
-                        )
-                        .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
+        // A single event advances one action at a time. The shared action
+        // executor keeps the original send/flush order and backpressure.
+        enum EventAction {
+            Flush,
+            Send(AssistantEvent),
+            SendMany(Vec<AssistantEvent>),
+            Text(String),
+            Continue,
+            Done,
+        }
+        let mut event = Some(event);
+        let mut phase = 0_u8;
+        loop {
+            let action = if phase == 0 {
+                phase = 1;
+                if matches!(event.as_ref(), Some(
+                    ApiStreamEvent::MessageStart(_)
+                    | ApiStreamEvent::ContentBlockStart(_)
+                    | ApiStreamEvent::ContentBlockStop(_)
+                    | ApiStreamEvent::MessageDelta(_)
+                    | ApiStreamEvent::MessageStop(_)
+                )) { EventAction::Flush } else { EventAction::Continue }
+            } else if phase == 1 {
+                match event.as_mut().expect("event remains until its action is prepared") {
+                    ApiStreamEvent::MessageStart(start) => {
+                        let mut events = Vec::new();
+                        for (index, block) in std::mem::take(&mut start.message.content).into_iter().enumerate() {
+                            let Ok(index) = u32::try_from(index) else { break; };
+                            push_provider_output_block(block, index, &mut events, &mut pending_tools, true);
+                        }
+                        phase = 2;
+                        EventAction::SendMany(events)
+                    }
+                    ApiStreamEvent::ContentBlockStart(_) => {
+                        let Some(ApiStreamEvent::ContentBlockStart(start)) = event.take() else { unreachable!() };
+                        let mut events = Vec::new();
+                        push_provider_output_block(start.content_block, start.index, &mut events, &mut pending_tools, true);
+                        phase = 3;
+                        EventAction::SendMany(events)
+                    }
+                    ApiStreamEvent::ContentBlockDelta(_) => {
+                        let Some(ApiStreamEvent::ContentBlockDelta(delta)) = event.take() else { unreachable!() };
+                        phase = 3;
+                        match delta.delta {
+                            ContentBlockDelta::TextDelta { text } if !text.is_empty() => EventAction::Text(text),
+                            ContentBlockDelta::TextDelta { .. } => EventAction::Continue,
+                            ContentBlockDelta::InputJsonDelta { partial_json } => {
+                                if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) { input.push_str(&partial_json); }
+                                EventAction::Continue
+                            }
+                            ContentBlockDelta::ReasoningSummaryDelta { text } => EventAction::Send(AssistantEvent::ReasoningSummaryDelta(text)),
+                            ContentBlockDelta::ThinkingDelta { thinking } => EventAction::Send(AssistantEvent::PrivateReasoningDelta(thinking)),
+                            ContentBlockDelta::SignatureDelta { signature } => EventAction::Send(AssistantEvent::SignatureDelta(signature)),
+                        }
+                    }
+                    ApiStreamEvent::ContentBlockStop(stop) => {
+                        phase = 2;
+                        match pending_tools.remove(&stop.index) {
+                            Some((id, name, input)) => EventAction::Send(AssistantEvent::ToolUse { id, name, input }),
+                            None => EventAction::Continue,
+                        }
+                    }
+                    ApiStreamEvent::MessageDelta(delta) => {
+                        if delta.usage_observed {
+                            let usage = merge_provider_usage_max(cumulative_usage, delta.usage.token_usage());
+                            cumulative_usage = Some(usage);
+                            *attempt_usage = Some(usage);
+                            *attempt_cache_dimensions_observed |= delta.cache_dimensions_observed;
+                        }
+                        phase = 3;
+                        match delta.delta.stop_reason.clone() {
+                            Some(stop_reason) => EventAction::Send(AssistantEvent::MessageBoundary { stop_reason: Some(stop_reason) }),
+                            None => EventAction::Continue,
+                        }
+                    }
+                    ApiStreamEvent::MessageStop(_) => {
+                        phase = 2;
+                        match cumulative_usage {
+                            Some(usage) => EventAction::Send(AssistantEvent::Usage(usage)),
+                            None => EventAction::Continue,
+                        }
                     }
                 }
-                ContentBlockDelta::InputJsonDelta { partial_json } => {
-                    if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
-                        input.push_str(&partial_json);
+            } else if phase == 2 {
+                phase = 3;
+                match event.take().expect("event retained for its post-action") {
+                    ApiStreamEvent::MessageStart(start) => {
+                        if start.message.usage_observed {
+                            let usage = merge_provider_usage_max(cumulative_usage, start.message.usage.token_usage());
+                            cumulative_usage = Some(usage);
+                            *attempt_usage = Some(usage);
+                            *attempt_cache_dimensions_observed |= start.message.cache_dimensions_observed;
+                        }
+                        EventAction::Continue
                     }
+                    ApiStreamEvent::ContentBlockStop(stop) => EventAction::Send(AssistantEvent::ItemCompleted { index: stop.index }),
+                    ApiStreamEvent::MessageStop(_) => { saw_stop = true; EventAction::Continue }
+                    _ => unreachable!("only events with a post-action reach this phase"),
                 }
-                ContentBlockDelta::ReasoningSummaryDelta { text } => {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::ReasoningSummaryDelta(text),
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                ContentBlockDelta::ThinkingDelta { thinking } => {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::PrivateReasoningDelta(thinking),
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                ContentBlockDelta::SignatureDelta { signature } => {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::SignatureDelta(signature),
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-            },
-            ApiStreamEvent::ContentBlockStop(stop) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::ToolUse { id, name, input },
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                if !forward_event(
-                    sender,
-                    AssistantEvent::ItemCompleted { index: stop.index },
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-            }
-            ApiStreamEvent::MessageDelta(delta) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                if delta.usage_observed {
-                    let usage =
-                        merge_provider_usage_max(cumulative_usage, delta.usage.token_usage());
-                    cumulative_usage = Some(usage);
-                    *attempt_usage = Some(usage);
-                    *attempt_cache_dimensions_observed |= delta.cache_dimensions_observed;
-                }
-                // Forward the provider's terminal reason when present so the
-                // runtime can distinguish a normal finish from a max-token
-                // truncation (PLAN W2 Step1). Emitted only on `stop_reason`.
-                if let Some(stop_reason) = delta.delta.stop_reason.clone() {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::MessageBoundary {
-                            stop_reason: Some(stop_reason),
-                        },
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-            }
-            ApiStreamEvent::MessageStop(_) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                if let Some(usage) = cumulative_usage {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::Usage(usage),
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                saw_stop = true;
-                // Runtime terminal publication is deliberately delayed until
-                // the caller commits attempt evidence and Provider cache
-                // persistence. See `forward_provider_attempt`.
-            }
+            } else {
+                EventAction::Done
+            };
+            let accepted = match action {
+                EventAction::Flush => flush_pending_text(sender, &mut pending_text, emit_output, &stream_callback, &mut emitted).await,
+                EventAction::Send(event) => forward_event(sender, event, emit_output, &stream_callback, &mut emitted).await,
+                EventAction::SendMany(events) => forward_events(sender, events, emit_output, &stream_callback, &mut emitted).await,
+                EventAction::Text(text) => forward_text_delta(sender, text, &mut pending_text, emit_output, &stream_callback, &mut emitted).await,
+                EventAction::Continue => true,
+                EventAction::Done => break,
+            };
+            if !accepted { return Ok(ForwardedProviderStream::ConsumerDropped); }
         }
         if first_semantic { diag.record("first_content_handler_complete", &transport_activity); semantic_recorded = true; }
     }
@@ -3383,6 +3267,27 @@ async fn forward_provider_stream(
     // This is a distinct nonstream SDK send. The preceding response-open is
     // deliberately out of scope: it cannot certify active cancellation here.
     drop(stream);
+    forward_provider_nonstream_fallback(
+        client, message_request, effective_model, resolved_profile, emit_output,
+        &stream_callback, sender, attempt_usage, attempt_cache_dimensions_observed,
+        control, &mut emitted,
+    ).await
+}
+
+// Entered only after the original stream has been dropped at empty EOF.
+async fn forward_provider_nonstream_fallback(
+    client: &ProviderClient,
+    message_request: &MessageRequest,
+    effective_model: &str,
+    resolved_profile: &ResolvedProviderProfile,
+    emit_output: bool,
+    stream_callback: &Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
+    attempt_usage: &mut Option<TokenUsage>,
+    attempt_cache_dimensions_observed: &mut bool,
+    control: &ProviderAttemptControl,
+    emitted: &mut bool,
+) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let fallback_request = MessageRequest {
         stream: false,
         ..message_request.clone()
@@ -3404,7 +3309,7 @@ async fn forward_provider_stream(
             identity: outcome_provider_identity(resolved_profile, effective_model),
         },
     );
-    if forward_events(sender, events, emit_output, &stream_callback, &mut emitted).await {
+    if forward_events(sender, events, emit_output, stream_callback, emitted).await {
         Ok(ForwardedProviderStream::Completed)
     } else {
         Ok(ForwardedProviderStream::ConsumerDropped)

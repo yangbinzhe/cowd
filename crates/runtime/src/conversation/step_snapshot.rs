@@ -924,16 +924,12 @@ impl OriginalPreparedMemberCapability {
     ) -> Result<Self, String> {
         // E1's equality compares the private Host/Process prepared Arc, not
         // the serialized fields of a prepared member.
-        let same = match (authority.member().host(), member.host(), authority.member().process(), member.process()) {
-            (Some(a), Some(b), None, None) => Arc::ptr_eq(a, b)
-                && Arc::ptr_eq(a.owner(), b.owner()) && Arc::ptr_eq(a.store(), b.store())
-                && Arc::ptr_eq(a.reservation(), &reservation) && a.ticket() == b.ticket(),
-            (None, None, Some(a), Some(b)) => Arc::ptr_eq(a, b)
-                && Arc::ptr_eq(a.owner(), b.owner()) && Arc::ptr_eq(a.owner().store(), b.owner().store())
-                && a.ticket() == b.ticket(),
+        let same = authority.member().matches(&member) && match (member.host(), member.process()) {
+            (Some(host), None) => Arc::ptr_eq(host.reservation(), &reservation),
+            (None, Some(_)) => true,
             _ => false,
         };
-        if !same || authority.member() != &member {
+        if !same {
             return Err("prepared member authority has a different original owner".into());
         }
         Ok(Self { member, authority, reservation, effect_fence })
@@ -1042,7 +1038,7 @@ impl OriginalPreparedMemberCapability {
             &crate::runtime_event_store::OriginalMemberEffectFence) -> Result<Arc<crate::OriginalCommittedMember>, crate::AgentActionServiceError>,
     ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
         if !Arc::ptr_eq(self.member.store(), services.event_store())
-            || self.authority.member() != &self.member {
+            || !self.authority.member().matches(&self.member) {
             return Err(crate::AgentActionServiceError::Corrupt("prepared member store or original owner changed".into()));
         }
         let outer = &self.member.prepared().outer_key;
@@ -1060,7 +1056,9 @@ impl OriginalPreparedMemberCapability {
             return Err(crate::AgentActionServiceError::Corrupt("prepared member owner missing".into()));
         };
         let session = request.session_id.as_deref().filter(|value| !value.is_empty())
-            .ok_or_else(|| crate::AgentActionServiceError::Corrupt("prepared member Session missing".into()))?;
+            .ok_or_else(|| {
+                crate::AgentActionServiceError::Corrupt("prepared member Session missing".into())
+            })?;
         let revision = request.policy_revision;
         if revision == 0 { return Err(crate::AgentActionServiceError::Corrupt("prepared member policy missing".into())); }
         if request.idempotency_key != *outer { return Err(crate::AgentActionServiceError::Corrupt("prepared outer differs from request".into())); }
@@ -1069,21 +1067,35 @@ impl OriginalPreparedMemberCapability {
         streams.sort();
         streams.dedup();
         let authority = Arc::clone(&self.authority);
-        authority.with_original_owners_for_checked_commit(services, |_| {
+        let result = authority.with_original_owners_for_checked_commit(services, &self.member, |_| {
             services.with_original_session_policy(session, &policy, |current| {
-                if current.revision != revision { return Err("prepared member policy changed".into()); }
+                if current.revision != revision {
+                    return Err("prepared member policy changed".into());
+                }
                 services.event_store().with_authenticated_stream_locks(&streams, |held| {
                 use sha2::Digest as _;
-                let invocation = request.compiled_invocation.as_ref().ok_or("original outer invocation missing")?;
+                let invocation = request.compiled_invocation.as_ref().ok_or_else(|| {
+                    "original outer invocation missing"
+                })?;
                 let read = invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read;
                 let effect_stream = format!("execution-effect:{outer}");
                 let key = format!("{outer}:{}", if read { "read-intent" } else { "intent" });
                 let intent = services.event_store().event_by_idempotency_key(&effect_stream, &key)
-                    .map_err(|error| error.to_string())?.ok_or("original outer intent unavailable")?;
+                    .map_err(|error| {
+                        error.to_string()
+                    })?.ok_or_else(|| {
+                        "original outer intent unavailable"
+                    })?;
                 let receipt = services.event_store().original_transaction_receipt(&intent.transaction_id)
-                    .map_err(|error| error.to_string())?.ok_or("original outer intent receipt unavailable")?;
+                    .map_err(|error| {
+                        error.to_string()
+                    })?.ok_or_else(|| {
+                        "original outer intent receipt unavailable"
+                    })?;
                 let replay = crate::execution_core::graph::receipt_replay_contract(request)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| {
+                        error.to_string()
+                    })?;
                 if intent.stream_id != effect_stream || intent.sequence != 1
                     || intent.scope != crate::RuntimeEventScope::ExecutionNode
                     || intent.kind != if read { "execution.read.intent" } else { "execution.effect.intent" }
@@ -1092,23 +1104,31 @@ impl OriginalPreparedMemberCapability {
                     || intent.payload["idempotency_key"] != request.idempotency_key
                     || intent.payload["tool_use_id"] != request.tool_use_id || intent.payload["tool_name"] != request.tool_name
                     || intent.payload["input_sha256"] != format!("sha256:{:x}", sha2::Sha256::digest(request.input.as_bytes()))
-                    || intent.payload["effect"] != serde_json::to_value(&invocation.effect).map_err(|error| error.to_string())?
+                    || intent.payload["effect"] != serde_json::to_value(&invocation.effect).map_err(|error| {
+                        error.to_string()
+                    })?
                     || intent.payload["replay"] != replay
                     || receipt.transaction_id != intent.transaction_id || receipt.commit_cursor != intent.commit_cursor
                     || receipt.event_ids.get(intent.transaction_index as usize) != Some(&intent.event_id)
                     || !receipt.stream_revisions.iter().any(|source| source.stream_id == effect_stream
                         && source.expected_revision == 0 && source.committed_revision == 1)
-                { return Err("original outer intent mismatch".into()); }
+                {
+                    return Err("original outer intent mismatch".into());
+                }
                 let mut sources = Vec::with_capacity(streams.len());
                 for stream_id in &streams {
                     let expected_revision = services.event_store().stream_revision(stream_id)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            error.to_string()
+                        })?;
                     sources.push(crate::ExpectedStreamRevision { stream_id: stream_id.clone(), expected_revision });
                 }
                 if self.authority.sources().any(|expected| !sources.iter().any(|actual| actual == expected)) {
                     return Err("prepared authority source changed under lock".into());
                 }
-                let index = u64::try_from(self.member.prepared().index).map_err(|_| "original member index overflow")?;
+                let index = u64::try_from(self.member.prepared().index).map_err(|_| {
+                    "original member index overflow"
+                })?;
                 if !self.reservation.matches_original(services.event_store(), outer, index, ticket) {
                     return Err("original member reservation changed before checked append".into());
                 }
@@ -1117,7 +1137,8 @@ impl OriginalPreparedMemberCapability {
                 Ok(append(held, &sources, &self.member, Arc::clone(&self.authority), &self.reservation, &self.effect_fence))
                 })
             }).map_err(crate::AgentActionServiceError::Corrupt)?
-        })
+        });
+        result
     }
 }
 

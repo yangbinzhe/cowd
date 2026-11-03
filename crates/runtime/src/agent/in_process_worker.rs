@@ -275,6 +275,9 @@ impl OriginalProcessPreparedMember {
         self.original_reservation().is_some_and(|token|
             token.matches_original(&self.owner.store, self.outer_key(), index, self.ticket()))
     }
+    pub(crate) fn original_effect_fence(&self) -> Option<&Arc<crate::runtime_event_store::OriginalMemberEffectFence>> {
+        self.effect_fence.get()
+    }
     pub(crate) fn original_preparation_fence_live(&self) -> bool {
         self.original_reservation_matches() && self.effect_fence.get().is_some()
     }
@@ -288,11 +291,6 @@ impl OriginalProcessPreparedMember {
         self.reservation.set(reservation).map_err(|_| "Process member reservation raced".to_string())?;
         if !self.original_reservation_matches() { return Err("Process member reservation owner changed".into()); }
         Ok(())
-    }
-    /// Only for the branch which has not attempted a marker or checked append.
-    fn cancel_unsubmitted_reservation(&self) -> Result<(), String> {
-        let token = self.original_reservation().ok_or("Process reservation unavailable")?;
-        self.owner.store.cancel_original_member_reservation(token).map_err(|error| error.to_string())
     }
     /// Only the original decision owner may call this after resolving any
     /// committed retry. It prepares a candidate and consumes no lease.
@@ -334,7 +332,8 @@ impl OriginalProcessPreparedMember {
         commit: impl FnOnce(&crate::authorization_negotiator::PreparedMemberAuthority, &crate::runtime_event_store::OriginalMemberReservation, &crate::runtime_event_store::OriginalMemberEffectFence)
             -> Result<Arc<crate::OriginalCommittedMember>, crate::AgentActionServiceError>,
     ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
-        if authority.member().process().is_none_or(|original| !Arc::ptr_eq(original, self))
+        let member_guard = authority.member().upgrade().ok_or_else(|| crate::AgentActionServiceError::MemberUnknown("original Process member owner unavailable".into()))?;
+        if member_guard.process().is_none_or(|original| !Arc::ptr_eq(original, self))
             || self.effective_prepared().is_none_or(|effective| effective != authority.member().prepared()) {
             return Err(crate::AgentActionServiceError::Corrupt("Process member authority owner changed".into()));
         }
@@ -344,7 +343,7 @@ impl OriginalProcessPreparedMember {
         }
         let reservation = self.original_reservation().ok_or_else(|| crate::AgentActionServiceError::MemberUnknown("original Process member reservation unavailable".into()))?;
         let effect_fence = self.effect_fence.get().ok_or_else(|| crate::AgentActionServiceError::MemberUnknown("original Process member preparation fence unavailable".into()))?;
-        authority.with_original_owners_for_checked_commit(services, |candidate| commit(candidate, reservation, effect_fence))
+        authority.with_original_owners_for_checked_commit(services, &member_guard, |candidate| commit(candidate, reservation, effect_fence))
     }
     /// The fresh effect owner must already have decided this member. The
     /// original Session policy owner executes the one hook and derives the
@@ -392,7 +391,96 @@ struct OriginalProcessBatchScope {
     call_slot: std::sync::Weak<ProcessCallSlot>,
     original_request: std::sync::OnceLock<Arc<crate::RuntimeToolExecutionRequest>>,
     members: Mutex<Option<Vec<Result<Arc<OriginalProcessPreparedMember>, String>>>>,
-    retained_stops: Mutex<Vec<crate::tool_host::OriginalStopPublication>>,
+    policy_owner: std::sync::OnceLock<Arc<dyn crate::tool_host::AgentBatchPolicyOwner>>,
+}
+
+/// Same-call publication state; it does not own the Process slot or request.
+pub(crate) struct ProcessMemberCustody {
+    binding: Mutex<Option<(crate::execution_core::NodeExecutionTicket, std::sync::Weak<crate::execution_core::graph::executors::agent_tool::NoDispatchObservation>)>>,
+    members: Mutex<BTreeMap<usize, (std::sync::Weak<OriginalProcessPreparedMember>, Arc<crate::tool_host::OriginalMemberSettlement>)>>,
+    unregistered: std::sync::atomic::AtomicBool,
+}
+impl ProcessMemberCustody {
+    fn new() -> Self { Self { binding: Mutex::new(None), members: Mutex::new(BTreeMap::new()), unregistered: Default::default() } }
+
+    pub(crate) fn bind(&self, ticket: &crate::execution_core::NodeExecutionTicket, observation: Arc<crate::execution_core::graph::executors::agent_tool::NoDispatchObservation>) -> Result<(), String> {
+        let mut binding = self.binding.lock().map_err(|_| "Process child binding unavailable")?;
+        match binding.as_ref() {
+            Some((old, obs)) if old == ticket && obs.upgrade().is_some_and(|obs| Arc::ptr_eq(&obs, &observation)) => Ok(()),
+            Some(_) => Err("Process child binding conflicts".into()),
+            None => { *binding = Some((ticket.clone(), Arc::downgrade(&observation))); Ok(()) }
+        }
+    }
+
+    fn register(&self, member: &Arc<OriginalProcessPreparedMember>) -> Result<(), String> {
+        let binding = self.binding.lock().map_err(|_| "Process child binding unavailable")?;
+        let (ticket, observation) = binding.as_ref().ok_or("Process child binding missing")?;
+        let observation = observation.upgrade().ok_or("Process child observation unavailable")?;
+        let index = member.index();
+        let mut members = self.members.lock().map_err(|_| "Process member custody unavailable")?;
+        if let Some((old, _)) = members.get(&index) {
+            return if old.upgrade().is_some_and(|old| Arc::ptr_eq(&old, member)) { Ok(()) }
+                else { Err("Process member custody conflicts".into()) };
+        }
+        let unit = Arc::new(crate::tool_host::OriginalMemberSettlement::default());
+        observation.register_member_custody(ticket, &member.original_request().tool_use_id, index, Arc::clone(&unit))?;
+        members.insert(index, (Arc::downgrade(member), unit));
+        Ok(())
+    }
+
+    pub(crate) fn verified_units(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+        child: &crate::execution_core::graph::executors::OriginalAgentChildCall,
+        facts: &[serde_json::Value],
+    ) -> Result<Vec<Arc<crate::tool_host::OriginalMemberSettlement>>, String> {
+        let binding = self.binding.lock().map_err(|_| "Process child binding unavailable")?;
+        if binding.as_ref().is_none_or(|(original, _)| original != ticket) { return Err("Process child ticket differs".into()); }
+        let members = self.members.lock().map_err(|_| "Process member custody unavailable")?;
+        let outcomes = child.request.tool_progress.original_members();
+        let mut units = Vec::with_capacity(members.len());
+        for (index, (original, unit)) in members.iter() {
+            let original = original.upgrade().ok_or("Process member owner unavailable")?;
+            if original.index() != *index || original.ticket() != &child.parent_ticket
+                || original.original_request() != child.request.as_ref()
+                || !original.original_request().tool_progress.same_original_channels(&child.request.tool_progress) {
+                return Err("Process member original identity differs".into());
+            }
+            let mut matching = outcomes.iter().filter(|(actual, _)| actual == index);
+            let (_, outcome) = matching.next().ok_or("Process member outcome unavailable")?;
+            if matching.next().is_some() { return Err("Process member outcome conflicts".into()); }
+            let crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else {
+                return Err("Process member outcome unresolved".into());
+            };
+            if member.index() != *index || member.action().payload().pointer("/member_admission/prepared/identity")
+                .and_then(serde_json::Value::as_str) != Some(original.identity()) {
+                return Err("Process committed member identity differs".into());
+            }
+            let expected = member.node_commit_fact(&child.store, &child.parent_ticket)?;
+            if !facts.iter().any(|fact| {
+                let mut source = fact.clone();
+                source["ticket"] = serde_json::to_value(&child.parent_ticket).unwrap_or_default();
+                source.as_object_mut().is_some_and(|obj| { obj.remove("source_ticket"); obj.remove("original_child_registration"); true })
+                    && source == expected
+            }) { return Err("Process member absent from original node".into()); }
+            units.push(Arc::clone(unit));
+        }
+        Ok(units)
+    }
+    fn unresolved(&self) -> bool {
+        self.unregistered.load(Ordering::Acquire)
+            || self.members.lock().map_or(true, |members| members.values().any(|(_, unit)| !unit.is_settled()))
+    }
+}
+
+pub(crate) fn current_process_member_custody(request: &crate::RuntimeToolExecutionRequest) -> Result<Option<Arc<ProcessMemberCustody>>, String> {
+    match ORIGINAL_PROCESS_BATCH_CALL.try_with(|scope| {
+        let captured = scope.original_request.get().ok_or("Process original request unavailable")?;
+        if captured.as_ref() != request || !captured.tool_progress.same_original_channels(&request.tool_progress) {
+            return Err("Process original request differs".into());
+        }
+        let slot = scope.call_slot.upgrade().ok_or("Process original call slot unavailable")?;
+        Ok(Arc::clone(&slot.member_custody))
+    }) { Ok(result) => result.map(Some), Err(_) => Ok(None) }
 }
 
 tokio::task_local! {
@@ -440,22 +528,14 @@ pub(crate) fn original_process_batch_policy_owner() -> Result<Arc<dyn crate::too
         let members = scope.members.lock().map_err(|_| "Process member capture poisoned")?.clone()
             .ok_or("Process original members not captured")?;
         let members = members.into_iter().map(|member| member.map(|member| Arc::downgrade(&member))).collect();
-        Ok(Arc::new(OriginalProcessBatchPolicyOwner { process: Arc::clone(&scope.owner), members, scope: Arc::downgrade(scope) })
-            as Arc<dyn crate::tool_host::AgentBatchPolicyOwner>)
+        let owner = Arc::new(OriginalProcessBatchPolicyOwner { process: Arc::clone(&scope.owner), members, scope: Arc::downgrade(scope) })
+            as Arc<dyn crate::tool_host::AgentBatchPolicyOwner>;
+        scope.policy_owner.set(Arc::clone(&owner)).map_err(|_| "Process original policy owner already captured")?;
+        Ok(owner)
     }).map_err(|_| "Process original batch scope unavailable".to_string())?
 }
 
 impl OriginalProcessBatchPolicyOwner {
-    fn cancel_unsubmitted_or_retain(&self, member: &Arc<OriginalProcessPreparedMember>) -> Result<(), String> {
-        if member.original_reservation().is_none() { return Ok(()); }
-        if let Err(reason) = member.cancel_unsubmitted_reservation() {
-            let scope = self.scope.upgrade().ok_or("Process original call scope unavailable during reservation custody")?;
-            let slot = scope.call_slot.upgrade().ok_or("Process original call slot unavailable during reservation custody")?;
-            slot.retained_members.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Arc::clone(member));
-            return Err(reason);
-        }
-        Ok(())
-    }
     fn validate_original(&self, original: &crate::RuntimeToolExecutionRequest, index: usize) -> Result<(), String> {
         self.process.validate_locked_child(original, self.process.ticket(), self.process.store().as_ref())?;
         let scope = self.scope.upgrade().ok_or("Process original call scope unavailable")?;
@@ -523,17 +603,20 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
             _ => return unknown(BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
                 "original fresh effect owner unavailable".into()),
         };
-        if let Err(reason) = member.reserve_original_member() {
-            return unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason);
-        }
         let Some(slot) = self.scope.upgrade().and_then(|scope| scope.call_slot.upgrade()) else {
-            let reason = self.cancel_unsubmitted_or_retain(&member).err()
-                .unwrap_or_else(|| "original Process call slot unavailable".into());
+            let reason = "original Process call slot unavailable".to_string();
             return unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason);
         };
         // Keep the same private member and hook facts after a marker attempt,
         // including when preparation or the marker reply is unknown.
         slot.retained_members.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Arc::clone(&member));
+        if let Err(reason) = slot.member_custody.register(&member) {
+            slot.member_custody.unregistered.store(true, Ordering::Release);
+            return unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason);
+        }
+        if let Err(reason) = member.reserve_original_member() {
+            return unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason);
+        }
         let reservation = member.original_reservation().expect("reservation was installed by this member owner");
         // A retains the original append request and token before attempting the
         // effect marker. Any failure here can be an unknown append outcome.
@@ -563,53 +646,7 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
         }
     }
 
-    async fn resolve_member(&self, original: &crate::RuntimeToolExecutionRequest, index: usize)
-        -> crate::tool_host::AgentBatchMemberResolution {
-        use crate::tool_host::{AgentBatchMemberResolution, BatchMemberUnknown, BatchMemberUnknownReason};
-        let Some(scope) = self.scope.upgrade() else {
-            return AgentBatchMemberResolution::Unknown(BatchMemberUnknown { index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable });
-        };
-        if let Err(reason) = self.validate_original(original, index) {
-            return AgentBatchMemberResolution::Unknown(BatchMemberUnknown { index, reason: BatchMemberUnknownReason::OriginalRequestNotAuthenticated(reason) });
-        }
-        match crate::agentic::process_original_member_replay(Arc::clone(&self.process), &self.process.actions, original, index) {
-            Ok(Some(replay)) => {
-                let coordinate = crate::tool_host::OriginalBatchMemberCoordinate::from_original(original, self.process.ticket(), index);
-                if let Err(reason) = replay.owner_applied {
-                    let stop = crate::tool_host::OriginalBatchMemberStop::publish(coordinate, crate::tool_host::OriginalBatchMemberStopReason::CommittedUnbound(
-                        crate::tool_host::OriginalMemberUnboundCommit { handle: replay.committed, reason }));
-                    scope.retained_stops.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(stop);
-                } else if matches!(replay.member.observation(), crate::tool_host::OriginalMemberObservation::Unavailable) {
-                    let stop = crate::tool_host::OriginalBatchMemberStop::publish(coordinate,
-                        crate::tool_host::OriginalBatchMemberStopReason::CommittedObservationUnavailable(replay.member));
-                    scope.retained_stops.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(stop);
-                } else {
-                    return AgentBatchMemberResolution::Replay(replay.member);
-                }
-                AgentBatchMemberResolution::Unknown(BatchMemberUnknown { index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable })
-            },
-            Ok(None) | Err(_) => AgentBatchMemberResolution::Unknown(BatchMemberUnknown { index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable }),
-        }
-    }
 
-    async fn read_committed_prefix(&self, original: &crate::RuntimeToolExecutionRequest)
-        -> crate::tool_host::AgentBatchCommittedPrefixRead {
-        use crate::tool_host::{AgentBatchCommittedPrefixRead, AgentBatchMemberFailure, AgentBatchMemberResolution,
-            AuthenticatedBatchPrefix, BatchMemberUnknown, BatchMemberUnknownReason, IncompleteAgentBatch};
-        let mut prefix = AuthenticatedBatchPrefix::new();
-        for index in 0..self.members.len() {
-            match self.resolve_member(original, index).await {
-                AgentBatchMemberResolution::Replay(member) if matches!(member.observation(), crate::tool_host::OriginalMemberObservation::Available(_)) => {
-                    if prefix.push(member).is_ok() { continue; }
-                }
-                _ => {},
-            }
-            let failure = AgentBatchMemberFailure::Unknown(BatchMemberUnknown { index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable });
-            return AgentBatchCommittedPrefixRead::Stopped(IncompleteAgentBatch::new(prefix, failure)
-                .unwrap_or_else(|_| unreachable!("Process owner visits members in order")));
-        }
-        AgentBatchCommittedPrefixRead::AllCommitted(prefix)
-    }
 
 }
 
@@ -771,6 +808,7 @@ impl ProcessRequestScope {
             result: Mutex::new(None),
             joined: Mutex::new(None),
             retained_members: Mutex::new(Vec::new()),
+            member_custody: Arc::new(ProcessMemberCustody::new()),
             driver_joined: std::sync::atomic::AtomicBool::new(false),
             returned: std::sync::atomic::AtomicBool::new(false),
             settled: std::sync::atomic::AtomicBool::new(false),
@@ -786,6 +824,7 @@ struct ProcessCallSlot {
     result: Mutex<Option<Result<String, String>>>,
     joined: Mutex<Option<tokio::task::JoinHandle<()>>>,
     retained_members: Mutex<Vec<Arc<OriginalProcessPreparedMember>>>,
+    member_custody: Arc<ProcessMemberCustody>,
     driver_joined: std::sync::atomic::AtomicBool,
     returned: std::sync::atomic::AtomicBool,
     settled: std::sync::atomic::AtomicBool,
@@ -1415,7 +1454,7 @@ impl ProcessJsonlToolSession {
                 };
                 match process_batch {
                     Some(owner) => ORIGINAL_PROCESS_BATCH_CALL.scope(Arc::new(OriginalProcessBatchScope {
-                        owner, call_slot: original_slot, original_request: std::sync::OnceLock::new(), members: Mutex::new(None), retained_stops: Mutex::new(Vec::new()),
+                        owner, call_slot: original_slot, original_request: std::sync::OnceLock::new(), members: Mutex::new(None), policy_owner: std::sync::OnceLock::new(),
                     }), scoped).await,
                     None => scoped.await,
                 }
@@ -1501,6 +1540,9 @@ impl ProcessJsonlToolSession {
                     "Process original tool receipt/unknown settlement remains unproven".into(),
                 );
             }
+            if call.member_custody.unresolved() {
+                return Err("Process original member custody remains unresolved".into());
+            }
             if !call.stop.child_drained.load(Ordering::Acquire) {
                 return Err("Process original child physical driver remains unproven".into());
             }
@@ -1528,6 +1570,7 @@ impl ProcessJsonlToolSession {
             if !call.driver_joined.load(Ordering::Acquire) {
                 return Err("Process original tool driver handle is not joined".into());
             }
+            call.retained_members.lock().map_err(|_| "Process member custody unavailable")?.clear();
         }
         Ok(())
     }
@@ -2811,6 +2854,26 @@ mod process_request_scope_tests {
     async fn original_admitted_child_keeps_attempt_receipt_drain_when_stop_follows_start() {
         let root = tempfile::tempdir().unwrap();
         let (services, host, packet) = tests::discovery_test_services(root.path(), true);
+        let runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+            services.executor_registry().clone(),
+            services.graph_state_store().clone(),
+            services.commit_service().clone(),
+            services.resource_manager().clone(),
+            services.scope_locks().clone(),
+            services.worktree_leases().clone(),
+            services.workspace_key(),
+            services.workspace_root(),
+        );
+        let snapshot = runner.pump_snapshot(packet.graph_id(), &std::collections::BTreeSet::new()).await.unwrap();
+        assert_eq!(snapshot.ready.len(), 1);
+        let wave = runner.prepare_ready_wave(packet.graph_id(), snapshot.ready).await.unwrap();
+        assert_eq!(wave.len(), 1);
+        let binding = wave[0].binding.as_ref().expect("original scheduler binding");
+        assert_eq!(binding.attempt, packet.attempt);
+        let running = services.graph_state_store().load(packet.graph_id()).unwrap();
+        let (ticket, _) = services.graph_state_store()
+            .binding_start_ticket(&running, packet.node_id(), binding).unwrap();
+        crate::execution_core::graph::validate_node_ticket_start(services.event_store(), &ticket, None).unwrap();
         let selection = AgentModelSelection {
             model: packet.model_lease.clone(),
             provider: "local-fixture".into(),

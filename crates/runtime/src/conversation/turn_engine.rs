@@ -336,8 +336,8 @@ pub(crate) struct PreparedOriginalBatchPolicyInput {
     claim: Arc<crate::execution_core::services::OriginalSessionClaim>,
     original_turn: harness_contract::turn::TurnId,
     fence: crate::SessionExecutionFence,
-    original_prepared: crate::step_snapshot::PreparedAgentBatchMember,
-    prepared: crate::step_snapshot::PreparedAgentBatchMember,
+    original_prepared: Box<crate::step_snapshot::PreparedAgentBatchMember>,
+    prepared: Box<crate::step_snapshot::PreparedAgentBatchMember>,
     hook_effective: String,
     effective: String,
     context: PermissionContext,
@@ -372,8 +372,8 @@ pub(crate) struct OriginalHostPreparedMember {
     ticket: crate::execution_core::graph::NodeExecutionTicket,
     original: Arc<crate::RuntimeToolExecutionRequest>,
     step: crate::step_snapshot::StepCallBinding,
-    original_prepared: crate::step_snapshot::PreparedAgentBatchMember,
-    prepared: crate::step_snapshot::PreparedAgentBatchMember,
+    original_prepared: Box<crate::step_snapshot::PreparedAgentBatchMember>,
+    prepared: Box<crate::step_snapshot::PreparedAgentBatchMember>,
     hook_effective: String,
     effective: String,
     context: PermissionContext,
@@ -864,6 +864,8 @@ impl SharedPolicyOwner {
         attempt: u32,
         index: usize,
         pinned: Option<tools::ToolHostLease>,
+        reservation: &crate::runtime_event_store::OriginalMemberReservation,
+        effect_fence: &Arc<crate::runtime_event_store::OriginalMemberEffectFence>,
     ) -> Result<PreparedOriginalBatchPolicyInput, RuntimeError> {
         if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RuntimeError::new("original member owner cancelled before preparation"));
@@ -877,11 +879,29 @@ impl SharedPolicyOwner {
         let fence = self.session_execution_fence.as_ref()
             .ok_or_else(|| RuntimeError::new("original member Session fence unavailable"))?;
         fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(RuntimeError::new)?;
-        let prepared = crate::step_snapshot::prepare_agent_batch_member(
-            binding, pinned.clone(), self.identity.session_id.as_str(), outer_invocation, outer_input, parent, attempt, index,
-            chrono::Utc::now().timestamp_millis(),
-        )?;
+        let prep_binding = binding.clone();
+        let prep_pinned = pinned.clone();
+        let prep_session = self.identity.session_id.clone();
+        let prep_invocation = outer_invocation.clone();
+        let prep_input = outer_input.to_owned();
+        let prep_parent = parent.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::step_snapshot::prepare_agent_batch_member(
+                &prep_binding, prep_pinned, &prep_session, &prep_invocation, &prep_input,
+                &prep_parent, attempt, index, chrono::Utc::now().timestamp_millis(),
+            ).map(Box::new)
+        }).await.map_err(|error| RuntimeError::new(error.to_string()))??;
+        if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::new("original member owner cancelled before hook"));
+        }
+        fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(RuntimeError::new)?;
+        if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::new("original member owner cancelled before hook"));
+        }
         let input = serde_json::to_string(&prepared.input).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let store = self.assessment.runtime_event_store.as_ref()
+            .ok_or_else(|| RuntimeError::new("original member store unavailable"))?;
+        store.claim_original_member_hook(effect_fence, reservation).map_err(|error| RuntimeError::new(error.to_string()))?;
         let hook = {
             let mut reporter = self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner());
             self.hook_runner.run_pre_tool_use_with_context(&prepared.tool, &input,
@@ -893,13 +913,22 @@ impl SharedPolicyOwner {
             context = PermissionContext::new(Some(crate::permissions::PermissionOverride::Deny),
                 Some(format!("PreToolUse hook denied batch member {}", prepared.index)));
         }
-        let (original_prepared, prepared_after_hook) = crate::step_snapshot::prepare_effective_agent_batch_member(
-            binding, pinned, self.identity.session_id.as_str(), outer_invocation, outer_input,
-            parent, attempt, index, chrono::Utc::now().timestamp_millis(), &effective)?;
-        if original_prepared != prepared { return Err(RuntimeError::new("original member changed while hook ran")); }
+        let prep_binding = binding.clone();
+        let prep_session = self.identity.session_id.clone();
+        let prep_invocation = outer_invocation.clone();
+        let prep_input = outer_input.to_owned();
+        let prep_parent = parent.clone();
         let hook_effective = effective;
-        let effective = serde_json::to_string(&prepared_after_hook.input).map_err(|e| RuntimeError::new(e.to_string()))?;
-        let prepared = prepared_after_hook;
+        let prep_effective = hook_effective.clone();
+        let (original_prepared, prepared, effective) = tokio::task::spawn_blocking(move || {
+            let (original, after_hook) = crate::step_snapshot::prepare_effective_agent_batch_member(
+                &prep_binding, pinned, &prep_session, &prep_invocation, &prep_input,
+                &prep_parent, attempt, index, chrono::Utc::now().timestamp_millis(), &prep_effective)?;
+            if original != *prepared { return Err(RuntimeError::new("original member changed while hook ran")); }
+            let effective = serde_json::to_string(&after_hook.input).map_err(|e| RuntimeError::new(e.to_string()))?;
+            Ok::<_, RuntimeError>((Box::new(original), Box::new(after_hook), effective))
+        }).await.map_err(|error| RuntimeError::new(error.to_string()))??;
+        fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(RuntimeError::new)?;
         if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RuntimeError::new("original member owner cancelled during preparation"));
         }
@@ -918,8 +947,10 @@ impl SharedPolicyOwner {
         let original = member.original_request();
         let invocation = original.compiled_invocation.as_ref().ok_or_else(|| RuntimeError::new("original Process invocation missing"))?;
         let parent = original.parent_execution.as_ref().ok_or_else(|| RuntimeError::new("original Process parent missing"))?;
+        let reservation = member.original_reservation().ok_or_else(|| RuntimeError::new("original Process reservation unavailable"))?;
+        let effect_fence = member.original_effect_fence().ok_or_else(|| RuntimeError::new("original Process effect fence unavailable"))?;
         self.prepare_original_batch_policy_input(member.step(), invocation, &original.input,
-            parent, member.packet().attempt, member.index(), Some(member.original_pinned_host().clone())).await
+            parent, member.packet().attempt, member.index(), Some(member.original_pinned_host().clone()), reservation, effect_fence).await
     }
 
     /// Original Host producer: validate the started ticket and exact outer
@@ -928,31 +959,64 @@ impl SharedPolicyOwner {
         self: &Arc<Self>, ticket: crate::execution_core::graph::NodeExecutionTicket,
         original: Arc<crate::RuntimeToolExecutionRequest>, index: usize,
         reservation: Arc<crate::runtime_event_store::OriginalMemberReservation>,
+        effect_fence: Arc<crate::runtime_event_store::OriginalMemberEffectFence>,
     ) -> Result<Arc<OriginalHostPreparedMember>, RuntimeError> {
         let store = self.assessment.runtime_event_store.as_ref()
-            .ok_or_else(|| RuntimeError::new("original Host member store unavailable"))?;
-        let fresh_effect = original.tool_progress.original_fresh_effect().map_err(RuntimeError::new)?
-            .ok_or_else(|| RuntimeError::new("original Host fresh effect owner unavailable"))?;
+            .ok_or_else(|| {
+                RuntimeError::new("original Host member store unavailable")
+            })?;
+        let fresh_effect = original.tool_progress.original_fresh_effect().map_err(|error| {
+            RuntimeError::new(error)
+        })?.ok_or_else(|| {
+            RuntimeError::new("original Host fresh effect owner unavailable")
+        })?;
         if !fresh_effect.matches_original(store, &original) {
             return Err(RuntimeError::new("original Host fresh effect owner mismatch"));
         }
-        crate::execution_core::graph::validate_node_ticket_start(store, &ticket, None)
-            .map_err(|e| RuntimeError::new(e.to_string()))?;
-        let member_index = u64::try_from(index).map_err(|_| RuntimeError::new("original Host member index overflow"))?;
+        let validation_store = Arc::clone(store);
+        let validation_ticket = ticket.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::execution_core::graph::validate_node_ticket_start(
+                &validation_store, &validation_ticket, None,
+            ).map(|_| ()).map_err(|error| RuntimeError::new(error.to_string()))
+        })
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))??;
+        let member_index = u64::try_from(index).map_err(|_| {
+            RuntimeError::new("original Host member index overflow")
+        })?;
         if !reservation.matches_original(store, &original.idempotency_key, member_index, &ticket) {
             return Err(RuntimeError::new("original Host member reservation mismatch"));
         }
-        let binding = original.step_binding.as_ref().ok_or_else(|| RuntimeError::new("original Host Step missing"))?;
-        let invocation = original.compiled_invocation.as_ref().ok_or_else(|| RuntimeError::new("original Host invocation missing"))?;
-        let parent = original.parent_execution.as_ref().ok_or_else(|| RuntimeError::new("original Host parent missing"))?;
-        let attempt = original.parent_execution_attempt.ok_or_else(|| RuntimeError::new("original Host attempt missing"))?;
-        let (calls, _) = crate::host::decode_tool_batch(&ticket.payload_ref).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let binding = original.step_binding.as_ref().ok_or_else(|| {
+            RuntimeError::new("original Host Step missing")
+        })?;
+        let invocation = original.compiled_invocation.as_ref().ok_or_else(|| {
+            RuntimeError::new("original Host invocation missing")
+        })?;
+        let parent = original.parent_execution.as_ref().ok_or_else(|| {
+            RuntimeError::new("original Host parent missing")
+        })?;
+        let attempt = original.parent_execution_attempt.ok_or_else(|| {
+            RuntimeError::new("original Host attempt missing")
+        })?;
+        let (calls, _) = crate::host::decode_tool_batch(&ticket.payload_ref).map_err(|e| {
+            RuntimeError::new(e.to_string())
+        })?;
         let mut matching = calls.iter().filter(|call| call.id == original.tool_use_id);
-        let call = matching.next().ok_or_else(|| RuntimeError::new("original Host ticket call missing"))?;
-        let original_json = harness_contract::step::parse_strict_json(&original.input).map_err(|e| RuntimeError::new(e.to_string()))?;
-        let model_json = harness_contract::step::parse_strict_json(&call.input).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let call = matching.next().ok_or_else(|| {
+            RuntimeError::new("original Host ticket call missing")
+        })?;
+        let original_json = harness_contract::step::parse_strict_json(&original.input).map_err(|e| {
+            RuntimeError::new(e.to_string())
+        })?;
+        let model_json = harness_contract::step::parse_strict_json(&call.input).map_err(|e| {
+            RuntimeError::new(e.to_string())
+        })?;
         let input_owned = model_json == original_json || original.tool_progress.original_governed_hook()
-            .map_err(RuntimeError::new)?.is_some_and(|hook| hook.matches(&ticket, &original, &model_json));
+            .map_err(|error| {
+                RuntimeError::new(error)
+            })?.is_some_and(|hook| hook.matches(&ticket, &original, &model_json));
         if matching.next().is_some() || call.name != original.tool_name || call.binding.as_ref() != Some(binding)
             || !input_owned
             || original.tool_name != "agent_action_batch" || original.idempotency_key != binding.effect_idempotency_key()
@@ -962,8 +1026,12 @@ impl SharedPolicyOwner {
             || original.policy_revision == 0 || self.policy_revision() != original.policy_revision {
             return Err(RuntimeError::new("original Host member source mismatch"));
         }
-        let candidate = self.prepare_original_batch_policy_input(binding, invocation, &original.input, parent, attempt, index, self.tool_lease.clone()).await?;
-        candidate.fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(RuntimeError::new)?;
+        let candidate = self.prepare_original_batch_policy_input(binding, invocation, &original.input, parent, attempt, index, self.tool_lease.clone(), &reservation, &effect_fence).await.map_err(|error| {
+            error
+        })?;
+        candidate.fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(|error| {
+            RuntimeError::new(error)
+        })?;
         if !fresh_effect.matches_original(store, &original)
             || !reservation.matches_original(store, &original.idempotency_key, member_index, &ticket)
             || self.policy_revision() != original.policy_revision || candidate.claim.session_id() != self.session_id() {
@@ -1762,8 +1830,15 @@ where
         mut self,
         lease: Arc<EvaluationProviderTokenLease>,
     ) -> Self {
-        self.evaluation_provider_token_lease = Some(lease);
+        self.set_in_place_evaluation_provider_token_lease(lease);
         self
+    }
+
+    pub(crate) fn set_in_place_evaluation_provider_token_lease(
+        &mut self,
+        lease: Arc<EvaluationProviderTokenLease>,
+    )  {
+        self.evaluation_provider_token_lease = Some(lease);
     }
 
     #[cfg(test)]
@@ -1823,8 +1898,12 @@ where
 
     #[must_use]
     pub fn with_tool_execution_plane(mut self, plane: Arc<crate::ToolExecutionPlane>) -> Self {
-        self.tool_execution_plane = plane;
+        self.set_in_place_tool_execution_plane(plane);
         self
+    }
+
+    pub(crate) fn set_in_place_tool_execution_plane(&mut self, plane: Arc<crate::ToolExecutionPlane>)  {
+        self.tool_execution_plane = plane;
     }
 
     #[cfg(test)]
@@ -1941,9 +2020,16 @@ where
         mut self,
         port: Arc<dyn crate::SessionRuntimeJournalPort>,
     ) -> Self {
+        self.set_in_place_session_journal_port(port);
+        self
+    }
+
+    pub(crate) fn set_in_place_session_journal_port(
+        &mut self,
+        port: Arc<dyn crate::SessionRuntimeJournalPort>,
+    )  {
         self.session_journal_port = Some(port);
         self.refresh_provider_wire_evidence_writer();
-        self
     }
 
     #[must_use]
@@ -1966,9 +2052,13 @@ where
 
     #[must_use]
     pub fn with_artifact_store(mut self, store: Arc<crate::ArtifactStore>) -> Self {
+        self.set_in_place_artifact_store(store);
+        self
+    }
+
+    pub(crate) fn set_in_place_artifact_store(&mut self, store: Arc<crate::ArtifactStore>)  {
         self.artifact_store = Some(store);
         self.refresh_provider_wire_evidence_writer();
-        self
     }
 
     pub(super) fn refresh_provider_wire_evidence_writer(&mut self) {
@@ -1990,12 +2080,16 @@ where
     /// Attach the durable store that owns tool, graph, agent, and task execution state.
     #[must_use]
     pub(crate) fn with_runtime_event_store(mut self, store: Arc<RuntimeEventStore>) -> Self {
+        self.set_in_place_runtime_event_store(store);
+        self
+    }
+
+    pub(crate) fn set_in_place_runtime_event_store(&mut self, store: Arc<RuntimeEventStore>)  {
         self.outcome_service = Some(Arc::new(crate::execution_core::OutcomeService::new(
             Arc::clone(&store),
         )));
         self.outcome_projector = Some(Arc::new(crate::OutcomeProjector::new(Arc::clone(&store))));
         self.runtime_event_store = Some(store);
-        self
     }
 
     #[must_use]
@@ -2004,9 +2098,17 @@ where
         service: Arc<crate::execution_core::OutcomeService>,
         projector: Arc<crate::OutcomeProjector>,
     ) -> Self {
+        self.set_in_place_outcome_runtime(service, projector);
+        self
+    }
+
+    pub(crate) fn set_in_place_outcome_runtime(
+        &mut self,
+        service: Arc<crate::execution_core::OutcomeService>,
+        projector: Arc<crate::OutcomeProjector>,
+    )  {
         self.outcome_service = Some(service);
         self.outcome_projector = Some(projector);
-        self
     }
 
     /// Attach a [`SessionEventLog`] for time-travel debugging and session rebuild.
@@ -2124,9 +2226,13 @@ where
     /// T35: Set a cancellation token for graceful shutdown.
     #[must_use]
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
-        self.hook_abort_signal = self.hook_abort_signal.with_cancellation(token.clone());
-        self.cancellation_token = token;
+        self.set_in_place_cancellation_token(token);
         self
+    }
+
+    pub(crate) fn set_in_place_cancellation_token(&mut self, token: CancellationToken)  {
+        self.hook_abort_signal = self.hook_abort_signal.clone().with_cancellation(token.clone());
+        self.cancellation_token = token;
     }
 
     #[must_use]
@@ -2198,8 +2304,12 @@ where
     /// Attach a CowdEventBus for domain event emission.
     #[must_use]
     pub fn with_cowd_event_bus(mut self, bus: crate::cowd_event::CowdEventBus) -> Self {
-        self.cowd_bus = Some(Arc::new(bus.clone()));
+        self.set_in_place_cowd_event_bus(bus);
         self
+    }
+
+    pub(crate) fn set_in_place_cowd_event_bus(&mut self, bus: crate::cowd_event::CowdEventBus)  {
+        self.cowd_bus = Some(Arc::new(bus.clone()));
     }
 
     /// Get a reference to the attached CowdEventBus, if any.
@@ -2364,9 +2474,13 @@ where
 
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
+        self.set_in_place_hook_abort_signal(hook_abort_signal);
+        self
+    }
+
+    pub(crate) fn set_in_place_hook_abort_signal(&mut self, hook_abort_signal: HookAbortSignal)  {
         self.hook_abort_signal =
             hook_abort_signal.with_cancellation(self.cancellation_token.clone());
-        self
     }
 
     #[must_use]
@@ -2402,8 +2516,15 @@ where
         mut self,
         supervisor: Arc<crate::execution_core::services::RuntimeMaintenanceSupervisor>,
     ) -> Self {
-        self.maintenance_supervisor = Some(supervisor);
+        self.set_in_place_maintenance_supervisor(supervisor);
         self
+    }
+
+    pub(crate) fn set_in_place_maintenance_supervisor(
+        &mut self,
+        supervisor: Arc<crate::execution_core::services::RuntimeMaintenanceSupervisor>,
+    )  {
+        self.maintenance_supervisor = Some(supervisor);
     }
 
     /// Attach the Runtime-owned Fact/Matrix recall port to this conversation.

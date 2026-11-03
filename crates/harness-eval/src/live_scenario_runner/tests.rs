@@ -6,7 +6,6 @@ fn u5_fixture_owner() -> U5Owner {
     U5Owner {
         pid: 42,
         starttime: 17,
-        image_sha256: format!("sha256:{}", "a".repeat(64)),
         candidate: "b".repeat(40),
         namespace: "fixture-run".into(),
         base_url: "http://127.0.0.1:12345".into(),
@@ -5250,4 +5249,93 @@ fn unreadable_execution_projection_marks_progress_unobservable() {
     observer.mark_stalled();
     observer.mark_unobservable();
     assert_eq!(observer.phase(), "unobservable");
+}
+
+
+#[test]
+fn v2_direct_numeric_answer_distinguishes_correct_wrong_and_unknown() {
+    for answer in ["56", "7 × 8 = 56", "答案是56。"] {
+        assert_eq!(v2_direct_decision(answer), Some(true), "{answer}");
+    }
+    for answer in ["156", "56 或 57", "7 × 8 = 56，但是答案是57", "56 不正确"] {
+        assert_eq!(v2_direct_decision(answer), Some(false), "{answer}");
+    }
+    assert_eq!(v2_direct_decision("也许是56"), None);
+}
+
+#[test]
+fn v2_workspace_version_answer_does_not_accept_a_different_version() {
+    let expected = "0.0.37";
+    assert_eq!(v2_version_decision("Cargo.toml workspace.package.version: 0.0.37", expected), Some(true));
+    assert_eq!(v2_version_decision("Cargo.toml version: 0.0.99", expected), Some(false));
+    assert_eq!(v2_version_decision("Cargo.toml version 0.0.37 或 0.0.99", expected), Some(false));
+    assert_ne!(v2_version_decision("Cargo.toml 没有 0.0.37", expected), Some(true));
+    assert_ne!(v2_version_decision("版本无法确认", expected), Some(true));
+}
+
+#[test]
+fn v2_version_delivery_requires_original_source_and_body() {
+    // Existing typed read-evidence fixture represents the consumer contract;
+    // it does not claim a live producer or a full scenario run.
+    let expected = V2WorkspaceVersion {
+        value: "0.0.37".into(), source_sha256: "source-digest".into(),
+        first_line: 2, last_line: 2,
+    };
+    let timeline = typed_read_timeline_fixture();
+    let evidence = &timeline["read_evidence"];
+    assert!(v2_version_delivered(evidence, &expected));
+    let mut absent = evidence.clone();
+    absent["pages"][0]["reads"] = json!([]);
+    assert!(!v2_version_delivered(&absent, &expected));
+    let mut wrong_source = evidence.clone();
+    wrong_source["pages"][0]["reads"][0]["source_sha256"] = json!("different-source");
+    assert!(!v2_version_delivered(&wrong_source, &expected));
+    let mut not_delivered = evidence.clone();
+    not_delivered["pages"][0]["reads"][0]["body_delivered"] = json!(false);
+    assert!(!v2_version_delivered(&not_delivered, &expected));
+    let mut wrong_extent = evidence.clone();
+    wrong_extent["pages"][0]["reads"][0]["delivered_extent"]["start_line"] = json!(3);
+    assert!(!v2_version_delivered(&wrong_extent, &expected));
+}
+
+#[test]
+fn v2_workspace_snapshot_reads_workspace_package_version_not_package_version() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"),
+        "[package]\nversion = \"9.9.9\"\n[workspace.package]\nversion = \"0.0.37\"\n").unwrap();
+    let snapshot = v2_workspace_version_snapshot_for_root(root.path()).unwrap();
+    assert_eq!(snapshot.value, "0.0.37");
+    assert_eq!((snapshot.first_line, snapshot.last_line), (4, 4));
+    assert_eq!(v2_version_decision("Cargo.toml version 9.9.9", &snapshot.value), Some(false));
+    std::fs::write(root.path().join("Cargo.toml"), "[package]\nversion = \"9.9.9\"\n").unwrap();
+    assert!(v2_workspace_version_snapshot_for_root(root.path()).is_err());
+}
+
+#[test]
+fn v2_scenario_selection_keeps_v1_and_unimplemented_scenarios_unchanged() {
+    fn original(id: &'static str) -> LiveScenarioSpec {
+        LiveScenarioSpec { id, prompt: "v1 original prompt", acceptance: LiveAcceptance::Contains("original"), timeout: LiveScenarioTimeout::direct() }
+    }
+    for id in ["live_direct_terminal", "live_tool_evidence", "live_minimal_batch_read", "live_small_two_team_collaboration", "live_single_architecture_baseline"] {
+        for requested in [None, Some("n8-eval-v1")] {
+            let (selected, revision) = v2_select_scenario(original(id), requested);
+            assert_eq!(revision, "n8-eval-v1", "{id}");
+            assert_eq!(selected.prompt, "v1 original prompt", "{id}");
+            assert!(matches!(selected.acceptance, LiveAcceptance::Contains("original")), "{id}");
+        }
+    }
+    for id in ["live_minimal_batch_read", "live_small_two_team_collaboration", "live_single_architecture_baseline"] {
+        let (selected, revision) = v2_select_scenario(original(id), Some("n8-eval-v2"));
+        assert_eq!(revision, "n8-eval-v1", "{id}");
+        assert_eq!(selected.prompt, "v1 original prompt", "{id}");
+        assert!(matches!(selected.acceptance, LiveAcceptance::Contains("original")), "{id}");
+    }
+    let (direct, revision) = v2_select_scenario(original("live_direct_terminal"), Some("n8-eval-v2"));
+    assert_eq!(revision, "n8-eval-v2");
+    assert!(matches!(direct.acceptance, LiveAcceptance::V2DirectNumber));
+    assert_eq!(Some(direct.prompt), v2_group_one_prompt("live_direct_terminal"));
+    let (tool, revision) = v2_select_scenario(original("live_tool_evidence"), Some("n8-eval-v2"));
+    assert_eq!(revision, "n8-eval-v2");
+    assert!(matches!(tool.acceptance, LiveAcceptance::V2WorkspaceVersion));
+    assert_eq!(Some(tool.prompt), v2_group_one_prompt("live_tool_evidence"));
 }

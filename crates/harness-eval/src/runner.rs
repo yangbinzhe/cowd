@@ -1926,7 +1926,7 @@ mod shared_lifecycle_tests {
         } else {
             crate::report::u5_stage_tests::original_stage()
         };
-        let host:crate::live_scenario_runner::U5Host=serde_json::from_value(json!({"nonce":"a".repeat(64),"launcher_pid":1,"launcher_start":1,"pid":2,"starttime":2,"image_sha256":format!("sha256:{}","c".repeat(64)),"exe_dev":1,"exe_ino":1,"listener_inode":1,"port":1,"candidate":"b".repeat(40),"source_sha256":"d".repeat(64),"namespace":"test-only-contract","base_url":"http://127.0.0.1:1","harness_sha256":"e".repeat(64),"runtime_dev":1,"runtime_ino":1})).unwrap();
+        let host:crate::live_scenario_runner::U5Host=serde_json::from_value(json!({"nonce":"a".repeat(64),"launcher_pid":1,"launcher_start":1,"pid":2,"starttime":2,"listener_inode":1,"port":1,"candidate":"b".repeat(40),"source_sha256":"d".repeat(64),"namespace":"test-only-contract","base_url":"http://127.0.0.1:1","runtime_dev":1,"runtime_ino":1})).unwrap();
         report["u5_host"] = host.binding();
         let path = if fault == "missing-parent" {
             root.join("absent/receipt.json")

@@ -2066,6 +2066,16 @@ fn parses_session_history_chunk_and_request_cache_limits() {
 }
 
 #[test]
+fn parses_gateway_runtime_thread_capacity_from_config() {
+    let root = JsonValue::parse(r#"{"gateway":{"capacity":{"runtime_workers":3,"runtime_stack_bytes":4194304}}}"#).unwrap();
+    let gateway = parse_optional_gateway_config(&root).unwrap();
+    assert_eq!(gateway.capacity.runtime_workers, Some(3));
+    assert_eq!(gateway.capacity.runtime_stack_bytes, Some(4 * 1024 * 1024));
+    let defaults = parse_optional_gateway_config(&JsonValue::parse(r#"{"gateway":{}}"#).unwrap()).unwrap();
+    assert_eq!(defaults.capacity.runtime_stack_bytes, None);
+}
+
+#[test]
 fn parses_gateway_recovery_working_set_and_rejects_invalid_budgets() {
     let root = JsonValue::parse(
         r#"{"gateway":{"recovery":{

@@ -211,7 +211,7 @@ pub struct StandardRuntimeHost<T>
 where
     T: ToolExecutor,
 {
-    runtime: Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
+    runtime: Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>>,
     /// Same original child owner while the Conversation itself lives in Graph.
     hook_scope: crate::HookExecutionScope,
     /// Set when the conversation runtime could not be returned to this host
@@ -224,7 +224,7 @@ where
     /// same host before a later turn is admitted.
     inflight_turn: Option<
         tokio::sync::oneshot::Receiver<(
-            Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
+            Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>>,
             Result<TurnSummary, RuntimeError>,
         )>,
     >,
@@ -413,7 +413,7 @@ where
     T: ToolExecutor,
 {
     submit_owned_conversation_turn_with_ingress(
-        runtime,
+        Box::new(runtime),
         services,
         content,
         prompter,
@@ -425,6 +425,7 @@ where
         false,
     )
     .await
+    .map(|(runtime, result)| (*runtime, result))
 }
 
 /// Start with the current request. Only a validated typed continuation below
@@ -820,12 +821,264 @@ fn enter_owned_root_scope(
     Ok((Some(scope), Some(lease)))
 }
 
+// Construct the turn state synchronously, before the graph setup awaits.
+// The returned state contains only the same values as the original initializer.
+fn prepare_turn_graph_state(
+    content: &str,
+    prompter: &SharedPrompter,
+    recovered_provider_usage: crate::conversation::RecoveredProviderUsage,
+    recovered_provider_attempt_count: usize,
+    recovered_cache_dimensions_known: bool,
+    ingress: &Option<TurnIngressRef>,
+    turn_transcript_start: usize,
+    session_id: &String,
+    turn_ref: &String,
+    evaluation_control: &Option<EvaluationTurnControl>,
+    recovered_tool_receipt_count: usize,
+    recovered_tool_receipts_require_text_only: bool,
+    execution_role: TurnExecutionRole,
+) -> Arc<tokio::sync::Mutex<TurnGraphState>> {
+    Arc::new(tokio::sync::Mutex::new(TurnGraphState {
+        content: content.to_string(),
+        task_understanding: None,
+        collaboration_obligation: None,
+        prompter: prompter.clone(),
+        first_model_step: true,
+        pending_next_model_context: Vec::new(),
+        persistent_collaboration_context: Vec::new(),
+        assistant_messages: Vec::new(),
+        tool_results: Vec::new(),
+        iterations: 0,
+        input_tokens: recovered_provider_usage.input_tokens,
+        output_tokens: recovered_provider_usage.output_tokens,
+        cache_create_tokens: recovered_provider_usage.cache_creation_input_tokens,
+        cache_read_tokens: recovered_provider_usage.cache_read_input_tokens,
+        cache_dimensions_known: recovered_cache_dimensions_known,
+        provider_usage_attempt_observed: recovered_provider_attempt_count > 0,
+        output_chars: 0,
+        output_chunks: 0,
+        wall_duration_ms: 0,
+        model: None,
+        models_used: Vec::new(),
+        first_token_latency_ms: None,
+        active_stream_duration_ms: 0,
+        summary: None,
+        failure: None,
+        terminal_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        pending_transcript: std::collections::BTreeMap::new(),
+        pending_member_batches: std::collections::BTreeMap::new(),
+        pending_agent_input_consumption: std::collections::BTreeMap::new(),
+        deferred_agent_input_consumption: Vec::new(),
+        ingress: (*ingress).clone(),
+        turn_transcript_start,
+        session_id: (*session_id).clone(),
+        turn_id: (*turn_ref).clone(),
+        goal_id: String::new(),
+        context_window: 0,
+        safety_lease: crate::execution_core::SafetyFusePolicy::derive(
+            0,
+            harness_contract::core::TaskComplexity::Simple,
+            None,
+        ),
+        terminal_override: None,
+        delivery_envelope: None,
+        terminal_presentation: None,
+        terminal_commit_owner: None,
+        authenticated_terminal_owner: None,
+        committed_terminal_answer: None,
+        committed_terminal_completion: None,
+        last_verified_progress: false,
+        consecutive_unverified_model_steps: 0,
+        closure_ready_steps: 0,
+        previous_objective_milestones: Default::default(),
+        verified_collaboration_progress: Default::default(),
+        verified_answer_ready_steps: 0,
+        final_answer_observed: false,
+        collaboration_convergence_replans: 0,
+        delegated_redrives: 0,
+        completion_gap_continuations: 0,
+        started_at: std::time::Instant::now(),
+        reasoning_only_attempts: 0,
+        force_text_only_next_model: evaluation_control
+            .as_ref()
+            .is_some_and(|control| control.provider_constraint == "judge")
+            || (recovered_tool_receipt_count > 0
+                && recovered_tool_receipts_require_text_only),
+        force_tool_allowlist_next_model: None,
+        force_tool_call_next_model: false,
+        force_reasoning_effort_next_model: None,
+        terminal_recovery_attempts: 0,
+        provider_protocol_recovery_attempts: 0,
+        provider_frame_repair_attempts: std::collections::BTreeMap::new(),
+        agentic_protocol_recovery_attempts: 0,
+        agentic_program_context_revision: None,
+        execution_role,
+        bounded_evidence_role: false,
+        focus_novelty_target_bp: 0,
+        focus_acceptance_scopes: Vec::new(),
+        focus_acceptance_pending_scopes: Vec::new(),
+        focus_required_output_fields: Vec::new(),
+        structured_output_replans: 0,
+        focus_observed_resource_scopes: BTreeSet::new(),
+        focus_observed_evidence: Vec::new(),
+        focus_action_rejections: 0,
+        pending_focus_terminal_candidate: None,
+        focus_discovery_replans: 0,
+        focus_verification_prefetched: false,
+        clean_terminal_synthesis_next: false,
+        clean_terminal_synthesis_attempted: false,
+        clean_terminal_retry_attempted: false,
+        terminal_failure_narration: None,
+        consecutive_tool_failure_batches: 0,
+        cold_start_failure_replans: 0,
+        consecutive_low_novelty_batches: 0,
+        successful_tool_calls: 0,
+        last_terminal_answer_digest: String::new(),
+        repeated_terminal_answers: 0,
+        completion_gap_outstanding: false,
+        outstanding_closure_rungs: Vec::new(),
+        tool_receipts_observed: recovered_tool_receipt_count,
+        duplicate_tool_calls: 0,
+        identical_action_digest: String::new(),
+        identical_action_result_digest: String::new(),
+        identical_action_streak: 0,
+        per_turn_tool_counts: BTreeMap::new(),
+        write_attempt_paths: Vec::new(),
+
+
+        committed_workspace_write_observed: false,
+        committed_workspace_write_scopes: BTreeSet::new(),
+        committed_workspace_observed_evidence: Vec::new(),
+        workspace_mutation_effect_sequences: BTreeSet::new(),
+
+        max_tool_concurrency_observed: 0,
+        parallel_tool_batches: 0,
+        early_tool_receipts: BTreeMap::new(),
+        evaluation_resource_scopes: evaluation_control
+            .as_ref()
+            .map(|control| control.resource_scopes.clone())
+            .unwrap_or_default(),
+        evaluation_scope_rejections: 0,
+        evaluation_judge_only: evaluation_control
+            .as_ref()
+            .is_some_and(|control| control.provider_constraint == "judge"),
+        collaboration_started: false,
+        pending_root_control_plane_requirement: None,
+
+        root_language_replan_attempted: false,
+        pending_terminal_artifact: None,
+        pending_controlled_recovery_claim_fingerprints: Vec::new(),
+        pending_disposition_inputs: Vec::new(),
+        terminal_tracker: crate::liveness::TerminalTracker::new(
+            crate::liveness::TerminalObligation::default(),
+        ),
+        terminal_satisfaction_since: None,
+    }))
+}
+
+// Build the initial graph without retaining compiler temporaries in the
+// asynchronous turn state. The caller retains the original owner guards.
+fn prepare_initial_conversation_graph(
+    services: &crate::RuntimeServices,
+    content: &str,
+    resolved_objective: &str,
+    session_id: &str,
+    ingress: Option<&TurnIngressRef>,
+    evaluation_control: Option<&EvaluationTurnControl>,
+    compile_target: crate::execution_core::RuntimeCompileTarget,
+    execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+    execution_lineage: Option<harness_contract::execution_graph::ExecutionGraphLineage>,
+    requests_background: bool,
+) -> Result<harness_contract::execution_graph::ExecutionGraph, RuntimeError> {
+    let turn_payload = serde_json::json!({
+        "kind": "conversation_turn",
+        "session_id": session_id,
+        "content": content,
+        "objective": resolved_objective,
+        "compile_target": compile_target,
+        "ingress": ingress,
+        "idempotency_key": ingress.as_ref().map(|value| value.request_id.as_str()),
+    })
+    .to_string();
+    let delegation_resource_scopes = root_delegation_resource_scopes(
+        evaluation_control,
+        services.session_execution_policy(session_id).as_ref(),
+    );
+    let mut graph = ExecutionGraphCompiler
+        .compile_conversation_turn(ExecutionCompileRequest {
+            objective: resolved_objective.to_string(),
+            payload_ref: turn_payload,
+            target: compile_target,
+            resource_scopes: delegation_resource_scopes,
+        })
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+    graph.parent_execution = execution_parent;
+    graph.lineage = execution_lineage;
+    if requests_background {
+        graph.service_class =
+            harness_contract::execution_graph::ExecutionServiceClass::Background;
+    } else if graph.parent_execution.is_some() {
+        graph.service_class =
+            harness_contract::execution_graph::ExecutionServiceClass::Foreground;
+    }
+    if let Some(ingress) = ingress {
+        let graph_id = crate::session_execution::session_ingress_graph_id(
+            &ingress.session_id,
+            &ingress.request_id,
+            &ingress.turn_id,
+        );
+        ExecutionGraphCompiler
+            .bind_conversation_graph_identity(
+                &mut graph,
+                &graph_id,
+                None,
+                Some(&ingress.request_id),
+            )
+            .map_err(RuntimeError::new)?;
+        graph.revision = 0;
+        graph.node_results.clear();
+        graph.recovery_cursor = Default::default();
+        graph.node_statuses.clear();
+        graph.lineage = Some(
+            harness_contract::execution_graph::ExecutionGraphLineage {
+                session_id: ingress.session_id.clone(),
+                turn_id: ingress.turn_id.clone(),
+                root_task_id: ingress.root_task_id.clone(),
+                task_id: ingress.primary_task_id.clone(),
+                generation: ingress.session_generation.max(1),
+            },
+        );
+        graph
+            .node_statuses
+            .insert(graph.nodes[0].id.clone(), ExecutionNodeStatus::Planned);
+        let root_id = graph.nodes[0].id.clone();
+        let dispatch_id = format!("{}:session-dispatch", graph.id);
+        let mut dispatch = ExecutionNodeSpec::new(
+            ExecutionNodeKind::SessionDispatch,
+            crate::SESSION_DISPATCH_EXECUTOR,
+            format!(
+                "session_ingress:{}",
+                serde_json::to_string(ingress).unwrap_or_default()
+            ),
+        );
+        dispatch.id = dispatch_id.clone();
+        dispatch.idempotency_key = format!("{}:dispatch", ingress.request_id);
+        graph.nodes.insert(0, dispatch);
+        graph.edges.push(ExecutionEdge {
+            from: dispatch_id,
+            to: root_id,
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+    }
+    Ok(graph)
+}
+
 #[allow(
     clippy::panic,
     reason = "a leaked graph-runner Arc would otherwise make it impossible to return the uniquely owned runtime"
 )]
 async fn submit_owned_conversation_turn_with_ingress<C, T>(
-    runtime: crate::ConversationRuntime<C, T>,
+    mut runtime: Box<crate::ConversationRuntime<C, T>>,
     services: Arc<crate::RuntimeServices>,
     content: &str,
     prompter: &SharedPrompter,
@@ -837,7 +1090,7 @@ async fn submit_owned_conversation_turn_with_ingress<C, T>(
     recovered_tool_receipts_require_text_only: bool,
 ) -> Result<
     (
-        crate::ConversationRuntime<C, T>,
+        Box<crate::ConversationRuntime<C, T>>,
         Result<TurnSummary, RuntimeError>,
     ),
     RuntimeError,
@@ -847,20 +1100,16 @@ where
     T: ToolExecutor,
 {
     let turn_started_at = std::time::Instant::now();
-    let mut runtime = runtime
-        .with_runtime_event_store(Arc::clone(services.event_store()))
-        .with_outcome_runtime(
-            Arc::clone(services.outcome_service()),
-            Arc::clone(services.outcome_projector()),
-        )
-        .with_artifact_store(Arc::clone(services.artifact_store()))
-        .with_maintenance_supervisor(services.maintenance_supervisor())
-        .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
+    runtime.set_in_place_runtime_event_store(Arc::clone(services.event_store()));
+    runtime.set_in_place_outcome_runtime(Arc::clone(services.outcome_service()), Arc::clone(services.outcome_projector()));
+    runtime.set_in_place_artifact_store(Arc::clone(services.artifact_store()));
+    runtime.set_in_place_maintenance_supervisor(services.maintenance_supervisor());
+    runtime.set_in_place_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
     if execution_role == TurnExecutionRole::RootTurn && runtime.cowd_bus().is_none() {
-        runtime = runtime.with_cowd_event_bus(CowdEventBus::new());
+        runtime.set_in_place_cowd_event_bus(CowdEventBus::new());
     }
     if let Some(journal) = services.session_journal_port() {
-        runtime = runtime.with_session_journal_port(journal);
+        runtime.set_in_place_session_journal_port(journal);
     }
     let session = runtime.session_snapshot().await;
     let evaluation_control = match evaluation_turn_control(content) {
@@ -878,7 +1127,7 @@ where
             .install_advisory(&session.session_id, lease_id, limit)
         {
             Ok(guard) => {
-                runtime = runtime.with_evaluation_provider_token_lease(guard.lease());
+                runtime.set_in_place_evaluation_provider_token_lease(guard.lease());
                 Some(guard)
             }
             Err(error) => return Ok((runtime, Err(error))),
@@ -1005,142 +1254,12 @@ where
     let mut owned_root_scope = None;
     let mut owned_root_bus_lease = None;
     let mut result = async {
-        let state = Arc::new(tokio::sync::Mutex::new(TurnGraphState {
-            content: content.to_string(),
-            task_understanding: None,
-            collaboration_obligation: None,
-            prompter: prompter.clone(),
-            first_model_step: true,
-            pending_next_model_context: Vec::new(),
-            persistent_collaboration_context: Vec::new(),
-            assistant_messages: Vec::new(),
-            tool_results: Vec::new(),
-            iterations: 0,
-            input_tokens: recovered_provider_usage.input_tokens,
-            output_tokens: recovered_provider_usage.output_tokens,
-            cache_create_tokens: recovered_provider_usage.cache_creation_input_tokens,
-            cache_read_tokens: recovered_provider_usage.cache_read_input_tokens,
-            cache_dimensions_known: recovered_cache_dimensions_known,
-            provider_usage_attempt_observed: recovered_provider_attempt_count > 0,
-            output_chars: 0,
-            output_chunks: 0,
-            wall_duration_ms: 0,
-            model: None,
-            models_used: Vec::new(),
-            first_token_latency_ms: None,
-            active_stream_duration_ms: 0,
-            summary: None,
-            failure: None,
-            terminal_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-            pending_transcript: std::collections::BTreeMap::new(),
-            pending_member_batches: std::collections::BTreeMap::new(),
-            pending_agent_input_consumption: std::collections::BTreeMap::new(),
-            deferred_agent_input_consumption: Vec::new(),
-            ingress: ingress.clone(),
-            turn_transcript_start,
-            session_id: session_id.clone(),
-            turn_id: turn_ref.clone(),
-            goal_id: String::new(),
-            context_window: 0,
-            safety_lease: crate::execution_core::SafetyFusePolicy::derive(
-                0,
-                harness_contract::core::TaskComplexity::Simple,
-                None,
-            ),
-            terminal_override: None,
-            delivery_envelope: None,
-            terminal_presentation: None,
-            terminal_commit_owner: None,
-            authenticated_terminal_owner: None,
-            committed_terminal_answer: None,
-            committed_terminal_completion: None,
-            last_verified_progress: false,
-            consecutive_unverified_model_steps: 0,
-            closure_ready_steps: 0,
-            previous_objective_milestones: Default::default(),
-            verified_collaboration_progress: Default::default(),
-            verified_answer_ready_steps: 0,
-            final_answer_observed: false,
-            collaboration_convergence_replans: 0,
-            delegated_redrives: 0,
-            completion_gap_continuations: 0,
-            started_at: std::time::Instant::now(),
-            reasoning_only_attempts: 0,
-            force_text_only_next_model: evaluation_control
-                .as_ref()
-                .is_some_and(|control| control.provider_constraint == "judge")
-                || (recovered_tool_receipt_count > 0
-                    && recovered_tool_receipts_require_text_only),
-            force_tool_allowlist_next_model: None,
-            force_tool_call_next_model: false,
-            force_reasoning_effort_next_model: None,
-            terminal_recovery_attempts: 0,
-            provider_protocol_recovery_attempts: 0,
-            provider_frame_repair_attempts: std::collections::BTreeMap::new(),
-            agentic_protocol_recovery_attempts: 0,
-            agentic_program_context_revision: None,
-            execution_role,
-            bounded_evidence_role: false,
-            focus_novelty_target_bp: 0,
-            focus_acceptance_scopes: Vec::new(),
-            focus_acceptance_pending_scopes: Vec::new(),
-            focus_required_output_fields: Vec::new(),
-            structured_output_replans: 0,
-            focus_observed_resource_scopes: BTreeSet::new(),
-            focus_observed_evidence: Vec::new(),
-            focus_action_rejections: 0,
-            pending_focus_terminal_candidate: None,
-            focus_discovery_replans: 0,
-            focus_verification_prefetched: false,
-            clean_terminal_synthesis_next: false,
-            clean_terminal_synthesis_attempted: false,
-            clean_terminal_retry_attempted: false,
-            terminal_failure_narration: None,
-            consecutive_tool_failure_batches: 0,
-            cold_start_failure_replans: 0,
-            consecutive_low_novelty_batches: 0,
-            successful_tool_calls: 0,
-            last_terminal_answer_digest: String::new(),
-            repeated_terminal_answers: 0,
-            completion_gap_outstanding: false,
-            outstanding_closure_rungs: Vec::new(),
-            tool_receipts_observed: recovered_tool_receipt_count,
-            duplicate_tool_calls: 0,
-            identical_action_digest: String::new(),
-            identical_action_result_digest: String::new(),
-            identical_action_streak: 0,
-            per_turn_tool_counts: BTreeMap::new(),
-            write_attempt_paths: Vec::new(),
-
-
-            committed_workspace_write_observed: false,
-            committed_workspace_write_scopes: BTreeSet::new(),
-            committed_workspace_observed_evidence: Vec::new(),
-            workspace_mutation_effect_sequences: BTreeSet::new(),
-
-            max_tool_concurrency_observed: 0,
-            parallel_tool_batches: 0,
-            early_tool_receipts: BTreeMap::new(),
-            evaluation_resource_scopes: evaluation_control
-                .as_ref()
-                .map(|control| control.resource_scopes.clone())
-                .unwrap_or_default(),
-            evaluation_scope_rejections: 0,
-            evaluation_judge_only: evaluation_control
-                .as_ref()
-                .is_some_and(|control| control.provider_constraint == "judge"),
-            collaboration_started: false,
-            pending_root_control_plane_requirement: None,
-
-            root_language_replan_attempted: false,
-            pending_terminal_artifact: None,
-            pending_controlled_recovery_claim_fingerprints: Vec::new(),
-            pending_disposition_inputs: Vec::new(),
-            terminal_tracker: crate::liveness::TerminalTracker::new(
-                crate::liveness::TerminalObligation::default(),
-            ),
-            terminal_satisfaction_since: None,
-        }));
+        let state = prepare_turn_graph_state(
+            content, prompter, recovered_provider_usage, recovered_provider_attempt_count,
+            recovered_cache_dimensions_known, &ingress, turn_transcript_start, &session_id,
+            &turn_ref, &evaluation_control, recovered_tool_receipt_count,
+            recovered_tool_receipts_require_text_only, execution_role,
+        );
 
         let provider_profile_fingerprint = {
             let runtime = runtime.lock().await;
@@ -1216,91 +1335,11 @@ where
             graph_state.focus_acceptance_scopes = delegated_focus_policy.1;
             graph_state.focus_required_output_fields = delegated_focus_policy.2;
         }
-        let turn_payload = serde_json::json!({
-            "kind": "conversation_turn",
-            "session_id": session_id,
-            "content": content,
-            "objective": resolved_objective,
-            "compile_target": compile_target,
-            "ingress": ingress,
-            "idempotency_key": ingress.as_ref().map(|value| value.request_id.as_str()),
-        })
-        .to_string();
-        let delegation_resource_scopes = root_delegation_resource_scopes(
-            evaluation_control.as_ref(),
-            services.session_execution_policy(&session_id).as_ref(),
-        );
-        let mut graph = ExecutionGraphCompiler
-            .compile_conversation_turn(ExecutionCompileRequest {
-                objective: resolved_objective.clone(),
-                payload_ref: turn_payload,
-                target: compile_target,
-                resource_scopes: delegation_resource_scopes,
-            })
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-        graph.parent_execution = execution_parent;
-        graph.lineage = execution_lineage;
-        if strategy
-            .decision
-            .strategy
-            .understanding
-            .requests_background
-        {
-            graph.service_class =
-                harness_contract::execution_graph::ExecutionServiceClass::Background;
-        } else if graph.parent_execution.is_some() {
-            graph.service_class =
-                harness_contract::execution_graph::ExecutionServiceClass::Foreground;
-        }
-        if let Some(ingress) = &ingress {
-            let graph_id = crate::session_execution::session_ingress_graph_id(
-                &ingress.session_id,
-                &ingress.request_id,
-                &ingress.turn_id,
-            );
-            ExecutionGraphCompiler
-                .bind_conversation_graph_identity(
-                    &mut graph,
-                    &graph_id,
-                    None,
-                    Some(&ingress.request_id),
-                )
-                .map_err(RuntimeError::new)?;
-            graph.revision = 0;
-            graph.node_results.clear();
-            graph.recovery_cursor = Default::default();
-            graph.node_statuses.clear();
-            graph.lineage = Some(
-                harness_contract::execution_graph::ExecutionGraphLineage {
-                    session_id: ingress.session_id.clone(),
-                    turn_id: ingress.turn_id.clone(),
-                    root_task_id: ingress.root_task_id.clone(),
-                    task_id: ingress.primary_task_id.clone(),
-                    generation: ingress.session_generation.max(1),
-                },
-            );
-            graph
-                .node_statuses
-                .insert(graph.nodes[0].id.clone(), ExecutionNodeStatus::Planned);
-            let root_id = graph.nodes[0].id.clone();
-            let dispatch_id = format!("{}:session-dispatch", graph.id);
-            let mut dispatch = ExecutionNodeSpec::new(
-                ExecutionNodeKind::SessionDispatch,
-                crate::SESSION_DISPATCH_EXECUTOR,
-                format!(
-                    "session_ingress:{}",
-                    serde_json::to_string(ingress).unwrap_or_default()
-                ),
-            );
-            dispatch.id = dispatch_id.clone();
-            dispatch.idempotency_key = format!("{}:dispatch", ingress.request_id);
-            graph.nodes.insert(0, dispatch);
-            graph.edges.push(ExecutionEdge {
-                from: dispatch_id,
-                to: root_id,
-                kind: ExecutionEdgeKind::DependsOn,
-            });
-        }
+        let mut graph = prepare_initial_conversation_graph(
+            services.as_ref(), content, &resolved_objective, &session_id, ingress.as_ref(),
+            evaluation_control.as_ref(), compile_target, execution_parent, execution_lineage,
+            strategy.decision.strategy.understanding.requests_background,
+        )?;
         if execution_role == TurnExecutionRole::RootTurn && ingress.is_some() {
             let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
                 RuntimeError::new("owned root requires its event bus")
@@ -5572,7 +5611,7 @@ fn turn_scope_matches(ticket: &NodeExecutionTicket, session_id: &str, graph_id: 
 struct TurnModelResolver<C: ApiClient, T: ToolExecutor> {
     session_id: String,
     graph_id: String,
-    runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: std::sync::Weak<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     state: std::sync::Weak<tokio::sync::Mutex<TurnGraphState>>,
     services: std::sync::Weak<crate::RuntimeServices>,
 }
@@ -5600,7 +5639,7 @@ where
 struct TurnToolResolver<C: ApiClient, T: ToolExecutor> {
     session_id: String,
     graph_id: String,
-    runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: std::sync::Weak<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     state: std::sync::Weak<tokio::sync::Mutex<TurnGraphState>>,
     services: std::sync::Weak<crate::RuntimeServices>,
 }
@@ -5628,7 +5667,7 @@ where
 struct TurnSynthesizeResolver<C: ApiClient, T: ToolExecutor> {
     session_id: String,
     graph_id: String,
-    runtime: std::sync::Weak<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: std::sync::Weak<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     state: std::sync::Weak<tokio::sync::Mutex<TurnGraphState>>,
     services: std::sync::Weak<crate::RuntimeServices>,
 }
@@ -5657,7 +5696,7 @@ where
 struct TurnModelStepBackend<C: ApiClient, T: ToolExecutor> {
     ticket: NodeExecutionTicket,
     stop: crate::CancellationToken,
-    runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: Arc<crate::RuntimeServices>,
 }
@@ -6286,7 +6325,7 @@ fn runtime_authored_tool_call_message(calls: &[ModelToolCall]) -> ConversationMe
 }
 
 struct TurnToolBatchBackend<C: ApiClient, T: ToolExecutor> {
-    runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: std::sync::Weak<crate::RuntimeServices>,
     goal_revalidation: std::sync::Mutex<Option<ToolGoalRevalidation>>,
@@ -6303,7 +6342,7 @@ struct ToolGoalRevalidation {
 }
 
 async fn compact_governed_tool_messages<C, T>(
-    runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: &Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     calls: &[ModelToolCall],
     raw_messages: Vec<ConversationMessage>,
     invocations: &HashMap<String, ToolInvocationRecord>,
@@ -6430,6 +6469,8 @@ tokio::task_local! {
 }
 
 struct OriginalBatchPolicyOwner {
+    state: std::sync::Weak<tokio::sync::Mutex<TurnGraphState>>,
+    services: std::sync::Weak<crate::RuntimeServices>,
     owner: Arc<crate::conversation::SharedPolicyOwner>,
     prompter: SharedPrompter,
     parent: harness_contract::execution_graph::ExecutionParentBinding,
@@ -6524,7 +6565,8 @@ impl OriginalBatchPolicyOwner {
         let handle = self.action_service.recover_retained_original_member(&marker.transaction_id)
             .map_err(|_| unavailable())?.ok_or_else(unavailable)?;
         let authority = handle.authority().ok_or_else(unavailable)?;
-        let host = authority.member().host().ok_or_else(unavailable)?;
+        let member_guard = authority.member().upgrade().ok_or_else(unavailable)?;
+        let host = member_guard.host().ok_or_else(unavailable)?;
         let source = host.original_request();
         let source_hook = source.tool_progress.original_governed_hook().map_err(|_| unavailable())?.ok_or_else(unavailable)?;
         let request_hook = original.tool_progress.original_governed_hook().map_err(|_| unavailable())?.ok_or_else(unavailable)?;
@@ -6625,17 +6667,6 @@ impl OriginalBatchPolicyOwner {
         Ok((marker, action, receipt))
     }
 
-    fn prepare_member_replay_witness(
-        &self, original: &crate::RuntimeToolExecutionRequest, index: usize,
-    ) -> Result<Arc<OriginalMemberReplayWitness>, crate::tool_host::BatchMemberUnknownReason> {
-        use crate::tool_host::BatchMemberUnknownReason;
-        let outer = self.validate_original_member(original, index)
-            .map_err(BatchMemberUnknownReason::OriginalRequestNotAuthenticated)?;
-        self.validate_original_outer_intent(original)
-            .map_err(BatchMemberUnknownReason::OriginalRequestNotAuthenticated)?;
-        self.prepare_member_replay_witness_from_outer(original, index, &outer)
-    }
-
     /// This is only a replay reader check. Missing intent is Unknown; it does
     /// not reject an uncommitted business call or issue a new authorization.
     fn validate_original_outer_intent(&self, original: &crate::RuntimeToolExecutionRequest) -> Result<(), String> {
@@ -6676,18 +6707,54 @@ impl OriginalBatchPolicyOwner {
             .map_err(BatchMemberUnknownReason::OriginalRequestNotAuthenticated)
     }
 
+    async fn retain_original_host_member(
+        &self, original: &crate::RuntimeToolExecutionRequest, index: usize,
+        member: &Arc<crate::conversation::OriginalHostPreparedMember>,
+    ) -> Result<(), String> {
+        let services = self.services.upgrade().ok_or("original Host services unavailable")?;
+        let observation = services.tool_batch_executor().binding_observation(&self.ticket)
+            .ok_or("original Host binding observation unavailable")?;
+        let state = self.state.upgrade().ok_or("original Host turn state unavailable")?;
+        let state = state.lock().await;
+        let entries = state.pending_member_batches.get(&(self.ticket.node_id.clone(), self.ticket.attempt))
+            .ok_or("original Host call carrier unavailable")?;
+        let mut found = None;
+        for (call_id, pending) in entries {
+            if call_id != &original.tool_use_id { continue; }
+            if let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.value() {
+                if carrier.original_request() != original
+                    || !carrier.original_request().tool_progress.same_original_channels(&original.tool_progress) {
+                    return Err("original Host call carrier changed".into());
+                }
+                if found.replace(Arc::clone(carrier)).is_some() {
+                    return Err("original Host call carrier is ambiguous".into());
+                }
+            }
+        }
+        let carrier = found.ok_or("original Host call carrier unavailable")?;
+        drop(state);
+        if member.prepared().index != index { return Err("original Host member index differs".into()); }
+        carrier.retain_host_member(&self.ticket, member, &observation)?;
+        if services.tool_batch_executor().binding_observation(&self.ticket)
+            .is_none_or(|current| !Arc::ptr_eq(&current, &observation)) {
+            return Err("original Host binding observation changed".into());
+        }
+        Ok(())
+    }
+
     /// Original Host owner prepares this member without consuming a lease.
     /// The physical outer intent and ticket remain the same producer facts.
     async fn prepare_original_host_member(
         &self, original: &crate::RuntimeToolExecutionRequest, index: usize,
         reservation: Arc<crate::runtime_event_store::OriginalMemberReservation>,
+        effect_fence: Arc<crate::runtime_event_store::OriginalMemberEffectFence>,
     ) -> Result<Arc<crate::conversation::OriginalHostPreparedMember>, String> {
-        self.validate_original_member(original, index)?;
+        self.validate_original_member(original, index).await?;
         self.validate_original_outer_intent(original)?;
         if !self.owner.uses_original_store(&self.event_store) {
             return Err("Host member store differs from original policy owner".into());
         }
-        self.owner.prepare_original_host_member(self.ticket.clone(), Arc::new(original.clone()), index, reservation)
+        self.owner.prepare_original_host_member(self.ticket.clone(), Arc::new(original.clone()), index, reservation, effect_fence)
             .await.map_err(|error| error.to_string())
     }
 
@@ -6711,24 +6778,36 @@ impl OriginalBatchPolicyOwner {
         // exclusive rights before the first hook or approval can run.
         let effect_fence = self.event_store.acquire_original_member_preparation_fence(
             &reservation, original, &self.ticket, index, fresh_effect,
-        ).map_err(|error| OriginalHostPreparationFailure {
-            reason: OriginalHostPreparationFailureReason::OriginalOwnerStore(Arc::new(error)), effect_fence: None,
+        ).map_err(|error| {
+            OriginalHostPreparationFailure {
+                reason: OriginalHostPreparationFailureReason::OriginalOwnerStore(Arc::new(error)), effect_fence: None,
+            }
         })?;
         // Acquisition must atomically retain this durable fence in the same
         // original reservation before any await, including future cancellation.
         let result = async {
-            let member = self.prepare_original_host_member(original, index, Arc::clone(&reservation)).await
+            let member = self.prepare_original_host_member(original, index, Arc::clone(&reservation), Arc::clone(&effect_fence)).await
+                .map_err(|error| {
+                    OriginalHostPreparationFailureReason::Preparation(error)
+                })?;
+            self.retain_original_host_member(original, index, &member).await
                 .map_err(OriginalHostPreparationFailureReason::Preparation)?;
             let authority = member.prepare_authority_with_approval().await
-                .map_err(OriginalHostPreparationFailureReason::Preparation)?;
+                .map_err(|error| {
+                    OriginalHostPreparationFailureReason::Preparation(error)
+                })?;
             if !reservation.matches_original(&self.event_store, &original.idempotency_key, original_index, &self.ticket) {
                 return Err(OriginalHostPreparationFailureReason::Preparation("original member reservation changed during preparation".into()));
             }
             self.event_store.verify_original_member_preparation_fence(
                 &effect_fence, &reservation, original, &self.ticket, index,
-            ).map_err(|error| OriginalHostPreparationFailureReason::OriginalOwnerStore(Arc::new(error)))?;
+            ).map_err(|error| {
+                OriginalHostPreparationFailureReason::OriginalOwnerStore(Arc::new(error))
+            })?;
             self.bind_prepared_host_authority(member, authority, Arc::clone(&reservation), Arc::clone(&effect_fence))
-                .map_err(OriginalHostPreparationFailureReason::Preparation)
+                .map_err(|error| {
+                    OriginalHostPreparationFailureReason::Preparation(error)
+                })
         }.await;
         result.map_err(|reason| OriginalHostPreparationFailure { reason, effect_fence: Some(effect_fence) })
     }
@@ -6750,19 +6829,31 @@ impl OriginalBatchPolicyOwner {
         crate::step_snapshot::OriginalPreparedMemberCapability::from_host(member, authority, reservation, effect_fence)
     }
 
-    fn validate_original_member(&self, original: &crate::RuntimeToolExecutionRequest, index: usize)
+    async fn validate_original_member(&self, original: &crate::RuntimeToolExecutionRequest, index: usize)
         -> Result<serde_json::Value, String> {
-        let binding = original.step_binding.as_ref().ok_or("batch original Step missing")?;
-        original.compiled_invocation.as_ref().ok_or("batch original invocation missing")?;
+        let binding = original.step_binding.as_ref().ok_or_else(|| {
+            "batch original Step missing"
+        })?;
+        original.compiled_invocation.as_ref().ok_or_else(|| {
+            "batch original invocation missing"
+        })?;
         // The Step is a description, not proof that this call belonged to the
         // executor's original started ticket. Re-read the original start and
         // require exactly one matching call from its persisted payload.
-        crate::execution_core::graph::validate_node_ticket_start(&self.event_store, &self.ticket, None)
-            .map_err(|error| format!("batch original ticket start invalid: {error}"))?;
+        let validation_store = Arc::clone(&self.event_store);
+        let validation_ticket = self.ticket.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::execution_core::graph::validate_node_ticket_start(&validation_store, &validation_ticket, None)
+                .map(|_| ()).map_err(|error| format!("batch original ticket start invalid: {error}"))
+        }).await.map_err(|error| format!("batch original ticket validation task failed: {error}"))??;
         crate::execution_core::graph::executors::agent_tool::validate_original_call_request(&self.ticket, original)
-            .map_err(|error| format!("batch original ticket call invalid: {error}"))?;
+            .map_err(|error| {
+                format!("batch original ticket call invalid: {error}")
+            })?;
         let input = harness_contract::step::parse_strict_json(&original.input)
-            .map_err(|error| format!("batch original input invalid: {error}"))?;
+            .map_err(|error| {
+                format!("batch original input invalid: {error}")
+            })?;
         if original.parent_execution.as_ref() != Some(&self.parent)
             || original.parent_execution_attempt != Some(self.attempt)
             || original.session_id.as_deref() != Some(self.owner.session_id())
@@ -6770,11 +6861,15 @@ impl OriginalBatchPolicyOwner {
             || original.idempotency_key != binding.effect_idempotency_key()
             || original.tool_use_id != binding.origin.call_id
             || !self.owner.owns_turn(binding)
-        { return Err("batch original owner mismatch".into()); }
+        {
+            return Err("batch original owner mismatch".into());
+        }
         if input.get("actions").and_then(serde_json::Value::as_array)
             .filter(|actions| !actions.is_empty() && actions.len() <= 25)
             .and_then(|actions| actions.get(index)).is_none()
-        { return Err("batch original member index missing".into()); }
+        {
+            return Err("batch original member index missing".into());
+        }
         Ok(input)
     }
 
@@ -6940,11 +7035,13 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
     async fn prepare_member_pregrant(&self, original: &crate::RuntimeToolExecutionRequest, index: usize)
         -> crate::tool_host::AgentBatchMemberPregrant {
         use crate::tool_host::{AgentBatchMemberPregrant, BatchMemberUnknown, BatchMemberUnknownReason};
-        let outer = match self.validate_original_member(original, index) {
+        let outer = match self.validate_original_member(original, index).await {
             Ok(outer) => outer,
-            Err(reason) => return AgentBatchMemberPregrant::Unknown {
-                failure: BatchMemberUnknown { index, reason: BatchMemberUnknownReason::OriginalRequestNotAuthenticated(reason) },
-                stop: None,
+            Err(reason) => {
+                return AgentBatchMemberPregrant::Unknown {
+                    failure: BatchMemberUnknown { index, reason: BatchMemberUnknownReason::OriginalRequestNotAuthenticated(reason) },
+                    stop: None,
+                };
             },
         };
         let coordinate = crate::tool_host::OriginalBatchMemberCoordinate::from_original(original, &self.ticket, index);
@@ -6957,7 +7054,9 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
             };
         }
         match self.read_retained_original_member(original, index) {
-            Ok(Some(member)) => return AgentBatchMemberPregrant::Replay(member),
+            Ok(Some(member)) => {
+                return AgentBatchMemberPregrant::Replay(member);
+            },
             Ok(None) => {},
             Err(reason) => {
                 if let Ok(witness) = self.prepare_member_replay_witness_from_outer(original, index, &outer) {
@@ -7015,7 +7114,9 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
             }
         };
         match self.prepare_original_host_capability(original, index, Arc::clone(&reservation), &fresh_effect).await {
-            Ok(candidate) => AgentBatchMemberPregrant::Candidate(candidate),
+            Ok(candidate) => {
+                AgentBatchMemberPregrant::Candidate(candidate)
+            },
             Err(failure) => {
                 // The effect/backend check may itself be uncertain. Retain the
                 // exact original reservation; do not infer cancellation.
@@ -7042,76 +7143,7 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
         }
     }
 
-    async fn resolve_member(&self, original: &crate::RuntimeToolExecutionRequest, index: usize)
-        -> crate::tool_host::AgentBatchMemberResolution {
-        use crate::tool_host::{AgentBatchMemberResolution, BatchMemberUnknown, BatchMemberUnknownReason};
-        let outer = match self.validate_original_member(original, index) {
-            Ok(value) => value,
-            Err(reason) => return AgentBatchMemberResolution::Unknown(BatchMemberUnknown {
-                index, reason: BatchMemberUnknownReason::OriginalRequestNotAuthenticated(reason),
-            }),
-        };
-        if let Err(reason) = self.validate_original_outer_intent(original) {
-            return AgentBatchMemberResolution::Unknown(BatchMemberUnknown {
-                index, reason: BatchMemberUnknownReason::OriginalRequestNotAuthenticated(reason),
-            });
-        }
-        match self.read_retained_original_member(original, index) {
-            Ok(Some(member)) => return AgentBatchMemberResolution::Replay(member),
-            Ok(None) => {},
-            Err(reason) => return match self.prepare_member_replay_witness_from_outer(original, index, &outer) {
-                Ok(witness) => AgentBatchMemberResolution::Replay(crate::tool_host::AuthenticatedBatchMember::from_original_witness(witness)),
-                Err(_) => AgentBatchMemberResolution::Unknown(BatchMemberUnknown { index, reason }),
-            },
-        }
-        AgentBatchMemberResolution::Unknown(BatchMemberUnknown { index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable })
-    }
 
-    async fn read_committed_prefix(&self, original: &crate::RuntimeToolExecutionRequest)
-        -> crate::tool_host::AgentBatchCommittedPrefixRead {
-        use crate::tool_host::{AgentBatchCommittedPrefixRead, AgentBatchMemberFailure,
-            AuthenticatedBatchMember, AuthenticatedBatchPrefix, BatchMemberUnknown,
-            BatchMemberUnknownReason, IncompleteAgentBatch};
-        let mut prefix = AuthenticatedBatchPrefix::new();
-        let outer = match self.validate_original_member(original, 0) {
-            Ok(outer) => outer,
-            Err(reason) => return AgentBatchCommittedPrefixRead::Stopped(
-                IncompleteAgentBatch::new(prefix, AgentBatchMemberFailure::Unknown(BatchMemberUnknown {
-                    index: 0, reason: BatchMemberUnknownReason::OriginalRequestNotAuthenticated(reason),
-                })).unwrap_or_else(|_| unreachable!("empty prefix begins at zero"))),
-        };
-        if let Err(reason) = self.validate_original_outer_intent(original) {
-            return AgentBatchCommittedPrefixRead::Stopped(
-                IncompleteAgentBatch::new(prefix, AgentBatchMemberFailure::Unknown(BatchMemberUnknown {
-                    index: 0, reason: BatchMemberUnknownReason::OriginalRequestNotAuthenticated(reason),
-                })).unwrap_or_else(|_| unreachable!("empty prefix begins at zero")));
-        }
-        let actions = outer.get("actions").and_then(serde_json::Value::as_array)
-            .expect("original member validation established an actions array");
-        for index in 0..actions.len() {
-            match self.read_retained_original_member(original, index) {
-                Ok(Some(member)) => {
-                    if prefix.push(member).is_err() { unreachable!("owner resolves its own prefix in index order"); }
-                    continue;
-                }
-                Ok(None) => return AgentBatchCommittedPrefixRead::Stopped(
-                    IncompleteAgentBatch::new(prefix, AgentBatchMemberFailure::Unknown(BatchMemberUnknown {
-                        index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
-                    })).unwrap_or_else(|_| unreachable!("owner resolves its own prefix in index order"))),
-                Err(reason) => match self.prepare_member_replay_witness_from_outer(original, index, &outer) {
-                    Ok(witness) => {
-                        if prefix.push(AuthenticatedBatchMember::from_original_witness(witness)).is_err() {
-                            unreachable!("owner resolves its own prefix in index order");
-                        }
-                    }
-                    Err(_) => return AgentBatchCommittedPrefixRead::Stopped(
-                        IncompleteAgentBatch::new(prefix, AgentBatchMemberFailure::Unknown(BatchMemberUnknown { index, reason }))
-                            .unwrap_or_else(|_| unreachable!("owner resolves its own prefix in index order"))),
-                },
-            }
-        }
-        AgentBatchCommittedPrefixRead::AllCommitted(prefix)
-    }
 
 
 }
@@ -7287,6 +7319,7 @@ async fn execute_fenced_runtime_tool_owned(
     action_issuer: Option<&crate::conversation::tool_plane::OwnedRootActionIssuer>,
     single_capture: Option<&crate::conversation::tool_plane::OriginalSingleProducerCapture>,
 ) -> crate::RuntimeToolExecutionOutcome {
+
     let Some(effect) = effect else {
         if let Some(observation) = observation {
             observation.refuse(
@@ -7309,6 +7342,7 @@ async fn execute_fenced_runtime_tool_owned(
             pending_agent_batch: None,
         };
     };
+
     if tools::tool_orchestrator::effect_is_bounded_read_only_compute(effect)
         || request.tool_name == "execute_code" {
         let result = async {
@@ -7366,6 +7400,7 @@ async fn execute_fenced_runtime_tool_owned(
     }
     // Only direct actions take this path. Batch members own their own admission;
     // acquiring the outer scope here could deadlock or lend its authority to them.
+
     let direct_action = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
         .contains(&request.tool_name.as_str());
     let locked = if direct_action {
@@ -7395,6 +7430,7 @@ async fn execute_fenced_runtime_tool_owned(
             }
         }
     } else { None };
+
     let mut admitted_scope = None;
     let admission = (|| {
         if let Some(outcome) = commit_service.completed_tool_effect(request, effect)? {
@@ -7419,6 +7455,7 @@ async fn execute_fenced_runtime_tool_owned(
                 .map_err(|error| crate::ToolError::new(error.to_string()))?;
                 crate::bound_tool_batch::admitted_effect_scope(request, effect, current, &resolver)
             };
+
         let scope = match &locked { Some(locked) => Ok(locked.scope.clone()), None => build_scope() }.map_err(|error| {
             if let Some(observation) = observation {
                 observation.refuse(&request.tool_use_id, error.to_string());
@@ -7426,6 +7463,7 @@ async fn execute_fenced_runtime_tool_owned(
             crate::execution_core::graph::ExecutionCommitError::InvalidCommand(error.to_string())
         })?;
         admitted_scope = Some(scope);
+
         commit_service.begin_bound_tool_effect_observed(
             request,
             effect,
@@ -7433,6 +7471,7 @@ async fn execute_fenced_runtime_tool_owned(
             observation,
         )
     })();
+
     match admission {
         Ok(crate::execution_core::graph::ToolEffectState::Completed(mut outcome)) => {
             if direct_action {
@@ -7485,6 +7524,7 @@ async fn execute_fenced_runtime_tool_owned(
             // command runs: the host executor can only report quiescence after
             // the fact, and the receipt may only be settled against an
             // admission that was published first.
+
             let host_process_admission = match commit_service
                 .admit_host_process(request, effect)
                 .await
@@ -7521,6 +7561,7 @@ async fn execute_fenced_runtime_tool_owned(
                     };
                 }
             }
+
             let execute = async {
                 if direct_action {
                     let issuer = action_issuer.ok_or_else(|| crate::ToolError::new("original root action issuer unavailable"))?;
@@ -7536,6 +7577,7 @@ async fn execute_fenced_runtime_tool_owned(
             let result = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
                 crate::bound_tool_batch::with_outer_read_receipt_owner(request, execute).await
             } else { execute.await };
+
             let mut outcome = match result {
                 Ok(outcome) => outcome,
                 Err(error) => crate::RuntimeToolExecutionOutcome {
@@ -7612,6 +7654,7 @@ async fn execute_fenced_runtime_tool_owned(
             // A read-class effect has no settlement stream for a process
             // terminal, so it keeps its plain read receipt and the witness stays
             // honestly unproven for it.
+
             let committed = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
                 if host_process_terminal {
                     commit_service
@@ -7638,6 +7681,7 @@ async fn execute_fenced_runtime_tool_owned(
             } else {
                 commit_service.commit_tool_effect(request, effect, &outcome)
             };
+
             if let Err(error) = committed {
                 return crate::RuntimeToolExecutionOutcome {
                     tool_use_id: request.tool_use_id.clone(),
@@ -7674,7 +7718,6 @@ async fn execute_fenced_runtime_tool_owned(
         },
     }
 }
-
 fn bound_runtime_tool_request(
     call: &ModelToolCall,
     task: &crate::GovernedToolPlanTask,
@@ -8520,7 +8563,7 @@ fn synthetic_capability_gap(
 }
 
 struct TurnSynthesizeBackend<C: ApiClient, T: ToolExecutor> {
-    runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: Arc<crate::RuntimeServices>,
 }

@@ -619,7 +619,7 @@ async fn own836_public_direct_foreign_owner_and_role_mismatch_fail_before_strate
             TurnExecutionRole::RootTurn
         };
         let (runtime, result) = submit_owned_conversation_turn_with_ingress(
-            runtime,
+            Box::new(runtime),
             services.clone(),
             "never execute a provider",
             &SharedPrompter::none(),
@@ -778,7 +778,7 @@ fn r1_observation_branch_runtime<C: ApiClient + Send + Sync + 'static>(
     graph: &harness_contract::execution_graph::ExecutionGraph,
     goal_id: &str,
 ) -> (
-    Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, RecordingToolExecutor>>>,
+    Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, RecordingToolExecutor>>>>,
     TurnGraphState,
     (
         Option<crate::CowdExecutionScope>,
@@ -810,7 +810,7 @@ fn r1_observation_branch_runtime<C: ApiClient + Send + Sync + 'static>(
         strategy.decision.complexity(),
         None,
     );
-    (Arc::new(tokio::sync::Mutex::new(runtime)), state, scope)
+    (Arc::new(tokio::sync::Mutex::new(Box::new(runtime))), state, scope)
 }
 
 fn r1_same_transaction_model_result(
@@ -1938,7 +1938,7 @@ async fn r1_event_replay_host_after_narration_fence_does_not_emit_before_fence_o
     let release = Arc::new(tokio::sync::Notify::new());
     let attempts = Arc::new(AtomicUsize::new(0));
     let runtime = Arc::new(tokio::sync::Mutex::new(
-        crate::ConversationRuntime::new(
+        Box::new(crate::ConversationRuntime::new(
             session.clone(),
             R1NarratorFenceClient {
                 entered: entered.clone(),
@@ -1951,7 +1951,7 @@ async fn r1_event_replay_host_after_narration_fence_does_not_emit_before_fence_o
         )
         .without_memory()
         .with_runtime_event_store(services.event_store().clone())
-        .with_artifact_store(services.artifact_store().clone()),
+        .with_artifact_store(services.artifact_store().clone())),
     ));
     let stream = runtime.lock().await.session_input_stream();
     stream.set_active_turn(Some(TurnId::from_string("r1-branch-turn")));

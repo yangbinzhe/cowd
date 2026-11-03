@@ -1920,13 +1920,17 @@ where
                 Some((slots, framing)),
             )
             .await?;
+        Self::finish_input_interpretation(&mut step, slots);
+        Ok(step)
+    }
+
+    pub(crate) fn finish_input_interpretation(step: &mut ModelStepResult, slots: usize) {
         step.input_interpretation = Some(match &step.intent {
             ModelStepIntent::FinalAnswer { text }
                 if step.early_tool_receipts.is_empty() && step.preflight_tool_results.is_empty() =>
                 harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(text, slots),
             _ => Err("input interpretation emitted execution instead of a business proposal".into()),
         });
-        Ok(step)
     }
 
     pub(crate) async fn execute_model_step_for_purpose(
@@ -2670,6 +2674,9 @@ where
                 execution,
             )
             .await;
+            // Construct the result phase only after the original stream and
+            // producer/consumer finish have returned in this same task.
+            let completed = Box::pin(async {
             let resource_result_class = stream_run.resource_result_class;
             let observed_usage = stream_run
                 .collected
@@ -2783,7 +2790,7 @@ where
                 {
                     self.mark_provider_account_unavailable(&error);
                     last_error = Some(error);
-                    continue;
+                    return Ok(None);
                 }
                 if let Some(observed_limit) = error.provider_context_window_limit() {
                     if calibration_retries.insert(model.clone())
@@ -2795,7 +2802,7 @@ where
                             "provider context window calibrated; retrying candidate once"
                         );
                         candidates.push_front(model);
-                        continue;
+                        return Ok(None);
                     }
                 }
                 let retries = provider_retries.entry(model.clone()).or_default();
@@ -2817,10 +2824,10 @@ where
                         () = tokio::time::sleep(retry_after) => {}
                     }
                     candidates.push_front(model);
-                    continue;
+                    return Ok(None);
                 }
                 last_error = Some(error);
-                continue;
+                return Ok(None);
             }
 
             // A `length` truncation used to be silently returned. The terminal
@@ -3130,7 +3137,7 @@ where
                         self.consume_active_runtime_inputs_for_next_step(
                             TurnInputCheckpoint::AfterProviderResponse,
                         );
-                        return Ok(ModelStepResult {
+                        return Ok(Some(ModelStepResult {
                             input_interpretation: None,
                             intent: ModelStepIntent::Replan {
                                 reason: replan_reason,
@@ -3153,7 +3160,7 @@ where
                             early_tool_deferrals,
                             response_completed_at_ms,
                             text_only_response,
-                        });
+                        }));
                     }
                 }
             }
@@ -3311,7 +3318,7 @@ where
                 self.consume_active_runtime_inputs_for_next_step(
                     TurnInputCheckpoint::AfterProviderResponse,
                 );
-                return Ok(ModelStepResult {
+                return Ok(Some(ModelStepResult {
                     input_interpretation: None,
                     intent: ModelStepIntent::Replan {
                         reason: format!(
@@ -3337,7 +3344,7 @@ where
                     early_tool_deferrals,
                     response_completed_at_ms,
                     text_only_response,
-                });
+                }));
             }
             if discovery_activation_notice.is_some() {
                 if let Ok(mut notice) = self.next_model_tool_activation_notice.lock() {
@@ -3446,7 +3453,7 @@ where
             self.consume_active_runtime_inputs_for_next_step(
                 TurnInputCheckpoint::AfterProviderResponse,
             );
-            return Ok(ModelStepResult {
+            return Ok(Some(ModelStepResult {
                 input_interpretation: None,
                 intent,
                 assistant_message,
@@ -3466,7 +3473,12 @@ where
                 early_tool_deferrals,
                 response_completed_at_ms,
                 text_only_response,
-            });
+            }));
+            }).await?;
+            match completed {
+                Some(result) => return Ok(result),
+                None => continue,
+            }
         }
         Err(last_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")))
     }

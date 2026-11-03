@@ -705,7 +705,9 @@ impl OriginalGovernedHook {
     }
 
     pub(crate) fn original_pinned_lease(&self) -> Option<&tools::ToolHostLease> { self.pinned.lease().map(Arc::as_ref) }
-    pub(crate) fn original_native_executor(&self) -> Option<&Arc<dyn crate::ToolExecutor>> { self.pinned.lease().is_none().then_some(self.pinned.executor()) }
+    pub(crate) fn original_native_executor(&self) -> Option<Arc<dyn crate::ToolExecutor>> {
+        self.pinned.lease().is_none().then(|| self.pinned.executor()).flatten()
+    }
     pub(crate) fn original_ticket(&self) -> &crate::execution_core::NodeExecutionTicket { &self.ticket }
     pub(crate) fn original_plan_id(&self) -> &str { &self.plan_id }
     pub(crate) fn original_plan_revision(&self) -> u64 { self.plan_revision }
@@ -733,7 +735,7 @@ impl OriginalGovernedHook {
         }
         self.original_pinned_lease().cloned().ok_or_else(|| "original call has no pinned catalogue".to_string())
     }
-    pub(crate) fn original_authorized_native(&self, request: &crate::RuntimeToolExecutionRequest) -> Result<&Arc<dyn crate::ToolExecutor>, String> {
+    pub(crate) fn original_authorized_native(&self, request: &crate::RuntimeToolExecutionRequest) -> Result<Arc<dyn crate::ToolExecutor>, String> {
         let authorization = self.authorization.get().ok_or("original native authorization missing")?;
         if !self.matches(&self.ticket, request, &self.model_input) || Some(authorization) != request.authorization.as_ref() {
             return Err("original native call authorization differs".into());
@@ -3216,9 +3218,10 @@ where
         if request.step_binding.is_none() {
             let original = request.tool_progress.original_governed_hook().map_err(ToolError::new)?
                 .ok_or_else(|| ToolError::new("original unbound call owner missing"))?;
-            if let Some(native) = original.original_native_executor() {
+            if original.original_pinned_lease().is_none() {
+                let native = original.original_authorized_native(request).map_err(ToolError::unknown)?;
                 let executor: Arc<dyn crate::ToolExecutor> = self.tool_executor.clone();
-                if !Arc::ptr_eq(native, &executor) || !Arc::ptr_eq(original.original_authorized_native(request).map_err(ToolError::new)?, &executor) {
+                if !Arc::ptr_eq(&native, &executor) {
                     return Err(ToolError::new("original native executor changed"));
                 }
                 if descriptor.spawns_process {
@@ -3673,7 +3676,7 @@ where
             return Err(RuntimeError::new("original pinned invocation differs"));
         }
         let original_executor: Arc<dyn crate::ToolExecutor> = self.tool_executor.clone();
-        if !Arc::ptr_eq(pinned.executor(), &original_executor) {
+        if pinned.executor().is_none_or(|owner| !Arc::ptr_eq(&owner, &original_executor)) {
             return Err(RuntimeError::new("original tool executor differs from plan"));
         }
         let model_input = harness_contract::step::parse_strict_json(model).map_err(|error| RuntimeError::new(error.to_string()))?;

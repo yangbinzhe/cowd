@@ -38,7 +38,7 @@ fn host() -> StandardRuntimeHost<NoTools> {
     ).without_memory();
     StandardRuntimeHost {
         hook_scope: runtime.hook_execution_scope(),
-        runtime: Some(runtime),
+        runtime: Some(Box::new(runtime)),
         poisoned: false,
         inflight_turn: None,
         services: crate::RuntimeServices::in_memory().unwrap(),

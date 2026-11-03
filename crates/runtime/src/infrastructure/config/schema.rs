@@ -1369,6 +1369,7 @@ impl Default for SessionRecoveryConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GatewayCapacityConfig {
     pub runtime_workers: Option<usize>,
+    pub runtime_stack_bytes: Option<usize>,
     pub control_requests: Option<usize>,
     pub data_requests: Option<usize>,
     pub stream_connections: Option<usize>,

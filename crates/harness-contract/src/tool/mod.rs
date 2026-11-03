@@ -123,6 +123,34 @@ pub struct ToolEffectDescriptor {
     pub assessment: EffectAssessment,
 }
 
+/// Classifies a pure Runtime control effect; it does not authorize execution.
+#[must_use]
+pub fn is_internal_control_effect(
+    effect_kind: ToolEffectKind,
+    idempotency: ToolIdempotency,
+    required_permission: ToolPermissionMode,
+    approval_class: ToolApprovalClass,
+    scopes: &[PermissionScope],
+    uses_network: bool,
+    spawns_process: bool,
+    mutates_packages: bool,
+    mutates_system: bool,
+) -> bool {
+    effect_kind == ToolEffectKind::Write
+        && idempotency == ToolIdempotency::IdempotentWithKey
+        && required_permission == ToolPermissionMode::ReadOnly
+        && approval_class == ToolApprovalClass::None
+        && !scopes.is_empty()
+        && scopes.iter().all(|scope| {
+            scope.resource == crate::policy::PermissionResource::Tool
+                && scope.operation == crate::policy::PermissionOperation::Control
+        })
+        && !uses_network
+        && !spawns_process
+        && !mutates_packages
+        && !mutates_system
+}
+
 /// Declarative resolver selected when a tool is registered.
 ///
 /// The contract carries resolver identity only. Implementations remain in the

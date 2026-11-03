@@ -49,12 +49,13 @@ struct OriginalActionCommit<'a> {
 /// deserialized receipt cannot construct this capability.
 /// Original checked commits and verified unknown-outcome reads share the same
 /// durable commit receipt. Validation detail exists only for a direct return.
+#[derive(Clone)]
 pub(crate) struct OriginalMemberCommitReceipt {
     pub commit: crate::AppendTransactionReceipt,
     pub validation: Option<crate::CheckedSourceEvidence>,
 }
 struct CommittedActionAppend {
-    store: Arc<RuntimeEventStore>,
+    store: std::sync::Weak<RuntimeEventStore>,
     request: Arc<crate::CheckedAppendRequest>,
     receipt: OriginalMemberCommitReceipt,
     authority: Option<Arc<crate::authorization_negotiator::PreparedMemberAuthority>>,
@@ -146,13 +147,15 @@ pub(crate) fn process_original_member_replay(
     use crate::tool_host::BatchMemberUnknownReason;
     let unavailable = || BatchMemberUnknownReason::OriginalTransactionFactsUnavailable;
     if !Arc::ptr_eq(process.store(), &actions.store) { return Err(unavailable()); }
-    let Some(transaction_id) = actions.store.retained_original_process_member_transaction(&process, original, index)
+    let Some((transaction_id, member_guard)) = actions.store.retained_original_process_member_transaction(&process, original, index)
         .map_err(|_| unavailable())? else { return Ok(None); };
     let committed = actions.recover_retained_original_member(&transaction_id)
         .map_err(|_| unavailable())?.ok_or_else(unavailable)?;
     let authority = committed.authority().cloned().ok_or_else(unavailable)?;
-    let member_owner = authority.member().process().ok_or_else(unavailable)?;
-    if !Arc::ptr_eq(member_owner.owner(), &process) || !authority.matches_committed(&committed) {
+    if !authority.member().matches(&member_guard) { return Err(unavailable()); }
+    let approval_guard = authority.approval_guard(&member_guard).map_err(|_| unavailable())?;
+    let member_owner = member_guard.process().ok_or_else(unavailable)?;
+    if !Arc::ptr_eq(member_owner.owner(), &process) || !authority.matches_committed(&member_guard, &committed) {
         return Err(unavailable());
     }
     let transaction = &committed.request().transaction;
@@ -166,8 +169,14 @@ pub(crate) fn process_original_member_replay(
         .map_err(|_| unavailable())?;
     let member = crate::tool_host::AuthenticatedBatchMember::from_original_committed(Arc::clone(&committed), process.store(), &envelope)
         .map_err(|_| unavailable())?;
-    let owner_applied = process.negotiator().apply_recovered_member_authority(&authority, &committed)
+    let owner_applied = process.negotiator().apply_recovered_member_authority(&authority, &member_guard, approval_guard.as_deref(), &committed)
         .and_then(|()| actions.release_original_member_after_owner_apply(&committed).map_err(|error| error.to_string()));
+    let (committed, member) = if owner_applied.is_ok() {
+        let completed = committed.after_original_authority_release();
+        let member = crate::tool_host::AuthenticatedBatchMember::from_original_committed(Arc::clone(&completed), process.store(), &envelope)
+            .map_err(|_| unavailable())?;
+        (completed, member)
+    } else { (committed, member) };
     Ok(Some(ProcessOriginalCommittedReplay { committed, member, owner_applied }))
 }
 
@@ -179,7 +188,19 @@ pub struct OriginalCommittedMember {
     observation_error: Option<String>,
 }
 impl OriginalCommittedMember {
-    pub fn belongs_to(&self, store: &Arc<RuntimeEventStore>) -> bool { Arc::ptr_eq(&self.append.store, store) }
+    pub fn belongs_to(&self, store: &Arc<RuntimeEventStore>) -> bool {
+        self.append.store.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, store))
+    }
+    /// Only the original authority owner may call this after its apply and release succeed.
+    pub(crate) fn after_original_authority_release(&self) -> Arc<Self> {
+        Arc::new(Self {
+            append: CommittedActionAppend {
+                store: self.append.store.clone(), request: Arc::clone(&self.append.request),
+                receipt: self.append.receipt.clone(), authority: None,
+            },
+            observation: self.observation.clone(), observation_error: self.observation_error.clone(),
+        })
+    }
     pub fn request(&self) -> &crate::CheckedAppendRequest { &self.append.request }
     pub(crate) fn receipt(&self) -> &OriginalMemberCommitReceipt { &self.append.receipt }
     pub fn observation(&self) -> Option<&Arc<AgentActionObservation>> { self.observation.as_ref() }
@@ -2299,7 +2320,7 @@ impl AgentActionService {
         let Some(original) = self.store.recover_retained_member(transaction_id)? else { return Ok(None); };
         Ok(Some(Arc::new(OriginalCommittedMember {
             append: CommittedActionAppend {
-                store: Arc::clone(&self.store), request: original.request,
+                store: Arc::downgrade(&self.store), request: original.request,
                 receipt: OriginalMemberCommitReceipt { commit: original.receipt, validation: None },
                 authority: Some(original.authority),
             },
@@ -2329,9 +2350,12 @@ impl AgentActionService {
         let Some(committed) = self.recover_retained_original_member(transaction_id)? else { return Ok(None); };
         let authority = committed.authority().cloned().ok_or_else(|| AgentActionServiceError::Corrupt(
             "retained committed member authority missing".into()))?;
-        let applied = negotiator.apply_recovered_member_authority(&authority, &committed)
+        let member_guard = authority.member().upgrade().ok_or_else(|| AgentActionServiceError::MemberUnknown("original member owner unavailable".into()))?;
+        let approval_guard = authority.approval_guard(&member_guard).map_err(AgentActionServiceError::MemberUnknown)?;
+        let applied = negotiator.apply_recovered_member_authority(&authority, &member_guard, approval_guard.as_deref(), &committed)
             .and_then(|()| self.store.release_reconciled_member(transaction_id, &committed.append.request,
                 &authority, &committed.append.receipt.commit).map_err(|error| error.to_string()));
+        let committed = if applied.is_ok() { committed.after_original_authority_release() } else { committed };
         Ok(Some((committed, applied)))
     }
 
@@ -2353,13 +2377,14 @@ impl AgentActionService {
         ticket: &crate::execution_core::graph::NodeExecutionTicket,
         original_events: &[crate::step_snapshot::OriginalMemberEventRef],
         authority: Arc<crate::authorization_negotiator::PreparedMemberAuthority>,
+        member_guard: &crate::authorization_negotiator::PreparedMemberBinding,
         reservation: &crate::runtime_event_store::OriginalMemberReservation,
         effect_fence: &crate::runtime_event_store::OriginalMemberEffectFence,
         outer_hook: Option<&Arc<crate::conversation::tool_plane::OriginalGovernedHook>>,
     ) -> Result<OriginalMemberSubmission, AgentActionServiceError> {
-        if authority.member().prepared() != prepared
-            || !Arc::ptr_eq(authority.member().store(), &self.store)
-            || authority.member().ticket() != ticket {
+        if !authority.member().matches(member_guard) || member_guard.prepared() != prepared
+            || !Arc::ptr_eq(member_guard.store(), &self.store)
+            || member_guard.ticket() != ticket {
             return Err(AgentActionServiceError::Corrupt("member authority preparation or owner mismatch".into()));
         }
         if !authority.matches_staged_authorization(authorization) {
@@ -2368,40 +2393,52 @@ impl AgentActionService {
         // The private original producer, not caller payload, owns both sides
         // of this same invocation's hook and its permission context.
         let (kind, original, effective, hook_raw, permission_context, outer_request, step) =
-            if let Some(host) = authority.member().host() {
+            if let Some(host) = member_guard.host() {
                 ("host", host.original_prepared(), host.prepared(), host.hook_effective_input(),
                     host.permission_context(), host.original_request(), host.step())
-            } else if let Some(process) = authority.member().process() {
-                let facts = process.original_hook_facts().ok_or_else(|| AgentActionServiceError::MemberUnknown(
-                    "original Process member hook facts unavailable".into()))?;
+            } else if let Some(process) = member_guard.process() {
+                let facts = process.original_hook_facts().ok_or_else(|| {
+                    AgentActionServiceError::MemberUnknown("original Process member hook facts unavailable".into())
+                })?;
                 if facts.validation_error().is_some() || !facts.owner_live_after_hook() || !facts.authorization_compatible() {
-                    return Err(AgentActionServiceError::MemberUnknown("original Process member hook is not admissible".into()));
+            return Err(AgentActionServiceError::MemberUnknown("original Process member hook is not admissible".into()));
                 }
-                let effective = facts.effective().ok_or_else(|| AgentActionServiceError::MemberUnknown(
-                    "original Process effective member unavailable".into()))?;
+                let effective = facts.effective().ok_or_else(|| {
+                    AgentActionServiceError::MemberUnknown("original Process effective member unavailable".into())
+                })?;
                 ("process", facts.original(), effective, facts.hook_effective_input(), facts.context(),
                     process.original_request(), process.step())
             } else {
-                return Err(AgentActionServiceError::MemberUnknown("original member hook owner unavailable".into()));
+            return Err(AgentActionServiceError::MemberUnknown("original member hook owner unavailable".into()));
             };
         if original.outer_key != prepared.outer_key || original.index != prepared.index
             || original.tool != prepared.tool || effective != prepared {
             return Err(AgentActionServiceError::Corrupt("member original hook identity mismatch".into()));
         }
         let outer_hook_facts = if kind == "host" {
-            let hook = outer_hook.ok_or_else(|| AgentActionServiceError::MemberUnknown("original Host outer hook owner unavailable".into()))?;
-            hook.publication_facts(ticket, outer_request).map_err(AgentActionServiceError::MemberUnknown)?
+            let hook = outer_hook.ok_or_else(|| {
+                AgentActionServiceError::MemberUnknown("original Host outer hook owner unavailable".into())
+            })?;
+            hook.publication_facts(ticket, outer_request).map_err(|error| {
+                AgentActionServiceError::MemberUnknown(error)
+            })?
         } else {
             if outer_hook.is_some() { return Err(AgentActionServiceError::Corrupt("Process member cannot use a Host outer hook".into())); }
-            let process = authority.member().process().ok_or_else(|| AgentActionServiceError::MemberUnknown("original Process owner unavailable".into()))?;
-            let facts = process.owner().outer_input_facts().ok_or_else(|| AgentActionServiceError::MemberUnknown("original Process outer input facts unavailable".into()))?;
+            let process = member_guard.process().ok_or_else(|| {
+                AgentActionServiceError::MemberUnknown("original Process owner unavailable".into())
+            })?;
+            let facts = process.owner().outer_input_facts().ok_or_else(|| {
+                AgentActionServiceError::MemberUnknown("original Process outer input facts unavailable".into())
+            })?;
             if facts.effective_input() != outer_request.input || outer_request.compiled_invocation.as_ref() != Some(facts.invocation()) {
-                return Err(AgentActionServiceError::Corrupt("original Process outer input differs".into()));
+            return Err(AgentActionServiceError::Corrupt("original Process outer input differs".into()));
             }
             json!({"owner":"process", "model_input":facts.model_input(), "effective_input":facts.effective_input(), "invocation":facts.invocation()})
         };
         let hook_input = harness_contract::step::parse_strict_json(hook_raw)
-            .map_err(|error| AgentActionServiceError::Corrupt(error.to_string()))?;
+            .map_err(|error| {
+                AgentActionServiceError::Corrupt(error.to_string())
+            })?;
         let decision = permission_context.override_decision().map(|value| match value {
             crate::permissions::PermissionOverride::Allow => "allow",
             crate::permissions::PermissionOverride::Deny => "deny",
@@ -2438,7 +2475,8 @@ impl AgentActionService {
             single_call_facts: None, member_call_facts: Some(facts), authority: Some(authority), reservation: Some(reservation), effect_fence: Some(effect_fence), committed_capture: Some(&captured) };
         let result = self.apply_original_action_locked(envelope, goal, verification, &context);
         drop(context);
-        match (captured.into_inner(), result) {
+        let result = (captured.into_inner(), result);
+        match result {
             (Some(append), Ok(observation)) => Ok(OriginalMemberSubmission::Committed(Arc::new(
                 OriginalCommittedMember { append, observation: Some(Arc::new(observation)), observation_error: None }
             ))),
@@ -2648,7 +2686,7 @@ impl AgentActionService {
         let context = OriginalActionCommit { sources, locks, control, claim, consumed_input_sequence, single_call_facts: Some(facts), member_call_facts: None, authority: None, reservation: None, effect_fence: None, committed_capture: Some(&captured) };
         let observation = self.apply_original_action_locked(envelope, goal, verification, &context);
         let committed = captured.into_inner().map(|append| Arc::new(OriginalCommittedSingle {
-            store: Arc::downgrade(&append.store), request: append.request, receipt: append.receipt,
+            store: append.store, request: append.request, receipt: append.receipt,
             observation: observation.as_ref().ok().map(|value| Arc::new(value.clone())),
             observation_error: observation.as_ref().err().map(ToString::to_string),
         }));
@@ -2772,8 +2810,12 @@ impl AgentActionService {
         let Some(facts) = context.and_then(|owner| owner.member_call_facts.as_ref()) else { return Ok(None); };
         let owner = context.ok_or_else(|| AgentActionServiceError::Corrupt("member owner missing".into()))?;
         let prepared: crate::step_snapshot::PreparedAgentBatchMember = serde_json::from_value(
-            facts.get("prepared").cloned().ok_or_else(|| AgentActionServiceError::Corrupt("member preparation missing".into()))?
-        )?;
+            facts.get("prepared").cloned().ok_or_else(|| {
+                AgentActionServiceError::Corrupt("member preparation missing".into())
+            })?
+        ).map_err(|error| {
+            error
+        })?;
         if prepared.outer_key.is_empty() || prepared.identity.is_empty() {
             return Err(AgentActionServiceError::Corrupt("member index identity missing".into()));
         }
@@ -2782,7 +2824,9 @@ impl AgentActionService {
             return Err(AgentActionServiceError::Corrupt("member original outer effect source is not locked".into()));
         }
         let program_event_index = u32::try_from(program_event_index)
-            .map_err(|_| AgentActionServiceError::Corrupt("member program event index overflow".into()))?;
+            .map_err(|_| {
+                AgentActionServiceError::Corrupt("member program event index overflow".into())
+            })?;
         Ok(Some(RuntimeTransactionEventInput {
             event: RuntimeEventInput {
                 stream_id,
@@ -2837,17 +2881,21 @@ impl AgentActionService {
                 transaction.events.push(event.clone());
             }
             if indices.is_empty() {
-                return Err(AgentActionServiceError::Corrupt("member authority events missing".into()));
+                    return Err(AgentActionServiceError::Corrupt("member authority events missing".into()));
             }
             let mut markers = transaction.events.iter_mut().filter(|event| event.event.kind == "agentic.batch_member.index");
-            let marker = markers.next().ok_or_else(|| AgentActionServiceError::Corrupt("member index missing for authority".into()))?;
+            let marker = markers.next().ok_or_else(|| {
+                AgentActionServiceError::Corrupt("member index missing for authority".into())
+            })?;
             marker.event.payload["authority_events"] = json!(indices);
             if markers.next().is_some() { return Err(AgentActionServiceError::Corrupt("member index ambiguous".into())); }
         }
         transaction.expected_streams.sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
         let digest = super::review_evidence::proof_value_digest(&transaction);
         let validator = StrictOriginalActionSources { digest: digest.clone(), authority_deadlines: member.authority.as_ref().map(|a| a.deadlines()) };
-        let fence = member.claim.fence().map_err(AgentActionServiceError::Corrupt)?;
+        let fence = member.claim.fence().map_err(|error| {
+            AgentActionServiceError::Corrupt(error)
+        })?;
         let claim = crate::RuntimeOriginalSessionClaim {
             session_id: member.claim.session_id(), ingress_message_id: member.claim.message_id(),
             turn_id: member.claim.turn_id(), fence: &fence,
@@ -2862,15 +2910,21 @@ impl AgentActionService {
                 if let Some(slot) = member.committed_capture {
                     let (request, receipt, authority) = committed.into_parts();
                     *slot.borrow_mut() = Some(CommittedActionAppend {
-                        store: Arc::clone(&self.store), request,
+                        store: Arc::downgrade(&self.store), request,
                         receipt: OriginalMemberCommitReceipt { commit: receipt.commit, validation: Some(receipt.validation) }, authority,
                     });
                 }
                 Ok(())
             },
-            Ok(None) => Err(AgentActionServiceError::MemberCancelled),
-            Err(RuntimeEventStoreError::CheckedAttemptRolledBack(cause)) => Err(AgentActionServiceError::Store(*cause)),
-            Err(error) => Err(AgentActionServiceError::MemberUnknown(error.to_string())),
+            Ok(None) => {
+                Err(AgentActionServiceError::MemberCancelled)
+            },
+            Err(RuntimeEventStoreError::CheckedAttemptRolledBack(cause)) => {
+                Err(AgentActionServiceError::Store(*cause))
+            },
+            Err(error) => {
+                Err(AgentActionServiceError::MemberUnknown(error.to_string()))
+            },
         }
     }
 
@@ -3258,8 +3312,12 @@ impl AgentActionService {
         internal_supervisor: bool,
         member: Option<&OriginalActionCommit<'_>>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
-        self.ensure_recovery_session_admitted(&envelope.actor.session_id)?;
-        if let Some(replay) = self.replay_if_applied(envelope)? {
+        self.ensure_recovery_session_admitted(&envelope.actor.session_id).map_err(|error| {
+            error
+        })?;
+        if let Some(replay) = self.replay_if_applied(envelope).map_err(|error| {
+            error
+        })? {
             return Ok(replay);
         }
         if matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_)) {
@@ -3300,18 +3358,28 @@ impl AgentActionService {
         }
         let physical_source = if let Some(physical) = physical {
             let invalid = |message: String| AgentActionServiceError::Corrupt(message);
-            let graphs = self.graphs.as_ref().ok_or_else(|| invalid("agent actor graph store unavailable".into()))?;
-            let graph = graphs.load(&physical.graph_id).map_err(|e| invalid(e.to_string()))?;
+            let graphs = self.graphs.as_ref().ok_or_else(|| {
+                invalid("agent actor graph store unavailable".into())
+            })?;
+            let graph = graphs.load(&physical.graph_id).map_err(|e| {
+                invalid(e.to_string())
+            })?;
             if !physical_actor_matches_running_graph(&envelope.actor, physical, &graph)
             {
                 return Err(invalid("agent actor physical execution no longer active".into()));
             }
             let binding = graphs.current_binding(&graph, &physical.node_id, physical.attempt)
-                .map_err(|e| invalid(e.to_string()))?;
+                .map_err(|e| {
+                    invalid(e.to_string())
+                })?;
             let (ticket, original) = graphs.binding_start_ticket(&graph, &physical.node_id, &binding)
-                .map_err(|e| invalid(e.to_string()))?;
+                .map_err(|e| {
+                    invalid(e.to_string())
+                })?;
             let start = crate::execution_core::graph::validate_node_ticket_start(&self.store, &ticket, None)
-                .map_err(|e| invalid(e.to_string()))?;
+                .map_err(|e| {
+                    invalid(e.to_string())
+                })?;
             if ticket.graph_id != physical.graph_id || ticket.node_id != physical.node_id
                 || ticket.attempt != physical.attempt
                 || start.nodes.iter().find(|node| node.id == physical.node_id) != Some(&original)
@@ -3319,7 +3387,9 @@ impl AgentActionService {
             {
                 return Err(invalid("agent actor original execution ticket mismatch".into()));
             }
-            self.validate_physical_action_owner(envelope, &graph, &original, &binding)?;
+            self.validate_physical_action_owner(envelope, &graph, &original, &binding).map_err(|error| {
+                error
+            })?;
             Some(ExpectedStreamRevision { stream_id: graph.id, expected_revision: graph.revision })
         } else {
             None
@@ -3370,9 +3440,13 @@ impl AgentActionService {
                     .clone_from(&envelope.actor.root_execution_id);
                 Arc::new(projection)
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(error);
+            },
         };
-        self.ensure_recovery_session_admitted(&projection.session_id)?;
+        self.ensure_recovery_session_admitted(&projection.session_id).map_err(|error| {
+            error
+        })?;
         if projection.objective_id != envelope.actor.objective_id {
             return Ok(rejected(
                 envelope,
@@ -3754,7 +3828,9 @@ impl AgentActionService {
                 let goal_stream = format!("goal:{goal_id}");
                 let goal = crate::execution_core::GoalStore::new(Arc::clone(&self.store))
                     .projection(&goal_id)
-                    .map_err(AgentActionServiceError::Corrupt)?;
+                    .map_err(|error| {
+                        AgentActionServiceError::Corrupt(error)
+                    })?;
                 quantity_source = Some(ExpectedStreamRevision {
                     stream_id: goal_stream,
                     expected_revision: goal.as_ref().map_or(0, |goal| goal.stream_revision),
@@ -4024,7 +4100,9 @@ impl AgentActionService {
         });
         if let Some(index) = Self::original_member_index_event(
             envelope, member, action_event_index, ACTION_EVENT_KIND, &action_key(&envelope.action_id),
-        )? { events.push(index); }
+        ).map_err(|error| {
+            error
+        })? { events.push(index); }
         let mut expected_streams = vec![ExpectedStreamRevision {
             stream_id: stream_id.to_string(),
             expected_revision: projection.revision,
@@ -4090,7 +4168,9 @@ impl AgentActionService {
         if matches!(envelope.action, AgentAction::TeamCreate(_)) {
             run_conclusion_append_hook(&transaction);
         }
-        self.append_original_action_transaction(transaction, member)?;
+        self.append_original_action_transaction(transaction, member).map_err(|error| {
+            error
+        })?;
         // S1: task success/rework is measured at the commit boundary (after the
         // replay guard and the durable append), never in the replayable
         // projection fold, so replays and rebuilds cannot inflate the counts.

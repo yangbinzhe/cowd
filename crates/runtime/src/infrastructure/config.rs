@@ -1914,6 +1914,11 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
                 "runtime_workers",
                 "merged settings.gateway.capacity",
             )?,
+            runtime_stack_bytes: optional_usize(
+                value,
+                "runtime_stack_bytes",
+                "merged settings.gateway.capacity",
+            )?,
             control_requests: optional_usize(
                 value,
                 "control_requests",

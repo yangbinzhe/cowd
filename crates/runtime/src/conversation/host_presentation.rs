@@ -777,6 +777,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
         task: &'a crate::GovernedToolPlanTask,
     ) -> crate::GovernedToolFuture<'a, crate::GovernedToolAdmission<Self::Admission>> {
         Box::pin(async move {
+
             let Some(call) = self.calls.get(task.original_call_index) else {
                 return crate::GovernedToolAdmission::Refused("original call missing".into());
             };
@@ -786,9 +787,11 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             {
                 return crate::GovernedToolAdmission::Refused("original call identity mismatch".into());
             }
+
             if let Some(error) = self.policy_failures.and_then(|items| items.get(&call.id)) {
                 return crate::GovernedToolAdmission::Failed(format!("tool preparation or policy assessment failed: {error}"));
             }
+
             if let (Some(state), Some(services)) = (self.scope_state, self.services) {
                 let mut effective_call = call.clone();
                 if let Some(input) = self.effective_inputs.and_then(|inputs| inputs.get(&call.id)) {
@@ -821,6 +824,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             } else if let Some(scope) = self.evaluation_scope_rejections.and_then(|items| items.get(&call.id)) {
                 return crate::GovernedToolAdmission::Refused(format!("evaluation_scope_exceeded: {scope}"));
             }
+
             if self.policy_refusals.is_some_and(|items| items.contains_key(&call.id)) {
                 let reason = self.capability_gaps.get(&call.id).and_then(|assessment| assessment.gap.as_ref())
                     .map_or("policy hard denial", |gap| gap.reason.as_str());
@@ -836,12 +840,14 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
         _admission: &'a mut Self::Admission,
     ) -> crate::GovernedToolFuture<'a, Result<Self::Output, String>> {
         Box::pin(async move {
+
             let call = self.calls.get(task.original_call_index).ok_or_else(|| {
                 format!(
                     "governed tool task `{}` references missing original call index {}",
                     task.tool_call_id, task.original_call_index
                 )
             })?;
+
             if let Some(assessment) = self.capability_gaps.get(&call.id) {
                 if let Some(observation) = self.physical_owner.binding_observation(self.ticket) {
                     observation.refuse(&call.id, "authorization_gap_before_host_dispatch".into());
@@ -852,17 +858,20 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     assessment,
                 ));
             }
+
             if let (Some(plan), Some(decision)) = (self.admission_plan, self.execution_decision) {
                 let mut call_plan = plan.clone();
                 call_plan.tasks.retain(|candidate| candidate.tool_call_id == task.tool_call_id);
                 if call_plan.tasks.len() != 1 {
                     return Err("checkpoint original call missing or ambiguous".into());
                 }
+
                 let validation = call_plan.validate_against_execution_decision(decision);
                 if !validation.allowed {
                     return Err(format!("tool strategy gate failed: {}", validation.findings.join(", ")));
                 }
                 if validation.requires_checkpoint {
+
                     self.strategy_gate.ok_or_else(|| "original Host checkpoint owner unavailable".to_string())?
                         .check(task, plan, decision, self.ticket).await?;
                 }
@@ -880,6 +889,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             if let Some(input) = self.effective_inputs.and_then(|inputs| inputs.get(&call.id)) {
                 effective_call.input = input.clone();
             }
+
             let mut request = self.prepared_requests
                 .and_then(|requests| requests.get(&call.id))
                 .cloned()
@@ -889,6 +899,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 || request.authorization.is_some() {
                 return Err("original prepared Host request changed".into());
             }
+
             request.authorization = authorization;
             if request.tool_name == "agent_action_batch" {
                 if let Some(owner) = &self.batch_policy_owner {
@@ -896,6 +907,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 }
             }
             if request.tool_name == "agent_action_batch" {
+
                 self.member_requests.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(call.id.clone(), Arc::new(request.clone()));
             }
@@ -904,19 +916,23 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             if let Some(state) = self.scope_state {
                 let carrier = crate::tool_host::OriginalMemberCallCarrier::from_original_request(Arc::new(request.clone()));
                 let pending = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)));
+
                 super::host_backend::retain_original_member_batches(state, self.ticket, &[(call.id.clone(), pending)])
                     .await.map_err(|error| error.to_string())?;
             }
+
             let start = self.invocations.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&call.id).cloned();
             let producer = start.as_ref().and_then(|record| record.original_producer.clone());
             if let (Some(record), Some(producer)) = (start, producer) {
+
                 request.tool_progress.record_lifecycle_anchor(crate::tool_host::ToolLifecycleAnchor {
                     invocation_id: record.invocation_id, session_id: record.session_id,
                     tool_call_id: record.tool_call_id, tool_name: record.tool_name,
                     input_hash: record.input_hash, producer,
                 })?;
             }
+
             let plane = Arc::clone(self.execution_plane);
             let demand = task.resource_demand.clone();
             let service_class = self.ticket.service_class;
@@ -932,12 +948,14 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner).get(&call.id).cloned());
             let scope_locks = Arc::clone(self.execution_plane.scope_locks());
             use sha2::Digest;
+
             let invocation_id = format!(
                 "leaf:{:x}",
                 sha2::Sha256::digest(
                     serde_json::to_vec(&request).map_err(|error| error.to_string())?
                 )
             );
+
             self.physical_owner
                 .execute_physical_tool(
                     self.ticket,

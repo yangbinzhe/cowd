@@ -685,7 +685,7 @@ fn apply_host_transcript_messages(
 }
 
 async fn stage_host_transcript<C, T>(
-    runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: &Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     services: &Arc<crate::RuntimeServices>,
     ticket: &NodeExecutionTicket,
     session_id: String,
@@ -731,7 +731,7 @@ where
 }
 
 async fn publish_host_transcript<C, T>(
-    runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: &Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     services: &Arc<crate::RuntimeServices>,
     ticket: &NodeExecutionTicket,
 ) -> Result<(String, String, Option<u8>), NodeExecutorError>
@@ -2312,32 +2312,31 @@ where
         if write_goal_source.stream_revision != model_goal_source.stream_revision {
             return Err(NodeExecutorError::Poll {node_id:ticket.node_id.clone(),reason:"Goal changed before Provider request".into()});
         }
-        let result = if let (Some(frame),Some(framing))=(&user_frame,&user_framing) {
-            model_runtime.execute_user_input_interpretation(&content,first_step,provider_retry_fenced,frame.inputs.len(),framing).await
-        } else if clean_terminal_synthesis {
+        let interpretation = match (&user_frame, &user_framing) {
+            (Some(frame), Some(framing)) => Some((frame.inputs.len(), framing.as_str())),
+            _ => None,
+        };
+        let result = if interpretation.is_none() && clean_terminal_synthesis {
             model_runtime
                 .execute_clean_terminal_synthesis(
                     &content,
-                    clean_terminal_evidence
-                        .as_ref()
-                        .map(|(digest, _)| digest.as_str())
-                        .unwrap_or_default(),
-                    clean_terminal_evidence
-                        .as_ref()
-                        .map(|(_, history)| history.clone())
-                        .unwrap_or_default(),
+                    clean_terminal_evidence.as_ref().map(|(digest, _)| digest.as_str()).unwrap_or_default(),
+                    clean_terminal_evidence.as_ref().map(|(_, history)| history.clone()).unwrap_or_default(),
                 )
                 .await
         } else {
-            model_runtime
-                .execute_model_step_with_early_dispatch(
-                    &content,
-                    first_step,
-                    early_dispatcher,
-                    provider_retry_fenced,
-                    operator_forbids_tool_use,
-                )
-                .await
+            let (dispatcher, forbids) = if interpretation.is_some() {
+                (None, false)
+            } else {
+                (early_dispatcher, operator_forbids_tool_use)
+            };
+            let mut result = model_runtime.execute_model_step_for_purpose(
+                &content, first_step, dispatcher, provider_retry_fenced, forbids, interpretation,
+            ).await;
+            if let (Ok(step), Some((slots, _))) = (&mut result, interpretation) {
+                crate::ConversationRuntime::<C, T>::finish_input_interpretation(step, slots);
+            }
+            result
         };
         let result = result.and_then(crate::conversation::ModelStepResult::into_host_result);
         drop(model_runtime);
@@ -2369,6 +2368,9 @@ where
         let cache_dimensions_known = runtime.turn_cache_dimensions_known();
         let cowd_bus = runtime.cowd_bus().cloned();
         drop(runtime);
+        // Construct the remaining result phase only after the original model
+        // scoped guards are dropped and transcript/input cleanup has run.
+        Box::pin(async {
         if result.as_ref().ok().is_some_and(|step|step.input_interpretation.is_some()) {
             let step=result.map_err(|e|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:e.to_string()})?;
             let (user_graph_revision, user_program_cut) = user_source_cuts.ok_or_else(||
@@ -4507,6 +4509,7 @@ where
                 Ok(outcome)
             }
         }
+        }).await
         }.await;
         let mut outcome = result?;
         if outcome.result.status == ExecutionNodeStatus::Completed {
@@ -8139,7 +8142,7 @@ fn remember_tool_goal_revalidation<C: ApiClient, T: ToolExecutor>(
 }
 
 pub(super) struct HostRuntimeStrategyGate<'a, C: ApiClient, T: ToolExecutor> {
-    pub(super) runtime: &'a Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    pub(super) runtime: &'a Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     pub(super) prompter: &'a crate::permissions::SharedPrompter,
 }
 
@@ -8373,7 +8376,7 @@ fn partial_member_messages(
 /// An unresolved effect remains Blocked; the transcript reference is evidence
 /// of message publication only, never evidence that the effect settled.
 async fn stage_uncertain_tool_batch<C, T>(
-    runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    runtime: &Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     services: &Arc<crate::RuntimeServices>,
     ticket: &NodeExecutionTicket,
     session_id: String,
@@ -8912,7 +8915,7 @@ where
                             });
                         let bounded = tools::tool_orchestrator::effect_is_bounded_read_only_compute(&descriptor)
                             || call.name == "execute_code";
-                        if let Some(request) = bound_request.as_mut().filter(|request| request.step_binding.is_none() || bounded) {
+                        if let Some(request) = bound_request.as_mut() {
                             let (Some(task), Some(hook)) = (task, hook.as_ref()) else {
                                 if bounded { return Err(NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:"bounded original plan or hook missing".into() }); }
                                 policy_failures.insert(call.id.clone(), "original unbound plan or hook missing".into());
@@ -9103,6 +9106,7 @@ where
                 node_id: ticket.node_id.clone(), reason: "original pre-grant action owner unavailable".into(),
             })?;
             let owner: Arc<dyn crate::tool_host::AgentBatchPolicyOwner> = Arc::new(OriginalBatchPolicyOwner {
+                state: Arc::downgrade(&self.state), services: self.services.clone(),
                 owner: Arc::clone(&policy_owner), prompter: prompter.clone(),
                 parent: harness_contract::execution_graph::ExecutionParentBinding {
                     execution_id: ticket.graph_id.clone(), node_id: ticket.node_id.clone(),
@@ -9307,6 +9311,7 @@ where
             let outcome = if delegated_agent_role {
                 if let Some((parent, attempt)) = member_parent {
                     let owner: Arc<dyn crate::tool_host::AgentBatchPolicyOwner> = Arc::new(OriginalBatchPolicyOwner {
+                        state: Arc::downgrade(&self.state), services: self.services.clone(),
                         owner: Arc::clone(&policy_owner), prompter: prompter.clone(), parent, attempt,
                         ticket: ticket.clone(), event_store: Arc::clone(services.event_store()),
                         action_service: services.agent_action_service(),
@@ -11171,11 +11176,12 @@ where
         let commits = services.commit_service().clone();
         // Only the original node owner may enumerate the manifest from the
         // node transaction. An empty manifest makes no claim about rollback.
-        let has_unresolved_member = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let (unresolved_outers, committed_member_facts) = tokio::task::spawn_blocking(move || -> Result<(std::collections::BTreeSet<String>, std::collections::BTreeMap<String, Vec<serde_json::Value>>), String> {
             let outers = commits.original_batch_outers_after_commit(&original_ticket)
                 .map_err(|error| error.to_string())?;
             let mut seen = std::collections::BTreeSet::new();
-            let mut has_unresolved_member = false;
+            let mut unresolved_outers = std::collections::BTreeSet::new();
+            let mut committed_member_facts = std::collections::BTreeMap::new();
             for outer in outers {
                 if !seen.insert(outer.clone()) { return Err("duplicate committed batch outer".into()); }
                 let mut matching = calls.iter().filter(|call| {
@@ -11189,14 +11195,15 @@ where
                     .map_err(|error| error.to_string())?;
                 let pending = commits.original_batch_pending_after_commit(&original_ticket, &outer)
                     .map_err(|error| error.to_string())?;
-                has_unresolved_member |= pending.is_some();
+                if pending.is_some() { unresolved_outers.insert(outer.clone()); }
                 if members.is_empty() && pending.is_none() {
                     return Err("committed batch manifest has neither prefix nor pending fact".into());
                 }
                 // These are committed business facts. They do not prove that
                 // the complete Host result or downstream effects were delivered.
+                committed_member_facts.insert(outer, members.iter().map(|member| member.payload().clone()).collect());
             }
-            Ok(has_unresolved_member)
+            Ok((unresolved_outers, committed_member_facts))
         }).await.map_err(|error| NodeExecutorError::Poll { node_id: node_id.clone(), reason: error.to_string() })?
           .map_err(|reason| NodeExecutorError::Poll { node_id, reason })?;
         let retained_replays = self.state.lock().await.pending_member_batches
@@ -11250,8 +11257,11 @@ where
         let mut settled_calls = std::collections::BTreeSet::new();
         let mut settlement_error = None;
         {
-            let retained = self.state.lock().await.pending_member_batches
-                .get(&(ticket.node_id.clone(), ticket.attempt)).cloned().unwrap_or_default();
+            let retained = {
+                let state = self.state.lock().await;
+                let existing = state.pending_member_batches.get(&(ticket.node_id.clone(), ticket.attempt));
+                existing.cloned().unwrap_or_default()
+            };
             let mut grouped = std::collections::BTreeMap::<String, Vec<crate::PendingAgentBatch>>::new();
             for (call_id, pending) in retained { grouped.entry(call_id).or_default().push(pending); }
             let mut candidates = Vec::new();
@@ -11268,38 +11278,64 @@ where
                             unverified = true;
                         } else if let Some(existing) = &original {
                             if !existing.original_request().tool_progress.same_original_channels(&carrier.original_request().tool_progress)
-                                || existing.original_request() != carrier.original_request() { unverified = true; }
+                                || existing.original_request() != carrier.original_request() {
+                                unverified = true;
+                            }
                         } else { original = Some(Arc::clone(carrier)); }
                     }
                 }
-                let Some(original) = original else { continue; };
+                let Some(original) = original else {
+                    continue;
+                };
                 let request = original.original_request();
                 for pending in &items {
                     match pending.value() {
                         crate::PendingAgentBatchValue::OriginalCall(_) => {}
                         crate::PendingAgentBatchValue::RecordedSink(sink) => {
-                            if !request.tool_progress.same_original_channels(sink) { unverified = true; }
+                            if !request.tool_progress.same_original_channels(sink) {
+                                unverified = true;
+                            }
                         }
                         crate::PendingAgentBatchValue::Recorded(recorded) => {
                             let actual = request.tool_progress.original_members();
                             if recorded.len() != actual.len() || recorded.iter().zip(&actual).any(|((i,a),(j,b))|
-                                i != j || !Arc::ptr_eq(a,b)) { unverified = true; }
+                                i != j || !Arc::ptr_eq(a,b)) {
+                                unverified = true;
+                            }
                         }
-                        _ => unverified = true,
+                        _ => {
+                            unverified = true;
+                        }
                     }
                 }
-                if unverified || request.tool_progress.has_original_member_stop() { continue; }
+                if unverified || request.tool_progress.has_original_member_stop() {
+                    continue;
+                }
                 match request.tool_progress.original_fresh_effect() {
-                    Ok(Some(_)) if has_unresolved_member => {}
+                    Ok(Some(_)) if unresolved_outers.contains(&request.idempotency_key) => {
+                    }
                     Ok(Some(owner)) if owner.original_request().tool_use_id == call_id
                         && owner.original_request().tool_progress.same_original_channels(&request.tool_progress) =>
-                        candidates.push((call_id, Some(owner))),
-                    Ok(Some(_)) => { settlement_error.get_or_insert("original effect owner does not match call sink".to_string()); }
+                        {
+                            let facts = committed_member_facts.get(&request.idempotency_key).map(Vec::as_slice).unwrap_or(&[]);
+                            match original.verified_host_settlements(ticket, services.event_store(), facts) {
+                                Ok(units) => candidates.push((call_id, Some(owner), units)),
+                                Err(reason) => { settlement_error.get_or_insert(reason); }
+                            }
+                        },
+                    Ok(Some(_)) => {
+                        settlement_error.get_or_insert("original effect owner does not match call sink".to_string());
+                    }
                     Ok(None) if request.compiled_invocation.as_ref().is_some_and(|invocation|
                         invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read) =>
-                        candidates.push((call_id, None)),
-                    Ok(None) => {} // no proof that an unknown mutation was not retained
-                    Err(reason) => { settlement_error.get_or_insert(reason); }
+                        {
+                            candidates.push((call_id, None, Vec::new()))
+                        },
+                    Ok(None) => {
+                    } // no proof that an unknown mutation was not retained
+                    Err(reason) => {
+                        settlement_error.get_or_insert(reason);
+                    }
                 }
             }
             if !candidates.is_empty() {
@@ -11310,7 +11346,7 @@ where
                         let mut settled = Vec::new();
                         let mut failures = Vec::new();
                         let mut released = Vec::new();
-                        for (call_id, owner) in candidates {
+                        for (call_id, owner, units) in candidates {
                             if let Some(owner) = owner {
                                 if !released.iter().any(|prior| Arc::ptr_eq(prior, &owner)) {
                                     if let Err(error) = commits.release_original_first_effect_after_node(&original_ticket, &close, &owner) {
@@ -11318,14 +11354,17 @@ where
                                         continue;
                                     }
                                     released.push(owner);
+                                } else {
                                 }
                             }
+                            for unit in units { unit.mark_settled(); }
                             settled.push(call_id);
                         }
                         (settled, failures)
                     }).await.map_err(|error| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
                     settled_calls.extend(settled);
                     if let Some(reason) = failed.into_iter().next() { settlement_error.get_or_insert(reason); }
+                } else {
                 }
             }
         }
@@ -11373,16 +11412,28 @@ where
         let mut state = self.state.lock().await;
         state.pending_transcript.remove(&ticket.node_id);
         if let Some(retained) = state.pending_member_batches.get_mut(&(ticket.node_id.clone(), ticket.attempt)) {
+            #[cfg(feature = "test-fixtures")]
+            let before_retain = retained.len();
             retained.retain(|(call_id, pending)| {
                 if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) {
                     !settled_packet_scope.iter().any(|(settled, _)| settled == pending)
                 } else { !settled_calls.contains(call_id) }
             });
             if retained.is_empty() { state.pending_member_batches.remove(&(ticket.node_id.clone(), ticket.attempt)); }
+        } else {
         }
+        let member_custody_unresolved = state.pending_member_batches.get(&(ticket.node_id.clone(), ticket.attempt))
+            .is_some_and(|entries| entries.iter().any(|(_, pending)| match pending.primary_value() {
+                crate::PendingAgentBatchValue::OriginalCall(carrier) => carrier.has_unsettled_host_members(),
+                _ => false,
+            }));
         drop(state);
         if let Some(reason) = settlement_error {
             return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason });
+        }
+        if member_custody_unresolved || services.tool_batch_executor().binding_observation(ticket)
+            .is_some_and(|observation| observation.member_custody_is_unresolved()) {
+            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original member custody remains unresolved".into() });
         }
         Ok(())
     }
@@ -11799,7 +11850,7 @@ mod closed_host_continuity_475_tests {
             let original_session = session.clone();
             let calls = Arc::new(AtomicUsize::new(0));
             let runtime = Arc::new(tokio::sync::Mutex::new(
-                crate::ConversationRuntime::new(
+                Box::new(crate::ConversationRuntime::new(
                     session,
                     NoReplay475(calls.clone()),
                     NoTools475,
@@ -11808,7 +11859,7 @@ mod closed_host_continuity_475_tests {
                 )
                 .without_memory()
                 .with_runtime_event_store(services.event_store().clone())
-                .with_artifact_store(artifacts.clone()),
+                .with_artifact_store(artifacts.clone())),
             ));
             let state = Arc::new(tokio::sync::Mutex::new(model_publication_state475(
                 &original_session.session_id,
@@ -12069,7 +12120,7 @@ mod closed_host_continuity_475_tests {
                 cold_services.graph_state_store().load(&closed.id).unwrap(),
                 closed
             );
-            let cold = Arc::new(tokio::sync::Mutex::new(
+            let cold = Arc::new(tokio::sync::Mutex::new(Box::new(
                 crate::ConversationRuntime::new(
                     original_session.clone(),
                     NoReplay475(calls.clone()),
@@ -12080,7 +12131,7 @@ mod closed_host_continuity_475_tests {
                 .without_memory()
                 .with_runtime_event_store(cold_services.event_store().clone())
                 .with_artifact_store(artifacts.clone()),
-            ));
+            )));
             let cold_state = Arc::new(tokio::sync::Mutex::new(model_publication_state475(
                 &original_session.session_id,
                 "475-no-goal-proof",

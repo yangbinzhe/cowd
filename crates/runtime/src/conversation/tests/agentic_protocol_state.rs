@@ -1482,7 +1482,7 @@ async fn exercise_worker_closure_surface(required_write: bool) {
     }
     let parent = services.graph_state_store().load(parent_id).unwrap();
     let (_, result) = submit_owned_conversation_turn_with_ingress(
-        runtime,
+        Box::new(runtime),
         Arc::clone(&services),
         content,
         &SharedPrompter::none(),
@@ -1729,7 +1729,7 @@ async fn actual_delegated_model_safe_point_receives_delta_and_only_success_ackno
         let parent = services.graph_state_store().load(parent_id).unwrap();
         let lineage = parent.lineage.clone().unwrap();
         let outcome = submit_owned_conversation_turn_with_ingress(
-            runtime,
+            Box::new(runtime),
             Arc::clone(&services),
             "Read the bounded source and preserve peer evidence",
             &SharedPrompter::none(),

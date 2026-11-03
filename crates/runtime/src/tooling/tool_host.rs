@@ -5,6 +5,14 @@ use harness_contract::execution_graph::ExecutionParentBinding;
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::ToolSafetyCategory;
 
+/// Original node owner's publication state; it carries no execution authority.
+#[derive(Debug, Default)]
+pub(crate) struct OriginalMemberSettlement(std::sync::atomic::AtomicBool);
+impl OriginalMemberSettlement {
+    pub(crate) fn is_settled(&self) -> bool { self.0.load(std::sync::atomic::Ordering::Acquire) }
+    pub(crate) fn mark_settled(&self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+}
+
 /// Same-call transport retained by the Runtime producer. This is not proof of
 /// ownership: the original node owner must authenticate the ticket and Step.
 #[derive(Clone)]
@@ -12,12 +20,79 @@ pub struct OriginalMemberCallCarrier {
     original_request: std::sync::Arc<RuntimeToolExecutionRequest>,
     outcomes: Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)>,
     stop_publications: Vec<std::sync::Arc<OriginalStopPublication>>,
+    host_members: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<usize, (std::sync::Arc<crate::conversation::OriginalHostPreparedMember>, std::sync::Arc<OriginalMemberSettlement>)>>>,
 }
 impl OriginalMemberCallCarrier {
     pub(crate) fn from_original_request(original_request: std::sync::Arc<RuntimeToolExecutionRequest>) -> Self {
         let outcomes = original_request.tool_progress.original_members();
         let stop_publications = original_request.tool_progress.original_stop_publications();
-        Self { original_request, outcomes, stop_publications }
+        Self { original_request, outcomes, stop_publications, host_members: Default::default() }
+    }
+    /// Retain the exact Host preparation under its original node carrier.
+    pub(crate) fn retain_host_member(
+        &self,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        member: &std::sync::Arc<crate::conversation::OriginalHostPreparedMember>,
+        observation: &crate::execution_core::graph::executors::agent_tool::NoDispatchObservation,
+    ) -> Result<(), String> {
+        let request = member.original_request();
+        let original = self.original_request.as_ref();
+        let index = member.prepared().index;
+        if index >= 25 || member.ticket() != ticket || request != original
+            || !request.tool_progress.same_original_channels(&original.tool_progress)
+            || request.step_binding.as_ref() != Some(member.step()) {
+            return Err("original Host member carrier identity differs".into());
+        }
+        let unit = {
+            let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+            match members.get(&index) {
+                Some((existing, unit)) if std::sync::Arc::ptr_eq(existing, member) => std::sync::Arc::clone(unit),
+                Some(_) => return Err("original Host member carrier conflicts".into()),
+                None => std::sync::Arc::new(OriginalMemberSettlement::default()),
+            }
+        };
+        observation.register_member_custody(ticket, &original.tool_use_id, index, std::sync::Arc::clone(&unit))?;
+        let mut members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        match members.get(&index) {
+            Some((existing, previous)) if std::sync::Arc::ptr_eq(existing, member) && std::sync::Arc::ptr_eq(previous, &unit) => Ok(()),
+            Some(_) => Err("original Host member carrier conflicts".into()),
+            None => { members.insert(index, (std::sync::Arc::clone(member), unit)); Ok(()) }
+        }
+    }
+    pub(crate) fn has_unsettled_host_members(&self) -> bool {
+        match self.host_members.lock() {
+            Ok(members) => members.values().any(|(_, unit)| !unit.is_settled()),
+            Err(_) => true,
+        }
+    }
+    /// Transfer only members already authenticated in this node's committed prefix.
+    pub(crate) fn verified_host_settlements(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+        store: &std::sync::Arc<crate::RuntimeEventStore>, facts: &[serde_json::Value],
+    ) -> Result<Vec<std::sync::Arc<OriginalMemberSettlement>>, String> {
+        let outcomes = self.original_request.tool_progress.original_members();
+        let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        for (index, (original, _)) in members.iter() {
+            if original.ticket() != ticket || original.prepared().index != *index {
+                return Err("original Host member settlement identity differs".into());
+            }
+            let mut matching = outcomes.iter().filter(|(actual, _)| actual == index);
+            let (_, outcome) = matching.next().ok_or("original Host member result unavailable")?;
+            if matching.next().is_some() { return Err("original Host member results conflict".into()); }
+            let OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else {
+                return Err("original Host member result remains unresolved".into());
+            };
+            if member.index() != *index
+                || member.action().payload().pointer("/member_admission/prepared/identity").and_then(serde_json::Value::as_str)
+                    != Some(original.prepared().identity.as_str()) {
+                return Err("original Host member result differs".into());
+            }
+            let fact = member.node_commit_fact(store, ticket)?;
+            if !facts.iter().any(|committed| committed == &fact) {
+                return Err("original Host member is absent from committed node".into());
+            }
+        }
+        Ok(members.values().map(|(_, unit)| std::sync::Arc::clone(unit)).collect())
     }
     pub fn original_request(&self) -> &RuntimeToolExecutionRequest { &self.original_request }
     pub fn outcomes(&self) -> &[(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)] { &self.outcomes }
@@ -506,7 +581,6 @@ pub enum OriginalMemberCommittedFact<'a> {
 
 /// Business commit and Host delivery are distinct facts.
 pub enum BatchMemberDelivery {
-    Complete(crate::RuntimeToolExecutionOutcome),
     Incomplete,
 }
 
@@ -565,10 +639,7 @@ impl AuthenticatedBatchPrefix {
     pub fn into_members(self) -> Vec<AuthenticatedBatchMember> { self.members }
 
     pub fn pending_deliveries(&self) -> impl Iterator<Item = BatchMemberDeliveryPending<'_>> {
-        self.members.iter().filter_map(|member| match member.delivery() {
-            BatchMemberDelivery::Incomplete => Some(BatchMemberDeliveryPending { member }),
-            BatchMemberDelivery::Complete(_) => None,
-        })
+        self.members.iter().map(|member| BatchMemberDeliveryPending { member })
     }
 }
 
@@ -615,18 +686,8 @@ impl IncompleteAgentBatch {
 /// The original Runtime policy owner issues one independently assessed member.
 #[async_trait::async_trait]
 pub trait AgentBatchPolicyOwner: Send + Sync {
-    /// Resolve against the original ticket and action transaction before any
-    /// once grant is negotiated. Missing facts are never evidence of Fresh.
-    async fn resolve_member(&self, original: &RuntimeToolExecutionRequest, index: usize)
-        -> AgentBatchMemberResolution;
-
     async fn prepare_member_pregrant(&self, original: &RuntimeToolExecutionRequest, index: usize)
         -> AgentBatchMemberPregrant;
-
-    /// Authenticate the outer once and return only its contiguous, committed
-    /// prefix. An unobserved member is Unknown, never permission to execute.
-    async fn read_committed_prefix(&self, original: &RuntimeToolExecutionRequest)
-        -> AgentBatchCommittedPrefixRead;
 
 }
 
@@ -648,7 +709,7 @@ pub struct ToolProgressSink {
     callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     child_reads: std::sync::Arc<std::sync::Mutex<Option<Vec<tools::OrchestratedRead>>>>,
     lifecycle_anchor: std::sync::Arc<std::sync::Mutex<Option<ToolLifecycleAnchor>>>,
-    batch_policy_owner: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn AgentBatchPolicyOwner>>>>,
+    batch_policy_owner: std::sync::Arc<std::sync::Mutex<Option<std::sync::Weak<dyn AgentBatchPolicyOwner>>>>,
     original_fresh_effect: std::sync::Arc<std::sync::Mutex<Option<std::sync::Weak<crate::execution_core::graph::OriginalFreshEffectOwner>>>>,
     original_effect_custody: std::sync::Arc<std::sync::Mutex<Option<OriginalEffectCustodyOrigin>>>,
     original_conclusions: std::sync::Arc<std::sync::Mutex<Vec<(Option<usize>, std::sync::Arc<crate::agentic::OriginalCommittedConclusion>)>>>,
@@ -828,11 +889,15 @@ impl ToolProgressSink {
     pub fn install_batch_policy_owner(&self, owner: std::sync::Arc<dyn AgentBatchPolicyOwner>) -> Result<(), String> {
         let mut slot = self.batch_policy_owner.lock().map_err(|_| "batch policy channel poisoned")?;
         if slot.is_some() { return Err("batch policy owner already installed".into()); }
-        *slot = Some(owner);
+        *slot = Some(std::sync::Arc::downgrade(&owner));
         Ok(())
     }
     pub fn batch_policy_owner(&self) -> Result<Option<std::sync::Arc<dyn AgentBatchPolicyOwner>>, String> {
-        Ok(self.batch_policy_owner.lock().map_err(|_| "batch policy channel poisoned")?.clone())
+        let slot = self.batch_policy_owner.lock().map_err(|_| "batch policy channel poisoned")?;
+        match slot.as_ref() {
+            Some(owner) => owner.upgrade().map(Some).ok_or_else(|| "original batch policy owner unavailable".into()),
+            None => Ok(None),
+        }
     }
     pub fn record_child_reads(&self, reads: Vec<tools::OrchestratedRead>) -> Result<(), String> {
         let mut slot = self.child_reads.lock().map_err(|_| "child read channel poisoned")?;

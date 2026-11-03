@@ -134,6 +134,7 @@ pub(crate) struct OriginalMemberEffectFence {
     ticket: crate::execution_core::graph::NodeExecutionTicket,
     request: Arc<AppendTransactionRequest>,
     receipt: StdMutex<Option<AppendTransactionReceipt>>,
+    hook_entered: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -839,6 +840,17 @@ impl RuntimeEventStore {
         Ok(receipt)
     }
 
+    /// A retained member authority is an unresolved original checked attempt.
+    pub(crate) fn has_unresolved_original_member_custody(&self) -> RuntimeEventStoreResult<bool> {
+        let retained = self.retained_checked_members.lock().map_err(|_|
+            RuntimeEventStoreError::Corrupt("original member custody unavailable".into()))?;
+        Ok(retained.values().any(|entry| match entry {
+            RetainedMemberEntry::Checked(owner) => owner.authority.is_some(),
+            RetainedMemberEntry::Reserved { effect, .. } => effect.is_some(),
+            RetainedMemberEntry::FreshEffect { original, .. } => original.tool_name == "agent_action_batch",
+        }))
+    }
+
     /// Keep the original effect append and call before entering the backend;
     /// a lost reply or failed carrier installation is not a rollback.
     pub(crate) fn retain_original_first_effect(
@@ -1004,7 +1016,8 @@ impl RuntimeEventStore {
                 }],
             };
             let fence = Arc::new(OriginalMemberEffectFence { owner: Arc::downgrade(self), nonce: Arc::clone(&reservation.nonce),
-                outer: original.idempotency_key.clone(), index, ticket: ticket.clone(), request: Arc::new(transaction), receipt: StdMutex::new(None) });
+                outer: original.idempotency_key.clone(), index, ticket: ticket.clone(), request: Arc::new(transaction), receipt: StdMutex::new(None),
+                hook_entered: std::sync::atomic::AtomicBool::new(false) });
             {
                 let mut owners = self.retained_checked_members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 match owners.get_mut(&original_member_reservation_key(&reservation.outer, reservation.index)) {
@@ -1047,6 +1060,37 @@ impl RuntimeEventStore {
         }
         *fence.receipt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt);
         Ok(Some(fence))
+    }
+
+    /// A hook claim is only a non-replay guard, never proof of completion or authorization.
+    pub(crate) fn claim_original_member_hook(
+        self: &Arc<Self>, fence: &Arc<OriginalMemberEffectFence>, reservation: &OriginalMemberReservation,
+    ) -> RuntimeEventStoreResult<()> {
+        if !std::ptr::eq(fence.owner.as_ptr(), Arc::as_ptr(self))
+            || !std::ptr::eq(reservation.owner.as_ptr(), Arc::as_ptr(self))
+            || !Arc::ptr_eq(&fence.nonce, &reservation.nonce)
+            || fence.outer != reservation.outer || fence.index != reservation.index || fence.ticket != reservation.ticket {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original member hook owner differs".into()));
+        }
+        let receipt_guard = fence.receipt.lock().map_err(|_| RuntimeEventStoreError::InvalidTransaction("original member fence receipt unavailable".into()))?;
+        let Some(receipt) = receipt_guard.as_ref() else {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original member fence receipt unknown".into()));
+        };
+        if receipt.transaction_id != fence.request.transaction_id || receipt.request_hash != domain::request_hash(&fence.request)?
+            || receipt.commit_cursor == 0 || receipt.event_ids.len() != fence.request.events.len() {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original member fence receipt differs".into()));
+        }
+        drop(receipt_guard);
+        let owners = self.retained_checked_members.lock().map_err(|_| RuntimeEventStoreError::InvalidTransaction("original member custody unavailable".into()))?;
+        match owners.get(&original_member_reservation_key(&reservation.outer, reservation.index)) {
+            Some(RetainedMemberEntry::Reserved { nonce, effect: Some(current), .. })
+                if Arc::ptr_eq(nonce, &reservation.nonce) && Arc::ptr_eq(current, fence) => {},
+            _ => return Err(RuntimeEventStoreError::InvalidTransaction("original member fence custody changed".into())),
+        }
+        fence.hook_entered.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire).map_err(|_| RuntimeEventStoreError::InvalidTransaction(
+                "original member hook outcome remains unknown".into()))?;
+        Ok(())
     }
 
     pub(crate) fn verify_original_member_preparation_fence(
@@ -1140,9 +1184,15 @@ impl RuntimeEventStore {
             ));
         }
         if authority.is_some() {
-            let reservation = reservation.ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original member reservation required".into()))?;
-            let fence = effect_fence.ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original member effect fence required".into()))?;
-            let source = self.original_member_effect_source_locked(fence, reservation, locks)?;
+            let reservation = reservation.ok_or_else(|| {
+                RuntimeEventStoreError::InvalidTransaction("original member reservation required".into())
+            })?;
+            let fence = effect_fence.ok_or_else(|| {
+                RuntimeEventStoreError::InvalidTransaction("original member effect fence required".into())
+            })?;
+            let source = self.original_member_effect_source_locked(fence, reservation, locks).map_err(|error| {
+                error
+            })?;
             if !request.transaction.expected_streams.iter().any(|expected| expected == &source) {
                 return Err(RuntimeEventStoreError::InvalidTransaction("original member effect source is not checked".into()));
             }
@@ -1150,25 +1200,41 @@ impl RuntimeEventStore {
                 expected.stream_id == fence.ticket.graph_id && self.stream_revision(&expected.stream_id).ok() == Some(expected.expected_revision)) {
                 return Err(RuntimeEventStoreError::InvalidTransaction("original member current graph source is not checked".into()));
             }
-            let owner = fence.owner.upgrade().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original member effect owner unavailable".into()))?;
+            let owner = fence.owner.upgrade().ok_or_else(|| {
+                RuntimeEventStoreError::InvalidTransaction("original member effect owner unavailable".into())
+            })?;
             let state = crate::execution_core::graph::ExecutionGraphStateStore::new(owner);
-            let graph = state.load(&fence.ticket.graph_id).map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+            let graph = state.load(&fence.ticket.graph_id).map_err(|error| {
+                RuntimeEventStoreError::InvalidTransaction(error.to_string())
+            })?;
             if graph.node_statuses.get(&fence.ticket.node_id) != Some(&harness_contract::execution_graph::ExecutionNodeStatus::Running)
                 || graph.recovery_cursor.node_attempts.get(&fence.ticket.node_id) != Some(&fence.ticket.attempt) {
                 return Err(RuntimeEventStoreError::InvalidTransaction("original member graph owner is no longer running".into()));
             }
             let binding = state.current_binding(&graph, &fence.ticket.node_id, fence.ticket.attempt)
-                .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+                .map_err(|error| {
+                    RuntimeEventStoreError::InvalidTransaction(error.to_string())
+                })?;
             let node = graph.nodes.iter().find(|node| node.id == fence.ticket.node_id)
-                .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original member graph node missing".into()))?;
+                .ok_or_else(|| {
+                    RuntimeEventStoreError::InvalidTransaction("original member graph node missing".into())
+                })?;
             crate::execution_core::graph::ExecutionNodeBinding::validate_ticket(&fence.ticket, &graph, node, binding.attempt)
-                .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+                .map_err(|error| {
+                    RuntimeEventStoreError::InvalidTransaction(error.to_string())
+                })?;
         } else if effect_fence.is_some() {
             return Err(RuntimeEventStoreError::InvalidTransaction("effect fence without original member authority".into()));
         }
-        self.ensure_graph_transaction_recovery_admitted(&request.transaction)?;
-        self.validate_content_publication(&mut request.transaction)?;
-        request.identity_hash()?;
+        self.ensure_graph_transaction_recovery_admitted(&request.transaction).map_err(|error| {
+            error
+        })?;
+        self.validate_content_publication(&mut request.transaction).map_err(|error| {
+            error
+        })?;
+        request.identity_hash().map_err(|error| {
+            error
+        })?;
         if request.frame_digest != validator.frame_digest() {
             return Err(RuntimeEventStoreError::InvalidTransaction(
                 "source validator frame mismatch".into(),
@@ -1184,9 +1250,13 @@ impl RuntimeEventStore {
                     "original checked member transaction outcome remains unresolved".into(),
                 ));
             }
-            let identity = original_member_identity(&submitted)?;
+            let identity = original_member_identity(&submitted).map_err(|error| {
+                error
+            })?;
             let retained_fence = if authority.is_some() {
-                let reservation = reservation.ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original member reservation required".into()))?;
+                let reservation = reservation.ok_or_else(|| {
+                RuntimeEventStoreError::InvalidTransaction("original member reservation required".into())
+            })?;
                 if !std::ptr::eq(reservation.owner.as_ptr(), self)
                     || identity.as_ref() != Some(&(reservation.outer.clone(), reservation.index))
                     || submitted.transaction.events.iter().find(|event| event.event.kind == "agentic.batch_member.index")
@@ -1197,7 +1267,9 @@ impl RuntimeEventStore {
                 let retained_fence = match retained.get(&key) {
                     Some(RetainedMemberEntry::Reserved { nonce, effect: Some(effect), .. })
                         if Arc::ptr_eq(nonce, &reservation.nonce) && effect_fence.is_some_and(|provided| std::ptr::eq(Arc::as_ptr(effect), provided)) => Arc::clone(effect),
-                    _ => return Err(RuntimeEventStoreError::InvalidTransaction("original member reservation or effect owner unavailable".into())),
+                    _ => {
+                        return Err(RuntimeEventStoreError::InvalidTransaction("original member reservation or effect owner unavailable".into()));
+                    },
                 };
                 // The same mutex changes the original reservation into the
                 // complete request; no await or gap permits a second owner.
@@ -1250,10 +1322,11 @@ impl RuntimeEventStore {
                 Err(RuntimeEventStoreError::CheckedAttemptRolledBack(cause))
             }
             // Commit result unknown: retain the original request and control.
-            Err(error) => Err(error),
+            Err(error) => {
+                Err(error)
+            },
         }
     }
-
     /// A missing commit is still Unknown. A present commit must match the
     /// exact retained checked request before it can be used for reconciliation.
     pub(crate) fn read_retained_checked_member_commit(
@@ -1289,7 +1362,7 @@ impl RuntimeEventStore {
     pub(crate) fn retained_original_process_member_transaction(
         &self, process: &Arc<crate::agent_in_process_worker::OriginalProcessBatchCall>,
         original: &crate::RuntimeToolExecutionRequest, index: usize,
-    ) -> RuntimeEventStoreResult<Option<String>> {
+    ) -> RuntimeEventStoreResult<Option<(String, crate::authorization_negotiator::PreparedMemberBinding)>> {
         if !std::ptr::eq(Arc::as_ptr(process.store()), self) {
             return Err(RuntimeEventStoreError::InvalidTransaction("original Process store mismatch".into()));
         }
@@ -1300,13 +1373,14 @@ impl RuntimeEventStore {
             let RetainedMemberEntry::Checked(owner) = entry else { continue; };
             if original_member_identity(&owner.request)?.as_ref() != Some(&(original.idempotency_key.clone(), index)) { continue; }
             let authority = owner.authority.as_ref().ok_or_else(|| RuntimeEventStoreError::Corrupt("retained member authority missing".into()))?;
-            let member = authority.member().process().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("retained member owner is not Process".into()))?;
+            let member_guard = authority.member().upgrade().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("retained member owner unavailable".into()))?;
+            let member = member_guard.process().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("retained member owner is not Process".into()))?;
             if !Arc::ptr_eq(member.owner(), process) || member.ticket() != process.ticket()
                 || member.original_request() != original
                 || !member.original_request().tool_progress.same_original_channels(&original.tool_progress) {
                 return Err(RuntimeEventStoreError::InvalidTransaction("retained Process call identity mismatch".into()));
             }
-            if found.replace(owner.request.transaction.transaction_id.clone()).is_some() {
+            if found.replace((owner.request.transaction.transaction_id.clone(), member_guard)).is_some() {
                 return Err(RuntimeEventStoreError::Corrupt("multiple retained original member transactions".into()));
             }
         }

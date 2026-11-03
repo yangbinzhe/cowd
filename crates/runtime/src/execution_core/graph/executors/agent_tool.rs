@@ -106,6 +106,7 @@ struct NoDispatchState {
     inherited_hook_pending: std::collections::BTreeSet<String>,
     bounded_controls: Vec<std::sync::Weak<crate::conversation::MemberCommitControl>>,
     packet_scope_pending: std::collections::BTreeSet<String>,
+    member_custody: std::collections::BTreeMap<(String, usize), Arc<crate::tool_host::OriginalMemberSettlement>>,
     bounded_acquisition_pending: std::collections::BTreeMap<String, (Arc<crate::bound_tool_batch::OriginalBoundedAcquisitionFailure>, Option<Arc<crate::execution_core::graph::CommittedCallRefusal>>)>,
     bounded_acquisition_conflicts: Vec<(Arc<crate::bound_tool_batch::OriginalBoundedAcquisitionFailure>, Option<Arc<crate::execution_core::graph::CommittedCallRefusal>>)>,
     bounded_owners: std::collections::BTreeMap<String, OriginalBoundedWitness>,
@@ -313,6 +314,7 @@ impl NoDispatchObservation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed || state.entered || !state.uncertain.is_empty() || !state.inherited_hook_pending.is_empty() || !state.refused.is_empty()
+            || state.member_custody.values().any(|unit| !unit.is_settled())
         {
             return false;
         }
@@ -427,12 +429,35 @@ impl NoDispatchObservation {
         state.bounded_acquisition_pending.insert(key, (fact, retained_receipt));
         Ok(())
     }
+    pub(crate) fn register_member_custody(
+        &self, ticket: &NodeExecutionTicket, call_id: &str, index: usize,
+        unit: Arc<crate::tool_host::OriginalMemberSettlement>,
+    ) -> Result<(), String> {
+        if !self.ticket_matches(ticket) || index >= 25 || !self.calls.iter().any(|call| call.call_id == call_id) {
+            return Err("original member custody identity mismatch".into());
+        }
+        let mut state = self.state.lock().map_err(|_| "original member custody unavailable")?;
+        if state.closed { return Err("original member custody already closed".into()); }
+        let key = (call_id.to_owned(), index);
+        match state.member_custody.get(&key) {
+            Some(previous) if Arc::ptr_eq(previous, &unit) => Ok(()),
+            Some(_) => Err("original member custody conflicts".into()),
+            None => { state.member_custody.insert(key, unit); Ok(()) }
+        }
+    }
+    pub(crate) fn member_custody_is_unresolved(&self) -> bool {
+        match self.state.lock() {
+            Ok(state) => state.member_custody.values().any(|unit| !unit.is_settled()),
+            Err(_) => true,
+        }
+    }
     pub(crate) fn packet_scope_is_unresolved(&self) -> bool {
         !self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).packet_scope_pending.is_empty()
     }
-    pub(crate) fn packet_scope_allows_forget(&self, publication_completed: bool) -> bool {
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    pub(crate) fn original_custody_allows_forget(&self, publication_completed: bool) -> bool {
+        let Ok(state) = self.state.lock() else { return false; };
         state.packet_scope_pending.is_empty() && (state.packet_scope_settled.is_empty() || publication_completed)
+            && state.member_custody.values().all(|unit| unit.is_settled())
     }
     /// Release only after the original commit owner authenticated this exact receipt.
     pub(crate) fn settle_packet_scope(&self, proof: &crate::execution_core::graph::CommittedCallRefusal) -> Result<(), String> {
@@ -1028,10 +1053,14 @@ impl AgentToolBatchDispatcher {
                 }
                 crate::execution_core::graph::validate_node_ticket_start(services.event_store(), &parent_ticket, None)
                     .map_err(|e| ToolError::unknown(e.to_string()))?;
+                let process_members = if preflight_request.tool_name == "agent_action_batch" {
+                    crate::agent_in_process_worker::current_process_member_custody(&preflight_request)
+                        .map_err(ToolError::unknown)?
+                } else { None };
                 Some(services.tool_batch_executor().retain_original_agent_child(
                     &graph_id, &node_id, &graph.nodes[0].payload_ref, Arc::new(preflight_request.clone()), parent_ticket,
                     packet, Arc::clone(services.event_store()),
-                    crate::conversation::tool_plane::current_original_single_capture(), stop.clone(),
+                    crate::conversation::tool_plane::current_original_single_capture(), stop.clone(), process_members,
                 ).map_err(ToolError::unknown)?)
             } else { None };
             if let Some(stop) = &stop {

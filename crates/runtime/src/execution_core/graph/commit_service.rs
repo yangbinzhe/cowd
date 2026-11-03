@@ -7510,12 +7510,21 @@ impl ExecutionCommitService {
         }
         // This reads only facts already committed with the original node; an
         // unresolved member keeps the live owner and its original error.
+        let mut member_facts = Vec::new();
         for outer in self.original_batch_outers_after_commit(ticket)? {
-            self.original_batch_members_after_commit(ticket, &outer)?;
+            member_facts.extend(self.original_batch_members_after_commit(ticket, &outer)?
+                .into_iter().map(|member| member.payload().clone()));
             if self.original_batch_pending_after_commit(ticket, &outer)?.is_some() {
                 return Err(invalid("original batch member outcome remains unresolved"));
             }
         }
+        let process_units = match close.original_agent_child() {
+            Some(child) => match &child.process_members {
+                Some(members) => members.verified_units(ticket, child, &member_facts).map_err(|error| invalid(&error))?,
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
         let stream = format!("execution-effect:{}", request.idempotency_key);
         let key = format!("{}:receipt", request.idempotency_key);
         let event = self.event_store.event_by_idempotency_key(&stream, &key)?
@@ -7546,6 +7555,7 @@ impl ExecutionCommitService {
             return Ok(());
         }
         self.event_store.release_original_first_effect_owner(&transaction, owner)?;
+        for unit in process_units { unit.mark_settled(); }
         Ok(())
     }
 

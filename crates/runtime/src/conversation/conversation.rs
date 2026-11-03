@@ -5134,6 +5134,25 @@ struct SessionProviderWireEvidenceWriter {
     native_wire_receipts: Arc<std::sync::Mutex<Vec<NativeWireReceipt>>>,
 }
 
+// Construct the wire artifact before entering its asynchronous write stage.
+// Keep the envelope and serializer identical to the original writer.
+fn provider_wire_evidence_payload(
+    context: &crate::ProviderRequestEvidenceContext,
+    evidence: &crate::ProviderWireEvidence,
+) -> Result<Vec<u8>, RuntimeError> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 4,
+        "session_id": context.session_id,
+        "execution_id": context.execution_id,
+        "turn_id": context.turn_id,
+        "request_sequence": context.request_sequence,
+        "request_compiler_cache_hit": context.request_compiler_cache_hit,
+        "budget": context.budget,
+        "provider_request": evidence,
+    }))
+    .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
 #[cfg(test)]
 pub(crate) fn r189_session_provider_writer_for_test(
     services: &crate::RuntimeServices,
@@ -5472,17 +5491,7 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
         let result_seals = crate::context_evidence::wire_tool_result_seals(&evidence.wire_request);
         let epoch = ProviderAttemptEpoch::new(&context.execution_id, &context.turn_id);
         let request_id = evidence.request_context.request_id.clone();
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 4,
-            "session_id": context.session_id,
-            "execution_id": context.execution_id,
-            "turn_id": context.turn_id,
-            "request_sequence": context.request_sequence,
-            "request_compiler_cache_hit": context.request_compiler_cache_hit,
-            "budget": context.budget,
-            "provider_request": &evidence,
-        }))
-        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let payload = provider_wire_evidence_payload(context, &evidence)?;
         let visibility_scope = format!("session:{}", context.session_id);
         let artifact = self
             .artifacts

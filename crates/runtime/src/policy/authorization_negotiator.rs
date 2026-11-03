@@ -404,6 +404,35 @@ pub(crate) struct PreparedMemberBinding {
     prepared: crate::step_snapshot::PreparedAgentBatchMember,
 }
 
+/// Same private member identity without owning its live execution objects.
+#[derive(Clone)]
+pub(crate) struct RetainedMemberBinding {
+    owner: RetainedMemberOwner,
+    prepared: crate::step_snapshot::PreparedAgentBatchMember,
+}
+#[derive(Clone)]
+enum RetainedMemberOwner {
+    Host(std::sync::Weak<crate::conversation::OriginalHostPreparedMember>),
+    Process(std::sync::Weak<crate::agent_in_process_worker::OriginalProcessPreparedMember>),
+}
+impl RetainedMemberBinding {
+    pub(crate) fn upgrade(&self) -> Option<PreparedMemberBinding> {
+        let owner = match &self.owner {
+            RetainedMemberOwner::Host(member) => OriginalMemberOwner::Host(member.upgrade()?),
+            RetainedMemberOwner::Process(member) => OriginalMemberOwner::Process(member.upgrade()?),
+        };
+        Some(PreparedMemberBinding { owner, prepared: self.prepared.clone() })
+    }
+    pub(crate) fn matches(&self, member: &PreparedMemberBinding) -> bool {
+        self.prepared == member.prepared && match (&self.owner, &member.owner) {
+            (RetainedMemberOwner::Host(a), OriginalMemberOwner::Host(b)) => std::sync::Weak::ptr_eq(a, &Arc::downgrade(b)),
+            (RetainedMemberOwner::Process(a), OriginalMemberOwner::Process(b)) => std::sync::Weak::ptr_eq(a, &Arc::downgrade(b)),
+            _ => false,
+        }
+    }
+    pub(crate) fn prepared(&self) -> &crate::step_snapshot::PreparedAgentBatchMember { &self.prepared }
+}
+
 /// One original Process member policy decision, kept across approval waits.
 /// Its private fields bind the same member, descriptor and Session snapshot.
 pub(crate) struct ProcessMemberEvaluation {
@@ -430,6 +459,13 @@ impl ProcessMemberEvaluation {
     pub(crate) fn snapshot(&self) -> &harness_contract::policy::SessionExecutionPolicy { &self.snapshot }
 }
 impl PreparedMemberBinding {
+    pub(crate) fn retained(&self) -> RetainedMemberBinding {
+        let owner = match &self.owner {
+            OriginalMemberOwner::Host(member) => RetainedMemberOwner::Host(Arc::downgrade(member)),
+            OriginalMemberOwner::Process(member) => RetainedMemberOwner::Process(Arc::downgrade(member)),
+        };
+        RetainedMemberBinding { owner, prepared: self.prepared.clone() }
+    }
     pub(crate) fn from_process(member: Arc<crate::agent_in_process_worker::OriginalProcessPreparedMember>) -> Result<Self, String> {
         let prepared = member.effective_prepared().ok_or("original Process member effective hook facts unavailable")?.clone();
         Ok(Self { owner: OriginalMemberOwner::Process(member), prepared })
@@ -459,7 +495,7 @@ impl PartialEq for PreparedMemberBinding {
 /// without changing its registry. This is not an admission or a receipt.
 pub(crate) struct PreparedMemberExistingLease {
     owner: Arc<Mutex<LeaseRegistry>>,
-    member: PreparedMemberBinding,
+    member: RetainedMemberBinding,
     request: AuthorizationRequest,
     effective: EffectiveToolAuthorizationDescriptor,
     assessment: CapabilityAssessment,
@@ -470,7 +506,7 @@ pub(crate) struct PreparedMemberExistingLease {
     event: crate::RuntimeTransactionEventInput,
 }
 impl PreparedMemberExistingLease {
-    pub(crate) fn member(&self) -> &PreparedMemberBinding { &self.member }
+    pub(crate) fn member(&self) -> &RetainedMemberBinding { &self.member }
     pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
     pub(crate) fn event(&self) -> &crate::RuntimeTransactionEventInput { &self.event }
     pub(crate) fn deadline_ms(&self) -> u64 { self.before.expires_at_ms }
@@ -481,7 +517,7 @@ impl PreparedMemberExistingLease {
 /// registry is unchanged until their containing checked transaction succeeds.
 pub(crate) struct PreparedMemberNewLease {
     owner: Arc<Mutex<LeaseRegistry>>,
-    member: PreparedMemberBinding,
+    member: RetainedMemberBinding,
     request: AuthorizationRequest,
     effective: EffectiveToolAuthorizationDescriptor,
     fingerprint: String,
@@ -496,7 +532,7 @@ pub(crate) struct PreparedMemberNewLease {
     events: Vec<crate::RuntimeTransactionEventInput>,
 }
 impl PreparedMemberNewLease {
-    pub(crate) fn member(&self) -> &PreparedMemberBinding { &self.member }
+    pub(crate) fn member(&self) -> &RetainedMemberBinding { &self.member }
     pub(crate) fn assessment(&self) -> &CapabilityAssessment { &self.assessment }
     pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
     pub(crate) fn events(&self) -> &[crate::RuntimeTransactionEventInput] { &self.events }
@@ -506,7 +542,7 @@ impl PreparedMemberNewLease {
 /// Original owner candidate for an existing or newly issued lease.
 pub(crate) enum PreparedMemberLease { Existing(PreparedMemberExistingLease), New(PreparedMemberNewLease) }
 impl PreparedMemberLease {
-    pub(crate) fn member(&self) -> &PreparedMemberBinding { match self { Self::Existing(v) => v.member(), Self::New(v) => v.member() } }
+    pub(crate) fn member(&self) -> &RetainedMemberBinding { match self { Self::Existing(v) => v.member(), Self::New(v) => v.member() } }
     pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { match self { Self::Existing(v) => v.source(), Self::New(v) => v.source() } }
     pub(crate) fn assessment(&self) -> &CapabilityAssessment { match self { Self::Existing(v) => v.assessment(), Self::New(v) => v.assessment() } }
     pub(crate) fn events(&self) -> &[crate::RuntimeTransactionEventInput] { match self { Self::Existing(v) => std::slice::from_ref(v.event()), Self::New(v) => v.events() } }
@@ -522,7 +558,8 @@ pub(crate) struct PreparedMemberAuthority {
 }
 impl PreparedMemberAuthority {
     pub(crate) fn new(lease: PreparedMemberLease, approval: Option<crate::approval_queue::PreparedMemberApproval>) -> Result<Self, String> {
-        if approval.as_ref().is_some_and(|a| a.member() != lease.member()) {
+        let member = lease.member().upgrade().ok_or("original member owner unavailable")?;
+        if approval.as_ref().is_some_and(|a| !a.member().matches(&member)) {
             return Err("lease and approval refer to different original members".into());
         }
         if let PreparedMemberLease::New(ref candidate) = lease {
@@ -532,7 +569,7 @@ impl PreparedMemberAuthority {
         } else if approval.is_some() {
             return Err("existing lease cannot consume unrelated once approval".into());
         }
-        let timeout_secs = match &lease.member().owner {
+        let timeout_secs = match &member.owner {
             OriginalMemberOwner::Host(member) => member.timeout_secs(),
             OriginalMemberOwner::Process(member) => member.original_member_timeout_secs().ok_or("original Process member timeout unavailable")?,
         };
@@ -543,15 +580,19 @@ impl PreparedMemberAuthority {
         };
         let decision = crate::ToolPolicy.authorize(effective, capability, request.idempotency_key.clone(), authorized_lease, timeout_secs)
             .map_err(|error| error.to_string())?;
-        let assessment = match &lease.member().owner {
+        let assessment = match &member.owner {
             OriginalMemberOwner::Host(member) => member.prepare_member_assessment(lease.assessment(), approval.as_ref().map(|value| value.grant()))?,
             OriginalMemberOwner::Process(member) => member.prepare_member_assessment(lease.assessment(), approval.as_ref().map(|value| value.grant()))?,
         };
         Ok(Self { lease, approval, assessment, decision })
     }
-    pub(crate) fn member(&self) -> &PreparedMemberBinding { self.lease.member() }
-    pub(crate) fn matches_committed(&self, committed: &crate::OriginalCommittedMember) -> bool {
-        if !committed.belongs_to(self.member().store())
+    pub(crate) fn member(&self) -> &RetainedMemberBinding { self.lease.member() }
+    pub(crate) fn approval_guard(&self, member_guard: &PreparedMemberBinding) -> Result<Option<Arc<crate::approval_queue::ApprovalQueue>>, String> {
+        if !self.member().matches(member_guard) { return Err("original member owner changed".into()); }
+        self.approval.as_ref().map(|approval| approval.owner_guard(member_guard.store())).transpose()
+    }
+    pub(crate) fn matches_committed(&self, member_guard: &PreparedMemberBinding, committed: &crate::OriginalCommittedMember) -> bool {
+        if !self.member().matches(member_guard) || !committed.belongs_to(member_guard.store())
             || !committed.authority().is_some_and(|authority| std::ptr::eq(authority.as_ref(), self)) { return false; }
         let transaction = &committed.request().transaction;
         let receipt = &committed.receipt().commit;
@@ -569,7 +610,7 @@ impl PreparedMemberAuthority {
             && entry.event.payload.get("member_identity").and_then(serde_json::Value::as_str) == Some(member.identity.as_str())
             && entry.event.payload.get("member_index").and_then(serde_json::Value::as_u64) == u64::try_from(member.index).ok());
         let Some(marker) = markers.next() else { return false; };
-        if markers.next().is_some() || serde_json::to_value(self.member().ticket()).ok().as_ref() != marker.event.payload.get("ticket") { return false; }
+        if markers.next().is_some() || serde_json::to_value(member_guard.ticket()).ok().as_ref() != marker.event.payload.get("ticket") { return false; }
         let Some(indices) = marker.event.payload.get("authority_events").and_then(serde_json::Value::as_array) else { return false; };
         let expected: Vec<_> = self.events().collect();
         if indices.len() != expected.len() { return false; }
@@ -602,18 +643,22 @@ impl PreparedMemberAuthority {
     /// and lease owners are held outside `commit`; the original action owner
     /// acquires its ordered stream locks inside that synchronous closure.
     pub(crate) fn with_original_owners_for_checked_commit(
-        &self, services: &crate::RuntimeServices,
+        &self, services: &crate::RuntimeServices, member_guard: &PreparedMemberBinding,
         commit: impl FnOnce(&PreparedMemberAuthority) -> Result<Arc<crate::OriginalCommittedMember>, crate::AgentActionServiceError>,
     ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
-        if !Arc::ptr_eq(self.member().store(), services.event_store()) {
+        if !self.member().matches(member_guard) || !Arc::ptr_eq(member_guard.store(), services.event_store()) {
             return Err(crate::AgentActionServiceError::Corrupt("original member service store changed".into()));
         }
-        let (committed, applied) = self.member().negotiator().commit_prepared_member_authority(self, commit)?;
+        let approval_guard = self.approval_guard(member_guard).map_err(crate::AgentActionServiceError::MemberUnknown)?;
+        let (committed, applied) = member_guard.negotiator().commit_prepared_member_authority(self, member_guard, approval_guard.as_deref(), commit).map_err(|error| {
+            error
+        })?;
         // The checked owner retains the original request and authority until
         // both hot owner updates have succeeded. A release error does not
         // change the committed result or make the member Fresh.
         let released = applied && services.agent_action_service()
             .release_original_member_after_owner_apply(&committed).is_ok();
+        let committed = if released { committed.after_original_authority_release() } else { committed };
         Ok((committed, released))
     }
     /// Lease deadline is inclusive; once approval deadline is exclusive.
@@ -1307,7 +1352,7 @@ impl AuthorizationNegotiator {
         }
         let request = member.authorization_request()?;
         let binding = PreparedMemberBinding::from_host(Arc::clone(&member));
-        if approval.as_ref().is_some_and(|value| value.member() != &binding) {
+        if approval.as_ref().is_some_and(|value| !value.member().matches(&binding)) {
             return Err("Host member approval belongs to a different owner".into());
         }
         let lease = match self.prepare_member_existing_lease(member.store().as_ref(), member.original_policy(), &request, &binding) {
@@ -1378,7 +1423,7 @@ impl AuthorizationNegotiator {
         let owner = evaluation.member.owner();
         if !Arc::ptr_eq(&self.registry, &owner.negotiator().registry)
             || owner.policy().execution_policy_control().revision() != evaluation.snapshot.revision
-            || approval.member() != &evaluation.binding {
+            || !approval.member().matches(&evaluation.binding) {
             return Err("original Process approval owner or policy changed".into());
         }
         let lease = self.prepare_member_new_lease_evaluated(owner.store().as_ref(), owner.policy(),
@@ -1409,7 +1454,7 @@ impl AuthorizationNegotiator {
         let input = harness_contract::step::parse_strict_json(&request.input).map_err(|e| e.to_string())?;
         if request.capability != original.tool || request.idempotency_key != original.identity
             || request.effect != original.effect || input != original.input
-            || approval.is_some_and(|a| a.member() != member) {
+            || approval.is_some_and(|a| !a.member().matches(member)) {
             return Err("original batch member and new lease request differ".into());
         }
         let effective = evaluation.map(|v| v.effective.clone()).unwrap_or_else(|| Self::compile_effective_descriptor(&request.effect, &request.input));
@@ -1484,7 +1529,7 @@ impl AuthorizationNegotiator {
         }
         let assessment = authorized_assessment(&request, request.effect.assessment.clone(), mode,
             active_mode, risk, path, issued.clone(), "original member prepared lease");
-        Ok(PreparedMemberNewLease { owner: Arc::clone(&self.registry), member: member.clone(), request, effective, fingerprint,
+        Ok(PreparedMemberNewLease { owner: Arc::clone(&self.registry), member: member.retained(), request, effective, fingerprint,
             prior_id, prior_lease, issued, consumed, assessment, approval_grant_id: approval.map(|a| a.grant().grant_id.clone()), source: crate::ExpectedStreamRevision { stream_id, expected_revision: 0 },
             expired_lease_source: evaluation.and_then(|value| value.expired_lease_source.clone()), events })
     }
@@ -1590,7 +1635,7 @@ impl AuthorizationNegotiator {
             evaluation.map_or_else(|| policy.active_mode(), |v| v.active_mode),
             evaluation.map_or_else(|| risk_for_effect(&request.effect.assessment), |v| v.risk), AuthorizationPath::ExistingLease,
             execution_lease, "existing scoped lease");
-        Ok(Some(PreparedMemberExistingLease { owner: Arc::clone(&self.registry), member: member.clone(), request, effective, assessment, before, after, transition,
+        Ok(Some(PreparedMemberExistingLease { owner: Arc::clone(&self.registry), member: member.retained(), request, effective, assessment, before, after, transition,
             source: crate::ExpectedStreamRevision { stream_id, expected_revision }, event }))
     }
 
@@ -1598,7 +1643,7 @@ impl AuthorizationNegotiator {
     /// transaction reports success. Unknown leaves the borrowed candidate held
     /// by the original caller for its transaction-resolution path.
     pub(crate) fn commit_prepared_member_new_lease(
-        &self, prepared: &PreparedMemberNewLease,
+        &self, prepared: &PreparedMemberNewLease, member_guard: &PreparedMemberBinding,
         commit: impl FnOnce(&PreparedMemberNewLease) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError>,
     ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
         if !Arc::ptr_eq(&self.registry, &prepared.owner) {
@@ -1612,7 +1657,9 @@ impl AuthorizationNegotiator {
             || !prepared.issued.is_active_at(now_ms()) {
             return Err(crate::AgentActionServiceError::Corrupt("member issuance source changed".into()));
         }
-        let result = commit(prepared)?;
+        let result = commit(prepared).map_err(|error| {
+            error
+        })?;
         if !result.1 { return Ok(result); }
         let id = prepared.issued.lease_id.clone();
         registry.lease_by_fingerprint.insert(prepared.fingerprint.clone(), id.clone());
@@ -1627,7 +1674,7 @@ impl AuthorizationNegotiator {
     /// Hold the original lease owner over the synchronous checked commit.
     /// An error (including an unknown backend outcome) leaves it unchanged.
     pub(crate) fn commit_prepared_member_existing_lease(
-        &self, prepared: &PreparedMemberExistingLease,
+        &self, prepared: &PreparedMemberExistingLease, member_guard: &PreparedMemberBinding,
         commit: impl FnOnce(&PreparedMemberExistingLease) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError>,
     ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
         if !Arc::ptr_eq(&self.registry, &prepared.owner) { return Err(crate::AgentActionServiceError::Corrupt("member lease owner changed".into())); }
@@ -1638,7 +1685,9 @@ impl AuthorizationNegotiator {
             || registry.leases.get(id) != Some(&prepared.before)
             || !prepared.before.is_active_at(now_ms())
         { return Err(crate::AgentActionServiceError::Corrupt("member lease changed before checked commit".into())); }
-        let result = commit(prepared)?;
+        let result = commit(prepared).map_err(|error| {
+            error
+        })?;
         if !result.1 { return Ok(result); }
         registry.leases.insert(id.clone(), prepared.after.clone());
         registry.consumed_idempotency.insert(key.clone());
@@ -1649,22 +1698,23 @@ impl AuthorizationNegotiator {
     /// The approval and lease locks cover the original synchronous checked
     /// transaction and their hot state changes only on its successful return.
     pub(crate) fn commit_prepared_member_authority(
-        &self, prepared: &PreparedMemberAuthority,
+        &self, prepared: &PreparedMemberAuthority, member_guard: &PreparedMemberBinding,
+        approval_guard: Option<&crate::approval_queue::ApprovalQueue>,
         commit: impl FnOnce(&PreparedMemberAuthority) -> Result<Arc<crate::OriginalCommittedMember>, crate::AgentActionServiceError>,
     ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
         let commit_lease = || {
             let actual_commit = || {
                 let committed = commit(prepared)?;
-                let matches = prepared.matches_committed(&committed);
+                let matches = prepared.matches_committed(member_guard, &committed);
                 Ok((committed, matches))
             };
             match &prepared.lease {
-                PreparedMemberLease::Existing(lease) => self.commit_prepared_member_existing_lease(lease, |_| actual_commit()),
-                PreparedMemberLease::New(lease) => self.commit_prepared_member_new_lease(lease, |_| actual_commit()),
+                PreparedMemberLease::Existing(lease) => self.commit_prepared_member_existing_lease(lease, member_guard, |_| actual_commit()),
+                PreparedMemberLease::New(lease) => self.commit_prepared_member_new_lease(lease, member_guard, |_| actual_commit()),
             }
         };
         match prepared.approval.as_ref() {
-            Some(approval) => approval.owner().commit_prepared_member_approval(approval, |_| commit_lease()),
+            Some(approval) => approval_guard.ok_or_else(|| crate::AgentActionServiceError::MemberUnknown("original approval owner unavailable".into()))?.commit_prepared_member_approval(approval, member_guard, |_| commit_lease()),
             None => commit_lease(),
         }
     }
@@ -1673,10 +1723,11 @@ impl AuthorizationNegotiator {
     /// owners. A mismatch leaves the retained transaction owned for resolution.
     /// Never returns a Fresh or rolled-back result for a committed handle.
     pub(crate) fn apply_recovered_member_authority(
-        &self, prepared: &Arc<PreparedMemberAuthority>, committed: &crate::OriginalCommittedMember,
+        &self, prepared: &Arc<PreparedMemberAuthority>, member_guard: &PreparedMemberBinding,
+        approval_guard: Option<&crate::approval_queue::ApprovalQueue>, committed: &crate::OriginalCommittedMember,
     ) -> Result<(), String> {
         if !committed.authority().is_some_and(|original| Arc::ptr_eq(original, prepared))
-            || !prepared.matches_committed(committed) {
+            || !prepared.matches_committed(member_guard, committed) {
             return Err("recovered member is not this original authority transaction".into());
         }
         let apply_lease = || {
@@ -1719,7 +1770,7 @@ impl AuthorizationNegotiator {
             Ok(())
         };
         match prepared.approval.as_ref() {
-            Some(approval) => approval.owner().apply_recovered_member_approval(approval, apply_lease),
+            Some(approval) => approval_guard.ok_or("original approval owner unavailable")?.apply_recovered_member_approval(approval, member_guard, apply_lease),
             None => apply_lease(),
         }
     }

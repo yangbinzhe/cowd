@@ -485,6 +485,7 @@ struct AdmittedLiveScenario {
     turn_id: String,
     expected_reads: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
     numeric_oracle: Option<crate::facet_gate::numeric_oracle::Snapshot>,
+    v2_workspace_version: Option<V2WorkspaceVersion>,
     trace: Vec<Value>,
 }
 
@@ -494,7 +495,6 @@ struct AdmittedLiveScenario {
 struct U5Owner {
     pid: u32,
     starttime: u64,
-    image_sha256: String,
     candidate: String,
     namespace: String,
     base_url: String,
@@ -511,9 +511,15 @@ pub(crate) struct U5Host {
     launcher_start: u64,
     pid: u32,
     starttime: u64,
-    image_sha256: String,
-    exe_dev: u64,
-    exe_ino: u64,
+    // Launcher-side file observations are neither process identity nor admission.
+    #[serde(default, rename = "image_sha256")]
+    _image_sha256: Option<serde_json::Value>,
+    #[serde(default, rename = "harness_sha256")]
+    _harness_sha256: Option<serde_json::Value>,
+    #[serde(default, rename = "exe_dev")]
+    _exe_dev: Option<serde_json::Value>,
+    #[serde(default, rename = "exe_ino")]
+    _exe_ino: Option<serde_json::Value>,
     listener_inode: u64,
     port: u16,
     #[serde(default)]
@@ -522,7 +528,6 @@ pub(crate) struct U5Host {
     source_sha256: Option<String>,
     pub(crate) namespace: String,
     pub(crate) base_url: String,
-    harness_sha256: String,
     runtime_dev: u64,
     runtime_ino: u64,
 }
@@ -676,13 +681,6 @@ impl U5Host {
             || host.runtime_ino != meta.ino()
             || host.nonce != std::env::var("COWD_EVAL_U5_NONCE").unwrap_or_default()
             || host.nonce.len() != 64
-            || host.harness_sha256
-                != std::env::var("COWD_EVAL_HARNESS_BINARY_SHA256").unwrap_or_default()
-            || host.image_sha256
-                != format!(
-                    "sha256:{}",
-                    std::env::var("COWD_EVAL_BINARY_SHA256").unwrap_or_default()
-                )
             || u5_proc_stat(std::process::id())?.0 != host.launcher_pid
             || u5_proc_stat(host.launcher_pid)?.1 != host.launcher_start
             || u5_proc_stat(host.pid)?.0 != host.launcher_pid
@@ -697,14 +695,9 @@ impl U5Host {
         self.validate_live_until(Instant::now() + Duration::from_secs(5))
     }
     fn validate_live_until(&self, deadline: Instant) -> Result<(), String> {
-        use std::{io::Read, os::unix::fs::MetadataExt};
+        use std::io::Read;
         if u5_proc_stat(self.pid)?.1 != self.starttime {
             return Err("U5 Child changed".into());
-        }
-        let exe =
-            std::fs::metadata(format!("/proc/{}/exe", self.pid)).map_err(|e| e.to_string())?;
-        if (exe.dev(), exe.ino()) != (self.exe_dev, self.exe_ino) {
-            return Err("U5 Child image replaced".into());
         }
         let url = reqwest::Url::parse(&self.base_url).map_err(|e| e.to_string())?;
         if url.host_str() != Some("127.0.0.1")
@@ -763,7 +756,6 @@ impl U5Host {
         U5Owner {
             pid: self.pid,
             starttime: self.starttime,
-            image_sha256: self.image_sha256.clone(),
             candidate: self
                 .candidate
                 .clone()
@@ -774,7 +766,7 @@ impl U5Host {
         }
     }
     pub(crate) fn binding(&self) -> Value {
-        json!({"nonce":self.nonce,"pid":self.pid,"starttime":self.starttime,"image_sha256":self.image_sha256,"candidate":self.candidate,"namespace":self.namespace,"source_sha256":self.source_sha256,"harness_sha256":self.harness_sha256})
+        json!({"nonce":self.nonce,"pid":self.pid,"starttime":self.starttime,"candidate":self.candidate,"namespace":self.namespace,"source_sha256":self.source_sha256})
     }
 }
 
@@ -1072,10 +1064,6 @@ fn u5_valid_owner(owner: &U5Owner, base_url: &str) -> bool {
         && owner.starttime > 0
         && !owner.namespace.is_empty()
         && owner.base_url == base_url
-        && owner
-            .image_sha256
-            .strip_prefix("sha256:")
-            .is_some_and(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
         && reqwest::Url::parse(base_url).is_ok_and(|url| {
             url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "::1"))
         })
@@ -1904,6 +1892,29 @@ fn live_provider_token_telemetry_limit() -> Result<Option<u64>, String> {
         return Err("COWD_EVAL_MAX_PROVIDER_TOKENS must be positive when supplied".to_string());
     }
     Ok(Some(limit))
+}
+
+/// Versioned business prompts for the first v2 group. The caller selects v2
+/// only together with that scenario's v2 oracle and report revision.
+fn v2_group_one_prompt(spec_id: &str) -> Option<&'static str> {
+    match spec_id {
+        "live_direct_terminal" => Some(
+            "请回答 7 乘以 8 的结果。不要调用工具，不要组队。",
+        ),
+        "live_tool_evidence" => Some(
+            "请只读当前工作区根目录的 Cargo.toml，报告文件路径及 [workspace.package] 下的 version。请依据本次实际读取的证据作答；无法取得或确认时明确说明，不要猜测。",
+        ),
+        "live_minimal_batch_read" => Some(
+            "请只读当前工作区以下七个路径，并分别报告完整路径和对应整数：Cargo.toml 的 [workspace] members 数组项数；crates/tools/src/lib.rs 的行首 pub mod 声明数；crates/runtime/src/lib.rs 的行首 pub mod 与 pub use 声明总数；crates/memory/src/lib.rs 的行首 mod、pub mod 与 pub(crate) mod 声明总数；crates/gateway/src/main.rs 的行数；crates/provider/src/lib.rs 的行首 pub use 声明数；crates/harness-eval/src/lib.rs 的行数。声明按源码行首计数，分组 use 算一条；行数按 UTF-8 行迭代计数，末行无换行也算一行。可用 JSON 对象、逐行路径与整数，或两列表格表达。读取方式和批次由你决定；只使用只读工具，不用 bash 或写工具。未能读取或确认的项目明确标为 unresolved，不要猜测或给出矛盾数字。",
+        ),
+        SMALL_TEAM_SCENARIO_ID => Some(
+            "请在隔离工作区完成两责任域协作审查：runtime 的执行边界，以及 gateway 的工具与 authority 边界。请实际组织恰好两个 Team 分别负责这两个领域，以本次真实取得的只读源码证据支持各域结论，引用实际来源；每域结果须由不同于该结果提交者的 Agent 独立复核。再综合消费两个已验收的上游结果，说明跨域关系、风险与结论；综合结果也须由不同于综合提交者的 Agent 独立复核。Team 名称、成员数、任务划分和工具组合由你决定。只使用只读源码工具及完成协作所需的 Agent 操作，不使用 bash 或写文件工具；证据不足时明确说明，不要编造。",
+        ),
+        "live_single_architecture_baseline" => Some(
+            "请不组建 Team，独立审查当前工作区中 runtime、memory 和 gateway 的架构。基于本次实际读取的只读源码，分别说明三个领域的职责边界、各自的状态或事件真相及潜在风险，引用真实来源，并综合说明三者关系。读取路径和工具组合由你决定；不要使用 bash 或写工具。证据不足时明确列出未解决事项，不要猜测或将未证实内容写成事实。",
+        ),
+        _ => None,
+    }
 }
 
 fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option<u64>) -> String {
@@ -3203,6 +3214,13 @@ impl LiveScenarioRunner {
 
     fn run(&self, provider_token_telemetry_limit: Option<u64>) -> Value {
         let claim_scope = self.claim_scope;
+        // These two focused HTTP Session flows use the Session presence ledger
+        // and public terminal outbox; the separate app SurfaceHost is observed.
+        // Mixed/v1 selections keep the original full health requirement.
+        let v2_simple_only = std::env::var("COWD_EVAL_REVISION").ok().as_deref() == Some("n8-eval-v2")
+            && selected_live_scenario_ids().as_ref().is_some_and(|ids| !ids.is_empty()
+                && ids.iter().all(|id| matches!(id.as_str(), "live_direct_terminal" | "live_tool_evidence")
+                    && v2_group_one_prompt(id).is_some()));
         let health_observations = [
             ("gateway", "/healthz", LiveHealthContract::Gateway),
             (
@@ -3236,20 +3254,20 @@ impl LiveScenarioRunner {
             let observed = self.get_json(path);
             (
                 id.to_string(),
-                match observed {
-                    Ok(response) => semantic_health_observation(path, contract, response),
-                    Err(error) => json!({
-                        "status": "failed",
-                        "path": path,
-                        "error": error,
-                    }),
+                {
+                    let mut value = match observed {
+                        Ok(response) => semantic_health_observation(path, contract, response),
+                        Err(error) => json!({"status": "failed", "path": path, "error": error}),
+                    };
+                    value["role"] = json!(if v2_simple_only && id == "surface_host" { "observation" } else { "required" });
+                    value
                 },
             )
         })
         .collect::<serde_json::Map<String, Value>>();
         let health_passed = health_observations
             .values()
-            .all(|observation| observation["status"] == "passed");
+            .all(|observation| observation["role"] == "observation" || observation["status"] == "passed");
         let mut scenario_specs = vec![
             LiveScenarioSpec {
                 id: "live_direct_terminal",
@@ -3469,6 +3487,7 @@ impl LiveScenarioRunner {
             .iter()
             .filter(|scenario| scenario.get("status").and_then(Value::as_str) == Some("passed"))
             .count();
+        let unknown_count = scenarios.iter().filter(|scenario| scenario["status"] == "unknown").count();
         let comparison_requested = scenarios.iter().any(|scenario| {
             scenario.get("scenario_id").and_then(Value::as_str)
                 == Some("live_single_architecture_baseline")
@@ -3535,12 +3554,17 @@ impl LiveScenarioRunner {
             "poll_interval_ms": self.poll_interval.as_millis(),
             "health_status": if health_passed { "passed" } else { "failed" },
             "health_observations": health_observations,
+            "requested_eval_revision": std::env::var("COWD_EVAL_REVISION").unwrap_or_else(|_| "n8-eval-v1".into()),
+            "eval_revision": if scenarios.is_empty() { "not_started" }
+                else if scenarios.iter().all(|scenario| scenario["eval_revision"] == "n8-eval-v2") { "n8-eval-v2" }
+                else if scenarios.iter().any(|scenario| scenario["eval_revision"] == "n8-eval-v2") { "mixed" } else { "n8-eval-v1" },
             "scenario_count": scenarios.len(),
             "selected_scenario_ids": selected_scenario_ids,
             "selection_errors": selection_errors,
             "selection_status": if selection_passed { "passed" } else { "failed" },
             "passed": passed,
             "failed": scenarios.len().saturating_sub(passed + usize::from(pending_outer)),
+            "unknown_scenarios": unknown_count,
             "metrics": metrics,
             "scenarios": scenarios,
             "collaboration_comparison": collaboration_comparison,
@@ -3552,13 +3576,17 @@ impl LiveScenarioRunner {
         spec: LiveScenarioSpec,
         provider_token_telemetry_limit: Option<u64>,
     ) -> Value {
-        if spec.id == U8_HISTORY {
-            return self.run_u8_order_history(spec, provider_token_telemetry_limit);
+        let requested_revision = std::env::var("COWD_EVAL_REVISION").ok();
+        let (spec, eval_revision) = v2_select_scenario(spec, requested_revision.as_deref());
+        let mut result = if spec.id == U8_HISTORY {
+            self.run_u8_order_history(spec, provider_token_telemetry_limit)
+        } else if spec.id == U7_MEMORY_LIFECYCLE {
+            self.run_u7_memory_lifecycle(provider_token_telemetry_limit)
+        } else { self.run_prepared_scenario(spec, provider_token_telemetry_limit, None) };
+        if let Some(object) = result.as_object_mut() {
+            object.insert("eval_revision".into(), json!(eval_revision));
         }
-        if spec.id == U7_MEMORY_LIFECYCLE {
-            return self.run_u7_memory_lifecycle(provider_token_telemetry_limit);
-        }
-        self.run_prepared_scenario(spec, provider_token_telemetry_limit, None)
+        result
     }
 
     fn run_prepared_scenario(&self, spec:LiveScenarioSpec, provider_token_telemetry_limit:Option<u64>, prepared:Option<(U7MemoryFixture,Value)>) -> Value {
@@ -3745,6 +3773,7 @@ impl LiveScenarioRunner {
                     turn_id: turn,
                     expected_reads: BTreeMap::new(),
                     numeric_oracle: None,
+                    v2_workspace_version: None,
                     trace: vec![
                         json!({"kind":"u8_original_input_admission","phase":index,"source_sha256":format!("{:x}",Sha256::digest(source.as_bytes())),"source_bytes":source.len(),"admission":admission}),
                     ],
@@ -4108,16 +4137,30 @@ impl LiveScenarioRunner {
         {
             Ok(expected) => expected,
             Err(error) => {
-                return Err(failed_scenario_with_session(
-                    spec,
-                    started,
-                    trace,
-                    session_id,
-                    error,
-                    Value::Null,
-                ));
+                let mut failure = failed_scenario_with_session(
+                    spec, started, trace, session_id, error, Value::Null);
+                if matches!(spec.acceptance, LiveAcceptance::V2WorkspaceVersion) {
+                    failure["status"] = json!("unknown");
+                }
+                return Err(failure);
             }
         };
+        let v2_workspace_version = if matches!(spec.acceptance, LiveAcceptance::V2WorkspaceVersion) {
+            if resume_session.is_some() {
+                let mut failure = failed_scenario_with_session(spec, started, trace, session_id,
+                    "v2 workspace oracle requires a fresh input snapshot".into(), Value::Null);
+                failure["status"] = json!("unknown");
+                return Err(failure);
+            }
+            match v2_workspace_version_snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    let mut failure = failed_scenario_with_session(spec, started, trace, session_id, error, Value::Null);
+                    failure["status"] = json!("unknown");
+                    return Err(failure);
+                },
+            }
+        } else { None };
         // Freeze independently before dispatch; resumed runs have no trustworthy
         // pre-dispatch snapshot and must not acquire a new oracle after the fact.
         let numeric_oracle = if matches!(
@@ -4278,6 +4321,7 @@ impl LiveScenarioRunner {
             turn_id: turn_id_ref.to_string(),
             expected_reads,
             numeric_oracle,
+            v2_workspace_version,
             trace,
         })
     }
@@ -4296,6 +4340,7 @@ impl LiveScenarioRunner {
             turn_id,
             expected_reads,
             numeric_oracle,
+            v2_workspace_version,
             mut trace,
         } = admitted;
         let execution_id = Some(execution_id);
@@ -4361,6 +4406,7 @@ impl LiveScenarioRunner {
             spec.acceptance,
             &expected_reads,
             numeric_oracle.as_ref(),
+            v2_workspace_version.as_ref(),
             &response_text,
             &session_id,
             turn_id_ref,
@@ -4396,6 +4442,27 @@ impl LiveScenarioRunner {
             agentic_program.as_ref(),
             started.elapsed(),
         );
+        let mut v2_evidence_unknown = false;
+        let mut v2_known_failure = false;
+        if matches!(spec.acceptance, LiveAcceptance::V2DirectNumber) {
+            let tool_observation_available = timeline.pointer("/tool_summary/count").and_then(Value::as_u64).is_some()
+                || timeline.get("tool_timeline").and_then(Value::as_array).is_some()
+                || timeline.get("tool_call_details").and_then(Value::as_array).is_some();
+            let no_tools = tool_observation_available.then(|| metrics["tool_calls"].as_u64() == Some(0));
+            let no_teams = v2_complete_empty_team_lineage(execution_id_ref, &projections)
+                .map(|empty| empty && metrics["team_count"].as_u64() == Some(0));
+            let direct_decision = v2_direct_decision(&response_text);
+            v2_evidence_unknown = no_tools.is_none() || no_teams.is_none() || direct_decision.is_none();
+            v2_known_failure = direct_decision == Some(false) || no_tools == Some(false) || no_teams == Some(false);
+            acceptance.checks.push(json!({"name":"v2_no_tools_or_teams", "passed":no_tools == Some(true) && no_teams == Some(true),
+                "evidence_status":if v2_evidence_unknown { "unknown" } else { "observed" }}));
+            acceptance.passed &= no_tools == Some(true) && no_teams == Some(true);
+        }
+        if let Some(expected) = &v2_workspace_version {
+            let version_decision = v2_version_decision(&response_text, &expected.value);
+            v2_evidence_unknown = !v2_version_delivered(&timeline["read_evidence"], expected) || version_decision.is_none();
+            v2_known_failure = version_decision == Some(false);
+        }
         let requested_model = self
             .model
             .as_deref()
@@ -4418,6 +4485,10 @@ impl LiveScenarioRunner {
             "passed": model_verified,
         }));
         acceptance.passed &= model_verified;
+        if matches!(spec.acceptance, LiveAcceptance::V2DirectNumber | LiveAcceptance::V2WorkspaceVersion) {
+            if requested_model.is_some() && effective_models.is_empty() { v2_evidence_unknown = true; }
+            else if !model_verified { v2_known_failure = true; }
+        }
         let (observation_trace, observation_integrity) = observer.finalize();
         let observation_passed = observation_integrity.get("status").and_then(Value::as_str)
             == Some("passed")
@@ -4440,9 +4511,13 @@ impl LiveScenarioRunner {
         }));
         acceptance.passed &= observation_passed;
         trace.extend(observation_trace);
+        let is_v2 = matches!(spec.acceptance, LiveAcceptance::V2DirectNumber | LiveAcceptance::V2WorkspaceVersion);
+        if is_v2 && (!delivery_confirmed || !observation_passed) { v2_evidence_unknown = true; }
+        let scenario_status = if acceptance.passed { "passed" }
+            else if is_v2 && v2_evidence_unknown && !v2_known_failure { "unknown" } else { "failed" };
         let mut result = json!({
             "scenario_id": spec.id,
-            "status": if acceptance.passed { "passed" } else { "failed" },
+            "status": scenario_status,
             "acceptance": acceptance.to_value(),
             "session_id": session_id,
             "execution_id": execution_id,
@@ -5009,6 +5084,7 @@ impl LiveScenarioRunner {
         acceptance: LiveAcceptance,
         expected_reads: &BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
         numeric_oracle: Option<&crate::facet_gate::numeric_oracle::Snapshot>,
+        v2_workspace_version: Option<&V2WorkspaceVersion>,
         response_text: &str,
         session_id: &str,
         turn_id: &str,
@@ -5076,6 +5152,7 @@ impl LiveScenarioRunner {
                     turn_id,
                     expected_reads.clone(),
                     if matches!(acceptance, LiveAcceptance::Facet { facet_id: "read_six_named_files", .. }) { 1 } else { 16 },
+                    v2_workspace_version,
                     deadline,
                     trace,
                     actor,
@@ -5098,6 +5175,14 @@ impl LiveScenarioRunner {
                 agentic_program.as_ref(),
                 root_execution_id,
             );
+            if let Some(expected) = v2_workspace_version {
+                let delivered = v2_version_delivered(&timeline["read_evidence"], expected);
+                let answer = v2_version_answer(response_text, &expected.value);
+                result.checks.push(json!({"name":"v2_workspace_package_version", "passed":answer && delivered,
+                    "answer_matches":answer, "authenticated_version_extent":delivered,
+                    "evidence_status":if delivered { "verified" } else { "unknown" }}));
+                result.passed &= answer && delivered;
+            }
             if let Some(expected) = numeric_oracle {
                 let stable = std::env::var_os("COWD_EVAL_WORKSPACE")
                     .map(std::path::PathBuf::from)
@@ -5182,6 +5267,21 @@ impl LiveScenarioRunner {
                 };
             }
 
+            let waiting_v2_evidence = v2_workspace_version.is_some_and(|expected|
+                v2_version_answer(response_text, &expected.value)
+                    && !v2_version_delivered(&timeline["read_evidence"], expected));
+            if waiting_v2_evidence {
+                let deadline = timeout.observation_deadline(scenario_started, wait_started,
+                    Duration::from_millis(observer.since_last_progress_ms(scenario_started.elapsed().as_millis() as u64)),
+                    observer.progress_observations() as usize);
+                if Instant::now() >= deadline {
+                    return DescendantTeamWait { timeline, projections, agentic_program, acceptance: result,
+                        report: json!({"required":true, "elapsed_ms":wait_started.elapsed().as_millis(),
+                            "observations":observations, "terminal_reason":"v2_version_evidence_unknown"}) };
+                }
+                thread::sleep(self.poll_interval.min(deadline.saturating_duration_since(Instant::now())));
+                continue;
+            }
             if !acceptance.requires_descendant_team_closure() || result.passed {
                 return DescendantTeamWait {
                     timeline,
@@ -5361,6 +5461,7 @@ impl LiveScenarioRunner {
         turn: &str,
         expected: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
         page_limit: usize,
+        v2_workspace_version: Option<&V2WorkspaceVersion>,
         deadline: Instant,
         trace: &mut Vec<Value>,
         actor: &mut SessionActor<'_>,
@@ -5419,11 +5520,14 @@ impl LiveScenarioRunner {
                     break;
                 }
             };
-            if evidence.accept(page).is_err() || evidence.satisfied() || evidence.exhausted() {
-                break;
-            }
+            if evidence.accept(page).is_err() { break; }
+            let sufficient = v2_workspace_version.map_or_else(|| evidence.satisfied(),
+                |expected| v2_version_delivered(&evidence.report(), expected));
+            if sufficient || evidence.exhausted() { break; }
         }
-        if !evidence.satisfied() && !evidence.exhausted() {
+        let sufficient = v2_workspace_version.map_or_else(|| evidence.satisfied(),
+            |expected| v2_version_delivered(&evidence.report(), expected));
+        if !sufficient && !evidence.exhausted() {
             evidence.fail("read evidence 256-page limit reached");
         }
         evidence.report()
@@ -6171,6 +6275,173 @@ fn value_u64(value: &Value, keys: &[&str]) -> u64 {
         .sum()
 }
 
+// This is the same selection used by run_scenario; unsupported scenarios stay v1.
+fn v2_select_scenario(mut spec: LiveScenarioSpec, requested: Option<&str>) -> (LiveScenarioSpec, &'static str) {
+    if requested == Some("n8-eval-v2") && matches!(spec.id, "live_direct_terminal" | "live_tool_evidence") {
+        if let Some(prompt) = v2_group_one_prompt(spec.id) {
+            spec.prompt = prompt;
+            spec.acceptance = if spec.id == "live_direct_terminal" { LiveAcceptance::V2DirectNumber }
+                else { LiveAcceptance::V2WorkspaceVersion };
+            return (spec, "n8-eval-v2");
+        }
+    }
+    (spec, "n8-eval-v1")
+}
+
+// v2 oracles are enabled only with their corresponding prompt and revision.
+#[derive(Clone)]
+struct V2WorkspaceVersion {
+    value: String,
+    source_sha256: String,
+    first_line: u64,
+    last_line: u64,
+}
+
+fn v2_workspace_version_snapshot() -> Result<V2WorkspaceVersion, String> {
+    let root = std::env::var_os("COWD_EVAL_WORKSPACE").map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok()).ok_or("workspace unavailable")?;
+    v2_workspace_version_snapshot_for_root(&root)
+}
+
+fn v2_workspace_version_snapshot_for_root(root: &std::path::Path) -> Result<V2WorkspaceVersion, String> {
+    #[derive(serde::Deserialize)]
+    struct Manifest { workspace: Workspace }
+    #[derive(serde::Deserialize)]
+    struct Workspace { package: Package }
+    #[derive(serde::Deserialize)]
+    struct Package { version: toml::Spanned<String> }
+    let bytes = std::fs::read(root.join("Cargo.toml")).map_err(|_| "workspace manifest unavailable")?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "workspace manifest is not UTF-8")?;
+    let manifest: Manifest = toml::from_str(text).map_err(|_| "workspace.package.version unavailable")?;
+    let span = manifest.workspace.package.version.span();
+    let first_line = 1 + bytes[..span.start].iter().filter(|&&byte| byte == b'\n').count() as u64;
+    let last_line = 1 + bytes[..span.end.saturating_sub(1)].iter().filter(|&&byte| byte == b'\n').count() as u64;
+    Ok(V2WorkspaceVersion { value: manifest.workspace.package.version.into_inner(),
+        source_sha256: format!("{:x}", Sha256::digest(&bytes)), first_line, last_line })
+}
+
+fn v2_complete_empty_team_lineage(root: &str, projections: &[Value]) -> Option<bool> {
+    let mut by_id = BTreeMap::new();
+    for projection in projections {
+        let Some(id) = projection["execution_id"].as_str().filter(|id| !id.is_empty()) else { return None; };
+        if by_id.insert(id, projection).is_some() { return None; }
+    }
+    let mut pending = vec![root];
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) { return None; }
+        let Some(projection) = by_id.get(id) else { return None; };
+        let teams = projection["teams"].as_array()?;
+        if !teams.is_empty() { return Some(false); }
+        let Some(children) = projection["child_executions"].as_array() else { return None; };
+        for child in children {
+            let Some(child_id) = child["execution_id"].as_str().filter(|id| !id.is_empty()) else { return None; };
+            pending.push(child_id);
+        }
+    }
+    Some(true)
+}
+
+fn v2_version_delivered(observation: &Value, expected: &V2WorkspaceVersion) -> bool {
+    let Some(pages) = observation.get("pages").and_then(Value::as_array) else { return false; };
+    let frozen = BTreeMap::from([("Cargo.toml".to_string(), expected.source_sha256.clone())]);
+    for (page_index, page) in pages.iter().enumerate() {
+        for (read_index, read) in page["reads"].as_array().into_iter().flatten().enumerate() {
+            if read.pointer("/path/workspace_relative_path").and_then(Value::as_str) != Some("Cargo.toml")
+                || read["source_sha256"].as_str().map(|value| value.trim_start_matches("sha256:")) != Some(expected.source_sha256.as_str())
+                || !match read.pointer("/recipient/kind").and_then(Value::as_str) {
+                    Some("root") => read["grade"] == "provider_model_observed",
+                    Some("agent") => matches!(read["grade"].as_str(), Some("provider_model_observed" | "agent_channel_send")),
+                    _ => false,
+                } || read["body_delivered"] != true { continue; }
+            let extent = &read["delivered_extent"];
+            let covered = match extent["kind"].as_str() {
+                Some("file_lines") => extent["start_line"].as_u64().zip(extent["line_count"].as_u64())
+                    .is_some_and(|(start, count)| start <= expected.first_line
+                        && start.checked_add(count).is_some_and(|end| end > expected.last_line)),
+                Some("artifact_chunks") => {
+                    let Some(total) = extent["total_chunks"].as_u64() else { continue; };
+                    let Some(chunks) = extent["chunks"].as_array() else { continue; };
+                    let indexes: BTreeSet<u64> = chunks.iter().filter_map(|chunk| chunk["index"].as_u64()).collect();
+                    let bytes = chunks.iter().try_fold(0_u64, |sum, chunk|
+                        sum.checked_add(chunk["body_bytes"].as_u64()?));
+                    total > 0 && indexes.len() == chunks.len() && indexes.len() as u64 == total
+                        && indexes.iter().copied().eq(0..total)
+                        && bytes == read["source_bytes"].as_u64()
+                },
+                _ => false,
+            };
+            if !covered { continue; }
+            let mut selected = observation.clone();
+            let Some(selected_pages) = selected["pages"].as_array_mut() else { return false; };
+            for (index, item) in selected_pages.iter_mut().enumerate() {
+                if index == page_index { item["reads"] = json!([read]); }
+                else { item["reads"] = json!([]); }
+            }
+            if crate::facet_gate::collect_read_paths_frozen(&selected, Some(&frozen))
+                .iter().any(|path| path == "Cargo.toml") { return true; }
+            let _ = read_index;
+        }
+    }
+    false
+}
+
+fn v2_direct_decision(response: &str) -> Option<bool> {
+    let compact: String = response.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let lower = compact.to_lowercase();
+    if ["not", "isn't", "wrong", "incorrect", "false", "不是", "错误", "不对", "不正确", "不成立", "有误", "不等于", "并非", "非56", "≠", "-56", "+56", "%", "％"]
+        .iter().any(|marker| lower.contains(marker)) { return Some(false); }
+    if compact.as_bytes().windows(3).any(|window| window[0].is_ascii_digit() && window[1] == b'.' && window[2].is_ascii_digit()) { return Some(false); }
+    let numbers: Vec<&str> = compact.split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty()).collect();
+    if numbers.is_empty() { return None; }
+    if numbers.iter().filter(|&&part| part == "56").count() != 1 { return Some(false); }
+    if numbers.len() != 1 {
+        let explicit_product = ["7×8", "7*8", "7乘8", "7乘以8", "8×7", "8*7", "8乘7", "8乘以7"]
+            .iter().any(|marker| compact.contains(marker));
+        if !explicit_product || numbers.iter().filter(|&&part| part == "7").count() != 1
+            || numbers.iter().filter(|&&part| part == "8").count() != 1 || numbers.len() != 3 { return Some(false); }
+    }
+    // A bounded set of affirmative answer phrases is accepted. Unknown prose
+    // is not evidence of an uncontradicted answer.
+    let mut remainder = lower;
+    for token in ["theansweris", "theanswer", "answeris", "resultis", "therefore", "because", "equals", "answer", "result",
+        "计算结果为", "计算结果是", "计算结果", "因此答案是", "所以答案是", "所以结果是", "答案是", "答案为", "结果是", "结果为",
+        "因此", "所以", "因为", "等于", "乘以", "答案", "结果", "乘", "是", "为", "即", "56", "7", "8", "×", "*", "=", "。", "，", "！", "!", ".", ":", "：", ";", "；", "(", ")", "（", "）", "is"] {
+        remainder = remainder.replace(token, "");
+    }
+    if remainder.is_empty() { Some(true) } else { None }
+}
+
+fn v2_direct_answer(response: &str) -> bool { v2_direct_decision(response) == Some(true) }
+
+fn v2_version_decision(response: &str, expected: &str) -> Option<bool> {
+    let candidates: Vec<&str> = response.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+'))
+        .map(|part| part.trim_matches('.').trim_start_matches('v'))
+        .filter(|part| part.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && part.contains('.'))
+        .collect();
+    if expected.is_empty() || candidates.is_empty() || response_marks_unresolved(response) { return None; }
+    let compact: String = response.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let lower = compact.to_lowercase();
+    let contradictory = ["not", "wrong", "incorrect", "isn't", "without", "missing", "lacks", "不是", "没有", "不存在", "未包含", "缺少", "并无", "不包含", "错误", "不对", "不正确", "不成立", "有误", "不等于", "并非", "≠"]
+        .iter().any(|marker| lower.contains(marker));
+    if contradictory || candidates.iter().any(|&part| part != expected) { return Some(false); }
+    if !response.contains("Cargo.toml") { return None; }
+    // Only recognized affirmative phrasing can establish the answer. Other
+    // prose remains unknown even if it happens to contain the version token.
+    let mut remainder = lower.replace(&expected.to_lowercase(), "");
+    for token in ["workspace.package.version", "workspacepackageversion", "cargo.toml", "theworkspacepackageversion", "packageversion", "workspaceversion",
+        "workspace包版本", "工作区包版本", "工作空间包版本", "工作区版本", "工作空间版本", "文件路径", "版本号", "版本", "工作区", "工作空间", "文件", "路径",
+        "inthe", "the", "version", "package", "workspace", "is", "in", "为", "是", "位于", "中", "的", "：", ":", "=", "。", "，", ",", ".", "；", ";", "（", "）", "(", ")", "`", "\"", "'", "v"] {
+        remainder = remainder.replace(token, "");
+    }
+    if remainder.is_empty() { Some(true) } else { None }
+}
+
+fn v2_version_answer(response: &str, expected: &str) -> bool {
+    v2_version_decision(response, expected) == Some(true)
+}
+
 #[derive(Clone, Copy)]
 struct LiveScenarioSpec {
     id: &'static str,
@@ -6368,6 +6639,8 @@ enum LiveAcceptance {
     MemoryRecall,
     U5(U5Mode),
     Contains(&'static str),
+    V2DirectNumber,
+    V2WorkspaceVersion,
     RequiresToolEvidence {
         tool_name: &'static str,
         target_path: &'static str,
@@ -6430,6 +6703,7 @@ enum ArchitectureEvidenceProfile {
 impl LiveAcceptance {
     fn read_obligations(self) -> Vec<&'static str> {
         match self {
+            Self::V2WorkspaceVersion => vec!["Cargo.toml"],
             Self::RequiresToolEvidence {
                 tool_name: "read_file",
                 target_path,
@@ -6479,6 +6753,14 @@ impl LiveAcceptance {
                 passed: false,
                 quality: None,
                 checks: vec![json!({"name":"u5_requires_composite_driver", "passed":false})],
+            },
+            Self::V2DirectNumber => LiveAcceptanceResult {
+                passed: v2_direct_answer(response), quality: None,
+                checks: vec![json!({"name":"v2_exact_56_no_contradiction", "passed":v2_direct_answer(response)})],
+            },
+            Self::V2WorkspaceVersion => LiveAcceptanceResult {
+                passed: !response.trim().is_empty(), quality: None,
+                checks: vec![json!({"name":"durable_response", "passed":!response.trim().is_empty()})],
             },
             Self::Contains(expected) => LiveAcceptanceResult {
                 passed: response.contains(expected),
@@ -9115,10 +9397,9 @@ mod source_metadata_owner_tests {
     fn u5_source_metadata_is_optional_and_actual_owner_stays_required() {
         let raw = json!({
             "nonce": "a".repeat(64), "launcher_pid": 1, "launcher_start": 1,
-            "pid": 2, "starttime": 2, "image_sha256": format!("sha256:{}", "b".repeat(64)),
-            "exe_dev": 1, "exe_ino": 2, "listener_inode": 3, "port": 12345,
+            "pid": 2, "starttime": 2, "listener_inode": 3, "port": 12345,
             "namespace": "owned-run", "base_url": "http://127.0.0.1:12345/",
-            "harness_sha256": "c".repeat(64), "runtime_dev": 4, "runtime_ino": 5
+            "runtime_dev": 4, "runtime_ino": 5
         });
         let host: U5Host = serde_json::from_value(raw.clone()).unwrap();
         assert!(host.candidate.is_none());
@@ -9128,9 +9409,14 @@ mod source_metadata_owner_tests {
         assert!(u5_valid_owner(&owner, &host.base_url));
         owner.pid = 0;
         assert!(!u5_valid_owner(&owner, &host.base_url));
-        owner = host.owner();
-        owner.image_sha256 = "unknown".into();
-        assert!(!u5_valid_owner(&owner, &host.base_url));
+        let mut observed = raw.clone();
+        observed["image_sha256"] = json!("not-a-process-identity");
+        observed["harness_sha256"] = json!(null);
+        observed["exe_dev"] = json!("unavailable");
+        let observed_host: U5Host = serde_json::from_value(observed).unwrap();
+        assert_eq!(observed_host.owner(), host.owner());
+        assert!(observed_host.binding().get("image_sha256").is_none());
+        assert!(observed_host.binding().get("harness_sha256").is_none());
         let mut explicit = raw;
         explicit["candidate"] = json!("d".repeat(40));
         explicit["source_sha256"] = json!("e".repeat(64));

@@ -11,7 +11,14 @@ use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const HISTOGRAM_CAPACITY: usize = 512;
-static RUNTIME_WORKER_OVERRIDE: OnceLock<usize> = OnceLock::new();
+const DEFAULT_RUNTIME_STACK_BYTES: usize = 4 * 1024 * 1024;
+static RUNTIME_THREADS: OnceLock<RuntimeThreadConfig> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeThreadConfig {
+    pub(crate) workers: usize,
+    pub(crate) stack_bytes: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +33,7 @@ pub(crate) enum HttpCapacityLane {
 pub(crate) struct GatewayCapacityConfig {
     pub(crate) runtime_workers: usize,
     pub(crate) runtime_workers_source: &'static str,
+    pub(crate) runtime_stack_bytes: usize,
     pub(crate) control_requests: usize,
     pub(crate) data_requests: usize,
     pub(crate) stream_connections: usize,
@@ -43,6 +51,7 @@ impl GatewayCapacityConfig {
         Self {
             runtime_workers,
             runtime_workers_source,
+            runtime_stack_bytes: config.runtime_stack_bytes.unwrap_or(DEFAULT_RUNTIME_STACK_BYTES),
             control_requests: config.control_requests.unwrap_or(16).clamp(4, 128),
             data_requests: config
                 .data_requests
@@ -61,16 +70,26 @@ impl GatewayCapacityConfig {
     }
 }
 
-pub(crate) fn configure_runtime_workers(config: &runtime::GatewayCapacityConfig) -> usize {
-    let effective = GatewayCapacityConfig::resolve(config).runtime_workers;
-    *RUNTIME_WORKER_OVERRIDE.get_or_init(|| effective)
+fn install_runtime_threads(slot: &OnceLock<RuntimeThreadConfig>, requested: RuntimeThreadConfig) -> Result<RuntimeThreadConfig, String> {
+    if requested.stack_bytes == 0 { return Err("gateway runtime stack size must be nonzero".into()); }
+    let installed = *slot.get_or_init(|| requested);
+    if installed != requested {
+        return Err(format!("gateway runtime thread configuration already initialized: installed {installed:?}, requested {requested:?}"));
+    }
+    Ok(installed)
 }
 
-pub(crate) fn configured_runtime_workers() -> usize {
-    *RUNTIME_WORKER_OVERRIDE.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map_or(2, usize::from)
-            .clamp(2, 16)
+pub(crate) fn configure_runtime_threads(config: &runtime::GatewayCapacityConfig) -> Result<RuntimeThreadConfig, String> {
+    let effective = GatewayCapacityConfig::resolve(config);
+    install_runtime_threads(&RUNTIME_THREADS, RuntimeThreadConfig {
+        workers: effective.runtime_workers, stack_bytes: effective.runtime_stack_bytes,
+    })
+}
+
+pub(crate) fn configured_runtime_threads() -> RuntimeThreadConfig {
+    *RUNTIME_THREADS.get_or_init(|| {
+        let effective = GatewayCapacityConfig::resolve(&runtime::GatewayCapacityConfig::default());
+        RuntimeThreadConfig { workers: effective.runtime_workers, stack_bytes: effective.runtime_stack_bytes }
     })
 }
 
@@ -408,5 +427,42 @@ mod tests {
             explicit.runtime_workers_source,
             "gateway.capacity.runtime_workers"
         );
+    }
+
+    #[test]
+    fn runtime_thread_settings_install_together_and_reject_conflicts() {
+        let slot = OnceLock::new();
+        let requested = RuntimeThreadConfig { workers: 3, stack_bytes: 4 * 1024 * 1024 };
+        assert_eq!(install_runtime_threads(&slot, requested).unwrap(), requested);
+        assert_eq!(install_runtime_threads(&slot, requested).unwrap(), requested);
+        assert!(install_runtime_threads(&slot, RuntimeThreadConfig { workers: 4, ..requested }).is_err());
+        assert!(install_runtime_threads(&slot, RuntimeThreadConfig { stack_bytes: 8 * 1024 * 1024, ..requested }).is_err());
+        assert!(install_runtime_threads(&OnceLock::new(), RuntimeThreadConfig { stack_bytes: 0, ..requested }).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_runtime_worker_and_blocking_threads_receive_configured_stack() {
+        fn stack_bytes() -> usize {
+            // SAFETY: pthread initializes the attributes before they are read.
+            unsafe {
+                let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+                assert_eq!(libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()), 0);
+                let mut attr = attr.assume_init();
+                let mut bytes = 0;
+                assert_eq!(libc::pthread_attr_getstacksize(&attr, &mut bytes), 0);
+                assert_eq!(libc::pthread_attr_destroy(&mut attr), 0);
+                bytes
+            }
+        }
+        let configured = configure_runtime_threads(&runtime::GatewayCapacityConfig::default()).unwrap();
+        assert_eq!(configured.stack_bytes, 4 * 1024 * 1024);
+        let (worker, blocking) = crate::SHARED_RT.block_on(async {
+            let worker = tokio::spawn(async { stack_bytes() }).await.unwrap();
+            let blocking = tokio::task::spawn_blocking(stack_bytes).await.unwrap();
+            (worker, blocking)
+        });
+        assert!(worker >= configured.stack_bytes);
+        assert!(blocking >= configured.stack_bytes);
     }
 }

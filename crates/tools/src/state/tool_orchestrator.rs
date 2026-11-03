@@ -513,19 +513,11 @@ fn join_ranked<Ranked: Copy + PartialEq>(left: Ranked, right: Ranked, order: &[R
 }
 
 fn effect_assessment(properties: &EffectProperties, input: &Value) -> EffectAssessment {
-    let internal_control = properties.effect_kind == ToolEffectKind::Write
-        && properties.idempotency == ToolIdempotency::IdempotentWithKey
-        && properties.required_permission == ToolPermissionMode::ReadOnly
-        && properties.approval_class == ToolApprovalClass::None
-        && !properties.scopes.is_empty()
-        && properties.scopes.iter().all(|scope| {
-            scope.resource == PermissionResource::Tool
-                && scope.operation == PermissionOperation::Control
-        })
-        && !properties.uses_network
-        && !properties.spawns_process
-        && !properties.mutates_packages
-        && !properties.mutates_system;
+    let internal_control = harness_contract::tool::is_internal_control_effect(
+        properties.effect_kind, properties.idempotency, properties.required_permission,
+        properties.approval_class, &properties.scopes, properties.uses_network,
+        properties.spawns_process, properties.mutates_packages, properties.mutates_system,
+    );
     let externality = if internal_control {
         EffectExternality::Internal
     } else if properties.mutates_system

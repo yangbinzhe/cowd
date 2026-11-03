@@ -5349,8 +5349,11 @@ async fn r1_restart_fixture_separate_adapter_does_not_receive_writer_doorbell() 
 
 // ROUND437 replays the retained completed model item, not a reconstructed wire.
 // Only original local Team metadata is applied; no paid model or external tool.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn round437_original_six_team_batch_crosses_host_to_next_node_on_default_stack() {
+#[test]
+fn round437_original_six_team_batch_crosses_host_to_next_node_on_default_stack() {
+    let threads = crate::gateway_capacity::configure_runtime_threads(&runtime::GatewayCapacityConfig::default()).unwrap();
+    eprintln!("round437 shared_runtime workers={} stack_bytes={}", threads.workers, threads.stack_bytes);
+    crate::SHARED_RT.block_on(async {
     use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
     let root = fixture_root().keep();
     std::fs::create_dir_all(root.join("workspace")).unwrap();
@@ -5358,7 +5361,7 @@ async fn round437_original_six_team_batch_crosses_host_to_next_node_on_default_s
     let providers = provider_registry(&[&provider]);
     let topology = SelectedStorageTopology::compose_for_test(&root.join("home"), &root.join("workspace")).unwrap();
     eprintln!("round437 replay_root={} schema={:?}", root.display(), topology.preserve_failed_test_namespace());
-    let services = RecoveryServices::start(&root, topology, providers).await;
+    let services = RecoveryServices::start_with_diagnostic_loopback(&root, topology, providers).await;
     let session_id = format!("round437:{}", uuid::Uuid::new_v4());
     let mut request = EnsureSessionRequest::new(&session_id, Some("test-model".into()), SessionSource::Tui);
     request.owner_principal_id = Some("round437-local-replay".into());
@@ -5382,6 +5385,7 @@ async fn round437_original_six_team_batch_crosses_host_to_next_node_on_default_s
     drop(provider);
     services.runtime.runtime_services().cancel_execution_tree(&admission.execution_graph_id, "round437 local reproduction complete").await.unwrap();
     services.stop().await;
+    });
 }
 
 // One zero-cost local gate for the collaboration admission path and the final
@@ -5580,7 +5584,7 @@ async fn b_scope_refusal_and_independent_read_reach_original_gateway_provider() 
     let mut provider = LoopbackProvider::start("root").await;
     let providers = provider_registry(&[&provider]);
     let topology = SelectedStorageTopology::compose_for_test(&root.path().join("home"), &workspace).unwrap();
-    let services = RecoveryServices::start(root.path(), topology, providers).await;
+    let services = RecoveryServices::start_with_diagnostic_loopback(root.path(), topology, providers).await;
     let runtime = services.runtime.runtime_services();
     let session = format!("b-scope-ingress:{}", uuid::Uuid::new_v4());
     let identity = std::sync::Mutex::new(None::<(String, String, String)>);

@@ -3111,6 +3111,11 @@ impl RuntimeServices {
                     .push(format!("Skill usage shutdown incomplete: {usage:?}"));
             }
         }
+        match self.event_store.has_unresolved_original_member_custody() {
+            Ok(false) => {}
+            Ok(true) => report.errors.push("original member custody remains unresolved".into()),
+            Err(_) => report.errors.push("original member custody could not be inspected".into()),
+        }
         report
     }
 

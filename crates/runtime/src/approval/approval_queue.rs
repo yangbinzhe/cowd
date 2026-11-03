@@ -91,9 +91,9 @@ pub struct ApprovalQueue {
 /// Original once-grant owner facts staged for a member transaction.
 /// The fields are private: preparing does not consume or change the grant.
 pub(crate) struct PreparedMemberApproval {
-    owner: Arc<ApprovalQueue>,
-    member: crate::authorization_negotiator::PreparedMemberBinding,
-    owner_store: Arc<RuntimeEventStore>,
+    owner: std::sync::Weak<ApprovalQueue>,
+    member: crate::authorization_negotiator::RetainedMemberBinding,
+    owner_store: std::sync::Weak<RuntimeEventStore>,
     grant: ApprovalGrant,
     source: crate::ExpectedStreamRevision,
     event: Option<RuntimeTransactionEventInput>,
@@ -101,9 +101,15 @@ pub(crate) struct PreparedMemberApproval {
 }
 
 impl PreparedMemberApproval {
-    pub(crate) fn owner(&self) -> &Arc<ApprovalQueue> { &self.owner }
+    pub(crate) fn owner_guard(&self, store: &Arc<RuntimeEventStore>) -> Result<Arc<ApprovalQueue>, String> {
+        let owner = self.owner.upgrade().ok_or("original approval owner unavailable")?;
+        if !Arc::ptr_eq(&owner.event_store, store) || !std::ptr::eq(Arc::as_ptr(store), self.owner_store.as_ptr()) {
+            return Err("original approval store changed".into());
+        }
+        Ok(owner)
+    }
     pub(crate) fn grant(&self) -> &ApprovalGrant { &self.grant }
-    pub(crate) fn member(&self) -> &crate::authorization_negotiator::PreparedMemberBinding { &self.member }
+    pub(crate) fn member(&self) -> &crate::authorization_negotiator::RetainedMemberBinding { &self.member }
     pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
     pub(crate) fn event(&self) -> Option<&RuntimeTransactionEventInput> { self.event.as_ref() }
     pub(crate) fn deadline_ms(&self) -> Option<u64> { self.deadline_ms }
@@ -1583,7 +1589,7 @@ impl ApprovalQueue {
             idempotency_key: Some(format!("approval-grant-consume:{grant_id}")),
             schema_version: 1,
         });
-        Ok(PreparedMemberApproval { owner: Arc::clone(self), member: member.clone(), owner_store: Arc::clone(&self.event_store),
+        Ok(PreparedMemberApproval { owner: Arc::downgrade(self), member: member.retained(), owner_store: Arc::downgrade(&self.event_store),
             deadline_ms: grant.expires_at_ms, grant,
             source: crate::ExpectedStreamRevision { stream_id, expected_revision: revision }, event })
     }
@@ -1593,19 +1599,37 @@ impl ApprovalQueue {
     /// An error leaves this owner unchanged, including an unknown outcome.
     pub(crate) fn commit_prepared_member_approval(
         &self, prepared: &PreparedMemberApproval,
+        member_guard: &crate::authorization_negotiator::PreparedMemberBinding,
         commit: impl FnOnce(&PreparedMemberApproval) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError>,
     ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
-        if !std::ptr::eq(self, prepared.owner.as_ref()) || !Arc::ptr_eq(&self.event_store, &prepared.owner_store) {
+        if !std::ptr::eq(self, prepared.owner.as_ptr()) || !std::ptr::eq(Arc::as_ptr(&self.event_store), prepared.owner_store.as_ptr())
+            || !prepared.member.matches(member_guard) {
+
             return Err(crate::AgentActionServiceError::Corrupt("approval owner changed".into()));
         }
         let mut grants = self.grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current = grants.get(&prepared.grant.grant_id).ok_or_else(|| crate::AgentActionServiceError::Corrupt("approval grant no longer active".into()))?;
-        if serde_json::to_value(current).map_err(|e| crate::AgentActionServiceError::Corrupt(e.to_string()))?
-            != serde_json::to_value(&prepared.grant).map_err(|e| crate::AgentActionServiceError::Corrupt(e.to_string()))?
+        let current = grants.get(&prepared.grant.grant_id).ok_or_else(|| {
+
+            crate::AgentActionServiceError::Corrupt("approval grant no longer active".into())
+        })?;
+        if serde_json::to_value(current).map_err(|e| {
+
+                crate::AgentActionServiceError::Corrupt(e.to_string())
+            })?
+            != serde_json::to_value(&prepared.grant).map_err(|e| {
+
+                crate::AgentActionServiceError::Corrupt(e.to_string())
+            })?
             || prepared.deadline_ms.is_some_and(|deadline| now_ms() >= deadline) {
+
             return Err(crate::AgentActionServiceError::Corrupt("approval grant changed or expired".into()));
         }
-        let result = commit(prepared)?;
+
+        let result = commit(prepared).map_err(|error| {
+
+            error
+        })?;
+
         if result.1 && prepared.event.is_some() { grants.remove(&prepared.grant.grant_id); }
         Ok(result)
     }
@@ -1613,9 +1637,12 @@ impl ApprovalQueue {
     /// Recovery of an already-committed original member. The caller has
     /// authenticated its original transaction before entering this owner.
     pub(crate) fn apply_recovered_member_approval(
-        &self, prepared: &PreparedMemberApproval, apply_lease: impl FnOnce() -> Result<(), String>,
+        &self, prepared: &PreparedMemberApproval,
+        member_guard: &crate::authorization_negotiator::PreparedMemberBinding,
+        apply_lease: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        if !std::ptr::eq(self, prepared.owner.as_ref()) || !Arc::ptr_eq(&self.event_store, &prepared.owner_store) {
+        if !std::ptr::eq(self, prepared.owner.as_ptr()) || !std::ptr::eq(Arc::as_ptr(&self.event_store), prepared.owner_store.as_ptr())
+            || !prepared.member.matches(member_guard) {
             return Err("recovered approval owner changed".into());
         }
         if prepared.event.is_none() { return apply_lease(); }

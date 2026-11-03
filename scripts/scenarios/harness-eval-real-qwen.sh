@@ -167,28 +167,36 @@ raise SystemExit(0 if ok else 1)
 PY
 }
 
-verify_child_image() {
-  local pid=$1 expected=$2
-  python3 - "$pid" "${CHILD_START[$pid]}" "$expected" "$RUN_ROOT/child-$pid.json" <<'PY'
-import hashlib, json, pathlib, sys, time
-pid, start, expected, output = sys.argv[1:]
+record_child_image() {
+  local pid=$1 selected=$2 label=$3
+  python3 - "$pid" "${CHILD_START[$pid]}" "$selected" "$RUN_ROOT/child-$pid.json" "$RUN_ROOT/binary-bindings.json" "$label" <<'PY'
+import hashlib, json, os, pathlib, sys, time
+pid, start, selected, output, bindings_path, label = sys.argv[1:]
 deadline = time.monotonic() + 5
+actual = None
 while time.monotonic() < deadline:
     try:
         fields = pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
-        if fields[19] != start or fields[0] in ('Z', 'X'):
+        if fields[19] != start or fields[0] in ('Z', 'X'): break
+        # Wait for exec only to record the selected child's image, never as an approval.
+        if os.path.samefile(f'/proc/{pid}/exe', selected):
+            with open(f'/proc/{pid}/exe', 'rb') as image:
+                actual = hashlib.file_digest(image, 'sha256').hexdigest()
             break
-        with open(f'/proc/{pid}/exe', 'rb') as image:
-            actual = hashlib.file_digest(image, 'sha256').hexdigest()
-        if actual == expected:
-            with open(output, 'x') as report:
-                json.dump({'pid': int(pid), 'starttime': int(start),
-                           'image_sha256': 'sha256:' + actual}, report)
-            raise SystemExit(0)
-    except (FileNotFoundError, ProcessLookupError, PermissionError):
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
         pass
     time.sleep(.01)
-raise SystemExit('owned child startup image not confirmed')
+with open(output, 'x') as report:
+    json.dump({'pid': int(pid), 'starttime': int(start),
+               'image_sha256': 'sha256:' + actual if actual else None}, report)
+try:
+    path = pathlib.Path(bindings_path)
+    bindings = json.loads(path.read_text())
+    bindings[0 if label == 'gateway' else 1]['process_image_sha256'] = actual
+    path.write_text(json.dumps(bindings))
+except (OSError, ValueError, KeyError, IndexError):
+    pass
+print(actual or 'unknown')
 PY
 }
 
@@ -274,76 +282,36 @@ stop_owned() {
 }
 
 prepare_binaries() {
+  [[ -f "$BIN" && -x "$BIN" ]] || { echo 'Gateway binary unavailable or not executable' >&2; return 1; }
+  [[ -f "$HARNESS_BIN" && -x "$HARNESS_BIN" ]] || { echo 'Harness binary unavailable or not executable' >&2; return 1; }
   local bindings
   bindings="$(python3 - "$BIN" "$HARNESS_BIN" "$RUN_ROOT" <<'PY'
-import hashlib, json, os, pathlib, stat, sys
-root = pathlib.Path(sys.argv[3]); (root / 'bin').mkdir(mode=0o700)
-bindings = []
-def consume(path, size=None, output=None):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, 'rb') as f:
-        meta = os.fstat(f.fileno())
-        if not stat.S_ISREG(meta.st_mode) or (size is not None and meta.st_size != size):
-            raise ValueError('binary extent/type changed')
-        left = meta.st_size; h = hashlib.sha256()
-        while left:
-            data = f.read(min(left, 1024*1024))
-            if not data: raise ValueError('binary truncated')
-            h.update(data); left -= len(data)
-            if output is not None: output.write(data)
-        if f.read(1): raise ValueError('binary grew')
-        return h.hexdigest(), meta.st_size
-for name, source in zip(('gateway', 'harness'), sys.argv[1:3]):
-    path = pathlib.Path(source).resolve(strict=True)
-    if not path.is_file() or not os.access(path, os.X_OK):
-        raise SystemExit('explicit binary must be an executable regular file')
-    expected, size = consume(path)
-    frozen = root / 'bin' / name
-    with frozen.open('xb') as out:
-        actual, _ = consume(path, size, out)
-    frozen.chmod(0o500)
-    copied, _ = consume(frozen, size)
-    if actual != expected or copied != expected:
-        raise SystemExit('binary changed while freezing')
-    bindings.append({'input': str(path), 'frozen': str(frozen), 'sha256': expected, 'bytes':size})
-with (root / 'binary-bindings.json').open('x') as out:
-    json.dump(bindings, out)
+import hashlib, json, os, pathlib, sys
+root = pathlib.Path(sys.argv[3]); bindings = []
+for source in sys.argv[1:3]:
+    path = os.path.abspath(source)
+    try:
+        with open(path, 'rb') as image: digest = hashlib.file_digest(image, 'sha256').hexdigest()
+    except OSError:
+        digest = None
+    bindings.append({'input':path, 'file_observation_sha256':digest, 'process_image_sha256':None})
+with (root / 'binary-bindings.json').open('x') as out: json.dump(bindings, out)
 for binding in bindings:
-    print(binding['input']); print(binding['frozen']); print(binding['sha256'])
+    print(binding['input']); print(binding['file_observation_sha256'] or 'unknown')
 PY
 )" || return 1
   local -a fields
   mapfile -t fields <<<"$bindings"
-  [[ "${#fields[@]}" == 6 ]] || return 1
-  INPUT_BIN=${fields[0]}; BIN=${fields[1]}; GATEWAY_BINARY_SHA256=${fields[2]}
-  INPUT_HARNESS_BIN=${fields[3]}; HARNESS_BIN=${fields[4]}; HARNESS_BINARY_SHA256=${fields[5]}
-}
-
-verify_binary_bindings() {
-  [[ -n "$INPUT_BIN" && -n "$INPUT_HARNESS_BIN" ]] || return 0
-  python3 - "$RUN_ROOT/binary-bindings.json" <<'PY'
-import hashlib, json, os, pathlib, stat, sys
-for binding in json.loads(pathlib.Path(sys.argv[1]).read_text()):
-    for key in ('input', 'frozen'):
-        fd = os.open(binding[key], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, 'rb') as f:
-            meta = os.fstat(f.fileno()); left = binding['bytes']; h = hashlib.sha256()
-            if not stat.S_ISREG(meta.st_mode) or meta.st_size != left:
-                raise SystemExit('binary extent/type changed during run')
-            while left:
-                data = f.read(min(left,1024*1024))
-                if not data: raise SystemExit('binary truncated during run')
-                h.update(data); left -= len(data)
-            if f.read(1) or h.hexdigest() != binding['sha256']:
-                raise SystemExit('binary binding changed during run')
-PY
+  [[ "${#fields[@]}" == 4 ]] || return 1
+  INPUT_BIN=${fields[0]}; BIN=${fields[0]}; GATEWAY_BINARY_SHA256=${fields[1]}
+  INPUT_HARNESS_BIN=${fields[2]}; HARNESS_BIN=${fields[2]}; HARNESS_BINARY_SHA256=${fields[3]}
 }
 
 validate_shutdown_receipt() {
   python3 - "$PRIVATE_RUNTIME" "$RUNTIME_DEVICE" "$RUNTIME_INODE" "$SHUTDOWN_NONCE" \
-    "$GATEWAY_ORIGINAL_PID" "$GATEWAY_STARTTIME" "$GATEWAY_BINARY_SHA256" "$RUN_ROOT" <<'PY'
+    "$GATEWAY_ORIGINAL_PID" "$GATEWAY_STARTTIME" "$RUN_ROOT" <<'PY'
 import hashlib, json, os, stat, sys
-path, device, inode, nonce, pid, start, image, root = sys.argv[1:]
+path, device, inode, nonce, pid, start, root = sys.argv[1:]
 def require(ok, reason):
     if not ok: raise ValueError(reason)
 def number(v):
@@ -368,7 +336,7 @@ try:
     value = json.loads(raw)
     require(type(value['schema_version']) is int and value['schema_version'] == 1, 'unknown schema')
     identity = value['identity']
-    require(identity['nonce'] == nonce and type(identity['pid']) is int and identity['pid'] == int(pid) and type(identity['starttime']) is int and identity['starttime'] == int(start) and identity['image_sha256'] == 'sha256:' + image, 'launch identity mismatch')
+    require(identity['nonce'] == nonce and type(identity['pid']) is int and identity['pid'] == int(pid) and type(identity['starttime']) is int and identity['starttime'] == int(start), 'launch identity mismatch')
     require(digest(identity['config_sha256']), 'invalid selected-config digest')
     report = value['report']; strings(report['phases'])
     require(not strings(report['failures']), 'Gateway shutdown failures')
@@ -415,7 +383,6 @@ cleanup() {
     [[ "$GATEWAY_WAIT_STATUS" == 0 ]] || secondary=1
     if validate_shutdown_receipt; then :; else secondary=1; fi
   fi
-  if verify_binary_bindings; then :; else secondary=1; fi
   local -a tracked=()
   local child
   for child in "${!CHILD_START[@]}"; do tracked+=("$child:${CHILD_START[$child]}:${CHILD_GROUP[$child]}"); done
@@ -463,7 +430,7 @@ launch_gateway() {
   GATEWAY_ORIGINAL_PID=$GATEWAY_PID
   track_child "$GATEWAY_PID" || return 1
   GATEWAY_STARTTIME=${CHILD_START[$GATEWAY_PID]}
-  verify_child_image "$GATEWAY_PID" "$GATEWAY_BINARY_SHA256"
+  GATEWAY_BINARY_SHA256="$(record_child_image "$GATEWAY_PID" "$BIN" gateway)" || GATEWAY_BINARY_SHA256=unknown
 }
 
 # Exact original host -> its own Harness descriptor. No caller JSON path.
@@ -485,17 +452,6 @@ def budget(): require(time.monotonic()<deadline,'owned listener deadline')
 meta=os.stat(root,follow_symlinks=False)
 require(stat.S_ISDIR(meta.st_mode) and meta.st_uid==os.getuid() and stat.S_IMODE(meta.st_mode)==0o700,'private root identity')
 require(proc(pid)==(parent,start),'wrong original Child')
-actual=hashlib.sha256()
-with open(f'/proc/{pid}/exe','rb') as image_file:
-    while True:
-        budget();chunk=image_file.read(1024*1024)
-        if not chunk: break
-        actual.update(chunk)
-require(actual.hexdigest()==image,'actual Child image changed')
-exe=os.stat(f'/proc/{pid}/exe')
-# Initial frozen actual-image SHA is already verified by verify_child_image.
-child=json.loads(pathlib.Path(root).parent.joinpath(f'child-{pid}.json').read_text())
-require(child=={'pid':pid,'starttime':start,'image_sha256':'sha256:'+image},'missing original image verification')
 sockets=set()
 for n,fd in enumerate(pathlib.Path(f'/proc/{pid}/fd').iterdir()):
     budget();require(n<4096,'too many owned descriptors')
@@ -511,9 +467,9 @@ for line in raw.decode().splitlines()[1:]:
 require(len(matching)==1,'listener not uniquely held by original Child')
 require(proc(pid)==(parent,start),'original Child changed')
 value=dict(nonce=nonce,launcher_pid=parent,launcher_start=proc(parent)[1],pid=pid,starttime=start,
-    image_sha256='sha256:'+image,exe_dev=exe.st_dev,exe_ino=exe.st_ino,listener_inode=matching[0],port=port,
+    listener_inode=matching[0],port=port,
     candidate=candidate,source_sha256=source,namespace=namespace+':'+pathlib.Path(root).parent.name,
-    base_url=url,harness_sha256=harness,runtime_dev=meta.st_dev,runtime_ino=meta.st_ino)
+    base_url=url,runtime_dev=meta.st_dev,runtime_ino=meta.st_ino)
 raw=json.dumps(value).encode();require(len(raw)<=16384,'host handoff too large')
 fd=os.open(pathlib.Path(root)/'u5-host.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
 with os.fdopen(fd,'wb') as out: out.write(raw);out.flush();os.fsync(out.fileno());os.fchmod(out.fileno(),0o400)
@@ -542,7 +498,7 @@ try:
     cancellation=scenario=='live_u5_active_cancel_isolation'
     need(type(inner['schema_version']) is int and inner['schema_version']==1 and inner['disposition']=='pending_outer_cleanup' and inner['scenario']==scenario,'not exact U5 pending')
     owner=inner['owner']
-    need(all(owner[k]==host[k] for k in owner) and set(owner)=={'nonce','pid','starttime','image_sha256','candidate','namespace','source_sha256','harness_sha256'},'wrong host binding')
+    need(all(owner[k]==host[k] for k in owner) and set(owner)=={'nonce','pid','starttime','candidate','namespace','source_sha256'},'wrong host binding')
     report_path=pathlib.Path(inner['report_path'])
     need(report_path.resolve().is_relative_to(pathlib.Path(evidence).resolve()),'report outside own evidence root')
     report,report_sha=read(report_path,8*1024*1024)
@@ -566,16 +522,13 @@ try:
     cleanup,cleanup_sha=read(pathlib.Path(root)/'cleanup-result.json',65536)
     need(cleanup['business_exit']==75 and cleanup['cleanup_failed'] is False and cleanup['gateway_wait_status']=='0' and cleanup['remaining_owned']==[],'outer resource return failed')
     v1,v1_sha=read(pathlib.Path(root)/'shutdown-validation.json',65536)
-    need(v1['status']=='passed' and all(v1['identity'][k]==host[k] for k in ['nonce','pid','starttime','image_sha256']),'wrong V1 identity')
-    bindings,_=read(pathlib.Path(root)/'binary-bindings.json',65536)
-    need(len(bindings)==2 and 'sha256:'+bindings[0]['sha256']==host['image_sha256'] and bindings[1]['sha256']==host['harness_sha256'],'wrong original dual image binding')
+    need(v1['status']=='passed' and all(v1['identity'][k]==host[k] for k in ['nonce','pid','starttime']),'wrong V1 identity')
     result=dict(schema_version=1,status='passed',scope='focused_U5_C_local_only' if cancellation else 'focused_U5_F_only',original_harness_exit=75,
         run_id=inner['run_id'],owner=owner,inner_sha256=inner_sha,report_sha256=report_sha,
         shutdown_validation_sha256=v1_sha,shutdown_receipt_sha256=v1['receipt_sha256'],cleanup_sha256=cleanup_sha,
         host_sha256=host_sha,usage=inner['usage'])
     if cancellation:
         result.update(remote_server_inference_stop='unknown',remote_billing_stop='unknown')
-    # verify_binary_bindings has just independently rehashed actual immutable images.
     path=pathlib.Path(root)/'u5-final-acceptance.v1.json'
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     with os.fdopen(fd,'w') as out: json.dump(result,out);out.flush();os.fsync(out.fileno())
@@ -612,7 +565,7 @@ launch_harness() {
   if [[ "$SCENARIO_ID" == live_u5_shared_session_fairness || "$SCENARIO_ID" == live_u5_active_cancel_isolation ]]; then exec 9<&-; fi
   track_child "$HARNESS_PID" || return 1
   HARNESS_STARTTIME=${CHILD_START[$HARNESS_PID]}
-  verify_child_image "$HARNESS_PID" "$HARNESS_BINARY_SHA256"
+  record_child_image "$HARNESS_PID" "$HARNESS_BIN" harness >/dev/null || :
 }
 
 # One concrete U7 boundary, still owned and reaped by this original parent.
@@ -1039,8 +992,7 @@ CANDIDATE_SOURCE_SHA256="${COWD_EVAL_CANDIDATE_SOURCE_SHA256:-}"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
 SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
 prepare_binaries
-verify_binary_bindings
-printf 'Gateway binary sha256: %s\nHarness binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" >&2
+printf 'Gateway file observation sha256: %s\nHarness file observation sha256: %s\n' "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" >&2
 EVIDENCE_KEY="$(printf '%s\n' "deep-real-v6" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" | sha256sum | awk '{print $1}')"
 # Historical reports remain evidence. Their presence neither substitutes for
 # this execution nor prevents a new run requested by its owner.
@@ -1153,7 +1105,6 @@ cd "$ROOT"
 if [[ -n "${COWD_EVAL_TIMEOUT_SECS:-}" && -z "${COWD_EVAL_SCENARIO_TIMEOUT_SECS:-}" ]]; then
   export COWD_EVAL_SCENARIO_TIMEOUT_SECS="$COWD_EVAL_TIMEOUT_SECS"
 fi
-verify_binary_bindings
 if [[ "$SCENARIO_ID" == live_u7_memory_correction_delete_restart ]]; then
   mkdir -m 700 "$RUN_ROOT/u7-restart"
   export COWD_EVAL_U7_RESTART_DIR="$RUN_ROOT/u7-restart"

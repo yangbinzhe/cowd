@@ -105,6 +105,7 @@ pub(crate) struct OriginalAgentChildCall {
     pub(crate) store: Arc<crate::RuntimeEventStore>,
     pub(crate) provider_capture: Option<Arc<crate::conversation::tool_plane::OriginalSingleProducerCapture>>,
     pub(crate) stop: Option<crate::bound_tool_batch::BoundToolStop>,
+    pub(crate) process_members: Option<Arc<crate::agent_in_process_worker::ProcessMemberCustody>>,
     child_payload: String,
 }
 pub(crate) struct PendingAgentChildCall {
@@ -189,12 +190,13 @@ impl ScopedNodeExecutor {
         packet: harness_contract::agent::AgentTaskPacket, store: Arc<crate::RuntimeEventStore>,
         provider_capture: Option<Arc<crate::conversation::tool_plane::OriginalSingleProducerCapture>>,
         stop: Option<crate::bound_tool_batch::BoundToolStop>,
+        process_members: Option<Arc<crate::agent_in_process_worker::ProcessMemberCustody>>,
     ) -> Result<PendingAgentChildCall, String> {
         if self.kind != "tool_batch" || graph_id.is_empty() || node_id.is_empty() || payload.is_empty() {
             return Err("invalid original child call".into());
         }
         let key = (graph_id.to_owned(), node_id.to_owned(), 0, String::new());
-        let call = Arc::new(OriginalAgentChildCall { request, parent_ticket, packet, store, provider_capture, stop, child_payload: payload.to_owned() });
+        let call = Arc::new(OriginalAgentChildCall { request, parent_ticket, packet, store, provider_capture, stop, process_members, child_payload: payload.to_owned() });
         let mut physical = self.physical.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if physical.contains_key(&key) || physical.keys().any(|k| k.0 == graph_id && k.1 == node_id && k.2 > 0) {
             return Err("original child call already admitted".into());
@@ -235,10 +237,15 @@ impl ScopedNodeExecutor {
         }
         let pending = (ticket.graph_id.clone(), ticket.node_id.clone(), 0, String::new());
         let original_child = if ticket.attempt == 1 {
-            physical.remove(&pending).and_then(|entry| entry.original_child)
+            physical.get(&pending).and_then(|entry| entry.original_child.clone())
                 .filter(|call| call.child_payload == ticket.payload_ref)
         } else { None };
         if let Some(child) = &original_child {
+            if let Some(members) = &child.process_members {
+                members.bind(ticket, Arc::clone(&observation)).map_err(|reason| NodeExecutorError::Invalid {
+                    node_id: ticket.node_id.clone(), reason,
+                })?;
+            }
             let owner = child.request.tool_progress.original_fresh_effect();
             let hook = child.request.tool_progress.original_governed_hook();
             if owner.as_ref().is_err() || owner.as_ref().is_ok_and(Option::is_some) || hook.as_ref().is_err() {
@@ -251,6 +258,7 @@ impl ScopedNodeExecutor {
                 observation.hold_inherited_hook(&child.request);
             }
         }
+        if original_child.is_some() { physical.remove(&pending); }
         physical.insert(
             key,
             PhysicalEntry {
@@ -316,7 +324,7 @@ impl ScopedNodeExecutor {
         let key = Self::physical_key(ticket, "");
         if physical.get(&key).is_some_and(|entry| {
             entry.closed
-                && entry.observation.as_ref().is_none_or(|observation| observation.packet_scope_allows_forget(entry.publication_completed))
+                && entry.observation.as_ref().is_none_or(|observation| observation.original_custody_allows_forget(entry.publication_completed))
                 && entry.work.as_ref().is_none_or(|work| work.peek().is_some())
                 && entry
                     .driver
@@ -1002,6 +1010,14 @@ impl NodeExecutor for ScopedNodeExecutor {
             return Err(NodeExecutorError::Uncertain {
                 node_id: key.1.clone(),
                 reason: "original packet scope transaction remains unknown after physical drain".into(),
+            });
+        }
+        if let Some((key, _)) = physical.iter().find(|(_, entry)| {
+            entry.observation.as_ref().is_some_and(|observation| observation.member_custody_is_unresolved())
+        }) {
+            return Err(NodeExecutorError::Uncertain {
+                node_id: key.1.clone(),
+                reason: "original member custody remains unresolved after physical drain".into(),
             });
         }
         Ok(())

@@ -555,7 +555,7 @@ mod pre_effect_admission_555 {
         state.content = "Read workspace files and report the observed result.".into();
         state.task_understanding = Some(strategy.decision.strategy.understanding.clone());
         state.collaboration_obligation = strategy.decision.collaboration_obligation.clone();
-        let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
+        let runtime = Arc::new(tokio::sync::Mutex::new(Box::new(runtime)));
         let state = Arc::new(tokio::sync::Mutex::new(state));
         services
             .tool_batch_executor()
@@ -1694,7 +1694,7 @@ async fn claimed_ingress_host_with_prompt(
     state.ingress = Some(ingress.clone());
     (
         PublicationHost {
-            runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+            runtime: Arc::new(tokio::sync::Mutex::new(Box::new(runtime))),
             state: Arc::new(tokio::sync::Mutex::new(state)),
             services: fixture.services.clone(),
         },
@@ -1994,7 +1994,7 @@ impl PublicationFixture {
             state.terminal_override = Some((GoalCompletion::Satisfied, ORIGINAL_ANSWER.into()));
         }
         PublicationHost {
-            runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+            runtime: Arc::new(tokio::sync::Mutex::new(Box::new(runtime))),
             state: Arc::new(tokio::sync::Mutex::new(state)),
             services,
         }
