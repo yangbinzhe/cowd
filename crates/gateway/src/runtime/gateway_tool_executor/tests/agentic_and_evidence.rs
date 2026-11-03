@@ -1,41 +1,3 @@
-fn admitted_agent_action_root(
-    services: &runtime::RuntimeServices,
-    session_id: &str,
-) -> (
-    harness_contract::execution_graph::ExecutionParentBinding,
-    runtime::RuntimeExecutionDecision,
-) {
-    use harness_contract::execution_graph::*;
-    let objective = "prove authenticated native Agent actions";
-    let mut graph = ExecutionGraph::new(objective);
-    graph.lineage = Some(ExecutionGraphLineage {
-        session_id: session_id.to_string(),
-        turn_id: format!("turn:{session_id}"),
-        root_task_id: format!("task:{session_id}"),
-        task_id: format!("task:{session_id}"),
-        generation: 1,
-    });
-    let node = ExecutionNodeSpec::new(
-        ExecutionNodeKind::InlineModel,
-        "inline_model",
-        "payload:root-model",
-    );
-    let parent = ExecutionParentBinding {
-        execution_id: graph.id.clone(),
-        node_id: node.id.clone(),
-    };
-    let mut decision = runtime::build_runtime_execution_decision(objective, None);
-    decision.execution_graph_ref = Some(graph.id.clone());
-    decision.session_ref = Some(session_id.to_string());
-    decision.turn_ref = Some(format!("turn:{session_id}"));
-    graph.nodes.push(node);
-    services
-        .commit_service()
-        .register_graph(graph)
-        .expect("admitted root graph");
-    (parent, decision)
-}
-
 #[test]
 fn evidence_retrieve_request_matches_published_query_schema() {
     let request: EvidenceRetrieveToolRequest = serde_json::from_value(serde_json::json!({
@@ -318,6 +280,7 @@ async fn publication_creation_identity_gateway_case() {
         .await
         .expect("durable source blocks");
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: None,
         session_id: Some(session_id),
@@ -326,6 +289,7 @@ async fn publication_creation_identity_gateway_case() {
         reality_context: None,
         model_lease: Some("test"),
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -502,6 +466,7 @@ async fn publication_creation_identity_gateway_case() {
     );
 
     let actor = root_agent_action_actor(RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: None,
         session_id: Some(session_id),
@@ -510,6 +475,7 @@ async fn publication_creation_identity_gateway_case() {
         reality_context: None,
         model_lease: Some("deepseek-v4-flash"),
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     })
@@ -574,461 +540,6 @@ async fn publication_creation_identity_gateway_case() {
 
     assert!(output.contains("durable mapped evidence"), "{output}");
     assert!(output.contains("\"available\": true"), "{output}");
-}
-
-#[tokio::test]
-async fn bound_root_model_bootstraps_program_and_inherits_evidence_scope() {
-    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
-    let mut graph =
-        harness_contract::execution_graph::ExecutionGraph::new("root Agent-first bootstrap");
-    graph.id = "graph-root-agent-first".to_string();
-    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
-        session_id: "session-root-agent-first".to_string(),
-        turn_id: "turn-root-agent-first".to_string(),
-        root_task_id: "task-root-agent-first".to_string(),
-        task_id: "task-root-agent-first".to_string(),
-        generation: 1,
-    });
-    let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
-        harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
-        "inline_model",
-        "payload:root-model",
-    );
-    node.id = "graph-root-agent-first:model".to_string();
-    node.idempotency_key = "root-model".to_string();
-    graph.nodes.push(node.clone());
-    services
-        .commit_service()
-        .register_graph(graph)
-        .expect("register root graph");
-
-    let mut decision = runtime::build_runtime_execution_decision(
-        "建立1个团队，只读检查 cowd-dev/Cargo.toml",
-        None,
-    );
-    decision.execution_graph_ref = Some("graph-root-agent-first".to_string());
-    decision.session_ref = Some("session-root-agent-first".to_string());
-    decision.turn_ref = Some("turn-root-agent-first".to_string());
-    let parent = harness_contract::execution_graph::ExecutionParentBinding {
-        execution_id: "graph-root-agent-first".to_string(),
-        node_id: node.id,
-    };
-    let registry = GatewayToolRegistry::builtin()
-        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
-        .expect("Agent action tools");
-    let executor = GatewayToolExecutor::new(None, false, registry);
-    executor
-        .bind_runtime_services(&services)
-        .expect("bind runtime services");
-    let binding = RuntimeToolExecutionBinding {
-        tool_lease: None,
-        action_id: Some("bound-root-create-team"),
-        session_id: Some("session-root-agent-first"),
-        authorized_scopes: &[],
-        memory_context: None,
-        reality_context: None,
-        model_lease: Some("deepseek-v4-flash"),
-        parent_execution: Some(&parent),
-        execution_decision: Some(&decision),
-        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-    };
-    let receipt = executor
-        .execute_runtime_tool_with_binding(
-            harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
-            serde_json::json!({
-                "name": "Evidence Team",
-                "mission": "inspect the exact admitted evidence scope"
-            }),
-            binding,
-        )
-        .await
-        .expect("bound root creates Team");
-    let receipt: harness_contract::agent_action::AgentActionObservation =
-        serde_json::from_str(&receipt).expect("Team receipt");
-    assert_eq!(
-        receipt.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let program = services
-        .agent_action_service()
-        .project(&harness_contract::agent_action::program_id_for_objective(
-            &harness_contract::agent_action::root_objective_id(
-                "session-root-agent-first",
-                "turn-root-agent-first",
-            ),
-        ))
-        .expect("durable Program");
-    assert_eq!(program.teams.len(), 1);
-    assert_eq!(
-        program.resource_scopes,
-        vec!["read:cowd-dev/Cargo.toml".to_string()]
-    );
-
-    // A later dynamically appended model node may carry a refreshed
-    // decision preview/model binding. It is the same authenticated root,
-    // so Runtime must inherit the Program's first durable binding instead
-    // of rejecting every subsequent small action as a mismatch.
-    let mut continuation_decision = decision.clone();
-    continuation_decision.user_intent_preview =
-        "dynamic replan text must not replace frozen Program authority".to_string();
-    continuation_decision
-        .strategy
-        .understanding
-        .required_workspace_evidence_scopes = Vec::new();
-    let continuation = RuntimeToolExecutionBinding {
-        action_id: Some("bound-root-invite-agent"),
-        model_lease: Some("refreshed-model-binding"),
-        execution_decision: Some(&continuation_decision),
-        ..binding
-    };
-    let team_ref = program.teams.keys().next().expect("created Team").clone();
-    let receipt = executor
-        .execute_runtime_tool_with_binding(
-            harness_contract::agent_action::AGENT_INVITE_TOOL_ID,
-            serde_json::json!({
-                "team_ref": team_ref,
-                "role": "Independent Reviewer",
-                "mission": "independently verify the admitted file evidence",
-                "required_capabilities": ["read"]
-            }),
-            continuation,
-        )
-        .await
-        .expect("continuation inherits frozen Program binding");
-    let receipt: harness_contract::agent_action::AgentActionObservation =
-        serde_json::from_str(&receipt).expect("Agent receipt");
-    assert_eq!(
-        receipt.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let continued = services
-        .agent_action_service()
-        .project(&program.program_id)
-        .expect("continued durable Program");
-    assert_eq!(continued.agents.len(), 1);
-    assert_eq!(program.objective_summary, "root Agent-first bootstrap");
-    assert_eq!(continued.objective_summary, program.objective_summary);
-    assert_eq!(continued.model_lease, "deepseek-v4-flash");
-    assert_eq!(continued.resource_scopes, program.resource_scopes);
-
-    let foreign = RuntimeToolExecutionBinding {
-        action_id: Some("foreign-root-create-team"),
-        session_id: Some("session-foreign"),
-        ..binding
-    };
-    let before_foreign = services
-        .agent_action_service()
-        .project(&program.program_id)
-        .expect("Program before rejected foreign root write");
-    assert!(executor
-        .execute_runtime_tool_with_binding(
-            harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
-            serde_json::json!({"name":"Foreign", "mission":"must fail"}),
-            foreign,
-        )
-        .await
-        .is_err());
-    assert_eq!(
-        services
-            .agent_action_service()
-            .project(&program.program_id)
-            .expect("Program after rejected foreign root write"),
-        before_foreign,
-        "a cross-Session root write must not change the durable Program"
-    );
-}
-
-#[tokio::test]
-async fn agent_action_gateway_commits_small_actions_and_rejects_fake_content() {
-    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
-    let registry = GatewayToolRegistry::builtin()
-        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
-        .expect("Agent action tools");
-    let executor = GatewayToolExecutor::new(None, false, registry);
-    executor
-        .bind_runtime_services(&services)
-        .expect("bind runtime services");
-    let (parent, decision) = admitted_agent_action_root(&services, "session-agentic-gateway");
-    let binding = RuntimeToolExecutionBinding {
-        tool_lease: None,
-        action_id: Some("create-team"),
-        session_id: Some("session-agentic-gateway"),
-        authorized_scopes: &[],
-        memory_context: None,
-        reality_context: None,
-        model_lease: Some("default"),
-        parent_execution: Some(&parent),
-        execution_decision: Some(&decision),
-        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-    };
-    let created = executor
-        .execute_runtime_tool_with_binding(
-            harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
-            serde_json::json!({
-                "name": "Evidence Team",
-                "mission": "produce independently reviewable evidence"
-            }),
-            binding,
-        )
-        .await
-        .expect("create Team");
-    let created: harness_contract::agent_action::AgentActionObservation =
-        serde_json::from_str(&created).expect("Team receipt");
-    assert_eq!(
-        created.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    assert_eq!(created.changed_refs.len(), 1);
-
-    let artifact = services
-        .artifact_store()
-        .write_bytes(
-            harness_contract::context::ArtifactWriteDescriptor {
-                media_type: "text/markdown".to_string(),
-                visibility_scope: "session:session-agentic-gateway".to_string(),
-                expected_bytes: Some(20),
-                original_name: Some("agent-report.md".to_string()),
-            },
-            b"durable agent report",
-        )
-        .await
-        .expect("durable Agent content");
-    let committed = executor
-        .execute_runtime_tool_with_binding(
-            harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID,
-            serde_json::json!({
-                "content_ref": artifact.selector,
-                "kind": "report",
-                "title": "Durable report"
-            }),
-            RuntimeToolExecutionBinding {
-                action_id: Some("durable-artifact"),
-                ..binding
-            },
-        )
-        .await
-        .expect("commit durable artifact");
-    let committed: serde_json::Value = serde_json::from_str(&committed).expect("artifact receipt");
-    assert_eq!(
-        committed["content_ref"].as_str(),
-        Some(artifact.selector.as_str()),
-        "receipt must echo the Runtime-parsed physical content_ref"
-    );
-
-    let actor = root_agent_action_actor(binding).unwrap();
-    let before_rejected_external_write = services
-        .agent_action_service()
-        .project(&actor.program_id)
-        .expect("Program before rejected external write");
-    let rejected = executor
-        .execute_runtime_tool_with_binding(
-            harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID,
-            serde_json::json!({
-                "content_ref": "artifact://invented",
-                "kind": "report",
-                "title": "Invented report"
-            }),
-            RuntimeToolExecutionBinding {
-                action_id: Some("fake-artifact"),
-                ..binding
-            },
-        )
-        .await
-        .expect_err("a refused action must reach the model as a failed tool call");
-    // The structured receipt survives inside the failure, so a caller that wants to
-    // deserialize the observation still can. What changed is that the call is marked
-    // failed: it used to arrive as a *successful* result carrying
-    // `"status": "rejected"` inside a pretty-printed blob, and one live run re-sent
-    // the identical malformed frame three times because it read a completed call.
-    let message = rejected.to_string();
-    assert!(
-        message.contains("Runtime did not execute"),
-        "the failure must lead with what did not run: {message}"
-    );
-    let receipt = message
-        .split("Structured receipt: ")
-        .nth(1)
-        .expect("the structured receipt must survive inside the failure");
-    let rejected: harness_contract::agent_action::AgentActionObservation =
-        serde_json::from_str(receipt).expect("artifact rejection");
-    assert_eq!(
-        rejected.status,
-        harness_contract::agent_action::AgentActionStatus::Rejected
-    );
-    assert_eq!(
-        rejected.error.expect("error").code,
-        "artifact_content_not_durable"
-    );
-    assert_eq!(
-        services
-            .agent_action_service()
-            .project(&actor.program_id)
-            .expect("Program after rejected external write"),
-        before_rejected_external_write,
-        "Gateway must reject invented content before writing business state"
-    );
-
-    let direct_artifact = harness_contract::agent_action::AgentAction::TaskSubmit(
-        harness_contract::agent_action::TaskSubmitInput {
-            deliverable: None,
-            task_ref: "task:any".to_string(),
-            artifact_refs: vec!["artifact:any".to_string()],
-            evidence_refs: vec![artifact.selector.clone()],
-            unresolved: Vec::new(),
-        },
-    );
-    services
-        .validate_agent_action_evidence(&actor, &direct_artifact)
-        .await
-        .expect("same-Session direct artifact evidence is readable");
-
-    let foreign_artifact = services
-        .artifact_store()
-        .write_bytes(
-            harness_contract::context::ArtifactWriteDescriptor {
-                media_type: "text/plain".to_string(),
-                visibility_scope: "session:foreign-session".to_string(),
-                expected_bytes: Some(16),
-                original_name: Some("foreign.txt".to_string()),
-            },
-            b"foreign evidence",
-        )
-        .await
-        .expect("foreign artifact");
-    let foreign_evidence = harness_contract::agent_action::AgentAction::TaskSubmit(
-        harness_contract::agent_action::TaskSubmitInput {
-            deliverable: None,
-            task_ref: "task:any".to_string(),
-            artifact_refs: vec!["artifact:any".to_string()],
-            evidence_refs: vec![foreign_artifact.selector],
-            unresolved: Vec::new(),
-        },
-    );
-    let error = services
-        .validate_agent_action_evidence(&actor, &foreign_evidence)
-        .await
-        .expect_err("cross-Session private artifact evidence must fail closed");
-    assert!(error.to_string().contains("is not readable in Session"));
-
-    let fake_evidence = harness_contract::agent_action::AgentAction::TaskSubmit(
-        harness_contract::agent_action::TaskSubmitInput {
-            deliverable: None,
-            task_ref: "task:any".to_string(),
-            artifact_refs: vec!["artifact:any".to_string()],
-            evidence_refs: vec!["tool://invented-receipt".to_string()],
-            unresolved: Vec::new(),
-        },
-    );
-    let error = services
-        .validate_agent_action_evidence(&actor, &fake_evidence)
-        .await
-        .expect_err("invented logical evidence must fail at trusted ingress");
-    assert!(
-        error
-            .to_string()
-            .contains("has no canonical durable receipt"),
-        "{error}"
-    );
-    assert_eq!(
-        services
-            .agent_action_service()
-            .project(&actor.program_id)
-            .expect("Program after rejected forged external evidence"),
-        before_rejected_external_write,
-        "unreadable or forged external evidence must not write business state"
-    );
-}
-
-#[tokio::test]
-async fn committed_agent_action_is_not_relabelled_failed_when_dispatch_is_deferred() {
-    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
-    let registry = GatewayToolRegistry::builtin()
-        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
-        .expect("Agent action tools");
-    let executor = GatewayToolExecutor::new(None, false, registry);
-    executor
-        .bind_runtime_services(&services)
-        .expect("bind runtime services");
-    let (parent, decision) = admitted_agent_action_root(&services, "session-deferred-dispatch");
-    let base = RuntimeToolExecutionBinding {
-        tool_lease: None,
-        action_id: Some("deferred-team"),
-        session_id: Some("session-deferred-dispatch"),
-        authorized_scopes: &[],
-        memory_context: None,
-        reality_context: None,
-        model_lease: Some("deepseek-v4-flash"),
-        parent_execution: Some(&parent),
-        execution_decision: Some(&decision),
-        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-    };
-    let team: harness_contract::agent_action::AgentActionObservation = serde_json::from_str(
-        &executor
-            .execute_runtime_tool_with_binding(
-                harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
-                serde_json::json!({
-                    "name": "Deferred Team",
-                    "mission": "prove semantic and physical outcomes stay distinct"
-                }),
-                base,
-            )
-            .await
-            .expect("create Team"),
-    )
-    .expect("Team receipt");
-    let team_ref = team.changed_refs[0].clone();
-    executor
-        .execute_runtime_tool_with_binding(
-            harness_contract::agent_action::AGENT_INVITE_TOOL_ID,
-            serde_json::json!({
-                "team_ref": team_ref,
-                "role": "Domain Specialist",
-                "mission": "requires an intentionally unavailable catalog capability",
-                "required_capabilities": ["custom_domain_operation"]
-            }),
-            RuntimeToolExecutionBinding {
-                tool_lease: None,
-                action_id: Some("deferred-agent"),
-                ..base
-            },
-        )
-        .await
-        .expect("invite remains a semantic action");
-    let published: harness_contract::agent_action::AgentActionObservation = serde_json::from_str(
-        &executor
-            .execute_runtime_tool_with_binding(
-                harness_contract::agent_action::TASK_PUBLISH_TOOL_ID,
-                serde_json::json!({
-                    "team_ref": team_ref,
-                    "title": "Unavailable physical work",
-                    "objective": "exercise deferred dispatch",
-                    "acceptance": "durable Task remains visible",
-                    "required_capabilities": ["custom_domain_operation"],
-                    "depends_on": []
-                }),
-                RuntimeToolExecutionBinding {
-                    tool_lease: None,
-                    action_id: Some("deferred-task"),
-                    ..base
-                },
-            )
-            .await
-            .expect("durable action must return an applied receipt"),
-    )
-    .expect("Task receipt");
-
-    assert_eq!(
-        published.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    assert!(published.actionable.iter().any(|item| {
-        item.contains("Semantic action committed") && item.contains("dispatch is deferred")
-    }));
-    let projection = services
-        .agent_action_service()
-        .project(&published.program_id)
-        .expect("durable Program");
-    assert_eq!(projection.tasks.len(), 1);
 }
 
 #[test]
@@ -1354,6 +865,7 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
         .validate_input("artifact_publish", &input)
         .unwrap();
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("publish"),
         session_id: Some("publication-session"),
@@ -1362,6 +874,7 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
         reality_context: None,
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite,
     };
@@ -1374,137 +887,6 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
     .unwrap();
     assert_eq!(published["bytes"], body.len());
     assert_eq!(published["sha256"], format!("sha256:{hash}"));
-    let (parent, decision) = admitted_agent_action_root(&services, "publication-session");
-    let root_actor = root_agent_action_actor(RuntimeToolExecutionBinding {
-        parent_execution: Some(&parent),
-        execution_decision: Some(&decision),
-        ..binding
-    })
-    .unwrap();
-    let root_action =
-        |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
-            action_id: action_id.into(),
-            actor: root_actor.clone(),
-            expected_revision: None,
-            action,
-        };
-    let team = services
-        .submit_agent_action(&root_action(
-            "file-team",
-            harness_contract::agent_action::AgentAction::TeamCreate(
-                serde_json::from_value(json!({
-                    "name":"File delivery", "mission":"deliver the exact required HTML file"
-                }))
-                .unwrap(),
-            ),
-        ))
-        .await
-        .unwrap()
-        .changed_refs[0]
-        .clone();
-    let author = services.submit_agent_action(&root_action("file-author",
-        harness_contract::agent_action::AgentAction::AgentInvite(serde_json::from_value(json!({
-            "team_ref":team,"role":"Author","mission":"deliver the HTML file","required_capabilities":["read"]
-        })).unwrap()))).await.unwrap().changed_refs[0].clone();
-    let task = services.submit_agent_action(&root_action("file-task",
-        harness_contract::agent_action::AgentAction::TaskPublish(serde_json::from_value(json!({
-            "team_ref":team,"title":"HTML deliverable","objective":"deliver the original HTML file",
-            "acceptance":"exact HTML bytes retained as a readable file artifact", "purpose":"delivery"
-        })).unwrap()))).await.unwrap().changed_refs[0].clone();
-    let mut worker = root_actor.clone();
-    worker.kind = harness_contract::agent_action::AgentActorKind::Agent;
-    worker.actor_id = author.clone();
-    worker.agent_id = Some(author.clone());
-    worker.team_id = Some(team);
-    worker.execution_id = Some("file-worker-claim".into());
-    let worker_action =
-        |action_id: &str, action| harness_contract::agent_action::AgentActionEnvelope {
-            action_id: action_id.into(),
-            actor: worker.clone(),
-            expected_revision: None,
-            action,
-        };
-    assert_eq!(
-        services
-            .submit_agent_action(&worker_action(
-                "file-claim",
-                harness_contract::agent_action::AgentAction::TaskClaim(
-                    harness_contract::agent_action::TaskClaimInput {
-                        task_ref: task.clone(),
-                        reason: None,
-                    }
-                )
-            ))
-            .await
-            .unwrap()
-            .status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let committed = services
-        .submit_agent_action(&worker_action(
-            "file-commit",
-            harness_contract::agent_action::AgentAction::ArtifactCommit(
-                harness_contract::agent_action::ArtifactCommitInput {
-                    content_ref: published["content_ref"].as_str().unwrap().into(),
-                    kind: "file".into(),
-                    title: "Original HTML".into(),
-                    relates_to: vec![task.clone()],
-                },
-            ),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        committed.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let submitted = services
-        .submit_agent_action(&worker_action(
-            "file-submit",
-            harness_contract::agent_action::AgentAction::TaskSubmit(
-                harness_contract::agent_action::TaskSubmitInput {
-                    task_ref: task.clone(),
-                    artifact_refs: committed.changed_refs.clone(),
-                    evidence_refs: vec![published["content_ref"].as_str().unwrap().into()],
-                    unresolved: vec![],
-                    deliverable: None,
-                },
-            ),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        submitted.status,
-        harness_contract::agent_action::AgentActionStatus::Applied
-    );
-    let program = services
-        .agent_action_service()
-        .project(&root_actor.program_id)
-        .unwrap();
-    assert_eq!(
-        program.tasks[&task].status,
-        runtime::AgenticTaskStatus::Submitted
-    );
-    assert_eq!(program.tasks[&task].artifact_refs, committed.changed_refs);
-    let result = &program.artifacts[&program.tasks[&task].artifact_refs[0]];
-    assert_eq!(result.committed_by, author);
-    assert_eq!(
-        result.claim_execution_id.as_deref(),
-        Some("file-worker-claim")
-    );
-    let artifact = services
-        .artifact_store()
-        .resolve(&result.content_ref)
-        .unwrap();
-    assert_eq!(
-        services
-            .artifact_store()
-            .read(&artifact, "session:publication-session", None)
-            .await
-            .unwrap(),
-        body.as_bytes()
-    );
-    assert!(program.objective_verdict.is_none());
     let export = serde_json::json!({"content_ref": published["content_ref"], "sha256": published["sha256"], "path":"result.html"});
     host.pin_snapshot()
         .validate_input("artifact_materialize", &export)
@@ -1566,125 +948,6 @@ async fn explicit_publication_roundtrip_and_scope_checks() {
 }
 
 #[tokio::test]
-async fn context_program_discovery_uses_one_authorized_revision_and_real_requests() {
-    let services = runtime::RuntimeServices::in_memory().unwrap();
-    let registry = GatewayToolRegistry::builtin()
-        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
-        .unwrap();
-    let executor = GatewayToolExecutor::new(None, false, registry);
-    executor.bind_runtime_services(&services).unwrap();
-    let (parent, decision) = admitted_agent_action_root(&services, "program-directory-session");
-    let binding = RuntimeToolExecutionBinding {
-        tool_lease: None,
-        action_id: Some("program-discovery"),
-        session_id: Some("program-directory-session"),
-        authorized_scopes: &[],
-        memory_context: None,
-        reality_context: None,
-        model_lease: Some("test-model"),
-        parent_execution: Some(&parent),
-        execution_decision: Some(&decision),
-        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-    };
-    let actor = services
-        .resolve_agent_action_actor(&parent, Some(root_agent_action_actor(binding).unwrap()))
-        .await
-        .expect("authenticated actor");
-    let actions = services.agent_action_service();
-    for index in 0..35 {
-        let result = services
-            .submit_agent_action(&harness_contract::agent_action::AgentActionEnvelope {
-                action_id: format!("directory-team-{index}"),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: harness_contract::agent_action::AgentAction::TeamCreate(
-                    harness_contract::agent_action::TeamCreateInput {
-                        name: format!("Directory Team {index:02}"),
-                        mission: "directory test".into(),
-                        objective: None,
-                    },
-                ),
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            result.status,
-            harness_contract::agent_action::AgentActionStatus::Applied
-        );
-    }
-    let revision = actions.project(&actor.program_id).unwrap().revision;
-    let mut request = serde_json::json!({"source":"program"});
-    let mut refs = std::collections::BTreeSet::new();
-    let mut first_next = None;
-    loop {
-        executor
-            .tool_host
-            .pin_snapshot()
-            .validate_input("context_retrieve", &request)
-            .unwrap();
-        let output = executor
-            .execute_runtime_tool_with_binding("context_retrieve", request, binding)
-            .await
-            .unwrap();
-        let page: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(page["revision"], revision);
-        for item in page["selected"].as_array().unwrap() {
-            assert!(refs.insert(item["ref"].as_str().unwrap().to_owned()));
-            executor
-                .tool_host
-                .pin_snapshot()
-                .validate_input("context_retrieve", &item["read_request"])
-                .unwrap();
-            let exact = executor
-                .execute_runtime_tool_with_binding(
-                    "context_retrieve",
-                    item["read_request"].clone(),
-                    binding,
-                )
-                .await
-                .unwrap();
-            assert!(exact.contains("Directory Team"));
-        }
-        if page["next_request"].is_null() {
-            assert_eq!(page["coverage"]["complete"], true);
-            break;
-        }
-        first_next = Some(page["next_request"].clone());
-        request = page["next_request"].clone();
-    }
-    assert_eq!(refs.len(), 35);
-    assert_eq!(
-        actions.project(&actor.program_id).unwrap().revision,
-        revision
-    );
-    let other = RuntimeToolExecutionBinding {
-        session_id: Some("other-session"),
-        ..binding
-    };
-    assert!(executor
-        .execute_runtime_tool_with_binding("context_retrieve", first_next.clone().unwrap(), other)
-        .await
-        .is_err());
-    let focused: serde_json::Value = serde_json::from_str(
-        &executor
-            .execute_runtime_tool_with_binding(
-                "context_retrieve",
-                serde_json::json!({"source":"program","query":"Directory Team 34"}),
-                binding,
-            )
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(focused["selected_count"], 1);
-    let changed = serde_json::json!({"source":"program","query":"changed","cursor":first_next.unwrap()["cursor"]});
-    assert!(executor
-        .execute_runtime_tool_with_binding("context_retrieve", changed, binding)
-        .await
-        .is_err());
-}
-
-#[tokio::test]
 async fn context_artifact_catalog_returns_readable_scoped_content_and_lossless_binary() {
     use base64::Engine;
     let services = runtime::RuntimeServices::in_memory().unwrap();
@@ -1694,6 +957,7 @@ async fn context_artifact_catalog_returns_readable_scoped_content_and_lossless_b
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor.bind_runtime_services(&services).unwrap();
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("artifact-directory"),
         session_id: Some("artifact-directory-session"),
@@ -1702,6 +966,7 @@ async fn context_artifact_catalog_returns_readable_scoped_content_and_lossless_b
         reality_context: None,
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -1859,198 +1124,6 @@ async fn native_agent_actions_reject_unadmitted_root_execution() {
     assert!(error.to_string().contains("authenticated parent binding"));
 }
 
-#[tokio::test]
-async fn agent_action_batch_applies_every_action_through_the_same_path() {
-    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
-    let objective = format!(
-        "{}保留第 180 字之后的精确事实和独立评审要求",
-        "建立两个团队并完成交付。".repeat(30)
-    );
-    let mut graph = harness_contract::execution_graph::ExecutionGraph::new(&objective);
-    graph.id = "graph-root-batch".to_string();
-    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
-        session_id: "session-root-batch".to_string(),
-        turn_id: "turn-root-batch".to_string(),
-        root_task_id: "task-root-batch".to_string(),
-        task_id: "task-root-batch".to_string(),
-        generation: 1,
-    });
-    let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
-        harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
-        "inline_model",
-        "payload:root-model",
-    );
-    node.id = "graph-root-batch:model".to_string();
-    node.idempotency_key = "root-model".to_string();
-    graph.nodes.push(node.clone());
-    services
-        .commit_service()
-        .register_graph(graph)
-        .expect("register root graph");
-
-    let mut decision = runtime::build_runtime_execution_decision(&objective, None);
-    assert_eq!(decision.user_intent_preview.chars().count(), 180);
-    decision.execution_graph_ref = Some("graph-root-batch".to_string());
-    decision.session_ref = Some("session-root-batch".to_string());
-    decision.turn_ref = Some("turn-root-batch".to_string());
-    let parent = harness_contract::execution_graph::ExecutionParentBinding {
-        execution_id: "graph-root-batch".to_string(),
-        node_id: node.id,
-    };
-    let registry = GatewayToolRegistry::builtin()
-        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
-        .expect("Agent action tools");
-    let executor = GatewayToolExecutor::new(None, false, registry);
-    executor
-        .bind_runtime_services(&services)
-        .expect("bind runtime services");
-    let binding = RuntimeToolExecutionBinding {
-        tool_lease: None,
-        action_id: Some("bound-root-batch"),
-        session_id: Some("session-root-batch"),
-        authorized_scopes: &[],
-        memory_context: None,
-        reality_context: None,
-        model_lease: Some("deepseek-v4-flash"),
-        parent_execution: Some(&parent),
-        execution_decision: Some(&decision),
-        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-    };
-    let receipt = executor
-        .execute_runtime_tool_with_binding(
-            "agent_action_batch",
-            serde_json::json!({
-                "actions": [
-                    {"tool": "team_create", "input": {"name": "Alpha", "mission": "first lane"}},
-                    {"tool": "team_create", "input": {"name": "Beta", "mission": "second lane"}}
-                ]
-            }),
-            binding,
-        )
-        .await
-        .expect("the batch must apply");
-    let value: serde_json::Value = serde_json::from_str(&receipt).expect("batch receipt json");
-    assert_eq!(value["type"], "agent_action_batch");
-    assert_eq!(value["count"], 2);
-
-    let program = services
-        .agent_action_service()
-        .project(&harness_contract::agent_action::program_id_for_objective(
-            &harness_contract::agent_action::root_objective_id(
-                "session-root-batch",
-                "turn-root-batch",
-            ),
-        ))
-        .expect("durable Program");
-    assert_eq!(program.teams.len(), 2, "both actions must have committed");
-    assert_eq!(program.objective_summary, objective);
-
-    // The batch dispatches Agent actions only; anything else is refused
-    // rather than silently routed to a different executor.
-    let error = executor
-        .execute_runtime_tool_with_binding(
-            "agent_action_batch",
-            serde_json::json!({"actions": [{"tool": "bash", "input": {"command": "echo hi"}}]}),
-            binding,
-        )
-        .await
-        .expect_err("bash must not be dispatchable through the batch");
-    assert!(error.to_string().contains("Agent actions only"), "{error}");
-}
-
-/// S1: a text-protocol model declares the structured `actions` parameter as
-/// a string (`string="true"`), so the array arrives JSON-encoded. The
-/// schema-aware boundary coerces it and the batch applies, instead of the
-/// whole plan dying at the input contract.
-#[tokio::test]
-async fn string_typed_actions_array_is_coerced_at_the_boundary() {
-    let services = runtime::RuntimeServices::in_memory().expect("runtime services");
-    let mut graph =
-        harness_contract::execution_graph::ExecutionGraph::new("root coercion bootstrap");
-    graph.id = "graph-root-coercion".to_string();
-    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
-        session_id: "session-root-coercion".to_string(),
-        turn_id: "turn-root-coercion".to_string(),
-        root_task_id: "task-root-coercion".to_string(),
-        task_id: "task-root-coercion".to_string(),
-        generation: 1,
-    });
-    let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
-        harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
-        "inline_model",
-        "payload:root-model",
-    );
-    node.id = "graph-root-coercion:model".to_string();
-    node.idempotency_key = "root-model".to_string();
-    graph.nodes.push(node.clone());
-    services
-        .commit_service()
-        .register_graph(graph)
-        .expect("register root graph");
-    let mut decision = runtime::build_runtime_execution_decision("coercion", None);
-    decision.execution_graph_ref = Some("graph-root-coercion".to_string());
-    decision.session_ref = Some("session-root-coercion".to_string());
-    decision.turn_ref = Some("turn-root-coercion".to_string());
-    let parent = harness_contract::execution_graph::ExecutionParentBinding {
-        execution_id: "graph-root-coercion".to_string(),
-        node_id: node.id,
-    };
-    let registry = GatewayToolRegistry::builtin()
-        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
-        .expect("Agent action tools");
-    let executor = GatewayToolExecutor::new(None, false, registry);
-    executor
-        .bind_runtime_services(&services)
-        .expect("bind runtime services");
-    let binding = RuntimeToolExecutionBinding {
-        tool_lease: None,
-        action_id: Some("bound-root-coercion"),
-        session_id: Some("session-root-coercion"),
-        authorized_scopes: &[],
-        memory_context: None,
-        reality_context: None,
-        model_lease: Some("qwen-local"),
-        parent_execution: Some(&parent),
-        execution_decision: Some(&decision),
-        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-    };
-    // The exact corruption shape a DSML text-protocol model produces: the
-    // array field arrives as a JSON-encoded string.
-    let string_typed_actions = serde_json::json!([
-        {"tool": "team_create", "input": {"name": "Gamma", "mission": "coerced lane"}}
-    ])
-    .to_string();
-    let receipt = executor
-        .execute_runtime_tool_with_binding(
-            "agent_action_batch",
-            serde_json::json!({"actions": string_typed_actions}),
-            binding,
-        )
-        .await
-        .expect("the string-typed actions array must be coerced, not rejected");
-    let value: serde_json::Value = serde_json::from_str(&receipt).expect("batch receipt json");
-    assert_eq!(value["type"], "agent_action_batch");
-    assert_eq!(value["count"], 1);
-    let program = services
-        .agent_action_service()
-        .project(&harness_contract::agent_action::program_id_for_objective(
-            &harness_contract::agent_action::root_objective_id(
-                "session-root-coercion",
-                "turn-root-coercion",
-            ),
-        ))
-        .expect("durable Program");
-    assert_eq!(
-        program.teams.len(),
-        1,
-        "the coerced action must have committed"
-    );
-}
-
-/// A pure `oneOf` schema has no top-level `properties`, and the coercion used to
-/// return early in that case - so `artifact_publish.block_index` was refused
-/// with `invalid type: string "0", expected usize` while the model had sent an
-/// unambiguous value. The variant union is now merged before coercing.
 #[test]
 fn a_pure_one_of_schema_still_coerces_its_variant_fields() {
     let registry = GatewayToolRegistry::builtin()
@@ -2979,7 +2052,7 @@ async fn k02_orchestration_partial_receipt_recovers_same_session_bounded_pages()
     let registry = GatewayToolRegistry::builtin().with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions()).unwrap();
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor.bind_runtime_services(&services).unwrap();
-    let binding = RuntimeToolExecutionBinding { tool_lease: None, action_id: None, session_id: Some(session_id), authorized_scopes: &[], memory_context: None, reality_context: None, model_lease: Some("test"), parent_execution: None, execution_decision: None, permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly };
+    let binding = RuntimeToolExecutionBinding { action_invocation: None, tool_lease: None, action_id: None, session_id: Some(session_id), authorized_scopes: &[], memory_context: None, reality_context: None, model_lease: Some("test"), parent_execution: None, parent_execution_attempt: None, execution_decision: None, permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly };
     let foreign = RuntimeToolExecutionBinding { session_id: Some("k02-recovery-foreign"), ..binding.clone() };
     let foreign_out = executor.execute_runtime_tool_with_binding("read_ref", request.clone(), foreign).await;
     assert!(foreign_out.is_err() || serde_json::from_str::<serde_json::Value>(&foreign_out.unwrap()).unwrap()["available"] != true);

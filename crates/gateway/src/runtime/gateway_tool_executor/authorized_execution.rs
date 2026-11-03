@@ -123,7 +123,7 @@ impl GatewayToolExecutor {
                 .execute_runtime_tool_with_binding(
                     &tool_name,
                     value,
-                    RuntimeToolExecutionBinding {
+                    RuntimeToolExecutionBinding { action_invocation: None,
                         tool_lease: is_step_bound.then_some(&lease),
                         action_id: None,
                         session_id: self.runtime_session_id.as_deref(),
@@ -132,6 +132,7 @@ impl GatewayToolExecutor {
                         reality_context: None,
                         model_lease: self.runtime_model_lease.as_deref(),
                         parent_execution: None,
+                        parent_execution_attempt: None,
                         execution_decision: None,
                         permission_ceiling: authorization.authorization_lease.ceiling,
                     },

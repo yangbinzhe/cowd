@@ -10,13 +10,18 @@ mod results;
 #[cfg(test)]
 pub(crate) use coverage::evidence_contains;
 pub(crate) use coverage::validate_review_coverage;
-pub(crate) use current_review::{CurrentReviewContext, ReviewActionIdentity};
+pub(crate) use current_review::{AuthenticatedHistoricalPolicyCall, AuthenticatedMemberApprovalEvidence, CurrentReviewContext, ReviewActionIdentity};
+#[allow(unused_imports)]
+pub(crate) use current_review::AuthenticatedMemberLeaseEvidence;
+#[allow(unused_imports)]
+pub(crate) use current_review::{authenticate_original_member_lease_transition, AuthenticatedMemberLeaseTransition};
 #[allow(unused_imports)]
 pub(crate) use policy::{
-    committed_proof_sources, completion_admission_context, effect_review_snapshot,
+    completion_admission_context, completion_admission_context_from_prepared, effect_review_snapshot,
     proof_input_snapshot, proof_input_snapshot_for_action, root_self_review_policy,
     validate_applied_proof_inputs, validate_proof_inputs, validate_proof_inputs_for_action,
-    CompletionAdmissionContext, ProofInputSnapshot,
+    CompletionAdmissionContext, ProofInputSnapshot, VerifiedConclusionProof,
+    validate_applied_proof_for_conclusion,
 };
 pub(crate) use policy::{nested_parent_material, read_delivery_snapshot_for_scope};
 #[cfg(test)]
@@ -42,35 +47,189 @@ pub(crate) struct ResultContentReaders<'reader> {
 #[derive(Clone)]
 pub(crate) struct ProcessInputVerifier {
     scope_locks: std::sync::Arc<crate::execution_core::graph::resources::ScopeLockManager>,
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct ProcessInputFrame {
-    verifier: ProcessInputVerifier,
+    verifier: Option<ProcessInputVerifier>,
     retained: std::sync::Mutex<BTreeMap<String, ProcessInputGuard>>,
+    artifact_owner: String,
+    artifact_pins: std::sync::Mutex<BTreeMap<String, ReviewArtifactPin>>,
+}
+
+struct ReviewArtifactPin {
+    store: crate::ArtifactStore,
+    artifact: harness_contract::context::ArtifactRef,
+    owner: String,
+}
+
+impl Drop for ReviewArtifactPin {
+    fn drop(&mut self) {
+        if let Err(error) = self.store.unpin(&self.artifact, &self.owner) {
+            tracing::warn!(%error, "review artifact pin release failed; pin retained");
+        }
+    }
 }
 
 struct ProcessInputGuard {
     _lease: crate::execution_core::graph::resources::ScopeLockLease,
     _descriptors: Vec<std::fs::File>,
     checked_runs: BTreeSet<String>,
+    protected_files: BTreeMap<String, (String, u64)>,
 }
 
 impl ProcessInputVerifier {
     pub(crate) fn new(
         scope_locks: std::sync::Arc<crate::execution_core::graph::resources::ScopeLockManager>,
     ) -> Self {
-        Self { scope_locks }
+        Self { scope_locks, workspace_root: None }
+    }
+
+    pub(crate) fn with_workspace(scope_locks: std::sync::Arc<crate::execution_core::graph::resources::ScopeLockManager>, workspace_root: std::path::PathBuf) -> Self {
+        Self { scope_locks, workspace_root: Some(workspace_root) }
     }
 
     pub(crate) fn frame(&self) -> ProcessInputFrame {
         ProcessInputFrame {
-            verifier: self.clone(),
+            verifier: Some(self.clone()),
             retained: std::sync::Mutex::new(BTreeMap::new()),
+            artifact_owner: format!("review-proof:{}", uuid::Uuid::new_v4()),
+            artifact_pins: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 }
 
 impl ProcessInputFrame {
+    pub(crate) fn without_process_verifier() -> Self {
+        Self {
+            verifier: None,
+            retained: std::sync::Mutex::new(BTreeMap::new()),
+            artifact_owner: format!("review-proof:{}", uuid::Uuid::new_v4()),
+            artifact_pins: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+    fn retain_artifact(&self, store: &crate::ArtifactStore,
+        artifact: &harness_contract::context::ArtifactRef) -> Result<(), String> {
+        let mut pins = self.artifact_pins.lock().map_err(|error| error.to_string())?;
+        if let Some(existing) = pins.get(&artifact.selector) {
+            if existing.artifact != *artifact {
+                return Err("review artifact identity changed while preparing".into());
+            }
+            return Ok(());
+        }
+        store.pin(artifact, &self.artifact_owner, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS)
+            .map_err(|error| error.to_string())?;
+        pins.insert(artifact.selector.clone(), ReviewArtifactPin {
+            store: store.clone(), artifact: artifact.clone(), owner: self.artifact_owner.clone(),
+        });
+        Ok(())
+    }
+    fn retains_exact_artifact(&self, artifact: &harness_contract::context::ArtifactRef) -> bool {
+        self.artifact_pins.lock().ok().and_then(|pins| pins.get(&artifact.selector)
+            .map(|pin| pin.artifact == *artifact)).unwrap_or(false)
+    }
+    pub(crate) fn retains_pinned_read(&self, selector: &str, digest: &str, bytes: u64) -> bool {
+        self.artifact_pins.lock().ok().and_then(|pins| pins.get(selector).map(|pin|
+            pin.artifact.selector == selector
+                && pin.artifact.sha256.trim_start_matches("sha256:") == digest.trim_start_matches("sha256:")
+                && pin.artifact.bytes == bytes)).unwrap_or(false)
+    }
+    pub(crate) fn has_original_file_workspace(&self) -> bool {
+        self.verifier.as_ref().is_some_and(|verifier| verifier.workspace_root.is_some())
+    }
+
+    /// Retain the exact authenticated File acquisition under the existing
+    /// workspace owner. This protects writers using the same scope manager;
+    /// external writers are not represented by that lease.
+    pub(crate) fn retain_original_file(&self, target: &harness_contract::goal::ProofEffectTarget, sha256: &str, bytes: u64) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Read;
+            use std::os::unix::fs::MetadataExt;
+            use sha2::{Digest, Sha256};
+            use crate::execution_core::graph::resources::{ScopeLockMode, ScopeLockRequest, ScopedResource};
+            let verifier = self.verifier.as_ref().ok_or("original File verifier unavailable")?;
+            let workspace = verifier.workspace_root.as_deref().ok_or("original File workspace owner unavailable")?;
+            let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(workspace).map_err(|error| error.to_string())?;
+            let path = &target.path.workspace_relative_path;
+            let canonical = resolver.resolve_existing(path).map_err(|error| error.to_string())?;
+            if !target.exact || canonical.workspace_id != target.path.workspace_id
+                || canonical.repository_id != target.path.repository_id
+                || canonical.workspace_relative_path != *path
+                || canonical.repository_relative_path != target.path.repository_relative_path
+                || canonical.object_kind != target.path.object_kind {
+                return Err("original File identity differs from workspace owner".into());
+            }
+            let mut retained = self.retained.lock().map_err(|_| "original File frame poisoned")?;
+            let key = resolver.workspace_id().to_string();
+            let lease = if retained.contains_key(&key) { None } else {
+                Some(verifier.scope_locks.try_acquire([ScopeLockRequest {
+                    scope: ScopedResource::workspace(&key).map_err(|error| error.to_string())?, mode: ScopeLockMode::Read,
+                }]).map_err(|error| error.to_string())?.ok_or("original File scope busy")?)
+            };
+            let root = std::fs::File::from(rustix::fs::openat2(rustix::fs::CWD, workspace,
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(), rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS)
+                .map_err(|error| error.to_string())?);
+            let open = || -> Result<std::fs::File, String> {
+                rustix::fs::openat2(&root, path.as_str(), rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(), rustix::fs::ResolveFlags::BENEATH | rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS)
+                    .map(std::fs::File::from).map_err(|error| error.to_string())
+            };
+            let root_before = root.metadata().map_err(|error| error.to_string())?;
+            let named_root = workspace.symlink_metadata().map_err(|error| error.to_string())?;
+            if !root_before.is_dir() || named_root.file_type().is_symlink() || root_before.dev() != named_root.dev() || root_before.ino() != named_root.ino() {
+                return Err("original File workspace changed".into());
+            }
+            let mut file = open()?;
+            let before = file.metadata().map_err(|error| error.to_string())?;
+            if !before.is_file() || before.nlink() != 1 || before.len() != bytes { return Err("original File extent changed".into()); }
+            let mut hash = Sha256::new();
+            let mut total = 0u64;
+            let mut buffer = [0u8; 65536];
+            loop { let count = file.read(&mut buffer).map_err(|error| error.to_string())?; if count == 0 { break; }
+                total = total.checked_add(count as u64).ok_or("original File size overflow")?;
+                if total > bytes { return Err("original File grew during validation".into()); }
+                hash.update(&buffer[..count]); }
+            let after = file.metadata().map_err(|error| error.to_string())?;
+            let named = open()?.metadata().map_err(|error| error.to_string())?;
+            let identity = |m: &std::fs::Metadata| (m.dev(), m.ino(), m.nlink(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec());
+            let root_after = workspace.symlink_metadata().map_err(|error| error.to_string())?;
+            if total != bytes || format!("{:x}", hash.finalize()) != sha256.trim_start_matches("sha256:")
+                || identity(&before) != identity(&after) || identity(&after) != identity(&named)
+                || root_after.file_type().is_symlink() || root_after.dev() != root_before.dev() || root_after.ino() != root_before.ino() {
+                return Err("original File changed during validation".into());
+            }
+            if let Some(guard) = retained.get_mut(&key) {
+                if guard.protected_files.get(path).is_some_and(|old| old.0.trim_start_matches("sha256:") != sha256.trim_start_matches("sha256:") || old.1 != bytes) {
+                    return Err("original File identity conflicts with retained guard".into());
+                }
+                guard.protected_files.insert(path.clone(), (sha256.to_owned(), bytes));
+                guard._descriptors.extend([file, root]);
+            } else {
+                retained.insert(key, ProcessInputGuard { _lease: lease.ok_or("original File scope lease missing")?, _descriptors: vec![file, root], checked_runs: BTreeSet::new(), protected_files: BTreeMap::from([(path.clone(), (sha256.to_owned(), bytes))]) });
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (target, sha256, bytes); Err("original File protected FD unsupported".into()) }
+    }
+
+    pub(crate) fn retains_process_input_run(&self, call_key: &str) -> bool {
+        self.retained.lock().ok().is_some_and(|guards|
+            guards.values().any(|guard| guard.checked_runs.contains(call_key)))
+    }
+    /// Only files actually checked by the original Process input owner are
+    /// covered: its workspace read lease and open descriptors remain held.
+    pub(crate) fn retains_exact_file(
+        &self, target: &harness_contract::goal::ProofEffectTarget,
+        digest: &str, bytes: Option<u64>,
+    ) -> bool {
+        self.retained.lock().ok().and_then(|guards| guards.get(&target.path.workspace_id)
+            .and_then(|guard| guard.protected_files.get(&target.path.workspace_relative_path))
+            .map(|(sha, size)| sha.trim_start_matches("sha256:") == digest.trim_start_matches("sha256:")
+                && bytes.is_none_or(|bytes| bytes == *size))).unwrap_or(false)
+    }
     fn validate(
         &self,
         store: &std::sync::Arc<crate::RuntimeEventStore>,
@@ -120,6 +279,13 @@ impl ProcessInputFrame {
         let key = resolver.workspace_id().to_string();
         if let Some(guard) = retained.get_mut(&key) {
             let descriptors = policy::validate_current_process_inputs(workspace, run)?;
+            for input in &run.fact.admission.inputs {
+                let identity = (input.sha256.clone(), input.bytes);
+                if guard.protected_files.insert(input.relative_path.clone(), identity.clone())
+                    .is_some_and(|previous| previous != identity) {
+                    return Err("bounded process protected File identity changed".into());
+                }
+            }
             if guard
                 .checked_runs
                 .insert(run.fact.admission.binding.call_key.clone())
@@ -135,6 +301,7 @@ impl ProcessInputFrame {
         };
         let lease = self
             .verifier
+            .as_ref().ok_or("bounded process selected input verifier context missing")?
             .scope_locks
             .try_acquire([request])
             .map_err(|error| error.to_string())?
@@ -146,6 +313,8 @@ impl ProcessInputFrame {
                 _lease: lease,
                 _descriptors: descriptors,
                 checked_runs: BTreeSet::from([run.fact.admission.binding.call_key.clone()]),
+                protected_files: run.fact.admission.inputs.iter().map(|input|
+                    (input.relative_path.clone(), (input.sha256.clone(), input.bytes))).collect(),
             },
         );
         Ok(())
@@ -1431,26 +1600,36 @@ fn effect_observation_refs(
 async fn physical_packet(
     services: &RuntimeServices,
     graph_id: &str,
+    original: &harness_contract::agent_action::OriginalAgentExecution,
 ) -> Result<AgentTaskPacket, String> {
     let graph = services
         .graph_state_store()
         .load_current_async(graph_id.to_string())
         .await
         .map_err(|error| error.to_string())?;
-    graph
-        .nodes
-        .iter()
+    let mut packets = graph.nodes.iter()
         .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
-        .filter_map(|node| {
-            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
-                .ok()
-                .filter(|packet| {
-                    packet_identity_matches(packet.graph_id(), packet.run_id(), graph_id)
-                        && packet.node_id() == node.id
-                })
-        })
-        .next()
-        .ok_or_else(|| format!("review physical Agent packet missing:{graph_id}"))
+        .filter_map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()
+            .filter(|packet| packet_identity_matches(packet.graph_id(), packet.run_id(), graph_id)
+                && packet.node_id() == node.id));
+    let mut packet = packets.next().ok_or_else(|| format!("review physical Agent packet missing:{graph_id}"))?;
+    if packets.next().is_some() { return Err("review physical Agent packet ambiguous".into()); }
+    if original.graph_id != graph.id || original.node_id != packet.node_id()
+        || original.attempt == 0
+        || graph.recovery_cursor.node_attempts.get(packet.node_id()) != Some(&original.attempt)
+    {
+        return Err("review original physical attempt is stale or foreign".into());
+    }
+    let binding = services.graph_state_store()
+        .current_binding(&graph, packet.node_id(), original.attempt)
+        .map_err(|error| error.to_string())?;
+    let (ticket, _) = services.graph_state_store()
+        .binding_start_ticket(&graph, packet.node_id(), &binding)
+        .map_err(|error| error.to_string())?;
+    crate::execution_core::graph::validate_node_ticket_start(services.event_store(), &ticket, None)
+        .map_err(|error| error.to_string())?;
+    packet.attempt = original.attempt;
+    Ok(packet)
 }
 
 /// The identity check in the caller's namespace.
@@ -1490,30 +1669,30 @@ fn task_review_attempt_rejection(
     task: &crate::agentic::program::AgenticTaskProjection,
     graph_id: &str,
     attempt: u32,
+    verified_node_attempt: u32,
     agent_id: &str,
     membership_id: &str,
     result_refs: &[String],
     condition_ref: Option<&str>,
 ) -> Result<(), String> {
-    if task.review_generation.saturating_add(1) != u64::from(attempt) {
-        return Err(format!(
-            "review attempt generation is stale: Task {} is at review generation {} and this \
-             physical run is attempt {}; inspect the Task and continue from its current revision",
-            task.task_id, task.review_generation, attempt
-        ));
+    // Business generation belongs to the registered Program attempt. The
+    // physical node attempt is a separate graph-ticket namespace.
+    if attempt == 0 || attempt != verified_node_attempt {
+        return Err("review physical node attempt is stale".into());
     }
     let active = task.active_attempts.get(graph_id).is_some_and(|candidate| {
-        candidate.mode == harness_contract::agent_action::AgentAttemptMode::Review
-            && candidate.generation.saturating_add(1) == u64::from(attempt)
+        candidate.execution_id == graph_id
+            && candidate.mode == harness_contract::agent_action::AgentAttemptMode::Review
+            && candidate.generation == task.review_generation
             && candidate.agent_id == agent_id
             && candidate.membership_id == membership_id
     });
     if !active {
         return Err(format!(
             "review attempt is not the active Review attempt for Task {}: Runtime has no Review \
-             attempt at generation {} bound to this graph, agent and membership; re-read the \
+             attempt bound to this graph, agent and membership; re-read the \
              Task and let Runtime dispatch the current attempt",
-            task.task_id, attempt
+            task.task_id
         ));
     }
     if condition_ref.is_none()
@@ -1665,6 +1844,7 @@ impl RuntimeServices {
                     .execution_id
                     .as_deref()
                     .ok_or("review has no physical run")?,
+                actor.original_execution.as_ref().ok_or("review original physical binding unobserved")?,
             )
             .await?;
             let scope = packet
@@ -1699,6 +1879,7 @@ impl RuntimeServices {
                     task,
                     packet.graph_id(),
                     packet.attempt,
+                    packet.attempt, // authenticated by physical_packet above
                     &scope.agent_id,
                     &scope.membership_id,
                     result_refs,
@@ -2392,6 +2573,21 @@ impl RuntimeServices {
                     .graph_state_store()
                     .load(packet.graph_id())
                     .map_err(|error| error.to_string())?;
+                // The material producer packet is attempt-specific. The node
+                // payload is its immutable template; validate the exact original
+                // NodesStarted ticket before binding the physical attempt to it.
+                let original_binding = self.graph_state_store()
+                    .current_binding(&graph, packet.node_id(), packet.attempt)
+                    .map_err(|error| error.to_string())?;
+                let (original_ticket, original_node) = self.graph_state_store()
+                    .binding_start_ticket(&graph, packet.node_id(), &original_binding)
+                    .map_err(|error| error.to_string())?;
+                crate::execution_core::graph::validate_node_ticket_start(
+                    self.event_store(), &original_ticket, None,
+                ).map_err(|error| error.to_string())?;
+                if !graph.nodes.iter().any(|node| node == &original_node) {
+                    return Err("recursive material original node changed".into());
+                }
                 if packet.session_id() != actor.session_id
                     || packet.binding.as_ref().is_none_or(|binding| {
                         !crate::agent::binding::recompute_binding_digest(binding)
@@ -2659,6 +2855,7 @@ impl RuntimeServices {
                         && event.payload["status"] == "completed"
                         && event.activity_binding().is_some_and(|binding| {
                             binding.session_id == actor.session_id
+                                && binding.agent_run_id.is_none()
                                 && root_materials.contains(&binding.root_execution_id)
                                 && binding_is_owned_by_root(
                                     &binding,
@@ -2710,7 +2907,8 @@ impl RuntimeServices {
                                 packet.node_id()
                             ))
                     }) || event.activity_binding().is_some_and(|binding| {
-                        primary_roots.contains(&binding.root_execution_id)
+                        binding.agent_run_id.is_none()
+                            && primary_roots.contains(&binding.root_execution_id)
                             && binding_is_owned_by_root(&binding, Some(&binding.root_execution_id))
                     });
                     let event_key = (source.clone(), event.event_id.clone());
@@ -3480,7 +3678,7 @@ mod tests {
         task.active_attempts.insert(
             "graph".to_string(),
             crate::agentic::program::AgenticTaskAttemptProjection {
-                execution_id: "execution:1".to_string(),
+                execution_id: "graph".to_string(),
                 agent_id: "agent:1".to_string(),
                 membership_id: "membership:1".to_string(),
                 mode: harness_contract::agent_action::AgentAttemptMode::Review,
@@ -3503,6 +3701,7 @@ mod tests {
                 &task,
                 "graph",
                 2,
+                2,
                 "agent:1",
                 "membership:1",
                 &["artifact:a".to_string(), "artifact:z".to_string()],
@@ -3517,6 +3716,7 @@ mod tests {
             &task,
             "graph",
             2,
+            2, // independently authenticated physical ticket
             "agent:1",
             "membership:1",
             &["artifact:a".to_string(), "artifact:z".to_string()],
@@ -3548,6 +3748,7 @@ mod tests {
             &task,
             "graph",
             5,
+            2, // independently authenticated physical ticket
             "agent:1",
             "membership:1",
             &["artifact:a".to_string()],
@@ -3555,14 +3756,22 @@ mod tests {
         )
         .expect_err("generation 5 cannot review a Task at review generation 1");
         assert!(
-            stale_generation.contains("generation is stale"),
+            stale_generation.contains("physical node attempt is stale"),
             "the refusal must name the generation: {stale_generation}"
         );
+
+        let mut old_owner = task.clone();
+        old_owner.active_attempts.get_mut("graph").unwrap().generation = 0;
+        assert!(task_review_attempt_rejection(
+            &old_owner, "graph", 2, 2, "agent:1", "membership:1",
+            &["artifact:a".to_string()], None,
+        ).is_err(), "old business generation is not a physical attempt");
 
         let wrong_agent = task_review_attempt_rejection(
             &task,
             "graph",
             2,
+            2, // independently authenticated physical ticket
             "agent:9",
             "membership:1",
             &["artifact:a".to_string()],
@@ -3578,6 +3787,7 @@ mod tests {
             &task,
             "graph",
             2,
+            2, // independently authenticated physical ticket
             "agent:1",
             "membership:1",
             &["artifact:a".to_string()],

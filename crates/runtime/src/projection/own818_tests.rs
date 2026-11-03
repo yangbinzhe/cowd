@@ -491,6 +491,7 @@ async fn own818_quiescent_real_runner_closure_still_proven_settled_without_goal_
             action_id: "818-team".into(),
             expected_revision: None,
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "818-objective".into(),
                 program_id: "818-program".into(),
                 session_id: "818-session".into(),

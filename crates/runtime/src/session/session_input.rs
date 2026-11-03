@@ -86,6 +86,7 @@ struct SessionInputStateInner {
 pub struct SessionInputStream {
     inner: Arc<Mutex<SessionInputStateInner>>,
     input_notify: Arc<Notify>,
+    original_turn_control: Arc<Mutex<Option<(TurnId, std::sync::Weak<crate::conversation::OriginalTurnInputControl>)>>>,
 }
 
 #[derive(Debug)]
@@ -161,6 +162,20 @@ impl SessionInputStream {
                 idempotency: HashMap::new(),
             })),
             input_notify: Arc::new(Notify::new()),
+            original_turn_control: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn install_original_turn_control(&self, turn_id: TurnId, control: &Arc<crate::conversation::OriginalTurnInputControl>) {
+        *self.original_turn_control.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((turn_id, Arc::downgrade(control)));
+    }
+    fn signal_original_approval_wait(&self, active_turn: Option<&TurnId>) {
+        let observer = self.original_turn_control.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((turn, control)) = observer.as_ref() {
+            if Some(turn) == active_turn {
+                if let Some(control) = control.upgrade() { control.signal_if_approval_waiting(); }
+            }
         }
     }
 
@@ -258,6 +273,9 @@ impl SessionInputStream {
             cursor: None,
             created_at: now,
         };
+        // Decide the original approval/commit race before publishing the new
+        // input to the same turn and before its notifier wakes the coordinator.
+        self.signal_original_approval_wait(inner.active_turn_id.as_ref());
         inner
             .idempotency
             .insert(envelope.idempotency_key.clone(), envelope.input_id.clone());
@@ -302,6 +320,7 @@ impl SessionInputStream {
             if !durable_cursor_matches(existing_cursor, receipt.cursor) {
                 return receipt;
             }
+            self.signal_original_approval_wait(inner.active_turn_id.as_ref());
             {
                 let record = &mut inner.records[index];
                 // A durable handoff may be replayed while the active Runtime
@@ -346,6 +365,7 @@ impl SessionInputStream {
             return receipt;
         }
 
+        self.signal_original_approval_wait(inner.active_turn_id.as_ref());
         inner.admitted_total = inner.admitted_total.saturating_add(1);
         inner.admitted_cursor = max_cursor(inner.admitted_cursor, receipt.cursor);
         inner.last_decision = Some(receipt.decision);

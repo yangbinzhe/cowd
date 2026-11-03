@@ -312,6 +312,28 @@ impl std::fmt::Debug for ToolHostLease {
 #[path = "local_network.rs"]
 mod local_network;
 
+/// Why one child effect of an orchestrated program could not be resolved.
+///
+/// `InvalidInput` means the child's own input violates its contract: the call
+/// would be refused, and the effects the sibling steps declared are still
+/// true. `Unprovable` means the effect itself cannot be proven, so the program
+/// may touch anything and no exact scope may be claimed.
+#[derive(Debug, Clone)]
+struct ChildEffectFailure {
+    reason: String,
+    unprovable: bool,
+}
+
+impl ChildEffectFailure {
+    fn unprovable(reason: String) -> Self {
+        Self { reason, unprovable: true }
+    }
+
+    fn invalid_input(reason: String) -> Self {
+        Self { reason, unprovable: false }
+    }
+}
+
 impl ToolHostLease {
     /// Execute under the original parent authorization while retaining actual
     /// successful child reads in a private, per-invocation trace. A caller must
@@ -570,10 +592,18 @@ impl ToolHostLease {
         }
         if canonical_id == "tool_orchestrate" {
             let preflight = crate::executor::orchestrate::effect_preflight(input);
-            let effects = preflight
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(|calls| self.orchestration_child_effects(calls));
+            // A child whose effect cannot be proven must not erase the effects
+            // the program already declared. Dropping every child on the first
+            // failure described a program that also writes as if it declared
+            // nothing, which is narrower than what the program may do. The
+            // resolved children are kept, the unresolved ones are reported as
+            // unresolved, and the composite stays conservative because an
+            // unresolved composite is unknown/Secret with the widest
+            // permission - so the decision still fails closed.
+            let (children, child_indices, unresolved) = match preflight.as_ref() {
+                Ok(calls) => self.orchestration_child_effects_partial(calls),
+                Err(_) => (Vec::new(), Vec::new(), true),
+            };
             let floor = preflight
                 .as_ref()
                 .map(|calls| {
@@ -588,15 +618,14 @@ impl ToolHostLease {
                     })
                 })
                 .unwrap_or(ToolPermissionMode::DangerFullAccess);
-            let unresolved = effects.is_err();
-            let children = effects.unwrap_or_default();
             let mut fingerprints = preflight
                 .as_ref()
                 .ok()
                 .into_iter()
                 .flatten()
-                .zip(&children)
-                .map(|(call, child)| {
+                .zip(child_indices.iter())
+                .map(|(call, index)| {
+                    let child = &children[*index];
                     format!(
                         "{}:{}:{}:{}",
                         call.step_id,
@@ -627,42 +656,126 @@ impl ToolHostLease {
         calls
             .iter()
             .map(|call| {
-                if !crate::executor::is_allowed_orchestration_tool(&call.tool)
-                    || !self.snapshot.catalog.contains(&call.tool)
-                {
-                    return Err(format!(
-                        "tool_orchestrate cannot dispatch pinned child `{}`",
-                        call.tool
-                    ));
-                }
-                let resolver = self.snapshot.catalog.effect_resolver(&call.tool);
-                let permission = self
-                    .snapshot
-                    .catalog
-                    .required_permission(&call.tool)
-                    .ok_or_else(|| format!("missing pinned permission for `{}`", call.tool))?;
-                let effect = if call.references.is_empty() {
-                    self.describe_effect_resolution(&call.tool, &call.input)
-                } else {
-                    crate::tool_orchestrator::resolve_orchestration_child_effect_resolution(
-                        &resolver,
-                        &call.tool,
-                        &call.input,
-                        permission,
-                        &call.references,
-                    )?
-                };
-                if effect.descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Unknown
-                {
-                    return Err(format!(
-                        "tool_orchestrate cannot prove complete effects for `{}` at {} ({})",
-                        call.tool, call.step_id, call.operation
-                    ));
-                }
-                Ok(effect)
+                self.orchestration_child_effect(call)
+                    .map_err(|failure| failure.reason)
             })
             .collect()
     }
+
+    /// Resolve the child effects that can be proven and report whether any
+    /// child could not be resolved, together with the index of each resolved
+    /// child so a fingerprint still pairs a step with its own effect.
+    pub(crate) fn orchestration_child_effects_partial(
+        &self,
+        calls: &[crate::executor::orchestrate::PreflightCall],
+    ) -> (Vec<ToolEffectResolution>, Vec<usize>, bool) {
+        let mut children = Vec::new();
+        let mut indices = Vec::new();
+        let mut unresolved = false;
+        for (index, call) in calls.iter().enumerate() {
+            match self.orchestration_child_effect(call) {
+                Ok(effect) => {
+                    children.push(effect);
+                    indices.push(index);
+                }
+                Err(failure) if failure.unprovable => {
+                    // The effect of this child cannot be proven, so the
+                    // program may touch anything: no exact scope may be
+                    // claimed and every child is dropped.
+                    return (Vec::new(), Vec::new(), true);
+                }
+                Err(_) => unresolved = true,
+            }
+        }
+        (children, indices, unresolved)
+    }
+
+    /// Whether this child's own declared file scope is invalid rather than
+    /// merely unproven.
+    ///
+    /// A bounded compute declares the exact files it may read through
+    /// `input_files`. A compute step that does not declare them violates that
+    /// contract, and the call is refused at execution; the effects the sibling
+    /// steps declared are still true, so they stay in the description. Any
+    /// other effect that cannot be proven leaves the whole program
+    /// unprovable, and then no exact scope may be claimed at all.
+    fn child_declares_an_invalid_file_scope(
+        &self,
+        call: &crate::executor::orchestrate::PreflightCall,
+    ) -> bool {
+        if call.tool == "execute_code" {
+            return crate::sandbox_exec::bounded_compute_input_files(&call.input).is_err();
+        }
+        crate::executor::orchestrate::original_static_file_scopes(&call.tool, &call.input).is_err()
+    }
+
+    fn orchestration_child_effect(
+        &self,
+        call: &crate::executor::orchestrate::PreflightCall,
+    ) -> Result<ToolEffectResolution, ChildEffectFailure> {
+        {
+            if !crate::executor::is_allowed_orchestration_tool(&call.tool)
+                || !self.snapshot.catalog.contains(&call.tool)
+            {
+                return Err(ChildEffectFailure::unprovable(format!(
+                    "tool_orchestrate cannot dispatch pinned child `{}`",
+                    call.tool
+                )));
+            }
+            let resolver = self.snapshot.catalog.effect_resolver(&call.tool);
+            let permission = self
+                .snapshot
+                .catalog
+                .required_permission(&call.tool)
+                .ok_or_else(|| {
+                    ChildEffectFailure::unprovable(format!(
+                        "missing pinned permission for `{}`",
+                        call.tool
+                    ))
+                })?;
+            let effect = if call.references.is_empty() {
+                self.describe_effect_resolution(&call.tool, &call.input)
+            } else {
+                crate::tool_orchestrator::resolve_orchestration_child_effect_resolution(
+                    &resolver,
+                    &call.tool,
+                    &call.input,
+                    permission,
+                    &call.references,
+                )
+                .map_err(|reason| {
+                    if self.child_declares_an_invalid_file_scope(call) {
+                        ChildEffectFailure::invalid_input(reason)
+                    } else {
+                        ChildEffectFailure::unprovable(reason)
+                    }
+                })?
+            };
+            if effect.descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Unknown
+            {
+                // Two different failures must not be described the same way.
+                // A child whose OWN input violates its contract (a compute
+                // step without a declared file set, for example) is an invalid
+                // call: the program is refused at execution, and the effects
+                // the sibling steps declared are still true, so they stay in
+                // the description. A child whose effect simply cannot be
+                // proven (a dynamic input) leaves the whole program
+                // unprovable, and then no exact scope may be claimed at all.
+                let invalid_input = self.child_declares_an_invalid_file_scope(call);
+                let reason = format!(
+                    "tool_orchestrate cannot prove complete effects for `{}` at {} ({})",
+                    call.tool, call.step_id, call.operation
+                );
+                return Err(if invalid_input {
+                    ChildEffectFailure::invalid_input(reason)
+                } else {
+                    ChildEffectFailure::unprovable(reason)
+                });
+            }
+            Ok(effect)
+        }
+    }
+
 
     /// Validate model-supplied input against the exact Tool definition pinned
     /// by this request. This boundary runs before policy negotiation so an
@@ -2779,12 +2892,12 @@ mod tests {
             .scopes
             .iter()
             .any(|scope| scope.target.as_deref() == Some("https://skipped.invalid")));
-        assert!(effect
+        assert!(!effect
             .scopes
             .iter()
             .any(|scope| scope.resource == PermissionResource::Shell
                 && scope.operation == PermissionOperation::Execute));
-        assert!(effect
+        assert!(!effect
             .scopes
             .iter()
             .any(|scope| scope.resource == PermissionResource::File

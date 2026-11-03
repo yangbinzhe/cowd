@@ -303,17 +303,20 @@ struct ProviderEntryTemplate {
     client: ProviderClient,
     profile: ResolvedProviderProfile,
     transport_fingerprint: crate::TransportProfileFingerprint,
+    diagnostic_send_reason: Option<String>,
 }
 
 impl ProviderEntryTemplate {
     fn request_entry(&self) -> ProviderEntry {
+        let request_id = uuid::Uuid::new_v4().to_string();
         ProviderEntry {
             model: self.model.clone(),
-            client: self.client.clone(),
+            client: self.client.clone().with_original_provider_request_id(request_id.clone()),
             request_context: ProviderRequestContext {
-                request_id: uuid::Uuid::new_v4().to_string(),
+                request_id,
                 profile: self.profile.clone(),
                 transport_fingerprint: self.transport_fingerprint,
+                diagnostic_send_reason: self.diagnostic_send_reason.clone(),
                 attempt: 1,
             },
         }
@@ -325,6 +328,9 @@ struct ProviderTemplateCacheKey {
     registry_revision: u64,
     model: String,
     transport_fingerprint: crate::TransportProfileFingerprint,
+    /// The identity of the installed physical send authority. A template
+    /// built without one must never be served to a client that has one.
+    physical_send_identity: Option<String>,
 }
 
 #[derive(Default)]
@@ -340,6 +346,8 @@ struct ProviderTemplateCacheState {
 /// cannot reuse a stale route.
 pub struct ProviderClientTemplateCache {
     state: std::sync::Mutex<ProviderTemplateCacheState>,
+    physical_send_factory: std::sync::OnceLock<Arc<crate::physical_send_owner::RuntimePhysicalSendFactory>>,
+    diagnostic_send: Option<Arc<provider::DiagnosticPhysicalSend>>,
     max_entries: usize,
     hits: AtomicU64,
     builds: AtomicU64,
@@ -365,6 +373,8 @@ impl ProviderClientTemplateCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             state: std::sync::Mutex::new(ProviderTemplateCacheState::default()),
+            physical_send_factory: std::sync::OnceLock::new(),
+            diagnostic_send: None,
             max_entries: max_entries.max(1),
             hits: AtomicU64::new(0),
             builds: AtomicU64::new(0),
@@ -372,11 +382,29 @@ impl ProviderClientTemplateCache {
         }
     }
 
+    /// Explicit operator-selected diagnostic mode, fixed before sharing this cache.
+    pub fn diagnostic(reason: &str) -> Result<Self, String> {
+        let mut cache = Self::default();
+        cache.diagnostic_send = Some(Arc::new(provider::DiagnosticPhysicalSend::new(reason)?));
+        Ok(cache)
+    }
+
+    /// Install only a capability already authenticated by the original owner.
+    /// Existing and future clients share it, while request identities are
+    /// bound separately at the actual attempt.
+    pub(crate) fn install_physical_send_factory(
+        &self,
+        factory: Arc<crate::physical_send_owner::RuntimePhysicalSendFactory>,
+    ) -> Result<(), &'static str> {
+        self.physical_send_factory.set(factory).map_err(|_| "physical send factory already installed")
+    }
+
     fn resolve(
         &self,
         snapshot: &ProviderRegistrySnapshot,
         transport_pool: &crate::ProviderTransportPool,
         model: &str,
+        physical_send_authority: Option<Arc<provider::PhysicalSendAuthority>>,
     ) -> Result<ProviderEntry, String> {
         let resolved = model.trim().to_string();
         let (transport_fingerprint, http) = transport_pool
@@ -386,6 +414,9 @@ impl ProviderClientTemplateCache {
             registry_revision: snapshot.revision(),
             model: resolved.clone(),
             transport_fingerprint,
+            physical_send_identity: physical_send_authority.as_ref()
+                .map(|authority| format!("authenticated:{}", authority.attestation().nonce))
+                .or_else(|| self.diagnostic_send.as_ref().map(|diagnostic| format!("diagnostic:{}", provider::body_digest(diagnostic.reason().as_bytes())))),
         };
         {
             let mut state = self
@@ -399,7 +430,14 @@ impl ProviderClientTemplateCache {
             }
         }
 
-        let template = build_provider_template(snapshot, transport_fingerprint, http, &resolved)?;
+        let template = build_provider_template(
+            snapshot,
+            transport_fingerprint,
+            http,
+            &resolved,
+            physical_send_authority,
+            self.diagnostic_send.clone(),
+        )?;
         let entry = template.request_entry();
         let mut state = self
             .state
@@ -473,6 +511,9 @@ pub struct ProviderRequestContext {
     pub request_id: String,
     pub profile: ResolvedProviderProfile,
     pub transport_fingerprint: crate::TransportProfileFingerprint,
+    /// Explicitly unauthenticated operator diagnostic; never acceptance evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_send_reason: Option<String>,
     pub attempt: u32,
 }
 
@@ -878,6 +919,9 @@ pub trait ProviderWireEvidenceWriter: Send + Sync {
 
 #[derive(Clone)]
 pub struct ProviderRuntimeClient {
+    /// The installed physical send authority. Without one every provider send
+    /// is refused before it leaves the process.
+    physical_send_authority: Option<Arc<provider::PhysicalSendAuthority>>,
     preparation_resources: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
     control_admission: Option<ControlResourceAdmission>,
     wire_preparations: Arc<AtomicU64>,
@@ -1032,6 +1076,25 @@ impl futures::Stream for ProviderEventStream {
 }
 
 impl ProviderRuntimeClient {
+    /// The identity of the installed physical send authority, used to key the
+    /// provider template cache so an authority is never silently dropped.
+    fn physical_send_identity(&self) -> Option<String> {
+        self.physical_send_authority
+            .as_ref()
+            .map(|authority| authority.attestation().nonce.clone())
+    }
+
+    /// Install the physical send authority. Without one every provider send is
+    /// refused before it leaves the process.
+    #[must_use]
+    pub fn with_physical_send_authority(
+        mut self,
+        authority: Arc<provider::PhysicalSendAuthority>,
+    ) -> Self {
+        self.physical_send_authority = Some(authority);
+        self
+    }
+
     pub fn new(
         registry: Arc<ProviderRegistry>,
         model: String,
@@ -1068,8 +1131,9 @@ impl ProviderRuntimeClient {
         tool_definitions: Vec<ToolDefinition>,
     ) -> Result<Self, String> {
         let snapshot = registry.pin();
-        template_cache.resolve(&snapshot, &transport_pool, &model)?;
+        template_cache.resolve(&snapshot, &transport_pool, &model, None)?;
         Ok(Self {
+            physical_send_authority: None,
             preparation_resources: None,
             control_admission: None,
             wire_preparations: Arc::new(AtomicU64::new(0)),
@@ -1220,10 +1284,16 @@ impl ProviderRuntimeClient {
         max_tokens: u32,
     ) -> Result<PreparedControlAnalysis, String> {
         let snapshot = self.registry.pin();
-        let entry = self
-            .template_cache
-            .resolve(&snapshot, &self.transport_pool, model)?;
+        let entry = self.template_cache.resolve(
+            &snapshot,
+            &self.transport_pool,
+            model,
+            self.physical_send_authority.clone(),
+        )?;
         self.validate_control_account(&entry)?;
+        if entry.request_context.diagnostic_send_reason.is_some() {
+            return Err("diagnostic control analysis lacks a bound original provider Step".into());
+        }
         let capacity = snapshot.context_window_resolution(model);
         if capacity.source == provider::ModelContextWindowSource::Assumed {
             return Err(
@@ -1592,13 +1662,21 @@ fn build_provider_entry(
     snapshot: &ProviderRegistrySnapshot,
     transport_pool: &crate::ProviderTransportPool,
     model: &str,
+    physical_send_authority: Option<Arc<provider::PhysicalSendAuthority>>,
 ) -> Result<ProviderEntry, String> {
     let resolved = model.trim().to_string();
     let (transport_fingerprint, http) = transport_pool
         .checkout_default()
         .map_err(|error| error.to_string())?;
-    build_provider_template(snapshot, transport_fingerprint, http, &resolved)
-        .map(|template| template.request_entry())
+    build_provider_template(
+        snapshot,
+        transport_fingerprint,
+        http,
+        &resolved,
+        physical_send_authority,
+        None,
+    )
+    .map(|template| template.request_entry())
 }
 
 fn build_provider_template(
@@ -1606,6 +1684,8 @@ fn build_provider_template(
     transport_fingerprint: crate::TransportProfileFingerprint,
     http: reqwest::Client,
     resolved: &str,
+    physical_send_authority: Option<Arc<provider::PhysicalSendAuthority>>,
+    diagnostic_send: Option<Arc<provider::DiagnosticPhysicalSend>>,
 ) -> Result<ProviderEntryTemplate, String> {
     let (
         client,
@@ -1647,6 +1727,14 @@ fn build_provider_template(
             ));
         }
     };
+    let (client, diagnostic_send_reason) = match (physical_send_authority, diagnostic_send) {
+        (Some(authority), _) => (client.with_physical_send_authority(authority), None),
+        (None, Some(diagnostic)) => {
+            let reason = diagnostic.reason().to_owned();
+            (client.with_diagnostic_physical_send(diagnostic), Some(reason))
+        }
+        (None, None) => (client, None),
+    };
     Ok(ProviderEntryTemplate {
         model: resolved.to_string(),
         client,
@@ -1666,6 +1754,7 @@ fn build_provider_template(
             capabilities,
         },
         transport_fingerprint,
+        diagnostic_send_reason,
     })
 }
 
@@ -1920,6 +2009,28 @@ impl ProviderRuntimeClient {
                     skill_source: request.preparation.skill_source.take(),
                 };
                 fence.validate()?;
+                if let Some(factory) = owner.template_cache.physical_send_factory.get() {
+                    let context = request.provider_evidence_context.as_ref().ok_or_else(|| {
+                        RuntimeError::new("physical send requires the original provider request context")
+                    })?;
+                    let step = request.bound_step.as_ref().ok_or_else(|| {
+                        RuntimeError::new("physical send requires the original bound Step")
+                    })?;
+                    let authority = factory
+                        .for_provider_attempt(context, step.snapshot(), &entry.request_context.request_id)
+                        .map_err(|error| RuntimeError::new(format!("physical send identity: {error}")))?;
+                    entry.client = entry.client.with_physical_send_authority(authority);
+                    entry.request_context.diagnostic_send_reason = None;
+                }
+                if entry.request_context.diagnostic_send_reason.is_some()
+                    && (request.provider_evidence_context.is_none()
+                        || request.bound_step.is_none()
+                        || owner.provider_wire_evidence_writer.is_none())
+                {
+                    return Err(RuntimeError::new(
+                        "diagnostic Provider send requires the original request context, bound Step and evidence writer",
+                    ));
+                }
                 let result = forward_provider_attempt(
                     entry,
                     Some(request.prompt.composition()),
@@ -2178,7 +2289,12 @@ impl ProviderRuntimeClient {
         if required_tool_name.is_some_and(|name| !active_tools.iter().any(|tool| tool.name == name)) {
             return Err(RuntimeError::new("required governed tool is not exposed"));
         }
-        let mut entry = self.template_cache.resolve(snapshot, &self.transport_pool, &request.model)
+        let mut entry = self.template_cache.resolve(
+            snapshot,
+            &self.transport_pool,
+            &request.model,
+            self.physical_send_authority.clone(),
+        )
             .map_err(|error| RuntimeError::new(format!("provider candidate unavailable: {error}")))?;
         if self.transport_pool.provider_account_is_fenced(
             entry.request_context.profile.registry_revision,
@@ -3736,6 +3852,7 @@ mod tests {
                 capabilities: ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(1),
+            diagnostic_send_reason: None,
             attempt: 1,
         };
         let wire = |stable: &str, tail: &str| provider::ProviderWireRequest {
@@ -3809,6 +3926,7 @@ mod tests {
                 capabilities: ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(1),
+            diagnostic_send_reason: None,
             attempt: 1,
         };
         let wire = |system: &str| provider::ProviderWireRequest {
@@ -3875,6 +3993,7 @@ mod tests {
                 capabilities: ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(1),
+            diagnostic_send_reason: None,
             attempt: 1,
         };
         let wire = |tool: &str| provider::ProviderWireRequest {
@@ -6704,7 +6823,7 @@ mod tests {
         let snapshot = registry.pin();
         let pool = ProviderTransportPool::new(1);
 
-        let error = match build_provider_entry(&snapshot, &pool, "claude-implicit") {
+        let error = match build_provider_entry(&snapshot, &pool, "claude-implicit", None) {
             Ok(_) => panic!("unconfigured models must not infer a provider from the environment"),
             Err(error) => error,
         };
@@ -6853,8 +6972,8 @@ mod tests {
         let snapshot = registry.pin();
         let pool = ProviderTransportPool::new(2);
 
-        let first = build_provider_entry(&snapshot, &pool, "primary").expect("first");
-        let second = build_provider_entry(&snapshot, &pool, "primary").expect("second");
+        let first = build_provider_entry(&snapshot, &pool, "primary", None).expect("first");
+        let second = build_provider_entry(&snapshot, &pool, "primary", None).expect("second");
 
         assert_ne!(
             first.request_context.request_id,
@@ -6890,10 +7009,10 @@ mod tests {
         let cache = super::ProviderClientTemplateCache::new(2);
 
         let first = cache
-            .resolve(&snapshot, &pool, "primary")
+            .resolve(&snapshot, &pool, "primary", None)
             .expect("first route");
         let second = cache
-            .resolve(&snapshot, &pool, "primary")
+            .resolve(&snapshot, &pool, "primary", None)
             .expect("cached route");
 
         assert_ne!(

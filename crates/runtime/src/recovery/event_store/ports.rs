@@ -13,6 +13,31 @@ pub enum RuntimeProjectionWorkClass {
     Recovery,
 }
 
+/// Original Session claim passed to the backend transaction owner. The
+/// Session backend still authenticates all fields while holding its row locks.
+pub struct RuntimeOriginalSessionClaim<'a> {
+    pub session_id: &'a str,
+    pub ingress_message_id: &'a str,
+    pub turn_id: &'a str,
+    pub fence: &'a session::SessionTerminalExecutionFence,
+    pub consumed_input_sequence: usize,
+}
+
+/// Backend-owned decision for one cancellable event transaction. A cancel
+/// request is not an acknowledgement until the backend confirms rollback.
+pub trait RuntimeTransactionCommitControl: Send + Sync {
+    /// Requests cancellation; true means cancellation won the decision race,
+    /// not that rollback has completed or the database has acknowledged it.
+    fn request_cancel(&self) -> bool;
+    fn begin(&self) -> Result<bool, String>;
+    fn before_commit(&self);
+    fn commit_wins(&self) -> Result<bool, String>;
+    fn finish(&self, outcome: RuntimeTransactionOutcome);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeTransactionOutcome { Committed, RolledBack, Unknown }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeEventScope {
@@ -137,6 +162,12 @@ pub enum RuntimeEventStoreError {
         expected: u64,
         actual: u64,
     },
+    /// Backend-confirmed rollback of the current checked attempt. This is not
+    /// a claim that no competing transaction with the same ID can exist.
+    #[error("checked transaction attempt rolled back: {0}")]
+    CheckedAttemptRolledBack(Box<RuntimeEventStoreError>),
+    #[error("original member authority expired before checked commit")]
+    CurrentMemberAuthorityExpired,
     #[error("invalid runtime event transaction: {0}")]
     InvalidTransaction(String),
     #[error("decision lease `{lease_id}` has already been consumed")]
@@ -683,7 +714,7 @@ impl From<&str> for PositionPageError {
     fn from(value: &str) -> Self { Self::Other(value.to_owned()) }
 }
 
-pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
+pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync + std::any::Any {
     #[cfg(any(test, feature = "test-fixtures"))]
     fn fixture_evidence_page(
         &self,
@@ -737,6 +768,17 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
             "prepared root probe unsupported".into(),
         ))
     }
+    /// Retrieve the durable original transaction; unsupported is not absence.
+    fn original_transaction_receipt(&self, _transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        Err(RuntimeEventStoreError::InvalidTransaction("original transaction receipt probe unsupported".into()))
+    }
+    /// Read the source validation recorded by the original checked transaction.
+    /// A missing record is not proof that the transaction rolled back.
+    fn original_checked_transaction_receipt(&self, _transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        Err(RuntimeEventStoreError::InvalidTransaction("original checked transaction receipt probe unsupported".into()))
+    }
     fn transaction_stream_revision_exact(
         &self,
         transaction_id: &str,
@@ -752,6 +794,11 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+    fn append_transaction_cancellable(
+        &self, _request: AppendTransactionRequest, _control: &dyn RuntimeTransactionCommitControl,
+    ) -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        Err(RuntimeEventStoreError::InvalidTransaction("backend has no cancellable transaction owner".into()))
+    }
     fn append_checked_transaction(
         &self,
         _request: CheckedAppendRequest,
@@ -760,6 +807,36 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         Err(RuntimeEventStoreError::InvalidTransaction(
             "backend does not support checked-source transactions".into(),
         ))
+    }
+    /// Checked source validation and cancellation must share the backend's
+    /// physical transaction and original commit-control decision.
+    fn append_checked_transaction_cancellable(
+        &self,
+        _request: CheckedAppendRequest,
+        _validator: &dyn CheckedSourceValidator,
+        _control: &dyn RuntimeTransactionCommitControl,
+        _claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        Err(RuntimeEventStoreError::InvalidTransaction(
+            "backend has no checked cancellable transaction owner".into(),
+        ))
+    }
+    /// Authenticate an already committed checked terminal. Absence means only
+    /// that no winner was observed, never that an earlier attempt rolled back.
+    fn original_checked_terminal_winner(
+        &self, _request: &CheckedAppendRequest, _terminal: &SessionTerminalInput,
+        _validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        Err(RuntimeEventStoreError::InvalidTransaction("backend has no checked terminal winner owner".into()))
+    }
+    /// Terminal, checked sources, original Session claim and commit control
+    /// share the same backend transaction. Unsupported owners fail closed.
+    fn append_checked_terminal_cancellable(
+        &self, _request: CheckedAppendRequest, _terminal: SessionTerminalInput,
+        _validator: &dyn CheckedSourceValidator, _control: &dyn RuntimeTransactionCommitControl,
+        _claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        Err(RuntimeEventStoreError::InvalidTransaction("backend has no checked terminal transaction owner".into()))
     }
     fn append_transaction_with_terminal(
         &self,

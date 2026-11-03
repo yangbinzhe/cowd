@@ -301,6 +301,7 @@ fn model_can_read_advice_without_mutating_program_or_gaining_permissions() {
     }
     let cursor = store.current_commit_cursor();
     let actor = AgentActorBinding {
+        original_execution: None,
         objective_id: "new-objective".into(),
         program_id: "new-program".into(),
         session_id: "new-session".into(),

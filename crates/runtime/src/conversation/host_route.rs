@@ -235,6 +235,18 @@ where
             .install_provider_cancellation_control(control)
     }
 
+    pub(crate) fn set_original_session_claim(&mut self, claim: Option<Arc<crate::execution_core::services::OriginalSessionClaim>>) {
+        self.runtime_mut().set_original_session_claim(claim);
+    }
+
+    pub(crate) fn set_session_execution_fence(&mut self, fence: crate::SessionExecutionFence) {
+        self.runtime_mut().set_session_execution_fence(fence);
+    }
+
+    pub(crate) fn install_original_policy_input_context(&mut self, input: crate::SessionInputStream, requested: Arc<crate::conversation::OriginalTurnInputControl>) {
+        self.runtime_mut().install_original_policy_input_context(input, requested);
+    }
+
     /// The original host keeps this same scope when its turn controls change.
     pub fn hook_execution_scope(&self) -> crate::HookExecutionScope {
         self.hook_scope.clone()
@@ -597,7 +609,7 @@ where
                                 ),
                             )
                         });
-                        let runtime = runtime;
+                        let mut runtime = runtime;
                         let fence = match usize::try_from(ingress.input_sequence) {
                             Ok(input_sequence) => match services.session_query_port() {
                                 Some(query) => crate::SessionExecutionFence::from_claim(
@@ -620,7 +632,25 @@ where
                             )),
                         };
                         let (runtime, result) = match fence {
-                            Ok(fence) => match submit_owned_conversation_turn_with_ingress(
+                            Ok(fence) => match execution_bus_lease.as_ref()
+                                .map(|lease| runtime.original_turn_control().and_then(|control| {
+                                    let (input, requested) = runtime.original_policy_input_context(&ingress.turn_id);
+                                    lease.install_session_fence(&ingress, fence.clone(), control, input, requested, runtime.permission_policy().clone())
+                                }))
+                                .transpose()
+                            {
+                                Err(error) => (Some(runtime), Err(RuntimeError::new(error))),
+                                Ok(claim) => {
+                                runtime.set_original_session_claim(claim);
+                                runtime.set_session_execution_fence(fence.clone());
+                                if let Some(lease) = execution_bus_lease.as_ref() {
+                                    let owner = Arc::new(runtime.shared_policy_owner());
+                                    if let Err(error) = lease.install_session_policy_owner(owner) {
+                                        let _ = completion_sender.send((Some(runtime), Err(RuntimeError::new(error))));
+                                        return;
+                                    }
+                                }
+                                match submit_owned_conversation_turn_with_ingress(
                                 runtime.with_session_execution_fence(fence),
                                 services,
                                 &content,
@@ -636,6 +666,8 @@ where
                             {
                                 Ok((runtime, result)) => (Some(runtime), result),
                                 Err(error) => (None, Err(error)),
+                            }
+                            },
                             },
                             Err(error) => (Some(runtime), Err(RuntimeError::new(error))),
                         };

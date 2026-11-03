@@ -46,6 +46,7 @@ mod ingress;
 mod lifecycle;
 mod query;
 mod terminal;
+pub use terminal::{lock_runtime_input_claim_tx, lock_runtime_input_claim_with_consumed_tx};
 
 const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
     id: "session.current-baseline",

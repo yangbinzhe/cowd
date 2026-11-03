@@ -2,6 +2,1323 @@
 
 use super::*;
 
+/// Evidence collected only while the original single-call policy producer runs.
+/// This collector is separate from the batch-member admission machinery.
+#[derive(Default)]
+pub(crate) struct OriginalSingleProducerCapture {
+    events: std::sync::Mutex<Vec<crate::DurableRuntimeEvent>>,
+    owner: std::sync::Mutex<Option<Arc<SharedPolicyOwner>>>,
+    permission_context: std::sync::Mutex<Option<PermissionContext>>,
+    original_decision: std::sync::Mutex<Option<crate::execution_core::RuntimeExecutionDecision>>,
+    decision_conflict: std::sync::atomic::AtomicBool,
+}
+tokio::task_local! {
+    static SINGLE_ORIGINAL_EVIDENCE: Arc<OriginalSingleProducerCapture>;
+}
+impl OriginalSingleProducerCapture {
+    pub(crate) fn bind_original_decision(&self, decision: &crate::execution_core::RuntimeExecutionDecision) {
+        let mut original = self.original_decision.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match original.as_ref() {
+            None => *original = Some(decision.clone()),
+            Some(existing) if existing == decision => {},
+            Some(_) => self.decision_conflict.store(true, std::sync::atomic::Ordering::Release),
+        }
+    }
+    pub(crate) fn with_original_decision<T>(&self, use_decision: impl FnOnce(Option<&crate::execution_core::RuntimeExecutionDecision>) -> Result<T, String>) -> Result<T, String> {
+        let original = self.original_decision.lock().map_err(|_| "original decision owner unavailable")?;
+        if self.decision_conflict.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("original decision owner conflict".into());
+        }
+        use_decision(original.as_ref())
+    }
+    pub(crate) fn original_decision(&self) -> Option<crate::execution_core::RuntimeExecutionDecision> {
+        let original = self.original_decision.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.decision_conflict.load(std::sync::atomic::Ordering::Acquire) { return None; }
+        original.clone()
+    }
+    pub(crate) fn permission_context(&self) -> Option<PermissionContext> {
+        self.permission_context.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+    pub(crate) fn owner(&self) -> Option<Arc<SharedPolicyOwner>> {
+        self.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+    pub(crate) fn events(&self) -> Vec<crate::DurableRuntimeEvent> {
+        self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+    pub(crate) async fn scope<F: std::future::Future>(self: Arc<Self>, work: F) -> F::Output {
+        SINGLE_ORIGINAL_EVIDENCE.scope(self, work).await
+    }
+}
+
+/// Inputs for the future single-call checked append, borrowed only while the
+/// original policy and ordered stream locks are held. No public constructor:
+/// the producer and its commit owner must authenticate every field first.
+pub(crate) struct RootSingleCheckedInputs<'a> {
+    pub(crate) held: &'a crate::runtime_event_store::HeldStreamLocks<'a>,
+    pub(crate) sources: &'a [crate::ExpectedStreamRevision],
+    pub(crate) control: Arc<crate::conversation::MemberCommitControl>,
+    pub(crate) claim: &'a crate::execution_core::services::OriginalSessionClaim,
+    pub(crate) consumed_input_sequence: usize,
+    pub(crate) ticket: &'a crate::execution_core::graph::NodeExecutionTicket,
+    pub(crate) request: &'a crate::RuntimeToolExecutionRequest,
+    pub(crate) assessment_event: &'a crate::DurableRuntimeEvent,
+    pub(crate) lease_event: &'a crate::DurableRuntimeEvent,
+    pub(crate) original_events: &'a [crate::DurableRuntimeEvent],
+    pub(crate) original_decision: &'a crate::execution_core::RuntimeExecutionDecision,
+    _original_owner_seal: (),
+}
+
+/// Both variants carry a private producer seal. `None` is only exposed for
+/// an authenticated delegated owner, never as an authorization by itself.
+pub(crate) enum OriginalSingleCheckedInputs<'a> {
+    Root(RootSingleCheckedInputs<'a>),
+    Delegated(crate::agentic::action_invocation::DelegatedSingleCheckedInputs<'a>),
+}
+impl<'a> OriginalSingleCheckedInputs<'a> {
+    pub(crate) fn held(&self) -> &crate::runtime_event_store::HeldStreamLocks<'a> {
+        match self { Self::Root(v) => v.held, Self::Delegated(v) => v.held }
+    }
+    pub(crate) fn sources(&self) -> &[crate::ExpectedStreamRevision] {
+        match self { Self::Root(v) => v.sources, Self::Delegated(v) => v.sources }
+    }
+    pub(crate) fn control(&self) -> Arc<crate::conversation::MemberCommitControl> {
+        match self { Self::Root(v) => Arc::clone(&v.control), Self::Delegated(v) => Arc::clone(&v.control) }
+    }
+    pub(crate) fn claim(&self) -> &crate::execution_core::services::OriginalSessionClaim {
+        match self { Self::Root(v) => v.claim, Self::Delegated(v) => v.claim }
+    }
+    pub(crate) fn consumed_input_sequence(&self) -> usize {
+        match self { Self::Root(v) => v.consumed_input_sequence, Self::Delegated(v) => v.consumed_input_sequence }
+    }
+    pub(crate) fn ticket(&self) -> &crate::execution_core::graph::NodeExecutionTicket {
+        match self { Self::Root(v) => v.ticket, Self::Delegated(v) => v.ticket }
+    }
+    pub(crate) fn request(&self) -> &crate::RuntimeToolExecutionRequest {
+        match self { Self::Root(v) => v.request, Self::Delegated(v) => v.request }
+    }
+    pub(crate) fn original_events(&self) -> &[crate::DurableRuntimeEvent] {
+        match self { Self::Root(v) => v.original_events, Self::Delegated(v) => v.original_events }
+    }
+    pub(crate) fn original_decision(&self) -> Option<&crate::execution_core::RuntimeExecutionDecision> {
+        match self { Self::Root(v) => Some(v.original_decision), Self::Delegated(v) => v.original_decision }
+    }
+    pub(crate) fn is_delegated(&self) -> bool { matches!(self, Self::Delegated(_)) }
+}
+
+// Captures only events actually returned by the original assessment/lease writer.
+tokio::task_local! {
+    static MEMBER_ORIGINAL_EVIDENCE: Arc<std::sync::Mutex<Vec<crate::DurableRuntimeEvent>>>;
+}
+fn capture_member_event(event: crate::DurableRuntimeEvent) {
+    let _ = SINGLE_ORIGINAL_EVIDENCE.try_with(|capture| {
+        capture.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(event.clone());
+    });
+    let _ = MEMBER_ORIGINAL_EVIDENCE.try_with(|events| {
+        events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(event);
+    });
+}
+
+tokio::task_local! {
+    static MEMBER_ORIGINAL_CONSUMPTION: Arc<std::sync::Mutex<Option<crate::authorization_negotiator::OriginalLeaseConsumption>>>;
+}
+pub(crate) fn capture_member_consumption(consumption: crate::authorization_negotiator::OriginalLeaseConsumption) {
+    let _ = MEMBER_ORIGINAL_CONSUMPTION.try_with(|slot| {
+        let mut current = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.is_none() { *current = Some(consumption); }
+    });
+}
+
+// Exact policy-request identity, carrying the original live policy control.
+// This is only the first mechanical extraction; no approval owner is inferred.
+struct SharedAuthorizationIdentity {
+    session_id: String,
+    agent_id: String,
+    execution: Option<crate::CowdExecutionContext>,
+    permission_policy: PermissionPolicy,
+}
+
+/// The original conversation policy owner's identity mapping. Callers must
+/// authenticate the Session and memory instance from the original call first.
+pub(crate) fn original_memory_authorization_identity(session: &str, agent: &str) -> (String, Option<String>) {
+    if agent == "primary" {
+        (format!("session:{session}"), None)
+    } else {
+        (format!("agent:{agent}"), Some(format!("binding:{agent}")))
+    }
+}
+
+impl SharedAuthorizationIdentity {
+    fn authorization_request(
+        &self,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        input: &str,
+        idempotency_key: String,
+        permission_context: PermissionContext,
+        execution_policy: &harness_contract::policy::SessionExecutionPolicy,
+    ) -> crate::AuthorizationRequest {
+        let execution_context = self.execution.as_ref();
+        let delegated = self.agent_id != "primary";
+        let (principal_id, parent_lease_id) = original_memory_authorization_identity(&self.session_id, &self.agent_id);
+        let recovery_scope = execution_context.as_ref().map_or_else(
+            || format!("session:{}", self.session_id.as_str()),
+            |context| format!("turn:{}", context.turn_id),
+        );
+        let safe_alternatives = crate::authorization_negotiator::safe_alternatives_for_effect(descriptor.effect_kind);
+        crate::AuthorizationRequest {
+            principal_id,
+            capability: descriptor.tool_id.clone(),
+            input: input.to_string(),
+            idempotency_key,
+            effect: descriptor.clone(),
+            parent_ceiling: if delegated {
+                self.permission_policy.active_mode()
+            } else {
+                crate::PermissionMode::DangerFullAccess
+            },
+            parent_lease_id,
+            policy_revision: execution_policy.revision,
+            recovery_scope,
+            context: permission_context,
+            safe_alternatives,
+        }
+    }
+
+}
+
+// The same original writer is used by the turn and by member policy work.
+// It retains B's call-refusal binding and the original event/transition writer.
+struct SharedAssessmentOwner {
+    session_id: String,
+    execution: Option<crate::CowdExecutionContext>,
+    cowd_bus: Option<Arc<crate::CowdEventBus>>,
+    runtime_event_store: Option<Arc<RuntimeEventStore>>,
+    authorization_negotiator: crate::AuthorizationNegotiator,
+}
+impl SharedAssessmentOwner {
+    fn cowd_bus(&self) -> Option<&crate::CowdEventBus> { self.cowd_bus.as_deref() }
+    fn record_capability_assessment_for_call(
+        &self,
+        assessment: &harness_contract::policy::CapabilityAssessment,
+        binding: Option<&serde_json::Value>,
+        permission_context: Option<&PermissionContext>,
+    ) -> Option<BoundPolicyAssessment> {
+        if let Some(cowd) = self.cowd_bus() {
+            cowd.emit(crate::cowd_event::CowdEvent::CapabilityAssessed {
+                assessment: assessment.clone(),
+            });
+        }
+        let mut refs = vec![RuntimeEventRef {
+            kind: "capability".to_string(),
+            id: assessment.capability.clone(),
+        }];
+        if let Some(lease) = assessment.lease.as_ref() {
+            refs.push(RuntimeEventRef {
+                kind: "authorization_lease".to_string(),
+                id: lease.lease_id.clone(),
+            });
+        }
+        if let Some(context) = self.execution.clone() {
+            for (kind, id) in [("execution", context.execution_id), ("session", context.session_id), ("turn", context.turn_id)] {
+                if !refs.iter().any(|reference| reference.kind == kind && reference.id == id) {
+                    refs.push(RuntimeEventRef { kind: kind.to_string(), id });
+                }
+            }
+        }
+        let assessment_event = self.runtime_event_store.as_ref().and_then(|store| {
+            let mut payload = match serde_json::to_value(assessment) {
+                Ok(payload) => payload,
+                Err(error) => { tracing::warn!(%error, "capability assessment serialization failed"); return None; }
+            };
+            if let Some(binding) = binding {
+                let Some(object) = payload.as_object_mut() else { return None; };
+                object.insert("_call_refusal_binding".into(), binding.clone());
+            }
+            if let Some(context) = permission_context {
+                let Some(object) = payload.as_object_mut() else { return None; };
+                let decision = context.override_decision().map(|decision| match decision {
+                    crate::permissions::PermissionOverride::Allow => "allow",
+                    crate::permissions::PermissionOverride::Deny => "deny",
+                    crate::permissions::PermissionOverride::Ask => "ask",
+                });
+                object.insert("_original_permission_context".into(), serde_json::json!({
+                    "override_decision": decision, "override_reason": context.override_reason(),
+                }));
+            }
+            match store.append(crate::RuntimeEventInput {
+                stream_id: format!("session:{}", self.session_id.as_str()),
+                scope: RuntimeEventScope::Tool,
+                kind: "authorization.capability_assessed".into(),
+                status: Some(format!("{:?}", assessment.path).to_ascii_lowercase()),
+                actor: Some("conversation_runtime".into()), refs, payload,
+            }) {
+                Ok(event) => {
+                    capture_member_event(event.clone());
+                    binding.map(|_| BoundPolicyAssessment { event })
+                },
+                Err(error) => { tracing::warn!(%error, "capability assessment append failed"); None }
+            }
+        });
+        let Some(store) = self.runtime_event_store.as_ref() else {
+            for transition in self.authorization_negotiator.drain_transitions() {
+                if let Some(cowd) = self.cowd_bus() {
+                    cowd.emit(crate::cowd_event::CowdEvent::AuthorizationLeaseTransition {
+                        transition,
+                    });
+                }
+            }
+            return assessment_event;
+        };
+        let _ = self
+            .authorization_negotiator
+            .take_transitions_for_persistence();
+        for transition in self
+            .authorization_negotiator
+            .transitions_awaiting_persistence()
+        {
+            // Authorization leases live on their own stream so parallel Team
+            // agents and early-tool grants never contend with session model
+            // events on the shared `session:<id>` stream.
+            let stream_id = format!("authorization-lease:{}", transition.lease.lease_id);
+            match crate::authorization_negotiator::persist_authorization_transition_event(
+                store,
+                &stream_id,
+                "conversation_runtime",
+                &transition,
+            ) {
+                Ok(event) => capture_member_event(event),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        transition_id = transition.transition_id,
+                        "authorization transition remains hot because durable append failed"
+                    );
+                    break;
+                }
+            }
+            if self
+                .authorization_negotiator
+                .acknowledge_persisted_transitions(std::slice::from_ref(&transition.transition_id))
+                == 1
+            {
+                if let Some(cowd) = self.cowd_bus() {
+                    cowd.emit(crate::cowd_event::CowdEvent::AuthorizationLeaseTransition {
+                        transition,
+                    });
+                }
+            }
+        }
+        assessment_event
+    }
+}
+
+// Both the direct turn and member admission must use these original owners.
+pub(crate) struct SharedPolicyOwner {
+    identity: SharedAuthorizationIdentity,
+    assessment: SharedAssessmentOwner,
+    approval_coordinator: Option<Arc<crate::ApprovalCoordinator>>,
+    cancellation: crate::CancellationToken,
+    session_input_stream: crate::session_input::SessionInputStream,
+    control_requested: Arc<crate::conversation::OriginalTurnInputControl>,
+    checkpoint_workspace_id: String,
+    memory_team_id: Option<String>,
+    activity: Option<harness_contract::projection::RuntimeActivityBinding>,
+    session_execution_fence: Option<crate::SessionExecutionFence>,
+    original_session_claim: Option<Arc<crate::execution_core::services::OriginalSessionClaim>>,
+    tool_lease: Option<tools::ToolHostLease>,
+    hook_runner: crate::HookRunner,
+    hook_abort_signal: crate::HookAbortSignal,
+    hook_progress_reporter: Arc<std::sync::Mutex<Option<Box<dyn crate::HookProgressReporter + Send>>>>,
+}
+
+/// Original member preparation owned by this policy instance. It is not an
+/// admission or a Fresh proof and cannot be serialized or constructed by callers.
+pub(crate) struct PreparedOriginalBatchPolicyInput {
+    claim: Arc<crate::execution_core::services::OriginalSessionClaim>,
+    original_turn: harness_contract::turn::TurnId,
+    fence: crate::SessionExecutionFence,
+    original_prepared: crate::step_snapshot::PreparedAgentBatchMember,
+    prepared: crate::step_snapshot::PreparedAgentBatchMember,
+    hook_effective: String,
+    effective: String,
+    context: PermissionContext,
+}
+impl PreparedOriginalBatchPolicyInput {
+    pub(crate) fn claim(&self) -> &Arc<crate::execution_core::services::OriginalSessionClaim> { &self.claim }
+    pub(crate) fn original_turn(&self) -> &harness_contract::turn::TurnId { &self.original_turn }
+    pub(crate) fn original(&self) -> &crate::step_snapshot::PreparedAgentBatchMember { &self.original_prepared }
+    pub(crate) fn prepared(&self) -> &crate::step_snapshot::PreparedAgentBatchMember { &self.prepared }
+    pub(crate) fn hook_effective(&self) -> &str { &self.hook_effective }
+    pub(crate) fn context(&self) -> &PermissionContext { &self.context }
+}
+
+/// Same-member assessment prepared by the original Host policy owner.
+/// It is written only by the original member checked transaction.
+pub(crate) struct PreparedHostMemberAssessment {
+    pub(crate) source: crate::ExpectedStreamRevision,
+    pub(crate) event: crate::RuntimeTransactionEventInput,
+}
+impl PreparedHostMemberAssessment {
+    pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
+    pub(crate) fn event(&self) -> &crate::RuntimeTransactionEventInput { &self.event }
+}
+
+/// Same original Host call and member preparation. This object is not a
+/// grant and does not establish a Fresh or committed member outcome.
+pub(crate) struct OriginalHostPreparedMember {
+    owner: Arc<SharedPolicyOwner>,
+    store: Arc<crate::RuntimeEventStore>,
+    reservation: Arc<crate::runtime_event_store::OriginalMemberReservation>,
+    fresh_effect: Arc<crate::execution_core::graph::OriginalFreshEffectOwner>,
+    ticket: crate::execution_core::graph::NodeExecutionTicket,
+    original: Arc<crate::RuntimeToolExecutionRequest>,
+    step: crate::step_snapshot::StepCallBinding,
+    original_prepared: crate::step_snapshot::PreparedAgentBatchMember,
+    prepared: crate::step_snapshot::PreparedAgentBatchMember,
+    hook_effective: String,
+    effective: String,
+    context: PermissionContext,
+    timeout_secs: u64,
+    claim: Arc<crate::execution_core::services::OriginalSessionClaim>,
+    fence: crate::SessionExecutionFence,
+}
+impl OriginalHostPreparedMember {
+    pub(crate) fn owner(&self) -> &Arc<SharedPolicyOwner> { &self.owner }
+    pub(crate) fn store(&self) -> &Arc<crate::RuntimeEventStore> { &self.store }
+    pub(crate) fn ticket(&self) -> &crate::execution_core::graph::NodeExecutionTicket { &self.ticket }
+    pub(crate) fn reservation(&self) -> &Arc<crate::runtime_event_store::OriginalMemberReservation> { &self.reservation }
+    fn reservation_is_current(&self) -> bool {
+        self.fresh_effect.matches_original(&self.store, &self.original)
+            && u64::try_from(self.prepared.index).is_ok_and(|index| self.reservation.matches_original(
+                &self.store, &self.prepared.outer_key, index, &self.ticket))
+    }
+    pub(crate) fn step(&self) -> &crate::step_snapshot::StepCallBinding { &self.step }
+    pub(crate) fn original_request(&self) -> &crate::RuntimeToolExecutionRequest { &self.original }
+    pub(crate) fn prepared(&self) -> &crate::step_snapshot::PreparedAgentBatchMember { &self.prepared }
+    pub(crate) fn original_prepared(&self) -> &crate::step_snapshot::PreparedAgentBatchMember { &self.original_prepared }
+    pub(crate) fn hook_effective_input(&self) -> &str { &self.hook_effective }
+    /// Same private outer-hook owner that produced this request. A must append
+    /// these facts with the original action/index and receipt, never infer
+    /// them from a later serialized request.
+    pub(crate) fn original_outer_hook_publication_facts(&self) -> Result<serde_json::Value, String> {
+        let hook = self.original_outer_hook_owner()?;
+        hook.publication_facts(&self.ticket, &self.original)
+    }
+    pub(crate) fn original_outer_hook_owner(&self) -> Result<Arc<crate::conversation::tool_plane::OriginalGovernedHook>, String> {
+        let hook = self.original.tool_progress.original_governed_hook()?
+            .ok_or("original outer hook owner unavailable")?;
+        hook.publication_facts(&self.ticket, &self.original)?;
+        Ok(hook)
+    }
+    pub(crate) fn claim(&self) -> &Arc<crate::execution_core::services::OriginalSessionClaim> { &self.claim }
+    pub(crate) fn fence(&self) -> &crate::SessionExecutionFence { &self.fence }
+    /// Called inside the original policy/source locks, with no await. The
+    /// returned claim and control are the same live turn owners that produced
+    /// this member, not values reconstructed from the action envelope.
+    pub(crate) fn locked_commit_context(&self)
+        -> Result<(Arc<crate::conversation::MemberCommitControl>, Arc<crate::execution_core::services::OriginalSessionClaim>, usize), String> {
+        let owner = &self.owner;
+        let turn = harness_contract::turn::TurnId::from_string(self.claim.turn_id());
+        if !self.reservation_is_current() || owner.cancellation.is_cancelled() || owner.control_requested.load(std::sync::atomic::Ordering::Acquire)
+            || owner.original_session_claim.as_ref().is_none_or(|claim| !Arc::ptr_eq(claim, &self.claim))
+            || owner.session_input_stream.active_turn_id().as_ref() != Some(&turn)
+            || chrono::Utc::now().timestamp_millis() >= self.step.snapshot.expires_at_ms {
+            return Err("original Host member turn or Step changed".into());
+        }
+        let fence = self.claim.fence()?;
+        let cursor = owner.session_input_stream.highest_consumed_cursor(&turn);
+        if owner.session_input_stream.active_turn_id().as_ref() != Some(&turn) {
+            return Err("original Host turn changed while reading cursor".into());
+        }
+        let consumed = match cursor {
+            Some(cursor) if cursor.generation == fence.session_generation =>
+                usize::try_from(cursor.sequence).map_err(|_| "original consumed cursor overflow")?.max(fence.input_sequence),
+            Some(_) => return Err("original consumed cursor generation mismatch".into()),
+            None => fence.input_sequence,
+        };
+        let control = owner.new_single_commit_control();
+        Ok((control, Arc::clone(&self.claim), consumed))
+    }
+    pub(crate) fn permission_context(&self) -> &PermissionContext { &self.context }
+    pub(crate) fn timeout_secs(&self) -> u64 { self.timeout_secs }
+    pub(crate) fn effective_input(&self) -> &str { &self.effective }
+    pub(crate) fn authorization_request(&self) -> Result<crate::AuthorizationRequest, String> {
+        if !self.reservation_is_current() || self.owner.cancellation.is_cancelled()
+            || self.owner.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("original Host member reservation unavailable or cancelled".into());
+        }
+        let snapshot = self.owner.identity.permission_policy.execution_policy_control().snapshot();
+        if snapshot.revision != self.original.policy_revision || snapshot.revision == 0 {
+            return Err("original Host member policy revision changed".into());
+        }
+        Ok(self.owner.identity.authorization_request(&self.prepared.effect, &self.effective,
+            self.prepared.identity.clone(), self.context.clone(), &snapshot))
+    }
+    pub(crate) fn prepare_member_assessment(
+        &self, assessment: &harness_contract::policy::CapabilityAssessment,
+        approval: Option<&harness_contract::policy::ApprovalGrant>,
+    ) -> Result<PreparedHostMemberAssessment, String> {
+        if assessment.capability != self.prepared.tool || assessment.lease.is_none()
+            || assessment.lease.as_ref().is_some_and(|lease| lease.idempotency_key != self.prepared.identity) {
+            return Err("Host member assessment does not match original preparation".into());
+        }
+        let mut refs = vec![RuntimeEventRef { kind: "capability".into(), id: assessment.capability.clone() }];
+        if let Some(lease) = &assessment.lease { refs.push(RuntimeEventRef { kind: "authorization_lease".into(), id: lease.lease_id.clone() }); }
+        if let Some(execution) = self.owner.assessment.execution.clone() {
+            for (kind, id) in [("execution", execution.execution_id), ("session", execution.session_id), ("turn", execution.turn_id)] {
+                if !refs.iter().any(|reference| reference.kind == kind && reference.id == id) { refs.push(RuntimeEventRef { kind: kind.into(), id }); }
+            }
+        }
+        let mut payload = serde_json::to_value(assessment).map_err(|e| e.to_string())?;
+        let object = payload.as_object_mut().ok_or("member assessment is not an object")?;
+        let decision = self.context.override_decision().map(|value| match value {
+            crate::permissions::PermissionOverride::Allow => "allow",
+            crate::permissions::PermissionOverride::Deny => "deny",
+            crate::permissions::PermissionOverride::Ask => "ask",
+        });
+        object.insert("_original_permission_context".into(), serde_json::json!({
+            "override_decision": decision, "override_reason": self.context.override_reason(),
+        }));
+        if let Some(grant) = approval { object.insert("_original_approval_grant".into(), serde_json::to_value(grant).map_err(|e| e.to_string())?); }
+        object.insert("_original_batch_member_binding".into(), serde_json::json!({
+            "version": 2, "step": self.step, "ticket": self.ticket,
+            "outer_invocation": self.original.compiled_invocation, "outer_input": self.original.input,
+            "parent": self.original.parent_execution, "attempt": self.original.parent_execution_attempt,
+            "index": self.prepared.index, "outer_key": self.prepared.outer_key,
+            "member_tool": self.prepared.tool, "member_input": self.prepared.input,
+            "member_effect": self.prepared.effect, "member_identity": self.prepared.identity,
+            "original_prepared": self.original_prepared, "hook_effective": self.hook_effective,
+            "normalized_effective": self.effective,
+        }));
+        let stream_id = format!("session:{}", self.claim.session_id());
+        let expected_revision = self.store.stream_revision(&stream_id).map_err(|e| e.to_string())?;
+        Ok(PreparedHostMemberAssessment {
+            source: crate::ExpectedStreamRevision { stream_id: stream_id.clone(), expected_revision },
+            event: crate::RuntimeTransactionEventInput { event: RuntimeEventInput {
+                stream_id, scope: RuntimeEventScope::Tool, kind: "authorization.capability_assessed".into(),
+                status: Some(format!("{:?}", assessment.path).to_ascii_lowercase()),
+                actor: Some("conversation_runtime".into()), refs, payload,
+            }, idempotency_key: Some(format!("member-assessment:{}", self.prepared.identity)), schema_version: 1 },
+        })
+    }
+
+    pub(crate) fn original_policy(&self) -> &PermissionPolicy { &self.owner.identity.permission_policy }
+    pub(crate) fn original_negotiator(&self) -> &crate::AuthorizationNegotiator { &self.owner.assessment.authorization_negotiator }
+    /// Run the original negotiator's no-consumption preparation after any
+    /// original approval wait; the checked action owner still decides Fresh.
+    pub(crate) fn prepare_authority(
+        self: &Arc<Self>, approval: Option<crate::approval_queue::PreparedMemberApproval>,
+    ) -> Result<Arc<crate::authorization_negotiator::PreparedMemberAuthority>, String> {
+        self.original_negotiator().prepare_host_member_authority(Arc::clone(self), approval)
+    }
+
+    /// Await the original approval owner only when the original policy route
+    /// requires it. No lease or once grant is consumed across this wait.
+    pub(crate) async fn prepare_authority_with_approval(
+        self: &Arc<Self>,
+    ) -> Result<Arc<crate::authorization_negotiator::PreparedMemberAuthority>, String> {
+        let timeout_secs = self.timeout_secs;
+        match self.prepare_authority(None) {
+            Ok(candidate) => return Ok(candidate),
+            Err(error) if !self.original_negotiator().host_member_requires_human(self)? => return Err(error),
+            Err(_) => {}
+        }
+        let owner = &self.owner;
+        let coordinator = owner.approval_coordinator.as_ref().ok_or("original approval coordinator unavailable")?;
+        let snapshot = owner.identity.permission_policy.execution_policy_control().snapshot();
+        if snapshot.revision != self.original.policy_revision { return Err("Host policy changed before approval".into()); }
+        let request = self.authorization_request()?;
+        let effective = crate::AuthorizationNegotiator::compile_effective_descriptor(&request.effect, &request.input);
+        let execution = owner.identity.execution.as_ref();
+        let source = harness_contract::policy::ApprovalSource {
+            kind: if owner.identity.agent_id != "primary" { harness_contract::policy::ApprovalSourceKind::Agent } else { harness_contract::policy::ApprovalSourceKind::Session },
+            session_id: Some(owner.identity.session_id.to_string()),
+            agent_id: (owner.identity.agent_id != "primary").then(|| owner.identity.agent_id.clone()),
+            team_id: owner.memory_team_id.clone(), mission_id: None,
+            resource_ref: Some(owner.checkpoint_workspace_id.clone()), review_ref: None, application: None,
+        };
+        let context = harness_contract::policy::ApprovalContext {
+            principal_id: request.principal_id.clone(), profile_id: snapshot.autonomy_profile.as_str().to_string(),
+            approval_profile: Some(snapshot.approval_profile), workspace_key: owner.checkpoint_workspace_id.clone(),
+            session_id: Some(owner.identity.session_id.to_string()),
+            turn_id: execution.map(|value| value.turn_id.clone()),
+            task_id: owner.activity.as_ref().map(|value| value.task_id.clone()),
+            capability: request.capability.clone(), invocation_id: Some(request.idempotency_key.clone()),
+            execution_id: execution.map(|value| value.execution_id.clone()), strategy_decision_ref: None,
+            source_surface: Some("gateway_session".into()),
+            resource_targets: effective.descriptor.scopes.iter().filter_map(|scope| scope.target.clone()).collect(),
+            effect: Some(effective.descriptor.clone()),
+            explicit_ask: request.context.override_decision() == Some(crate::permissions::PermissionOverride::Ask),
+            policy_revision: snapshot.revision, requested_sandbox_posture: Some(snapshot.sandbox_posture),
+            effective_sandbox_posture: Some(snapshot.sandbox_posture),
+        };
+        let pending = owner.assessment.cowd_bus.clone().map(|cowd| {
+            let tool = request.capability.clone();
+            Arc::new(move |approval: &harness_contract::policy::ApprovalRequest| {
+                cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
+                    status: harness_contract::projection::ExecutionLiveStatus::WaitingApproval, detail: Some(tool.clone()),
+                });
+                cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested { request_id: approval.approval_id.clone(), tool: tool.clone() });
+            }) as crate::ApprovalPendingHook
+        });
+        // resolve_tool normalizes profile before grant matching. Preserve that
+        // same current-call context for a reusable standing grant as well.
+        let mut matched_context = context.clone();
+        matched_context.profile_id = match snapshot.approval_profile {
+            harness_contract::policy::ApprovalProfile::Supervised => "supervised",
+            harness_contract::policy::ApprovalProfile::Balanced => "balanced",
+            harness_contract::policy::ApprovalProfile::Autonomous => "autonomous",
+            harness_contract::policy::ApprovalProfile::TrustAll => "trust-all",
+        }.into();
+        let wait = owner.control_requested.begin_approval_wait();
+        let result = coordinator.resolve_tool(source, context, Some(snapshot.autonomy_profile), &effective.descriptor,
+            &request.input, owner.cancellation.clone(), Some(owner.session_input_stream.input_notifier()),
+            pending, Duration::from_secs(timeout_secs.max(1))).await;
+        drop(wait);
+        emit_approval_resolution_event(owner.assessment.cowd_bus(), coordinator.queue(), &result);
+        let grant = match result {
+            Ok(crate::ApprovalResolution::Approved { grant, .. }) => grant,
+            Ok(crate::ApprovalResolution::ControlRequested { reason, .. }) => { owner.control_requested.signal(); return Err(reason); },
+            Ok(crate::ApprovalResolution::Denied { reason, .. }) | Ok(crate::ApprovalResolution::Cancelled { reason, .. }) => return Err(reason),
+            Err(error) => return Err(error),
+        };
+        self.fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await?;
+        if !self.reservation_is_current() || owner.cancellation.is_cancelled() || owner.control_requested.load(std::sync::atomic::Ordering::Acquire)
+            || owner.identity.permission_policy.execution_policy_control().revision() != snapshot.revision
+            || owner.original_session_claim.as_ref().is_none_or(|claim| !Arc::ptr_eq(claim, &self.claim)) {
+            return Err("original Host owner changed during approval".into());
+        }
+        let binding = crate::authorization_negotiator::PreparedMemberBinding::from_host(Arc::clone(self));
+        let risk = crate::approval_coordinator::task_risk_for_effect(&effective.descriptor);
+        let prepared = coordinator.queue().prepare_member_approval(&grant.grant_id, &matched_context, risk, &binding)?;
+        self.prepare_authority(Some(prepared))
+    }
+}
+
+impl SharedPolicyOwner {
+    pub(crate) fn register_original_control(&self, control: &Arc<crate::conversation::MemberCommitControl>) {
+        self.cancellation.register_member_commit_control(control);
+        self.control_requested.register(control);
+    }
+    /// Verify the Session lineage against the same owner instances held by
+    /// the active ingress. No authority is reconstructed from a child packet.
+    pub(crate) fn matches_original_lineage(
+        &self,
+        claim: &Arc<crate::execution_core::services::OriginalSessionClaim>,
+        policy: &crate::permissions::SessionExecutionPolicyControl,
+        requested: &Arc<crate::conversation::OriginalTurnInputControl>,
+        store: &Arc<crate::RuntimeEventStore>,
+    ) -> bool {
+        self.original_session_claim.as_ref().is_some_and(|original| Arc::ptr_eq(original, claim))
+            && self.identity.session_id == claim.session_id()
+            && self.identity.execution.as_ref().is_some_and(|execution| execution.turn_id == claim.turn_id())
+            && self.identity.permission_policy.execution_policy_control().same_owner(policy)
+            && Arc::ptr_eq(&self.control_requested, requested)
+            && self.uses_original_store(store)
+    }
+    pub(crate) fn uses_original_store(&self, store: &Arc<crate::RuntimeEventStore>) -> bool {
+        self.assessment.runtime_event_store.as_ref().is_some_and(|original| Arc::ptr_eq(original, store))
+    }
+    /// Resolve the current Process member's own approval without consuming it.
+    /// The checked member transaction consumes an once grant with its lease.
+    pub(crate) async fn prepare_process_member_approval(
+        &self,
+        evaluation: &crate::authorization_negotiator::ProcessMemberEvaluation,
+    ) -> Result<Arc<crate::authorization_negotiator::PreparedMemberAuthority>, String> {
+        let member = evaluation.member();
+        let request = evaluation.request();
+        if !member.uses_original_policy_owner(self) || !member.original_preparation_fence_live()
+            || !self.uses_original_store(member.owner().store())
+            || self.original_session_claim.as_ref().is_none_or(|claim| !Arc::ptr_eq(claim, member.claim())) {
+            return Err("original Process approval owner changed".into());
+        }
+        member.owner().check_original_stop()?;
+        let coordinator = self.approval_coordinator.as_ref().ok_or("original approval coordinator unavailable")?;
+        let snapshot = evaluation.snapshot();
+        if snapshot.revision != request.policy_revision { return Err("Process policy changed before approval".into()); }
+        let effective = evaluation.effective();
+        let source = harness_contract::policy::ApprovalSource {
+            kind: harness_contract::policy::ApprovalSourceKind::Agent,
+            session_id: Some(member.packet().session_id().into()),
+            agent_id: Some(member.packet().agent_id().into()),
+            team_id: member.packet().team_id().map(str::to_string),
+            mission_id: None, resource_ref: None, review_ref: None, application: None,
+        };
+        let mut context = crate::agent_in_process_worker::process_tool_approval_context(
+            member.packet(), snapshot, effective, &self.checkpoint_workspace_id, &request.idempotency_key);
+        context.explicit_ask = request.context.override_decision() == Some(crate::permissions::PermissionOverride::Ask)
+            || matches!(effective.descriptor.approval_class,
+                harness_contract::tool::ToolApprovalClass::User | harness_contract::tool::ToolApprovalClass::Administrator);
+        let mut matched_context = context.clone();
+        matched_context.profile_id = match snapshot.approval_profile {
+            harness_contract::policy::ApprovalProfile::Supervised => "supervised",
+            harness_contract::policy::ApprovalProfile::Balanced => "balanced",
+            harness_contract::policy::ApprovalProfile::Autonomous => "autonomous",
+            harness_contract::policy::ApprovalProfile::TrustAll => "trust-all",
+        }.into();
+        let timeout = member.original_member_timeout_secs().ok_or("Process member timeout unavailable")?;
+        let risk = crate::agent_in_process_worker::process_approval_task_risk(
+            evaluation.risk());
+        let wait = self.control_requested.begin_approval_wait();
+        let result = coordinator.resolve_tool_with_risk(source, context, Some(snapshot.autonomy_profile), &effective.descriptor,
+            &request.input, member.owner().cancellation(), Some(self.session_input_stream.input_notifier()),
+            None, Duration::from_secs(timeout.max(1)), risk).await;
+        drop(wait);
+        emit_approval_resolution_event(self.assessment.cowd_bus(), coordinator.queue(), &result);
+        let grant = match result {
+            Ok(crate::ApprovalResolution::Approved { grant, .. }) => grant,
+            Ok(crate::ApprovalResolution::ControlRequested { reason, .. }) => { self.control_requested.signal(); return Err(reason); },
+            Ok(crate::ApprovalResolution::Denied { reason, .. }) | Ok(crate::ApprovalResolution::Cancelled { reason, .. }) => return Err(reason),
+            Err(error) => return Err(error),
+        };
+        member.owner().fence().verify(crate::SessionExecutionFencePhase::ToolExecution).await?;
+        member.owner().check_original_stop()?;
+        if !member.original_preparation_fence_live() || self.cancellation.is_cancelled()
+            || self.control_requested.load(std::sync::atomic::Ordering::Acquire)
+            || self.identity.permission_policy.execution_policy_control().revision() != snapshot.revision
+            || self.original_session_claim.as_ref().is_none_or(|claim| !Arc::ptr_eq(claim, member.claim())) {
+            return Err("original Process owner changed during approval".into());
+        }
+        let binding = evaluation.binding();
+        let approval = coordinator.queue().prepare_member_approval(&grant.grant_id, &matched_context, risk, binding)?;
+        let negotiator = member.owner().negotiator().clone();
+        negotiator.finish_process_member_approval(evaluation, approval)
+    }
+    pub(crate) fn original_policy_control(&self) -> crate::permissions::SessionExecutionPolicyControl {
+        self.identity.permission_policy.execution_policy_control()
+    }
+    pub(crate) fn original_consumption(
+        &self, authorization: &harness_contract::tool::ToolExecutionAuthorization,
+    ) -> Option<crate::authorization_negotiator::OriginalLeaseConsumption> {
+        self.assessment.authorization_negotiator.original_consumption(
+            &authorization.authorization_lease, &authorization.request_id)
+            .filter(|consumption| consumption.belongs_to(&self.assessment.authorization_negotiator))
+    }
+    pub(crate) fn new_single_commit_control(&self) -> Arc<crate::conversation::MemberCommitControl> {
+        let control = self.cancellation.member_commit_control();
+        self.control_requested.register(&control);
+        control
+    }
+
+    /// Synchronous single-call gate. The caller supplies additional Program,
+    /// goal and review streams before locks are acquired and invokes A's
+    /// checked entry inside `append`; it must not await or reacquire locks.
+    pub(crate) fn with_single_checked<T>(
+        &self,
+        services: &crate::RuntimeServices,
+        ticket: &crate::execution_core::graph::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest,
+        events: &[crate::DurableRuntimeEvent],
+        permission_context: &PermissionContext,
+        original_decision: &crate::execution_core::RuntimeExecutionDecision,
+        control: Arc<crate::conversation::MemberCommitControl>,
+        additional_streams: &[String],
+        append: impl FnOnce(&OriginalSingleCheckedInputs<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let session = request.session_id.as_deref().ok_or("original Session missing")?;
+        let auth = request.authorization.as_ref().ok_or("original authorization missing")?;
+        // `events` are the immutable values returned by this producer's
+        // successful appends, captured inside the same call. Do not read those
+        // writes back from storage on the same-owner checked path.
+        let producer_store = self.assessment.runtime_event_store.as_ref()
+            .ok_or("original single-call producer store missing")?;
+        if !Arc::ptr_eq(producer_store, services.event_store()) {
+            return Err("original single-call store owner mismatch".into());
+        }
+        if session != self.identity.session_id || request.tool_name == "agent_action_batch"
+            || request.execution_decision.as_ref() != Some(original_decision)
+            || self.cancellation.is_cancelled()
+            || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("original single-call owner is not live".into());
+        }
+        let claim = self.original_session_claim.as_deref().ok_or("original Session claim missing")?;
+        let turn = harness_contract::turn::TurnId::from_string(claim.turn_id());
+        let mut streams = additional_streams.to_vec();
+        streams.push(ticket.graph_id.clone());
+        streams.push(format!("session:{session}"));
+        streams.extend(events.iter().map(|event| event.stream_id.clone()));
+        streams.sort(); streams.dedup();
+        if events.is_empty() || streams.iter().any(String::is_empty) { return Err("original single-call sources missing".into()); }
+        services.with_original_session_policy(session, &self.identity.permission_policy.execution_policy_control(), |policy| {
+            if policy.revision != request.policy_revision || auth.policy_revision != policy.revision
+                || policy.sandbox_posture != request.sandbox_posture || self.cancellation.is_cancelled()
+                || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("original single-call policy or control changed".into());
+            }
+            services.event_store().with_authenticated_stream_locks(&streams, |held| {
+                crate::execution_core::graph::validate_node_ticket_start(services.event_store(), ticket, None)
+                    .map_err(|error| error.to_string())?;
+                if request.parent_execution.as_ref().is_none_or(|parent| parent.execution_id != ticket.graph_id || parent.node_id != ticket.node_id)
+                    || request.parent_execution_attempt != Some(ticket.attempt) || claim.session_id() != session {
+                    return Err("original single-call ticket or claim mismatch".into());
+                }
+                let binding = request.step_binding.as_ref().ok_or("original Step missing")?;
+                let step = binding.resolve(self.tool_lease.clone()).map_err(|error| error.to_string())?;
+                let input = step.validate_call(&binding.origin, session, &request.tool_use_id, &request.tool_name,
+                    &request.input, chrono::Utc::now().timestamp_millis()).map_err(|error| error.to_string())?;
+                step.lease().validate_authorization(auth, &request.tool_name, &input).map_err(|error| error.to_string())?;
+                let original_consumption = self.assessment.authorization_negotiator
+                    .original_consumption(&auth.authorization_lease, &auth.request_id)
+                    .ok_or("original single-call lease consumption unavailable")?;
+                if !original_consumption.belongs_to(&self.assessment.authorization_negotiator)
+                    || original_consumption.lease != auth.authorization_lease {
+                    return Err("original single-call lease producer mismatch".into());
+                }
+                let original_transition = serde_json::to_value(&original_consumption.transition).map_err(|e| e.to_string())?;
+                let mut assessed = 0; let mut consumed = 0;
+                let mut pre_authorization_request = serde_json::to_value(request).map_err(|e| e.to_string())?;
+                let request_object = pre_authorization_request.as_object_mut().ok_or("original request invalid")?;
+                request_object.remove("authorization");
+                request_object.remove("execution_decision");
+                let context_decision = permission_context.override_decision().map(|decision| match decision {
+                    crate::permissions::PermissionOverride::Allow => "allow",
+                    crate::permissions::PermissionOverride::Deny => "deny",
+                    crate::permissions::PermissionOverride::Ask => "ask",
+                });
+                let original_context = serde_json::json!({"override_decision":context_decision,
+                    "override_reason":permission_context.override_reason()});
+                for event in events {
+                    let mut assessed_request = event.payload["_call_refusal_binding"]["request"].clone();
+                    let assessed_decision = assessed_request.as_object_mut().and_then(|object| object.remove("execution_decision"));
+                    let decision_matches = assessed_decision.as_ref().is_none_or(|decision|
+                        serde_json::to_value(original_decision).is_ok_and(|expected| *decision == expected));
+                    if event.kind == "authorization.capability_assessed"
+                        && decision_matches
+                        && event.actor.as_deref() == Some("conversation_runtime")
+                        && event.stream_id == format!("session:{session}")
+                        && event.payload["_call_refusal_binding"]["tool_name"].as_str() == Some(request.tool_name.as_str())
+                        && event.payload["_call_refusal_binding"]["effect_key"].as_str() == Some(request.idempotency_key.as_str())
+                        && event.payload["_call_refusal_binding"]["step_binding"] == serde_json::to_value(&request.step_binding).map_err(|e| e.to_string())?
+                        && assessed_request == pre_authorization_request
+                        && event.payload["_original_permission_context"] == original_context
+                        && event.payload["_call_refusal_binding"]["call_id"].as_str() == Some(request.tool_use_id.as_str())
+                        && event.payload["_call_refusal_binding"]["owner"]["ticket"] == serde_json::to_value(ticket).map_err(|e| e.to_string())?
+                        && event.payload["lease"]["lease_id"].as_str() == Some(auth.authorization_lease.lease_id.as_str()) { assessed += 1; }
+                    if event.kind == "authorization.lease_transition" && event.status.as_deref() == Some("consumed")
+                        && event.actor.as_deref() == Some("conversation_runtime")
+                        && event.payload == original_transition
+                        && event.payload["lease"]["lease_id"].as_str() == Some(auth.authorization_lease.lease_id.as_str())
+                        && event.payload["idempotency_key"].as_str() == Some(auth.request_id.as_str()) { consumed += 1; }
+                }
+                if assessed != 1 || consumed != 1 { return Err("original single-call assessment/lease provenance mismatch".into()); }
+                if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire)
+                    || self.session_input_stream.active_turn_id().as_ref() != Some(&turn) {
+                    return Err("original turn no longer active".into());
+                }
+                let fence = claim.fence()?;
+                let cursor = self.session_input_stream.highest_consumed_cursor(&turn);
+                if self.session_input_stream.active_turn_id().as_ref() != Some(&turn) { return Err("original turn changed while reading cursor".into()); }
+                let consumed_input_sequence = match cursor {
+                    Some(cursor) if cursor.generation == fence.session_generation => usize::try_from(cursor.sequence).map_err(|_| "consumed cursor overflow")?.max(fence.input_sequence),
+                    Some(_) => return Err("consumed cursor generation mismatch".into()),
+                    None => fence.input_sequence,
+                };
+                let sources = streams.iter().map(|stream_id| Ok(crate::ExpectedStreamRevision {
+                    stream_id: stream_id.clone(), expected_revision: services.event_store().stream_revision(stream_id).map_err(|e| e.to_string())?,
+                })).collect::<Result<Vec<_>, String>>()?;
+                let assessment_event = events.iter().find(|event| event.kind == "authorization.capability_assessed"
+                    && event.payload["_call_refusal_binding"]["call_id"].as_str() == Some(request.tool_use_id.as_str())
+                    && event.payload["lease"]["lease_id"].as_str() == Some(auth.authorization_lease.lease_id.as_str())).ok_or("assessment missing")?;
+                let lease_event = events.iter().find(|event| event.kind == "authorization.lease_transition" && event.status.as_deref() == Some("consumed")
+                    && event.payload["lease"]["lease_id"].as_str() == Some(auth.authorization_lease.lease_id.as_str())
+                    && event.payload["idempotency_key"].as_str() == Some(auth.request_id.as_str())).ok_or("lease event missing")?;
+                if request.tool_name == harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID {
+                    let coord = |event: &crate::DurableRuntimeEvent| serde_json::json!({
+                        "stream_id":event.stream_id, "sequence":event.sequence, "event_id":event.event_id,
+                        "transaction_id":event.transaction_id, "transaction_index":event.transaction_index, "commit_cursor":event.commit_cursor,
+                    });
+                    let authorized = events.iter().filter(|event| event.kind == "authorization.call_authorized"
+                        && event.scope == RuntimeEventScope::Tool && event.actor.as_deref() == Some("conversation_runtime")
+                        && event.status.as_deref() == Some("authorized") && event.stream_id == format!("session:{session}")
+                        && event.payload["version"].as_u64() == Some(1)
+                        && event.payload["binding"] == assessment_event.payload["_call_refusal_binding"]
+                        && event.payload["authorization"] == serde_json::to_value(auth).unwrap_or(serde_json::Value::Null)
+                        && event.payload["assessment"] == coord(assessment_event)
+                        && event.payload["consume"] == coord(lease_event)).count();
+                    if authorized != 1 { return Err("original completion call authorization event missing or ambiguous".into()); }
+                }
+                append(&OriginalSingleCheckedInputs::Root(RootSingleCheckedInputs { held, sources: &sources, control, claim, consumed_input_sequence, ticket, request, assessment_event, lease_event, original_events: events, original_decision, _original_owner_seal: () }))
+            })
+        })
+    }
+
+    pub(crate) fn session_id(&self) -> &str { &self.identity.session_id }
+    pub(crate) fn policy_revision(&self) -> u64 {
+        self.identity.permission_policy.execution_policy_control().revision()
+    }
+    pub(crate) fn owns_turn(&self, binding: &crate::step_snapshot::StepCallBinding) -> bool {
+        self.identity.execution.as_ref().is_some_and(|execution|
+            execution.session_id == binding.snapshot.identity.session_id
+                && execution.turn_id == binding.snapshot.identity.turn_id)
+    }
+    pub(crate) fn take_control_requested(&self) -> bool {
+        self.control_requested.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+    /// Prepare exact member input and hook context without negotiating or
+    /// consuming a lease/approval. This value alone grants no execution right.
+    async fn prepare_original_batch_policy_input(
+        &self,
+        binding: &crate::step_snapshot::StepCallBinding,
+        outer_invocation: &harness_contract::tool::GovernedToolInvocation,
+        outer_input: &str,
+        parent: &harness_contract::execution_graph::ExecutionParentBinding,
+        attempt: u32,
+        index: usize,
+        pinned: Option<tools::ToolHostLease>,
+    ) -> Result<PreparedOriginalBatchPolicyInput, RuntimeError> {
+        if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::new("original member owner cancelled before preparation"));
+        }
+        let claim = self.original_session_claim.clone()
+            .ok_or_else(|| RuntimeError::new("original member Session claim unavailable"))?;
+        if claim.session_id() != self.identity.session_id {
+            return Err(RuntimeError::new("original member Session claim mismatch"));
+        }
+        let original_turn = harness_contract::turn::TurnId::from_string(claim.turn_id());
+        let fence = self.session_execution_fence.as_ref()
+            .ok_or_else(|| RuntimeError::new("original member Session fence unavailable"))?;
+        fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(RuntimeError::new)?;
+        let prepared = crate::step_snapshot::prepare_agent_batch_member(
+            binding, pinned.clone(), self.identity.session_id.as_str(), outer_invocation, outer_input, parent, attempt, index,
+            chrono::Utc::now().timestamp_millis(),
+        )?;
+        let input = serde_json::to_string(&prepared.input).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let hook = {
+            let mut reporter = self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner());
+            self.hook_runner.run_pre_tool_use_with_context(&prepared.tool, &input,
+                Some(&self.hook_abort_signal), reporter.as_mut().map(|r| r.as_mut() as &mut dyn crate::HookProgressReporter))
+        };
+        let effective = hook.updated_input().map_or_else(|| input.clone(), ToOwned::to_owned);
+        let mut context = PermissionContext::new(hook.permission_override(), hook.permission_reason().map(ToOwned::to_owned));
+        if hook.is_cancelled() || hook.is_failed() || hook.is_denied() {
+            context = PermissionContext::new(Some(crate::permissions::PermissionOverride::Deny),
+                Some(format!("PreToolUse hook denied batch member {}", prepared.index)));
+        }
+        let (original_prepared, prepared_after_hook) = crate::step_snapshot::prepare_effective_agent_batch_member(
+            binding, pinned, self.identity.session_id.as_str(), outer_invocation, outer_input,
+            parent, attempt, index, chrono::Utc::now().timestamp_millis(), &effective)?;
+        if original_prepared != prepared { return Err(RuntimeError::new("original member changed while hook ran")); }
+        let hook_effective = effective;
+        let effective = serde_json::to_string(&prepared_after_hook.input).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let prepared = prepared_after_hook;
+        if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::new("original member owner cancelled during preparation"));
+        }
+        Ok(PreparedOriginalBatchPolicyInput { claim, original_turn, fence: fence.clone(), original_prepared, prepared, hook_effective, effective, context })
+    }
+
+    /// Borrow this actual Process member's original Step and pinned host.
+    /// The member owner has already authenticated the AgentTask ticket and
+    /// holds its in-flight reservation; callers cannot substitute a lease.
+    pub(crate) async fn prepare_original_process_batch_policy_input(
+        &self, member: &crate::agent_in_process_worker::OriginalProcessPreparedMember,
+    ) -> Result<PreparedOriginalBatchPolicyInput, RuntimeError> {
+        if !member.uses_original_policy_owner(self) || !member.original_reservation_matches() {
+            return Err(RuntimeError::new("original Process policy owner or reservation changed"));
+        }
+        let original = member.original_request();
+        let invocation = original.compiled_invocation.as_ref().ok_or_else(|| RuntimeError::new("original Process invocation missing"))?;
+        let parent = original.parent_execution.as_ref().ok_or_else(|| RuntimeError::new("original Process parent missing"))?;
+        self.prepare_original_batch_policy_input(member.step(), invocation, &original.input,
+            parent, member.packet().attempt, member.index(), Some(member.original_pinned_host().clone())).await
+    }
+
+    /// Original Host producer: validate the started ticket and exact outer
+    /// call, then capture the member hook result without consuming authority.
+    pub(crate) async fn prepare_original_host_member(
+        self: &Arc<Self>, ticket: crate::execution_core::graph::NodeExecutionTicket,
+        original: Arc<crate::RuntimeToolExecutionRequest>, index: usize,
+        reservation: Arc<crate::runtime_event_store::OriginalMemberReservation>,
+    ) -> Result<Arc<OriginalHostPreparedMember>, RuntimeError> {
+        let store = self.assessment.runtime_event_store.as_ref()
+            .ok_or_else(|| RuntimeError::new("original Host member store unavailable"))?;
+        let fresh_effect = original.tool_progress.original_fresh_effect().map_err(RuntimeError::new)?
+            .ok_or_else(|| RuntimeError::new("original Host fresh effect owner unavailable"))?;
+        if !fresh_effect.matches_original(store, &original) {
+            return Err(RuntimeError::new("original Host fresh effect owner mismatch"));
+        }
+        crate::execution_core::graph::validate_node_ticket_start(store, &ticket, None)
+            .map_err(|e| RuntimeError::new(e.to_string()))?;
+        let member_index = u64::try_from(index).map_err(|_| RuntimeError::new("original Host member index overflow"))?;
+        if !reservation.matches_original(store, &original.idempotency_key, member_index, &ticket) {
+            return Err(RuntimeError::new("original Host member reservation mismatch"));
+        }
+        let binding = original.step_binding.as_ref().ok_or_else(|| RuntimeError::new("original Host Step missing"))?;
+        let invocation = original.compiled_invocation.as_ref().ok_or_else(|| RuntimeError::new("original Host invocation missing"))?;
+        let parent = original.parent_execution.as_ref().ok_or_else(|| RuntimeError::new("original Host parent missing"))?;
+        let attempt = original.parent_execution_attempt.ok_or_else(|| RuntimeError::new("original Host attempt missing"))?;
+        let (calls, _) = crate::host::decode_tool_batch(&ticket.payload_ref).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let mut matching = calls.iter().filter(|call| call.id == original.tool_use_id);
+        let call = matching.next().ok_or_else(|| RuntimeError::new("original Host ticket call missing"))?;
+        let original_json = harness_contract::step::parse_strict_json(&original.input).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let model_json = harness_contract::step::parse_strict_json(&call.input).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let input_owned = model_json == original_json || original.tool_progress.original_governed_hook()
+            .map_err(RuntimeError::new)?.is_some_and(|hook| hook.matches(&ticket, &original, &model_json));
+        if matching.next().is_some() || call.name != original.tool_name || call.binding.as_ref() != Some(binding)
+            || !input_owned
+            || original.tool_name != "agent_action_batch" || original.idempotency_key != binding.effect_idempotency_key()
+            || original.tool_use_id != binding.origin.call_id || !self.owns_turn(binding)
+            || parent.execution_id != ticket.graph_id || parent.node_id != ticket.node_id || attempt != ticket.attempt
+            || original.session_id.as_deref() != Some(self.session_id())
+            || original.policy_revision == 0 || self.policy_revision() != original.policy_revision {
+            return Err(RuntimeError::new("original Host member source mismatch"));
+        }
+        let candidate = self.prepare_original_batch_policy_input(binding, invocation, &original.input, parent, attempt, index, self.tool_lease.clone()).await?;
+        candidate.fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(RuntimeError::new)?;
+        if !fresh_effect.matches_original(store, &original)
+            || !reservation.matches_original(store, &original.idempotency_key, member_index, &ticket)
+            || self.policy_revision() != original.policy_revision || candidate.claim.session_id() != self.session_id() {
+            return Err(RuntimeError::new("original Host member owner changed during preparation"));
+        }
+        Ok(Arc::new(OriginalHostPreparedMember { owner: Arc::clone(self), store: Arc::clone(store), reservation, fresh_effect, ticket,
+            original: Arc::clone(&original), step: binding.clone(), original_prepared: candidate.original_prepared,
+            prepared: candidate.prepared, hook_effective: candidate.hook_effective, effective: candidate.effective,
+            context: candidate.context, timeout_secs: 60, claim: candidate.claim, fence: candidate.fence.clone() }))
+    }
+
+    async fn negotiate_tool_authorization_inner(
+        &self,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        input: &str,
+        idempotency_key: String,
+        permission_context: PermissionContext,
+        timeout_secs: u64,
+        _prompter: &crate::permissions::SharedPrompter,
+        binding: Option<&serde_json::Value>,
+    ) -> Result<ToolAuthorizationDecision, RuntimeError> {
+        if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::new("original policy owner cancelled or control requested"));
+        }
+        let execution_policy = self.identity.permission_policy.execution_policy_control().snapshot();
+        let initial = self.assess_tool_authorization_at(
+            descriptor,
+            input,
+            idempotency_key.clone(),
+            permission_context.clone(),
+            timeout_secs,
+            &execution_policy,
+            binding,
+        )?;
+        let ToolAuthorizationDecision::Gap {
+            assessment,
+            effective,
+            assessment_event: _,
+        } = initial
+        else {
+            return Ok(initial);
+        };
+        if assessment.path != harness_contract::policy::AuthorizationPath::HumanApproval {
+            let assessment = self.govern_capability_gap(assessment);
+            let assessment_event = self.assessment.record_capability_assessment_for_call(&assessment, binding, Some(&permission_context));
+            if binding.is_some() && assessment_event.is_none() { return Err(RuntimeError::new("bound capability assessment append failed")); }
+            return Ok(ToolAuthorizationDecision::Gap {
+                assessment,
+                effective,
+                assessment_event,
+            });
+        }
+
+        let explicit_ask = permission_context.override_decision()
+            == Some(crate::permissions::PermissionOverride::Ask);
+        let request = self.identity.authorization_request(
+            descriptor,
+            input,
+            idempotency_key.clone(),
+            permission_context,
+            &execution_policy,
+        );
+        let Some(coordinator) = &self.approval_coordinator else {
+            let assessment = self.govern_capability_gap(assessment);
+            let assessment_event = self.assessment.record_capability_assessment_for_call(&assessment, binding, Some(&request.context));
+            if binding.is_some() && assessment_event.is_none() { return Err(RuntimeError::new("bound capability assessment append failed")); }
+            return Ok(ToolAuthorizationDecision::Gap {
+                assessment,
+                effective,
+                assessment_event,
+            });
+        };
+        let approved_grant = {
+            let execution_context = self.identity.execution.clone();
+            let activity_binding = self.activity.clone();
+            let source = harness_contract::policy::ApprovalSource {
+                kind: if self.identity.agent_id != "primary" {
+                    harness_contract::policy::ApprovalSourceKind::Agent
+                } else {
+                    harness_contract::policy::ApprovalSourceKind::Session
+                },
+                session_id: Some(self.identity.session_id.as_str().to_string()),
+                agent_id: (self.identity.agent_id != "primary").then(|| self.identity.agent_id.clone()),
+                team_id: self.memory_team_id.clone(),
+                mission_id: None,
+                resource_ref: Some(self.checkpoint_workspace_id.clone()),
+                review_ref: None,
+                application: None,
+            };
+            let context = harness_contract::policy::ApprovalContext {
+                principal_id: request.principal_id.clone(),
+                profile_id: execution_policy.autonomy_profile.as_str().to_string(),
+                approval_profile: Some(execution_policy.approval_profile),
+                workspace_key: self.checkpoint_workspace_id.clone(),
+                session_id: Some(self.identity.session_id.as_str().to_string()),
+                turn_id: execution_context
+                    .as_ref()
+                    .map(|value| value.turn_id.clone()),
+                task_id: activity_binding
+                    .as_ref()
+                    .map(|binding| binding.task_id.clone()),
+                capability: descriptor.tool_id.clone(),
+                invocation_id: Some(idempotency_key.clone()),
+                execution_id: execution_context
+                    .as_ref()
+                    .map(|value| value.execution_id.clone()),
+                strategy_decision_ref: None,
+                source_surface: Some("gateway_session".to_string()),
+                resource_targets: descriptor
+                    .scopes
+                    .iter()
+                    .filter_map(|scope| scope.target.clone())
+                    .collect(),
+                effect: Some(effective.descriptor.clone()),
+                explicit_ask,
+                policy_revision: execution_policy.revision,
+                requested_sandbox_posture: Some(execution_policy.sandbox_posture),
+                effective_sandbox_posture: Some(execution_policy.sandbox_posture),
+            };
+            let pending_hook = self.assessment.cowd_bus.clone().map(|cowd| {
+                let tool = descriptor.tool_id.clone();
+                Arc::new(move |request: &harness_contract::policy::ApprovalRequest| {
+                    cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
+                        status: harness_contract::projection::ExecutionLiveStatus::WaitingApproval,
+                        detail: Some(tool.clone()),
+                    });
+                    cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
+                        request_id: request.approval_id.clone(),
+                        tool: tool.clone(),
+                    });
+                }) as crate::ApprovalPendingHook
+            });
+            let _original_approval_wait = self.control_requested.begin_approval_wait();
+            let approval_result = coordinator
+                .resolve_tool(
+                    source,
+                    context,
+                    Some(execution_policy.autonomy_profile),
+                    &effective.descriptor,
+                    input,
+                    self.cancellation.clone(),
+                    Some(self.session_input_stream.input_notifier()),
+                    pending_hook,
+                    Duration::from_secs(timeout_secs.max(1)),
+                )
+                .await;
+            emit_approval_resolution_event(self.assessment.cowd_bus(), coordinator.queue(), &approval_result);
+            match approval_result {
+                Ok(crate::ApprovalResolution::Approved { grant, .. }) => grant,
+                Ok(crate::ApprovalResolution::Denied {
+                    reason,
+                    approval_id,
+                })
+                | Ok(crate::ApprovalResolution::Cancelled {
+                    reason,
+                    approval_id,
+                }) => {
+                    let denied = denied_capability_assessment(assessment, &reason, &approval_id);
+                    let assessment_event = self.assessment.record_capability_assessment_for_call(&denied, binding, Some(&request.context));
+                    if binding.is_some() && assessment_event.is_none() { return Err(RuntimeError::new("bound capability assessment append failed")); }
+                    return Ok(ToolAuthorizationDecision::Gap {
+                        assessment: denied,
+                        effective,
+                        assessment_event,
+                    });
+                }
+                Ok(crate::ApprovalResolution::ControlRequested {
+                    reason,
+                    approval_id,
+                }) => {
+                    self.control_requested.signal();
+                    let denied = denied_capability_assessment(assessment, &reason, &approval_id);
+                    let assessment_event = self.assessment.record_capability_assessment_for_call(&denied, binding, Some(&request.context));
+                    if binding.is_some() && assessment_event.is_none() { return Err(RuntimeError::new("bound capability assessment append failed")); }
+                    return Ok(ToolAuthorizationDecision::Gap {
+                        assessment: denied,
+                        effective,
+                        assessment_event,
+                    });
+                }
+                Err(error) => {
+                    let denied = denied_capability_assessment(
+                        assessment,
+                        &error,
+                        &format!("tool-approval:{idempotency_key}"),
+                    );
+                    let assessment_event = self.assessment.record_capability_assessment_for_call(&denied, binding, Some(&request.context));
+                    if binding.is_some() && assessment_event.is_none() { return Err(RuntimeError::new("bound capability assessment append failed")); }
+                    return Ok(ToolAuthorizationDecision::Gap {
+                        assessment: denied,
+                        effective,
+                        assessment_event,
+                    });
+                }
+            }
+        };
+
+        if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::new("original policy owner changed during approval"));
+        }
+        let current_revision = self.identity.permission_policy.execution_policy_control().revision();
+        if current_revision != execution_policy.revision {
+            let denied = denied_capability_assessment(
+                assessment,
+                "session policy changed while approval was pending; replan the effect",
+                &approved_grant.grant_id,
+            );
+            let assessment_event = self.assessment.record_capability_assessment_for_call(&denied, binding, Some(&request.context));
+            if binding.is_some() && assessment_event.is_none() { return Err(RuntimeError::new("bound capability assessment append failed")); }
+            return Ok(ToolAuthorizationDecision::Gap {
+                assessment: denied,
+                effective,
+                assessment_event,
+            });
+        }
+        let bound_policy = self.identity.permission_policy.bound_to_snapshot(&execution_policy);
+        let approved = self.assessment.authorization_negotiator.approve_effective(
+            &bound_policy,
+            &request,
+            &effective,
+            &approved_grant,
+        );
+        let assessment_event = self.assessment.record_capability_assessment_for_call(&approved, binding, Some(&request.context));
+        if binding.is_some() && assessment_event.is_none() { return Err(RuntimeError::new("bound capability assessment append failed")); }
+        let Some(lease) = approved.lease.clone() else {
+            return Ok(ToolAuthorizationDecision::Gap {
+                assessment: approved,
+                effective,
+                assessment_event,
+            });
+        };
+        let authorized = crate::ToolPolicy
+            .authorize(&effective, &approved, idempotency_key, lease, timeout_secs)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if approved_grant.scope == harness_contract::policy::ApprovalGrantScope::Once {
+            let event = coordinator.queue()
+                .consume_once_grant_exclusive(&approved_grant.grant_id)
+                .map_err(RuntimeError::new)?;
+            capture_member_event(event);
+        }
+        Ok(ToolAuthorizationDecision::Authorized(authorized))
+    }
+
+    fn assess_tool_authorization_at(
+        &self,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        input: &str,
+        idempotency_key: String,
+        permission_context: PermissionContext,
+        timeout_secs: u64,
+        execution_policy: &harness_contract::policy::SessionExecutionPolicy,
+        binding: Option<&serde_json::Value>,
+    ) -> Result<ToolAuthorizationDecision, RuntimeError> {
+        let request = self.identity.authorization_request(
+            descriptor,
+            input,
+            idempotency_key.clone(),
+            permission_context,
+            execution_policy,
+        );
+        let bound_policy = self.identity.permission_policy.bound_to_snapshot(execution_policy);
+        let evaluated = self
+            .assessment.authorization_negotiator
+            .assess_effective(&bound_policy, &request);
+        let assessment = evaluated.assessment;
+        if let Some(lease) = assessment.lease.clone() {
+            let event = self.assessment.record_capability_assessment_for_call(&assessment, binding, Some(&request.context));
+            if binding.is_some() && event.is_none() {
+                return Err(RuntimeError::new("bound capability assessment append failed"));
+            }
+            return crate::ToolPolicy
+                .authorize(
+                    &evaluated.effective,
+                    &assessment,
+                    idempotency_key,
+                    lease,
+                    timeout_secs,
+                )
+                .map(ToolAuthorizationDecision::Authorized)
+                .map_err(|error| RuntimeError::new(error.to_string()));
+        }
+        Ok(ToolAuthorizationDecision::Gap {
+            assessment,
+            effective: evaluated.effective,
+            assessment_event: None,
+        })
+    }
+
+    fn govern_capability_gap(
+        &self,
+        mut assessment: harness_contract::policy::CapabilityAssessment,
+    ) -> harness_contract::policy::CapabilityAssessment {
+        let Some(fingerprint) = assessment
+            .gap
+            .as_ref()
+            .filter(|gap| gap.recoverable)
+            .map(|gap| gap.fingerprint.clone())
+        else {
+            return assessment;
+        };
+        let Some(context) = self.identity.execution.clone()
+        else {
+            close_controlled_recovery_gap(
+                &mut assessment,
+                "controlled recovery requires an exact durable turn identity",
+                "authorization.recovery_missing_turn_identity",
+            );
+            return assessment;
+        };
+        let recovery_scope = format!("turn:{}", context.turn_id);
+        if !self
+            .assessment.authorization_negotiator
+            .claim_controlled_recovery(&assessment, &recovery_scope)
+        {
+            close_controlled_recovery_gap(
+                &mut assessment,
+                "the same capability gap already consumed its single controlled recovery",
+                "authorization.recovery_circuit_open",
+            );
+            return assessment;
+        }
+        let claim = crate::authorization_negotiator::ControlledRecoveryClaimRecord {
+            fingerprint: fingerprint.clone(),
+            recovery_scope,
+            session_id: context.session_id,
+            turn_id: context.turn_id,
+            execution_id: context.execution_id,
+            capability: assessment.capability.clone(),
+        };
+        let persist_result = self
+            .assessment.runtime_event_store
+            .as_ref()
+            .ok_or_else(|| {
+                "controlled recovery requires the durable Runtime event store".to_string()
+            })
+            .and_then(|store| {
+                crate::authorization_negotiator::persist_controlled_recovery_claim(store, &claim)
+            });
+        if let Err(error) = persist_result {
+            self.assessment.authorization_negotiator
+                .rollback_unpersisted_controlled_recovery_claim(&fingerprint);
+            close_controlled_recovery_gap(
+                &mut assessment,
+                &format!("controlled recovery claim was not durably recorded: {error}"),
+                "authorization.recovery_persistence_failed",
+            );
+        } else {
+            assessment.evidence_refs.push(format!(
+                "authorization.controlled_recovery_claim:{fingerprint}"
+            ));
+        }
+        assessment
+    }
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -153,6 +1470,10 @@ where
             session_id: session_id.clone(),
             session,
             session_input_stream: crate::session_input::SessionInputStream::new(session_id),
+            original_session_claim: None,
+            original_policy_input: None,
+            original_policy_control_requested: Arc::new(crate::conversation::OriginalTurnInputControl::default()),
+            original_policy_control_parent_owned: false,
             consumed_session_inputs: std::sync::Mutex::new(Vec::new()),
             api_client,
             tool_executor,
@@ -280,6 +1601,7 @@ where
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
             turn_generated_model_receipts: std::sync::Mutex::new(Vec::new()),
             turn_native_tool_sources: std::sync::Mutex::new(BTreeMap::new()),
+            turn_original_root_calls: std::sync::Mutex::new(BTreeMap::new()),
             turn_native_root_owners: std::sync::Mutex::new(BTreeMap::new()),
             native_wire_receipts: Arc::new(std::sync::Mutex::new(Vec::new())),
             turn_model_observations: std::sync::Mutex::new(Vec::new()),
@@ -364,6 +1686,10 @@ where
     pub fn with_session_execution_fence(mut self, fence: crate::SessionExecutionFence) -> Self {
         self.session_execution_fence = Some(fence);
         self
+    }
+
+    pub(crate) fn set_session_execution_fence(&mut self, fence: crate::SessionExecutionFence) {
+        self.session_execution_fence = Some(fence);
     }
 
     pub(crate) async fn verify_session_execution_fence(
@@ -813,22 +2139,40 @@ where
     /// holding that Arc answers identically, so this never depends on which
     /// runtime instance the caller runs in. A step-scoped provider stop is not
     /// a turn cancellation and must never reach this predicate.
-    pub(crate) fn turn_cancelled(&self) -> bool {
-        match self.turn_cancellation_control.as_ref() {
-            Some(control) => control.is_cancelled(),
-            // No shared home was injected (a direct owned turn): the installed
-            // per-instance token is then the only turn-level signal.
-            None => self.cancellation_token.is_cancelled(),
-        }
+    pub(crate) fn turn_cancelled(&self) -> Result<bool, String> {
+        self.turn_cancellation_control.as_ref().map(|control| control.is_cancelled())
+            .ok_or_else(|| "turn cancellation control is missing".to_string())
+    }
+
+    pub(crate) fn set_original_session_claim(&mut self, claim: Option<Arc<crate::execution_core::services::OriginalSessionClaim>>) {
+        self.original_session_claim = claim;
+    }
+
+    pub(crate) fn original_policy_input_context(&mut self, turn_id: &str) -> (crate::session_input::SessionInputStream, Arc<crate::conversation::OriginalTurnInputControl>) {
+        // A later ingress must not inherit a late control signal from a child
+        // still holding the previous turn's original context.
+        self.original_policy_input = None;
+        self.original_policy_control_parent_owned = false;
+        self.original_policy_control_requested = Arc::new(crate::conversation::OriginalTurnInputControl::default());
+        self.session_input_stream.install_original_turn_control(TurnId::from_string(turn_id), &self.original_policy_control_requested);
+        (self.session_input_stream.clone(), Arc::clone(&self.original_policy_control_requested))
+    }
+    pub(crate) fn install_original_policy_input_context(&mut self, input: crate::session_input::SessionInputStream, control: Arc<crate::conversation::OriginalTurnInputControl>) {
+        self.original_policy_input = Some(input);
+        self.original_policy_control_requested = control;
+        self.original_policy_control_parent_owned = true;
+    }
+    pub(crate) fn original_policy_control_is_parent_owned(&self) -> bool { self.original_policy_control_parent_owned }
+
+    pub(crate) fn original_turn_control(&self) -> Result<Arc<crate::execution_core::services::TurnCancellationControl>, String> {
+        self.turn_cancellation_control.clone().ok_or_else(|| "original Session turn control is missing".to_string())
     }
 
     /// The turn-level token for callers that must inspect it after an await
     /// without holding the runtime lock.
-    pub(crate) fn turn_cancellation_token(&self) -> CancellationToken {
-        match self.turn_cancellation_control.as_ref() {
-            Some(control) => control.token(),
-            None => self.cancellation_token.clone(),
-        }
+    pub(crate) fn turn_cancellation_token(&self) -> Result<CancellationToken, String> {
+        self.turn_cancellation_control.as_ref().map(|control| control.token())
+            .ok_or_else(|| "turn cancellation control is missing".to_string())
     }
 
     pub(super) fn governed_workspace_root(&self) -> Result<PathBuf, RuntimeError> {
@@ -1346,165 +2690,70 @@ where
         permission_context: PermissionContext,
         execution_policy: &harness_contract::policy::SessionExecutionPolicy,
     ) -> crate::AuthorizationRequest {
-        let execution_context = self
-            .cowd_bus()
-            .and_then(crate::CowdEventBus::current_execution_context);
-        let delegated = self.memory_agent_id != "primary";
-        let recovery_scope = execution_context.as_ref().map_or_else(
-            || format!("session:{}", self.session_id()),
-            |context| format!("turn:{}", context.turn_id),
-        );
-        let safe_alternatives = match descriptor.effect_kind {
-            harness_contract::tool::ToolEffectKind::Read => Vec::new(),
-            harness_contract::tool::ToolEffectKind::Write => {
-                vec!["return a patch or proposed change without applying it".to_string()]
-            }
-            harness_contract::tool::ToolEffectKind::Network => {
-                vec!["use already-authorized local or cached evidence".to_string()]
-            }
-            harness_contract::tool::ToolEffectKind::Process
-            | harness_contract::tool::ToolEffectKind::Package => {
-                vec!["inspect and report the required operation without executing it".to_string()]
-            }
-            harness_contract::tool::ToolEffectKind::System
-            | harness_contract::tool::ToolEffectKind::Destructive
-            | harness_contract::tool::ToolEffectKind::Unknown => Vec::new(),
-        };
-        crate::AuthorizationRequest {
-            principal_id: if delegated {
-                format!("agent:{}", self.memory_agent_id)
-            } else {
-                format!("session:{}", self.session_id())
-            },
-            capability: descriptor.tool_id.clone(),
-            input: input.to_string(),
-            idempotency_key,
-            effect: descriptor.clone(),
-            parent_ceiling: if delegated {
-                self.permission_policy.active_mode()
-            } else {
-                crate::PermissionMode::DangerFullAccess
-            },
-            parent_lease_id: delegated.then(|| format!("binding:{}", self.memory_agent_id)),
-            policy_revision: execution_policy.revision,
-            recovery_scope,
-            context: permission_context,
-            safe_alternatives,
-        }
+        self.shared_policy_owner().identity.authorization_request(
+            descriptor, input, idempotency_key, permission_context, execution_policy,
+        )
     }
 
     pub(super) fn record_capability_assessment(
         &self,
         assessment: &harness_contract::policy::CapabilityAssessment,
-    ) {
-        if let Some(cowd) = self.cowd_bus() {
-            cowd.emit(crate::cowd_event::CowdEvent::CapabilityAssessed {
-                assessment: assessment.clone(),
-            });
-        }
-        let mut refs = vec![RuntimeEventRef {
-            kind: "capability".to_string(),
-            id: assessment.capability.clone(),
-        }];
-        if let Some(lease) = assessment.lease.as_ref() {
-            refs.push(RuntimeEventRef {
-                kind: "authorization_lease".to_string(),
-                id: lease.lease_id.clone(),
-            });
-        }
-        self.append_execution_runtime_event(
-            RuntimeEventScope::Tool,
-            "authorization.capability_assessed",
-            Some(format!("{:?}", assessment.path).to_ascii_lowercase()),
-            refs,
-            serde_json::to_value(assessment).unwrap_or_else(|_| serde_json::json!({})),
-        );
-        let Some(store) = self.runtime_event_store.as_ref() else {
-            for transition in self.authorization_negotiator.drain_transitions() {
-                if let Some(cowd) = self.cowd_bus() {
-                    cowd.emit(crate::cowd_event::CowdEvent::AuthorizationLeaseTransition {
-                        transition,
-                    });
-                }
-            }
-            return;
-        };
-        let _ = self
-            .authorization_negotiator
-            .take_transitions_for_persistence();
-        for transition in self
-            .authorization_negotiator
-            .transitions_awaiting_persistence()
-        {
-            // Authorization leases live on their own stream so parallel Team
-            // agents and early-tool grants never contend with session model
-            // events on the shared `session:<id>` stream.
-            let stream_id = format!("authorization-lease:{}", transition.lease.lease_id);
-            if let Err(error) = crate::authorization_negotiator::persist_authorization_transition(
-                store,
-                &stream_id,
-                "conversation_runtime",
-                &transition,
-            ) {
-                tracing::warn!(
-                    %error,
-                    transition_id = transition.transition_id,
-                    "authorization transition remains hot because durable append failed"
-                );
-                break;
-            }
-            if self
-                .authorization_negotiator
-                .acknowledge_persisted_transitions(std::slice::from_ref(&transition.transition_id))
-                == 1
-            {
-                if let Some(cowd) = self.cowd_bus() {
-                    cowd.emit(crate::cowd_event::CowdEvent::AuthorizationLeaseTransition {
-                        transition,
-                    });
-                }
-            }
+    ) -> Option<BoundPolicyAssessment> {
+        self.record_capability_assessment_for_call(assessment, None)
+    }
+
+    fn record_capability_assessment_for_call(
+        &self,
+        assessment: &harness_contract::policy::CapabilityAssessment,
+        binding: Option<&serde_json::Value>,
+    ) -> Option<BoundPolicyAssessment> {
+        self.shared_assessment_owner().record_capability_assessment_for_call(assessment, binding, None)
+    }
+
+    fn shared_assessment_owner(&self) -> SharedAssessmentOwner {
+        self.shared_policy_owner().assessment
+    }
+
+    pub(crate) fn shared_policy_owner(&self) -> SharedPolicyOwner {
+        let execution = self.cowd_bus().and_then(crate::CowdEventBus::current_execution_context);
+        SharedPolicyOwner {
+            identity: SharedAuthorizationIdentity {
+                session_id: self.session_id().to_string(),
+                agent_id: self.memory_agent_id.clone(),
+                execution: execution.clone(),
+                permission_policy: self.permission_policy.clone(),
+            },
+            assessment: SharedAssessmentOwner {
+                session_id: self.session_id().to_string(), execution,
+                cowd_bus: self.cowd_bus.clone(),
+                runtime_event_store: self.runtime_event_store.clone(),
+                authorization_negotiator: self.authorization_negotiator.clone(),
+            },
+            approval_coordinator: self.approval_coordinator.clone(),
+            cancellation: self.cancellation_token(),
+            session_input_stream: self.original_policy_input.clone().unwrap_or_else(|| self.session_input_stream.clone()),
+            control_requested: Arc::clone(&self.original_policy_control_requested),
+            checkpoint_workspace_id: self.checkpoint_workspace_id.clone(),
+            memory_team_id: self.memory_team_id.clone(),
+            activity: self.cowd_bus().and_then(crate::CowdEventBus::current_activity_binding),
+            session_execution_fence: self.session_execution_fence.clone(),
+            original_session_claim: self.original_session_claim.clone(),
+            tool_lease: self.tool_executor.pin_step_catalog(),
+            hook_runner: self.hook_runner.clone(),
+            hook_abort_signal: self.hook_abort_signal.clone(),
+            hook_progress_reporter: self.hook_progress_reporter.clone(),
         }
     }
 
     pub(super) fn assess_tool_authorization_at(
-        &self,
-        descriptor: &harness_contract::tool::ToolEffectDescriptor,
-        input: &str,
-        idempotency_key: String,
-        permission_context: PermissionContext,
-        timeout_secs: u64,
+        &self, descriptor: &harness_contract::tool::ToolEffectDescriptor, input: &str,
+        idempotency_key: String, permission_context: PermissionContext, timeout_secs: u64,
         execution_policy: &harness_contract::policy::SessionExecutionPolicy,
+        binding: Option<&serde_json::Value>,
     ) -> Result<ToolAuthorizationDecision, RuntimeError> {
-        let request = self.authorization_request(
-            descriptor,
-            input,
-            idempotency_key.clone(),
-            permission_context,
-            execution_policy,
-        );
-        let bound_policy = self.permission_policy.bound_to_snapshot(execution_policy);
-        let evaluated = self
-            .authorization_negotiator
-            .assess_effective(&bound_policy, &request);
-        let assessment = evaluated.assessment;
-        if let Some(lease) = assessment.lease.clone() {
-            self.record_capability_assessment(&assessment);
-            return crate::ToolPolicy
-                .authorize(
-                    &evaluated.effective,
-                    &assessment,
-                    idempotency_key,
-                    lease,
-                    timeout_secs,
-                )
-                .map(ToolAuthorizationDecision::Authorized)
-                .map_err(|error| RuntimeError::new(error.to_string()));
-        }
-        Ok(ToolAuthorizationDecision::Gap {
-            assessment,
-            effective: evaluated.effective,
-        })
+        self.shared_policy_owner().assess_tool_authorization_at(
+            descriptor, input, idempotency_key, permission_context, timeout_secs, execution_policy, binding,
+        )
     }
 
     pub(crate) async fn negotiate_tool_authorization(
@@ -1514,279 +2763,226 @@ where
         idempotency_key: String,
         permission_context: PermissionContext,
         timeout_secs: u64,
-        _prompter: &crate::permissions::SharedPrompter,
+        prompter: &crate::permissions::SharedPrompter,
     ) -> Result<ToolAuthorizationDecision, RuntimeError> {
-        let execution_policy = self.permission_policy.execution_policy_control().snapshot();
-        let initial = self.assess_tool_authorization_at(
-            descriptor,
-            input,
-            idempotency_key.clone(),
-            permission_context.clone(),
-            timeout_secs,
-            &execution_policy,
-        )?;
-        let ToolAuthorizationDecision::Gap {
-            assessment,
-            effective,
-        } = initial
-        else {
-            return Ok(initial);
-        };
-        if assessment.path != harness_contract::policy::AuthorizationPath::HumanApproval {
-            let assessment = self.govern_capability_gap(assessment);
-            self.record_capability_assessment(&assessment);
-            return Ok(ToolAuthorizationDecision::Gap {
-                assessment,
-                effective,
-            });
-        }
+        self.negotiate_tool_authorization_inner(descriptor, input, idempotency_key, permission_context, timeout_secs, prompter, None).await
+    }
 
-        let explicit_ask = permission_context.override_decision()
-            == Some(crate::permissions::PermissionOverride::Ask);
-        let request = self.authorization_request(
-            descriptor,
-            input,
-            idempotency_key.clone(),
-            permission_context,
-            &execution_policy,
-        );
-        let Some(coordinator) = &self.approval_coordinator else {
-            let assessment = self.govern_capability_gap(assessment);
-            self.record_capability_assessment(&assessment);
-            return Ok(ToolAuthorizationDecision::Gap {
-                assessment,
-                effective,
-            });
-        };
-        let approved_grant = {
-            let execution_context = self
-                .cowd_bus()
-                .and_then(crate::CowdEventBus::current_execution_context);
-            let activity_binding = self
-                .cowd_bus()
-                .and_then(crate::CowdEventBus::current_activity_binding);
-            let source = harness_contract::policy::ApprovalSource {
-                kind: if self.memory_agent_id != "primary" {
-                    harness_contract::policy::ApprovalSourceKind::Agent
-                } else {
-                    harness_contract::policy::ApprovalSourceKind::Session
-                },
-                session_id: Some(self.session_id().to_string()),
-                agent_id: (self.memory_agent_id != "primary").then(|| self.memory_agent_id.clone()),
-                team_id: self.memory_team_id.clone(),
-                mission_id: None,
-                resource_ref: Some(self.checkpoint_workspace_id.clone()),
-                review_ref: None,
-                application: None,
-            };
-            let context = harness_contract::policy::ApprovalContext {
-                principal_id: request.principal_id.clone(),
-                profile_id: execution_policy.autonomy_profile.as_str().to_string(),
-                approval_profile: Some(execution_policy.approval_profile),
-                workspace_key: self.checkpoint_workspace_id.clone(),
-                session_id: Some(self.session_id().to_string()),
-                turn_id: execution_context
-                    .as_ref()
-                    .map(|value| value.turn_id.clone()),
-                task_id: activity_binding
-                    .as_ref()
-                    .map(|binding| binding.task_id.clone()),
-                capability: descriptor.tool_id.clone(),
-                invocation_id: Some(idempotency_key.clone()),
-                execution_id: execution_context
-                    .as_ref()
-                    .map(|value| value.execution_id.clone()),
-                strategy_decision_ref: None,
-                source_surface: Some("gateway_session".to_string()),
-                resource_targets: descriptor
-                    .scopes
-                    .iter()
-                    .filter_map(|scope| scope.target.clone())
-                    .collect(),
-                effect: Some(effective.descriptor.clone()),
-                explicit_ask,
-                policy_revision: execution_policy.revision,
-                requested_sandbox_posture: Some(execution_policy.sandbox_posture),
-                effective_sandbox_posture: Some(execution_policy.sandbox_posture),
-            };
-            let pending_hook = self.cowd_bus.clone().map(|cowd| {
-                let tool = descriptor.tool_id.clone();
-                Arc::new(move |request: &harness_contract::policy::ApprovalRequest| {
-                    cowd.emit(crate::cowd_event::CowdEvent::ExecutionPhase {
-                        status: harness_contract::projection::ExecutionLiveStatus::WaitingApproval,
-                        detail: Some(tool.clone()),
-                    });
-                    cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
-                        request_id: request.approval_id.clone(),
-                        tool: tool.clone(),
-                    });
-                }) as crate::ApprovalPendingHook
-            });
-            let approval_result = coordinator
-                .resolve_tool(
-                    source,
-                    context,
-                    Some(execution_policy.autonomy_profile),
-                    &effective.descriptor,
-                    input,
-                    self.cancellation_token(),
-                    Some(self.session_input_stream.input_notifier()),
-                    pending_hook,
-                    Duration::from_secs(timeout_secs.max(1)),
-                )
-                .await;
-            emit_approval_resolution_event(self.cowd_bus(), coordinator.queue(), &approval_result);
-            match approval_result {
-                Ok(crate::ApprovalResolution::Approved { grant, .. }) => grant,
-                Ok(crate::ApprovalResolution::Denied {
-                    reason,
-                    approval_id,
-                })
-                | Ok(crate::ApprovalResolution::Cancelled {
-                    reason,
-                    approval_id,
-                }) => {
-                    let denied = denied_capability_assessment(assessment, &reason, &approval_id);
-                    self.record_capability_assessment(&denied);
-                    return Ok(ToolAuthorizationDecision::Gap {
-                        assessment: denied,
-                        effective,
-                    });
-                }
-                Ok(crate::ApprovalResolution::ControlRequested {
-                    reason,
-                    approval_id,
-                }) => {
-                    self.consume_active_runtime_inputs_for_next_step(
-                        TurnInputCheckpoint::AfterToolResult,
-                    );
-                    let denied = denied_capability_assessment(assessment, &reason, &approval_id);
-                    self.record_capability_assessment(&denied);
-                    return Ok(ToolAuthorizationDecision::Gap {
-                        assessment: denied,
-                        effective,
-                    });
-                }
-                Err(error) => {
-                    let denied = denied_capability_assessment(
-                        assessment,
-                        &error,
-                        &format!("tool-approval:{idempotency_key}"),
-                    );
-                    self.record_capability_assessment(&denied);
-                    return Ok(ToolAuthorizationDecision::Gap {
-                        assessment: denied,
-                        effective,
-                    });
-                }
-            }
-        };
-
-        let current_revision = self.permission_policy.execution_policy_control().revision();
-        if current_revision != execution_policy.revision {
-            let denied = denied_capability_assessment(
-                assessment,
-                "session policy changed while approval was pending; replan the effect",
-                &approved_grant.grant_id,
-            );
-            self.record_capability_assessment(&denied);
-            return Ok(ToolAuthorizationDecision::Gap {
-                assessment: denied,
-                effective,
-            });
-        }
-        let bound_policy = self.permission_policy.bound_to_snapshot(&execution_policy);
-        let approved = self.authorization_negotiator.approve_effective(
-            &bound_policy,
-            &request,
-            &effective,
-            &approved_grant,
-        );
-        self.record_capability_assessment(&approved);
-        let Some(lease) = approved.lease.clone() else {
-            return Ok(ToolAuthorizationDecision::Gap {
-                assessment: approved,
-                effective,
-            });
-        };
-        let authorized = crate::ToolPolicy
-            .authorize(&effective, &approved, idempotency_key, lease, timeout_secs)
+    /// Prove that this exact original ticket/request uses the invocation
+    /// prepared from its pinned Step catalog. This does not run a hook or
+    /// negotiate/consume an authorization lease.
+    pub(crate) fn prepare_call_effect_evidence(
+        &self,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<PreparedCallEffect, RuntimeError> {
+        crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, request)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-        if approved_grant.scope == harness_contract::policy::ApprovalGrantScope::Once {
-            coordinator
-                .queue()
-                .consume_once_grant(&approved_grant.grant_id)
-                .map_err(RuntimeError::new)?;
+        if request.step_binding.is_none() {
+            if request.tool_name == "agent_action_batch" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
+                return Err(RuntimeError::new("original action Step binding missing"));
+            }
+            let owner = request.tool_progress.original_governed_hook().map_err(RuntimeError::new)?
+                .ok_or_else(|| RuntimeError::new("original unbound call owner missing"))?;
+            let workspace_root = if let Some(lease) = owner.original_pinned_lease() {
+                owner.original_prepared_lease(ticket, request).map_err(RuntimeError::new)?;
+                lease.workspace_root().to_path_buf()
+            } else if owner.matches_native_preparation(ticket, request) {
+                self.governed_workspace_root()?
+            } else {
+                return Err(RuntimeError::new("original native preparation differs"));
+            };
+            return Ok(PreparedCallEffect { ticket: ticket.clone(), request: serde_json::to_value(request)
+                .map_err(|error| RuntimeError::new(error.to_string()))?, workspace_root });
         }
-        Ok(ToolAuthorizationDecision::Authorized(authorized))
+        let binding = request.step_binding.as_ref().ok_or_else(|| RuntimeError::new("prepared call Step missing"))?;
+        let invocation = request.compiled_invocation.as_ref().ok_or_else(|| RuntimeError::new("prepared call invocation missing"))?;
+        let input = harness_contract::step::parse_strict_json(&request.input)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let step = binding.resolve(self.tool_executor.pin_step_catalog())?;
+        let workspace_root = step.lease().workspace_root().to_path_buf();
+        let mut derived = binding.prepare_invocation(Some(step.lease().clone()), &request.tool_name, &input)?;
+        // The original plan compiler adds dependency edges after preparing the
+        // pinned tool. Ticket/plan consumers validate those edges separately.
+        derived.explicit_dependencies = invocation.explicit_dependencies.clone();
+        derived.compiled_dependencies = invocation.compiled_dependencies.clone();
+        if &derived != invocation {
+            return Err(RuntimeError::new("prepared call differs from pinned Step descriptor"));
+        }
+        Ok(PreparedCallEffect { ticket:ticket.clone(), request:serde_json::to_value(request)
+            .map_err(|error| RuntimeError::new(error.to_string()))?, workspace_root })
+    }
+
+    /// Evaluate once, and attach the original owner/call to the assessment
+    /// actually written by that evaluation. The commit owner must still
+    /// authenticate the binding and settle refusal against admission.
+    pub(crate) async fn negotiate_tool_authorization_for_call(
+        &self,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        input: &str,
+        idempotency_key: String,
+        permission_context: PermissionContext,
+        timeout_secs: u64,
+        prompter: &crate::permissions::SharedPrompter,
+        owner: crate::execution_core::graph::CallRefusalOwner<'_>,
+        request: &crate::RuntimeToolExecutionRequest,
+        prepared_effect: Option<&PreparedCallEffect>,
+    ) -> Result<ToolAuthorizationDecision, RuntimeError> {
+        use sha2::Digest as _;
+        let step = request.step_binding.as_ref().ok_or_else(|| RuntimeError::new("assessment original Step missing"))?;
+        let invocation = request.compiled_invocation.as_ref()
+            .ok_or_else(|| RuntimeError::new("assessment original invocation missing"))?;
+        let effective = harness_contract::step::parse_strict_json(input)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if request.input != input || request.session_id.as_deref() != Some(self.session_id())
+            || request.tool_name != descriptor.tool_id || step.origin.call_id != request.tool_use_id
+            || step.effect_idempotency_key() != request.idempotency_key
+            || &invocation.effect != descriptor || effective != invocation.intent.normalized_input {
+            return Err(RuntimeError::new("assessment original call or effective input mismatch"));
+        }
+        let owner = match owner {
+            crate::execution_core::graph::CallRefusalOwner::Node(ticket) => {
+                if prepared_effect.is_none_or(|proof| !proof.matches(ticket, request)) {
+                    return Err(RuntimeError::new("assessment original prepared effect unavailable"));
+                }
+                serde_json::json!({"kind":"node", "ticket":ticket})
+            },
+        };
+        let binding = serde_json::json!({
+            "version":1, "step_binding":step, "owner":owner, "request":request,
+            "call_id":request.tool_use_id, "tool_name":request.tool_name,
+            "effect_key":request.idempotency_key,
+            "input_sha256":format!("sha256:{:x}", sha2::Sha256::digest(input.as_bytes())),
+        });
+        if request.tool_name != harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID {
+            return self.negotiate_tool_authorization_inner(descriptor, input, idempotency_key,
+                permission_context, timeout_secs, prompter, Some(&binding)).await;
+        }
+        // Preserve the exact owner events emitted by this one negotiation.
+        // The fact below is written only after ToolPolicy returns its real
+        // authorization and before this function can hand it to dispatch.
+        let evidence = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let consumed = Arc::new(std::sync::Mutex::new(None));
+        let request_id = idempotency_key.clone();
+        let result = MEMBER_ORIGINAL_CONSUMPTION.scope(Arc::clone(&consumed),
+            MEMBER_ORIGINAL_EVIDENCE.scope(Arc::clone(&evidence),
+                self.negotiate_tool_authorization_inner(descriptor, input, idempotency_key,
+                    permission_context, timeout_secs, prompter, Some(&binding)))).await?;
+        let ToolAuthorizationDecision::Authorized(decision) = &result else { return Ok(result); };
+        let store = self.runtime_event_store.as_ref()
+            .ok_or_else(|| RuntimeError::new("completion original authorization store unavailable"))?;
+        let authorization = &decision.authorization;
+        let lease = &authorization.authorization_lease;
+        let consumption = consumed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone().ok_or_else(|| RuntimeError::new("completion original lease consume unavailable"))?;
+        if authorization.request_id != request_id || lease.idempotency_key != request_id
+            || !consumption.belongs_to(&self.authorization_negotiator) || consumption.lease != *lease
+        { return Err(RuntimeError::new("completion original authorization owner mismatch")); }
+        let stream = format!("authorization-lease:{}", lease.lease_id);
+        let consume = store.event_by_idempotency_key(&stream, &consumption.transition.transition_id)
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+            .ok_or_else(|| RuntimeError::new("completion original consume was not persisted"))?;
+        let transition: harness_contract::policy::AuthorizationLeaseTransition = serde_json::from_value(consume.payload.clone())
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let receipt = store.original_transaction_receipt(&consume.transaction_id)
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+            .ok_or_else(|| RuntimeError::new("completion original consume receipt unavailable"))?;
+        if transition != consumption.transition || transition.idempotency_key.as_deref() != Some(request_id.as_str())
+            || transition.kind != harness_contract::policy::AuthorizationLeaseTransitionKind::Consumed
+            || consume.scope != RuntimeEventScope::Tool || consume.kind != "authorization.lease_transition"
+            || consume.status.as_deref() != Some("consumed") || consume.actor.as_deref() != Some("conversation_runtime")
+            || consume.stream_id != stream || consume.transaction_index != 0 || consume.schema_version != 1
+            || consume.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
+            || consume.transaction_id != format!("authorization-transition:{}", transition.transition_id)
+            || consume.refs != vec![RuntimeEventRef { kind: "authorization_lease".into(), id: lease.lease_id.clone() }]
+            || receipt.transaction_id != consume.transaction_id || receipt.commit_cursor != consume.commit_cursor
+            || receipt.event_ids.as_slice() != [consume.event_id.clone()] || receipt.stream_revisions.len() != 1
+            || receipt.stream_revisions[0].stream_id != stream
+            || receipt.stream_revisions[0].committed_revision != consume.sequence
+            || receipt.stream_revisions[0].expected_revision.checked_add(1) != Some(consume.sequence)
+        { return Err(RuntimeError::new("completion original consume transaction mismatch")); }
+        let events = evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let assessments = events.iter().filter(|event| event.kind == "authorization.capability_assessed"
+            && event.payload.get("_call_refusal_binding") == Some(&binding)
+            && event.payload.pointer("/lease/lease_id").and_then(serde_json::Value::as_str) == Some(lease.lease_id.as_str())
+        ).collect::<Vec<_>>();
+        if assessments.len() != 1 { return Err(RuntimeError::new("completion original assessment missing or ambiguous")); }
+        let assessment = assessments[0];
+        let assessment_receipt = store.original_transaction_receipt(&assessment.transaction_id)
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+            .ok_or_else(|| RuntimeError::new("completion original assessment receipt unavailable"))?;
+        if assessment.scope != RuntimeEventScope::Tool || assessment.actor.as_deref() != Some("conversation_runtime")
+            || assessment.transaction_index != 0 || assessment.schema_version != 1
+            || assessment_receipt.transaction_id != assessment.transaction_id
+            || assessment_receipt.commit_cursor != assessment.commit_cursor
+            || assessment_receipt.event_ids.as_slice() != [assessment.event_id.clone()]
+            || assessment_receipt.stream_revisions.len() != 1
+            || assessment_receipt.stream_revisions[0].stream_id != assessment.stream_id
+            || assessment_receipt.stream_revisions[0].committed_revision != assessment.sequence
+            || assessment_receipt.stream_revisions[0].expected_revision.checked_add(1) != Some(assessment.sequence)
+        { return Err(RuntimeError::new("completion original assessment transaction mismatch")); }
+        let coord = |event: &crate::DurableRuntimeEvent| serde_json::json!({
+            "stream_id":event.stream_id, "sequence":event.sequence, "event_id":event.event_id,
+            "transaction_id":event.transaction_id, "transaction_index":event.transaction_index,
+            "commit_cursor":event.commit_cursor,
+        });
+        let payload = serde_json::json!({
+            "version":1, "binding":binding, "authorization":authorization,
+            "assessment":coord(assessment), "consume":coord(&consume),
+        });
+        drop(events);
+        let persisted = store.append(RuntimeEventInput {
+            stream_id: format!("session:{}", self.session_id()), scope: RuntimeEventScope::Tool,
+            kind: "authorization.call_authorized".into(), status: Some("authorized".into()),
+            actor: Some("conversation_runtime".into()),
+            refs: vec![RuntimeEventRef { kind:"authorization_lease".into(), id:lease.lease_id.clone() },
+                RuntimeEventRef { kind:"capability".into(), id:request.tool_name.clone() }],
+            payload,
+        });
+        if let Ok(event) = &persisted {
+            // The surrounding original single-call scope carries this exact
+            // returned event into the original checked action transaction.
+            capture_member_event(event.clone());
+        }
+        if let Err(error) = persisted {
+            self.authorization_negotiator.revoke(&lease.lease_id);
+            let _ = self.authorization_negotiator.take_transitions_for_persistence();
+            for pending in self.authorization_negotiator.transitions_awaiting_persistence() {
+                let pending_stream = format!("authorization-lease:{}", pending.lease.lease_id);
+                if crate::authorization_negotiator::persist_authorization_transition_event(
+                    store, &pending_stream, "conversation_runtime", &pending,
+                ).is_err() { break; }
+                self.authorization_negotiator.acknowledge_persisted_transitions(std::slice::from_ref(&pending.transition_id));
+            }
+            return Err(RuntimeError::new(format!("completion original authorization persistence failed: {error}")));
+        }
+        Ok(result)
+    }
+
+    async fn negotiate_tool_authorization_inner(
+        &self, descriptor: &harness_contract::tool::ToolEffectDescriptor, input: &str,
+        idempotency_key: String, permission_context: PermissionContext, timeout_secs: u64,
+        prompter: &crate::permissions::SharedPrompter, binding: Option<&serde_json::Value>,
+    ) -> Result<ToolAuthorizationDecision, RuntimeError> {
+        let owner = Arc::new(self.shared_policy_owner());
+        let _ = SINGLE_ORIGINAL_EVIDENCE.try_with(|capture| {
+            *capture.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
+            *capture.permission_context.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(permission_context.clone());
+        });
+        let result = owner.negotiate_tool_authorization_inner(
+            descriptor, input, idempotency_key, permission_context, timeout_secs, prompter, binding,
+        ).await;
+        if !self.original_policy_control_parent_owned
+            && owner.control_requested.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::AfterToolResult);
+        }
+        result
     }
 
     pub(super) fn govern_capability_gap(
-        &self,
-        mut assessment: harness_contract::policy::CapabilityAssessment,
+        &self, assessment: harness_contract::policy::CapabilityAssessment,
     ) -> harness_contract::policy::CapabilityAssessment {
-        let Some(fingerprint) = assessment
-            .gap
-            .as_ref()
-            .filter(|gap| gap.recoverable)
-            .map(|gap| gap.fingerprint.clone())
-        else {
-            return assessment;
-        };
-        let Some(context) = self
-            .cowd_bus()
-            .and_then(crate::CowdEventBus::current_execution_context)
-        else {
-            close_controlled_recovery_gap(
-                &mut assessment,
-                "controlled recovery requires an exact durable turn identity",
-                "authorization.recovery_missing_turn_identity",
-            );
-            return assessment;
-        };
-        let recovery_scope = format!("turn:{}", context.turn_id);
-        if !self
-            .authorization_negotiator
-            .claim_controlled_recovery(&assessment, &recovery_scope)
-        {
-            close_controlled_recovery_gap(
-                &mut assessment,
-                "the same capability gap already consumed its single controlled recovery",
-                "authorization.recovery_circuit_open",
-            );
-            return assessment;
-        }
-        let claim = crate::authorization_negotiator::ControlledRecoveryClaimRecord {
-            fingerprint: fingerprint.clone(),
-            recovery_scope,
-            session_id: context.session_id,
-            turn_id: context.turn_id,
-            execution_id: context.execution_id,
-            capability: assessment.capability.clone(),
-        };
-        let persist_result = self
-            .runtime_event_store
-            .as_ref()
-            .ok_or_else(|| {
-                "controlled recovery requires the durable Runtime event store".to_string()
-            })
-            .and_then(|store| {
-                crate::authorization_negotiator::persist_controlled_recovery_claim(store, &claim)
-            });
-        if let Err(error) = persist_result {
-            self.authorization_negotiator
-                .rollback_unpersisted_controlled_recovery_claim(&fingerprint);
-            close_controlled_recovery_gap(
-                &mut assessment,
-                &format!("controlled recovery claim was not durably recorded: {error}"),
-                "authorization.recovery_persistence_failed",
-            );
-        } else {
-            assessment.evidence_refs.push(format!(
-                "authorization.controlled_recovery_claim:{fingerprint}"
-            ));
-        }
-        assessment
+        self.shared_policy_owner().govern_capability_gap(assessment)
     }
 
     pub(crate) fn restore_controlled_recovery_claims_for_turn(

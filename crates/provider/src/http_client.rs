@@ -61,7 +61,8 @@ impl ProxyConfig {
 
 /// Build a `reqwest::Client` that honours the standard `HTTP_PROXY`,
 /// `HTTPS_PROXY`, and `NO_PROXY` environment variables. When no proxy is
-/// configured the client behaves identically to `reqwest::Client::new()`.
+/// configured the client uses a bounded connect timeout and refuses automatic
+/// redirects so an additional physical send cannot bypass a per-send gate.
 pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
     build_http_client_with(&ProxyConfig::from_env())
 }
@@ -84,6 +85,7 @@ pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, A
         .map_or(Duration::from_secs(10), Duration::from_secs);
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout);
 
     let no_proxy = config
@@ -124,10 +126,69 @@ where
 }
 
 #[cfg(test)]
+pub(crate) async fn fixture_assert_redirect_refused(client: reqwest::Client) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let first = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().await.unwrap();
+        let mut bytes = [0u8; 2048]; let _ = stream.read(&mut bytes).await.unwrap();
+        stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    });
+    let redirected = tokio::spawn(async move {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), target.accept()).await {
+            Ok(Ok((mut stream, _))) => {
+                let mut bytes = [0u8; 2048]; let _ = stream.read(&mut bytes).await.unwrap();
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                true
+            }
+            _ => false,
+        }
+    });
+    let result = client.get(format!("http://{origin_addr}/initial")).send().await.unwrap();
+    first.await.unwrap();
+    let second = redirected.await.unwrap();
+    assert_eq!(result.status(), reqwest::StatusCode::FOUND, "client followed a redirect");
+    assert!(!second, "redirect caused an additional physical request");
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::{build_http_client_with, ProxyConfig};
+
+    #[tokio::test]
+    async fn provider_client_does_not_automatically_send_redirect_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let first = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut data = [0u8; 2048]; let _ = stream.read(&mut data).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let redirected = tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), target.accept()).await {
+                Ok(Ok((mut stream, _))) => {
+                    let mut data = [0u8; 2048]; let _ = stream.read(&mut data).await.unwrap();
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    true
+                }
+                _ => false,
+            }
+        });
+        let client = build_http_client_with(&ProxyConfig::default()).unwrap();
+        let result = client.get(format!("http://{origin_addr}/initial")).send().await.unwrap();
+        first.await.unwrap();
+        let second_request_occurred = redirected.await.unwrap();
+        assert_eq!(result.status(), reqwest::StatusCode::FOUND);
+        assert!(!second_request_occurred, "redirect sent a second physical HTTP request");
+    }
 
     fn config_from_map(pairs: &[(&str, &str)]) -> ProxyConfig {
         let map: HashMap<String, String> = pairs

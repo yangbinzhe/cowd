@@ -156,6 +156,7 @@ struct ContextRetrieveRequest {
 
 #[derive(Debug, Clone, Copy)]
 struct RuntimeToolExecutionBinding<'a> {
+    action_invocation: Option<&'a runtime::agentic::action_invocation::VerifiedActionInvocation>,
     tool_lease: Option<&'a tools::ToolHostLease>,
     action_id: Option<&'a str>,
     session_id: Option<&'a str>,
@@ -164,8 +165,16 @@ struct RuntimeToolExecutionBinding<'a> {
     reality_context: Option<&'a harness_contract::agent::AgentDataLease>,
     model_lease: Option<&'a str>,
     parent_execution: Option<&'a harness_contract::execution_graph::ExecutionParentBinding>,
+    // Original node attempt supplied by Runtime, never model input.
+    parent_execution_attempt: Option<u32>,
     execution_decision: Option<&'a runtime::RuntimeExecutionDecision>,
     permission_ceiling: harness_contract::policy::PermissionMode,
+}
+
+impl<'a> RuntimeToolExecutionBinding<'a> {
+    fn for_batch_action(self, action_id: &'a str) -> Self {
+        Self { action_id: Some(action_id), action_invocation: None, ..self }
+    }
 }
 
 fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
@@ -278,6 +287,7 @@ fn root_agent_action_actor(
     resource_scopes.dedup();
     let actor_id = format!("root:{session_id}");
     Ok(harness_contract::agent_action::AgentActorBinding {
+        original_execution: None,
         objective_id,
         program_id,
         session_id: session_id.to_string(),

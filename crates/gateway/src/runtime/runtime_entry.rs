@@ -61,11 +61,12 @@ impl GatewayRuntimeEntry {
 
     pub(crate) fn install_turn_control(
         &mut self,
-        cancellation_token: runtime::CancellationToken,
+        control: std::sync::Arc<runtime::execution_core::services::TurnCancellationControl>,
         hook_abort_signal: runtime::HookAbortSignal,
-    ) {
-        self.runtime_mut()
-            .install_turn_control(cancellation_token, hook_abort_signal);
+    ) -> Result<(), runtime::RuntimeError> {
+        let runtime = self.runtime_mut();
+        runtime.install_turn_control(control.token(), hook_abort_signal);
+        runtime.install_provider_cancellation_control(Some(control))
     }
 
     pub(crate) fn install_provider_cancellation_control(

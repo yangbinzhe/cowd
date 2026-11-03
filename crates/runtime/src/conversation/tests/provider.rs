@@ -448,6 +448,7 @@ fn r304_diagnostic_request_fixture(
                     model_protocol::provider_capability::ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(42),
+            diagnostic_send_reason: None,
         },
         wire_request: provider::ProviderWireRequest {
             method: "POST".into(),
@@ -748,6 +749,7 @@ async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
                     model_protocol::provider_capability::ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(42),
+            diagnostic_send_reason: None,
             attempt: 7,
         },
         wire_request: provider::ProviderWireRequest {
@@ -5263,6 +5265,7 @@ mod r1_native_real_wire {
                 error,
                 evidence_ref: format!("tool-effect:{}", request.idempotency_key),
                 observed_evidence: Vec::new(),
+                pending_agent_batch: None,
             }
         }
     }
@@ -6768,6 +6771,7 @@ fn empty_final_completion_is_failure_with_original_usage_not_a_goal_candidate() 
             error: None,
             evidence_ref: "original-receipt".into(),
             observed_evidence: vec![],
+            pending_agent_batch: None,
         },
     };
     let mut after_effect = make("", vec![], false);

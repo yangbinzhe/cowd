@@ -559,6 +559,7 @@ mod tests {
             .apply(&harness_contract::agent_action::AgentActionEnvelope {
                 action_id: format!("open-{program_id}"),
                 actor: harness_contract::agent_action::AgentActorBinding {
+                    original_execution: None,
                     objective_id: format!("objective-{program_id}"),
                     program_id: program_id.to_string(),
                     session_id: session.to_string(),

@@ -81,7 +81,8 @@ pub(crate) fn validate_review_coverage(
             .all(|(stream, revision)| {
                 snapshot.sources.iter().any(|source| {
                     &source.stream_id == stream && source.expected_revision == *revision
-                })
+                }) || snapshot.pre_authenticated_session_source.as_ref().is_some_and(|source|
+                    &source.stream_id == stream && source.expected_revision == *revision)
             })
     {
         return Err(ReviewCoverageError::Snapshot);
@@ -169,11 +170,14 @@ mod tests {
             task_refs: vec![],
             artifact_refs: vec![],
             reviewer_execution_refs: ["review-run".into()].into_iter().collect(),
+            reviewer_packet: None,
             retiring_optional_task_refs: Default::default(),
             semantic_digest: "semantic".into(),
             policy_digest: "policy".into(),
             sources: vec![],
             current_review_effect_key: None,
+            dependency_frame: super::super::policy::ConclusionMaterialDependencies::empty_for_coverage_test(),
+            pre_authenticated_session_source: None,
             effects: super::super::policy::RootReviewPolicySnapshot {
                 digest: "effects".into(),
                 last_effect_cursor: 0,

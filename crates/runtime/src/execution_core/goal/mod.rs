@@ -17,7 +17,7 @@ mod program_completion;
 pub(crate) use program_completion::delivered_result_refs;
 pub mod supervisor;
 
-pub(crate) use program_completion::PreparedProgramConclusion;
+pub(crate) use program_completion::{OriginalConclusionProofCustody, PreparedProgramConclusion};
 
 pub use supervisor::{ObjectiveReconcileDecision, ObjectiveSupervisor};
 
@@ -4481,6 +4481,7 @@ mod tests {
                 .build()
                 .unwrap();
             let actor = AgentActorBinding {
+                original_execution: None,
                 objective_id: "user-objective".into(),
                 program_id: "user-program".into(),
                 session_id: "session-test".into(),
@@ -5136,6 +5137,7 @@ mod tests {
             let events = Arc::new(RuntimeEventStore::for_test());
             let actions = crate::AgentActionService::new(events.clone());
             let actor = AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective-1".into(),
                 program_id: "program-1".into(),
                 session_id: "session-1".into(),
@@ -5477,412 +5479,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn model_refinements_preserve_original_goal_and_failed_or_replayed_updates_do_not_write()
-    {
-        use harness_contract::agent_action::*;
-        let services = crate::RuntimeServices::in_memory().unwrap();
-        let material = services
-            .artifact_store()
-            .write_bytes(
-                harness_contract::context::ArtifactWriteDescriptor {
-                    media_type: "text/plain".into(),
-                    visibility_scope: "session:session-test".into(),
-                    expected_bytes: None,
-                    original_name: None,
-                },
-                b"Check the source-backed result against the user's original requirements",
-            )
-            .await
-            .unwrap();
-        let mut original = goal();
-        original.id = "goal:refinement-root".into();
-        original.scope = harness_contract::goal::GoalScope::UserObjective;
-        original.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
-            objective_id: "refinement-objective".into(),
-            session_id: original.session_id.clone(),
-            turn_id: "refinement-turn".into(),
-            root_execution_id: "refinement-root".into(),
-            agentic_program_id: "refinement-program".into(),
-        });
-        original
-            .obligations
-            .push(harness_contract::goal::ObjectiveObligation {
-                obligation_id: "original-user-obligation".into(),
-                required: true,
-                success_predicate: "retain and verify the original user deliverable".into(),
-                producer: Default::default(),
-                evidence_requirement: Default::default(),
-                state: ObjectiveObligationState::Open,
-                artifact_refs: vec![],
-                evidence_refs: vec![],
-                reread_receipts: vec![],
-                verifier_decision: None,
-                diagnostic_code: None,
-            });
-        services.goal_store().create(original.clone()).unwrap();
-        let actor = AgentActorBinding {
-            objective_id: "refinement-objective".into(),
-            program_id: "refinement-program".into(),
-            session_id: "session-test".into(),
-            turn_id: "refinement-turn".into(),
-            root_execution_id: Some("refinement-root".into()),
-            required_team_count: 0,
-            exact_team_count: None,
-            objective_summary: original.objective.clone(),
-            model_lease: "test".into(),
-            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
-            resource_scopes: vec![],
-            actor_id: "refinement-root-actor".into(),
-            kind: AgentActorKind::Root,
-            execution_id: None,
-            team_id: None,
-            agent_id: None,
-        };
-        let action = |id: &str, operation, criterion_ref: Option<String>| AgentActionEnvelope {
-            action_id: id.into(),
-            actor: actor.clone(),
-            expected_revision: None,
-            action: AgentAction::ObjectiveUpdate(ObjectiveUpdateInput {
-                criterion_ref,
-                operation,
-                statement_ref: Some(material.selector.clone()),
-                source_refs: vec![material.selector.clone()],
-                reason_ref: Some(material.selector.clone()),
-                evidence_requirements: vec![],
-            }),
-        };
-        let add = action("add-derived", ObjectiveUpdateOperation::Add, None);
-        let added = services.submit_agent_action(&add).await.unwrap();
-        assert_eq!(added.status, AgentActionStatus::Applied);
-        let first = services.goal_store().get(&original.id).unwrap().unwrap();
-        assert_eq!(first.spec_revision, 2);
-        assert_eq!(first.criteria[0], original.criteria[0]);
-        let derived = added
-            .changed_refs
-            .first()
-            .expect("model receives its generated criterion reference")
-            .clone();
-        assert_eq!(derived, first.criteria[1].id);
-        let inspect = |id: &str, entry_ref: Option<String>, page_cursor: Option<String>| {
-            AgentActionEnvelope {
-                action_id: id.into(),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: AgentAction::StateInspect(StateInspectInput {
-                    query: entry_ref.is_none().then(|| original.id.clone()),
-                    entry_ref,
-                    page_cursor,
-                    ..Default::default()
-                }),
-            }
-        };
-        let visible = services
-            .submit_agent_action(&inspect("inspect-derived", Some(derived.clone()), None))
-            .await
-            .unwrap();
-        assert_eq!(visible.status, AgentActionStatus::Observed);
-        assert_eq!(
-            visible.projection.unwrap()["goal_entry"]["criterion"]["id"],
-            derived
-        );
-        let review = |id: &str| AgentActionEnvelope {
-            action_id: id.into(),
-            actor: actor.clone(),
-            expected_revision: None,
-            action: AgentAction::ObjectiveReview(ObjectiveReviewInput {
-                criterion_ref: derived.clone(),
-                decision: ObjectiveReviewDecision::Gap,
-                result_refs: vec![],
-                evidence_refs: vec![material.selector.clone()],
-                reason_ref: material.selector.clone(),
-                reason: "the reviewed delivery does not yet cover every current result".to_string(),
-            }),
-        };
-        let team = services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "refinement-support-team".into(),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: AgentAction::TeamCreate(TeamCreateInput {
-                    name: "Support".into(),
-                    mission: "Support existing conditions without replacing them".into(),
-                    objective: None,
-                }),
-            })
-            .await
-            .unwrap()
-            .changed_refs[0]
-            .clone();
-        let publish = |id: &str, references: Vec<String>, purpose| AgentActionEnvelope {
-            action_id: id.into(),
-            actor: actor.clone(),
-            expected_revision: None,
-            action: AgentAction::TaskPublish(TaskPublishInput {
-                team_ref: team.clone(),
-                title: id.into(),
-                objective: "Check source".into(),
-                acceptance: "source-backed evidence".into(),
-                criterion_source: Default::default(),
-                acceptance_checks: Vec::new(),
-                required_capabilities: vec![],
-                depends_on: vec![],
-                obligation_refs: references,
-                purpose,
-                execution_requirements: vec![],
-                expertise_hints: vec![],
-            }),
-        };
-        let refs = vec![
-            derived.clone(),
-            "original-user-obligation".into(),
-            "checked".into(),
-        ];
-        let supporting = publish("support-many", refs.clone(), TaskPurpose::Delivery);
-        for request in [
-            supporting.clone(),
-            publish("support-same", refs.clone(), TaskPurpose::Delivery),
-            publish("optional-exploration", vec![], TaskPurpose::Exploration),
-        ] {
-            let result = services.submit_agent_action(&request).await.unwrap();
-            assert_eq!(result.status, AgentActionStatus::Applied);
-            let projection = services
-                .agent_action_service()
-                .project(&actor.program_id)
-                .unwrap();
-            let task = &projection.tasks[&result.changed_refs[0]];
-            let AgentAction::TaskPublish(input) = request.action else {
-                unreachable!()
-            };
-            assert_eq!(task.obligation_refs, input.obligation_refs);
-            assert_eq!(task.purpose, input.purpose);
-        }
-        assert_eq!(
-            services.goal_store().get(&original.id).unwrap().unwrap(),
-            first,
-            "publishing supporting or exploration work cannot change Goal obligations or success"
-        );
-        let before_invalid = services
-            .agent_action_service()
-            .project(&actor.program_id)
-            .unwrap()
-            .revision;
-        let invalid = services
-            .submit_agent_action(&publish(
-                "unknown-obligation",
-                vec!["foreign-condition".into()],
-                TaskPurpose::Delivery,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(invalid.status, AgentActionStatus::Rejected);
-        assert_eq!(invalid.error.unwrap().code, "obligation_not_found");
-        assert_eq!(
-            services
-                .agent_action_service()
-                .project(&actor.program_id)
-                .unwrap()
-                .revision,
-            before_invalid
-        );
-        for operation in [
-            ObjectiveUpdateOperation::Replace,
-            ObjectiveUpdateOperation::Retire,
-        ] {
-            if operation == ObjectiveUpdateOperation::Retire {
-                let reviewed = services
-                    .submit_agent_action(&review("derived-gap"))
-                    .await
-                    .unwrap();
-                assert_eq!(reviewed.status, AgentActionStatus::Applied);
-                assert!(reviewed.changed_refs[0].starts_with("objective_review:"));
-            }
-            let before = services
-                .event_store()
-                .stream_revision("goal:goal:refinement-root")
-                .unwrap();
-            let before_program = services
-                .agent_action_service()
-                .project(&actor.program_id)
-                .unwrap()
-                .revision;
-            let rejected = action(
-                &format!("forbidden-{operation:?}"),
-                operation,
-                Some("checked".into()),
-            );
-            assert!(services
-                .submit_agent_action(&rejected)
-                .await
-                .unwrap_err()
-                .contains("original user_intent"));
-            assert_eq!(
-                services
-                    .event_store()
-                    .stream_revision("goal:goal:refinement-root")
-                    .unwrap(),
-                before
-            );
-            assert_eq!(
-                services
-                    .agent_action_service()
-                    .project(&actor.program_id)
-                    .unwrap()
-                    .revision,
-                before_program
-            );
-            let allowed = action(
-                &format!("derived-{operation:?}"),
-                operation,
-                Some(derived.clone()),
-            );
-            assert_eq!(
-                services.submit_agent_action(&allowed).await.unwrap().status,
-                AgentActionStatus::Applied
-            );
-        }
-        let before_retired = services
-            .agent_action_service()
-            .project(&actor.program_id)
-            .unwrap()
-            .revision;
-        let retired = services
-            .submit_agent_action(&publish(
-                "retired-support",
-                vec![derived.clone()],
-                TaskPurpose::Delivery,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(retired.status, AgentActionStatus::Rejected);
-        assert_eq!(retired.error.unwrap().code, "obligation_not_found");
-        let replayed = services.submit_agent_action(&supporting).await.unwrap();
-        assert!(replayed.duplicate);
-        assert_eq!(replayed.status, AgentActionStatus::Applied);
-        assert_eq!(
-            services
-                .agent_action_service()
-                .project(&actor.program_id)
-                .unwrap()
-                .revision,
-            before_retired
-        );
-        let current = services.goal_store().get(&original.id).unwrap().unwrap();
-        assert_eq!(current.criteria, original.criteria);
-        assert_eq!(current.obligations, original.obligations);
-        assert_eq!(current.source_intent_ref, original.source_intent_ref);
-        assert_eq!(current.spec_revision, 4);
-        assert!(services
-            .submit_agent_action(&review("cannot-review-retired-criterion"))
-            .await
-            .unwrap_err()
-            .contains("does not exist"));
-
-        let before = services
-            .event_store()
-            .stream_revision("goal:goal:refinement-root")
-            .unwrap();
-        assert_eq!(
-            services.submit_agent_action(&add).await.unwrap().status,
-            AgentActionStatus::Applied
-        );
-        assert_eq!(
-            services
-                .event_store()
-                .stream_revision("goal:goal:refinement-root")
-                .unwrap(),
-            before
-        );
-        let mut forged = serde_json::to_value(&add.action).unwrap();
-        forged["input"]["waiver"] = serde_json::json!({"permission_receipt":"model-says-approved"});
-        assert!(serde_json::from_value::<AgentAction>(forged).is_err());
-        let mut forged_receipt = action("forged-statement", ObjectiveUpdateOperation::Add, None);
-        if let AgentAction::ObjectiveUpdate(input) = &mut forged_receipt.action {
-            input.statement_ref = Some("tool://invented".into());
-        }
-        assert!(services.submit_agent_action(&forged_receipt).await.is_err());
-        assert_eq!(
-            services
-                .event_store()
-                .stream_revision("goal:goal:refinement-root")
-                .unwrap(),
-            before
-        );
-        // Independent Goal owner updates must also invalidate a directory
-        // cursor even when no Program action changes its revision.
-        let current = services.goal_store().get(&original.id).unwrap().unwrap();
-        services
-            .goal_store()
-            .revise(
-                &original.id,
-                current.revision,
-                current.user_sequence + 1,
-                "test owner adds a paged criterion set",
-                |goal| {
-                    for index in 0..40 {
-                        let mut criterion = original.criteria[0].clone();
-                        criterion.id = format!("criterion:paged:{index:03}");
-                        goal.criteria.push(criterion);
-                    }
-                    goal.spec_revision += 1;
-                    goal.spec_digest = goal_spec_digest(goal);
-                    vec![
-                        "criteria".into(),
-                        "spec_revision".into(),
-                        "spec_digest".into(),
-                    ]
-                },
-            )
-            .unwrap();
-        let page = services
-            .submit_agent_action(&inspect("goal-directory", None, None))
-            .await
-            .unwrap()
-            .projection
-            .unwrap();
-        assert_eq!(page["entries"].as_array().unwrap().len(), 32);
-        let cursor = page["next_page_cursor"].as_str().unwrap().to_string();
-        let program_revision = services
-            .agent_action_service()
-            .project(&actor.program_id)
-            .unwrap()
-            .revision;
-        let current = services.goal_store().get(&original.id).unwrap().unwrap();
-        services
-            .goal_store()
-            .revise(
-                &original.id,
-                current.revision,
-                current.user_sequence + 1,
-                "test independent Goal revision",
-                |goal| {
-                    goal.constraints.push("new current constraint".into());
-                    goal.spec_revision += 1;
-                    goal.spec_digest = goal_spec_digest(goal);
-                    vec![
-                        "constraints".into(),
-                        "spec_revision".into(),
-                        "spec_digest".into(),
-                    ]
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            services
-                .agent_action_service()
-                .project(&actor.program_id)
-                .unwrap()
-                .revision,
-            program_revision
-        );
-        let stale = services
-            .submit_agent_action(&inspect("stale-goal-directory", None, Some(cursor)))
-            .await
-            .unwrap();
-        assert_eq!(stale.status, AgentActionStatus::Rejected);
-        assert!(stale.error.unwrap().message.contains("revision"));
-    }
-
     fn terminal_for_test() -> ObjectiveTerminal {
         ObjectiveTerminal {
             kind: ObjectiveTerminalKind::Satisfied,
@@ -6199,85 +5795,25 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn over_qualified_criterion_ref_resolves_to_the_plain_id() {
-        use harness_contract::agent_action::*;
-        let services = crate::RuntimeServices::in_memory().unwrap();
-        let material = services
-            .artifact_store()
-            .write_bytes(
-                harness_contract::context::ArtifactWriteDescriptor {
-                    media_type: "text/plain".into(),
-                    visibility_scope: "session:session-test".into(),
-                    expected_bytes: None,
-                    original_name: None,
-                },
-                b"review body",
-            )
-            .await
-            .unwrap();
-        let mut original = goal();
-        original.id = "goal:over-qualified-root".into();
-        original.scope = harness_contract::goal::GoalScope::UserObjective;
-        original.execution_binding = Some(harness_contract::goal::GoalExecutionBinding {
-            objective_id: "over-qualified-objective".into(),
-            session_id: original.session_id.clone(),
-            turn_id: "over-qualified-turn".into(),
-            root_execution_id: "over-qualified-root".into(),
-            agentic_program_id: "over-qualified-program".into(),
+    #[test]
+    fn over_qualified_criterion_ref_resolves_to_the_plain_id() {
+        use harness_contract::agent_action::{AgentAction, ObjectiveReviewDecision, ObjectiveReviewInput};
+        let action = AgentAction::ObjectiveReview(ObjectiveReviewInput {
+            criterion_ref: "criterion:goal:goal:over-qualified:checked".into(),
+            decision: ObjectiveReviewDecision::Gap,
+            result_refs: vec![], evidence_refs: vec![], reason_ref: "evidence".into(),
+            reason: "reviewed result does not yet meet the criterion".into(),
         });
-        services.goal_store().create(original.clone()).unwrap();
-        let actor = AgentActorBinding {
-            objective_id: "over-qualified-objective".into(),
-            program_id: "over-qualified-program".into(),
-            session_id: "session-test".into(),
-            turn_id: "over-qualified-turn".into(),
-            root_execution_id: Some("over-qualified-root".into()),
-            required_team_count: 0,
-            exact_team_count: None,
-            objective_summary: original.objective.clone(),
-            model_lease: "test".into(),
-            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
-            resource_scopes: vec![],
-            actor_id: "over-qualified-actor".into(),
-            kind: AgentActorKind::Root,
-            execution_id: None,
-            team_id: None,
-            agent_id: None,
+        let AgentAction::ObjectiveReview(normalized) = GoalStore::normalize_criterion_ref(&action, &goal()) else {
+            panic!("review action changed kind");
         };
-        // The over-qualified path a model routinely emits; the specification
-        // only knows the plain id, so the boundary must resolve the tail.
-        let applied = services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "over-qualified-review".into(),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: AgentAction::ObjectiveReview(ObjectiveReviewInput {
-                    criterion_ref: "criterion:goal:goal:over-qualified:checked".into(),
-                    decision: ObjectiveReviewDecision::Gap,
-                    result_refs: vec![],
-                    evidence_refs: vec![material.selector.clone()],
-                    reason_ref: material.selector.clone(),
-                    reason: "the reviewed delivery does not yet cover every current result"
-                        .to_string(),
-                }),
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            applied.status,
-            AgentActionStatus::Applied,
-            "an over-qualified criterion ref must resolve to the live criterion"
-        );
-        let updated = services.goal_store().get(&original.id).unwrap().unwrap();
-        assert!(
-            updated
-                .reviews
-                .iter()
-                .any(|review| review.criterion_ref == "checked"),
-            "the stored review must carry the plain criterion id: {:?}",
-            updated.reviews
-        );
+        assert_eq!(normalized.criterion_ref, "checked");
+        let AgentAction::ObjectiveReview(mut unknown) = action else { unreachable!() };
+        unknown.criterion_ref = "criterion:goal:unknown".into();
+        let AgentAction::ObjectiveReview(normalized) = GoalStore::normalize_criterion_ref(&AgentAction::ObjectiveReview(unknown), &goal()) else {
+            unreachable!();
+        };
+        assert_eq!(normalized.criterion_ref, "criterion:goal:unknown");
     }
 
     /// A satisfied review retires the gap it was sent to close. This is the

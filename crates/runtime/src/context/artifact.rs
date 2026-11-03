@@ -445,6 +445,18 @@ pub trait ArtifactMetadataRepository: Send + Sync {
         let _ = sha256;
         Err("prepared checkpoint metadata reuse is unsupported by this adapter".into())
     }
+    /// In one owner snapshot, verify the generation, revision, exact length,
+    /// and SHA-256 of the entire compact body before returning at most 64 KiB.
+    /// The digest is the authenticated record identity supplied by the caller.
+    /// Unsupported adapters must fail closed; server-side work remains unbounded
+    /// by the page length.
+    fn verified_compact_page(
+        &self, sha256: &str, generation: &str, revision: &str, bytes: u64,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let _ = (sha256, generation, revision, bytes, range);
+        Err("verified compact page unsupported by this adapter".into())
+    }
     fn record(&self, artifact_id: &str) -> Result<Option<ArtifactRecord>, String>;
     fn catalog_page(&self, query: ArtifactCatalogQuery) -> Result<ArtifactCatalogPage, String>;
     fn touch(&self, artifact_id: &str, at_ms: u64) -> Result<(), String>;
@@ -518,6 +530,27 @@ pub(crate) struct PreparedCheckpointGuard {
     object: ArtifactObjectRecord,
     revision: String,
     blob_identity: Option<String>,
+}
+
+pub(crate) struct PreparedEventPageWitness {
+    owner: Arc<ArtifactStoreInner>,
+    record: ArtifactRecord,
+    object: ArtifactObjectRecord,
+    revision: String,
+    identity: String,
+}
+impl PreparedEventPageWitness {
+    fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner) && self.record == other.record
+            && self.object == other.object && self.revision == other.revision
+            && self.identity == other.identity
+    }
+}
+#[cfg(unix)]
+fn prepared_blob_identity(meta: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("{}:{}:{}:{}:{}:{}:{}", meta.len(), meta.dev(), meta.ino(),
+        meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())
 }
 
 impl ArtifactStore {
@@ -1018,6 +1051,19 @@ impl ArtifactStore {
         sha256: &str,
         byte_count: u64,
     ) -> Result<Vec<u8>, ArtifactError> {
+        self.read_session_content_by_digest_with_ref_blocking(session_id, sha256, byte_count)
+            .map(|(_, bytes)| bytes)
+    }
+
+    /// Return the exact owner record selected by the digest reader so an
+    /// operation that retains the result can pin that record, rather than a
+    /// caller-supplied selector or an arbitrary same-digest object.
+    pub(crate) fn read_session_content_by_digest_with_ref_blocking(
+        &self,
+        session_id: &str,
+        sha256: &str,
+        byte_count: u64,
+    ) -> Result<(ArtifactRef, Vec<u8>), ArtifactError> {
         if session_id.trim().is_empty() {
             return Err(ArtifactError::Unauthorized);
         }
@@ -1065,12 +1111,13 @@ impl ArtifactStore {
                 {
                     continue;
                 }
-                match self.read_blocking(&record.content_reference(), &scope, None) {
+                let selected = record.content_reference();
+                match self.read_blocking(&selected, &scope, None) {
                     Ok(bytes) => {
                         if bytes.len() as u64 == byte_count
                             && format!("{:x}", Sha256::digest(&bytes)) == digest
                         {
-                            return Ok(bytes);
+                            return Ok((selected, bytes));
                         }
                         last_error = ArtifactError::Metadata(
                             "Artifact content does not match its SHA256/bytes".into(),
@@ -1099,6 +1146,117 @@ impl ArtifactStore {
     ) -> Result<Vec<u8>, ArtifactError> {
         self.read_verified_blocking(artifact, authorized_scope, range, None, false, true)
             .map(|read| read.body)
+    }
+
+    /// One bounded page of a prepared event body. Every call hashes the whole
+    /// object and checks the same metadata witness before and after the read.
+    /// A caller must independently bind the event record to the origin.
+    pub(crate) fn read_prepared_event_page(
+        &self, artifact: &ArtifactRef, scope: &str, origin: &PreparedArtifactOrigin,
+        range: Range<u64>, previous: Option<&PreparedEventPageWitness>,
+    ) -> Result<(Vec<u8>, PreparedEventPageWitness), ArtifactError> {
+        const MAX_PAGE: u64 = 64 * 1024;
+        if !matches!(origin, PreparedArtifactOrigin::EventBody { .. })
+            || !scope.starts_with("session:") || scope.len() <= "session:".len()
+            || artifact.visibility_scope != scope
+        { return Err(ArtifactError::Unauthorized); }
+        origin.validate().map_err(ArtifactError::Metadata)?;
+        let range = normalize_range(Some(range), artifact.bytes)?;
+        if range.end - range.start > MAX_PAGE {
+            return Err(ArtifactError::Metadata("prepared event page exceeds 64 KiB".into()));
+        }
+        let snapshot = || -> Result<PreparedEventPageWitness, ArtifactError> {
+            let record = self.inner.repository.process_closure_record(parse_selector(&artifact.selector)?)
+                .map_err(ArtifactError::Metadata)?.ok_or(ArtifactError::NotFound)?;
+            validate_ref(artifact, &record)?;
+            if record.record_class != ArtifactRecordClass::PrivatePrepared
+                || record.visibility_scope != scope || record.prepared_origin.as_ref() != Some(origin)
+                || !self.inner.repository.prepared_readable(&record, origin).map_err(ArtifactError::Metadata)?
+            { return Err(ArtifactError::Unauthorized); }
+            let (object, revision) = self.inner.repository.checkpoint_object_metadata(&record.sha256)
+                .map_err(ArtifactError::Metadata)?.ok_or(ArtifactError::NotFound)?;
+            if record.tier != object.tier
+                || object.compact_body.is_some() || object.sha256 != record.sha256
+                || object.bytes != record.bytes || object.bytes > self.inner.config.max_object_bytes
+                || object.generation.is_empty() || object.generation.len() > 128
+                || !object.generation.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || object.sha256.strip_prefix("sha256:").is_none_or(|digest|
+                    digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()))
+                || revision.is_empty() || revision.len() > 128
+                || prepared_metadata_bytes(&record).map_err(ArtifactError::Metadata)? > 16 * 1024
+            { return Err(ArtifactError::Metadata("unsupported or inconsistent prepared event object".into())); }
+            #[cfg(unix)]
+            let identity = match object.tier {
+                ArtifactObjectTier::Compact => "compact".to_owned(),
+                ArtifactObjectTier::Blob => {
+                    let path = self.generation_path(&object.sha256, &object.generation);
+                    let meta = fs::symlink_metadata(path)?;
+                    if !meta.file_type().is_file() || meta.len() != object.bytes {
+                        return Err(ArtifactError::Metadata("prepared event blob changed".into()));
+                    }
+                    prepared_blob_identity(&meta)
+                }
+            };
+            #[cfg(not(unix))]
+            return Err(ArtifactError::Metadata("blob identity unsupported".into()));
+            #[cfg(unix)]
+            Ok(PreparedEventPageWitness { owner: self.inner.clone(), record, object, revision, identity })
+        };
+        let before = snapshot()?;
+        if previous.is_some_and(|old| !before.same_as(old)) {
+            return Err(ArtifactError::Metadata("prepared event witness changed".into()));
+        }
+        if before.object.tier == ArtifactObjectTier::Compact {
+            let body = self.inner.repository.verified_compact_page(
+                &before.record.sha256, &before.object.generation, &before.revision,
+                before.object.bytes, range.clone(),
+            ).map_err(ArtifactError::Metadata)?.ok_or(ArtifactError::NotFound)?;
+            #[cfg(test)]
+            if let Some(hook) = self.inner.public_read_hook.lock().unwrap().clone() { hook(); }
+            if body.len() as u64 != range.end - range.start || !before.same_as(&snapshot()?) {
+                return Err(ArtifactError::Metadata("prepared compact page or witness changed".into()));
+            }
+            return Ok((body, before));
+        }
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(self.generation_path(&before.object.sha256, &before.object.generation))?
+        };
+        #[cfg(not(unix))]
+        return Err(ArtifactError::Metadata("blob identity unsupported".into()));
+        #[cfg(unix)]
+        {
+            if prepared_blob_identity(&file.metadata()?) != before.identity {
+                return Err(ArtifactError::Metadata("prepared event blob replaced".into()));
+            }
+            let mut digest = Sha256::new();
+            let mut scratch = [0u8; 64 * 1024];
+            let mut body = Vec::with_capacity((range.end - range.start) as usize);
+            let mut offset = 0u64;
+            while offset < before.object.bytes {
+                let size = (before.object.bytes - offset).min(scratch.len() as u64) as usize;
+                let n = file.read(&mut scratch[..size])?;
+                if n == 0 { return Err(ArtifactError::Metadata("prepared event blob truncated".into())); }
+                digest.update(&scratch[..n]);
+                #[cfg(test)]
+                self.inner.verified_read_hash_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                let end = offset + n as u64;
+                let start_copy = offset.max(range.start);
+                let end_copy = end.min(range.end);
+                if start_copy < end_copy { body.extend_from_slice(&scratch[(start_copy-offset) as usize..(end_copy-offset) as usize]); }
+                offset = end;
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.inner.public_read_hook.lock().unwrap().clone() { hook(); }
+            if body.len() as u64 != range.end - range.start
+                || format!("sha256:{:x}", digest.finalize()) != before.record.sha256
+                || prepared_blob_identity(&file.metadata()?) != before.identity
+                || !before.same_as(&snapshot()?)
+            { return Err(ArtifactError::Metadata("prepared event content or witness changed".into())); }
+            Ok((body, before))
+        }
     }
 
     pub(crate) fn read_prepared_blocking(
@@ -2488,6 +2646,26 @@ impl ArtifactMetadataRepository for EphemeralArtifactRepository {
         )))
     }
 
+    fn verified_compact_page(
+        &self, sha256: &str, generation: &str, revision: &str, bytes: u64,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if range.start > range.end || range.end > bytes || range.end - range.start > 64 * 1024 {
+            return Err("invalid compact page range".into());
+        }
+        let state = self.state.lock().map_err(|_| "artifact lock poisoned")?;
+        let Some(object) = state.objects.get(sha256) else { return Ok(None) };
+        if !state.ready.contains(sha256) || state.deleting.contains(sha256)
+            || object.tier != ArtifactObjectTier::Compact || object.generation != generation
+            || revision != generation || object.sha256 != sha256 || object.bytes != bytes
+        { return Ok(None); }
+        let Some(body) = object.compact_body.as_ref() else { return Ok(None) };
+        if body.len() as u64 != bytes || format!("sha256:{:x}", Sha256::digest(body)) != sha256 {
+            return Err("compact body length or digest mismatch".into());
+        }
+        Ok(Some(body[range.start as usize..range.end as usize].to_vec()))
+    }
+
     fn catalog_page(&self, query: ArtifactCatalogQuery) -> Result<ArtifactCatalogPage, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
         let revisions = query
@@ -3733,6 +3911,11 @@ mod tests {
                 .unwrap();
             assert_ne!(first.selector, second.selector);
             store.delete(&first, "session:local").unwrap();
+            let (selected, selected_bytes) = store
+                .read_session_content_by_digest_with_ref_blocking("local", &second.sha256, second.bytes)
+                .unwrap();
+            assert_eq!(selected, second);
+            assert_eq!(selected_bytes, body);
             store
                 .pin(
                     &second,
@@ -4952,5 +5135,115 @@ mod structured_artifact_identity_tests {
             .write_bytes_with_identity(descriptor, br#"[]"#, "task_identity_input")
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod bounded_timeline_blob_tests {
+    use super::*;
+    #[test]
+    fn prepared_pages_hash_all_and_reject_owner_tamper_ranges_and_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(EphemeralArtifactRepository::default());
+        let store = ArtifactStore::new(tmp.path(), repo.clone(), ArtifactStoreConfig {
+            compact_threshold_bytes: 1, ..Default::default()
+        }).unwrap();
+        let origin = PreparedArtifactOrigin::EventBody { stream_id:"graph:one".into(),
+            idempotency_key:"key".into(), kind:"graph.updated".into() };
+        let body: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
+        let artifact = store.write_pre_pinned_blocking("session:one", "bounded", &body, &origin).unwrap();
+        let before = store.inner.verified_read_hash_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let (page, witness) = store.read_prepared_event_page(&artifact, "session:one", &origin, 130_000..130_011, None).unwrap();
+        assert_eq!(page, body[130_000..130_011]);
+        assert_eq!(store.inner.verified_read_hash_bytes.load(std::sync::atomic::Ordering::Relaxed) - before, body.len() as u64);
+        let (page, _) = store.read_prepared_event_page(&artifact, "session:one", &origin, 0..4, Some(&witness)).unwrap();
+        assert_eq!(page, body[..4]);
+        assert!(store.read_prepared_event_page(&artifact, "session:other", &origin, 0..1, None).is_err());
+        let wrong = PreparedArtifactOrigin::EventBody { stream_id:"other".into(), idempotency_key:"key".into(), kind:"graph.updated".into() };
+        assert!(store.read_prepared_event_page(&artifact, "session:one", &wrong, 0..1, None).is_err());
+        for range in [0..65537, 1..300001, 4..3] {
+            assert!(store.read_prepared_event_page(&artifact, "session:one", &origin, range, None).is_err());
+        }
+        let mut forged = artifact.clone(); forged.sha256 = format!("sha256:{}", "0".repeat(64));
+        assert!(store.read_prepared_event_page(&forged, "session:one", &origin, 0..1, None).is_err());
+        let id = parse_selector(&artifact.selector).unwrap();
+        let pin = (id.to_string(), ARTIFACT_PREPARED_PIN_OWNER.to_string());
+        let saved = repo.state.lock().unwrap().pins.remove(&pin).unwrap();
+        assert!(store.read_prepared_event_page(&artifact, "session:one", &origin, 0..1, None).is_err());
+        repo.state.lock().unwrap().pins.insert(pin, saved);
+        { let mut state = repo.state.lock().unwrap(); state.records.get_mut(id).unwrap().created_at_ms += 1; }
+        assert!(store.read_prepared_event_page(&artifact, "session:one", &origin, 0..1, Some(&witness)).is_err());
+        { let mut state = repo.state.lock().unwrap(); state.records.get_mut(id).unwrap().created_at_ms -= 1; state.objects.get_mut(&artifact.sha256).unwrap().generation.push('x'); }
+        assert!(store.read_prepared_event_page(&artifact, "session:one", &origin, 0..1, Some(&witness)).is_err());
+        { let mut state = repo.state.lock().unwrap(); state.objects.get_mut(&artifact.sha256).unwrap().generation.pop(); }
+        let path = store.generation_path(&witness.object.sha256, &witness.object.generation);
+        let mut changed = body.clone(); changed[200_000] ^= 1; fs::write(path, changed).unwrap();
+        assert!(store.read_prepared_event_page(&artifact, "session:one", &origin, 0..1, None).is_err());
+    }
+    #[test]
+    fn metadata_change_during_hash_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(EphemeralArtifactRepository::default());
+        let store = ArtifactStore::new(tmp.path(), repo.clone(), ArtifactStoreConfig {
+            compact_threshold_bytes: 1, ..Default::default()
+        }).unwrap();
+        let origin = PreparedArtifactOrigin::EventBody { stream_id:"g".into(), idempotency_key:"k".into(), kind:"graph.updated".into() };
+        let artifact = store.write_pre_pinned_blocking("session:one", "race", &vec![42; 100_000], &origin).unwrap();
+        let id = parse_selector(&artifact.selector).unwrap().to_owned();
+        store.set_public_read_hook(Arc::new(move || {
+            repo.state.lock().unwrap().records.get_mut(&id).unwrap().created_at_ms += 1;
+        }));
+        assert!(store.read_prepared_event_page(&artifact, "session:one", &origin, 0..1, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod compact_event_page_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, ArtifactStore, Arc<EphemeralArtifactRepository>, ArtifactRef, PreparedArtifactOrigin, Vec<u8>) {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Arc::new(EphemeralArtifactRepository::default());
+        let store = ArtifactStore::new(root.path(), repo.clone(), ArtifactStoreConfig::default()).unwrap();
+        let origin = PreparedArtifactOrigin::EventBody { stream_id: "graph:compact".into(),
+            idempotency_key: "event-key".into(), kind: "execution_graph.planned".into() };
+        let body: Vec<u8> = (0..150_000).map(|i| (i % 251) as u8).collect();
+        let artifact = store.write_pre_pinned_blocking("session:owner", "body", &body, &origin).unwrap();
+        (root, store, repo, artifact, origin, body)
+    }
+
+    #[test]
+    fn compact_page_is_bounded_and_owner_checked() {
+        let (_root, store, repo, artifact, origin, body) = fixture();
+        assert_eq!(repo.object(&artifact.sha256).unwrap().unwrap().tier, ArtifactObjectTier::Compact);
+        let (page, witness) = store.read_prepared_event_page(&artifact, "session:owner", &origin, 65530..65550, None).unwrap();
+        assert_eq!(page, body[65530..65550]);
+        let (page, _) = store.read_prepared_event_page(&artifact, "session:owner", &origin, 0..65536, Some(&witness)).unwrap();
+        assert_eq!(page, body[..65536]);
+        assert!(store.read_prepared_event_page(&artifact, "session:foreign", &origin, 0..1, None).is_err());
+        let wrong = PreparedArtifactOrigin::EventBody { stream_id: "graph:foreign".into(),
+            idempotency_key: "event-key".into(), kind: "execution_graph.planned".into() };
+        assert!(store.read_prepared_event_page(&artifact, "session:owner", &wrong, 0..1, None).is_err());
+        assert!(store.read_prepared_event_page(&artifact, "session:owner", &origin, 0..65537, None).is_err());
+        assert!(store.read_prepared_event_page(&artifact, "session:owner", &origin, 150000..150001, None).is_err());
+    }
+
+    #[test]
+    fn compact_corruption_outside_requested_page_is_rejected() {
+        let (_root, store, repo, artifact, origin, _) = fixture();
+        let mut state = repo.state.lock().unwrap();
+        state.objects.get_mut(&artifact.sha256).unwrap().compact_body.as_mut().unwrap()[149_999] ^= 1;
+        drop(state);
+        assert!(store.read_prepared_event_page(&artifact, "session:owner", &origin, 0..1, None).is_err());
+    }
+
+    #[test]
+    fn compact_requires_prepared_protection_after_body_query() {
+        let (_root, store, repo, artifact, origin, _) = fixture();
+        let id = parse_selector(&artifact.selector).unwrap().to_owned();
+        store.set_public_read_hook(Arc::new(move || {
+            repo.state.lock().unwrap().pins.remove(&(id.clone(), ARTIFACT_PREPARED_PIN_OWNER.into()));
+        }));
+        assert!(store.read_prepared_event_page(&artifact, "session:owner", &origin, 0..1, None).is_err());
     }
 }

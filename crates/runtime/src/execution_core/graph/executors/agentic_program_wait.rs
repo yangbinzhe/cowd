@@ -1000,7 +1000,7 @@ fn has_submitted_tasks_without_active_graph(projection: &AgenticProgramProjectio
         .any(|task| task.status == AgenticTaskStatus::Submitted)
 }
 
-async fn active_agentic_child_graphs(
+pub(crate) async fn active_agentic_child_graphs(
     root_execution_id: &str,
     program_id: &str,
     projection: &crate::AgenticProgramProjection,
@@ -1085,13 +1085,13 @@ fn child_graph_task_is_live(
     })
 }
 
-fn graph_belongs_to_program(graph: &ExecutionGraph, program_id: &str) -> bool {
+pub(crate) fn graph_belongs_to_program(graph: &ExecutionGraph, program_id: &str) -> bool {
     agentic_program_ids(graph)
         .iter()
         .any(|candidate| candidate == program_id)
 }
 
-fn agentic_program_ids(graph: &ExecutionGraph) -> Vec<String> {
+pub(crate) fn agentic_program_ids(graph: &ExecutionGraph) -> Vec<String> {
     graph
         .nodes
         .iter()
@@ -1151,6 +1151,7 @@ mod tests {
 
     fn root_actor(program_id: &str, root_execution_id: &str) -> AgentActorBinding {
         AgentActorBinding {
+            original_execution: None,
             objective_id: format!("objective:{program_id}"),
             program_id: program_id.to_string(),
             session_id: format!("session:{program_id}"),
@@ -1919,16 +1920,19 @@ mod tests {
 
         // Re-dispatch the unreachable Task: Runtime tried and could not place it.
         for attempt in 0..4 {
+            let observed = services.agent_action_service().project(program_id).expect("observed Program");
+            let generation = observed.tasks.get(&unreachable).expect("observed Task").claim_generation;
             let receipt = services
                 .dispatch_agentic_followups(
                     &AgentActionEnvelope {
                         action_id: format!("stranded-release-{attempt}"),
                         actor: root.clone(),
-                        expected_revision: None,
+                        expected_revision: Some(observed.revision),
                         action: AgentAction::TaskRelease(
                             harness_contract::agent_action::TaskReleaseInput {
                                 task_ref: unreachable.clone(),
                                 reason: String::new(),
+                                expected_claim_generation: Some(generation),
                             },
                         ),
                     },

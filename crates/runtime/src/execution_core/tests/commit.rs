@@ -455,6 +455,7 @@ async fn bounded_process_private_terminal_original_owner_recovery_and_public_for
 
 fn outcome(id: &str, output: &str) -> crate::RuntimeToolExecutionOutcome {
     crate::RuntimeToolExecutionOutcome {
+        pending_agent_batch: None,
         tool_use_id: id.to_string(),
         tool_name: "fixture_tool".to_string(),
         status: crate::RuntimeToolExecutionStatus::Executed,

@@ -52,6 +52,32 @@ pub(crate) fn graph_tail_preserves_work(
                     resolved.sequence, resolved.kind
                 ));
             }
+            // The graph's own added ToolBatch identifies the plan needed for
+            // this continuation. Authenticate that selected plan's original
+            // transaction; Session events are never used as a tail whitelist.
+            for node in next.nodes.iter().filter(|node|
+                !before.nodes.iter().any(|previous| previous.id == node.id)
+                    && node.kind == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch) {
+                let plans = original_continuation_plans(&node.payload_ref, &before.id, session_events)
+                    .ok_or("graph continuation original plan missing or ambiguous")?;
+                for plan in plans {
+                    let receipt = store.original_transaction_receipt(&plan.transaction_id)
+                        .map_err(|error| error.to_string())?
+                        .ok_or("graph continuation plan transaction missing")?;
+                    let cut = store.transaction_stream_revision_exact(&plan.transaction_id, &plan.stream_id)
+                        .map_err(|error| error.to_string())?
+                        .ok_or("graph continuation plan source missing")?;
+                    if receipt.transaction_id != plan.transaction_id || receipt.commit_cursor != plan.commit_cursor
+                        || receipt.event_ids.get(plan.transaction_index as usize) != Some(&plan.event_id)
+                        || cut.expected_revision >= plan.sequence || plan.sequence > cut.committed_revision
+                        || receipt.stream_revisions.iter().filter(|revision| revision.stream_id == plan.stream_id).count() != 1
+                        || !receipt.stream_revisions.iter().any(|revision| revision.stream_id == cut.stream_id
+                            && revision.expected_revision == cut.expected_revision
+                            && revision.committed_revision == cut.committed_revision) {
+                        return Err("graph continuation plan transaction differs".into());
+                    }
+                }
+            }
         }
         graph = Some(next);
     }
@@ -194,42 +220,43 @@ fn parent_transition_preserves_work(
 }
 
 fn continuation_calls_are_original(
-    payload: &str,
-    graph: &str,
-    events: &[crate::DurableRuntimeEvent],
+    payload: &str, graph: &str, events: &[crate::DurableRuntimeEvent],
 ) -> bool {
-    let Ok((calls, _)) = crate::host::decode_tool_batch(payload) else {
-        return false;
-    };
-    !calls.is_empty()
-        && calls.iter().all(|call| {
-            let Some(binding) = &call.binding else {
-                return false;
-            };
-            let Ok(input) = serde_json::from_str::<serde_json::Value>(&call.input) else {
-                return false;
-            };
-            binding.snapshot.identity.execution_id.as_deref() == Some(graph)
-                && events.iter().any(|event| {
-                    event.actor.as_deref() == Some("conversation_runtime")
-                        && event.stream_id
-                            == format!("session:{}", binding.snapshot.identity.session_id)
-                        && event.kind == "tool.execution_plan.created"
-                        && event.payload["tasks"].as_array().is_some_and(|tasks| {
-                            tasks.iter().any(|task| {
-                                task["tool_call_id"] == call.id
-                                && task["tool_name"] == call.name
-                                && task["normalized_input"] == input
-                                && serde_json::from_value::<crate::step_snapshot::StepCallBinding>(
-                                    task["step_binding"].clone(),
-                                )
-                                .ok()
-                                .as_ref()
-                                    == Some(binding)
-                            })
-                        })
-                })
-        })
+    original_continuation_plans(payload, graph, events).is_some()
+}
+
+fn original_continuation_plans<'a>(
+    payload: &str, graph: &str, events: &'a [crate::DurableRuntimeEvent],
+) -> Option<Vec<&'a crate::DurableRuntimeEvent>> {
+    let (calls, _) = crate::host::decode_tool_batch(payload).ok()?;
+    if calls.is_empty() { return None; }
+    let mut selected = Vec::new();
+    for call in calls {
+        let binding = call.binding.as_ref()?;
+        let input = serde_json::from_str::<serde_json::Value>(&call.input).ok()?;
+        let identity = &binding.snapshot.identity;
+        if identity.execution_id.as_deref() != Some(graph) { return None; }
+        let stream = format!("session:{}", identity.session_id);
+        let mut matching = events.iter().filter(|event| {
+            event.stream_id == stream && event.scope == crate::RuntimeEventScope::Tool
+                && event.schema_version == 1 && event.status.as_deref() == Some("planned")
+                && event.actor.as_deref() == Some("conversation_runtime")
+                && event.kind == "tool.execution_plan.created"
+                && [("execution", graph), ("session", identity.session_id.as_str()),
+                    ("turn", identity.turn_id.as_str())].iter().all(|(kind, id)|
+                    event.refs.iter().any(|reference| reference.kind == *kind && reference.id == *id))
+                && event.payload["tasks"].as_array().is_some_and(|tasks| tasks.iter().filter(|task| {
+                    task["tool_call_id"] == call.id && task["tool_name"] == call.name
+                        && task["normalized_input"] == input
+                        && serde_json::from_value::<crate::step_snapshot::StepCallBinding>(task["step_binding"].clone())
+                            .ok().as_ref() == Some(binding)
+                }).count() == 1)
+        });
+        let plan = matching.next()?;
+        if matching.next().is_some() { return None; }
+        selected.push(plan);
+    }
+    Some(selected)
 }
 
 pub(crate) fn graph_tail_is_own_review_retirement(

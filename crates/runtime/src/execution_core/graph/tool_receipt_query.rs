@@ -153,6 +153,7 @@ mod tests {
             });
             let stream = format!("execution-effect:{}", request.idempotency_key);
             let outcome = crate::RuntimeToolExecutionOutcome {
+                pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: crate::RuntimeToolExecutionStatus::Executed,

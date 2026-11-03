@@ -282,6 +282,7 @@ mod tests {
 
     fn root_envelope() -> AgentActionEnvelope {
         let actor = AgentActorBinding {
+            original_execution: None,
             objective_id: "objective".into(),
             program_id: "program".into(),
             session_id: "session".into(),

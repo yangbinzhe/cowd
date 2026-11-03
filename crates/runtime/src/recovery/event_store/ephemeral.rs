@@ -903,6 +903,24 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
         }
         Ok(lines)
     }
+    fn original_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        let state = self.state.lock()
+            .map_err(|_| RuntimeEventStoreError::Corrupt("event lock poisoned".into()))?;
+        Ok(state.transactions.get(transaction_id).cloned())
+    }
+
+    fn original_checked_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        let state = self.state.lock().map_err(|_| RuntimeEventStoreError::Corrupt("event lock poisoned".into()))?;
+        match (state.transactions.get(transaction_id), state.checked_evidence.get(transaction_id)) {
+            (None, None) => Ok(None),
+            (Some(commit), Some(validation)) => Ok(Some(CheckedAppendReceipt { commit: commit.clone(), validation: validation.clone() })),
+            (Some(_), None) => Err(RuntimeEventStoreError::InvalidTransaction("original transaction is not checked".into())),
+            (None, Some(_)) => Err(RuntimeEventStoreError::Corrupt("orphan checked evidence".into())),
+        }
+    }
+
     fn transaction_stream_revision_exact(
         &self,
         transaction_id: &str,

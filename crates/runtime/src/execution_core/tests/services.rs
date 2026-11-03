@@ -1615,6 +1615,7 @@ impl crate::RuntimeExecutionHost for TestExecutionHost {
         request: &crate::RuntimeToolExecutionRequest,
     ) -> crate::RuntimeToolExecutionOutcome {
         crate::RuntimeToolExecutionOutcome {
+            pending_agent_batch: None,
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             status: crate::RuntimeToolExecutionStatus::Executed,

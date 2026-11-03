@@ -1273,6 +1273,27 @@ where
         }
         let result = async {
         if let Some(outcome)=self.resume_user_input_application(ticket, false).await? {return Ok(outcome);}
+        // A Program verdict may wake the barrier before the ingress loop has
+        // installed its presentation override. Derive it from the committed
+        // Goal so that the resumed model node cannot race into another call.
+        let (session, turn, goal_id, is_root) = {
+            let state = self.state.lock().await;
+            (state.session_id.clone(), state.turn_id.clone(), state.goal_id.clone(), state.execution_role.owns_root_presentation())
+        };
+        let program = is_root.then(|| super::root_agentic_program_projection(self.services.as_ref(), &session, &turn)).flatten();
+        if let Some(verdict) = program.as_ref().and_then(|program| program.objective_verdict.as_ref())
+            .filter(|verdict| verdict.kind == harness_contract::goal::ObjectiveTerminalKind::Blocked)
+        {
+            let goal = self.services.goal_store().get(&goal_id)
+                .map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?
+                .ok_or_else(|| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "blocked Program Goal missing".into() })?;
+            let terminal = goal.terminal.as_ref().filter(|terminal| goal.id == verdict.goal_id
+                && goal.revision == verdict.goal_revision && terminal.terminal_fence == verdict.terminal_fence
+                && terminal.authority_revision == verdict.authority_revision
+                && terminal.kind == verdict.kind && goal.completion == GoalCompletion::Blocked)
+                .ok_or_else(|| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: "blocked Program Goal verdict mismatch".into() })?;
+            self.state.lock().await.terminal_override = Some((GoalCompletion::Blocked, terminal.reason.clone()));
+        }
         if self.state.lock().await.terminal_override.is_some() {
             return Ok(precommitted_terminal_outcome(ticket));
         }
@@ -2238,7 +2259,9 @@ where
         }
         let transcript_len = runtime.session_head().await.message_count;
         let root = self.state.lock().await.execution_role == TurnExecutionRole::RootTurn;
-        let mut step_runtime = runtime.scoped_model_stop(self.stop.clone());
+        let mut step_runtime = runtime.scoped_model_stop(self.stop.clone()).map_err(|reason| NodeExecutorError::Poll {
+            node_id: ticket.node_id.clone(), reason,
+        })?;
         let mut model_runtime = step_runtime.scoped_root_node_activity(ticket, root)
             .map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(), reason: error.to_string(),
@@ -2247,8 +2270,13 @@ where
             model_runtime.root_effect_owner_for_ticket(ticket).ok().map(|(activity, attempt)|
                 crate::provider_runtime_client::ProviderGraphOwner { activity, attempt })
         } else { None };
+        // Early dispatch cannot consume the ToolBatch's original evaluation
+        // scope fact. Keep scoped calls on the normal per-call admission path.
+        let evaluation_scopes = self.state.lock().await.evaluation_resource_scopes.clone();
         let early_dispatcher: Option<Arc<dyn crate::conversation::EarlyToolDispatcher>> =
-            if clean_terminal_synthesis || force_text_only_response {
+            if !evaluation_scope_allows_early_dispatch(
+                clean_terminal_synthesis, force_text_only_response, &evaluation_scopes,
+            ) {
                 None
             } else {
                 model_runtime.active_turn_strategy().and_then(|strategy| {
@@ -2384,8 +2412,6 @@ where
                         _ => None,
                     })
                     .sum::<u64>();
-                #[cfg(test)]
-                super::tests::r1_capture_original_model_step(self.services.event_store().as_ref(), ticket, &step);
                 let usage = ExecutionUsage {
                     model: step.model.clone(),
                     provider_usage_observed: Some(step.assistant_message.usage.is_some()),
@@ -2895,12 +2921,32 @@ where
                         if blocked_program.is_none()
                             && verified_team_executions < required_team_executions
                         {
-                            state.collaboration_convergence_replans =
-                                state.collaboration_convergence_replans.saturating_add(1);
+                            let progress_sources = stable_collaboration_sources(self.services.as_ref(), &state.session_id, &state.turn_id);
+                            let progress_known = progress_sources.as_ref().is_some_and(|(program, _)| {
+                                program.status != crate::AgenticProgramStatus::Blocked
+                                    && agentic_program.as_ref().is_some_and(|before| before.revision == program.revision)
+                            });
+                            let verified_progress = if let Some((program, goal)) = progress_sources.as_ref().filter(|_| progress_known) {
+                                state.verified_collaboration_progress.observe(
+                                    Some(program), 0, goal.observations.iter()
+                                        .filter(|observation| observation.has_verified_gain())
+                                        .flat_map(|observation| observation.information_gain.distinguishing_evidence_refs.iter().cloned())
+                                        .filter(|reference| !reference.starts_with("verified_collaboration:"))
+                                        .chain(goal.progress.criteria.iter().filter_map(|(id, status)|
+                                            matches!(status, AcceptanceStatus::Satisfied | AcceptanceStatus::Waived)
+                                                .then(|| format!("criterion:{id}:{status:?}"))))
+                                        .chain(goal.goal.obligations.iter().filter_map(|obligation|
+                                            matches!(obligation.state, harness_contract::goal::ObjectiveObligationState::Satisfied | harness_contract::goal::ObjectiveObligationState::Waived)
+                                                .then(|| format!("obligation:{}:{:?}", obligation.obligation_id, obligation.state)))),
+                                )
+                            } else { false };
+                            state.collaboration_convergence_replans = next_collaboration_redrives(
+                                state.collaboration_convergence_replans, verified_progress, progress_known,
+                            );
                             let convergence_bound = collaboration_convergence_replan_bound(
                                 state.safety_lease.complexity,
                             );
-                            if state.collaboration_convergence_replans > convergence_bound {
+                            if progress_known && state.collaboration_convergence_replans > convergence_bound {
                                 // Bounded convergence: the verified-Team minimum
                                 // stays unmet after repeated replans. End the turn
                                 // as an honest partial with explicit disclosure
@@ -3756,34 +3802,11 @@ where
                             &calls,
                             self.services.workspace_root(),
                         );
-                        let evaluation_scope_violation = evaluation_scope_violation(
-                            &state.evaluation_resource_scopes,
-                            &calls,
-                            self.services.workspace_root(),
-                        );
                         if let Some(pending_writes) = pending_focus_write_action {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
                             let (intervention, next) =
                                 focus_action_rejection_outcome(ticket, &mut state, &pending_writes);
-                            model_intervention = Some(intervention);
-                            next
-                        } else if let Some(violation) = evaluation_scope_violation {
-                            state.assistant_messages.pop();
-                            state.pending_transcript.remove(&ticket.node_id);
-                            let authorized_scopes = state.evaluation_resource_scopes.join(", ");
-                            let (intervention, next) = evaluation_scope_rejection_outcome(
-                                ticket,
-                                &mut state,
-                                &required_workspace_write_scopes,
-                                &violation,
-                                self.services.workspace_root(),
-                                self.services.path_identity_resolver(),
-                                "eval-resource-ceiling-replan-model",
-                                format!(
-                                    "the pre-registered evaluation resource ceiling rejected `{violation}`; authorized exact scopes are [{authorized_scopes}]. Do not use broad workspace, shell, execute-code, glob, or pathless search calls. Use exact-path file tools for those scopes, including the authorized write tool when the objective requires mutation"
-                                ),
-                             Some(self.services.as_ref()), );
                             model_intervention = Some(intervention);
                             next
                         } else {
@@ -3946,6 +3969,20 @@ where
                 Ok(outcome)
             }
             Err(error) => {
+                if !error.early_tool_failures().is_empty() {
+                    // Preserve completed siblings, but never turn an unknown
+                    // early authorization commit into a fresh batch admission.
+                    let mut state = self.state.lock().await;
+                    for receipt in error.effect_receipts() {
+                        if state.early_tool_receipts.insert(receipt.call.id.clone(), receipt.clone()).is_none() {
+                            state.tool_receipts_observed = state.tool_receipts_observed.saturating_add(1);
+                        }
+                    }
+                    return Err(NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: error.to_string(),
+                    });
+                }
                 if let (Some(proof), Some(owner)) = (error.authenticated_provider_cancellation(), original_provider_owner.as_ref()) {
                     if error.effect_receipts().is_empty() && proof.matches_original(owner, ticket) {
                         return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
@@ -5281,6 +5318,66 @@ fn closure_drive_after_steps() -> usize {
 /// again and closes the gate on the next step.
 const CLOSURE_DRIVE_AFTER_STEPS_DEFAULT: usize = 1;
 
+/// Monotonic, durable collaboration facts, kept separately from attempted work.
+#[derive(Debug, Clone, Default)]
+pub(super) struct VerifiedCollaborationProgress {
+    teams: std::collections::BTreeSet<String>,
+    accepted_tasks: std::collections::BTreeSet<String>,
+    evidence: std::collections::BTreeSet<String>,
+    objective_reviews: usize,
+}
+
+impl VerifiedCollaborationProgress {
+    pub(super) fn observe(&mut self, program: Option<&crate::AgenticProgramProjection>, reviews: usize, evidence: impl IntoIterator<Item = String>) -> bool {
+        let mut advanced = reviews > self.objective_reviews;
+        self.objective_reviews = self.objective_reviews.max(reviews);
+        for reference in evidence { advanced |= self.evidence.insert(reference); }
+        if let Some(program) = program {
+            for task in program.tasks.values().filter(|task| task.status == crate::AgenticTaskStatus::Accepted) {
+                advanced |= self.teams.insert(task.team_id.clone());
+                advanced |= self.accepted_tasks.insert(task.task_id.clone());
+                for reference in task.artifact_refs.iter().chain(&task.evidence_refs) {
+                    advanced |= self.evidence.insert(reference.clone());
+                }
+            }
+        }
+        advanced
+    }
+}
+
+/// Compare both durable heads twice: matching revisions bound one overlapping
+/// observation interval; a missing or changing source remains unknown.
+pub(super) fn stable_collaboration_sources(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<(crate::AgenticProgramProjection, crate::execution_core::goal::GoalProjection)> {
+    let program = root_agentic_program_projection(services, session_id, turn_id)?;
+    let root = program.root_execution_id.as_ref()?;
+    let goal_id = format!("goal:{root}");
+    let goal = services.goal_store().projection(&goal_id).ok().flatten()?;
+    let binding = goal.goal.execution_binding.as_ref()?;
+    if binding.agentic_program_id != program.program_id || binding.session_id != session_id
+        || binding.turn_id != turn_id || binding.root_execution_id != *root {
+        return None;
+    }
+    let check_program = root_agentic_program_projection(services, session_id, turn_id)?;
+    let check_goal = services.goal_store().projection(&goal_id).ok().flatten()?;
+    if check_program.revision != program.revision || check_goal.stream_revision != goal.stream_revision {
+        return None;
+    }
+    Some((program, goal))
+}
+
+fn next_collaboration_redrives(previous: usize, verified_progress: bool, redriven: bool) -> usize {
+    if verified_progress { 0 } else if redriven { previous.saturating_add(1) } else { previous }
+}
+
+fn failed_agent_action_receipt(output: &str) -> Option<harness_contract::agent_action::AgentActionObservation> {
+    let body = output.rsplit_once("Structured receipt: ").map_or(output, |(_, receipt)| receipt);
+    serde_json::from_str(body.trim()).ok()
+}
+
 /// The Objective convergence milestones, separate from execution health.
 ///
 /// These are the facts that mean convergence moved toward finishing. Every
@@ -6165,10 +6262,65 @@ fn collaboration_ceiling_reached(
 /// is a convergence bound, never a topology: the model still owns every
 /// semantic decision, but it cannot replan without end while the verified-Team
 /// minimum stays unmet.
+/// True when the turn must converge instead of re-driving delegated work.
+///
+/// The bound is the product's own convergence-replan policy value: a turn that
+/// re-drives delegated work past it must present the retained receipts and
+/// their verified facts. A mandatory closure rung or an outstanding
+/// completion gap keeps the turn open - convergence must never drop work the
+/// framework still owes.
+fn forced_convergence_required(
+    delegated_redrives: usize,
+    bound: usize,
+    completion_gap_outstanding: bool,
+    outstanding_closure_rungs: usize,
+    blocked_program: bool,
+    progress_known: bool,
+) -> bool {
+    progress_known && !blocked_program && delegated_redrives > bound
+        && !completion_gap_outstanding
+        && outstanding_closure_rungs == 0
+}
+
 fn collaboration_convergence_replan_bound(
     complexity: harness_contract::core::TaskComplexity,
 ) -> usize {
     crate::execution_core::ComplexityBudget::derive(complexity).convergence_replans
+}
+
+#[cfg(test)]
+mod forced_convergence_tests {
+    use super::forced_convergence_required;
+
+    #[test]
+    fn progress_resets_redrive_and_unrelated_batches_do_not_count() {
+        assert_eq!(super::next_collaboration_redrives(6, true, true), 0);
+        assert_eq!(super::next_collaboration_redrives(6, false, false), 6);
+        assert_eq!(super::next_collaboration_redrives(6, false, true), 7);
+    }
+
+    #[test]
+    fn forced_convergence_starts_past_the_policy_bound() {
+        assert!(!forced_convergence_required(6, 6, false, 0, false, true));
+        assert!(forced_convergence_required(7, 6, false, 0, false, true));
+    }
+
+    #[test]
+    fn forced_convergence_never_drops_owed_work() {
+        assert!(!forced_convergence_required(9, 6, true, 0, false, true));
+        assert!(!forced_convergence_required(9, 6, false, 1, false, true));
+        assert!(forced_convergence_required(9, 6, false, 0, false, true));
+        assert!(!forced_convergence_required(9, 6, false, 0, true, true));
+        assert!(!forced_convergence_required(9, 6, false, 0, false, false));
+    }
+
+    #[test]
+    fn durable_progress_is_counted_once() {
+        let mut seen = super::VerifiedCollaborationProgress::default();
+        assert!(seen.observe(None, 1, ["durable:one".to_string()]));
+        assert!(!seen.observe(None, 1, ["durable:one".to_string()]));
+        assert!(seen.observe(None, 2, ["durable:one".to_string()]));
+    }
 }
 
 #[cfg(test)]
@@ -6897,6 +7049,11 @@ pub(super) fn delegated_agentic_protocol_state(
     // live claim appear foreign, which allowed generic text synthesis to
     // preempt artifact/submit closure and caused cross-graph retry loops.
     let actor_id = agentic.agent_id.as_str();
+    let business_generation = crate::agentic::registered_attempt_generation(
+        task, agentic, packet.graph_id(),
+        if mode == "review" { harness_contract::agent_action::AgentAttemptMode::Review }
+        else { harness_contract::agent_action::AgentAttemptMode::Execute },
+    );
     let mut artifacts = projection
         .artifacts
         .values()
@@ -6912,7 +7069,8 @@ pub(super) fn delegated_agentic_protocol_state(
                     && artifact.relates_to.contains(&task_id)
                     && artifact.claim_execution_id.as_deref()
                         == Some(packet.assignment.graph_id.as_str())
-                    && artifact.claim_generation == Some(u64::from(packet.attempt))
+                    && business_generation.and_then(|generation| generation.checked_add(1))
+                        .is_some_and(|generation| artifact.claim_generation == Some(generation))
             }
         })
         .map(|artifact| (artifact.artifact_ref.clone(), artifact.content_ref.clone()))
@@ -6924,12 +7082,12 @@ pub(super) fn delegated_agentic_protocol_state(
             task.status == crate::AgenticTaskStatus::Claimed
                 && task.claimant.as_deref() == Some(actor_id)
                 && task.claim_execution_id.as_deref() == Some(packet.assignment.graph_id.as_str())
-                && task.claim_generation == u64::from(packet.attempt)
+                && business_generation.and_then(|generation| generation.checked_add(1)) == Some(task.claim_generation)
         }
         "review" => {
             task.status == crate::AgenticTaskStatus::Submitted
                 && task.claimant.as_deref() != Some(actor_id)
-                && task.review_generation.saturating_add(1) == u64::from(packet.attempt)
+                && business_generation == Some(task.review_generation)
         }
         _ => false,
     };
@@ -7717,6 +7875,249 @@ fn precommitted_terminal_outcome(ticket: &NodeExecutionTicket) -> NodeExecutionO
     })
 }
 
+/// Original checked results already owned by this physical ToolBatch.
+enum OriginalPostActionCommit {
+    Single(Arc<crate::agentic::OriginalCommittedSingle>),
+    Member(Arc<crate::OriginalCommittedMember>),
+    Conclusion(Arc<crate::agentic::OriginalCommittedConclusion>),
+    Replay(Arc<crate::agentic::OriginalReplayedAction>),
+}
+impl OriginalPostActionCommit {
+    fn request(&self) -> Option<&crate::CheckedAppendRequest> { match self { Self::Single(v) => Some(v.request()), Self::Member(v) => Some(v.request()), Self::Conclusion(v) => Some(v.request()), Self::Replay(_) => None } }
+    fn receipt(&self) -> &crate::AppendTransactionReceipt { match self { Self::Single(v) => &v.receipt().commit, Self::Member(v) => &v.receipt().commit, Self::Conclusion(v) => &v.receipt().commit, Self::Replay(v) => v.receipt() } }
+    fn observation(&self) -> Option<&harness_contract::agent_action::AgentActionObservation> { match self { Self::Single(v) => v.observation().map(Arc::as_ref), Self::Member(v) => v.observation().map(Arc::as_ref), Self::Conclusion(_) => None, Self::Replay(v) => v.observation() } }
+    fn belongs_to(&self, store: &Arc<crate::RuntimeEventStore>) -> bool { match self { Self::Single(v) => v.belongs_to(store), Self::Member(v) => v.belongs_to(store), Self::Conclusion(v) => v.belongs_to(store), Self::Replay(v) => v.belongs_to(store) } }
+}
+
+/// Reuse the original conclusion owner only for an authenticated completion
+/// request whose same-call result has not yet reached its original sink.
+fn publish_existing_original_conclusion<C: ApiClient, T: ToolExecutor>(
+    backend: &TurnToolBatchBackend<C, T>,
+    request: &crate::CheckedAppendRequest,
+    receipt: &crate::AppendTransactionReceipt,
+    action_id: &str,
+) -> Result<bool, String> {
+    let _services = backend.services.upgrade().ok_or("original ToolBatch services unavailable")?;
+    if request.transaction.transaction_id != receipt.transaction_id {
+        return Err("original completion action receipt differs".into());
+    }
+    let mut actions = request.transaction.events.iter().enumerate().filter(|(_, event)|
+        event.event.kind == "agentic.action_applied"
+            && event.event.payload.pointer("/envelope/action_id").and_then(serde_json::Value::as_str) == Some(action_id));
+    let (position, action) = actions.next().ok_or("original completion action unavailable")?;
+    if actions.next().is_some() || receipt.event_ids.get(position).is_none() {
+        return Err("original completion action ambiguous".into());
+    }
+    let envelope: harness_contract::agent_action::AgentActionEnvelope = serde_json::from_value(
+        action.event.payload.get("envelope").cloned().ok_or("original action envelope missing")?)
+        .map_err(|error| error.to_string())?;
+    if !matches!(&envelope.action, harness_contract::agent_action::AgentAction::ObjectiveCompleteRequest(_)) {
+        return Ok(false);
+    }
+    let stream = format!("agentic-program:{}", envelope.actor.program_id);
+    if action.event.stream_id != stream { return Err("original completion Program differs".into()); }
+    let cut = receipt.stream_revisions.iter().find(|source| source.stream_id == stream)
+        .ok_or("original completion Program source unavailable")?;
+    if cut.expected_revision.checked_add(1) != Some(cut.committed_revision) {
+        return Err("original completion Program revision ambiguous".into());
+    }
+    authenticate_original_conclusion_at_revision(backend, &envelope.actor.program_id, action_id, cut.committed_revision)
+}
+
+fn authenticate_original_conclusion_at_revision<C: ApiClient, T: ToolExecutor>(
+    backend: &TurnToolBatchBackend<C, T>, program_id: &str, action_id: &str, revision: u64,
+) -> Result<bool, String> {
+    let services = backend.services.upgrade().ok_or("original ToolBatch services unavailable")?;
+    let stream = format!("agentic-program:{program_id}");
+    let store = services.event_store();
+    let opened = store.event_by_idempotency_key(&stream, "agentic-program-opened")
+        .map_err(|error| error.to_string())?.ok_or("original Program opening missing")?;
+    let actions = services.agent_action_service();
+    let projection = actions.project_snapshot_bounded(program_id, revision, &opened, None,
+        |after, through| store.list_stream_after(&stream, after, through, 100, 1024 * 1024),
+        |error| error.to_string())?;
+    if projection.completion_request.as_ref().is_none_or(|completion|
+        completion.action_id != action_id || completion.program_revision != revision) {
+        return Err("original completion request projection differs".into());
+    }
+    // False means no authenticated conclusion winner, not rollback or Fresh.
+    actions.authenticated_existing_request_conclusion(&projection).map_err(|error| error.to_string())
+}
+
+/// Apply same-call Goal revisions from original checked results. Later changes
+/// remain outside these cuts and are rejected by the original node CAS.
+fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
+    backend: &TurnToolBatchBackend<C, T>, ticket: &NodeExecutionTicket,
+    before: &crate::execution_core::goal::GoalProjection,
+    successful: &std::collections::BTreeSet<String>,
+    members: &[(String, crate::PendingAgentBatch)],
+    replays: &BTreeMap<String, HostOriginalReplay>,
+) -> Result<Option<(crate::execution_core::goal::GoalProjection, Option<(String, u64)>)>, String> {
+    let services = backend.services.upgrade().ok_or("original ToolBatch services unavailable")?;
+    let mut committed = Vec::new();
+    for (call_id, replay) in replays {
+        if !successful.contains(call_id) || replay.call.id != *call_id
+            || replay.original_action.call_id() != call_id || replay.original_action.ticket() != ticket {
+            return Err("original replay delivery or owner differs".into());
+        }
+        if replay.call.name == harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID {
+            let action = replay.original_action.program_event();
+            let envelope: harness_contract::agent_action::AgentActionEnvelope = serde_json::from_value(
+                action.payload.get("envelope").cloned().ok_or("original replay action envelope missing")?)
+                .map_err(|error| error.to_string())?;
+            if !matches!(&envelope.action, harness_contract::agent_action::AgentAction::ObjectiveCompleteRequest(_)) {
+                return Err("original replay completion action differs".into());
+            }
+            if authenticate_original_conclusion_at_revision(backend, &envelope.actor.program_id, &envelope.action_id, action.sequence)? {
+                let store = services.event_store();
+                let (_, original, owner) = store.retained_original_first_effect(&format!("{}:intent", envelope.action_id))
+                    .map_err(|error| error.to_string())?.ok_or("original completion custody unavailable")?;
+                let owner = owner.ok_or("original completion owner unavailable")?;
+                if !owner.matches_original(store, &original) || original.idempotency_key != envelope.action_id
+                    || original.tool_use_id != *call_id
+                    || serde_json::to_value(original.as_ref()).map_err(|error| error.to_string())?
+                        != action.payload["original_single_call"]["request"] {
+                    return Err("original completion replay custody differs".into());
+                }
+                crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, &original)
+                    .map_err(|error| error.to_string())?;
+                let conclusion = original.tool_progress.original_conclusion(None, &envelope.action_id)?
+                    .ok_or("original authenticated replay conclusion remains unpublished")?;
+                committed.push(OriginalPostActionCommit::Conclusion(conclusion));
+            }
+        }
+        committed.push(OriginalPostActionCommit::Replay(Arc::clone(&replay.original_action)));
+    }
+    for (call_id, pending) in members {
+        if matches!(pending.value(), crate::PendingAgentBatchValue::WithCause { .. }) {
+            return Err("original member result remains unresolved".into());
+        }
+        let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.value() else { continue };
+        if carrier.original_request().tool_use_id != *call_id { return Err("original member call differs".into()); }
+        if let Some(handle) = carrier.original_request().tool_progress.original_single()? {
+            if !successful.contains(call_id) || !handle.belongs_to(services.event_store()) {
+                return Err("original committed action delivery or owner unavailable".into());
+            }
+            if carrier.original_request().tool_progress.original_conclusion(None, &carrier.original_request().idempotency_key)?.is_none()
+                && publish_existing_original_conclusion(backend, handle.request(), &handle.receipt().commit,
+                    &carrier.original_request().idempotency_key)?
+                && carrier.original_request().tool_progress.original_conclusion(None, &carrier.original_request().idempotency_key)?.is_none() {
+                return Err("original authenticated conclusion remains unpublished".into());
+            }
+            committed.push(OriginalPostActionCommit::Single(handle));
+        }
+        let mut consumed_conclusions: Vec<(Option<usize>, Arc<crate::agentic::OriginalCommittedConclusion>)> = Vec::new();
+        if carrier.original_request().tool_name != "agent_action_batch" {
+            let action_id = &carrier.original_request().idempotency_key;
+            if let Some(conclusion) = carrier.original_request().tool_progress.original_conclusion(None, action_id)? {
+                if conclusion.action_id() != action_id || !successful.contains(call_id) {
+                    return Err("original conclusion call or delivery differs".into());
+                }
+                consumed_conclusions.push((None, Arc::clone(&conclusion)));
+                committed.push(OriginalPostActionCommit::Conclusion(conclusion));
+            }
+        }
+        let mut member_indices = std::collections::BTreeSet::new();
+        for (index, outcome) in carrier.outcomes() {
+            let crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else {
+                return Err("original member commit remains unknown".into());
+            };
+            if member.index() != *index || !member_indices.insert(*index) {
+                return Err("original member ordinal differs or is ambiguous".into());
+            }
+            member.node_commit_fact(services.event_store(), ticket)?;
+            let handle = member.same_owner_committed().ok_or("original member committed owner missing")?;
+            if !successful.contains(call_id) { return Err("original member delivery is unavailable".into()); }
+            let action_id = member.action().payload().pointer("/envelope/action_id")
+                .and_then(serde_json::Value::as_str).filter(|value| !value.is_empty())
+                .ok_or("original member action identity unavailable")?;
+            if carrier.original_request().tool_progress.original_conclusion(Some(*index), action_id)?.is_none()
+                && publish_existing_original_conclusion(backend, handle.request(), &handle.receipt().commit, action_id)?
+                && carrier.original_request().tool_progress.original_conclusion(Some(*index), action_id)?.is_none() {
+                return Err("original authenticated member conclusion remains unpublished".into());
+            }
+            if let Some(conclusion) = carrier.original_request().tool_progress.original_conclusion(Some(*index), action_id)? {
+                if conclusion.action_id() != action_id { return Err("original conclusion member differs".into()); }
+                consumed_conclusions.push((Some(*index), Arc::clone(&conclusion)));
+                committed.push(OriginalPostActionCommit::Conclusion(conclusion));
+            }
+            committed.push(OriginalPostActionCommit::Member(Arc::clone(handle)));
+        }
+        let observed = carrier.original_request().tool_progress.original_conclusion_entries()?;
+        if observed.len() != consumed_conclusions.len() || observed.iter().any(|(index, result)|
+            !consumed_conclusions.iter().any(|(seen_index, seen)| index == seen_index && Arc::ptr_eq(result, seen))) {
+            return Err("original conclusion is pending its matching member result".into());
+        }
+    }
+    committed.sort_by_key(|handle| handle.receipt().commit_cursor);
+    committed.dedup_by(|a, b| a.belongs_to(services.event_store())
+        && b.belongs_to(services.event_store()) && a.receipt() == b.receipt());
+    let goal_stream = format!("goal:{}", before.goal.id);
+    let binding = before.goal.execution_binding.as_ref();
+    let mut source = before.clone();
+    let mut program_source: Option<(String, u64)> = None;
+    let mut changed = false;
+    for handle in &committed {
+        if !handle.belongs_to(services.event_store()) { return Err("original committed store differs".into()); }
+        let observation = handle.observation();
+        if !matches!(handle, OriginalPostActionCommit::Conclusion(_))
+            && observation.is_none_or(|value| value.status != harness_contract::agent_action::AgentActionStatus::Applied) {
+            return Err("original committed action observation unavailable or not applied".into());
+        }
+        let transaction = handle.request().map(|request| &request.transaction);
+        let receipt = handle.receipt();
+        if transaction.is_some_and(|transaction| receipt.transaction_id != transaction.transaction_id) { return Err("original checked transaction differs".into()); }
+        let replay_goal = match handle { OriginalPostActionCommit::Replay(replay) => replay.goal_event(), _ => None };
+        let Some(binding) = binding else {
+            if replay_goal.is_some() || transaction.is_some_and(|transaction| transaction.events.iter().any(|event| event.event.stream_id == goal_stream)) {
+                return Err("original Goal Program binding missing".into());
+            }
+            continue;
+        };
+        if let Some(observation) = observation {
+            if observation.program_id != binding.agentic_program_id {
+                return Err("original committed Program differs".into());
+            }
+        }
+        let program_stream = format!("agentic-program:{}", binding.agentic_program_id);
+        if let Some(cut) = receipt.stream_revisions.iter().find(|cut| cut.stream_id == program_stream && cut.committed_revision > cut.expected_revision) {
+            if program_source.as_ref().is_some_and(|(stream, revision)| stream != &program_stream || *revision != cut.expected_revision) {
+                return Err("Program changed between original actions".into());
+            }
+            program_source = Some((program_stream, cut.committed_revision));
+        }
+        let goal_payload = if let Some(transaction) = transaction {
+            let events = transaction.events.iter().enumerate().filter(|(_, event)| event.event.stream_id == goal_stream).collect::<Vec<_>>();
+            if events.is_empty() { continue; }
+            let [(index, event)] = events.as_slice() else { return Err("original Goal action is ambiguous".into()) };
+            if receipt.event_ids.get(*index).is_none() { return Err("original Goal receipt position missing".into()); }
+            &event.event.payload
+        } else if let Some(event) = replay_goal {
+            if event.stream_id != goal_stream { return Err("original replay Goal differs".into()); }
+            &event.payload
+        } else { continue };
+        let cut = receipt.stream_revisions.iter().find(|cut| cut.stream_id == goal_stream).ok_or("original committed Goal source missing")?;
+        if cut.expected_revision != source.stream_revision || cut.committed_revision != source.stream_revision.checked_add(1).ok_or("Goal revision overflow")? { return Err("Goal changed outside the original actions".into()); }
+        let next: harness_contract::goal::GoalContract = serde_json::from_value(goal_payload["goal"].clone())
+            .map_err(|error| format!("original committed Goal is unavailable: {error}"))?;
+        if next.id != source.goal.id || next.session_id != source.goal.session_id { return Err("original committed Goal identity differs".into()); }
+        crate::execution_core::goal::GoalProgressReducer::reconcile_goal(&mut source.progress, &source.goal, &next);
+        source.goal = next;
+        source.stream_revision = cut.committed_revision;
+        changed = true;
+    }
+    if changed && program_source.is_none() { return Err("original committed Program source missing".into()); }
+    // This fixture-only read marks the exact same-call post-action boundary.
+    // Its result is not a Goal source and never changes the production CAS.
+    #[cfg(feature = "test-fixtures")]
+    if changed {
+        let store = services.event_store();
+        store.fixture_scope_original_goal_read(ticket, &goal_stream,
+            || store.stream_revision(&goal_stream)).map_err(|error| error.to_string())?;
+    }
+    Ok(changed.then_some((source, program_source)))
+}
+
 // Keep the saved projection, observation and outcome construction out of the
 // tool batch future: every tool batch carries that future even when it is not
 // a completion request. This does not change the lifetime or authority of the
@@ -7737,6 +8138,399 @@ fn remember_tool_goal_revalidation<C: ApiClient, T: ToolExecutor>(
     });
 }
 
+pub(super) struct HostRuntimeStrategyGate<'a, C: ApiClient, T: ToolExecutor> {
+    pub(super) runtime: &'a Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    pub(super) prompter: &'a crate::permissions::SharedPrompter,
+}
+
+impl<C, T> HostOriginalStrategyGate for HostRuntimeStrategyGate<'_, C, T>
+where
+    C: ApiClient + Send + Sync + 'static,
+    T: ToolExecutor,
+{
+    fn check<'a>(&'a self, task: &'a crate::GovernedToolPlanTask,
+        plan: &'a crate::GovernedToolPlan,
+        decision: &'a crate::execution_core::RuntimeExecutionDecision,
+        ticket: &'a NodeExecutionTicket,
+    ) -> crate::GovernedToolFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.runtime.lock().await.satisfy_original_call_strategy_gate(
+                task, plan, decision, self.prompter, Some(ticket), None,
+            ).await
+        })
+    }
+}
+
+/// Retain the same live call carriers only for this turn. This map is not
+/// authority and cannot establish that the node transaction committed.
+pub(crate) async fn retain_original_member_batches(
+    state: &Arc<tokio::sync::Mutex<TurnGraphState>>,
+    ticket: &NodeExecutionTicket,
+    batches: &[(String, crate::PendingAgentBatch)],
+) -> Result<(), NodeExecutorError> {
+    if batches.is_empty() { return Ok(()); }
+    let mut state = state.lock().await;
+    let key = (ticket.node_id.clone(), ticket.attempt);
+    let retained = state.pending_member_batches.entry(key).or_default();
+    for (call_id, pending) in batches {
+        // Arc equality here only avoids retaining the exact same live object
+        // twice. It is never used for authorization or fact comparison.
+        if !retained.iter().any(|(old_call, old)| old_call == call_id && old == pending) {
+            retained.push((call_id.clone(), pending.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Select only original, contiguous committed members for the node owner.
+/// Unknown and unbound submissions never become committed members.
+fn original_member_prefixes(
+    calls: &[ModelToolCall],
+    batches: &[(String, crate::PendingAgentBatch)],
+) -> Result<Vec<(String, std::sync::Arc<crate::tool_host::AuthenticatedBatchPrefix>)>, String> {
+    let mut prefixes = Vec::new();
+    for (call_id, pending) in batches {
+        let mut matching = calls.iter().filter(|call| &call.id == call_id);
+        let call = matching.next().ok_or("member carrier call missing")?;
+        if matching.next().is_some() { return Err("member carrier call ambiguous".into()); }
+        if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalReplay(_) | crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) { continue; }
+        let binding = call.binding.as_ref().ok_or("member carrier original Step missing")?;
+        let outer = binding.effect_idempotency_key();
+        let mut prefix = crate::tool_host::AuthenticatedBatchPrefix::new();
+        let members = match pending.primary_value() {
+            crate::PendingAgentBatchValue::Recorded(members) => members.clone(),
+            crate::PendingAgentBatchValue::RecordedSink(sink) => sink.original_members(),
+            crate::PendingAgentBatchValue::OriginalCall(carrier) => carrier.outcomes().to_vec(),
+            _ => return Err("member carrier representation not yet connected".into()),
+        };
+        {
+                for (index, result) in &members {
+                    let crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) = result.as_ref() else { break };
+                    if *index != member.index() { return Err("member carrier index mismatch".into()); }
+                    let action = member.action();
+                    let member_outer = action.payload().pointer("/member_admission/prepared/outer_key")
+                        .and_then(serde_json::Value::as_str).ok_or("member original outer missing")?;
+                    if member_outer != outer { return Err("member original outer mismatch".into()); }
+                    prefix.push(member.clone()).map_err(|_| "member carrier order mismatch")?;
+                }
+            }
+        // A checked member with no observation arrives in the private stop,
+        // not in the successful outcome vector. Include its original handle
+        // only when the same live publication has no conflict; the node
+        // commit owner performs the authoritative ticket/store verification.
+        if let (Some(publication), crate::PendingAgentBatchValue::OriginalCall(carrier)) =
+            (pending.original_stop_publication(), pending.primary_value())
+        {
+            let stop = publication.current();
+            let coordinate = stop.coordinate();
+            if publication.failure().is_none()
+                && stop.belongs_to_original_sink(&carrier.original_request().tool_progress)
+                && coordinate.call_id() == call_id
+                && coordinate.outer_key() == outer
+                && coordinate.step() == Some(binding)
+            {
+                if let crate::tool_host::OriginalBatchMemberStopReason::CommittedObservationUnavailable(member) = stop.reason() {
+                    if member.index() != coordinate.index() || prefix.members().len() != member.index() {
+                        return Err("committed stop prefix order mismatch".into());
+                    }
+                    prefix.push(member.clone()).map_err(|_| "committed stop prefix mismatch")?;
+                }
+            }
+        }
+        if !prefix.members().is_empty() { prefixes.push((call_id.clone(), std::sync::Arc::new(prefix))); }
+    }
+    Ok(prefixes)
+}
+
+fn attach_original_member_prefixes(
+    services: &crate::RuntimeServices,
+    outcome: &mut NodeExecutionOutcome,
+    prefixes: &[(String, std::sync::Arc<crate::tool_host::AuthenticatedBatchPrefix>)],
+    batches: &[(String, crate::PendingAgentBatch)],
+) -> Result<(), String> {
+    for (_, prefix) in prefixes {
+        services.commit_service().attach_original_batch_members(outcome, std::sync::Arc::clone(prefix))
+            .map_err(|error| error.to_string())?;
+    }
+    for (call_id, pending) in batches {
+        if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) { continue; }
+        if let crate::PendingAgentBatchValue::OriginalReplay(original) = pending.primary_value() {
+            if original.replay.call_id() != call_id { return Err("original replay call differs".into()); }
+            services.commit_service().attach_original_replayed_action(outcome, Arc::clone(&original.replay))
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+        let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.primary_value() else {
+            return Err("original member call carrier unavailable".into());
+        };
+        if carrier.original_request().tool_use_id != *call_id {
+            return Err("original member call carrier mismatch".into());
+        }
+        // Multiple distinct direct publications cannot be compressed into
+        // A's single-publication API. Keep the original carriers retained and
+        // fail closed rather than dropping either one.
+        if carrier.stop_publications().len() > 1 {
+            return Err("multiple original stop publications require owner settlement".into());
+        }
+        let direct = pending.original_stop_publication().cloned();
+        if let (Some(direct), Some(retained)) = (&direct, carrier.stop_publications().first()) {
+            if !std::sync::Arc::ptr_eq(direct, retained) {
+                return Err("different original stop publications require owner settlement".into());
+            }
+        }
+        // Only the original commit owner can materialize this sealed carrier.
+        services.commit_service().attach_original_batch_pending(
+            outcome, std::sync::Arc::clone(carrier), direct.or_else(|| carrier.stop_publications().first().cloned()),
+        );
+    }
+    Ok(())
+}
+
+/// Render only original owner-authenticated observations for an unresolved
+/// batch. This is a partial tool result, never proof of Host delivery.
+fn partial_member_messages(
+    calls: &[ModelToolCall],
+    messages: &mut Vec<ConversationMessage>,
+    batches: &[(String, crate::PendingAgentBatch)],
+    prefixes: &[(String, std::sync::Arc<crate::tool_host::AuthenticatedBatchPrefix>)],
+) -> Result<(), String> {
+    for (call_id, pending) in batches {
+        if messages.iter().any(|message| message.blocks.iter().any(|block|
+            matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == call_id))) {
+            continue;
+        }
+        if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalReplay(_) | crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) { continue; }
+        let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.primary_value() else {
+            return Err("original member call carrier unavailable for partial message".into());
+        };
+        if carrier.original_request().tool_use_id != *call_id {
+            return Err("original member partial call mismatch".into());
+        }
+        let prefix = prefixes.iter().find(|(id, _)| id == call_id).map(|(_, prefix)| prefix);
+        let mut parts = Vec::new();
+        for (index, result) in carrier.outcomes() {
+            match result.as_ref() {
+                crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) => {
+                    if prefix.and_then(|prefix| prefix.members().get(*index)).is_none() {
+                        return Err("committed member missing from original node prefix".into());
+                    }
+                    let committed = match member.committed_fact().ok_or("original committed member fact missing")? {
+                        crate::tool_host::OriginalMemberCommittedFact::Applied { .. } => "action committed",
+                        crate::tool_host::OriginalMemberCommittedFact::Rejected { .. } => "rejection committed",
+                    };
+                    let observation = match member.observation() {
+                        crate::tool_host::OriginalMemberObservation::Available(value) =>
+                            format!("original observation: {}", serde_json::to_string(value).map_err(|error| error.to_string())?),
+                        crate::tool_host::OriginalMemberObservation::Unavailable =>
+                            "original observation unavailable".to_string(),
+                    };
+                    parts.push(format!("member {index}: {committed}; {observation}; Host delivery pending"));
+                }
+                crate::tool_host::OriginalMemberSubmitOutcome::CommittedUnbound(_) =>
+                    parts.push(format!("member {index}: candidate original transaction committed; association with this member unverified")),
+                crate::tool_host::OriginalMemberSubmitOutcome::NoCommittedReceipt(_) =>
+                    parts.push(format!("member {index}: no commit receipt observed; outcome unknown")),
+            }
+        }
+        if let Some(publication) = pending.original_stop_publication() {
+            let stop = publication.current();
+            let coordinate = stop.coordinate();
+            if publication.failure().is_some() || !stop.belongs_to_original_sink(&carrier.original_request().tool_progress)
+                || coordinate.call_id() != call_id {
+                parts.push("Original stop publication is unresolved; no rollback is implied.".into());
+            } else {
+                let index = coordinate.index();
+                let status = match stop.reason() {
+                    crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeUnknown(_) =>
+                        "member outcome is unknown before a committed result",
+                    crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeError(_) =>
+                        "member encountered an error before a committed result; rollback is unproven",
+                    crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeStoreError(_) =>
+                        "member storage outcome is unknown; rollback is unproven",
+                    crate::tool_host::OriginalBatchMemberStopReason::UnknownNoReceipt(_) =>
+                        "no commit receipt was observed; outcome remains unknown",
+                    crate::tool_host::OriginalBatchMemberStopReason::CommittedObservationUnavailable(_) =>
+                        "action committed; original observation unavailable and Host delivery pending",
+                    crate::tool_host::OriginalBatchMemberStopReason::CommittedUnbound(_) =>
+                        "candidate original transaction committed; association with this member unverified",
+                };
+                parts.push(format!("member {index}: {status}"));
+            }
+        }
+        if parts.is_empty() { continue; }
+        parts.push("Any unobserved later member remains unresolved; no rollback is implied.".into());
+        messages.push(ConversationMessage::tool_result(
+            call_id.clone(), "agent_action_batch", parts.join("\n"), true));
+    }
+    messages.sort_by_key(|message| message.blocks.iter().find_map(|block| match block {
+        ContentBlock::ToolResult { tool_use_id, .. } => calls.iter().position(|call| &call.id == tool_use_id),
+        _ => None,
+    }).unwrap_or(usize::MAX));
+    Ok(())
+}
+
+/// Commit the already-consumed siblings with the original node transition.
+/// An unresolved effect remains Blocked; the transcript reference is evidence
+/// of message publication only, never evidence that the effect settled.
+async fn stage_uncertain_tool_batch<C, T>(
+    runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+    services: &Arc<crate::RuntimeServices>,
+    ticket: &NodeExecutionTicket,
+    session_id: String,
+    turn_id: String,
+    calls: &[ModelToolCall],
+    mut messages: Vec<ConversationMessage>,
+    unresolved: Vec<crate::conversation::ToolBatchUnresolved>,
+) -> Result<NodeExecutionOutcome, NodeExecutorError>
+where
+    C: ApiClient + Send + Sync + 'static,
+    T: ToolExecutor,
+{
+    let reason = serde_json::to_string(&unresolved).map_err(|error| NodeExecutorError::Uncertain {
+        node_id: ticket.node_id.clone(),
+        reason: format!("could not encode unsettled original calls: {error}"),
+    })?;
+    let mut outcome = NodeExecutionOutcome::new(harness_contract::execution_graph::ExecutionNodeResult {
+        status: harness_contract::execution_graph::ExecutionNodeStatus::Blocked,
+        result_ref: None,
+        wait_class: None,
+        summary: None,
+        evidence_refs: Vec::new(),
+        failure: Some(harness_contract::execution_graph::ExecutionFailure {
+            kind: "effect_completion_uncertain".into(),
+            message: reason.clone(),
+            retryable: false,
+            evidence_refs: Vec::new(),
+        }),
+        usage: Default::default(),
+        finished_at_ms: crate::tool_invocation::now_ms(),
+    });
+    if runtime_authored_tool_batch(calls) {
+        messages.insert(0, runtime_authored_tool_call_message(calls));
+    }
+    stage_host_transcript(runtime, services, ticket, session_id, turn_id, messages, None, &mut outcome)
+        .await
+        .map_err(|error| NodeExecutorError::Uncertain {
+            node_id: ticket.node_id.clone(),
+            reason: format!("unsettled calls {reason}; sibling transcript staging failed: {error}"),
+        })?;
+    Ok(outcome)
+}
+
+/// Recover only the exact original Host receipt after the semantic action
+/// transaction and its turn owner have both been authenticated. No current
+/// policy, hook, grant, actor or projected response is constructed here.
+pub(crate) fn pregrant_original_action_receipt(
+    issuer: &crate::conversation::tool_plane::OwnedRootActionIssuer,
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+    call: &ModelToolCall,
+) -> Result<OriginalActionReceiptState, NodeExecutorError> {
+    let unknown = |reason: String| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason };
+    let Some(witness) = issuer.original_replay_witness(ticket, &call.id).map_err(|e| unknown(e.to_string()))? else {
+        let binding = call.binding.as_ref().ok_or_else(|| unknown("original call Step missing".into()))?;
+        let effect_key = binding.effect_idempotency_key();
+        let stream = format!("execution-effect:{effect_key}");
+        for suffix in ["intent", "read-intent", "receipt", "read-receipt"] {
+            let key = format!("{effect_key}:{suffix}");
+            if services.event_store().event_by_idempotency_key(&stream, &key)
+                .map_err(|e| unknown(e.to_string()))?.is_some() {
+                return Err(unknown("original effect evidence exists without an authenticated action transaction".into()));
+            }
+        }
+        return Ok(OriginalActionReceiptState::Unobserved); // Not rollback or admission.
+    };
+    let original_action = Arc::new(services.verify_original_root_replay(&witness).map_err(unknown)?);
+    let request = witness.original_request();
+    crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, request)
+        .map_err(|e| unknown(format!("original ToolBatch call proof unavailable: {e}")))?;
+    let effect = &request.compiled_invocation.as_ref()
+        .ok_or_else(|| unknown("original compiled invocation missing".into()))?.effect;
+    let read = effect.effect_kind == harness_contract::tool::ToolEffectKind::Read;
+    let suffix = if read { "read-receipt" } else { "receipt" };
+    let stream = format!("execution-effect:{}", request.idempotency_key);
+    let key = format!("{}:{suffix}", request.idempotency_key);
+    let event = match services.event_store().event_by_idempotency_key(&stream, &key)
+        .map_err(|e| unknown(e.to_string()))? {
+        Some(event) => event,
+        None if original_action.observation().is_none() => {
+            let partial = ConversationMessage::tool_result(&call.id, &call.name,
+                "original action committed; observation and physical outcome unavailable", true);
+            let carrier = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalReplay(
+                crate::conversation::OriginalReplayedPartial { replay: Arc::clone(&original_action), physical_receipt: None }));
+            return Ok(OriginalActionReceiptState::CommittedPartial(partial, carrier));
+        }
+        None => return Err(unknown("original semantic transaction exists but Host outcome receipt is unobserved".into())),
+    };
+    let receipt = services.event_store().original_transaction_receipt(&event.transaction_id)
+        .map_err(|e| unknown(e.to_string()))?
+        .ok_or_else(|| unknown("original Host outcome transaction receipt unavailable".into()))?;
+    if event.stream_id != stream || event.scope != crate::RuntimeEventScope::ExecutionNode
+        || event.schema_version != 1 || event.actor.as_deref() != Some("governed_tool")
+        || event.kind != if read { "execution.read.receipt" } else { "execution.effect.receipt" }
+        || event.idempotency_key.as_deref() != Some(key.as_str())
+        || event.payload["resolved_effect_scope"]["version"].as_u64() != Some(2)
+        || receipt.transaction_id != event.transaction_id || receipt.commit_cursor != event.commit_cursor
+        || receipt.event_ids.get(event.transaction_index as usize) != Some(&event.event_id)
+        || (event.commit_cursor, event.transaction_index)
+            <= (witness.original_action_event().commit_cursor, witness.original_action_event().transaction_index) {
+        return Err(unknown("original Host outcome receipt identity or ordering mismatch".into()));
+    }
+    // A missing flag is not false: old mutation receipts bounded errors
+    // silently. Truncated bodies require a separately authenticated full
+    // original artifact, which this consumer cannot yet recover.
+    match event.payload.get("outcome_truncated").and_then(serde_json::Value::as_bool) {
+        Some(false) => {},
+        Some(true) => return Err(unknown("original Host outcome was truncated; full original artifact is unavailable".into())),
+        None => return Err(unknown("original Host outcome completeness was not recorded".into())),
+    }
+    // The primary and the original graph/node/attempt index must be the same
+    // atomic physical receipt and must both explicitly prove non-truncation.
+    let index_stream = format!("execution-agent-receipts:{}:{}:{}", ticket.graph_id, ticket.node_id, ticket.attempt);
+    let index_key = format!("agent-tool-receipt:{}", request.idempotency_key);
+    let index = services.event_store().event_by_idempotency_key(&index_stream, &index_key)
+        .map_err(|e| unknown(e.to_string()))?
+        .ok_or_else(|| unknown("original Host receipt index unavailable".into()))?;
+    if index.stream_id != index_stream || index.scope != crate::RuntimeEventScope::ExecutionNode
+        || index.schema_version != 2 || index.kind != "execution.agent_tool.receipt"
+        || index.status.as_deref() != Some("completed") || index.actor.as_deref() != Some("governed_tool")
+        || index.idempotency_key.as_deref() != Some(index_key.as_str())
+        || index.transaction_id != event.transaction_id || index.commit_cursor != event.commit_cursor
+        || index.transaction_index <= event.transaction_index
+        || receipt.event_ids.get(index.transaction_index as usize) != Some(&index.event_id)
+        || index.payload["idempotency_key"].as_str() != Some(request.idempotency_key.as_str())
+        || index.payload["outcome"] != event.payload["outcome"] {
+        return Err(unknown("original Host receipt index identity or payload mismatch".into()));
+    }
+    match index.payload.get("outcome_truncated").and_then(serde_json::Value::as_bool) {
+        Some(false) => {},
+        Some(true) => return Err(unknown("original Host receipt index is truncated; full original artifact is unavailable".into())),
+        None => return Err(unknown("original Host receipt index completeness was not recorded".into())),
+    }
+    let outcome = services.commit_service().completed_tool_effect(request, effect)
+        .map_err(|e| unknown(e.to_string()))?
+        .ok_or_else(|| unknown("original Host outcome receipt vanished".into()))?;
+    if outcome.tool_use_id != call.id || outcome.tool_name != call.name
+        || outcome.status == crate::RuntimeToolExecutionStatus::Unknown
+        || serde_json::to_value(&outcome).map_err(|e| unknown(e.to_string()))? != event.payload["outcome"] {
+        return Err(unknown("original Host outcome differs from the original call or remains unknown".into()));
+    }
+    // Semantic observation and physical receipt are different objects. The
+    // original action transaction and original effect receipt were each
+    // authenticated above against the same ticket, Step, call and effect key.
+    // Return the recorded Host bytes without comparing either format or
+    // reconstructing Gateway follow-ups from a current projection.
+    if original_action.observation().is_none() {
+        let partial = ConversationMessage::tool_result(&call.id, &call.name,
+            "original action committed; semantic observation unavailable", true);
+        let carrier = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalReplay(
+            crate::conversation::OriginalReplayedPartial { replay: original_action, physical_receipt: Some(Arc::new(event)) }));
+        return Ok(OriginalActionReceiptState::CommittedPartial(partial, carrier));
+    }
+    Ok(OriginalActionReceiptState::Complete(HostOriginalReplay { call: call.clone(),
+        outcome: crate::bound_tool_batch::retained_replay_outcome(outcome), original_action }))
+}
+
 #[async_trait]
 impl<C, T> ScopedNodeBackend for TurnToolBatchBackend<C, T>
 where
@@ -7747,6 +8541,9 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        let services = self.services.upgrade().ok_or_else(|| NodeExecutorError::Uncertain {
+            node_id: ticket.node_id.clone(), reason: "original ToolBatch services unavailable".into(),
+        })?;
         if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
             bus.emit(CowdEvent::ExecutionPhase {
                 status: harness_contract::projection::ExecutionLiveStatus::CallingTool,
@@ -7781,7 +8578,7 @@ where
             };
             stage_host_transcript(
                 &self.runtime,
-                &self.services,
+                &services,
                 ticket,
                 session_id,
                 turn_id,
@@ -7793,8 +8590,7 @@ where
             return Ok(outcome);
         }
         let write_goal_id = self.state.lock().await.goal_id.clone();
-        let write_goal_source = self
-            .services
+        let write_goal_source = services
             .goal_store()
             .projection(&write_goal_id)
             .map_err(|reason| NodeExecutorError::Poll {
@@ -7835,9 +8631,11 @@ where
             })?;
         #[cfg(feature = "test-fixtures")]
         let rc_completion_trace = std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some()
-            && calls.iter().any(|call| call.id == "recovery-complete" && call.name == "objective_complete_request");
+            && calls.iter().any(|call| (call.id == "recovery-complete" && call.name == "objective_complete_request") || (call.id == "d-objective-review" && call.name == "objective_review"));
         #[cfg(feature = "test-fixtures")]
-        if rc_completion_trace { eprintln!("rc_completion_stage decoded"); }
+        let rc_review_trace = calls.iter().any(|call| call.id == "d-objective-review" && call.name == "objective_review");
+        #[cfg(feature = "test-fixtures")]
+        if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_decoded" } else { "recovery-complete:host_decoded" }, None, None); }
         let admitted_turn = self.state.lock().await.turn_id.clone();
         if calls.iter().any(|call| {
             call.binding.as_ref().is_some_and(|binding| {
@@ -7856,6 +8654,18 @@ where
                 reason: "tool batch has no model-requested calls".to_string(),
             });
         }
+        // Apply the same registered evaluation ceiling at the actual per-call
+        // ToolBatch boundary, including system-authored and restored batches.
+        // Refusals become releasable only after the original owner commits them;
+        // a scope finding alone never releases a conflict-only successor.
+        let evaluation_scope_rejections = {
+            let state = self.state.lock().await;
+            evaluation_scope_call_violations(
+                &state.evaluation_resource_scopes,
+                &calls,
+                services.workspace_root(),
+            )
+        };
         let mut precompleted = {
             let state = self.state.lock().await;
             calls
@@ -7884,164 +8694,80 @@ where
                 })
                 .collect::<BTreeMap<_, _>>()
         };
+        if precompleted.keys().any(|id| evaluation_scope_rejections.contains_key(id)) {
+            return Err(NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "evaluation_scope_precompleted_call_cannot_be_certified_undispatched".into(),
+            });
+        }
         let governed_host = if delegated_agent_role {
             None
         } else {
-            self.services.tool_execution_host()
+            services.tool_execution_host()
         };
-        let mut receipt_invocations = BTreeMap::new();
-        if governed_host.is_some() {
-            let policy_revision = self
-                .runtime
-                .lock()
-                .await
-                .permission_policy()
-                .execution_policy_control()
-                .snapshot()
-                .revision;
-            let current = governed_host.and_then(|host| host.pin_step_catalog());
-            for call in &calls {
-                if call.binding.as_ref().is_some_and(|binding| {
-                    binding.snapshot.expires_at_ms > chrono::Utc::now().timestamp_millis()
-                        && binding.snapshot.related_revisions.get("policy")
-                            == Some(&policy_revision.to_string())
-                        && current.as_ref().is_some_and(|lease| {
-                            binding.snapshot.tools.iter().all(|tool| {
-                                tool.semantic_revision == lease.implementation_revision()
-                            })
-                        })
-                }) {
-                    continue;
-                }
-                let Some(binding) = call.binding.as_ref() else {
-                    continue;
-                };
-                let idempotency_key = binding.effect_idempotency_key();
-                let parent = harness_contract::execution_graph::ExecutionParentBinding {
-                    execution_id: ticket.graph_id.clone(),
-                    node_id: ticket.node_id.clone(),
-                };
-                let query = crate::execution_core::graph::ToolReceiptQuery {
-                    step_binding: binding,
-                    parent_execution: &parent,
-                    session_id: &session_id,
-                    policy_revision,
-                    idempotency_key: &idempotency_key,
-                    tool_use_id: &call.id,
-                    tool_name: &call.name,
-                    input: &call.input,
-                };
-                if let Some(replay) = self
-                    .services
-                    .commit_service()
-                    .query_completed_tool_effect(&query)
-                    .map_err(|error| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason: error.to_string(),
-                    })?
-                {
-                    let allowed = matches!(
-                        self.runtime
-                            .lock()
-                            .await
-                            .permission_policy()
-                            .authorize_required_with_context(
-                                &call.name,
-                                &call.input,
-                                crate::permissions::PermissionMode::ReadOnly,
-                                &crate::permissions::PermissionContext::default(),
-                                None,
-                            ),
-                        crate::permissions::PermissionOutcome::Allow
-                    );
-                    if !allowed {
-                        return Err(NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason: "tool_receipt_read_permission_revoked".to_string(),
-                        });
-                    }
-                    receipt_invocations.insert(call.id.clone(), replay.invocation);
-                    precompleted.insert(
-                        call.id.clone(),
-                        crate::conversation::EarlyToolExecutionReceipt {
-                            lifecycle: crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: replay.lifecycle },
-                            call: call.clone(),
-                            outcome: replay.outcome,
-                            ready_at_ms: replay.completed_at_ms,
-                            started_at_ms: replay.completed_at_ms,
-                            completed_at_ms: replay.completed_at_ms,
-                        },
-                    );
-                }
-            }
-        }
-        if delegated_agent_role {
-            let runtime = self.runtime.lock().await;
-            let current = runtime.tool_executor().pin_step_catalog();
-            let policy_revision = runtime
-                .permission_policy()
-                .execution_policy_control()
-                .snapshot()
-                .revision;
-            for call in &calls {
-                if call.binding.as_ref().is_some_and(|binding| {
-                    binding.snapshot.expires_at_ms > chrono::Utc::now().timestamp_millis()
-                        && binding.snapshot.related_revisions.get("policy")
-                            == Some(&policy_revision.to_string())
-                        && current.as_ref().is_some_and(|lease| {
-                            binding.snapshot.tools.iter().all(|tool| {
-                                tool.semantic_revision == lease.implementation_revision()
-                            })
-                        })
-                }) {
-                    continue;
-                }
-                if let Some((invocation, outcome, completed_at_ms)) = runtime
-                    .tool_executor()
-                    .recover_step_tool_receipt(call)
-                    .await
-                    .map_err(|error| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason: error.to_string(),
-                    })?
-                {
-                    if !matches!(
-                        runtime.permission_policy().authorize_required_with_context(
-                            &call.name,
-                            &call.input,
-                            crate::permissions::PermissionMode::ReadOnly,
-                            &crate::permissions::PermissionContext::default(),
-                            None
-                        ),
-                        crate::permissions::PermissionOutcome::Allow
-                    ) {
-                        return Err(NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason: "tool_receipt_read_permission_revoked".into(),
-                        });
-                    }
-                    receipt_invocations.insert(call.id.clone(), invocation);
-                    precompleted.insert(
-                        call.id.clone(),
-                        crate::conversation::EarlyToolExecutionReceipt {
-                            lifecycle: crate::conversation::ToolLifecycleReuse::DurableEffectReplay { original_lifecycle: None },
-                            call: call.clone(),
-                            outcome,
-                            ready_at_ms: completed_at_ms,
-                            started_at_ms: completed_at_ms,
-                            completed_at_ms,
-                        },
-                    );
-                }
-            }
-        }
         // Only the ToolHost graph path prepares and compiles here. Delegated
         // agents use execute_tool_batch_step(), which owns the same work for
         // that path; doing both would duplicate policy revision and approval.
+        // Capture the original owner before any per-call policy negotiation;
+        // a replay witness may be minted here without consuming a grant.
+        let pregrant_action_issuer = if governed_host.is_some() {
+            let runtime = self.runtime.lock().await;
+            let owner = Arc::new(runtime.shared_policy_owner());
+            Some(Arc::new(runtime.owned_root_action_issuer(owner)))
+        } else { None };
+        let mut original_replays = BTreeMap::new();
+        if let Some(issuer) = pregrant_action_issuer.as_deref() {
+            for call in &calls {
+                if precompleted.contains_key(&call.id)
+                    || !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str()) { continue; }
+                match pregrant_original_action_receipt(issuer, services.as_ref(), ticket, call) {
+                    Ok(OriginalActionReceiptState::Complete(receipt)) => { original_replays.insert(call.id.clone(), receipt); }
+                    Ok(OriginalActionReceiptState::Unobserved) => {},
+                    Ok(OriginalActionReceiptState::CommittedPartial(partial, original)) => {
+                        let messages = calls.iter().filter_map(|item| {
+                            if item.id == call.id { Some(partial.clone()) }
+                            else { original_replays.get(&item.id).map(|replay: &HostOriginalReplay| tool_outcome_message(replay.outcome.clone()))
+                                .or_else(|| precompleted.get(&item.id).map(early_tool_receipt_message)) }
+                        }).collect();
+                        let unresolved = calls.iter().filter(|item| !original_replays.contains_key(&item.id) && !precompleted.contains_key(&item.id))
+                            .map(|item| crate::conversation::ToolBatchUnresolved::Unknown {
+                                call_id: item.id.clone(), detail: "original action committed; Host delivery incomplete".into(),
+                                terminal_detail: "original Gateway postprocessing and effect receipt unobserved".into(), commit_error: None,
+                            }).collect();
+                        let batches = vec![(call.id.clone(), original)];
+                        retain_original_member_batches(&self.state, ticket, &batches).await?;
+                        let mut node = stage_uncertain_tool_batch(&self.runtime, &services, ticket,
+                            session_id.clone(), admitted_turn.clone(), &calls, messages, unresolved).await?;
+                        attach_original_member_prefixes(&services, &mut node, &[], &batches)
+                            .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+                        return Ok(node);
+                    },
+                    Err(error) => {
+                        let messages = calls.iter().filter_map(|item| {
+                            original_replays.get(&item.id).map(|replay: &HostOriginalReplay| tool_outcome_message(replay.outcome.clone()))
+                                .or_else(|| precompleted.get(&item.id).map(early_tool_receipt_message))
+                        }).collect();
+                        let unresolved = calls.iter().filter(|item| !original_replays.contains_key(&item.id) && !precompleted.contains_key(&item.id))
+                            .map(|item| crate::conversation::ToolBatchUnresolved::Unknown {
+                                call_id: item.id.clone(), detail: error.to_string(),
+                                terminal_detail: "pre-grant original outcome unresolved".into(), commit_error: None,
+                            }).collect();
+                        return stage_uncertain_tool_batch(&self.runtime, &services, ticket,
+                            session_id.clone(), admitted_turn.clone(), &calls, messages, unresolved).await;
+                    }
+                }
+            }
+        }
+        let single_captures: Arc<Mutex<HashMap<String, Arc<crate::conversation::tool_plane::OriginalSingleProducerCapture>>>> = Arc::new(Mutex::new(HashMap::new()));
         let governed_bundle: Option<(
             std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
             std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
             std::collections::HashMap<String, harness_contract::policy::CapabilityAssessment>,
+            std::collections::HashMap<String, HostPolicyRefusal>,
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, crate::conversation::PreparedCallEffect>,
+            std::collections::HashMap<String, crate::RuntimeToolExecutionRequest>,
             crate::execution_core::RuntimeExecutionDecision,
             Result<crate::GovernedToolCompilation, crate::GovernedToolCompileError>,
         )> = if governed_host.is_some() {
@@ -8060,17 +8786,21 @@ where
                         depends_on: call.depends_on.clone(),
                     })
                     .collect::<Vec<_>>();
+                let original_executor: Arc<dyn crate::ToolExecutor> = tool_exec.clone();
+                let plan_pin = original_executor.pin_step_catalog().map(Arc::new);
                 let mut prepared = Vec::with_capacity(requests.len());
+                let mut original_pins = std::collections::HashMap::new();
                 let mut admission_rejections = BTreeMap::new();
                 for request in &requests {
-                    if let Some(invocation) = receipt_invocations.get(&request.tool_use_id) {
-                        prepared.push(invocation.clone());
+                    if admission_rejections.contains_key(&request.tool_use_id) {
                         continue;
                     }
-                    match tool_exec.prepare_step_invocations(std::slice::from_ref(request), &calls)
+                    match tool_exec.prepare_step_invocations(std::slice::from_ref(request), &calls, plan_pin.as_ref(), &original_executor)
                     {
                         Ok(mut invocations) if invocations.len() == 1 => {
-                            prepared.push(invocations.remove(0))
+                            let item = Arc::new(invocations.remove(0));
+                            original_pins.insert(item.invocation().invocation_id.clone(), Arc::clone(&item));
+                            prepared.push(item.invocation().clone());
                         }
                         Ok(_) => {
                             admission_rejections.insert(
@@ -8103,7 +8833,7 @@ where
                 );
                 let mut governed_compilation = crate::GovernedToolCompiler
                     .compile_prepared_partial(
-                        self.services.workspace_root(),
+                        services.workspace_root(),
                         &requests,
                         &prepared,
                         &admission_rejections,
@@ -8111,6 +8841,9 @@ where
                 if let Ok(compilation) = governed_compilation.as_mut() {
                     if let Some(plan) = compilation.plan.as_mut() {
                         crate::step_snapshot::bind_plan_calls(plan, &calls);
+                        for task in &mut plan.tasks {
+                            task.original_pin = original_pins.get(&task.tool_call_id).cloned();
+                        }
                     }
                 }
                 let execution_decision = runtime
@@ -8122,17 +8855,32 @@ where
                     })?;
                 let mut auths = std::collections::HashMap::new();
                 let mut gaps = std::collections::HashMap::new();
+                let mut policy_refusals = std::collections::HashMap::new();
+                let mut policy_failures = std::collections::HashMap::new();
+                let mut effective_inputs = std::collections::HashMap::new();
+                let mut prepared_effects = std::collections::HashMap::new();
+                let mut prepared_requests = std::collections::HashMap::new();
                 for call in &calls {
-                    if receipt_invocations.contains_key(&call.id) {
-                        continue;
-                    }
+                    if precompleted.contains_key(&call.id) || original_replays.contains_key(&call.id) { continue; }
                     if let Some(invocation) = prepared
                         .iter()
                         .find(|invocation| invocation.invocation_id == call.id)
                     {
+                        let task = governed_compilation.as_ref().ok()
+                            .and_then(|compilation| compilation.plan.as_ref())
+                            .and_then(|plan| plan.tasks.iter().find(|task| task.tool_call_id == call.id));
+                        let hook = match task {
+                            Some(task) => match runtime.prepare_governed_hook(task, &call.input) {
+                                Ok(hook) => Some(hook),
+                                Err(error) => { policy_failures.insert(call.id.clone(), error.to_string()); continue; }
+                            },
+                            None => None,
+                        };
+                        let effective_input = hook.as_ref().map_or(call.input.as_str(), |hook| hook.effective_input.as_str());
+                        effective_inputs.insert(call.id.clone(), effective_input.to_string());
                         let descriptor = invocation.effect.clone();
                         let objective_refusal = crate::execution_core::goal::goal_tool_effect_rejection(
-                            &write_goal_source.goal, &descriptor, self.services.path_identity_resolver(),
+                            &write_goal_source.goal, &descriptor, services.path_identity_resolver(),
                         ).or_else(||workspace_mutation_is_objectively_forbidden(forbids_write,descriptor.required_permission)
                             .then_some("original admitted user constraint prohibits workspace mutation"));
                         if let Some(reason) = objective_refusal {
@@ -8147,17 +8895,82 @@ where
                             continue;
                         }
                         let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
-                        match runtime
-                            .negotiate_tool_authorization(
+                        let mut bound_request = governed_compilation.as_ref().ok()
+                            .and_then(|compilation| compilation.plan.as_ref())
+                            .and_then(|plan| plan.tasks.iter().find(|task| task.tool_call_id == call.id).map(|task| (plan, task)))
+                            .filter(|(_, task)| task.step_binding == call.binding)
+                            .map(|(plan, task)| {
+                                let policy = runtime.permission_policy().execution_policy_control().snapshot();
+                                let memory = runtime.memory_turn_context();
+                                let reality = runtime.reality_data_lease();
+                                let mut effective_call = call.clone();
+                                effective_call.input = effective_input.to_string();
+                                bound_runtime_tool_request(&effective_call, task, &plan.plan_id, plan.revision,
+                                    u64::try_from(iteration).unwrap_or(u64::MAX).max(1), &session_id,
+                                    policy.sandbox_posture, policy.revision, Some(&memory), reality.as_ref(),
+                                    model_lease.as_deref(), ticket, Some(&execution_decision), None, None)
+                            });
+                        let bounded = tools::tool_orchestrator::effect_is_bounded_read_only_compute(&descriptor)
+                            || call.name == "execute_code";
+                        if let Some(request) = bound_request.as_mut().filter(|request| request.step_binding.is_none() || bounded) {
+                            let (Some(task), Some(hook)) = (task, hook.as_ref()) else {
+                                if bounded { return Err(NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:"bounded original plan or hook missing".into() }); }
+                                policy_failures.insert(call.id.clone(), "original unbound plan or hook missing".into());
+                                continue;
+                            };
+                            let Some(plan) = governed_compilation.as_ref().ok().and_then(|compilation| compilation.plan.as_ref()) else {
+                                if bounded { return Err(NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:"bounded original plan missing".into() }); }
+                                policy_failures.insert(call.id.clone(), "original unbound plan missing".into());
+                                continue;
+                            };
+                            if let Err(error) = runtime.bind_original_governed_hook(ticket, task, &call.input, hook, request,
+                                &plan.plan_id, plan.revision) {
+                                if bounded { return Err(NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:error.to_string() }); }
+                                policy_failures.insert(call.id.clone(), error.to_string());
+                                continue;
+                            }
+                        }
+                        let decision = if let Some(request) = bound_request.as_ref() {
+                            if request.step_binding.is_none() {
+                                if call.name == "agent_action_batch"
+                                    || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str()) {
+                                    policy_failures.insert(call.id.clone(), "original action Step binding missing".into());
+                                    continue;
+                                }
+                                prepared_requests.insert(call.id.clone(), request.clone());
+                                runtime.negotiate_tool_authorization(&descriptor, effective_input, request_id,
+                                    hook.as_ref().map_or_else(crate::PermissionContext::default, |hook| hook.permission_context.clone()),
+                                    hook.as_ref().map_or(default_timeout, |hook| hook.tool_timeout).as_secs(), &prompter).await
+                            } else {
+                            let effect = match runtime.prepare_call_effect_evidence(ticket, request) {
+                                Ok(effect) => effect,
+                                Err(error) => { policy_failures.insert(call.id.clone(), error.to_string()); continue; }
+                            };
+                            let capture = Arc::new(crate::conversation::tool_plane::OriginalSingleProducerCapture::default());
+                            capture.bind_original_decision(&execution_decision);
+                            let decision = Arc::clone(&capture).scope(runtime.negotiate_tool_authorization_for_call(
                                 &descriptor,
-                                &call.input,
+                                effective_input,
                                 request_id,
-                                crate::PermissionContext::default(),
-                                default_timeout.as_secs(),
+                                hook.as_ref().map_or_else(crate::PermissionContext::default, |hook| hook.permission_context.clone()),
+                                hook.as_ref().map_or(default_timeout, |hook| hook.tool_timeout).as_secs(),
                                 &prompter,
-                            )
-                            .await
-                        {
+                                crate::execution_core::graph::CallRefusalOwner::Node(ticket),
+                                request,
+                                Some(&effect),
+                            )).await;
+                            if harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str()) {
+                                single_captures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(call.id.clone(), capture);
+                            }
+                            prepared_effects.insert(call.id.clone(), effect);
+                            prepared_requests.insert(call.id.clone(), request.clone());
+                            decision
+                            }
+                        } else {
+                            policy_failures.insert(call.id.clone(), "original call Step binding missing or mismatched".into());
+                            continue;
+                        };
+                        match decision {
                             Ok(crate::conversation::ToolAuthorizationDecision::Authorized(
                                 decision,
                             )) => {
@@ -8165,19 +8978,18 @@ where
                             }
                             Ok(crate::conversation::ToolAuthorizationDecision::Gap {
                                 assessment,
+                                assessment_event,
                                 ..
                             }) => {
+                                if assessment.path == harness_contract::policy::AuthorizationPath::HardDeny {
+                                    if let (Some(request), Some(assessment_event)) = (bound_request, assessment_event) {
+                                        policy_refusals.insert(call.id.clone(), HostPolicyRefusal { request, assessment: assessment_event });
+                                    }
+                                }
                                 gaps.insert(call.id.clone(), assessment);
                             }
                             Err(error) => {
-                                gaps.insert(
-                                    call.id.clone(),
-                                    synthetic_capability_gap(
-                                        &descriptor,
-                                        runtime.active_permission_mode(),
-                                        error.to_string(),
-                                    ),
-                                );
+                                policy_failures.insert(call.id.clone(), error.to_string());
                             }
                         }
                     }
@@ -8186,6 +8998,11 @@ where
                     auths,
                     prepared_by_id,
                     gaps,
+                    policy_refusals,
+                    policy_failures,
+                    effective_inputs,
+                    prepared_effects,
+                    prepared_requests,
                     execution_decision,
                     governed_compilation,
                 )
@@ -8193,6 +9010,7 @@ where
         } else {
             None
         };
+        let mut original_member_batches = Vec::new();
         let (
             result,
             mut orchestration_terminal_summary,
@@ -8204,6 +9022,11 @@ where
                 tool_authorizations,
                 prepared_tool_invocations,
                 capability_gaps,
+                policy_refusals,
+                policy_failures,
+                effective_inputs,
+                prepared_effects,
+                prepared_requests,
                 execution_decision,
                 governed_compilation,
             ) = governed_bundle.ok_or_else(|| NodeExecutorError::Poll {
@@ -8246,7 +9069,48 @@ where
                     original_producers,
                 )
             };
-            let governed = execute_governed_runtime_tool_batch(
+            if !precompleted.is_empty() {
+                let runtime = self.runtime.lock().await;
+                let state = self.state.lock().await;
+                if state.has_evaluation_scope() {
+                    let plan = governed_compilation.as_ref().ok().and_then(|compiled| compiled.plan.as_ref())
+                        .ok_or_else(|| NodeExecutorError::Poll { node_id: ticket.node_id.clone(),
+                            reason: "precompleted scope requires the original compiled plan".into() })?;
+                    for call in calls.iter().filter(|call| precompleted.contains_key(&call.id)) {
+                        let task = plan.tasks.iter().find(|task| task.tool_call_id == call.id)
+                            .ok_or_else(|| NodeExecutorError::Poll { node_id: ticket.node_id.clone(),
+                                reason: "precompleted scope requires its original compiled call".into() })?;
+                        let request = bound_runtime_tool_request(call, task, &plan.plan_id, plan.revision,
+                            u64::try_from(iteration).unwrap_or(u64::MAX).max(1), &session_id,
+                            execution_policy.sandbox_posture, execution_policy.revision, Some(&memory_context),
+                            reality_context.as_ref(), model_lease.as_deref(), ticket, Some(&execution_decision), None, None);
+                        let effect = runtime.prepare_call_effect_evidence(ticket, &request)
+                            .map_err(|error| NodeExecutorError::Poll { node_id: ticket.node_id.clone(),
+                                reason: format!("precompleted original pinned effect unavailable: {error}") })?;
+                        match state.evaluate_scope_refusal(ticket, &request, services.as_ref(), &effect) {
+                            Ok(None) => {}
+                            Ok(Some(_)) => return Err(NodeExecutorError::Poll { node_id: ticket.node_id.clone(),
+                                reason: "precompleted call exceeds its current evaluation scope".into() }),
+                            Err(error) => return Err(NodeExecutorError::Poll { node_id: ticket.node_id.clone(),
+                                reason: format!("precompleted call scope unresolved: {error}") }),
+                        }
+                    }
+                }
+            }
+            let strategy_gate = HostRuntimeStrategyGate { runtime: &self.runtime, prompter: &prompter };
+            let policy_owner = Arc::new(self.runtime.lock().await.shared_policy_owner());
+            let action_issuer = pregrant_action_issuer.ok_or_else(|| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(), reason: "original pre-grant action owner unavailable".into(),
+            })?;
+            let owner: Arc<dyn crate::tool_host::AgentBatchPolicyOwner> = Arc::new(OriginalBatchPolicyOwner {
+                owner: Arc::clone(&policy_owner), prompter: prompter.clone(),
+                parent: harness_contract::execution_graph::ExecutionParentBinding {
+                    execution_id: ticket.graph_id.clone(), node_id: ticket.node_id.clone(),
+                }, attempt: ticket.attempt, ticket: ticket.clone(),
+                event_store: Arc::clone(services.event_store()),
+                action_service: services.agent_action_service(),
+            });
+            let governed = ROOT_SINGLE_CAPTURES.scope(Arc::clone(&single_captures), ROOT_ACTION_ISSUER.scope(action_issuer, ROOT_BATCH_POLICY_OWNER.scope(owner, execute_governed_runtime_tool_batch(
                 Arc::clone(host),
                 event_bus,
                 &calls,
@@ -8263,16 +9127,34 @@ where
                 &prepared_tool_invocations,
                 governed_compilation,
                 &execution_decision,
-                self.services.tool_execution_plane(),
-                self.services.tool_batch_executor(),
-                self.services.commit_service(),
+                services.tool_execution_plane(),
+                services.tool_batch_executor(),
+                services.commit_service(),
                 &precompleted,
+                &original_replays,
                 &original_producers,
-            )
-            .await;
+                Some(&evaluation_scope_rejections),
+                Some(&self.state),
+                Some(services.as_ref()),
+                Some(&policy_refusals),
+                Some(&policy_failures),
+                Some(&effective_inputs),
+                Some(&prepared_effects),
+                Some(&prepared_requests),
+                Some(&strategy_gate),
+            )))).await;
+            if policy_owner.take_control_requested() {
+                self.runtime.lock().await.consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::AfterToolResult);
+            }
+            let governed = governed.map_err(|reason| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(), reason,
+            })?;
             #[cfg(feature = "test-fixtures")]
-            if rc_completion_trace { eprintln!("rc_completion_stage governed_returned"); }
+            if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_governed_returned" } else { "recovery-complete:host_governed_returned" }, None, None); }
             let GovernedToolBatchResult {
+                member_batches,
+                unresolved,
+                unknown_effect,
                 refused_before_dispatch,
                 messages: governed_messages,
                 invocations,
@@ -8280,6 +9162,9 @@ where
                 max_concurrency_observed,
                 parallel_batches,
             } = governed;
+            if unknown_effect.is_some() {
+                retain_original_member_batches(&self.state, ticket, &member_batches).await?;
+            }
             // Preserve the full, durable orchestration receipt long enough to
             // derive a verified Program terminal. The model-facing compactor
             // deliberately replaces large JSON with an elided summary, so
@@ -8288,7 +9173,7 @@ where
             let orchestration_terminal_summary = completed_orchestration_terminal_summary(
                 &calls,
                 &governed_messages,
-                self.services.workspace_root(),
+                services.workspace_root(),
                 true,
             );
             // Semantic Action progress must be read from the complete
@@ -8299,6 +9184,8 @@ where
             // the next model node sees the result, route its raw output
             // through the same durable evidence and context-ledger path used
             // by normal conversation tool calls.
+            #[cfg(feature = "test-fixtures")]
+            if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_compactor_enter" } else { "recovery-complete:host_compactor_enter" }, None, None); }
             let messages = compact_governed_tool_messages(
                 &self.runtime,
                 &calls,
@@ -8306,15 +9193,49 @@ where
                 &invocations,
                 &precompleted,
             )
-            .await
-            .map_err(|error| NodeExecutorError::Poll {
-                node_id: ticket.node_id.clone(),
-                reason: format!("tool evidence durability barrier failed: {error}"),
-            })?;
+            .await;
             #[cfg(feature = "test-fixtures")]
-            if rc_completion_trace { eprintln!("rc_completion_stage compactor_returned"); }
+            if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_compactor_return" } else { "recovery-complete:host_compactor_return" }, None, Some(messages.is_ok())); }
+            let messages = messages.map_err(|error| match &unknown_effect {
+                Some(unknown) => NodeExecutorError::Uncertain {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("{unknown}; unresolved calls {unresolved:?}; completed sibling consumption failed: {error}"),
+                },
+                None => NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("tool evidence durability barrier failed: {error}"),
+                },
+            })?;
+            if let Some(unknown) = unknown_effect {
+                let retained = self.runtime.lock().await
+                    .verify_completed_sibling_prefix(&calls, &messages, Some(&invocations));
+                if let Err(error) = retained {
+                    return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(),
+                        reason: format!("{unknown}; unresolved calls {unresolved:?}; completed sibling retention failed: {error}") });
+                }
+                let (session_id, turn_id) = {
+                    let state = self.state.lock().await;
+                    (state.session_id.clone(), state.turn_id.clone())
+                };
+                let prefixes = original_member_prefixes(&calls, &member_batches)
+                    .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+                let mut messages = messages;
+                partial_member_messages(&calls, &mut messages, &member_batches, &prefixes)
+                    .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+                let mut node = stage_uncertain_tool_batch(
+                    &self.runtime, &services, ticket, session_id, turn_id,
+                    &calls, messages, unresolved,
+                ).await?;
+                attach_original_member_prefixes(&services, &mut node, &prefixes, &member_batches)
+                    .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+                return Ok(node);
+            }
+            original_member_batches = member_batches;
+            #[cfg(feature = "test-fixtures")]
+            if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_compactor_returned" } else { "recovery-complete:host_compactor_returned" }, None, None); }
             (
                 crate::conversation::ToolBatchStepResult {
+                    member_batches: Vec::new(),
                     refused_before_dispatch,
                     failed: messages
                         .iter()
@@ -8338,7 +9259,17 @@ where
             if !delegated_agent_role
                 && calls
                     .iter()
-                    .any(|call| !runtime.tool_executor().owns_durable_tool_effect(&call.name))
+                    .any(|call| {
+                        // Use the same resolved owner decision as preparation
+                        // and execution. Unknown descriptors conservatively
+                        // require the original ticket owner.
+                        let effect = call.binding.as_ref()
+                            .and_then(|binding| binding.resolve(runtime.tool_executor().pin_step_catalog()).ok())
+                            .and_then(|step| harness_contract::step::parse_strict_json(&call.input).ok()
+                                .map(|input| step.lease().describe_effect(&call.name, &input)));
+                        effect.as_ref().is_none_or(|effect|
+                            !runtime.executor_owns_governed_effect(&call.name, effect))
+                    })
             {
                 let (owner, attempt) =
                     runtime
@@ -8359,16 +9290,33 @@ where
                 root_owner = Some((owner, attempt));
             }
             let transcript_len = runtime.session_head().await.message_count;
-            let outcome = runtime
-                .execute_tool_batch_step_with_owner(
+            let policy_owner = Arc::new(runtime.shared_policy_owner());
+            let member_parent = runtime.tool_executor().durable_tool_effect_parent();
+            let work = runtime.execute_tool_batch_step_with_owner(
                     &calls,
                     &prompter,
                     iteration,
                     &precompleted,
-                    &receipt_invocations,
+                    &evaluation_scope_rejections,
                     root_owner.as_ref(),
-                )
-                .await;
+                    Some(ticket),
+                    Some(&self.state),
+                    Some(services.as_ref()),
+                    Some(services.commit_service()),
+                );
+            let outcome = if delegated_agent_role {
+                if let Some((parent, attempt)) = member_parent {
+                    let owner: Arc<dyn crate::tool_host::AgentBatchPolicyOwner> = Arc::new(OriginalBatchPolicyOwner {
+                        owner: Arc::clone(&policy_owner), prompter: prompter.clone(), parent, attempt,
+                        ticket: ticket.clone(), event_store: Arc::clone(services.event_store()),
+                        action_service: services.agent_action_service(),
+                    });
+                    crate::tool_host::DELEGATED_BATCH_POLICY_OWNER.scope(owner, work).await
+                } else { work.await }
+            } else { work.await };
+            if !runtime.original_policy_control_is_parent_owned() && policy_owner.take_control_requested() {
+                runtime.consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::AfterToolResult);
+            }
             let observed_evidence = runtime.tool_executor().observed_evidence_snapshot();
             // The legacy conversation engine writes tool messages eagerly. Roll them
             // back until the graph transition commits; after_commit publishes them.
@@ -8377,15 +9325,56 @@ where
                 .await
                 .truncate_messages(transcript_len);
             drop(runtime);
-            let (result, prepared_invocations) =
-                outcome.map_err(|error| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: error.to_string(),
-                })?;
+            let (result, prepared_invocations) = match outcome {
+                Ok(value) => value,
+                Err(error) => {
+                    if let (Some(_unknown), Some(partial)) =
+                        (error.tool_effect_unknown(), error.partial_tool_batch())
+                    {
+                        let (session_id, turn_id) = {
+                            let state = self.state.lock().await;
+                            (state.session_id.clone(), state.turn_id.clone())
+                        };
+                        // Retain the raw original carrier before verifying it;
+                        // a mismatch remains Unknown and must not drop custody.
+                        retain_original_member_batches(&self.state, ticket, &partial.member_batches).await?;
+                        for (call_id, pending) in &partial.member_batches {
+                            if let crate::PendingAgentBatchValue::OriginalBoundedAcquisition(original) = pending.primary_value() {
+                                if !original.matches(ticket, services.event_store(), call_id) {
+                                    return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original bounded acquisition custody mismatch".into() });
+                                }
+                            }
+                            if let crate::PendingAgentBatchValue::OriginalPacketScope(original) = pending.primary_value() {
+                                if !original.matches(ticket, services.event_store(), call_id) {
+                                    return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original packet scope custody mismatch".into() });
+                                }
+                            }
+                        }
+                        let prefixes = original_member_prefixes(&calls, &partial.member_batches)
+                            .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+                        let mut messages = partial.messages.clone();
+                        partial_member_messages(&calls, &mut messages, &partial.member_batches, &prefixes)
+                            .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+                        let mut node = stage_uncertain_tool_batch(
+                            &self.runtime, &services, ticket, session_id, turn_id,
+                            &calls, messages, partial.unresolved.clone(),
+                        ).await?;
+                        attach_original_member_prefixes(&services, &mut node, &prefixes, &partial.member_batches)
+                            .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+                        return Ok(node);
+                    }
+                    return Err(if let Some(unknown) = error.tool_effect_unknown() {
+                        NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: unknown.to_string() }
+                    } else {
+                        NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: error.to_string() }
+                    });
+                }
+            };
             let prepared_tool_invocations = prepared_invocations
                 .into_iter()
                 .map(|invocation| (invocation.invocation_id.clone(), invocation))
                 .collect::<std::collections::HashMap<_, _>>();
+            original_member_batches = result.member_batches.clone();
             let orchestration_terminal_summary: Option<String> = None;
             let agentic_progress_refs = agentic_action_progress_refs(&result.messages);
             (
@@ -8396,6 +9385,23 @@ where
                 agentic_progress_refs,
             )
         };
+        let successful_original_calls = successful_tool_call_ids(&result.messages);
+        let mut original_call_results = self.state.lock().await.pending_member_batches
+            .get(&(ticket.node_id.clone(), ticket.attempt)).cloned().unwrap_or_default();
+        original_call_results.extend(original_member_batches.iter().cloned());
+        let committed_goal = original_committed_goal(self, ticket, &write_goal_source,
+            &successful_original_calls, &original_call_results, &original_replays)
+            .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+        let (write_goal_source, post_action_program_source) = committed_goal
+            .unwrap_or_else(|| (write_goal_source.clone(), None));
+        // The original authorization used the pre-dispatch source above.
+        // All following progress/checkpoint computation uses the committed source.
+        let required_workspace_write_scopes = {
+            let state = self.state.lock().await;
+            current_turn_write_scopes(&write_goal_source.goal, state.execution_role.is_delegated_leaf(),
+                &state.focus_acceptance_scopes, state.task_understanding.as_ref().is_some_and(|understanding| understanding.requires_write))
+        };
+        let required_write_for_completion = !required_workspace_write_scopes.is_empty();
         self.runtime
             .lock()
             .await
@@ -8406,8 +9412,7 @@ where
                 state.early_tool_receipts.remove(&call.id);
             }
         }
-        if let Some(observation) = self
-            .services
+        if let Some(observation) = services
             .tool_batch_executor()
             .binding_observation(ticket)
         {
@@ -8418,6 +9423,31 @@ where
         let tool_calls = result.messages.len() as u64;
         let failed = result.failed;
         let failed_tools = failed_tool_names(&result.messages);
+        let mut rejection_receipts = result.messages.iter().flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { output, is_error: true, .. } =>
+                    failed_agent_action_receipt(output)
+                        .filter(|observation| observation.status == harness_contract::agent_action::AgentActionStatus::Rejected)
+                        .map(|observation| observation.receipt_id),
+                _ => None,
+            }).collect::<Vec<_>>();
+        rejection_receipts.sort();
+        let mut failure_causes = result.messages.iter().flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, tool_name, output, is_error: true, .. } => {
+                    let input = calls.iter().find(|call| call.id == *tool_use_id)
+                        .map(|call| tool_batch_fingerprint(std::slice::from_ref(call)))
+                        .unwrap_or_else(|| format!("unbound:{tool_use_id}"));
+                    let reason = failed_agent_action_receipt(output)
+                        .and_then(|observation| observation.error.map(|error|
+                            format!("{}:{}:{}", observation.program_id, error.code, error.message)))
+                        .unwrap_or_else(|| sha256_digest(output));
+                    Some(format!("{tool_name}:{input}:{reason}"))
+                }
+                _ => None,
+            }).collect::<Vec<_>>();
+        failure_causes.sort();
+        let failure_cause_digest = sha256_digest(&failure_causes.join("\n"));
         let successful_call_ids = successful_tool_call_ids(&result.messages);
         // Read the registered, Runtime-compiled descriptor that was actually
         // authorized for the successful call. Do not infer an effect from
@@ -8440,11 +9470,11 @@ where
             )
         };
         #[cfg(feature = "test-fixtures")]
-        if rc_completion_trace { eprintln!("rc_completion_stage before_program_wait"); }
+        if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_before_program_wait" } else { "recovery-complete:host_before_program_wait" }, None, None); }
         let agentic_program_wait_request = if delegated {
             None
         } else if let Some(program) =
-            root_agentic_program_projection(self.services.as_ref(), &session_id, &turn_id)
+            root_agentic_program_projection(services.as_ref(), &session_id, &turn_id)
         {
             // Durable collaboration deadline for this Program: the barrier
             // itself carries it, so the periodic reconciliation releases the
@@ -8466,7 +9496,7 @@ where
             crate::execution_core::graph::executors::AgenticProgramWaitRequest::for_active_root(
                 &program,
                 &ticket.graph_id,
-                self.services.graph_state_store(),
+                services.graph_state_store(),
                 requested_agentic_worker_wait(&calls, &successful_call_ids),
                 deadline_at_ms,
             )
@@ -8479,7 +9509,7 @@ where
             None
         };
         #[cfg(feature = "test-fixtures")]
-        if rc_completion_trace { eprintln!("rc_completion_stage after_program_wait"); }
+        if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_after_program_wait" } else { "recovery-complete:host_after_program_wait" }, None, None); }
         let closed_delegated_protocol = calls.iter().any(|call| {
             successful_call_ids.contains(&call.id)
                 && (call
@@ -8491,7 +9521,7 @@ where
         });
         if closed_delegated_protocol {
             if let Some(protocol) =
-                delegated_agentic_protocol_state(self.services.as_ref(), ticket)?
+                delegated_agentic_protocol_state(services.as_ref(), ticket)?
             {
                 // A successful `task_submit`/`task_review` call does not by itself
                 // prove the Program Task closed: the action can be applied while
@@ -8509,7 +9539,7 @@ where
         let action_fingerprint = tool_batch_fingerprint(&calls);
         let goal_id = self.state.lock().await.goal_id.clone();
         let prior_observations =
-            self.services
+            services
                 .goal_store()
                 .observations(&goal_id)
                 .map_err(|reason| NodeExecutorError::Poll {
@@ -8552,7 +9582,7 @@ where
             &required_workspace_write_scopes,
             &prior_workspace_mutation_sequences,
             &successful_observed_evidence,
-            self.services.path_identity_resolver(),
+            services.path_identity_resolver(),
         );
         for evidence in verified_postcondition_writes {
             if !successful_observed_evidence.contains(&evidence) {
@@ -8647,7 +9677,7 @@ where
             &focus_acceptance_scopes,
             &successful_observed_evidence,
             &prior_observed_evidence,
-            self.services.path_identity_resolver(),
+            services.path_identity_resolver(),
         );
         // A deterministic Focus prefetch is compiled by Runtime and reaches
         // this point only after its governed ToolBatch produced a successful
@@ -8692,7 +9722,7 @@ where
                     .eq_ignore_ascii_case(harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID)
         });
         let mut delegated_protocol_for_batch =
-            delegated_agentic_protocol_state(self.services.as_ref(), ticket)?;
+            delegated_agentic_protocol_state(services.as_ref(), ticket)?;
         if let Some(protocol) = delegated_protocol_for_batch.as_mut() {
             let available = self
                 .runtime
@@ -8855,25 +9885,18 @@ where
             let concrete_verification_scopes = concrete_focus_verification_scopes(
                 &state.focus_acceptance_pending_scopes,
                 &state.focus_observed_evidence,
-                self.services.path_identity_resolver(),
+                services.path_identity_resolver(),
             );
             automatic_focus_verification = focus_verification_tool_calls(
                 &concrete_verification_scopes,
                 followup_iteration,
-                self.services.workspace_root(),
+                services.workspace_root(),
             )
             .map(|calls| (state.session_id.clone(), followup_iteration, calls));
         }
         state
             .pending_transcript
             .insert(ticket.node_id.clone(), result.messages.clone());
-        // A successful tool batch is real progress: whatever the model concluded
-        // before it, the situation is now different, so a later restatement is a
-        // new answer rather than a loop.
-        if !successful_call_ids.is_empty() {
-            state.last_terminal_answer_digest.clear();
-            state.repeated_terminal_answers = 0;
-        }
         state.successful_tool_calls = state
             .successful_tool_calls
             .saturating_add(successful_call_ids.len());
@@ -8888,15 +9911,14 @@ where
             executed_failures(
                 failed,
                 &calls,
-                &self
-                    .services
+                &services
                     .event_store()
                     .repetition_scope(&session_id, &turn_id),
             ),
             false,
         );
         let mut current_objective_milestones = objective_milestones(
-            self.services.as_ref(),
+            services.as_ref(),
             &state.session_id.clone(),
             &state.turn_id.clone(),
         );
@@ -8948,8 +9970,7 @@ where
         // Diagnose only. The model keeps the decision; it is told the one fact it
         // was missing - that the call has been made before and produced this
         // result - and where the same bytes can be had without another call.
-        let repeat_turn = self
-            .services
+        let repeat_turn = services
             .event_store()
             .repetition_scope(&state.session_id, &state.turn_id);
         let repeated_calls = record_repeated_calls(&repeat_turn, &calls, &successful_call_ids);
@@ -9076,7 +10097,7 @@ where
         }
         let batch_terminal_framing = crate::host::scope_turn_framing_for_role(
             crate::host::agentic_turn_framing(
-                self.services.as_ref(),
+                services.as_ref(),
                 &state.session_id,
                 &state.turn_id,
                 state.iterations,
@@ -9102,7 +10123,7 @@ where
             &required_workspace_write_scopes,
             &state.committed_workspace_observed_evidence,
             state.committed_workspace_write_observed,
-            self.services.path_identity_resolver(),
+            services.path_identity_resolver(),
         );
         let required_effects_pending = !focus_acceptance_pending_scopes.is_empty()
             || (required_write_for_completion && !successful_write_observed);
@@ -9115,8 +10136,7 @@ where
             |protocol| {
                 protocol.terminal_action_ids().any(|tool| {
                     !crate::repetition_guard::cause_blocked_for_tool(
-                        &self
-                            .services
+                        &services
                             .event_store()
                             .repetition_scope(&state.session_id, &state.turn_id),
                         tool,
@@ -9124,6 +10144,35 @@ where
                 })
             },
         );
+        let progress_sources = stable_collaboration_sources(services.as_ref(), &state.session_id, &state.turn_id);
+        let progress_known = progress_sources.is_some();
+        let collaboration_progress = if let Some((program, goal)) = progress_sources.as_ref() {
+            state.verified_collaboration_progress.observe(
+                Some(program), 0, goal.observations.iter()
+                    .filter(|observation| observation.has_verified_gain())
+                    .flat_map(|observation| observation.information_gain.distinguishing_evidence_refs.iter().cloned())
+                    .filter(|reference| !reference.starts_with("verified_collaboration:"))
+                    .chain(goal.progress.criteria.iter().filter_map(|(id, status)|
+                        matches!(status, AcceptanceStatus::Satisfied | AcceptanceStatus::Waived)
+                            .then(|| format!("criterion:{id}:{status:?}"))))
+                    .chain(goal.goal.obligations.iter().filter_map(|obligation|
+                        matches!(obligation.state, harness_contract::goal::ObjectiveObligationState::Satisfied | harness_contract::goal::ObjectiveObligationState::Waived)
+                            .then(|| format!("obligation:{}:{:?}", obligation.obligation_id, obligation.state)))),
+            )
+        } else { false };
+        let delegated_redrives = next_collaboration_redrives(
+            state.delegated_redrives, collaboration_progress, pending_delegated_action && progress_known,
+        );
+        state.delegated_redrives = delegated_redrives;
+        let delegated_redrive_bound = collaboration_convergence_replan_bound(state.safety_lease.complexity);
+        let blocked_program = progress_sources.as_ref().is_some_and(|(program, _)| program.status == crate::AgenticProgramStatus::Blocked);
+        let forced_convergence = forced_convergence_required(
+            delegated_redrives, delegated_redrive_bound, state.completion_gap_outstanding,
+            state.outstanding_closure_rungs.len(), blocked_program, progress_known,
+        );
+        let forced_convergence_reason = forced_convergence.then(|| format!(
+            "forced convergence: the turn re-drove delegated work {delegated_redrives} time(s) beyond the convergence bound ({delegated_redrive_bound}); present the retained receipts and their verified facts now instead of acquiring again"
+        ));
         // A stalled/failing turn gets an explicit, advisory notice before the
         // existing forced-synthesis or fail-closed paths engage. Delegated
         // protocol closure has its own authoritative continuation, so it is
@@ -9185,7 +10234,7 @@ where
         }
         let exact_workspace_evidence = focus_scopes_are_exact_workspace_files(
             &focus_acceptance_scopes,
-            self.services.workspace_root(),
+            services.workspace_root(),
         );
         let focus_synthesis_ready = batch_forced_terminal_ready
             && !pending_delegated_action
@@ -9208,13 +10257,12 @@ where
             write_attempted: !state.write_attempt_paths.is_empty(),
         };
         let root_write_checkpoint = task_focus.is_none();
-        let (write_decision, write_goal_cut) = self
-            .services
+        let (write_decision, write_goal_cut) = services
             .goal_store()
             .assess_write_checkpoint(
                 &write_goal_source,
                 ticket,
-                self.services.path_identity_resolver(),
+                services.path_identity_resolver(),
                 revalidation_checkpoint,
                 task_focus,
                 &successful_observed_evidence,
@@ -9328,37 +10376,41 @@ where
             fresh_execution_health,
         );
         state.previous_objective_milestones = current_objective_milestones;
-        let verified_evidence_refs = if state.last_verified_progress {
-            new_observed_fingerprints
+        let verified_evidence_refs = new_observed_fingerprints
                 .iter()
                 .map(|fingerprint| format!("tool_observation:{fingerprint}"))
+                .filter(|reference| !write_goal_source.progress.evidence_refs.contains(reference))
                 .chain(
                     successful_focus_resource_scope_keys
                         .iter()
                         .filter(|scope| {
                             !focus_resource_scopes_covered_before.contains(scope.as_str())
+                                && !write_goal_source.progress.evidence_refs.contains(&format!("focus_resource_scope:{scope}"))
                         })
                         .map(|scope| format!("focus_resource_scope:{scope}")),
                 )
-                .chain(
-                    satisfied_focus_acceptance_scope_keys
-                        .iter()
-                        .map(|scope| format!("focus_resource_scope:{scope}")),
-                )
-                .chain(agentic_progress_refs.iter().cloned())
+                .chain(progress_sources.as_ref().filter(|_| collaboration_progress).map(|(program, goal)| {
+                    let accepted = program.tasks.values().filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
+                        .map(|task| &task.task_id).collect::<Vec<_>>();
+                    let gain = goal.observations.iter().filter(|observation| observation.has_verified_gain())
+                        .flat_map(|observation| observation.information_gain.distinguishing_evidence_refs.iter())
+                        .filter(|reference| !reference.starts_with("verified_collaboration:"))
+                        .collect::<BTreeSet<_>>();
+                    let identity = serde_json::to_string(&(accepted, &goal.progress.criteria, &goal.goal.obligations, gain)).unwrap_or_default();
+                    format!("verified_collaboration:{}", sha256_digest(&identity))
+                }))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let observation_fingerprint = if failed_tools.is_empty() {
+                .collect::<Vec<_>>();
+        let observation_fingerprint = if failed == 0 {
             action_fingerprint
+        } else if failure_causes.is_empty() {
+            format!("unidentified-tool-failure:{}:{}", ticket.idempotency_key, ticket.attempt)
         } else {
-            format!("tool_failure:{}", failed_tools.join(","))
+            format!("tool_failure:{failure_cause_digest}")
         };
         let mut observation = runtime_observation(
-            runtime_observation_identity(&self.services, &state, ticket),
+            runtime_observation_identity(&services, &state, ticket),
             RuntimeObservationKind::ToolProgress,
             "runtime.tool_batch",
             u64::try_from(state.iterations).unwrap_or(u64::MAX),
@@ -9392,6 +10444,10 @@ where
             },
         );
         observation.failure_class = (failed > 0).then_some(ObservationFailureClass::Tool);
+        if let Some(reason) = forced_convergence_reason.clone() {
+            observation.source = "runtime.convergence.forced".to_string();
+            observation.summary = format!("{}; {reason}", observation.summary);
+        }
         observation.observed_evidence = successful_observed_evidence.clone();
         observation.evidence_refs = calls
             .iter()
@@ -9439,18 +10495,28 @@ where
             idempotency_ref: ticket.idempotency_key.clone(),
         });
         observation.cost_delta.tool_calls = tool_calls;
+        let resolved_unknown_refs = satisfied_focus_acceptance_scope_keys
+            .iter()
+            .filter(|scope| !focus_resource_scopes_covered_before.contains(scope.as_str())
+                && write_goal_source.progress.open_unknowns.contains(&format!("focus-acceptance:{scope}")))
+            .map(|scope| format!("focus-acceptance:{scope}"))
+            .collect::<Vec<_>>();
+        let has_verified_evidence = !verified_evidence_refs.is_empty() || !resolved_unknown_refs.is_empty();
         observation.information_gain = InformationGain {
             distinguishing_evidence_refs: verified_evidence_refs,
-            resolved_unknown_refs: satisfied_focus_acceptance_scope_keys
-                .iter()
-                .map(|scope| format!("focus-acceptance:{scope}"))
-                .collect(),
-            provenance: if state.last_verified_progress {
+            resolved_unknown_refs,
+            provenance: if has_verified_evidence {
                 MeasureProvenance::Observed
             } else {
                 MeasureProvenance::Unknown
             },
         };
+        if failed > 0 && rejection_receipts.len() == failed && !observation.has_verified_gain() {
+            // Repeated delivery of the same original action rejection is one
+            // observation, even when the graph retries with another ticket.
+            observation.source = format!("runtime.tool_rejection:{}", sha256_digest(&rejection_receipts.join("\n")));
+            observation.source_revision = 1;
+        }
         for scope in &focus_acceptance_pending_scopes {
             observation.unknown_deltas.push(UnknownDelta {
                 unknown_id: format!("focus-acceptance:{scope}"),
@@ -9466,6 +10532,24 @@ where
             });
         }
         let goal_id = state.goal_id.clone();
+        if let Some(reason) = forced_convergence_reason.clone() {
+            // Present from the retained receipts: one clean synthesis with the
+            // evidence already committed, and no further acquisition.
+            state.clean_terminal_synthesis_next = true;
+            state.force_text_only_next_model = true;
+            state.force_tool_allowlist_next_model = None;
+            let mut item = ContextItem::new(
+                format!("forced-convergence:{}", ticket.node_id),
+                ContextSourceKind::ToolTrace,
+                ContextRole::Instruction,
+                format!(
+                    "{reason}. No further tool calls are available: state the verified facts from the receipts you already hold, and name any remaining uncertainty explicitly."
+                ),
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            state.pending_next_model_context.push(item);
+        }
         drop(state);
         if !pending_delegated_action
             && batch_forced_terminal_ready
@@ -9489,7 +10573,17 @@ where
                     reason: error.to_string(),
                 })?;
         }
-        let mut intervention = if pending_delegated_action {
+        let mut intervention = if let Some(reason) = forced_convergence_reason.clone() {
+            // The forced convergence is recorded with this intervention, so the
+            // durable goal history states why the turn stopped acquiring.
+            Some(RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: RuntimeInterventionKind::Synthesize,
+                reason,
+                evidence_refs: observation.evidence_refs.clone(),
+                expected_graph_revision: None,
+            })
+        } else if pending_delegated_action {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
                 kind: RuntimeInterventionKind::Replan,
@@ -9596,7 +10690,7 @@ where
             (!continue_with_tool_batch)
                 .then(|| {
                     propose_intervention_after_observation(
-                        &self.services,
+                        &services,
                         &goal_id,
                         observation.clone(),
                     )
@@ -9639,8 +10733,7 @@ where
             && protocol_closure_can_be_required(
                 delegated_protocol_for_batch.as_ref(),
                 intervention.as_ref(),
-                &self
-                    .services
+                &services
                     .event_store()
                     .repetition_scope(&session_id, &turn_id),
             );
@@ -9675,8 +10768,8 @@ where
                     iteration,
                     &session_id,
                     calls,
-                    self.services.workspace_root(),
-                    Some(self.services.as_ref()),
+                    services.workspace_root(),
+                    Some(services.as_ref()),
                     true,
                 )?;
                 (nodes.len() == 1).then(|| nodes.remove(0))
@@ -9742,7 +10835,7 @@ where
                                 &state.focus_observed_resource_scopes,
                                 &state.write_attempt_paths,
                                 &state.tool_results,
-                                self.services.workspace_root(),
+                                services.workspace_root(),
                             )
                         } else {
                             None
@@ -9821,7 +10914,7 @@ where
             node
         };
         #[cfg(feature = "test-fixtures")]
-        if rc_completion_trace { eprintln!("rc_completion_stage outcome_constructed"); }
+        if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_outcome_constructed" } else { "recovery-complete:host_outcome_constructed" }, None, None); }
         let mut outcome = NodeExecutionOutcome::new(completed_result(
             Some(format!("{}:tool-results:{tool_calls}", ticket.graph_id)),
             ExecutionUsage {
@@ -9830,7 +10923,7 @@ where
             },
         ));
         outcome.domain_events.push(
-            self.services
+            services
                 .goal_store()
                 .observation_event_at(
                     &write_goal_source,
@@ -9847,7 +10940,7 @@ where
             .filter(|intervention| intervention.kind != RuntimeInterventionKind::Continue)
         {
             outcome.domain_events.push(
-                self.services
+                services
                     .goal_store()
                     .intervention_event(
                         intervention,
@@ -9863,6 +10956,11 @@ where
         outcome
             .source_revisions
             .insert(write_goal_cut.stream_id, write_goal_cut.expected_revision);
+        if let Some((stream, revision)) = post_action_program_source {
+            if outcome.source_revisions.insert(stream, revision).is_some_and(|previous| previous != revision) {
+                return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original Program source conflict".into() });
+            }
+        }
 
         if let Some(recovery) = write_recovery {
             outcome
@@ -9925,10 +11023,10 @@ where
             messages.insert(0, runtime_authored_tool_call_message(&calls));
         }
         #[cfg(feature = "test-fixtures")]
-        if rc_completion_trace { eprintln!("rc_completion_stage before_transcript"); }
+        if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_before_transcript" } else { "recovery-complete:host_before_transcript" }, None, None); }
         stage_host_transcript(
             &self.runtime,
-            &self.services,
+            &services,
             ticket,
             session_id,
             turn_id,
@@ -9937,6 +11035,11 @@ where
             &mut outcome,
         )
         .await?;
+        retain_original_member_batches(&self.state, ticket, &original_member_batches).await?;
+        let prefixes = original_member_prefixes(&calls, &original_member_batches)
+            .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+        attach_original_member_prefixes(&services, &mut outcome, &prefixes, &original_member_batches)
+            .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
         // Retain the exact original post-tool computation in this physical
         // backend only. This does not grant authority to dispatch again.
         if root_write_checkpoint && revalidation_disposition
@@ -9948,7 +11051,7 @@ where
                 revalidation_checkpoint, original_satisfied, &outcome);
         }
         #[cfg(feature = "test-fixtures")]
-        if rc_completion_trace { eprintln!("rc_completion_stage executor_return"); }
+        if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_executor_return" } else { "recovery-complete:host_executor_return" }, None, None); }
         Ok(outcome)
     }
 
@@ -9960,6 +11063,9 @@ where
         expected: u64,
         actual: u64,
     ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        let services = self.services.upgrade().ok_or_else(|| NodeExecutorError::Uncertain {
+            node_id: ticket.node_id.clone(), reason: "original ToolBatch services unavailable".into(),
+        })?;
         let saved = self.goal_revalidation.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let Some(saved) = saved else { return Ok(None) };
         let fail = |reason: String| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason };
@@ -9973,7 +11079,7 @@ where
             || outcome.source_revisions.get(stale_stream) != Some(&expected)
             || expected.checked_add(1) != Some(actual)
         { return Ok(None); }
-        let Some(current) = self.services.goal_store().projection(&saved.source.goal.id).map_err(&fail)? else { return Ok(None) };
+        let Some(current) = services.goal_store().projection(&saved.source.goal.id).map_err(&fail)? else { return Ok(None) };
         if current.stream_revision != actual || saved.source.goal.completion != GoalCompletion::Open
             || saved.source.goal.terminal.is_some() || current.goal.completion != GoalCompletion::Satisfied
             || current.goal.phase != "completed"
@@ -9993,7 +11099,7 @@ where
         if comparable != saved.source.goal { return Ok(None); }
         let Some(binding) = current.goal.execution_binding.as_ref() else { return Ok(None) };
         if binding.root_execution_id != ticket.graph_id || binding.session_id != current.goal.session_id { return Ok(None); }
-        let store = self.services.event_store();
+        let store = services.event_store();
         let events = store.list_stream_after(stale_stream, expected, actual, 2, 1024 * 1024).map_err(&fail)?;
         let [completed] = events.as_slice() else { return Ok(None) };
         if completed.sequence != actual || completed.kind != "goal.completed"
@@ -10024,8 +11130,8 @@ where
             || store.stream_revision(&program_stream).map_err(|e| fail(e.to_string()))? != program_revision
             || outcome.source_revisions.get(&program_stream).is_some_and(|r| *r != program_revision)
         { return Ok(None); }
-        let (decision, cut) = self.services.goal_store().assess_write_checkpoint(
-            &current, ticket, self.services.path_identity_resolver(), saved.checkpoint, None,
+        let (decision, cut) = services.goal_store().assess_write_checkpoint(
+            &current, ticket, services.path_identity_resolver(), saved.checkpoint, None,
             &saved.observation.observed_evidence,
         ).map_err(&fail)?;
         if cut.stream_id != stale_stream || cut.expected_revision != actual
@@ -10033,7 +11139,18 @@ where
         { return Ok(None); }
         let Some(index) = outcome.domain_events.iter().position(|e| e.event.stream_id == stale_stream && e.event.kind == "goal.observation") else { return Ok(None) };
         let Some(key) = outcome.domain_events[index].idempotency_key.clone() else { return Ok(None) };
-        let event = self.services.goal_store().observation_event_at(&current, &saved.observation, key).map_err(&fail)?;
+        let mut observation = saved.observation.clone();
+        observation.evidence_delta.added.retain(|reference| !current.progress.evidence_refs.contains(reference));
+        observation.information_gain.distinguishing_evidence_refs.retain(|reference|
+            !current.progress.evidence_refs.contains(reference));
+        observation.information_gain.resolved_unknown_refs.retain(|reference|
+            current.progress.open_unknowns.contains(reference));
+        if observation.information_gain.distinguishing_evidence_refs.is_empty()
+            && observation.information_gain.resolved_unknown_refs.is_empty()
+        {
+            observation.information_gain.provenance = MeasureProvenance::Unknown;
+        }
+        let event = services.goal_store().observation_event_at(&current, &observation, key).map_err(&fail)?;
         let mut rebuilt = outcome.clone();
         rebuilt.domain_events[index] = event;
         rebuilt.source_revisions.insert(stale_stream.to_owned(), actual);
@@ -10042,16 +11159,231 @@ where
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
-        decode_tool_batch(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
+        let services = self.services.upgrade().ok_or_else(|| NodeExecutorError::Uncertain {
+            node_id: ticket.node_id.clone(), reason: "original ToolBatch services unavailable".into(),
+        })?;
+        let (calls, _) = decode_tool_batch(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
             node_id: ticket.node_id.clone(),
             reason: format!("tool batch persistent payload is invalid after commit: {error}"),
         })?;
-        publish_host_transcript(&self.runtime, &self.services, ticket).await?;
-        self.state
-            .lock()
-            .await
-            .pending_transcript
-            .remove(&ticket.node_id);
+        let node_id = ticket.node_id.clone();
+        let original_ticket = ticket.clone();
+        let commits = services.commit_service().clone();
+        // Only the original node owner may enumerate the manifest from the
+        // node transaction. An empty manifest makes no claim about rollback.
+        let has_unresolved_member = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let outers = commits.original_batch_outers_after_commit(&original_ticket)
+                .map_err(|error| error.to_string())?;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut has_unresolved_member = false;
+            for outer in outers {
+                if !seen.insert(outer.clone()) { return Err("duplicate committed batch outer".into()); }
+                let mut matching = calls.iter().filter(|call| {
+                    call.name == "agent_action_batch" && call.binding.as_ref()
+                        .is_some_and(|binding| binding.effect_idempotency_key() == outer)
+                });
+                if matching.next().is_none() || matching.next().is_some() {
+                    return Err("committed batch outer does not match one original call".into());
+                }
+                let members = commits.original_batch_members_after_commit(&original_ticket, &outer)
+                    .map_err(|error| error.to_string())?;
+                let pending = commits.original_batch_pending_after_commit(&original_ticket, &outer)
+                    .map_err(|error| error.to_string())?;
+                has_unresolved_member |= pending.is_some();
+                if members.is_empty() && pending.is_none() {
+                    return Err("committed batch manifest has neither prefix nor pending fact".into());
+                }
+                // These are committed business facts. They do not prove that
+                // the complete Host result or downstream effects were delivered.
+            }
+            Ok(has_unresolved_member)
+        }).await.map_err(|error| NodeExecutorError::Poll { node_id: node_id.clone(), reason: error.to_string() })?
+          .map_err(|reason| NodeExecutorError::Poll { node_id, reason })?;
+        let retained_replays = self.state.lock().await.pending_member_batches
+            .get(&(ticket.node_id.clone(), ticket.attempt)).cloned().unwrap_or_default();
+        let mut settled_packet_scope = Vec::new();
+        let mut packet_scope_unresolved = false;
+        for (call_id, pending) in &retained_replays {
+            let crate::PendingAgentBatchValue::OriginalPacketScope(original) = pending.primary_value() else { continue };
+            if !original.matches(ticket, services.event_store(), call_id) {
+                return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original packet scope custody mismatch".into() });
+            }
+            let request = original.request();
+            let proof = match services.commit_service().original_agent_packet_scope_refusal(ticket, request, original.fact()) {
+                Ok(proof) => proof,
+                Err(_) => { packet_scope_unresolved = true; continue; }
+            };
+            if original.receipt().is_some_and(|receipt|
+                receipt.event_id() != proof.event_id() || receipt.transaction_id() != proof.transaction_id()) {
+                return Err(NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:"original packet scope winner mismatch".into() });
+            }
+            settled_packet_scope.push((pending.clone(), proof));
+        }
+        for (call_id, pending) in &retained_replays {
+            let crate::PendingAgentBatchValue::OriginalBoundedAcquisition(original) = pending.primary_value() else { continue };
+            if !original.matches(ticket, services.event_store(), call_id) {
+                return Err(NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:"original bounded acquisition custody mismatch".into() });
+            }
+            let proof = match services.commit_service().original_bounded_acquisition_failure(ticket, original.fact()) {
+                Ok(proof) => proof,
+                Err(_) => { packet_scope_unresolved = true; continue; }
+            };
+            if original.receipt().is_some_and(|receipt| receipt.event_id() != proof.event_id() || receipt.transaction_id() != proof.transaction_id()) {
+                return Err(NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:"original bounded acquisition winner mismatch".into() });
+            }
+            settled_packet_scope.push((pending.clone(), proof));
+        }
+        if packet_scope_unresolved {
+            // The Scoped physical owner retains this backend and the original
+            // same-ticket state when after_commit returns Uncertain.
+            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(),
+                reason: "original packet scope transaction remains unresolved".into() });
+        }
+        for (call_id, pending) in &retained_replays {
+            if let crate::PendingAgentBatchValue::OriginalReplay(original) = pending.primary_value() {
+                if original.replay.call_id() != call_id { return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original replay call differs".into() }); }
+                services.commit_service().original_replayed_action_after_commit(ticket, &original.replay)
+                    .map_err(|error| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
+            }
+        }
+        publish_host_transcript(&self.runtime, &services, ticket).await?;
+        let mut settled_calls = std::collections::BTreeSet::new();
+        let mut settlement_error = None;
+        {
+            let retained = self.state.lock().await.pending_member_batches
+                .get(&(ticket.node_id.clone(), ticket.attempt)).cloned().unwrap_or_default();
+            let mut grouped = std::collections::BTreeMap::<String, Vec<crate::PendingAgentBatch>>::new();
+            for (call_id, pending) in retained { grouped.entry(call_id).or_default().push(pending); }
+            let mut candidates = Vec::new();
+            for (call_id, items) in grouped {
+                let mut original: Option<Arc<crate::tool_host::OriginalMemberCallCarrier>> = None;
+                let mut unverified = false;
+                for pending in &items {
+                    if matches!(pending.value(), crate::PendingAgentBatchValue::WithCause { .. }) {
+                        unverified = true;
+                        continue;
+                    }
+                    if let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.value() {
+                        if carrier.original_request().tool_use_id != call_id {
+                            unverified = true;
+                        } else if let Some(existing) = &original {
+                            if !existing.original_request().tool_progress.same_original_channels(&carrier.original_request().tool_progress)
+                                || existing.original_request() != carrier.original_request() { unverified = true; }
+                        } else { original = Some(Arc::clone(carrier)); }
+                    }
+                }
+                let Some(original) = original else { continue; };
+                let request = original.original_request();
+                for pending in &items {
+                    match pending.value() {
+                        crate::PendingAgentBatchValue::OriginalCall(_) => {}
+                        crate::PendingAgentBatchValue::RecordedSink(sink) => {
+                            if !request.tool_progress.same_original_channels(sink) { unverified = true; }
+                        }
+                        crate::PendingAgentBatchValue::Recorded(recorded) => {
+                            let actual = request.tool_progress.original_members();
+                            if recorded.len() != actual.len() || recorded.iter().zip(&actual).any(|((i,a),(j,b))|
+                                i != j || !Arc::ptr_eq(a,b)) { unverified = true; }
+                        }
+                        _ => unverified = true,
+                    }
+                }
+                if unverified || request.tool_progress.has_original_member_stop() { continue; }
+                match request.tool_progress.original_fresh_effect() {
+                    Ok(Some(_)) if has_unresolved_member => {}
+                    Ok(Some(owner)) if owner.original_request().tool_use_id == call_id
+                        && owner.original_request().tool_progress.same_original_channels(&request.tool_progress) =>
+                        candidates.push((call_id, Some(owner))),
+                    Ok(Some(_)) => { settlement_error.get_or_insert("original effect owner does not match call sink".to_string()); }
+                    Ok(None) if request.compiled_invocation.as_ref().is_some_and(|invocation|
+                        invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read) =>
+                        candidates.push((call_id, None)),
+                    Ok(None) => {} // no proof that an unknown mutation was not retained
+                    Err(reason) => { settlement_error.get_or_insert(reason); }
+                }
+            }
+            if !candidates.is_empty() {
+                if let Some(close) = crate::execution_core::graph::executors::current_original_physical_close(ticket) {
+                    let commits = services.commit_service().clone();
+                    let original_ticket = ticket.clone();
+                    let (settled, failed) = tokio::task::spawn_blocking(move || {
+                        let mut settled = Vec::new();
+                        let mut failures = Vec::new();
+                        let mut released = Vec::new();
+                        for (call_id, owner) in candidates {
+                            if let Some(owner) = owner {
+                                if !released.iter().any(|prior| Arc::ptr_eq(prior, &owner)) {
+                                    if let Err(error) = commits.release_original_first_effect_after_node(&original_ticket, &close, &owner) {
+                                        failures.push(error.to_string());
+                                        continue;
+                                    }
+                                    released.push(owner);
+                                }
+                            }
+                            settled.push(call_id);
+                        }
+                        (settled, failures)
+                    }).await.map_err(|error| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
+                    settled_calls.extend(settled);
+                    if let Some(reason) = failed.into_iter().next() { settlement_error.get_or_insert(reason); }
+                }
+            }
+        }
+        let goal_id = self.state.lock().await.goal_id.clone();
+        let committed = services.event_store().event_by_idempotency_key(
+            &format!("goal:{goal_id}"), &format!("{}:goal-observation", ticket.idempotency_key),
+        ).map_err(|error| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
+        if let Some(event) = committed {
+            let value = services.event_store().resolve_observation_record(&event)
+                .map_err(|reason| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason })?;
+            let observation: RuntimeObservation = serde_json::from_value(value)
+                .map_err(|error| NodeExecutorError::Poll { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
+            if observation.identity.graph_id == ticket.graph_id
+                && observation.identity.node_id.as_deref() == Some(ticket.node_id.as_str())
+                && observation.goal_id() == goal_id && observation.has_verified_gain()
+            {
+                let mut state = self.state.lock().await;
+                let first_commit = state.verified_collaboration_progress.observe(
+                    None, 0, std::iter::once(format!("committed_goal_observation:{}", observation.idempotency_fingerprint())),
+                );
+                if first_commit {
+                    state.last_terminal_answer_digest.clear();
+                    state.repeated_terminal_answers = 0;
+                }
+            }
+        }
+        if let Some(reason) = settlement_error.as_ref().filter(|_| !settled_packet_scope.is_empty()) {
+            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: reason.clone() });
+        }
+        if !settled_packet_scope.is_empty() {
+            let observation = services.tool_batch_executor().binding_observation(ticket)
+                .ok_or_else(|| NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:"original packet scope observation unavailable".into() })?;
+            for (pending, proof) in &settled_packet_scope {
+                observation.settle_packet_scope(proof)
+                    .map_err(|reason| NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason })?;
+                if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) {
+                    services.event_store().release_original_bounded_decision(proof)
+                        .map_err(|error| NodeExecutorError::Uncertain { node_id:ticket.node_id.clone(), reason:error.to_string() })?;
+                }
+            }
+        }
+        // ScopedNodeExecutor calls this original backend only after
+        // close_and_drain succeeds. A pending fact is not proof that its
+        // original owner has resolved or transferred the live carrier.
+        let mut state = self.state.lock().await;
+        state.pending_transcript.remove(&ticket.node_id);
+        if let Some(retained) = state.pending_member_batches.get_mut(&(ticket.node_id.clone(), ticket.attempt)) {
+            retained.retain(|(call_id, pending)| {
+                if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) {
+                    !settled_packet_scope.iter().any(|(settled, _)| settled == pending)
+                } else { !settled_calls.contains(call_id) }
+            });
+            if retained.is_empty() { state.pending_member_batches.remove(&(ticket.node_id.clone(), ticket.attempt)); }
+        }
+        drop(state);
+        if let Some(reason) = settlement_error {
+            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason });
+        }
         Ok(())
     }
 }
@@ -10070,6 +11402,21 @@ mod tests {
         },
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn structured_rejection_inside_tool_error_retains_original_receipt_identity() {
+        let receipt = harness_contract::agent_action::AgentActionObservation {
+            receipt_id: "rejection:program:action".into(), action_id: "action".into(),
+            action: "objective_complete_request".into(), program_id: "program".into(), revision: 7,
+            status: harness_contract::agent_action::AgentActionStatus::Rejected, duplicate: true,
+            changed_refs: vec![], actionable: vec![], projection: None,
+            error: Some(harness_contract::agent_action::AgentActionErrorObservation {
+                code: "objective_not_verifiable".into(), message: "review missing".into(), recoverable: true,
+            }),
+        };
+        let output = format!("Runtime did not execute the action.\nStructured receipt: {}", serde_json::to_string(&receipt).unwrap());
+        assert_eq!(super::failed_agent_action_receipt(&output), Some(receipt));
+    }
 
     #[test]
     fn planning_false_negative_cannot_deny_an_authorized_workspace_effect() {
@@ -10380,6 +11727,13 @@ mod closed_host_continuity_475_tests {
     #[derive(Clone)]
     struct NoReplay475(Arc<AtomicUsize>);
     impl ApiClient for NoReplay475 {
+        fn configure_turn_cancellation(
+            &mut self,
+            _control: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+        ) -> Result<(), RuntimeError> {
+            // This fixture rejects every provider replay and owns no producer.
+            Ok(())
+        }
         fn stream(
             &mut self,
             _request: crate::ApiRequest,
@@ -10579,7 +11933,13 @@ mod closed_host_continuity_475_tests {
             };
             {
                 let mut runtime_guard = runtime.lock().await;
-                let turn_stop = runtime_guard.cancellation_token();
+                assert!(runtime_guard.turn_cancelled().is_err());
+                assert!(runtime_guard.scoped_model_stop(crate::CancellationToken::new()).is_err());
+                let control = crate::execution_core::services::TurnCancellationControl::operational(
+                    "475-session", "475-turn", "475-execution",
+                );
+                runtime_guard.install_provider_cancellation_control(Some(control.clone())).unwrap();
+                let turn_stop = control.token();
                 assert!(hot.retains_physical_execution());
                 for field in [
                     "graph",
@@ -10606,17 +11966,19 @@ mod closed_host_continuity_475_tests {
                 assert!(hot.stop.is_cancelled());
                 assert!(!turn_stop.is_cancelled());
                 {
-                    let scoped = runtime_guard.scoped_model_stop(hot.stop.clone());
+                    let scoped = runtime_guard.scoped_model_stop(hot.stop.clone()).unwrap();
                     assert!(scoped.cancellation_token().is_cancelled());
                 }
-                assert!(!runtime_guard.cancellation_token().is_cancelled());
+                assert!(!runtime_guard.turn_cancelled().unwrap());
+                let fresh_stop = crate::CancellationToken::new();
+                assert!(!runtime_guard.scoped_model_stop(fresh_stop).unwrap().cancellation_token().is_cancelled());
                 let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let scoped = runtime_guard.scoped_model_stop(hot.stop.clone());
+                    let scoped = runtime_guard.scoped_model_stop(hot.stop.clone()).unwrap();
                     assert!(scoped.cancellation_token().is_cancelled());
                     panic!("controlled model scope unwind");
                 }));
                 assert!(unwind.is_err());
-                assert!(!runtime_guard.cancellation_token().is_cancelled());
+                assert!(!runtime_guard.turn_cancelled().unwrap());
                 assert!(matches!(
                     hot.execute(&ticket).await,
                     Err(NodeExecutorError::Poll { reason, .. })
@@ -10886,6 +12248,7 @@ mod closed_host_continuity_475_tests {
             failure: None,
             terminal_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             pending_transcript: std::collections::BTreeMap::new(),
+            pending_member_batches: std::collections::BTreeMap::new(),
             pending_agent_input_consumption: std::collections::BTreeMap::new(),
             deferred_agent_input_consumption: Vec::new(),
             ingress: None,
@@ -10903,15 +12266,18 @@ mod closed_host_continuity_475_tests {
             delivery_envelope: None,
             terminal_presentation: None,
             terminal_commit_owner: None,
+            authenticated_terminal_owner: None,
             committed_terminal_answer: None,
             committed_terminal_completion: None,
             last_verified_progress: false,
             consecutive_unverified_model_steps: 0,
             closure_ready_steps: 0,
             previous_objective_milestones: Default::default(),
+            verified_collaboration_progress: Default::default(),
             verified_answer_ready_steps: 0,
             final_answer_observed: false,
             collaboration_convergence_replans: 0,
+            delegated_redrives: 0,
             completion_gap_continuations: 0,
             started_at: std::time::Instant::now(),
             reasoning_only_attempts: 0,

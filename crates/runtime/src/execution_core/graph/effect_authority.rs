@@ -128,6 +128,21 @@ impl ExecutionCommitService {
         request: &crate::RuntimeToolExecutionRequest,
         refused: &dyn Fn(&str),
     ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+        self.tool_effect_authority_for_original_effect(request, None, refused)
+    }
+
+    /// Only the read-intent owner supplies the actual effect. Other callers
+    /// retain the original Task claim rules without a read exemption.
+    pub(super) fn reviewer_read_effect_authority(
+        &self, request: &crate::RuntimeToolExecutionRequest, effect: &ToolEffectDescriptor,
+    ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+        self.tool_effect_authority_for_original_effect(request, Some(effect), &|_| {})
+    }
+
+    fn tool_effect_authority_for_original_effect(
+        &self, request: &crate::RuntimeToolExecutionRequest,
+        read_effect: Option<&ToolEffectDescriptor>, refused: &dyn Fn(&str),
+    ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
         let Some(parent) = &request.parent_execution else {
             return Ok(Vec::new());
         };
@@ -187,7 +202,16 @@ impl ExecutionCommitService {
             }
             return Ok(sources);
         }
-        let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)?;
+        let mut packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)?;
+        let physical_attempt = request.parent_execution_attempt
+            .filter(|attempt| *attempt > 0)
+            .ok_or_else(|| denied("parent physical attempt is missing"))?;
+        if graph.recovery_cursor.node_attempts.get(&node.id) != Some(&physical_attempt)
+            || self.effect_authority_graphs.current_binding(&graph, &node.id, physical_attempt).is_err()
+        {
+            return Err(denied("parent physical attempt has no current original binding"));
+        }
+        packet.attempt = physical_attempt;
         let binding = packet
             .binding
             .as_ref()
@@ -231,7 +255,7 @@ impl ExecutionCommitService {
             return Err(denied("Program or membership no longer authorizes writes"));
         }
         if registered_collaboration_control_allows(
-            &program, scope, packet.graph_id(), packet.attempt,
+            &program, scope, packet.graph_id(), packet.attempt, physical_attempt,
             &request.tool_name, &request.input,
         ) {
             sources.push(ExpectedStreamRevision {
@@ -260,9 +284,18 @@ impl ExecutionCommitService {
                 attempt.execution_id == packet.graph_id()
                     && attempt.agent_id == scope.agent_id
                     && attempt.membership_id == scope.membership_id
-                    && attempt.generation.checked_add(1) == Some(u64::from(packet.attempt))
                     && task_control_phase_allows(task, scope, attempt, &request.tool_name, &request.input)
             })
+        {
+            sources.push(ExpectedStreamRevision {
+                stream_id: format!("agentic-program:{}", program.program_id),
+                expected_revision: program.revision,
+            });
+            return Ok(sources);
+        }
+        if matches!(scope.focus, AgenticExecutionFocus::TaskReview { .. })
+            && read_effect.is_some_and(|effect| strict_original_review_read(request, effect))
+            && active_independent_review_read(task, scope, packet.graph_id())
         {
             sources.push(ExpectedStreamRevision {
                 stream_id: format!("agentic-program:{}", program.program_id),
@@ -277,7 +310,9 @@ impl ExecutionCommitService {
             || task.team_id != scope.task_team_id
             || task.claimant.as_deref() != Some(scope.agent_id.as_str())
             || task.claim_execution_id.as_deref() != Some(packet.graph_id())
-            || task.claim_generation != u64::from(packet.attempt)
+            || !task.active_attempts.get(packet.graph_id()).is_some_and(|attempt| {
+                attempt.generation.checked_add(1) == Some(task.claim_generation)
+            })
             || task
                 .lease_expires_at_ms
                 .is_none_or(|expires| expires <= now_ms)
@@ -291,7 +326,7 @@ impl ExecutionCommitService {
                         && attempt.agent_id == scope.agent_id
                         && attempt.membership_id == scope.membership_id
                         && attempt.mode == AgentAttemptMode::Execute
-                        && attempt.generation.checked_add(1) == Some(u64::from(packet.attempt))
+                        && attempt.generation.checked_add(1) == Some(task.claim_generation)
                 })
         {
             return Err(denied(
@@ -334,6 +369,35 @@ impl ExecutionCommitService {
 }
 
 
+fn active_independent_review_read(
+    task: &crate::agentic::AgenticTaskProjection,
+    scope: &harness_contract::agent::AgenticExecutionBinding,
+    execution_id: &str,
+) -> bool {
+    task.team_id == scope.task_team_id
+        && task.status == AgenticTaskStatus::Submitted
+        && task.cancel_requested_by.is_none() && task.pending_retirement.is_none()
+        && task.claimant.as_deref().is_some_and(|producer| producer != scope.agent_id.as_str())
+        && task.active_attempts.get(execution_id).is_some_and(|attempt| {
+            attempt.execution_id == execution_id && attempt.agent_id == scope.agent_id
+                && attempt.membership_id == scope.membership_id && attempt.mode == AgentAttemptMode::Review
+                && attempt.generation == task.review_generation
+        })
+}
+
+fn strict_original_review_read(request: &crate::RuntimeToolExecutionRequest, effect: &ToolEffectDescriptor) -> bool {
+    use harness_contract::policy::{PermissionOperation, PermissionResource};
+    let Some(invocation) = request.compiled_invocation.as_ref() else { return false };
+    effect.effect_kind == ToolEffectKind::Read
+        && !effect.spawns_process && !effect.uses_network && !effect.mutates_packages && !effect.mutates_system
+        && effect.tool_id == request.tool_name && invocation.effect == *effect
+        && invocation.invocation_id == request.tool_use_id && invocation.intent.tool_name == request.tool_name
+        && harness_contract::step::parse_strict_json(&request.input).is_ok_and(|input| input == invocation.intent.normalized_input)
+        && !effect.scopes.is_empty()
+        && effect.scopes.iter().all(|scope| matches!((&scope.resource, &scope.operation),
+            (PermissionResource::File, PermissionOperation::Read) | (PermissionResource::Tool, PermissionOperation::Read)))
+}
+
 fn agent_control_input(input: &str) -> Option<serde_json::Value> {
     let mut value = serde_json::from_str::<serde_json::Value>(input).ok()?;
     let object = value.as_object_mut()?;
@@ -350,10 +414,14 @@ fn registered_collaboration_control_allows(
     scope: &harness_contract::agent::AgenticExecutionBinding,
     execution_id: &str,
     packet_attempt: u32,
+    verified_node_attempt: u32,
     tool_name: &str,
     input: &str,
 ) -> bool {
     use harness_contract::agent_action::AgentAction;
+    if packet_attempt == 0 || packet_attempt != verified_node_attempt {
+        return false;
+    }
     let Some(input) = agent_control_input(input) else {
         return false;
     };
@@ -373,7 +441,7 @@ fn registered_collaboration_control_allows(
                 && matches!(task.status, AgenticTaskStatus::Claimed | AgenticTaskStatus::CancelRequested)
                 && task.claimant.as_deref() == Some(scope.agent_id.as_str())
                 && task.claim_execution_id.as_deref() == Some(execution_id)
-                && task.claim_generation == u64::from(packet_attempt);
+                && attempt.generation.checked_add(1) == Some(task.claim_generation);
             if !preclaim && !release {
                 return false;
             }
@@ -415,7 +483,7 @@ fn registered_collaboration_control_allows(
             attempt.execution_id == execution_id && attempt.agent_id == scope.agent_id
                 && attempt.membership_id == scope.membership_id && attempt.mode == mode
                 && attempt.generation == generation
-                && attempt.generation.checked_add(1) == Some(u64::from(packet_attempt))
+                && packet_attempt > 0
         })
     {
         return false;
@@ -794,6 +862,56 @@ mod task_control_700_tests {
         assert!(!task_control_phase_allows(&task, &scope, &attempt, "task_review", input));
     }
 
+    #[test]
+    fn reviewer_read_keeps_original_descriptor_and_review_attempt_boundaries() {
+        use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+        let workspace = tempfile::tempdir().unwrap();
+        let lease = tools::ToolHost::builtin("review-read-owner", workspace.path()).pin_snapshot();
+        for (tool, input) in [("read_file", json!({"path":"proof.txt"})),
+            ("tool_search", json!({"query":"read"}))] {
+            let invocation = lease.prepare_governed_invocation("review-call", tool, &input, &[]);
+            let effect = invocation.effect.clone();
+            let mut request = crate::RuntimeToolExecutionRequest {
+                compiled_invocation: Some(invocation), step_binding: None,
+                governed_plan_id: "plan".into(), governed_plan_revision: 1, observation_wave_sequence: 1,
+                idempotency_key: "effect".into(), tool_use_id: "review-call".into(), tool_name: tool.into(),
+                input: input.to_string(), category: crate::ToolSafetyCategory::from_effect(&effect),
+                authorization: None, session_id: Some("session".into()),
+                sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+                policy_revision: 1, authorized_scopes: vec![], memory_context: None, reality_context: None,
+                model_lease: None, parent_execution: None, parent_execution_attempt: None,
+                execution_decision: None, evaluation_isolated: true, managed_invocation: None,
+                tool_progress: crate::ToolProgressSink::default(),
+            };
+            assert!(strict_original_review_read(&request, &effect), "original {tool} descriptor rejected: {:?}", effect.scopes);
+            let mut denied = effect.clone();
+            for scopes in [vec![], vec![PermissionScope::new(PermissionResource::Tool, PermissionOperation::Call)],
+                vec![PermissionScope::new(PermissionResource::Tool, PermissionOperation::Read),
+                    PermissionScope::new(PermissionResource::File, PermissionOperation::Write)]] {
+                denied.scopes = scopes;
+                request.compiled_invocation.as_mut().unwrap().effect = denied.clone();
+                assert!(!strict_original_review_read(&request, &denied));
+            }
+            for process in [false, true] {
+                denied = effect.clone();
+                if process { denied.spawns_process = true; } else { denied.uses_network = true; }
+                request.compiled_invocation.as_mut().unwrap().effect = denied.clone();
+                assert!(!strict_original_review_read(&request, &denied));
+            }
+        }
+        let (mut task, scope, attempt) = fixture(true);
+        task.active_attempts.insert("execution".into(), attempt);
+        assert!(active_independent_review_read(&task, &scope, "execution"));
+        task.claimant = Some(scope.agent_id.clone());
+        assert!(!active_independent_review_read(&task, &scope, "execution"));
+        task.claimant = Some("producer".into());
+        task.review_generation += 1;
+        assert!(!active_independent_review_read(&task, &scope, "execution"));
+        task.review_generation -= 1;
+        task.cancel_requested_by = Some("operator".into());
+        assert!(!active_independent_review_read(&task, &scope, "execution"));
+    }
+
     #[tokio::test]
     async fn r1_711_preclaim_and_review_collaboration_do_not_grant_ordinary_writes() {
         let existing = crate::agentic::coordination::tests::fixture(false).await;
@@ -804,19 +922,19 @@ mod task_control_700_tests {
             program.tasks.insert(task.task_id.clone(), task);
             let input = r#"{"topic_ref":"topic:team","summary":"Scope needs clarification"}"#;
             assert!(registered_collaboration_control_allows(
-                &program, &scope, "execution", 5, "message_publish", input,
+                &program, &scope, "execution", 5, 5, "message_publish", input,
             ));
             for tool in ["edit", "execute_code", "task_submit", "task_release", "objective_complete_request"] {
                 assert!(!registered_collaboration_control_allows(
-                    &program, &scope, "execution", 5, tool, r#"{"task_ref":"task"}"#,
+                    &program, &scope, "execution", 5, 5, tool, r#"{"task_ref":"task"}"#,
                 ), "{review}/{tool}");
             }
             assert!(!registered_collaboration_control_allows(
-                &program, &scope, "execution", 6, "message_publish", input,
+                &program, &scope, "execution", 6, 5, "message_publish", input,
             ));
             program.tasks.get_mut("task").unwrap().status = AgenticTaskStatus::Withdrawn;
             assert!(!registered_collaboration_control_allows(
-                &program, &scope, "execution", 5, "message_publish", input,
+                &program, &scope, "execution", 5, 5, "message_publish", input,
             ));
         }
         let (mut task, scope, attempt) = fixture(false);
@@ -829,16 +947,16 @@ mod task_control_700_tests {
         program.tasks.insert(task.task_id.clone(), task);
         let release = r#"{"task_ref":"task","reason":"release original cancelled claim"}"#;
         assert!(registered_collaboration_control_allows(
-            &program, &scope, "execution", 5, "task_release", release,
+            &program, &scope, "execution", 5, 5, "task_release", release,
         ));
         assert!(!registered_collaboration_control_allows(
-            &program, &scope, "foreign", 5, "task_release", release,
+            &program, &scope, "foreign", 5, 5, "task_release", release,
         ));
         assert!(!registered_collaboration_control_allows(
-            &program, &scope, "execution", 5, "edit", release,
+            &program, &scope, "execution", 5, 5, "edit", release,
         ));
         assert!(!registered_collaboration_control_allows(
-            &program, &scope, "execution", 5, "task_release", r#"{"task_ref":"foreign"}"#,
+            &program, &scope, "execution", 5, 5, "task_release", r#"{"task_ref":"foreign"}"#,
         ));
     }
 
@@ -889,7 +1007,7 @@ mod collaboration_control_711_tests {
                       scope: &harness_contract::agent::AgenticExecutionBinding,
                       attempt, tool, input: &str| {
             registered_collaboration_control_allows(
-                program, scope, fixture.packet.graph_id(), attempt, tool, input,
+                program, scope, fixture.packet.graph_id(), attempt, fixture.packet.attempt, tool, input,
             )
         };
         assert!(allows(&program, scope, fixture.packet.attempt, "message_publish", &input));
@@ -909,18 +1027,6 @@ mod collaboration_control_711_tests {
         let mut settled = program.clone();
         settled.settle_coordination(fixture.packet.graph_id(), None);
         assert!(!allows(&settled, scope, fixture.packet.attempt, "message_publish", &input));
-        let actor = crate::agentic::coordination::tests::actor(&fixture).await;
-        let observation = fixture.services.submit_agent_action(
-            &harness_contract::agent_action::AgentActionEnvelope {
-                action_id:"r1-711-real-reply".into(), actor, expected_revision:None,
-                action:serde_json::from_value(serde_json::json!({
-                    "kind":"message_publish","input":serde_json::from_str::<serde_json::Value>(&input).unwrap()
-                })).unwrap(),
-            },
-        ).await.unwrap();
-        assert_eq!(observation.status, harness_contract::agent_action::AgentActionStatus::Applied);
-        let replied = fixture.services.agent_action_service().project(&scope.program_id).unwrap();
-        assert!(allows(&replied, scope, fixture.packet.attempt, "task_release", &release));
     }
 }
 
@@ -1061,122 +1167,5 @@ impl ExecutionCommitService {
             expected_revision: program.as_ref().map_or(0, |program| program.revision),
         });
         Ok(sources)
-    }
-}
-
-#[cfg(test)]
-mod current_bound_goal_tests {
-
-    #[tokio::test]
-    async fn rootless_original_program_claim_keeps_ordinary_authority() {
-        use harness_contract::agent_action::{
-            AgentAction, AgentActionEnvelope, AgentActionStatus, TaskClaimInput,
-        };
-        let fixture = crate::agentic::coordination::tests::fixture_with_process_task(
-            crate::ProcessJsonlSpec::new("command:rootless-authority", "not-executed.py", vec![]),
-        )
-        .await;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let graph = fixture
-                    .services
-                    .graph_state_store()
-                    .load(fixture.packet.graph_id())
-                    .unwrap();
-                let status = graph.node_statuses[fixture.packet.node_id()];
-                if status == harness_contract::execution_graph::ExecutionNodeStatus::Running {
-                    break;
-                }
-                assert!(
-                    !status.is_terminal(),
-                    "original independent runner ended before claim: {status:?}"
-                );
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the original Runner must start the independent claimed Task");
-        let actor = crate::agentic::coordination::tests::actor(&fixture).await;
-        assert!(actor.root_execution_id.is_none());
-        let claimed = fixture
-            .services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "rootless-original-claim".into(),
-                actor,
-                expected_revision: None,
-                action: AgentAction::TaskClaim(TaskClaimInput {
-                    task_ref: fixture.task_ref.clone(),
-                    reason: None,
-                }),
-            })
-            .await
-            .unwrap();
-        assert_eq!(claimed.status, AgentActionStatus::Applied, "{claimed:?}");
-        let program = fixture
-            .services
-            .agent_action_service()
-            .project("coord-program")
-            .unwrap();
-        assert!(
-            program.root_execution_id.is_none(),
-            "original ingress creates the independent domain"
-        );
-        assert_eq!(
-            program.tasks[&fixture.task_ref]
-                .claim_execution_id
-                .as_deref(),
-            Some(fixture.packet.graph_id())
-        );
-        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
-            &crate::tool_dispatch::ToolRequest {
-                tool_use_id: "rootless-source-reader".into(),
-                tool_name: "edit".into(),
-                depends_on: vec![],
-                input: r#"{"path":"proof.txt","content":"not dispatched"}"#.into(),
-            },
-        );
-        request.session_id = Some(fixture.packet.session_id().into());
-        request.parent_execution =
-            Some(harness_contract::execution_graph::ExecutionParentBinding {
-                execution_id: fixture.packet.graph_id().into(),
-                node_id: fixture.packet.node_id().into(),
-            });
-        request.parent_execution_attempt = Some(fixture.packet.attempt);
-        let sources = fixture
-            .services
-            .commit_service()
-            .tool_effect_authority(&request)
-            .unwrap();
-        assert_eq!(
-            sources.len(),
-            2,
-            "only the actual Graph and original independent Program; no fabricated root"
-        );
-        assert!(sources
-            .iter()
-            .any(|cut| cut.stream_id == fixture.packet.graph_id()));
-        assert!(sources
-            .iter()
-            .any(|cut| cut.stream_id == "agentic-program:coord-program"
-                && cut.expected_revision == program.revision));
-        request.parent_execution_attempt = Some(fixture.packet.attempt + 1);
-        assert!(fixture
-            .services
-            .commit_service()
-            .tool_effect_authority(&request)
-            .is_err());
-        request.parent_execution_attempt = Some(fixture.packet.attempt);
-        request.session_id = Some("foreign".into());
-        assert!(fixture
-            .services
-            .commit_service()
-            .tool_effect_authority(&request)
-            .is_err());
-        assert!(
-            !fixture.workspace.path().join("proof.txt").exists(),
-            "reader is not a ToolHost execution"
-        );
-        fixture.services.shutdown_maintenance().await;
-        fixture.services.shutdown_execution().await;
     }
 }

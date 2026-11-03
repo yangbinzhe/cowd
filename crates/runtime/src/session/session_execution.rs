@@ -443,6 +443,11 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
             },
             delivery_envelope: None,
             terminal_presentation: None,
+            original_batch_prefixes: Vec::new(),
+            original_pending_batches: Vec::new(),
+            original_replayed_actions: Vec::new(),
+            original_agent_child: None,
+            original_terminal_owner: None,
             domain_events: vec![RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
                     stream_id: format!("session-dispatch:{}", ticket.idempotency_key),

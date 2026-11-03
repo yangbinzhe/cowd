@@ -226,8 +226,22 @@ impl Default for StrategyResourceHealth {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrategyLease {
     pub lease_id: String,
-    pub input_fingerprint: u64,
+    /// Canonical decimal identity: a full-width hash must survive strict JSON.
+    #[serde(deserialize_with = "deserialize_input_fingerprint")]
+    pub input_fingerprint: String,
     pub locked_pattern: ExecutionPattern,
+}
+
+fn deserialize_input_fingerprint<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let parsed = value.parse::<u64>().map_err(serde::de::Error::custom)?;
+    if parsed.to_string() != value {
+        return Err(serde::de::Error::custom("input fingerprint is not canonical decimal"));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,7 +671,7 @@ fn build_runtime_execution_decision_inner(
             lease_id: format!("strategy-lease-{}", Uuid::new_v4()),
             input_fingerprint: model_protocol::fingerprint::stable_hash_bytes(
                 user_input.as_bytes(),
-            ),
+            ).to_string(),
             locked_pattern: recommended_pattern,
         },
         executable: blocked_reasons.is_empty(),
@@ -696,6 +710,33 @@ fn evidence_mode_for_strategy(strategy: &StrategyDecision) -> EvidenceAcquisitio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strategy_lease_full_width_fingerprint_round_trips_strict_json() {
+        let lease = StrategyLease {
+            lease_id: "original".into(),
+            input_fingerprint: u64::MAX.to_string(),
+            locked_pattern: ExecutionPattern::Direct,
+        };
+        let encoded = serde_json::to_string(&lease).unwrap();
+        let value = harness_contract::step::parse_strict_json(&encoded).unwrap();
+        assert_eq!(value["input_fingerprint"], u64::MAX.to_string());
+        assert_eq!(serde_json::from_value::<StrategyLease>(value).unwrap(), lease);
+        for original in [0, 7644217367651223534, u64::MAX] {
+            let mut candidate = lease.clone();
+            candidate.input_fingerprint = original.to_string();
+            let json = serde_json::to_string(&candidate).unwrap();
+            let value = harness_contract::step::parse_strict_json(&json).unwrap();
+            assert_eq!(serde_json::from_value::<StrategyLease>(value).unwrap(), candidate);
+        }
+        for invalid in [serde_json::json!(1), serde_json::json!(null),
+            serde_json::json!("18446744073709551616"), serde_json::json!("01"),
+            serde_json::json!("-1"), serde_json::json!("+1")] {
+            let mut value = serde_json::to_value(&lease).unwrap();
+            value["input_fingerprint"] = invalid;
+            assert!(serde_json::from_value::<StrategyLease>(value).is_err());
+        }
+    }
 
     #[test]
     fn semantic_multi_agent_preference_selects_collaboration_without_hard_obligation() {

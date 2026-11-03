@@ -198,7 +198,8 @@ mod test_support;
 #[path = "agent/test_support/failure_evidence.rs"]
 pub mod failure_evidence;
 pub use agentic::{
-    AgentActionService, AgentActionServiceError, AgentMemberProjection, AgenticArtifactProjection,
+    AgentActionService, AgentActionServiceError, OriginalCommittedMember, OriginalMemberSubmission,
+    AgentMemberProjection, AgenticArtifactProjection,
     AgenticCompletionRequestProjection, AgenticDispatchContext, AgenticDispatchReceipt,
     AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,
     AgenticProgramProjection, AgenticProgramStatus, AgenticTaskProjection, AgenticTaskRetirement,
@@ -249,6 +250,8 @@ pub mod projection;
 pub mod provider_outcome_selector;
 #[path = "provider/prefix_attribution.rs"]
 pub mod provider_prefix_attribution;
+#[path = "provider/physical_send_owner.rs"]
+pub mod physical_send_owner;
 #[path = "provider/provider_registry.rs"]
 pub mod provider_registry;
 #[path = "provider/provider_resources.rs"]
@@ -322,6 +325,7 @@ pub mod tool_dispatch;
 pub mod tool_execution_plane;
 #[path = "tooling/tool_host.rs"]
 pub mod tool_host;
+pub use tool_host::{AuthenticatedBatchMember, OriginalMemberSubmitOutcome, OriginalMemberUnboundCommit};
 #[path = "tooling/tool_invocation.rs"]
 pub mod tool_invocation;
 
@@ -426,7 +430,7 @@ pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExp
 pub use conversation::{
     build_cc_memory_config, image_user_message_from_path, memory_project_id_for_workspace,
     ApiClient, ApiClientStream, ApiRequest, AssistantEvent, AssistantItemKind, AutoCompactionEvent,
-    CancellationToken, ConversationRuntime, MemoryCallback, ProviderContextInventory, RuntimeError,
+    CancellationToken, ConversationRuntime, MemoryCallback, PendingAgentBatch, PendingAgentBatchValue, ProviderContextInventory, RuntimeError,
     SessionReadHead, StaticToolExecutor, ToolCallback, ToolError, ToolExecutor,
     ToolModelDeliveryRequirement, TurnSummary,
 };
@@ -500,10 +504,6 @@ pub use session_runtime_port::{
     SessionRuntimeQueryPort,
 };
 
-#[cfg(feature = "test-fixtures")]
-pub use agentic::execution::reviewed_goal_fixture::{
-    independently_reviewed_goal_fixture, ReviewedGoalFixture,
-};
 pub use artifact::{
     ArtifactCatalogPage, ArtifactCatalogQuery, ArtifactCatalogSnapshot, ArtifactDirectoryPage,
     ArtifactError, ArtifactGcPort, ArtifactGcReport, ArtifactMetadataPort,
@@ -695,6 +695,7 @@ pub use runtime_event_store::{
     CheckedSourceEvidence, CheckedSourceValidator, CommittedEventBatch, CommittedStreamRevision,
     DurableRuntimeEvent, ExpectedStreamRevision, PreparedContentRoot, PreparedReconciliationReport,
     QuiescedContentRoots, RuntimeBoundedEventLookup, RuntimeEventInput, RuntimeEventRecord,
+    RuntimeOriginalSessionClaim, RuntimeTransactionCommitControl, RuntimeTransactionOutcome,
     PositionPageError, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeEventStoreBackend,
     RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeProjectionCheckpoint,
     RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionScanPage,

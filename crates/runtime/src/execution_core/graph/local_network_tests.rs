@@ -63,6 +63,7 @@ fn fixture() -> (crate::DurableRuntimeEvent, ToolEffectDescriptor) {
         }],
     };
     let outcome = RuntimeToolExecutionOutcome {
+        pending_agent_batch: None,
         tool_use_id: "801-call".into(),
         tool_name: "web_fetch".into(),
         status: RuntimeToolExecutionStatus::Executed,

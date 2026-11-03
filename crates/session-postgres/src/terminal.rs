@@ -2,31 +2,26 @@
 
 use super::*;
 
-fn lock_claim_event_append_tx(
+/// Lock and verify the current Session input claim in the caller's PostgreSQL
+/// transaction. The caller must use the Session and Runtime tables in the same
+/// schema, keep this transaction open through its append, and authorize the
+/// operation independently; this verifies the claim fence, not tool permission.
+pub fn lock_runtime_input_claim_tx(
     transaction: &mut PostgresTransaction<'_>,
-    request: &SessionClaimEventAppend,
-) -> session::SessionResult<SessionEvent> {
-    let fence = &request.fence;
-    if [
-        request.session_id.as_str(),
-        request.ingress_message_id.as_str(),
-        request.turn_id.as_str(),
-        fence.request_id.as_str(),
-        fence.claim_owner.as_str(),
-        fence.claim_token.as_str(),
-        request.event.event_id.as_str(),
-    ]
-    .iter()
-    .any(|identity| identity.trim().is_empty())
-        || fence.session_generation == 0
-        || fence.claim_fence_epoch == 0
-        || request.event.session_id != request.session_id
+    session_id: &str,
+    ingress_message_id: &str,
+    turn_id: &str,
+    fence: &session::SessionTerminalExecutionFence,
+) -> session::SessionResult<()> {
+    if [session_id, ingress_message_id, turn_id, fence.request_id.as_str(),
+        fence.claim_owner.as_str(), fence.claim_token.as_str()]
+        .iter().any(|identity| identity.trim().is_empty())
+        || fence.session_generation == 0 || fence.claim_fence_epoch == 0
     {
         return Err(session::SessionError::InvalidArgument(
-            "claim-fenced event append requires complete, matching Session identity".to_string(),
+            "claim fence requires complete Session identity".to_string(),
         ));
     }
-    let event = request.event.to_session_event()?;
     // Session first, exact outbox second. Only this owner operation uses
     // NO KEY UPDATE: it excludes admission/generation updates and other event
     // allocators, but permits outbox-first workers' parent FK KEY SHARE locks.
@@ -36,20 +31,20 @@ fn lock_claim_event_append_tx(
     transaction
         .query_opt(
             "SELECT session_id FROM session_records WHERE session_id=$1 FOR NO KEY UPDATE",
-            &[&request.session_id],
+            &[&session_id],
         )
         .map_err(postgres_error)?
         .ok_or_else(|| {
             session::SessionError::StaleExecutionFence(format!(
                 "session `{}` no longer exists",
-                request.session_id
+                session_id
             ))
         })?;
     let admission =
-        query_input_admission_tx(transaction, &request.session_id, false)?.ok_or_else(|| {
+        query_input_admission_tx(transaction, &session_id, false)?.ok_or_else(|| {
             session::SessionError::StaleExecutionFence(format!(
                 "session `{}` no longer exists",
-                request.session_id
+                session_id
             ))
         })?;
     let current = runtime_outbox_for_update(transaction, &fence.request_id)?;
@@ -67,13 +62,13 @@ fn lock_claim_event_append_tx(
             .map_err(postgres_error)?,
         "claim append owner clock",
     )?;
-    if current.session_id != request.session_id
-        || current.message_id != request.ingress_message_id
-        || current.turn_id != request.turn_id
+    if current.session_id != session_id
+        || current.message_id != ingress_message_id
+        || current.turn_id != turn_id
         || current.request_id != fence.request_id
         || current.sequence != fence.input_sequence
         || current.session_generation != fence.session_generation
-        || admission.session_id != request.session_id
+        || admission.session_id != session_id
         || admission.generation != fence.session_generation
         || !admission.open
         || !matches!(
@@ -92,6 +87,62 @@ fn lock_claim_event_append_tx(
             fence.request_id, fence.session_generation, fence.claim_fence_epoch, current.status
         )));
     }
+    Ok(())
+}
+
+/// Verify the original Session claim and the actual consumed input position
+/// within the caller's transaction, using the Session owner's lock order.
+pub fn lock_runtime_input_claim_with_consumed_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+    ingress_message_id: &str,
+    turn_id: &str,
+    fence: &session::SessionTerminalExecutionFence,
+    consumed_input_sequence: usize,
+) -> session::SessionResult<()> {
+    if consumed_input_sequence < fence.input_sequence {
+        return Err(session::SessionError::StaleExecutionFence(
+            "consumed input position precedes original ingress".into(),
+        ));
+    }
+    let consumed = to_i64(consumed_input_sequence, "consumed input sequence")?;
+    lock_runtime_input_claim_tx(transaction, session_id, ingress_message_id, turn_id, fence)?;
+    let newest = newest_pending_control_sequence_tx(
+        transaction, session_id, fence.session_generation, fence.input_sequence,
+    )?;
+    if newest.is_some_and(|sequence| sequence > consumed) {
+        return Err(session::SessionError::StaleExecutionFence(
+            "original action input position is behind pending Session control".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn newest_pending_control_sequence_tx(
+    transaction: &mut PostgresTransaction<'_>, session_id: &str, generation: u64, ingress_sequence: usize,
+) -> session::SessionResult<Option<i64>> {
+    transaction.query_one(
+        "SELECT MAX(sequence) FROM session_runtime_outbox
+          WHERE session_id=$1 AND session_generation=$2 AND sequence>$3
+            AND status NOT IN ('rejected_duplicate','rejected_policy','completed','supplemented','failed','cancelled','expired')
+            AND decision IN ('supplement_current_turn','interrupt_and_replan','control_or_approval')",
+        &[&session_id, &to_u64_i64(generation, "session generation")?,
+          &to_i64(ingress_sequence, "input sequence")?],
+    ).map_err(postgres_error)?.try_get(0).map_err(postgres_error)
+}
+
+fn lock_claim_event_append_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    request: &SessionClaimEventAppend,
+) -> session::SessionResult<SessionEvent> {
+    if request.event.event_id.trim().is_empty() || request.event.session_id != request.session_id {
+        return Err(session::SessionError::InvalidArgument(
+            "claim-fenced event append requires complete, matching Session identity".to_string(),
+        ));
+    }
+    let event = request.event.to_session_event()?;
+    lock_runtime_input_claim_tx(transaction, &request.session_id, &request.ingress_message_id,
+        &request.turn_id, &request.fence)?;
     request.validate_locked_event_binding()?;
     Ok(event)
 }
@@ -2323,31 +2374,10 @@ impl PostgresSessionStore {
                 current.revision
             )));
         }
-        let newest_pending_sequence = transaction
-            .query_one(
-                "SELECT MAX(sequence)
-                   FROM session_runtime_outbox
-                  WHERE session_id=$1 AND session_generation=$2
-                    AND sequence>$3
-                    AND status NOT IN (
-                      'rejected_duplicate','rejected_policy','completed',
-                      'supplemented','failed','cancelled','expired'
-                    )
-                    AND decision IN (
-                      'supplement_current_turn',
-                      'interrupt_and_replan',
-                      'control_or_approval'
-                    )",
-                &[
-                    &request.session_id,
-                    &to_u64_i64(request.fence.session_generation, "session generation")?,
-                    &to_i64(request.fence.input_sequence, "input sequence")?,
-                ],
-            )
-            .map_err(postgres_error)?
-            .try_get::<_, Option<i64>>(0)
-            .map_err(postgres_error)?
-            .map(|value| value.max(0) as usize);
+        let newest_pending_sequence = newest_pending_control_sequence_tx(
+            &mut transaction, &request.session_id, request.fence.session_generation,
+            request.fence.input_sequence,
+        )?.map(|value| value.max(0) as usize);
         if newest_pending_sequence
             .is_some_and(|sequence| sequence > request.consumed_input_sequence)
         {

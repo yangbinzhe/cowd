@@ -245,6 +245,7 @@ impl ExecutionCommitService {
         error: None,
         evidence_ref: "801-test-source".into(),
         observed_evidence: vec![fact.into_observation("web_fetch".into(), 1)],
+        pending_agent_batch: None,
     };
     (
         crate::DurableRuntimeEvent {

@@ -62,11 +62,70 @@ enum PhysicalOutcome {
 type PhysicalWork = Shared<BoxFuture<'static, Result<PhysicalOutcome, NodeExecutorError>>>;
 type PhysicalDriver = Shared<BoxFuture<'static, Result<(), String>>>;
 
+/// A successful drain of the original ticket's physical entry.  This is an
+/// in-process owner handoff, not a durable receipt or an execution grant.
+pub(crate) struct OriginalPhysicalClose {
+    ticket: NodeExecutionTicket,
+    observation: Arc<super::agent_tool::NoDispatchObservation>,
+    original_child: Option<Arc<OriginalAgentChildCall>>,
+}
+
+impl OriginalPhysicalClose {
+    pub(crate) fn matches_original_ticket(&self, ticket: &NodeExecutionTicket) -> bool {
+        &self.ticket == ticket && self.observation.ticket_matches(ticket)
+    }
+    pub(crate) fn original_agent_child(&self) -> Option<&OriginalAgentChildCall> {
+        self.original_child.as_deref()
+    }
+    pub(crate) fn original_refusal(&self, request: &crate::RuntimeToolExecutionRequest) -> Option<crate::RuntimeToolExecutionOutcome> {
+        self.observation.refusal(request)
+    }
+}
+
+tokio::task_local! {
+    static ORIGINAL_PHYSICAL_CLOSE: Arc<OriginalPhysicalClose>;
+}
+
+pub(crate) fn current_original_physical_close(
+    ticket: &NodeExecutionTicket,
+) -> Option<Arc<OriginalPhysicalClose>> {
+    ORIGINAL_PHYSICAL_CLOSE.try_with(|close| {
+        close.matches_original_ticket(ticket)
+            .then(|| Arc::clone(close))
+    }).ok().flatten()
+}
+
+/// Operation-scoped handoff held by the existing retained physical owner.
+/// Its private fields originate in the live caller, never deserialization.
+#[derive(Clone)]
+pub(crate) struct OriginalAgentChildCall {
+    pub(crate) request: Arc<crate::RuntimeToolExecutionRequest>,
+    pub(crate) parent_ticket: NodeExecutionTicket,
+    pub(crate) packet: harness_contract::agent::AgentTaskPacket,
+    pub(crate) store: Arc<crate::RuntimeEventStore>,
+    pub(crate) provider_capture: Option<Arc<crate::conversation::tool_plane::OriginalSingleProducerCapture>>,
+    pub(crate) stop: Option<crate::bound_tool_batch::BoundToolStop>,
+    child_payload: String,
+}
+pub(crate) struct PendingAgentChildCall {
+    executor: Arc<ScopedNodeExecutor>,
+    key: PhysicalKey,
+    call: Arc<OriginalAgentChildCall>,
+}
+impl Drop for PendingAgentChildCall {
+    fn drop(&mut self) {
+        let mut physical = self.executor.physical.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if physical.get(&self.key).and_then(|entry| entry.original_child.as_ref())
+            .is_some_and(|call| Arc::ptr_eq(call, &self.call)) { physical.remove(&self.key); }
+    }
+}
+
 #[derive(Clone, Default)]
 struct PhysicalEntry {
     work: Option<PhysicalWork>,
     publication_completed: bool,
     observation: Option<Arc<super::agent_tool::NoDispatchObservation>>,
+    original_child: Option<Arc<OriginalAgentChildCall>>,
     closed: bool,
     original_binding: bool,
     backend: Option<Arc<dyn ScopedNodeBackend>>,
@@ -124,6 +183,34 @@ impl ScopedNodeExecutor {
         )
     }
 
+    pub(crate) fn retain_original_agent_child(
+        self: &Arc<Self>, graph_id: &str, node_id: &str, payload: &str,
+        request: Arc<crate::RuntimeToolExecutionRequest>, parent_ticket: NodeExecutionTicket,
+        packet: harness_contract::agent::AgentTaskPacket, store: Arc<crate::RuntimeEventStore>,
+        provider_capture: Option<Arc<crate::conversation::tool_plane::OriginalSingleProducerCapture>>,
+        stop: Option<crate::bound_tool_batch::BoundToolStop>,
+    ) -> Result<PendingAgentChildCall, String> {
+        if self.kind != "tool_batch" || graph_id.is_empty() || node_id.is_empty() || payload.is_empty() {
+            return Err("invalid original child call".into());
+        }
+        let key = (graph_id.to_owned(), node_id.to_owned(), 0, String::new());
+        let call = Arc::new(OriginalAgentChildCall { request, parent_ticket, packet, store, provider_capture, stop, child_payload: payload.to_owned() });
+        let mut physical = self.physical.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if physical.contains_key(&key) || physical.keys().any(|k| k.0 == graph_id && k.1 == node_id && k.2 > 0) {
+            return Err("original child call already admitted".into());
+        }
+        physical.insert(key.clone(), PhysicalEntry { original_child: Some(Arc::clone(&call)), ..Default::default() });
+        Ok(PendingAgentChildCall { executor: Arc::clone(self), key, call })
+    }
+
+    pub(crate) fn original_agent_child(&self, ticket: &NodeExecutionTicket) -> Option<Arc<OriginalAgentChildCall>> {
+        let physical = self.physical.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = physical.get(&Self::physical_key(ticket, ""))?;
+        if entry.closed || !entry.original_binding || ticket.attempt != 1
+            || entry.observation.as_ref().is_none_or(|obs| !obs.ticket_matches(ticket)) { return None; }
+        entry.original_child.as_ref().filter(|call| call.child_payload == ticket.payload_ref).cloned()
+    }
+
     pub(crate) fn observe_binding(
         &self,
         ticket: &NodeExecutionTicket,
@@ -146,10 +233,28 @@ impl ScopedNodeExecutor {
                 reason: "original ToolBatch observation already admitted".into(),
             });
         }
+        let pending = (ticket.graph_id.clone(), ticket.node_id.clone(), 0, String::new());
+        let original_child = if ticket.attempt == 1 {
+            physical.remove(&pending).and_then(|entry| entry.original_child)
+                .filter(|call| call.child_payload == ticket.payload_ref)
+        } else { None };
+        if let Some(child) = &original_child {
+            let owner = child.request.tool_progress.original_fresh_effect();
+            let hook = child.request.tool_progress.original_governed_hook();
+            if owner.as_ref().is_err() || owner.as_ref().is_ok_and(Option::is_some) || hook.as_ref().is_err() {
+                // The child did not create the original intent; never mint a
+                // zero-history witness while its original effect is retained.
+                observation.uncertain(&child.request);
+            } else if hook.as_ref().is_ok_and(Option::is_some) {
+                // A hook is not itself an effect. Keep a distinct pending
+                // marker until the same child owner commits a checked fact.
+                observation.hold_inherited_hook(&child.request);
+            }
+        }
         physical.insert(
             key,
             PhysicalEntry {
-                observation: Some(observation.clone()),
+                observation: Some(observation.clone()), original_child,
                 original_binding: true,
                 ..Default::default()
             },
@@ -211,6 +316,7 @@ impl ScopedNodeExecutor {
         let key = Self::physical_key(ticket, "");
         if physical.get(&key).is_some_and(|entry| {
             entry.closed
+                && entry.observation.as_ref().is_none_or(|observation| observation.packet_scope_allows_forget(entry.publication_completed))
                 && entry.work.as_ref().is_none_or(|work| work.peek().is_some())
                 && entry
                     .driver
@@ -222,6 +328,7 @@ impl ScopedNodeExecutor {
                 entry.backend = None;
                 entry.driver = None;
                 entry.observation = None;
+                entry.original_child = None;
                 entry.publication_completed = false;
             }
         }
@@ -546,7 +653,15 @@ impl NodeExecutor for ScopedNodeExecutor {
             let result = backend.execute(ticket).await;
             #[cfg(feature = "test-fixtures")]
             if trace_completion { eprintln!("rc_completion_stage scoped_backend_returned"); }
-            let result = super::agent_tool::finish_observed_outcome(ticket, observation.as_deref(), result);
+            let result = super::agent_tool::finish_observed_outcome(ticket, observation.as_deref(), result)
+                .and_then(|mut outcome| {
+                    if let Some(child) = self.original_agent_child(ticket) {
+                        outcome.attach_original_agent_child(child).map_err(|reason| NodeExecutorError::Invalid {
+                            node_id: ticket.node_id.clone(), reason,
+                        })?;
+                    }
+                    Ok(outcome)
+                });
             #[cfg(feature = "test-fixtures")]
             if trace_completion { eprintln!("rc_completion_stage scoped_finish_returned ok={}", result.is_ok()); }
             return result;
@@ -602,7 +717,14 @@ impl NodeExecutor for ScopedNodeExecutor {
         };
         match work {
             Some(work) => match work.await? {
-                PhysicalOutcome::Node(outcome) => Ok(outcome),
+                PhysicalOutcome::Node(mut outcome) => {
+                    if let Some(child) = self.original_agent_child(ticket) {
+                        outcome.attach_original_agent_child(child).map_err(|reason| NodeExecutorError::Invalid {
+                            node_id: ticket.node_id.clone(), reason,
+                        })?;
+                    }
+                    Ok(outcome)
+                },
                 PhysicalOutcome::Tool(_) => Err(NodeExecutorError::Invalid {
                     node_id: ticket.node_id.clone(),
                     reason: "node identity collides with physical leaf".into(),
@@ -662,10 +784,28 @@ impl NodeExecutor for ScopedNodeExecutor {
                         .is_some_and(|observation| observation.ticket_matches(ticket))
             })
         };
+        let original_close_source = {
+            let physical = self.physical.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            physical.get(&Self::physical_key(ticket, "")).and_then(|entry| {
+                if !entry.original_binding || entry.closed { return None; }
+                let observation = entry.observation.as_ref()?;
+                if !observation.ticket_matches(ticket) { return None; }
+                let child = entry.original_child.clone();
+                if child.as_ref().is_some_and(|child| child.child_payload != ticket.payload_ref) { return None; }
+                Some((Arc::clone(observation), Arc::clone(entry.backend.as_ref()?), child))
+            })
+        };
         // The success path must not abandon an in-flight physical write: wait
         // for it. Bounded cancellation is reserved for cancel/abort paths, where
         // stopping is the point (PLAN W3 / R-02).
-        self.close_and_drain(ticket, false).await?;
+        #[cfg(feature = "test-fixtures")]
+        let traced = super::super::runner::k05_completion_trace_enabled(ticket);
+        #[cfg(feature = "test-fixtures")]
+        if traced { super::super::runner::k05_completion_trace(ticket, "physical_drain_enter", None, None); }
+        let drained = self.close_and_drain(ticket, false).await;
+        #[cfg(feature = "test-fixtures")]
+        if traced { super::super::runner::k05_completion_trace(ticket, "physical_drain_return", None, Some(drained.is_ok())); }
+        drained?;
         self.physical
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -685,7 +825,37 @@ impl NodeExecutor for ScopedNodeExecutor {
                 node_id: ticket.node_id.clone(),
             }
         })?;
-        backend.after_commit(ticket).await?;
+        let close = original_close_source.and_then(|(observation, original_backend, original_child)| {
+            if !Arc::ptr_eq(&backend, &original_backend) { return None; }
+            let physical = self.physical.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = physical.get(&Self::physical_key(ticket, ""))?;
+            if !entry.original_binding || !entry.closed
+                || entry.observation.as_ref().is_none_or(|actual| !Arc::ptr_eq(actual, &observation))
+                || entry.backend.as_ref().is_none_or(|actual| !Arc::ptr_eq(actual, &original_backend))
+                || match (&entry.original_child, &original_child) {
+                    (Some(actual), Some(original)) => !Arc::ptr_eq(actual, original),
+                    (None, None) => false,
+                    _ => true,
+                }
+                || physical.iter().filter(|(key, _)| Self::owns_key(ticket, key)).any(|(_, item)| {
+                    !item.closed
+                        || item.work.as_ref().is_some_and(|work| work.peek().is_none())
+                        || item.driver.as_ref().is_some_and(|driver| !matches!(driver.peek(), Some(Ok(()))))
+                }) {
+                return None;
+            }
+            Some(Arc::new(OriginalPhysicalClose { ticket: ticket.clone(), observation, original_child }))
+        });
+        #[cfg(feature = "test-fixtures")]
+        if traced { super::super::runner::k05_completion_trace(ticket, "backend_after_commit_enter", None, Some(close.is_some())); }
+        let published = if let Some(close) = close {
+            ORIGINAL_PHYSICAL_CLOSE.scope(close, backend.after_commit(ticket)).await
+        } else {
+            backend.after_commit(ticket).await
+        };
+        #[cfg(feature = "test-fixtures")]
+        if traced { super::super::runner::k05_completion_trace(ticket, "backend_after_commit_return", None, Some(published.is_ok())); }
+        published?;
         if let Some(entry) = self
             .physical
             .lock()
@@ -818,13 +988,23 @@ impl NodeExecutor for ScopedNodeExecutor {
             uncertain.get_or_insert_with(|| key.1.clone());
         }
         if let Some(node_id) = uncertain {
-            Err(NodeExecutorError::Uncertain {
+            return Err(NodeExecutorError::Uncertain {
                 node_id,
                 reason: "original physical drain could not prove every driver join".into(),
-            })
-        } else {
-            Ok(())
+            });
         }
+        // A joined physical driver does not settle its original packet decision.
+        // Preserve the same-ticket entry and report that distinct Unknown to the
+        // existing shutdown owner; do not retry or synthesize a receipt here.
+        if let Some((key, _)) = physical.iter().find(|(_, entry)| {
+            entry.observation.as_ref().is_some_and(|observation| observation.packet_scope_is_unresolved())
+        }) {
+            return Err(NodeExecutorError::Uncertain {
+                node_id: key.1.clone(),
+                reason: "original packet scope transaction remains unknown after physical drain".into(),
+            });
+        }
+        Ok(())
     }
     fn cancellation_finalized(&self, ticket: &NodeExecutionTicket) {
         let mut physical = self
@@ -1146,6 +1326,7 @@ mod tests {
                                 release.notified().await;
                                 std::fs::write(&path, "finished").unwrap();
                                 Ok(crate::RuntimeToolExecutionOutcome {
+                                    pending_agent_batch: None,
                                     tool_use_id: "leaf".into(),
                                     tool_name: "edit".into(),
                                     status: crate::RuntimeToolExecutionStatus::Executed,
@@ -1442,6 +1623,7 @@ mod tests {
                         polled_by_leaf.store(true, Ordering::Release);
                         let output = std::fs::read_to_string(&path).unwrap();
                         Ok(crate::RuntimeToolExecutionOutcome {
+                            pending_agent_batch: None,
                             tool_use_id: "dispatched-520".into(),
                             tool_name: "read_file".into(),
                             status: crate::RuntimeToolExecutionStatus::Executed,
@@ -1643,6 +1825,7 @@ mod controlled_stop_tests {
             Box::pin(async move {
                 ready.await.unwrap();
                 Ok(crate::RuntimeToolExecutionOutcome {
+                    pending_agent_batch: None,
                     tool_use_id: "shutdown-leaf".into(),
                     tool_name: "edit".into(),
                     status: crate::RuntimeToolExecutionStatus::Executed,
@@ -1698,6 +1881,7 @@ mod controlled_stop_tests {
             Box::pin(async move {
                 work_ready.await.unwrap();
                 Ok(crate::RuntimeToolExecutionOutcome {
+                    pending_agent_batch: None,
                     tool_use_id: "joined-leaf".into(),
                     tool_name: "edit".into(),
                     status: crate::RuntimeToolExecutionStatus::Executed,

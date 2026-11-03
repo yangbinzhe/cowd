@@ -5074,6 +5074,7 @@ time.sleep(300)
                 error: None,
                 evidence_ref: format!("fixture-read:{}", request.tool_use_id),
                 observed_evidence: vec![],
+                pending_agent_batch: None,
             }
         }
         fn delegated_tool_effect_descriptor(
@@ -5206,6 +5207,7 @@ time.sleep(300)
         packet.allowed_tools = vec!["read_file".into()];
         packet.resource_scopes = vec!["read:.".into()];
         let root = AgentActorBinding {
+            original_execution: None,
             objective_id: "topic-process-objective".into(),
             program_id: "topic-process-program".into(),
             session_id: packet.session_id().into(),
@@ -5477,6 +5479,7 @@ time.sleep(300)
                         content_ref: material.selector,
                     },
                 },
+                vec![format!("session:{}", context.session_id)],
             )
             .await
             .unwrap();

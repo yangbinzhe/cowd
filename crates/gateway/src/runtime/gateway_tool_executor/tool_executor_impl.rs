@@ -224,26 +224,6 @@ impl ToolExecutor for GatewayToolExecutor {
         )
     }
 
-    fn prepare_governed_invocations(
-        &self,
-        requests: &[runtime::tool_dispatch::ToolRequest],
-    ) -> Vec<harness_contract::tool::GovernedToolInvocation> {
-        let lease = self.tool_host.pin_snapshot();
-        requests
-            .iter()
-            .map(|request| {
-                let input = serde_json::from_str::<serde_json::Value>(&request.input)
-                    .unwrap_or(serde_json::Value::Null);
-                lease.prepare_governed_invocation(
-                    request.tool_use_id.clone(),
-                    &request.tool_name,
-                    &input,
-                    &request.depends_on,
-                )
-            })
-            .collect()
-    }
-
     async fn execute_authorized_output(
         &self,
         authorization: &harness_contract::tool::ToolExecutionAuthorization,
@@ -252,6 +232,18 @@ impl ToolExecutor for GatewayToolExecutor {
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         self.execute_authorized_output_with_progress(authorization, tool_name, input, None, None)
             .await
+    }
+
+    async fn execute_root_action_with_invocation(
+        &self, request: &runtime::RuntimeToolExecutionRequest,
+        capability: &runtime::agentic::action_invocation::VerifiedActionInvocation,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        let outcome = runtime::RuntimeExecutionHost::execute_runtime_tool_with_action_invocation(self, request, capability).await;
+        match outcome.status {
+            runtime::RuntimeToolExecutionStatus::Executed => Ok(harness_contract::context::ToolOutputDraft::bounded_inline(outcome.output.unwrap_or_default())),
+            runtime::RuntimeToolExecutionStatus::Unknown => Err(ToolError::unknown(outcome.error.unwrap_or_else(|| "root action outcome is unknown".into()))),
+            _ => Err(ToolError::new(outcome.error.unwrap_or_else(|| "root action blocked".into()))),
+        }
     }
 
     async fn execute_step_authorized_invocation_output(

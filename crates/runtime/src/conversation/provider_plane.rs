@@ -815,50 +815,6 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn r1_assert_replay_activation_for_test(&self, output: &str) {
-        let catalog = self.tool_executor.tool_discovery_receipt();
-        let historical: harness_contract::tool::ToolDiscoveryReceipt =
-            serde_json::from_str(output).unwrap();
-        assert!(historical.activation_candidates.is_empty());
-        for revision in [catalog.catalog_revision, historical.catalog_revision] {
-            *self.tool_exposure_state.lock().unwrap() = Some(ToolExposureState {
-                catalog_revision: revision,
-                bootstrap: BTreeSet::from(["tool_search".to_string()]),
-                active: BTreeSet::new(),
-                deferred: catalog.activation_candidates.iter().cloned().collect(),
-                reason: "retained replay activation boundary".into(),
-                revision: 1,
-                fallback_full: false,
-            });
-            let activation = self.activate_tool_discovery(output).unwrap();
-            assert!(activation.decisions.is_empty());
-            assert!(self
-                .tool_exposure_state
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .active
-                .is_empty());
-        }
-        *self.tool_exposure_state.lock().unwrap() = Some(ToolExposureState {
-            catalog_revision: catalog.catalog_revision,
-            bootstrap: BTreeSet::from(["tool_search".to_string()]),
-            active: BTreeSet::new(),
-            deferred: catalog.activation_candidates.iter().cloned().collect(),
-            reason: "live activation positive control".into(),
-            revision: 1,
-            fallback_full: false,
-        });
-        let mut live = catalog;
-        live.activation_candidates = vec!["read_file".into()];
-        let activation = self
-            .activate_tool_discovery(&serde_json::to_string(&live).unwrap())
-            .unwrap();
-        assert!(activation.activated_ids().any(|name| name == "read_file"));
-    }
-
-    #[cfg(test)]
     pub(crate) async fn r1_dispatch_provider_step_for_test(
         &mut self,
         mut request: ApiRequest,
@@ -1422,8 +1378,9 @@ where
                     first_event_at,
                     first_text_at: _,
                     stop_reason: _,
-                    early_tool_receipts: _,
+                    early_tool_receipts,
                     early_tool_deferrals: _,
+                    early_tool_failures,
                     response_completed_at_ms,
                 } = stream_run.collected;
                 let effective_model = effective_provider_identity
@@ -1437,11 +1394,16 @@ where
                 }
                 add_token_usage(&mut billed_usage, usage);
                 billed_usage_observed &= observed_usage.is_some();
-                token_reservations
-                    .reconcile(observed_usage)
-                    .map_err(|error| {
-                        error.with_provider_usage(billed_usage_observed.then_some(billed_usage))
-                    })?;
+                let reconciliation = token_reservations.reconcile(observed_usage);
+                if !early_tool_failures.is_empty() {
+                    return Err(RuntimeError::early_tool_failure(early_tool_failures)
+                        .with_effect_receipts(early_tool_receipts)
+                        .with_provider_usage(billed_usage_observed.then_some(billed_usage)));
+                }
+                reconciliation.map_err(|error| {
+                    error.with_effect_receipts(early_tool_receipts)
+                        .with_provider_usage(billed_usage_observed.then_some(billed_usage))
+                })?;
                 if let Some(observed) = observed_usage {
                     self.reconcile_provider_context_usage(observed);
                 }
@@ -2726,6 +2688,7 @@ where
                 stop_reason,
                 early_tool_receipts,
                 early_tool_deferrals,
+                early_tool_failures,
                 response_completed_at_ms,
             } = stream_run.collected;
             if let Some(first_text_at) = first_text_at {
@@ -2793,9 +2756,13 @@ where
                     .map(RuntimeError::provider_failure_scope),
             );
             drop(provider_lease);
-            token_reservations
-                .reconcile(observed_usage)
-                .map_err(|error| error.with_effect_receipts(early_tool_receipts.clone()))?;
+            let reconciliation = token_reservations.reconcile(observed_usage);
+            if !early_tool_failures.is_empty() {
+                return Err(RuntimeError::early_tool_failure(early_tool_failures)
+                    .with_effect_receipts(early_tool_receipts)
+                    .with_provider_usage(observed_usage));
+            }
+            reconciliation.map_err(|error| error.with_effect_receipts(early_tool_receipts.clone()))?;
             if let Some(error) = stream_run.failure {
                 if error.authenticated_provider_cancellation().is_some() {
                     return Err(if early_tool_receipts.is_empty() { error } else { error.with_effect_receipts(early_tool_receipts) });
@@ -2916,6 +2883,7 @@ where
                 }
             }
             let requested_tool_call_count = calls.len();
+            self.remember_original_root_calls(&calls)?;
             self.remember_native_tool_calls(&calls)?;
             let transcript_calls = calls.clone();
             // One shape for "the model asked for something that did not run",

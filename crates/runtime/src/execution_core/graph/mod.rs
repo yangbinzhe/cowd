@@ -1,4 +1,5 @@
 mod commit_service;
+pub(crate) use commit_service::{validate_node_ticket_start, validate_node_ticket_start_at_revision};
 #[cfg(test)]
 pub(crate) use commit_service::bounded_process_tests;
 mod compiler;
@@ -8,6 +9,10 @@ mod host;
 mod recovery;
 mod registry;
 mod runner;
+#[cfg(feature = "test-fixtures")]
+pub(crate) use runner::k05_completion_trace;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) use runner::k05_trace_emit;
 mod state_store;
 
 pub mod resources;
@@ -24,14 +29,15 @@ pub mod resources;
 /// retirement can share one bound.
 pub(crate) const PHYSICAL_CLOSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub(crate) use commit_service::{process_closure_document, receipt_replay_contract, TerminalScopeReader};
-#[cfg(test)]
-pub(crate) use commit_service::receipt_lifecycle_anchor;
+pub(crate) use commit_service::{execution_lineage_stream_id, process_closure_document, receipt_replay_contract, TerminalScopeReader};
 pub use commit_service::{
-    DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
+    CallRefusalOwner, CommittedCallRefusal, DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
     ExecutionEffectState, ProcessClosurePublicationAuthority, ToolEffectState,
 };
-pub(crate) use commit_service::{PreEffectRefusal, ToolReceiptQuery};
+pub(crate) use commit_service::PreEffectRefusal;
+pub(crate) use commit_service::OriginalFreshEffectOwner;
+#[cfg(test)]
+pub(crate) use commit_service::ToolReceiptQuery;
 pub use compiler::{ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler};
 pub use events::{ExecutionGraphEvent, ExecutionNodeBinding};
 pub use executors::{ScopedNodeBackend, ScopedNodeExecutor};

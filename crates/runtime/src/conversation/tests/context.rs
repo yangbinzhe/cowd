@@ -3565,6 +3565,7 @@ impl EarlyToolDispatcher for RecordingEarlyDispatcher {
                     error: None,
                     evidence_ref: "test:early-result".to_string(),
                     observed_evidence: Vec::new(),
+                    pending_agent_batch: None,
                 },
                 call: candidate.call,
                 ready_at_ms: candidate.ready_at_ms,

@@ -421,11 +421,13 @@ fn validate_task_claim(
     let same_execution_renewal = task.status == AgenticTaskStatus::Claimed
         && task.claimant.as_deref() == actor_agent_id(envelope)
         && task.claim_execution_id == envelope.actor.execution_id;
+    if expired_claim && !same_execution_renewal {
+        return Some(("task_physical_closure_unconfirmed", input.task_ref.clone()));
+    }
     if !matches!(
         task.status,
         AgenticTaskStatus::Published | AgenticTaskStatus::Rework
-    ) && !expired_claim
-        && !same_execution_renewal
+    ) && !same_execution_renewal
     {
         return Some(("task_not_claimable", format!("{:?}", task.status)));
     }
@@ -526,9 +528,22 @@ fn validate_task_release(
     envelope: &AgentActionEnvelope,
     input: &TaskReleaseInput,
 ) -> Option<(&'static str, String)> {
+    if envelope.expected_revision.is_none() {
+        return Some(("task_release_revision_required", input.task_ref.clone()));
+    }
     let Some(task) = projection.tasks.get(&input.task_ref) else {
         return Some(("task_not_found", input.task_ref.clone()));
     };
+    match input.expected_claim_generation {
+        None => return Some(("task_release_generation_required", input.task_ref.clone())),
+        Some(expected) if expected != task.claim_generation => {
+            return Some(("stale_claim_generation", format!(
+                "task {} expected claim generation {}, actual {}",
+                input.task_ref, expected, task.claim_generation
+            )));
+        }
+        Some(_) => {}
+    }
     if let Some(attempt) = envelope
         .actor
         .execution_id
@@ -1072,6 +1087,7 @@ mod reclaim_discipline_tests {
         AgentActionEnvelope {
             action_id: format!("claim:{}", execution_id),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective".to_string(),
                 program_id: "program".to_string(),
                 session_id: "session".to_string(),

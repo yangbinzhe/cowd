@@ -115,6 +115,23 @@ pub struct AnthropicClient {
     max_backoff: Duration,
     request_profile: AnthropicRequestProfile,
     session_tracer: Option<SessionTracer>,
+    /// The installed physical-send authority. `None` refuses every send.
+    authority: Option<std::sync::Arc<crate::physical_send::PhysicalSendAuthority>>,
+    diagnostic_send: Option<std::sync::Arc<crate::physical_send::DiagnosticPhysicalSend>>,
+    original_request_id: Option<String>,
+    send_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    test_count_gate_refusal: bool,
+}
+
+// Network/parse failures in count_tokens are advisory, but a pre-send gate
+// refusal is an authorization decision and must stop the message send.
+fn count_tokens_preflight_result(result: Result<u32, ApiError>) -> Result<Option<u32>, ApiError> {
+    match result {
+        Ok(tokens) => Ok(Some(tokens)),
+        Err(error) if error.is_physical_send_gate() => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 impl AnthropicClient {
@@ -184,7 +201,14 @@ impl AnthropicClient {
 
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::new_with_http(api_key, reqwest::Client::new())
+        Self::new_with_http(api_key, Self::default_http_client())
+    }
+
+    fn default_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("failed to construct no-redirect Anthropic transport")
     }
 
     #[must_use]
@@ -198,12 +222,18 @@ impl AnthropicClient {
             max_backoff: DEFAULT_MAX_BACKOFF,
             request_profile: AnthropicRequestProfile::default(),
             session_tracer: None,
+            authority: None,
+            diagnostic_send: None,
+            original_request_id: None,
+            send_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            test_count_gate_refusal: false,
         }
     }
 
     #[must_use]
     pub fn from_auth(auth: AuthSource) -> Self {
-        Self::from_auth_with_http(auth, reqwest::Client::new())
+        Self::from_auth_with_http(auth, Self::default_http_client())
     }
 
     #[must_use]
@@ -217,6 +247,12 @@ impl AnthropicClient {
             max_backoff: DEFAULT_MAX_BACKOFF,
             request_profile: AnthropicRequestProfile::default(),
             session_tracer: None,
+            authority: None,
+            diagnostic_send: None,
+            original_request_id: None,
+            send_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            test_count_gate_refusal: false,
         }
     }
 
@@ -323,6 +359,34 @@ impl AnthropicClient {
         &self.auth
     }
 
+    /// Install the physical-send authority. Without one every send is refused.
+    #[must_use]
+    pub fn with_original_provider_request_id(mut self, request_id: String) -> Self {
+        self.original_request_id = Some(request_id); self
+    }
+
+    #[must_use]
+    pub fn with_diagnostic_physical_send(mut self, diagnostic: std::sync::Arc<crate::physical_send::DiagnosticPhysicalSend>) -> Self {
+        self.diagnostic_send = Some(diagnostic); self
+    }
+
+    #[must_use]
+    pub fn with_physical_send_authority(
+        mut self,
+        authority: std::sync::Arc<crate::physical_send::PhysicalSendAuthority>,
+    ) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    /// A unique id per physical send. A receipt is consumed once.
+    fn next_send_id(&self, label: &str) -> String {
+        let counter = self
+            .send_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{label}#{counter}")
+    }
+
     pub async fn send_message(
         &self,
         request: &MessageRequest,
@@ -421,11 +485,25 @@ impl AnthropicClient {
         config: &OAuthConfig,
         request: &OAuthTokenExchangeRequest,
     ) -> Result<OAuthTokenSet, ApiError> {
+        crate::physical_send::authorize_physical_send_or_diagnostic(
+            self.authority.as_deref(), self.diagnostic_send.as_deref(),
+            &crate::physical_send::PhysicalSendRequest {
+                send_id: self.next_send_id("anthropic_oauth_exchange"),
+                endpoint: config.token_url.clone(),
+                method: "POST".to_string(),
+                protocol: "anthropic_oauth_exchange".to_string(),
+                model: String::new(),
+                body_sha256: crate::physical_send::body_digest(
+                    crate::physical_send::form_urlencode(&request.form_params()).as_bytes(),
+                ),
+            }, self.original_request_id.as_deref(),
+        )
+        .await?;
         let response = self
             .http
             .post(&config.token_url)
             .header("content-type", "application/x-www-form-urlencoded")
-            .form(&request.form_params())
+            .body(crate::physical_send::form_urlencode(&request.form_params()))
             .send()
             .await
             .map_err(ApiError::from)?;
@@ -441,11 +519,25 @@ impl AnthropicClient {
         config: &OAuthConfig,
         request: &OAuthRefreshRequest,
     ) -> Result<OAuthTokenSet, ApiError> {
+        crate::physical_send::authorize_physical_send_or_diagnostic(
+            self.authority.as_deref(), self.diagnostic_send.as_deref(),
+            &crate::physical_send::PhysicalSendRequest {
+                send_id: self.next_send_id("anthropic_oauth_refresh"),
+                endpoint: config.token_url.clone(),
+                method: "POST".to_string(),
+                protocol: "anthropic_oauth_refresh".to_string(),
+                model: String::new(),
+                body_sha256: crate::physical_send::body_digest(
+                    crate::physical_send::form_urlencode(&request.form_params()).as_bytes(),
+                ),
+            }, self.original_request_id.as_deref(),
+        )
+        .await?;
         let response = self
             .http
             .post(&config.token_url)
             .header("content-type", "application/x-www-form-urlencoded")
-            .form(&request.form_params())
+            .body(crate::physical_send::form_urlencode(&request.form_params()))
             .send()
             .await
             .map_err(ApiError::from)?;
@@ -540,6 +632,18 @@ impl AnthropicClient {
             "anthropic_messages",
             &self.preparation_binding()?,
         )?;
+        crate::physical_send::authorize_physical_send_or_diagnostic(
+            self.authority.as_deref(), self.diagnostic_send.as_deref(),
+            &crate::physical_send::PhysicalSendRequest {
+                send_id: self.next_send_id("anthropic_messages"),
+                endpoint: request_url.clone(),
+                method: "POST".to_string(),
+                protocol: "anthropic_messages".to_string(),
+                model: request.model.clone(),
+                body_sha256: prepared.wire_request().body_sha256.clone(),
+            }, self.original_request_id.as_deref(),
+        )
+        .await?;
         let request_builder = self.build_request(&request_url).body(prepared.body());
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -573,9 +677,9 @@ impl AnthropicClient {
         };
 
         // Best-effort refinement using the Anthropic count_tokens endpoint.
-        // On any failure (network, parse, auth), fall back to the local
-        // byte-estimate result which already passed above.
-        let Ok(counted_input_tokens) = self.count_tokens(request).await else {
+        // Ordinary network, parse or auth failures fall back to the local
+        // estimate. Physical-send gate refusal is never an advisory failure.
+        let Some(counted_input_tokens) = count_tokens_preflight_result(self.count_tokens(request).await)? else {
             return Ok(());
         };
         let estimated_total_tokens = counted_input_tokens.saturating_add(request.max_tokens);
@@ -593,6 +697,10 @@ impl AnthropicClient {
     }
 
     async fn count_tokens(&self, request: &MessageRequest) -> Result<u32, ApiError> {
+        #[cfg(test)]
+        if self.test_count_gate_refusal {
+            return Err(ApiError::PhysicalSendGate { reason: "test injected refusal".into() });
+        }
         #[derive(serde::Deserialize)]
         struct CountTokensResponse {
             input_tokens: u32,
@@ -604,6 +712,20 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        crate::physical_send::authorize_physical_send_or_diagnostic(
+            self.authority.as_deref(), self.diagnostic_send.as_deref(),
+            &crate::physical_send::PhysicalSendRequest {
+                send_id: self.next_send_id("anthropic_count_tokens"),
+                endpoint: request_url.clone(),
+                method: "POST".to_string(),
+                protocol: "anthropic_count_tokens".to_string(),
+                model: request.model.clone(),
+                body_sha256: crate::physical_send::body_digest(
+                    &serde_json::to_vec(&request_body).unwrap_or_default(),
+                ),
+            }, self.original_request_id.as_deref(),
+        )
+        .await?;
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -1164,6 +1286,15 @@ struct AnthropicErrorBody {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn default_anthropic_api_key_client_refuses_redirects() {
+        crate::http_client::fixture_assert_redirect_refused(super::AnthropicClient::new("fixture").http).await;
+    }
+
+    #[tokio::test]
+    async fn default_anthropic_auth_client_refuses_redirects() {
+        crate::http_client::fixture_assert_redirect_refused(super::AnthropicClient::from_auth(super::AuthSource::ApiKey("fixture".into())).http).await;
+    }
     use super::{
         cache_control_marker, retry_after_from_headers, ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER,
     };

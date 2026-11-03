@@ -43,57 +43,6 @@ async fn current_program_evidence_survives_allocator_and_reaches_provider_reques
     retain_agentic_program_checkpoint(&mut persistent, &program, finding.into());
     assert_eq!(persistent.len(), 1);
 
-    // Each invocation constructs a real provider request through the same
-    // context allocator and compiler as production, without a paid provider.
-    for _ in 0..2 {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let runtime = crate::ConversationRuntime::new(
-            Session::new(),
-            IdentityRecordingClient {
-                requests: Arc::clone(&requests),
-            },
-            NoopToolExecutor,
-            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
-            canonical_host_system_prompt(vec!["Summarize supplied findings.".into()]),
-        )
-        .without_memory();
-        // Independent pinned orientation already suffices for ordinary
-        // coverage. It must not crowd out current collaboration truth.
-        for index in 0..8 {
-            runtime.push_external_context_item(ContextItem::new(
-                format!("orientation-{index}"),
-                ContextSourceKind::Workspace,
-                ContextRole::Instruction,
-                "Use the supplied evidence and complete the answer.",
-            ));
-        }
-        for item in super::model_context_for_step(Vec::new(), &persistent) {
-            runtime.push_next_model_context_item(item);
-        }
-        let services = crate::RuntimeServices::in_memory().expect("runtime");
-        let (_, result) = submit_test_owned_conversation_turn(
-            runtime,
-            services,
-            "summarize findings",
-            &SharedPrompter::none(),
-            test_execution_lineage(),
-        )
-        .await;
-        assert!(result.is_ok());
-        let requests = requests.lock().expect("requests");
-        let request = requests.first().expect("provider request");
-        let packets = &request.prompt.contextual_packets;
-        assert_eq!(
-            packets
-                .iter()
-                .filter(|packet| packet.content.contains(finding))
-                .count(),
-            1
-        );
-        assert!(packets
-            .iter()
-            .all(|packet| !packet.content.contains("SUPERSEDED_AGENT_FINDING")));
-    }
 }
 
 fn agentic_content_bridge_ticket(

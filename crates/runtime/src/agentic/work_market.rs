@@ -781,6 +781,7 @@ mod tests {
         AgentActionEnvelope {
             action_id: format!("claim:{execution_id}"),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective".to_string(),
                 program_id: "program".to_string(),
                 session_id: "session".to_string(),
@@ -1426,6 +1427,7 @@ mod criterion_source_tests {
         AgentActionEnvelope {
             action_id: "publish".to_string(),
             actor: harness_contract::agent_action::AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective-1".to_string(),
                 program_id: "program-1".to_string(),
                 session_id: "session-1".to_string(),

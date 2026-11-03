@@ -28,6 +28,7 @@ struct RecordingExecutionHost {
     inner: Arc<crate::gateway_tool_executor::GatewayToolExecutor>,
     calls: Arc<std::sync::Mutex<Vec<PhysicalCall>>>,
     holds: Arc<std::sync::Mutex<std::collections::BTreeMap<String, PhysicalHold>>>,
+    bounded_missing: Arc<std::sync::atomic::AtomicU8>,
 }
 
 struct PhysicalHold {
@@ -37,6 +38,31 @@ struct PhysicalHold {
 
 #[async_trait::async_trait]
 impl runtime::RuntimeExecutionHost for RecordingExecutionHost {
+    fn bounded_process_authority(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> Result<runtime::tool_host::BoundedProcessAuthority, runtime::ToolError> {
+        if self.bounded_missing.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+            return Err(runtime::ToolError::new("fixture: bounded authority unavailable"));
+        }
+        runtime::RuntimeExecutionHost::bounded_process_authority(self.inner.as_ref(), request)
+    }
+
+    fn bounded_process_lease(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+    ) -> Result<tools::ToolHostLease, runtime::ToolError> {
+        if self.bounded_missing.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            return Err(runtime::ToolError::new("fixture: bounded lease unavailable"));
+        }
+        runtime::RuntimeExecutionHost::bounded_process_lease(self.inner.as_ref(), request)
+    }
+
+    fn bounded_process_plane(&self) -> Option<Arc<runtime::ToolExecutionPlane>> {
+        if self.bounded_missing.load(std::sync::atomic::Ordering::SeqCst) == 3 { return None; }
+        runtime::RuntimeExecutionHost::bounded_process_plane(self.inner.as_ref())
+    }
+
     fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
         runtime::RuntimeExecutionHost::pin_step_catalog(self.inner.as_ref())
     }
@@ -83,9 +109,38 @@ impl runtime::RuntimeExecutionHost for RecordingExecutionHost {
         }
         outcome
     }
+    async fn execute_runtime_tool_with_action_invocation(
+        &self,
+        request: &runtime::RuntimeToolExecutionRequest,
+        capability: &runtime::agentic::action_invocation::VerifiedActionInvocation,
+    ) -> runtime::RuntimeToolExecutionOutcome {
+        self.calls.lock().unwrap().push(PhysicalCall {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            input: request.input.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            parent_execution: request.parent_execution.clone(),
+            attempt: request.parent_execution_attempt,
+        });
+        let outcome = runtime::RuntimeExecutionHost::execute_runtime_tool_with_action_invocation(
+            self.inner.as_ref(), request, capability,
+        ).await;
+        let hold = self.holds.lock().unwrap().remove(&request.tool_use_id);
+        if let Some(hold) = hold {
+            assert_eq!(outcome.status, runtime::RuntimeToolExecutionStatus::Executed);
+            if hold.entered.send(request.clone()).is_ok() {
+                let _ = hold.released.await;
+            }
+        }
+        outcome
+    }
+
 }
 
 struct ProviderRequest {
+    wire_id: usize,
+    body_sha256: String,
+    wire_facts: Arc<std::sync::Mutex<Vec<Value>>>,
     body: Value,
     reply: tokio::sync::oneshot::Sender<Value>,
 }
@@ -250,6 +305,7 @@ struct LoopbackProvider {
     routes: Arc<std::sync::Mutex<Vec<(String, tokio::sync::mpsc::Sender<ProviderRequest>)>>>,
     marker: String,
     task_route_controls: usize,
+    wire_facts: Arc<std::sync::Mutex<Vec<Value>>>,
     pending_request: Option<ProviderRequest>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -272,15 +328,22 @@ impl LoopbackProvider {
             tokio::sync::mpsc::Sender<ProviderRequest>,
         )>::new()));
         let routing = routes.clone();
+        let wire_facts = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let task_wire_facts = wire_facts.clone();
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
+            let mut connection_number = 0_u64;
             loop {
                 tokio::select! {
                     connection = listener.accept() => {
                         let (mut socket, peer) = connection.unwrap();
                         assert!(peer.ip().is_loopback());
+                        connection_number += 1;
+                        let connection_number = connection_number;
+                        eprintln!("b_scope_loopback connection={connection_number} stage=accepted");
                         let sender = sender.clone();
                         let routing = routing.clone();
+                        let wire_facts = task_wire_facts.clone();
                         connections.spawn(async move {
                             let mut bytes = Vec::new();
                             let body = loop {
@@ -305,6 +368,7 @@ impl LoopbackProvider {
                                 }
                                 assert!(bytes.len() < 16 * 1024 * 1024);
                                 bytes.extend_from_slice(&buffer[..count]);
+                                eprintln!("b_scope_loopback connection={connection_number} stage=read bytes={}", bytes.len());
                                 if let Some(offset) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
                                     let headers = String::from_utf8_lossy(&bytes[..offset]);
                                     let length = headers.lines().find_map(|line| {
@@ -313,10 +377,16 @@ impl LoopbackProvider {
                                             .then(|| value.trim().parse::<usize>().unwrap())
                                     }).unwrap();
                                     if bytes.len() >= offset + 4 + length {
-                                        break serde_json::from_slice::<Value>(&bytes[offset + 4..offset + 4 + length]).unwrap();
+                                        use sha2::Digest;
+                                        let raw = &bytes[offset + 4..offset + 4 + length];
+                                        let parsed = serde_json::from_slice::<Value>(raw).unwrap();
+                                        eprintln!("b_scope_loopback connection={connection_number} stage=decoded");
+                                        break (parsed, format!("{:x}", sha2::Sha256::digest(raw)));
                                     }
                                 }
                             };
+                            let (body, body_sha256) = body;
+                            let wire_id = { let mut facts = wire_facts.lock().unwrap(); let id = facts.len(); facts.push(json!({"wire_id":id,"body_sha256":body_sha256,"queue":"receiving","reply":"pending","socket":"pending"})); id };
                             let model = body["model"].as_str().unwrap().to_string();
                             let streaming = body.get("stream").and_then(Value::as_bool)
                                 .expect("explicit loopback wire stream mode");
@@ -342,8 +412,18 @@ impl LoopbackProvider {
                                 .collect::<Vec<_>>();
                             eprintln!("recovery215 wire_authority model={model} system_lines={system_authority:?}");
                             let (reply, response) = tokio::sync::oneshot::channel();
-                            if sender.send(ProviderRequest { body, reply }).await.is_err() { return; }
-                            let Ok(delta) = response.await else { return; };
+                            if sender.send(ProviderRequest { wire_id, body_sha256, wire_facts: wire_facts.clone(), body, reply }).await.is_err() {
+                                eprintln!("b_scope_loopback connection={connection_number} stage=queue_closed");
+                                return;
+                            }
+                            { let mut facts = wire_facts.lock().unwrap(); if facts[wire_id]["queue"] == "receiving" { facts[wire_id]["queue"] = json!("enqueued"); } }
+                            eprintln!("b_scope_loopback connection={connection_number} stage=queued");
+                            let Ok(delta) = response.await else {
+                                eprintln!("b_scope_loopback connection={connection_number} stage=reply_closed");
+                                return;
+                            };
+                            wire_facts.lock().unwrap()[wire_id]["reply"] = json!("received");
+                            eprintln!("b_scope_loopback connection={connection_number} stage=reply_received");
                             eprintln!("recovery188 wire_reply model={model} tool_calls={}", delta.get("tool_calls").is_some());
                             let finish = if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
                             let (content_type, body) = if streaming {
@@ -368,6 +448,8 @@ impl LoopbackProvider {
                                 "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 content_type, body.len(), body,
                             ).as_bytes()).await;
+                            wire_facts.lock().unwrap()[wire_id]["socket"] = json!(if written.is_ok() { "written" } else { "write_error" });
+                            eprintln!("b_scope_loopback connection={connection_number} stage=response_written ok={}", written.is_ok());
                             eprintln!("recovery188 wire_write model={model} result={written:?}");
                         });
                     }
@@ -387,6 +469,7 @@ impl LoopbackProvider {
             routes,
             marker: format!("RECOVERY_{}_LANE", model.to_ascii_uppercase()),
             task_route_controls: 0,
+            wire_facts,
             pending_request: None,
             task,
         }
@@ -399,6 +482,7 @@ impl LoopbackProvider {
         tokio::time::timeout(Duration::from_secs(90), async {
             for _ in 0..2 {
                 let request = self.requests.recv().await.expect("loopback request channel closed");
+                request.wire_facts.lock().unwrap()[request.wire_id]["queue"] = json!("dequeued");
                 assert_eq!(request.body["model"], self.model);
                 let reply = task_route_control_reply(&request.body)
                     .unwrap_or_else(|reason| panic!("recovery206 lane={} {reason}", self.marker));
@@ -4321,6 +4405,7 @@ struct RecoveryServices {
     notification_reader: Option<Arc<runtime::RuntimeEventStore>>,
     physical_calls: Arc<std::sync::Mutex<Vec<PhysicalCall>>>,
     physical_holds: Arc<std::sync::Mutex<std::collections::BTreeMap<String, PhysicalHold>>>,
+    bounded_missing: Arc<std::sync::atomic::AtomicU8>,
     lane_hits: Option<Arc<std::sync::atomic::AtomicU64>>,
     delivery_hits:
         Option<crate::session_runtime_bridge::terminal_delivery_faults::NotificationWitness>,
@@ -4356,6 +4441,7 @@ impl RecoveryServices {
             notification_reader,
             candidate_graph,
             None,
+            false,
         )
         .await
     }
@@ -4368,7 +4454,15 @@ impl RecoveryServices {
         let mut config = runtime::ProviderResourceConfig::default();
         config.global = runtime::ProviderQuotaPolicy::new(1, 1, 1, 0);
         config.fallback = runtime::ProviderQuotaPolicy::new(1, 1, 1, 0);
-        Self::start_composed(root, topology, providers, None, None, Some(config)).await
+        Self::start_composed(root, topology, providers, None, None, Some(config), false).await
+    }
+
+    // Only the selected real-Session local loopback fixture opts into the
+    // explicit unauthenticated diagnostic transport.
+    async fn start_with_diagnostic_loopback(
+        root: &Path, topology: SelectedStorageTopology, providers: Arc<runtime::ProviderRegistry>,
+    ) -> Self {
+        Self::start_composed(root, topology, providers, None, None, None, true).await
     }
 
     async fn start_composed(
@@ -4378,6 +4472,7 @@ impl RecoveryServices {
         notification_reader: Option<Arc<runtime::RuntimeEventStore>>,
         candidate_graph: Option<String>,
         provider_config: Option<runtime::ProviderResourceConfig>,
+        diagnostic_loopback: bool,
     ) -> Self {
         use crate::services::session_service::{
             activation::SessionActivationCoordinator, presence::SessionPresenceLedger,
@@ -4421,13 +4516,22 @@ impl RecoveryServices {
         );
         let physical_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let physical_holds = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let bounded_missing = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let recording_host = Arc::new(RecordingExecutionHost {
+            bounded_missing: bounded_missing.clone(),
             inner: executor.clone(),
             calls: physical_calls.clone(),
             holds: physical_holds.clone(),
         });
         let config_home = root.join("home");
-        let services = runtime::RuntimeServices::builder(&config_home, root.join("workspace"))
+        let mut builder = runtime::RuntimeServices::builder(&config_home, root.join("workspace"));
+        if diagnostic_loopback {
+            let cache = runtime::ProviderClientTemplateCache::diagnostic(
+                "isolated real-Session test using local loopback; unauthenticated",
+            ).expect("explicit loopback diagnostic reason");
+            builder = builder.provider_template_cache(Arc::new(cache));
+        }
+        let services = builder
             .provider_resource_config(provider_config.unwrap_or_default())
             .provider_registry(providers.clone())
             .tool_execution_host(recording_host)
@@ -4529,6 +4633,7 @@ impl RecoveryServices {
             notification_reader,
             physical_calls,
             physical_holds,
+            bounded_missing,
             lane_hits,
             delivery_hits,
             recovered_candidate,
@@ -5440,3 +5545,1771 @@ fn collaboration_admission_and_final_evidence_gate_on_large_stack() {
 
 #[path = "rc_session_receipt.rs"]
 mod rc_session_receipt;
+
+// Real Session ingress supplies the turn control and its original graph
+// identity; the local provider only supplies deterministic model responses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "run alone in an isolated process with an exclusive Session PG fixture"]
+async fn b_scope_refusal_and_independent_read_reach_original_gateway_provider() {
+    use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
+    use futures::FutureExt;
+    struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value { std::env::set_var(key, value); }
+                else { std::env::remove_var(key); }
+            }
+        }
+    }
+    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE",
+        "COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND"];
+    let _restore = Restore(keys.into_iter().map(|key| (key, std::env::var_os(key))).collect());
+    std::env::set_var("COWD_EVAL_HARNESS", "1");
+    std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
+    std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
+    // This independent test process sends only to its own loopback listener;
+    // the diagnostic capability is not a production send authorization.
+    std::env::set_var("COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND", "local loopback fixture");
+    eprintln!("b_scope_script stage=diagnostic_send_configured endpoint=loopback");
+    let root = fixture_root();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("target.txt"), "scope fixture content").unwrap();
+    std::fs::write(workspace.join("outside.txt"), "must not be read").unwrap();
+    let mut provider = LoopbackProvider::start("root").await;
+    let providers = provider_registry(&[&provider]);
+    let topology = SelectedStorageTopology::compose_for_test(&root.path().join("home"), &workspace).unwrap();
+    let services = RecoveryServices::start(root.path(), topology, providers).await;
+    let runtime = services.runtime.runtime_services();
+    let session = format!("b-scope-ingress:{}", uuid::Uuid::new_v4());
+    let identity = std::sync::Mutex::new(None::<(String, String, String)>);
+    let run = std::panic::AssertUnwindSafe(async {
+        let mut request = EnsureSessionRequest::new(&session, Some(provider.model.clone()), SessionSource::Tui);
+        request.owner_principal_id = Some("b-scope-local-fixture".into());
+        services.session.create_user_session(request).await.unwrap();
+        let control = json!({"corpus_id":"live-scenarios-v1", "workspace_fixture":"none",
+            "provider_constraint":"normal", "temperature_milli":0,
+            "resource_scopes":["read:target.txt"], "prompt":"Read target.txt."});
+        let envelope = harness_contract::turn::SessionInputEnvelope::text(&session,
+            harness_contract::turn::InputSourceKind::Tui,
+            &format!("COWD_EVAL_CONTROL {control}\nRead target.txt and report its content."));
+        let request_id = envelope.idempotency_key.clone();
+        let admitted = services.session.admit_input(envelope).await.unwrap();
+        let turn = admitted.turn_id;
+        let graph = admitted.execution_graph_id;
+        *identity.lock().unwrap() = Some((request_id.clone(), turn.clone(), graph.clone()));
+        let input = services.session.runtime_input(&request_id).await.unwrap().expect("original Session input");
+        assert_eq!(input.session_id, session);
+        assert_eq!(input.turn_id, turn);
+        eprintln!("b_scope_script stage=await_initial_request");
+        provider.tool("b-scope-discover", "tool_search", json!({"query":"select:read_file"}), None).await;
+        eprintln!("b_scope_script stage=discovery_reply_submitted");
+        let request = provider.next().await;
+        eprintln!("b_scope_script stage=awaiting_mixed_call_response");
+        assert!(request.body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool|
+            tool["function"]["name"] == "read_file")), "original next Step must expose read_file");
+        request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[
+            {"index":0,"id":"b-scope-outside","type":"function","function":{"name":"read_file","arguments":json!({"path":"outside.txt"}).to_string()}},
+            {"index":1,"id":"b-scope-allowed","type":"function","function":{"name":"read_file","arguments":json!({"path":"target.txt"}).to_string()}}
+        ]})).unwrap();
+        eprintln!("b_scope_script stage=mixed_reply_submitted");
+        let next = provider.next().await;
+        eprintln!("b_scope_script stage=continuation_received");
+        let messages = next.body["messages"].as_array().expect("actual next provider messages");
+        let refused = messages.iter().find(|message| message["role"] == "tool"
+            && message["tool_call_id"] == "b-scope-outside").expect("original refusal delivered");
+        let refused = refused["content"].to_string();
+        assert!(refused.contains("evaluation_scope_exceeded") && refused.contains("read:target.txt")
+            && refused.contains("policy and lease still apply"), "{refused}");
+        let allowed = messages.iter().find(|message| message["role"] == "tool"
+            && message["tool_call_id"] == "b-scope-allowed").expect("independent result delivered");
+        assert!(allowed["content"].to_string().contains("scope fixture content"));
+        let calls = services.physical_calls.lock().unwrap();
+        assert!(calls.iter().any(|call| call.tool_use_id == "b-scope-allowed"));
+        assert!(calls.iter().all(|call| call.tool_use_id != "b-scope-outside"));
+        drop(calls);
+        let facts = runtime.event_reader().all_events(4096).unwrap();
+        assert!(facts.iter().any(|event| event.kind == "execution.call.refused"
+            && event.payload["request"]["tool_use_id"] == "b-scope-outside"));
+        assert!(facts.iter().any(|event| event.kind == "execution.read.receipt"
+            && event.payload.to_string().contains("b-scope-allowed")));
+        assert!(facts.iter().all(|event| event.kind != "execution.effect.intent"
+            || !event.payload.to_string().contains("b-scope-outside")));
+        let undispatched = facts.iter().filter_map(|event| event.payload.get("no_dispatch"))
+            .flat_map(|fact| fact["calls"].as_array().into_iter().flatten()).collect::<Vec<_>>();
+        assert_eq!(undispatched.iter().filter(|call| call["call_id"] == "b-scope-outside").count(), 1);
+        assert!(undispatched.iter().all(|call| call["call_id"] != "b-scope-allowed"));
+        next.reply.send(json!({"role":"assistant","content":"scope fixture content"})).unwrap();
+    }).catch_unwind().await;
+    if let Some((request_id, turn, graph)) = identity.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        let active = services.runtime.stop_accepting_for_recovery();
+        if let Ok(Some(input)) = services.session.runtime_input(&request_id).await {
+            let _ = services.session.cancel_input(&session,
+                harness_contract::turn::SessionInputId::from_string(input.input_id.to_string()),
+                "local scope fixture complete").await;
+        }
+        let _ = services.session.cancel_active_execution(&session, &turn, &graph, "local scope fixture complete");
+        let _ = runtime.cancel_execution_tree(&graph, "local scope fixture complete").await;
+        let drain = services.runtime.wait_for_active_turns(active.len(), Duration::from_secs(30)).await;
+        assert!(drain.remaining_turn_ids.is_empty(), "original Session turn must drain");
+    }
+    drop(runtime);
+    drop(provider);
+    let cleanup = std::panic::AssertUnwindSafe(services.stop()).catch_unwind().await;
+    if let Err(panic) = run { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
+}
+
+// Metadata-only fallback for either a missing private directory or a failed
+// private write. It never prints request/response bodies or raw error text.
+fn c_bounded_original_failure_summary(
+    services: &runtime::RuntimeServices, session: &str, turn: &str, root: Option<&String>,
+) -> Value {
+    let reader = services.event_reader();
+    let program = harness_contract::agent_action::program_id_for_objective(
+        &harness_contract::agent_action::root_objective_id(session, turn));
+    let program_stream = format!("agentic-program:{program}");
+    let records = reader.all_events(100_001);
+    let mut facts = Vec::new();
+    let mut team_events = Vec::new();
+    let mut first_failure: Option<Value> = None;
+    if let Ok(events) = &records {
+        let mut ordered = events.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+        for event in ordered {
+            let same_scope = event.stream_id == program_stream
+        || root.is_some_and(|root| event.stream_id == *root)
+        || event.refs.iter().any(|reference|
+            (reference.kind == "turn" && reference.id == turn)
+            || (reference.kind == "execution_graph" && root == Some(&reference.id)))
+        || event.activity_binding().is_some_and(|activity|
+            activity.session_id == session && activity.turn_id == turn);
+            let call_id = event.payload["tool_use_id"].as_str()
+        .or_else(|| event.payload["outcome"]["tool_use_id"].as_str())
+        .or_else(|| event.payload["request"]["tool_use_id"].as_str());
+            let plan_matches = event.payload["tasks"].as_array().is_some_and(|tasks|
+        tasks.iter().any(|task| task["tool_call_id"].as_str() == Some("c-ingress-team")));
+            if !same_scope { continue; }
+            let has_error = !event.payload["error"].is_null() || !event.payload["outcome"]["error"].is_null();
+            let kind = match event.kind.as_str() {
+                "agentic.action_applied" => "agentic.action_applied",
+                "execution.call.refused" => "execution.call.refused",
+                "execution.effect.intent" => "execution.effect.intent",
+                "execution.effect.receipt" => "execution.effect.receipt",
+                "execution.read.receipt" => "execution.read.receipt",
+                "execution.agent_tool.receipt" => "execution.agent_tool.receipt",
+                "tool.execution_plan.created" => "tool.execution_plan.created",
+                _ => "other",
+            };
+            let status = match event.status.as_deref() {
+                Some("failed") => "failed", Some("error") => "error", Some("refused") => "refused",
+                Some("rejected") => "rejected", Some("completed") => "completed",
+                Some("applied") => "applied", Some("executed") => "executed",
+                Some("running") => "running", _ => "other_or_absent",
+            };
+            let fact = json!({"sequence":event.sequence,"kind":kind,"status":status,
+                "cursor":event.commit_cursor,
+                "call":if call_id == Some("c-ingress-team") || plan_matches { Some("c-ingress-team") } else { None },
+                "error_present":has_error});
+            if first_failure.is_none() && (has_error || event.status.as_deref().is_some_and(|status|
+        matches!(status, "failed" | "error" | "refused" | "rejected"))) {
+        first_failure = Some(fact.clone());
+            }
+            if (call_id == Some("c-ingress-team") || plan_matches) && team_events.len() < 16 {
+        team_events.push(fact.clone());
+            }
+            if facts.len() < 64 { facts.push(fact); }
+        }
+    }
+    json!({"session_id":session,"turn_id":turn,"root_graph_id":root,
+        "program_id":program,"events":facts,"limit":64,
+        "first_failure_candidate":first_failure,"team_call_events":team_events,
+        "association":"original stream/ref/activity candidate; owner binding still requires verification",
+        "source_read_ok":records.is_ok(),
+        "source_possibly_truncated":records.as_ref().is_ok_and(|events| events.len() >= 100_001)})
+}
+
+// Shared v3 original-facts export, before either fixture shuts down.
+async fn c_export_original_failure(
+    services: &runtime::RuntimeServices,
+    calls: &std::sync::Mutex<Vec<PhysicalCall>>,
+    session: &str, turn: &str, root: Option<String>, model: &str,
+    failure: &str, turn_control: &str, goal_source: &str, root_task: Option<&str>,
+    route_facts: Option<Value>,
+) {
+    // Read original facts before cleanup; no new observation or receipt is
+    // written to Runtime. tmpfs is mandatory; never fall back to disk.
+    #[cfg(target_os = "linux")]
+    let tmpfs_ok = std::fs::read_to_string("/proc/self/mountinfo").ok().is_some_and(|mounts| {
+        mounts.lines().filter_map(|line| line.split_once(" - ")).any(|(left, right)| {
+            left.split_whitespace().nth(4) == Some("/dev/shm")
+                && right.split_whitespace().next() == Some("tmpfs")
+        })
+    });
+    #[cfg(not(target_os = "linux"))]
+    let tmpfs_ok = false;
+    // The PG owner deliberately puts compile TMPDIR on the data disk. It
+    // separately provides an owned, mode-0700 tmpfs evidence directory.
+    let private_parent = std::env::var_os("COWD_FIXTURE_EVIDENCE_DIR")
+        .map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    #[cfg(target_os = "linux")]
+    let private_parent_ok = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(&private_parent);
+        let own_uid = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
+        let on_tmpfs = std::process::Command::new("stat")
+            .args(["-f", "-c", "%T"]).arg(&private_parent).output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"tmpfs\n");
+        on_tmpfs && private_parent.canonicalize().is_ok()
+            && metadata.is_ok_and(|m| m.file_type().is_dir()
+                && m.permissions().mode() & 0o777 == 0o700 && Some(m.uid()) == own_uid)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let private_parent_ok = false;
+    let directory = if tmpfs_ok && private_parent_ok {
+        tempfile::Builder::new().prefix("cowd-delegated-evidence-")
+            .tempdir_in(&private_parent).and_then(|dir| {
+                #[cfg(unix)] {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+                }
+                Ok(dir)
+            })
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "verified private tmpfs unavailable"))
+    };
+    match directory {
+        Ok(directory) => {
+            let reader = services.event_reader();
+            let root = root.clone();
+            let program = harness_contract::agent_action::program_id_for_objective(
+                &harness_contract::agent_action::root_objective_id(session, turn));
+            let program_stream = format!("agentic-program:{program}");
+            let mut program_events = reader.list_stream(&program_stream);
+            if let Ok(events) = &mut program_events {
+                events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+            }
+            let mut graph_ids = std::collections::BTreeSet::new();
+            if let Some(root) = root.as_ref() { graph_ids.insert(root.clone()); }
+            if let Ok(events) = &program_events {
+                for event in events {
+                    if let Some(id) = event.payload["envelope"]["action"]["input"]["execution_id"].as_str() {
+                        graph_ids.insert(id.to_string());
+                    }
+                }
+            }
+            let graphs = graph_ids.iter().map(|id| {
+                let graph = services.graph_state_store().load(id).map_err(|error| error.to_string());
+                json!({"graph_id":id,"graph":graph.as_ref().ok(),"error":graph.as_ref().err()})
+            }).collect::<Vec<_>>();
+            let all = reader.all_events(100_001);
+            let mut matching = all.as_ref().ok().map(|events| events.iter().filter(|event| {
+                event.stream_id == program_stream
+                    || event.stream_id == format!("session:{session}")
+                    || root.as_ref().is_some_and(|root| event.stream_id == format!("goal:goal:{root}"))
+                    || (event.kind.starts_with("goal.") && event.payload["session_id"].as_str() == Some(session))
+                    || graph_ids.contains(&event.stream_id)
+                    || event.refs.iter().any(|reference| graph_ids.contains(&reference.id))
+                    || event.activity_binding().is_some_and(|activity|
+                        activity.session_id == session && activity.turn_id == turn)
+            }).collect::<Vec<_>>());
+            if let Some(events) = &mut matching {
+                events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+            }
+            let timeline = reader.session_timeline_events(session, None, 100);
+            let captured_calls = calls.lock().unwrap_or_else(|error| error.into_inner()).iter().map(|call| json!({
+                "tool_use_id":call.tool_use_id,"tool_name":call.tool_name,"input":call.input,
+                "idempotency_key":call.idempotency_key,"parent_execution":call.parent_execution,"attempt":call.attempt,
+            })).collect::<Vec<_>>();
+            // Use the public, session-scoped reader on each original event's
+            // artifact reference. A prepared body may be rejected; preserve
+            // that error instead of bypassing the owner or changing scope.
+            let mut transcript_bodies = Vec::new();
+            if let Some(events) = matching.as_ref() {
+                for (index, event) in events.iter().filter(|event| matches!(event.kind.as_str(), "execution.host.transcript" | "goal.observation")).enumerate() {
+                    let mut fact = json!({"event_id":event.event_id,"stream_id":event.stream_id,
+                        "kind":event.kind,
+                        "body_status":"unknown", "truncated":"unknown",
+                        "association":"candidate from original event; owner and node binding require independent verification"});
+                    let pointer = if event.kind == "goal.observation" { "/observation_body/body/artifact" } else { "/body/body/artifact" };
+                    match event.payload.pointer(pointer) {
+                        None => {
+                            fact["error"] = json!("artifact reference missing or body inline; inspect original event");
+                        },
+                        Some(value) => match serde_json::from_value::<runtime::ArtifactRef>(value.clone()) {
+                            Err(error) => fact["error"] = json!(format!("invalid original ArtifactRef: {error}")),
+                            Ok(artifact) => {
+                                fact["artifact"] = json!(artifact);
+                                match services.artifact_store().read(&artifact, &format!("session:{session}"), None).await {
+                                    Err(error) => fact["error"] = json!(format!("ArtifactStore::read: {error}")),
+                                    Ok(bytes) => {
+                                        let name = format!("original-body-{index}.body");
+                                        let path = directory.path().join(&name);
+                                        #[cfg(unix)] use std::os::unix::fs::OpenOptionsExt;
+                                        use std::io::Write;
+                                        let write = (|| -> std::io::Result<()> {
+                                            let mut options = std::fs::OpenOptions::new();
+                                            options.write(true).create_new(true);
+                                            #[cfg(unix)] options.mode(0o600);
+                                            options.open(&path)?.write_all(&bytes)
+                                        })();
+                                        fact["bytes_read"] = json!(bytes.len());
+                                        fact["truncated"] = json!(false);
+                                        match write {
+                                            Ok(()) => { fact["body_status"] = json!("exported"); fact["file"] = json!(name); }
+                                            Err(error) => fact["error"] = json!(format!("private tmpfs write: {error}")),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    transcript_bodies.push(fact);
+                }
+            }
+            let data = json!({
+                "session_id":session,"turn_id":turn,"root_graph_id":root,"program_id":program,
+                "failure":failure,
+                "provider_route_facts":route_facts,
+                "preconditions":{
+                    "session_policy":services.session_execution_policy(session),
+                    "root_task":root_task.map(|id| format!("{:?}", services.task_aggregate_service().get(id))),
+                    "goal":root.as_ref().map(|root| services.goal_store().get(&format!("goal:{root}"))),
+                    "gateway_host_installed":services.tool_execution_host().is_some(),
+                    "gateway_catalog_installed":services.tool_execution_host().and_then(|host| host.pin_step_catalog()).is_some(),
+                    "provider_model_resolves":services.provider_registry().pin().resolve(model).is_some(),
+                    "provider_configured_context_window":services.provider_registry().pin().configured_context_window(model),
+                    "builtin_direct_definition":format!("{:?}", services.definition_registry().resolve_agent(
+                        &harness_contract::agent::AgentDefinitionId::new(harness_contract::agent::DefinitionScope::Builtin, "cowd/direct").unwrap(),
+                        harness_contract::agent::RevisionSelector::LatestApprovedStable)),
+                    "session_input_router_installed":services.session_input_router().is_some(),
+                    "session_history_reader_installed":services.session_history_reader().is_some(),
+                    "turn_control":turn_control,
+                    "root_causal_bus":"unknown: no public inspection port",
+                    "root_step_authorization":"Gateway follows existing per-call policy and Step validation; exact signed authorization not retained by existing call recorder",
+                    "goal_source":goal_source
+                },
+                "program_events":program_events.as_ref().ok(),"program_events_error":program_events.as_ref().err(),
+                "graphs":graphs,"agent_runs":services.agent_runtime().list().into_iter().filter(|run| graph_ids.contains(&run.graph_id)).collect::<Vec<_>>(),
+                "events":matching,"all_events_error":all.as_ref().err(),
+                "event_selection":"original graph refs or same fixture session/turn; nested candidates require separate graph binding verification",
+                "all_events_limit":100001,"all_events_possibly_truncated":all.as_ref().ok().is_some_and(|events| events.len() >= 100001),
+                "event_order":"commit_cursor, transaction_index",
+                "earliest_event_conclusion":if all.is_err() || all.as_ref().is_ok_and(|events| events.len() >= 100001) { "unknown: global read failed or may be truncated" } else { "global read within limit; earliest matching event is first after sort, subject to run correlation" },
+                "session_timeline":timeline.as_ref().ok().map(|page| json!({"events":page.events,"has_more":page.has_more,"complete_through_cursor":page.complete_through_cursor})),
+                "session_timeline_error":timeline.as_ref().err(),
+                "existing_host_call_recorder":captured_calls,
+                "host_transcript_event_count":matching.as_ref().map(|events| events.iter().filter(|event| event.kind == "execution.host.transcript").count()),
+                "original_body_candidates":transcript_bodies,
+                "host_transcript_reader":"public ArtifactStore::read; committed_host_transcript verification is crate-private"
+            });
+            let path = directory.path().join("original-facts.json");
+            #[cfg(unix)] use std::os::unix::fs::OpenOptionsExt;
+            use std::io::Write;
+            let write = (|| -> Result<(), String> {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)] options.mode(0o600);
+                let mut file = options.open(&path).map_err(|error| error.to_string())?;
+                let bytes = serde_json::to_vec_pretty(&data).map_err(|error| error.to_string())?;
+                file.write_all(&bytes).map_err(|error| error.to_string())
+            })();
+            let kept = directory.keep();
+            match write {
+                Ok(()) => eprintln!("private tmpfs original facts: {}", kept.display()),
+                Err(error) => eprintln!("private tmpfs fact export failed at {}: {error}; bounded_original_summary={}",
+                    kept.display(), c_bounded_original_failure_summary(services, session, turn, root.as_ref())),
+            }
+        }
+        Err(error) => eprintln!("private tmpfs fact export unavailable: {error}; bounded_original_summary={}",
+            c_bounded_original_failure_summary(services, session, turn, root.as_ref())),
+    }
+}
+
+// Correlate exact received wire bytes with original Session packed and Runtime
+// step facts. Missing, truncated or non-unique evidence fails closed.
+async fn c_route_owner(
+    services: &RecoveryServices, request: &ProviderRequest, session: &str,
+    turn: &str, root: &str, program: &str, task: Option<&str>,
+) -> Result<bool, String> {
+    let rows = services.topology.session_store.get_session_domain_events_by_kind_limited(
+        session, "context.provider_request_packed", 0, 10_001).await.map_err(|e| e.to_string())?;
+    if rows.len() >= 10_001 { return Err("packed Session events possibly truncated".into()); }
+    let mut packed = Vec::new();
+    for row in rows {
+        let event = session::SessionDomainEvent::from_session_event(&row).map_err(|e| e.to_string())?;
+        if event.session_id == session && event.payload["turn_id"] == turn
+            && event.payload["body_sha256"] == request.body_sha256 { packed.push(event); }
+    }
+    if packed.len() != 1 { return Err(format!("packed wire match count {}", packed.len())); }
+    let payload = &packed[0].payload;
+    let step_id = payload.pointer("/step_render/step_id").and_then(Value::as_str).ok_or("packed step missing")?;
+    let execution = payload["execution_id"].as_str().ok_or("packed execution missing")?;
+    let events = services.runtime.runtime_services().event_reader().all_events(100_001)?;
+    if events.len() >= 100_001 { return Err("Runtime step events possibly truncated".into()); }
+    let steps = events.iter().filter(|event| event.kind == "model.step_bound"
+        && event.payload["identity"]["step_id"] == step_id).collect::<Vec<_>>();
+    if steps.len() != 1 { return Err(format!("step match count {}", steps.len())); }
+    let render_attempt = payload.pointer("/step_render/attempt_id").and_then(Value::as_str)
+        .ok_or("packed provider attempt missing")?;
+    let render_catalog = payload.pointer("/step_render/catalog_digest").and_then(Value::as_str)
+        .ok_or("packed catalog missing")?;
+    if steps[0].payload["provider_attempt"]["attempt_id"] != render_attempt
+        || steps[0].payload["catalog_digest"] != render_catalog {
+        return Err("packed/step provider attempt or catalog mismatch".into());
+    }
+    let identity = &steps[0].payload["identity"];
+    if identity["session_id"] != session || identity["turn_id"] != turn || identity["execution_id"] != execution {
+        return Err("packed/step session, turn or execution mismatch".into());
+    }
+    if execution == root && identity["run_ref"].is_null() { return Ok(false); }
+    let task = task.ok_or("delegated request before Task is known")?;
+    let run_id = identity["run_ref"].as_str().ok_or("delegated run missing")?;
+    let runtime = services.runtime.runtime_services();
+    let runs = runtime.agent_runtime().list().into_iter().filter(|run| run.run_id == run_id && run.session_id == session).collect::<Vec<_>>();
+    if runs.len() != 1 { return Err(format!("original run match count {}", runs.len())); }
+    let run = &runs[0];
+    let binding = run.agentic_binding.as_ref().ok_or("run Program binding missing")?;
+    let mode = match &binding.focus {
+        harness_contract::agent::AgenticExecutionFocus::TaskExecute { task_ref } if task_ref == task =>
+            harness_contract::agent_action::AgentAttemptMode::Execute,
+        harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } if task_ref == task =>
+            harness_contract::agent_action::AgentAttemptMode::Review,
+        _ => return Err("run Program/Task owner mismatch".into()),
+    };
+    if binding.program_id != program { return Err("run Program owner mismatch".into()); }
+    // Native Host step execution is the original run id, not the
+    // AgentTask graph id. Verify the run's frozen physical coordinates.
+    let run_identity = serde_json::to_value(&run.execution_identity).map_err(|e| e.to_string())?;
+    if execution != run_id || identity["task_ref"] != run.task_id
+        || run_identity["agent_run_id"] != run_id || run_identity["graph_id"] != run.graph_id
+        || run_identity["node_id"] != run.node_id || run_identity["turn_id"] != turn
+        || run_identity["session_id"] != session {
+        return Err("step/run physical execution identity mismatch".into());
+    }
+    let graph = runtime.graph_state_store().load(&run.graph_id).map_err(|e| e.to_string())?;
+    let node = graph.nodes.iter().find(|node| node.id == run.node_id).ok_or("AgentTask node missing")?;
+    let packet: harness_contract::agent::AgentTaskPacket = serde_json::from_str(&node.payload_ref).map_err(|e| e.to_string())?;
+    if packet.run_id() != run_id || packet.graph_id() != run.graph_id || packet.node_id() != run.node_id
+        || packet.session_id() != session || packet.attempt != run.attempt { return Err("run/packet physical identity mismatch".into()); }
+    let projection = runtime.agent_action_service().project(program).map_err(|e| e.to_string())?;
+    let active = projection.tasks.get(task).and_then(|task| task.active_attempts.get(&run.graph_id))
+        .is_some_and(|attempt| attempt.mode == mode
+            && attempt.agent_id == binding.agent_id && attempt.membership_id == binding.membership_id);
+    if !active {
+        // Only the original executor may finish its response after its own
+        // submit removed it from active_attempts. Never route it as a reviewer
+        // or use this historical evidence to authorize another action.
+        let has_submit_result = request.body["messages"].as_array().is_some_and(|messages|
+            messages.iter().any(|message| message["role"] == "tool" && message["tool_call_id"] == "d-original-submit"));
+        if mode != harness_contract::agent_action::AgentAttemptMode::Execute || !has_submit_result
+            || packet.agentic_binding.as_ref() != Some(binding) {
+            return Err("Program original attempt owner mismatch".into());
+        }
+        let program_stream = format!("agentic-program:{program}");
+        let mut dispatches = Vec::new();
+        let mut submissions = Vec::new();
+        for event in &events {
+            if event.stream_id != program_stream || event.kind != "agentic.action_applied" { continue; }
+            let envelope = &event.payload["envelope"];
+            let action = &envelope["action"];
+            let input = &action["input"];
+            if action["kind"] == "task_attempt_dispatch" && input["task_ref"] == task
+                && input["execution_id"] == run.graph_id && input["mode"] == "execute"
+                && input["agent_ref"] == binding.agent_id && input["membership_id"] == binding.membership_id {
+                dispatches.push(event);
+            }
+            if action["kind"] == "task_submit" && input["task_ref"] == task
+                && envelope["actor"]["program_id"] == program && envelope["actor"]["session_id"] == session
+                && envelope["actor"]["turn_id"] == turn && envelope["actor"]["execution_id"] == run.graph_id
+                && envelope["actor"]["agent_id"] == binding.agent_id {
+                submissions.push(event);
+            }
+        }
+        if dispatches.len() != 1 || submissions.len() != 1
+            || dispatches[0].commit_cursor >= submissions[0].commit_cursor
+            || submissions[0].commit_cursor >= steps[0].commit_cursor {
+            return Err("submitted original execution evidence missing or ambiguous".into());
+        }
+        let action_key = submissions[0].payload["envelope"]["action_id"].as_str()
+            .ok_or("submitted original action identity missing")?;
+        let primary_stream = format!("execution-effect:{action_key}");
+        let index_stream = format!("execution-agent-receipts:{}:{}:{}", run.graph_id, run.node_id, run.attempt);
+        let primaries = events.iter().filter(|event| event.stream_id == primary_stream
+            && event.kind == "execution.effect.receipt" && event.payload["idempotency_key"] == action_key).collect::<Vec<_>>();
+        let indices = events.iter().filter(|event| event.stream_id == index_stream
+            && event.kind == "execution.agent_tool.receipt" && event.payload["idempotency_key"] == action_key).collect::<Vec<_>>();
+        if primaries.len() != 1 || indices.len() != 1 { return Err("submitted original receipt missing or ambiguous".into()); }
+        let (primary, index) = (primaries[0], indices[0]);
+        let outcome = &primary.payload["outcome"];
+        let original_output = outcome["output"].as_str().ok_or("submitted original output missing")?;
+        let messages = request.body["messages"].as_array().ok_or("original provider messages missing")?;
+        let results = messages.iter().filter(|message| message["role"] == "tool"
+            && message["tool_call_id"] == "d-original-submit").collect::<Vec<_>>();
+        if results.len() != 1 || results[0]["content"].as_str() != Some(original_output)
+            || outcome["status"] != "executed" || !outcome["error"].is_null()
+            || outcome["tool_use_id"] != "d-original-submit" || outcome["tool_name"] != "task_submit"
+            || primary.payload["replay"]["call_id"] != "d-original-submit"
+            || primary.payload["replay"]["session_id"] != session
+            || primary.payload["replay"]["parent_execution"]["execution_id"] != run.graph_id
+            || primary.payload["replay"]["parent_execution"]["node_id"] != run.node_id
+            || primary.payload["replay"]["parent_execution_attempt"].as_u64() != Some(u64::from(run.attempt))
+            || primary.transaction_id != index.transaction_id || primary.commit_cursor != index.commit_cursor
+            || primary.transaction_index >= index.transaction_index || primary.payload["outcome"] != index.payload["outcome"]
+            || submissions[0].commit_cursor >= primary.commit_cursor || primary.commit_cursor >= steps[0].commit_cursor {
+            return Err("submitted original call outcome is failed, unknown or mismatched".into());
+        }
+    }
+    let parent = harness_contract::execution_graph::ExecutionParentBinding { execution_id: run.graph_id.clone(), node_id: run.node_id.clone() };
+    let actor = runtime.resolve_agent_action_actor_for_attempt(&parent, run.attempt, None).await?;
+    if actor.session_id != session || actor.turn_id != turn || actor.program_id != program {
+        return Err("original NodesStarted actor scope mismatch".into());
+    }
+    Ok(true)
+}
+
+async fn c_root_tool(
+    services: &RecoveryServices, provider: &mut LoopbackProvider, session: &str, turn: &str,
+    graph: &str, program: &str, id: &str, name: &str, input: Value,
+) {
+    let request = provider.next().await;
+    assert!(!c_route_owner(services, &request, session, turn, graph, program, None).await.expect("unique root wire owner"));
+    request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[{
+        "index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}
+    }]})).expect("root provider reply");
+}
+
+// Explicit PG integration gate: all model responses are served by the private
+// loopback fixture, while Session admission and worker ownership are real.
+#[tokio::test]
+#[ignore = "requires isolated COWD_TEST_POSTGRES_URL"]
+async fn c_delegated_gateway_session_ingress_native_claim_original_attempt() {
+    c_original_session_worker_fixture(None).await;
+}
+
+// Same production Session/Program/Task producer as the claim test. The only
+// variant is the capability requested and the local provider's next call.
+#[tokio::test]
+#[ignore = "requires isolated COWD_TEST_POSTGRES_URL and a working bounded process sandbox"]
+async fn b_delegated_conversation_ticket_bounded_compute_original_producer() {
+    c_original_session_worker_fixture(Some(0)).await;
+}
+
+#[tokio::test]
+#[ignore = "run alone with isolated Session PG and the real producer fixture"]
+async fn b_delegated_conversation_ticket_missing_bounded_capabilities_fail_closed() {
+    for missing in 1..=3 { c_original_session_worker_fixture(Some(missing)).await; }
+}
+
+// Inspect only the original Session plan and the corresponding durable receipt
+// pair for this exact root call. A tool message by itself is not a read.
+fn c_verified_root_artifact_page(
+    services: &RecoveryServices, request: &ProviderRequest, session: &str, turn: &str,
+    root: &str, call: &str, selector: &str, expected_start: u64, expected_total: Option<u64>,
+    expected_source: Option<(&str, u64)>,
+) -> Result<(Option<Value>, u64, u64, String, u64), String> {
+    let runtime = services.runtime.runtime_services();
+    let events = runtime.event_reader().list_stream(&format!("session:{session}"))?;
+    let refusals: Vec<_> = events.iter().filter(|event| event.kind == "tool.call.rejected_before_dispatch"
+        && event.payload["tool_call_id"] == call).collect();
+    if !refusals.is_empty() { return Err(format!("original root read refused before dispatch: {}", refusals[0].payload["reason"].as_str().unwrap_or("unknown"))); }
+    let tasks: Vec<_> = events.iter().filter(|event| event.kind == "tool.execution_plan.created"
+        && event.actor.as_deref() == Some("conversation_runtime"))
+        .flat_map(|event| event.payload["tasks"].as_array().into_iter().flatten())
+        .filter(|task| task["tool_call_id"] == call && task["tool_name"] == "read_ref").collect();
+    if tasks.len() != 1 { return Err("original root read plan missing or ambiguous".into()); }
+    let step: runtime::step_snapshot::StepCallBinding = serde_json::from_value(tasks[0]["step_binding"].clone())
+        .map_err(|_| "original root read Step binding malformed")?;
+    if step.origin.call_id != call || step.snapshot.identity.session_id != session
+        || step.snapshot.identity.turn_id != turn || step.snapshot.identity.execution_id.as_deref() != Some(root)
+        || step.snapshot.identity.run_ref.is_some() {
+        return Err("original root read Step owner differs".into());
+    }
+    let key = step.effect_idempotency_key();
+    let primary = runtime.event_reader().list_stream(&format!("execution-effect:{key}"))?
+        .into_iter().filter(|event| event.kind == "execution.read.receipt"
+            && event.idempotency_key.as_deref() == Some(format!("{key}:read-receipt").as_str())).collect::<Vec<_>>();
+    if primary.len() != 1 { return Err("original root read receipt missing or ambiguous".into()); }
+    let primary = &primary[0];
+    let replay = &primary.payload["replay"];
+    let context = &primary.payload["root_effect_context"];
+    let owner = &primary.payload["root_effect_owner"];
+    if replay["session_id"] != session || replay["call_id"] != call {
+        return Err("root read receipt call differs".into());
+    }
+    let (node, attempt, ticket_owner) = if owner.is_null() && context.is_null() {
+        let parent = &replay["parent_execution"];
+        let node = parent["node_id"].as_str().filter(|value| !value.is_empty()).ok_or("original root ticket node missing")?;
+        let attempt = replay["parent_execution_attempt"].as_u64().filter(|value| *value > 0).ok_or("original root ticket attempt missing")?;
+        if parent["execution_id"] != root { return Err("original root ticket graph differs".into()); }
+        (node, attempt, true)
+    } else {
+        let binding = &owner["binding"];
+        let node = binding["node_id"].as_str().filter(|value| !value.is_empty()).ok_or("root read original node missing")?;
+        let attempt = owner["attempt"].as_u64().filter(|value| *value > 0).ok_or("root read original attempt missing")?;
+        if !replay["parent_execution"].is_null() || !replay["parent_execution_attempt"].is_null()
+            || context["execution_id"] != root || context["session_id"] != session || context["turn_id"] != turn
+            || binding["root_execution_id"] != root || binding["session_id"] != session || binding["turn_id"] != turn {
+            return Err("root read receipt owner differs".into());
+        }
+        (node, attempt, false)
+    };
+    let index = runtime.event_reader().list_stream(&format!("execution-agent-receipts:{root}:{node}:{attempt}"))?
+        .into_iter().filter(|event| event.kind == "execution.agent_tool.receipt"
+            && event.idempotency_key.as_deref() == Some(format!("agent-tool-receipt:{key}").as_str())).collect::<Vec<_>>();
+    if index.len() != 1 || primary.transaction_id != index[0].transaction_id
+        || primary.commit_cursor != index[0].commit_cursor || primary.transaction_index >= index[0].transaction_index
+        || primary.payload["outcome"] != index[0].payload["outcome"]
+        || primary.payload["root_effect_owner"] != index[0].payload["root_effect_owner"]
+        || primary.payload["root_effect_context"] != index[0].payload["root_effect_context"] {
+        return Err("original root read receipt pair differs".into());
+    }
+    for event in [primary, &index[0]] {
+        if event.scope != runtime::RuntimeEventScope::ExecutionNode || event.actor.as_deref() != Some("governed_tool")
+            || event.status.as_deref() != Some("completed") || event.payload["idempotency_key"] != key
+            || ![("execution_graph", root), ("execution_node", node), ("agent_attempt", &attempt.to_string())].iter()
+                .all(|(kind, id)| event.refs.iter().any(|reference| reference.kind == *kind && reference.id == *id)) {
+            return Err("original root read receipt references differ".into());
+        }
+    }
+    use runtime::RuntimeEventStoreBackend as _;
+    let backend = runtime_postgres::PostgresRuntimeEventStore::new(services.topology.postgres_executor.clone())
+        .map_err(|error| error.to_string())?;
+    if ticket_owner {
+        let graph_events = runtime.event_reader().list_stream(root)?;
+        let starts: Vec<_> = graph_events.iter().filter(|event| event.kind == "execution_graph.nodes_started"
+            && event.commit_cursor < primary.commit_cursor
+            && event.payload["body"]["value"]["bindings"][node]["attempt"].as_u64() == Some(attempt)
+            && event.payload["body"]["value"]["bindings"][node]["executor_kind"] == "tool_batch"
+            && event.payload["_runtime_activity_binding"]["root_execution_id"] == root
+            && event.payload["_runtime_activity_binding"]["session_id"] == session
+            && event.payload["_runtime_activity_binding"]["turn_id"] == turn).collect();
+        if starts.len() != 1 { return Err("original root ticket start missing or ambiguous".into()); }
+        let start = starts[0];
+        let start_receipt = backend.original_transaction_receipt(&start.transaction_id).map_err(|error| error.to_string())?
+            .ok_or("original root ticket transaction receipt missing")?;
+        if start_receipt.transaction_id != start.transaction_id
+            || start_receipt.commit_cursor != start.commit_cursor
+            || start_receipt.event_ids.get(start.transaction_index as usize) != Some(&start.event_id)
+            || !start_receipt.stream_revisions.iter().any(|source| source.stream_id == start.stream_id
+                && source.expected_revision < start.sequence && start.sequence <= source.committed_revision) {
+            return Err("original root ticket transaction differs".into());
+        }
+    }
+    let receipt = backend.original_transaction_receipt(&primary.transaction_id).map_err(|error| error.to_string())?
+        .ok_or("original root read transaction receipt missing")?;
+    if receipt.transaction_id != primary.transaction_id || receipt.commit_cursor != primary.commit_cursor
+        || receipt.event_ids.get(primary.transaction_index as usize) != Some(&primary.event_id)
+        || receipt.event_ids.get(index[0].transaction_index as usize) != Some(&index[0].event_id)
+        || ![primary, &index[0]].iter().all(|event| receipt.stream_revisions.iter().any(|source|
+            source.stream_id == event.stream_id && source.expected_revision < event.sequence && event.sequence <= source.committed_revision)) {
+        return Err("original root read transaction receipt differs".into());
+    }
+    let acquisition = &primary.payload["read_acquisition_v1"];
+    if acquisition.is_null() || acquisition != &index[0].payload["read_acquisition_v1"]
+        || acquisition["primary_stream"] != primary.stream_id || acquisition["index_stream"] != index[0].stream_id
+        || acquisition["session_id"] != session || acquisition["invocation_id"] != call
+        || acquisition["tool_name"] != "read_ref" || acquisition["graph_id"] != root
+        || acquisition["node_id"] != node || acquisition["attempt"].as_u64() != Some(attempt)
+        || acquisition["step"] != serde_json::to_value(&step.snapshot.identity).map_err(|error| error.to_string())?
+        || acquisition["origin"] != serde_json::to_value(&step.origin).map_err(|error| error.to_string())?
+        || acquisition["body"]["source_ref"] != selector {
+        return Err("original root read acquisition differs".into());
+    }
+    let source_hash = acquisition["body"]["source_sha256"].as_str().filter(|value| !value.is_empty())
+        .ok_or("root read source digest missing")?;
+    let source_bytes = acquisition["body"]["source_bytes"].as_u64().ok_or("root read source length missing")?;
+    if expected_source.is_some_and(|(hash, bytes)| hash != source_hash || bytes != source_bytes) {
+        return Err("root read continuation changed source".into());
+    }
+    let outcome = &primary.payload["outcome"];
+    if outcome["tool_use_id"] != call || outcome["tool_name"] != "read_ref"
+        || outcome["status"] != "executed" || !outcome["error"].is_null() {
+        return Err(format!("original root read did not succeed: {}", outcome["error"].as_str().unwrap_or("unknown")));
+    }
+    let output = outcome["output"].as_str().ok_or("original root read output missing")?;
+    if primary.payload["outcome_truncated"] != false { return Err("original root read receipt output truncated or unknown".into()); }
+    let completions: Vec<_> = events.iter().filter(|event| event.kind == "tool.invocation.completed"
+        && event.payload["tool_call_id"] == call && event.payload["tool_name"] == "read_ref"
+        && event.payload["is_error"] == false && event.commit_cursor > primary.commit_cursor).collect();
+    if completions.len() != 1 { return Err("original root read completion missing or ambiguous".into()); }
+    let completion = completions[0];
+    let raw_ref = completion.payload["full_output_ref"].as_str().filter(|value| value.starts_with("tool://"))
+        .ok_or("original root read feedback reference missing")?;
+    let messages: Vec<_> = request.body["messages"].as_array().ok_or("provider messages missing")?.iter()
+        .filter(|message| message["role"] == "tool" && message["tool_call_id"] == call).collect();
+    let feedback = messages.first().and_then(|message| message["content"].as_str()).ok_or("root read feedback missing")?;
+    if messages.len() != 1 || !feedback.starts_with("Tool `read_ref` completed. Evidence: ") || !feedback.contains(raw_ref)
+        || completion.payload["input_hash"].as_str().is_none_or(|hash| primary.payload["input_sha256"] != format!("sha256:{hash}")) {
+        return Err("original root read feedback differs from owner receipt".into());
+    }
+    let page: Value = serde_json::from_str(output).map_err(|_| "original root read output malformed")?;
+    if page["available"] != true || page["evidence_ref"] != selector || page.get("next_request").is_none()
+        || page["coverage"]["selection"] != "sequential_content" {
+        return Err("original root artifact page unavailable or unbound".into());
+    }
+    let start = page["coverage"]["byte_start"].as_u64().ok_or("root read page start missing")?;
+    let end = page["coverage"]["byte_end"].as_u64().ok_or("root read page end missing")?;
+    let total = page["coverage"]["total_bytes"].as_u64().ok_or("root read page total missing")?;
+    if total != source_bytes || start != expected_start || end < start || end > total || (start == end && end < total)
+        || expected_total.is_some_and(|value| value != total) {
+        return Err("root artifact page coverage is discontinuous".into());
+    }
+    if page["next_request"].is_null() {
+        if end != total { return Err("root artifact coverage incomplete without continuation".into()); }
+        return Ok((None, end, total, source_hash.to_string(), source_bytes));
+    }
+    if end == total { return Err("root artifact continuation follows complete coverage".into()); }
+    if !page["next_request"]["query"].is_null() || page["next_request"]["cursor"] != page["next_cursor"] {
+        return Err("root read continuation differs from original page".into());
+    }
+    let next = page["next_request"].as_object().ok_or("root read continuation malformed")?;
+    let reference = next.get("reference").or_else(|| next.get("evidence_ref")).and_then(Value::as_str)
+        .filter(|value| *value == selector).ok_or("root read continuation changes artifact")?;
+    let cursor = next.get("cursor").and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or("root read continuation cursor missing")?;
+    let mut input = json!({"reference": reference, "cursor": cursor});
+    if let Some(limit) = next.get("limit") { input["limit"] = limit.clone(); }
+    Ok((Some(input), end, total, source_hash.to_string(), source_bytes))
+}
+
+// Check the original per-call outcome before scripting the next model response.
+fn c_require_original_tool_success(
+    services: &RecoveryServices, request: &ProviderRequest, session: &str, turn: &str,
+    program: &str, call: &str, tool: &str, action: Option<&str>,
+) -> Result<(), String> {
+    let runtime = services.runtime.runtime_services();
+    let events = runtime.event_reader().list_stream(&format!("session:{session}"))?;
+    let tasks: Vec<_> = events.iter().filter(|event| event.kind == "tool.execution_plan.created")
+        .flat_map(|event| event.payload["tasks"].as_array().into_iter().flatten())
+        .filter(|task| task["tool_call_id"] == call && task["tool_name"] == tool).collect();
+    if tasks.len() != 1 { return Err("original tool plan missing or ambiguous".into()); }
+    let step: runtime::step_snapshot::StepCallBinding = serde_json::from_value(tasks[0]["step_binding"].clone())
+        .map_err(|_| "original tool Step missing")?;
+    if step.origin.call_id != call || step.snapshot.identity.session_id != session || step.snapshot.identity.turn_id != turn {
+        return Err("original tool Step owner differs".into());
+    }
+    let key = step.effect_idempotency_key();
+    let suffix = if action.is_some() { "receipt" } else { "read-receipt" };
+    let primaries: Vec<_> = runtime.event_reader().list_stream(&format!("execution-effect:{key}"))?.into_iter()
+        .filter(|event| event.idempotency_key.as_deref() == Some(format!("{key}:{suffix}").as_str())).collect();
+    if primaries.len() != 1 { return Err("original tool receipt missing or ambiguous".into()); }
+    let primary = &primaries[0];
+    let outcome = &primary.payload["outcome"];
+    if outcome["tool_use_id"] != call || outcome["tool_name"] != tool
+        || outcome["status"] != "executed" || !outcome["error"].is_null() {
+        return Err(format!("original {tool} failed or unknown: {}", outcome["error"].as_str().unwrap_or("unknown")));
+    }
+    let parent = &primary.payload["replay"]["parent_execution"];
+    let graph = parent["execution_id"].as_str().ok_or("original tool graph missing")?;
+    let node = parent["node_id"].as_str().ok_or("original tool node missing")?;
+    let attempt = primary.payload["replay"]["parent_execution_attempt"].as_u64().ok_or("original tool attempt missing")?;
+    let indices: Vec<_> = runtime.event_reader().list_stream(&format!("execution-agent-receipts:{graph}:{node}:{attempt}"))?
+        .into_iter().filter(|event| event.kind == "execution.agent_tool.receipt"
+            && event.idempotency_key.as_deref() == Some(format!("agent-tool-receipt:{key}").as_str())).collect();
+    if indices.len() != 1 || primary.transaction_id != indices[0].transaction_id
+        || primary.commit_cursor != indices[0].commit_cursor || primary.transaction_index >= indices[0].transaction_index
+        || primary.payload["outcome"] != indices[0].payload["outcome"] {
+        return Err("original tool primary/index differ".into());
+    }
+    use runtime::RuntimeEventStoreBackend as _;
+    let backend = runtime_postgres::PostgresRuntimeEventStore::new(services.topology.postgres_executor.clone())
+        .map_err(|error| error.to_string())?;
+    let receipt = backend.original_transaction_receipt(&primary.transaction_id).map_err(|error| error.to_string())?
+        .ok_or("original tool transaction receipt missing")?;
+    if receipt.transaction_id != primary.transaction_id || receipt.commit_cursor != primary.commit_cursor
+        || receipt.event_ids.get(primary.transaction_index as usize) != Some(&primary.event_id)
+        || receipt.event_ids.get(indices[0].transaction_index as usize) != Some(&indices[0].event_id) {
+        return Err("original tool transaction differs".into());
+    }
+    let completed = events.iter().filter(|event| event.kind == "tool.invocation.completed"
+        && event.payload["tool_call_id"] == call && event.payload["tool_name"] == tool
+        && event.payload["status"] == "completed" && event.payload["is_error"] == false
+        && event.commit_cursor > primary.commit_cursor).count();
+    let messages = request.body["messages"].as_array().ok_or("provider messages missing")?;
+    if completed != 1 || messages.iter().filter(|message| message["role"] == "tool" && message["tool_call_id"] == call).count() != 1 {
+        return Err("original completed tool feedback missing or ambiguous".into());
+    }
+    if let Some(action) = action {
+        let applied = runtime.event_reader().list_stream(&format!("agentic-program:{program}"))?.into_iter()
+            .filter(|event| event.kind == "agentic.action_applied" && event.payload["envelope"]["action_id"] == key
+                && event.payload["envelope"]["action"]["kind"] == action && event.commit_cursor < primary.commit_cursor).count();
+        if applied != 1 { return Err("original applied Program action missing or ambiguous".into()); }
+    }
+    Ok(())
+}
+
+// Called only by the original read fault once its exact post-action scope is
+// active. It writes through the real Goal owner and retains the transaction
+// identities needed to distinguish a missed hook from an actual update.
+fn c_original_review_for_external_goal(
+    store: &runtime::RuntimeEventStore,
+    backend: &runtime_postgres::PostgresRuntimeEventStore,
+    ticket_graph: &str, ticket_node: &str, ticket_attempt: u32,
+    session: &str, turn: &str, root: &str, program: &str, goal_id: &str,
+) -> Result<(String, u64, Value), String> {
+    use runtime::RuntimeEventStoreBackend as _;
+    let program_stream = format!("agentic-program:{program}");
+    let goal_stream = format!("goal:{goal_id}");
+    let mut matches = Vec::new();
+    for action in store.list_stream(&program_stream)? {
+        let envelope = &action.payload["envelope"];
+        if action.kind != "agentic.action_applied"
+            || envelope["action"]["kind"] != "objective_review"
+            || envelope["actor"]["session_id"] != session
+            || envelope["actor"]["turn_id"] != turn
+            || envelope["actor"]["root_execution_id"] != root {
+            continue;
+        }
+        let Some(key) = envelope["action_id"].as_str() else { continue; };
+        let source = format!("execution-effect:{key}");
+        let Some(primary) = store.event_by_idempotency_key(&source, &format!("{key}:receipt"))
+            .map_err(|error| error.to_string())? else { continue; };
+        let outcome = &primary.payload["outcome"];
+        if outcome["tool_use_id"] != "d-objective-review" || outcome["tool_name"] != "objective_review"
+            || outcome["status"] != "executed" || !outcome["error"].is_null()
+            || primary.commit_cursor <= action.commit_cursor { continue; }
+        let Some(output) = outcome["output"].as_str() else { continue; };
+        let Ok(observation) = serde_json::from_str::<harness_contract::agent_action::AgentActionObservation>(output) else { continue; };
+        if observation.action_id != key || observation.program_id != program || observation.revision != action.sequence
+            || observation.status != harness_contract::agent_action::AgentActionStatus::Applied
+            || observation.duplicate || observation.error.is_some() { continue; }
+        let replay = &primary.payload["replay"];
+        let parent = &replay["parent_execution"];
+        let Some(node) = parent["node_id"].as_str() else { continue; };
+        let Some(attempt) = replay["parent_execution_attempt"].as_u64() else { continue; };
+        if replay["session_id"] != session || replay["call_id"] != "d-objective-review"
+            || parent["execution_id"] != root || ticket_graph != root || ticket_node != node
+            || u64::from(ticket_attempt) != attempt || attempt == 0 { continue; }
+        let starts: Vec<_> = store.list_stream(root)?.into_iter().filter(|event| {
+            let binding = &event.payload["body"]["value"]["bindings"][node];
+            event.kind == "execution_graph.nodes_started" && event.commit_cursor < action.commit_cursor
+                && binding["attempt"].as_u64() == Some(attempt) && binding["executor_kind"] == "tool_batch"
+                && binding["ticket_idempotency_key"].as_str().is_some_and(|value| !value.is_empty())
+                && event.payload["_runtime_activity_binding"]["root_execution_id"] == root
+                && event.payload["_runtime_activity_binding"]["session_id"] == session
+                && event.payload["_runtime_activity_binding"]["turn_id"] == turn
+        }).collect();
+        let [start] = starts.as_slice() else { continue; };
+        let Some(start_receipt) = backend.original_transaction_receipt(&start.transaction_id)
+            .map_err(|error| error.to_string())? else { continue; };
+        if start_receipt.transaction_id != start.transaction_id || start_receipt.commit_cursor != start.commit_cursor
+            || start_receipt.event_ids.get(start.transaction_index as usize) != Some(&start.event_id)
+            || !start_receipt.stream_revisions.iter().any(|source| source.stream_id == start.stream_id
+                && source.expected_revision < start.sequence && start.sequence <= source.committed_revision) { continue; }
+        let index_stream = format!("execution-agent-receipts:{root}:{node}:{attempt}");
+        let Some(index) = store.event_by_idempotency_key(&index_stream, &format!("agent-tool-receipt:{key}"))
+            .map_err(|error| error.to_string())? else { continue; };
+        let Some(physical) = backend.original_transaction_receipt(&primary.transaction_id)
+            .map_err(|error| error.to_string())? else { continue; };
+        if primary.kind != "execution.effect.receipt" || index.kind != "execution.agent_tool.receipt"
+            || primary.scope != runtime::RuntimeEventScope::ExecutionNode || index.scope != primary.scope
+            || primary.actor.as_deref() != Some("governed_tool") || index.actor != primary.actor
+            || primary.transaction_id != index.transaction_id || primary.commit_cursor != index.commit_cursor
+            || primary.transaction_index >= index.transaction_index || primary.payload["outcome"] != index.payload["outcome"]
+            || physical.transaction_id != primary.transaction_id || physical.commit_cursor != primary.commit_cursor
+            || physical.event_ids.get(primary.transaction_index as usize) != Some(&primary.event_id)
+            || physical.event_ids.get(index.transaction_index as usize) != Some(&index.event_id)
+            || ![&primary, &index].iter().all(|event| physical.stream_revisions.iter().any(|source|
+                source.stream_id == event.stream_id && source.expected_revision < event.sequence && event.sequence <= source.committed_revision)) { continue; }
+        let goal_events: Vec<_> = store.list_stream(&goal_stream)?.into_iter().filter(|event|
+            event.kind == "goal.revised" && event.transaction_id == action.transaction_id
+                && event.commit_cursor == action.commit_cursor).collect();
+        let [original_goal] = goal_events.as_slice() else { continue; };
+        let Some(action_receipt) = backend.original_transaction_receipt(&action.transaction_id)
+            .map_err(|error| error.to_string())? else { continue; };
+        if action_receipt.transaction_id != action.transaction_id || action_receipt.commit_cursor != action.commit_cursor
+            || action_receipt.event_ids.get(action.transaction_index as usize) != Some(&action.event_id)
+            || action_receipt.event_ids.get(original_goal.transaction_index as usize) != Some(&original_goal.event_id)
+            || !action_receipt.stream_revisions.iter().any(|source| source.stream_id == program_stream
+                && source.expected_revision < action.sequence && action.sequence <= source.committed_revision)
+            || !action_receipt.stream_revisions.iter().any(|source| source.stream_id == goal_stream
+                && source.committed_revision == original_goal.sequence
+                && source.expected_revision.checked_add(1) == Some(original_goal.sequence)) { continue; }
+        matches.push((action.transaction_id.clone(), original_goal.sequence, original_goal.payload["goal"].clone()));
+    }
+    let [(transaction_id, original_head, original_goal)] = matches.as_slice() else {
+        return Err("same-call original review and receipt missing or ambiguous".into());
+    };
+    Ok((transaction_id.clone(), *original_head, original_goal.clone()))
+}
+
+fn c_append_external_goal(
+    store: &runtime::RuntimeEventStore,
+    goals: &runtime::execution_core::goal::GoalStore,
+    backend: &runtime_postgres::PostgresRuntimeEventStore,
+    goal_id: &str,
+    original: &(String, u64, Value),
+) -> Result<(String, u64, u64), String> {
+    use runtime::RuntimeEventStoreBackend as _;
+    let goal_stream = format!("goal:{goal_id}");
+    let (transaction_id, original_head, original_goal) = original;
+    let current = goals.get(goal_id)?.ok_or("original Goal missing")?;
+    if serde_json::to_value(&current).map_err(|error| error.to_string())? != *original_goal {
+        return Err("Goal changed before external update".into());
+    }
+    goals.revise(goal_id, current.revision, current.user_sequence + 1, "external concurrent constraint", |goal| {
+        goal.constraints.push("external concurrent constraint".into());
+        vec!["constraints".into()]
+    })?;
+    let updates: Vec<_> = store.list_stream(&goal_stream)?.into_iter().filter(|event|
+        event.sequence == original_head + 1 && event.kind == "goal.revised"
+            && event.transaction_id != *transaction_id
+            && event.payload["goal"]["constraints"].as_array().is_some_and(|constraints|
+                constraints.iter().any(|constraint| constraint == "external concurrent constraint"))).collect();
+    let [update] = updates.as_slice() else { return Err("external Goal revision missing or ambiguous".into()); };
+    let update_receipt = backend.original_transaction_receipt(&update.transaction_id)
+        .map_err(|error| error.to_string())?.ok_or("external Goal transaction receipt missing")?;
+    if update_receipt.transaction_id != update.transaction_id || update_receipt.commit_cursor != update.commit_cursor
+        || update_receipt.event_ids.get(update.transaction_index as usize) != Some(&update.event_id)
+        || !update_receipt.stream_revisions.iter().any(|source| source.stream_id == goal_stream
+            && source.expected_revision == *original_head && source.committed_revision == *original_head + 1) {
+        return Err("external Goal revision transaction differs".into());
+    }
+    Ok((transaction_id.clone(), *original_head, original_head + 1))
+}
+
+// Observe the existing owner phase trace, not a second commit path. Missing,
+// incomplete or mismatched trace remains unknown and cannot satisfy the gate.
+fn c_observed_external_goal_cas(graph: &str, node: &str, attempt: u32, goal_stream: &str, old: u64, new: u64) -> bool {
+    use sha2::{Digest as _, Sha256};
+    let Some(dir) = std::env::var_os("COWD_FIXTURE_EVIDENCE_DIR") else { return false; };
+    let Ok(log) = std::fs::read_to_string(std::path::PathBuf::from(dir).join("callback-complete.log")) else { return false; };
+    let graph = format!("graph_sha256={:x}", Sha256::digest(graph.as_bytes()));
+    let node = format!("node_sha256={:x}", Sha256::digest(node.as_bytes()));
+    let source = format!("source_sha256=Some(\"{:x}\")", Sha256::digest(goal_stream.as_bytes()));
+    let attempt = format!("attempt={attempt}");
+    let expected = format!("expected=Some({old})");
+    let actual = format!("actual=Some({new})");
+    log.split_inclusive('\n').filter(|line| line.ends_with('\n')).any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        line.starts_with("k05_runner_cas_error ") && fields.contains(&graph.as_str()) && fields.contains(&node.as_str())
+            && fields.contains(&attempt.as_str()) && fields.contains(&"category=event_store_stale_revision")
+            && fields.contains(&"source_kind=goal") && fields.contains(&source.as_str())
+            && fields.contains(&expected.as_str()) && fields.contains(&actual.as_str())
+    })
+}
+
+async fn c_original_session_worker_fixture(missing: Option<u8>) {
+    let compute = missing.is_some();
+    use futures::FutureExt;
+    use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
+    struct RestoreEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value { std::env::set_var(key, value); }
+                else { std::env::remove_var(key); }
+            }
+        }
+    }
+    // This ignored integration test must run alone in a child process.
+    let _environment = if compute {
+        let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE"];
+        let restore = RestoreEnvironment(keys.into_iter().map(|key| (key, std::env::var_os(key))).collect());
+        std::env::set_var("COWD_EVAL_HARNESS", "1");
+        std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
+        std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
+        Some(restore)
+    } else { None };
+    let root = fixture_root();
+    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+    if compute {
+        std::fs::write(root.path().join("workspace/target.txt"), "bounded-ticket-proof").unwrap();
+        std::fs::write(root.path().join("workspace/outside.txt"), "must-not-be-read").unwrap();
+    }
+    let mut provider = LoopbackProvider::start("root").await;
+    let providers = provider_registry(&[&provider]);
+    let topology = SelectedStorageTopology::compose_for_test(
+        &root.path().join("home"), &root.path().join("workspace"),
+    ).unwrap();
+    let services = RecoveryServices::start_with_diagnostic_loopback(root.path(), topology, providers).await;
+    services.bounded_missing.store(missing.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+    let runtime = services.runtime.runtime_services();
+    let session = format!("c-delegated-ingress:{}", uuid::Uuid::new_v4());
+    let identity = std::sync::Mutex::new(None::<(String, String)>);
+    let ingress_admission = std::sync::Mutex::new(None::<Value>);
+    let run = std::panic::AssertUnwindSafe(async {
+        let mut request = EnsureSessionRequest::new(&session, Some(provider.model.clone()), SessionSource::Tui);
+        request.owner_principal_id = Some("c-delegated-test-operator".into());
+        services.session.create_user_session(request).await.unwrap();
+        let prompt = if compute {
+            let control = json!({"corpus_id":"live-scenarios-v1", "workspace_fixture":"none",
+                "provider_constraint":"normal", "temperature_milli":0,
+                "resource_scopes":["read:target.txt"], "prompt":"Delegate one bounded task."});
+            format!("COWD_EVAL_CONTROL {control}\nDelegate one bounded task and record the assigned agent's claim.")
+        } else {
+            "Delegate one bounded task and record the assigned agent's claim.".to_string()
+        };
+        let envelope = harness_contract::turn::SessionInputEnvelope::text(
+            &session, harness_contract::turn::InputSourceKind::Tui, &prompt,
+        );
+        let request_id = envelope.idempotency_key.clone();
+        let admission = services.session.admit_input(envelope).await.unwrap();
+        *ingress_admission.lock().unwrap() = Some(json!({
+            "session_matches":admission.receipt.session_id == session,
+            "input_id_present":!admission.receipt.input_id.to_string().is_empty(),
+            "input_status":admission.receipt.status,
+            "turn_present":!admission.turn_id.is_empty(),
+            "execution_present":!admission.execution_graph_id.is_empty(),
+            "terminal_id_present":!admission.terminal_id.is_empty(),
+            "materialized_present":admission.materialized.is_some(),
+        }));
+        let graph_id = admission.execution_graph_id;
+        let turn = admission.turn_id;
+        *identity.lock().unwrap() = Some((turn.clone(), graph_id.clone()));
+        let program_id = harness_contract::agent_action::program_id_for_objective(
+            &harness_contract::agent_action::root_objective_id(&session, &turn));
+        c_root_tool(&services, &mut provider, &session, &turn, &graph_id, &program_id, "c-ingress-team", "team_create", json!({
+            "name":"Claim team", "mission":"Claim the bounded task"
+        })).await;
+        // Observe the original Program and root terminal together. The
+        // failure exporter reads bounded call candidates once after failure;
+        // unrelated event volume is never a business precondition.
+        let team = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                if let Some(team) = runtime.agent_action_service().project_if_exists(&program_id)
+                    .expect("original Program projection must be readable")
+                    .and_then(|program| program.teams.keys().next().cloned()) { break team; }
+                if let Ok(graph) = runtime.graph_state_store().load(&graph_id) {
+                    use harness_contract::execution_graph::ExecutionNodeStatus;
+                    let statuses = graph.node_statuses.values().copied().collect::<Vec<_>>();
+                    if !statuses.is_empty() && statuses.iter().all(|status| status.is_terminal())
+                        && statuses.iter().any(|status| matches!(status,
+                            ExecutionNodeStatus::Failed | ExecutionNodeStatus::Blocked | ExecutionNodeStatus::Cancelled)) {
+                        panic!("original root execution terminal before team_create; inspect original event export");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }).await.expect("original team_create did not settle before deadline");
+        c_root_tool(&services, &mut provider, &session, &turn, &graph_id, &program_id, "c-ingress-invite", "agent_invite", json!({
+            "team_ref":team, "role":"Reader", "mission":"Claim the bounded task",
+            "required_capabilities":if compute { json!(["read", "test", "search"]) } else { json!(["read"]) },
+            "definition_ref":if compute { "builtin/cowd/execute" } else { "builtin/cowd/direct" }
+        })).await;
+        if !compute {
+            c_root_tool(&services, &mut provider, &session, &turn, &graph_id, &program_id, "d-ingress-reviewer", "agent_invite", json!({
+                "team_ref":team, "role":"Independent reviewer", "mission":"Independently review the submitted result",
+                "required_capabilities":["read"], "definition_ref":"builtin/cowd/direct"
+            })).await;
+        }
+        c_root_tool(&services, &mut provider, &session, &turn, &graph_id, &program_id, "c-ingress-publish", "task_publish", json!({
+            "team_ref":team, "title":"Claim task", "objective":"Claim the bounded task",
+            "acceptance":"Claim is recorded by Runtime",
+            "required_capabilities":if compute { json!(["read", "test", "search"]) } else { json!(["read"]) }
+        })).await;
+        let task = durable_until(|| runtime.agent_action_service().project_if_exists(&program_id)
+            .unwrap().and_then(|program| program.tasks.keys().next().cloned())).await;
+        let mut root_wait_sent = false;
+        let mut claim_sent = false;
+        let mut claimed_continuation = None;
+        let mut compute_stage = 0_u8;
+        tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                let request = provider.next().await;
+                let child = c_route_owner(&services, &request, &session, &turn, &graph_id, &program_id, Some(&task))
+                    .await.expect("unique original provider owner");
+                if child && !claim_sent {
+                    assert!(request.body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool|
+                        tool["function"]["name"] == "task_claim")), "Agent must be offered original task_claim");
+                    request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[{
+                        "index":0,"id":"c-ingress-claim","type":"function",
+                        "function":{"name":"task_claim","arguments":json!({"task_ref":task,"reason":"Accept the assigned task"}).to_string()}
+                    }]})).unwrap();
+                    claim_sent = true;
+                } else if child && claim_sent {
+                    if !compute || compute_stage == 0 {
+                        assert!(request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|
+                            message["role"] == "tool" && message["tool_call_id"] == "c-ingress-claim")));
+                    }
+                    if !compute {
+                        // Hold the real worker at its original provider request while
+                        // the claim/receipt assertions below inspect the live owner.
+                        claimed_continuation = Some(request);
+                        break;
+                    }
+                    match compute_stage {
+                        0 => {
+                            assert!(request.body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool|
+                                tool["function"]["name"] == "tool_search")), "original Agent Step must expose tool_search");
+                            request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[{
+                                "index":0,"id":"b-native-search","type":"function",
+                                "function":{"name":"tool_search","arguments":json!({"query":"select:execute_code"}).to_string()}
+                            }]})).unwrap();
+                        }
+                        1 => {
+                            assert!(request.body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool|
+                                tool["function"]["name"] == "execute_code")), "original Agent Step must expose execute_code");
+                            request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[
+                                {"index":0,"id":"b-native-outside","type":"function",
+                                 "function":{"name":"execute_code","arguments":json!({"language":"python",
+                                    "code":"print(open('/project/outside.txt').read())",
+                                    "input_files":["outside.txt"],"timeout_ms":5000}).to_string()}},
+                                {"index":1,"id":"b-native-compute","type":"function",
+                                 "function":{"name":"execute_code","arguments":json!({"language":"python",
+                                    "code":"print(open('/project/target.txt').read())",
+                                    "input_files":["target.txt"],"timeout_ms":5000}).to_string()}}
+                            ]})).unwrap();
+                        }
+                        2 => {
+                            let message = request.body["messages"].as_array().unwrap().iter().find(|message|
+                                message["role"] == "tool" && message["tool_call_id"] == "b-native-compute")
+                                .expect("original next provider request must contain compute result");
+                            if missing == Some(0) {
+                                assert!(message.to_string().contains("bounded-ticket-proof"),
+                                    "original bounded compute did not return the declared file: {message}");
+                            } else {
+                                assert!(!message.to_string().contains("bounded-ticket-proof"),
+                                    "missing bounded capability must not return the declared content");
+                                assert!(message.to_string().contains("bound") || message.to_string().contains("unavailable")
+                                    || message.to_string().contains("error"), "missing capability must be reported: {message}");
+                            }
+                            let rejected = request.body["messages"].as_array().unwrap().iter().find(|message|
+                                message["role"] == "tool" && message["tool_call_id"] == "b-native-outside")
+                                .expect("original next provider request must report the out-of-scope call");
+                            assert!(!rejected.to_string().contains("must-not-be-read"),
+                                "out-of-scope content cannot reach the provider");
+                            assert_eq!(rejected["is_error"], true, "out-of-scope tool feedback must be an error");
+                            let text = rejected["content"].as_str().expect("original refusal feedback text");
+                            assert!(text.contains("scope") || text.contains("denied") || text.contains("refus")
+                                || (text.contains("outside") && text.contains("resource lease")),
+                                "out-of-scope feedback must explicitly identify the refusal");
+                            request.reply.send(json!({"role":"assistant","content":"The bounded calculation completed."})).unwrap();
+                            break;
+                        }
+                        _ => panic!("unexpected Agent compute stage"),
+                    }
+                    compute_stage += 1;
+                } else if !root_wait_sent {
+                    assert!(request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|
+                        message["role"] == "tool" && message["tool_call_id"] == "c-ingress-publish")));
+                    request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[{
+                        "index":0,"id":"c-ingress-wait","type":"function",
+                        "function":{"name":"state_inspect","arguments":json!({"scope_ref":program_id,"wait_for_workers":true}).to_string()}
+                    }]})).unwrap();
+                    root_wait_sent = true;
+                } else {
+                    panic!("unexpected extra root provider request while waiting for Agent claim");
+                }
+            }
+        }).await.expect("real delegated Agent claim continuation deadline");
+        let stream = format!("agentic-program:{program_id}");
+        let event = durable_until(|| runtime.event_reader().list_stream(&stream).unwrap().into_iter().find(|event|
+            event.kind == "agentic.action_applied" && event.payload["envelope"]["action"]["kind"] == "task_claim"
+                && event.payload["envelope"]["action"]["input"]["task_ref"] == task)).await;
+        let actor = &event.payload["envelope"]["actor"];
+        let actual = services.physical_calls.lock().unwrap().iter()
+            .find(|call| call.tool_use_id == "c-ingress-claim").cloned().expect("same Gateway saw Agent request");
+        let parent = actual.parent_execution.as_ref().expect("AgentTask parent");
+        let attempt = actual.attempt.expect("original AgentTask attempt");
+        if compute {
+            let agent_graph = runtime.graph_state_store().load(&parent.execution_id).expect("original AgentTask graph");
+            let node = agent_graph.nodes.iter().find(|node| node.id == parent.node_id).expect("original AgentTask node");
+            let packet: harness_contract::agent::AgentTaskPacket = serde_json::from_str(&node.payload_ref).expect("original AgentTask packet");
+            assert!(packet.resource_scopes.iter().any(|scope| scope == "read:target.txt"),
+                "original packet must carry the root Session's bounded read scope");
+            let events = runtime.event_reader().all_events(100_001).expect("original compute receipts");
+            assert!(events.len() < 100_001, "receipt evidence may be truncated");
+            let receipts = |call: &str| events.iter().filter(|event| match event.kind.as_str() {
+                "execution.read.receipt" => event.payload["tool_use_id"] == call,
+                "execution.effect.receipt" => event.payload["outcome"]["tool_use_id"] == call,
+                _ => false,
+            }).count();
+            assert_eq!(receipts("b-native-compute"), usize::from(missing == Some(0)),
+                "a valid call requires its original receipt; a missing capability cannot produce one");
+            assert_eq!(receipts("b-native-outside"), 0, "refused call cannot produce an execution receipt");
+            if missing == Some(0) {
+                let primary = events.iter().find(|event| event.kind == "execution.effect.receipt"
+                    && event.payload["outcome"]["tool_use_id"] == "b-native-compute")
+                    .expect("original compute effect primary");
+                let key = primary.payload["idempotency_key"].as_str().filter(|key| !key.is_empty())
+                    .expect("original compute effect key");
+                assert_eq!(primary.stream_id, format!("execution-effect:{key}"));
+                assert_eq!(primary.schema_version, 1);
+                assert_eq!(primary.payload["replay"]["call_id"], "b-native-compute");
+                assert_eq!(primary.payload["replay"]["parent_execution"]["execution_id"], parent.execution_id);
+                assert_eq!(primary.payload["replay"]["parent_execution"]["node_id"], parent.node_id);
+                let indexes: Vec<_> = events.iter().filter(|event| event.kind == "execution.agent_tool.receipt"
+                    && event.payload["idempotency_key"] == key).collect();
+                assert_eq!(indexes.len(), 1, "unique original compute index");
+                let index = indexes[0];
+                assert_eq!(index.schema_version, 2);
+                assert_eq!(index.stream_id, format!("execution-agent-receipts:{}:{}:{}",
+                    parent.execution_id, parent.node_id, attempt));
+                assert_eq!(primary.transaction_id, index.transaction_id);
+                assert_eq!(primary.commit_cursor, index.commit_cursor);
+                assert!(primary.transaction_index < index.transaction_index);
+                assert_eq!(primary.payload["outcome"], index.payload["outcome"]);
+                assert_eq!(primary.payload["effect"], index.payload["effect"]);
+                assert_eq!(primary.payload["outcome"]["status"], "executed");
+                assert_eq!(primary.payload["outcome_truncated"], false);
+                assert_eq!(index.payload["outcome_truncated"], false);
+                let attempt_ref = attempt.to_string();
+                for event in [primary, index] {
+                    for (kind, id) in [("tool_invocation", "b-native-compute"),
+                        ("execution_graph", parent.execution_id.as_str()),
+                        ("execution_node", parent.node_id.as_str()), ("agent_attempt", attempt_ref.as_str())] {
+                        assert!(event.refs.iter().any(|reference| reference.kind == kind && reference.id == id),
+                            "original compute receipt reference missing");
+                    }
+                }
+                use runtime::RuntimeEventStoreBackend as _;
+                let backend = runtime_postgres::PostgresRuntimeEventStore::new(services.topology.postgres_executor.clone())
+                    .expect("original compute receipt backend");
+                let receipt = backend.original_transaction_receipt(&primary.transaction_id)
+                    .expect("read original compute transaction").expect("original compute transaction receipt");
+                assert_eq!(receipt.transaction_id, primary.transaction_id);
+                assert_eq!(receipt.commit_cursor, primary.commit_cursor);
+                for event in [primary, index] {
+                    assert_eq!(receipt.event_ids.get(event.transaction_index as usize), Some(&event.event_id));
+                    assert!(receipt.stream_revisions.iter().any(|source| source.stream_id == event.stream_id
+                        && source.expected_revision < event.sequence && event.sequence <= source.committed_revision));
+                }
+            }
+            let no_dispatch: Vec<_> = events.iter().filter(|event| event.kind == "execution_node.transitioned")
+                .filter_map(|event| event.payload.get("no_dispatch").map(|fact| (event, fact)))
+                .flat_map(|(event, fact)| fact["calls"].as_array().into_iter().flatten()
+                    .filter(|call| call["call_id"] == "b-native-outside").map(move |call| (event, fact, call)))
+                .collect();
+            assert_eq!(no_dispatch.len(), 1, "original outside refusal must bind one node outcome");
+            let (node_event, fact, outside) = no_dispatch[0];
+            assert_eq!(outside["reason"], "committed_call_refusal");
+            let refusal_id = outside["refusal_event_id"].as_str().expect("durable refusal id");
+            let effect_key = outside["effect_key"].as_str().expect("original outside effect key");
+            let ticket = &fact["ticket"];
+            assert_eq!(ticket["attempt"].as_u64(), Some(1), "original node attempt");
+            assert_eq!(node_event.payload["graph_id"], ticket["graph_id"], "original node graph");
+            assert_eq!(node_event.payload["node_id"], ticket["node_id"], "original node identity");
+            let refusals: Vec<_> = events.iter().filter(|event| event.event_id == refusal_id
+                && event.kind == "execution.call.refused" && event.status.as_deref() == Some("refused"))
+                .collect();
+            assert_eq!(refusals.len(), 1, "original committed refusal event");
+            let refusal = refusals[0];
+            assert_eq!(refusal.payload["ticket"], *ticket, "refusal binds the original node ticket");
+            assert_eq!(refusal.payload["request"]["tool_use_id"], "b-native-outside", "refusal binds the original call");
+            assert_eq!(refusal.payload["request"]["idempotency_key"], effect_key, "refusal binds the original effect");
+            assert!(refusal.commit_cursor < node_event.commit_cursor, "refusal precedes node outcome");
+            assert!(refusal.stream_id == format!("execution-call-decision:{effect_key}"), "same original effect decision");
+            use runtime::RuntimeEventStoreBackend as _;
+            let backend = runtime_postgres::PostgresRuntimeEventStore::new(services.topology.postgres_executor.clone())
+                .expect("original receipt backend");
+            for event in [refusal, node_event] {
+                let receipt = backend.original_transaction_receipt(&event.transaction_id)
+                    .expect("read original transaction receipt").expect("original transaction receipt");
+                assert_eq!(receipt.transaction_id, event.transaction_id);
+                assert_eq!(receipt.commit_cursor, event.commit_cursor);
+                assert_eq!(receipt.event_ids.get(event.transaction_index as usize), Some(&event.event_id));
+                assert!(receipt.stream_revisions.iter().any(|source| source.stream_id == event.stream_id
+                    && source.expected_revision < event.sequence && source.committed_revision >= event.sequence));
+                if event.event_id == refusal.event_id {
+                    let effect_stream = format!("execution-effect:{effect_key}");
+                    let effect_sources: Vec<_> = receipt.stream_revisions.iter()
+                        .filter(|source| source.stream_id == effect_stream).collect();
+                    assert_eq!(effect_sources.len(), 1, "original refusal transaction effect fence");
+                    assert_eq!(effect_sources[0].expected_revision, 0, "effect absent at refusal");
+                    assert_eq!(effect_sources[0].committed_revision, 0, "refusal did not append an effect");
+                }
+            }
+            assert_eq!(runtime.event_reader().list_stream(&format!("execution-effect:{effect_key}"))
+                .expect("original outside effect stream").len(), 0, "refused outside call has no effect history");
+        }
+        assert_eq!(actor["original_execution"]["graph_id"], parent.execution_id);
+        assert_eq!(actor["original_execution"]["node_id"], parent.node_id);
+        assert_eq!(actor["original_execution"]["attempt"], attempt);
+        assert_eq!(actor["execution_id"], parent.execution_id);
+        let projection = runtime.agent_action_service().project(&program_id).unwrap();
+        let registered = projection.tasks[&task].active_attempts.get(&parent.execution_id)
+            .expect("original Program dispatch owner");
+        assert_eq!(registered.mode, harness_contract::agent_action::AgentAttemptMode::Execute);
+        assert_eq!(projection.tasks[&task].claim_execution_id.as_deref(), Some(parent.execution_id.as_str()));
+        let input = services.session.runtime_input(&request_id).await.unwrap().expect("original Session input");
+        assert_eq!(input.turn_id, turn);
+        assert_eq!(input.session_id, session);
+        assert!(input.claim_owner.is_some() && input.claim_token.is_some() && input.claim_fence_epoch.is_some());
+        {
+            let state = services.runtime.active_turns.state.lock().unwrap();
+            let control = state.controls.get(&turn).expect("Gateway installed original turn control");
+            assert_eq!(control.session_id, session);
+            assert_eq!(control.execution_id.as_deref(), Some(graph_id.as_str()));
+        }
+        let authenticated = runtime.resolve_agent_action_actor_for_attempt(parent, attempt, None).await
+            .expect("original NodesStarted ticket and fence");
+        assert_eq!(serde_json::to_value(authenticated).unwrap(), *actor);
+        let index = runtime.event_reader().list_stream(&format!("execution-agent-receipts:{}:{}:{}", parent.execution_id, parent.node_id, attempt)).unwrap();
+        let receipt = index.iter().find(|record| record.kind == "execution.agent_tool.receipt"
+            && record.payload["idempotency_key"] == actual.idempotency_key
+            && record.payload["outcome"]["tool_use_id"] == actual.tool_use_id).expect("original Agent receipt index");
+        let primary = runtime.event_reader().list_stream(&format!("execution-effect:{}", actual.idempotency_key)).unwrap();
+        let primary = primary.iter().find(|record| matches!(record.kind.as_str(), "execution.effect.receipt" | "execution.read.receipt"))
+            .expect("original Gateway receipt");
+        assert_eq!(primary.transaction_id, receipt.transaction_id);
+        assert_eq!(primary.commit_cursor, receipt.commit_cursor);
+        assert!(primary.transaction_index < receipt.transaction_index);
+        assert_eq!(primary.payload["outcome"], receipt.payload["outcome"]);
+        let graph = runtime.graph_state_store().load(&graph_id).expect("original ingress graph");
+        let lineage = graph.lineage.as_ref().expect("original Task lineage");
+        assert_eq!(lineage.session_id, session);
+        assert_eq!(lineage.turn_id, turn);
+        assert!(runtime.task_aggregate_service().get(&lineage.root_task_id).unwrap().is_some(), "original root Task owner");
+        let goal = runtime.goal_store().get(&format!("goal:{graph_id}")).unwrap().expect("original root Goal");
+        let binding = goal.execution_binding.as_ref().unwrap();
+        assert_eq!(binding.root_execution_id, graph_id);
+        assert_eq!(binding.turn_id, turn);
+        assert_eq!(goal.session_id, session);
+        // Retain only the original bound facts needed to review this claim;
+        // do not manufacture a Goal conclusion or export the session history.
+        let evidence_dir = std::path::PathBuf::from(std::env::var_os("COWD_FIXTURE_EVIDENCE_DIR")
+            .expect("private fixture evidence directory"));
+        let facts = json!({"session_id":session,"turn_id":turn,"root_graph_id":graph_id,
+            "program_id":program_id,"task_id":task,"claim_event":event,
+            "primary_receipt":primary,"index_receipt":receipt});
+        use std::io::Write;
+        #[cfg(unix)] use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] options.mode(0o600);
+        let evidence_name = match missing { None => "claim-original-facts.json".to_string(),
+            Some(case) => format!("bounded-original-facts-{case}.json") };
+        let mut output = options.open(evidence_dir.join(evidence_name))
+            .expect("create private claim facts");
+        serde_json::to_writer(&mut output, &facts).expect("write original claim facts");
+        output.flush().expect("flush original claim facts");
+        output.sync_all().expect("sync original claim facts");
+        let mut original_conclusion_observed = false;
+        let cas_probe = std::env::var_os("COWD_TEST_ORIGINAL_CONCLUSION_CAS").is_some();
+        let external_goal_probe = std::env::var_os("COWD_TEST_ORIGINAL_EXTERNAL_GOAL").is_some();
+        let external_review_match = Arc::new(std::sync::Mutex::new(None::<(String, u64, Value)>));
+        let external_goal_result = Arc::new(std::sync::Mutex::new(None::<Result<(String, u64, u64, String, u32), String>>));
+        let mut cas_observed = false;
+        let conclusion_hook_result = Arc::new(std::sync::Mutex::new(None::<Result<(String, u64, u64), String>>));
+        let conclusion_attempt_result = Arc::new(std::sync::Mutex::new(None::<(bool, Option<runtime::execution_core::services::ConclusionAttemptObservation>)>));
+        if let Some(request) = claimed_continuation.take() {
+            request.reply.send(json!({"role":"assistant", "content":"The bounded task is complete.", "tool_calls":[{
+                "index":0, "id":"d-original-submit", "type":"function", "function":{
+                    "name":"task_submit", "arguments":json!({"task_ref":task, "artifact_refs":[], "evidence_refs":[],
+                        "unresolved":[], "deliverable":{"block_index":0,"kind":"note","title":"Bounded task result"}}).to_string()
+                }
+            }]})).expect("send original worker submission over loopback");
+            let mut reviewer_read_sent = false;
+            let mut task_review_sent = false;
+            let mut root_read_sent = false;
+            let mut root_read_complete = false;
+            let mut root_read_page = 0_u32;
+            let mut root_read_call = String::new();
+            let mut root_read_source: Option<(String, u64)> = None;
+            let mut root_read_end = 0_u64;
+            let mut root_read_total: Option<u64> = None;
+            let mut external_goal_rejection_observed = false;
+            let mut objective_review_sent = false;
+            let mut completion_sent = false;
+            let mut wait_index = 0_u32;
+            let chain_result = tokio::time::timeout(Duration::from_secs(120), async {
+                loop {
+                    if external_goal_probe {
+                        let hit = external_goal_result.lock().unwrap().clone();
+                        if let Some(Ok((_, old, new, node, attempt))) = hit {
+                            if c_observed_external_goal_cas(&graph_id, &node, attempt,
+                                &format!("goal:goal:{graph_id}"), old, new) {
+                                external_goal_rejection_observed = true;
+                                break;
+                            }
+                        }
+                    }
+                    let current = runtime.agent_action_service().project(&program_id).expect("original Program projection");
+                    let goal = runtime.goal_store().get(&format!("goal:{graph_id}")).unwrap().expect("original Goal");
+                    if cas_probe && conclusion_attempt_result.lock().unwrap().is_some() {
+                        cas_observed = true;
+                        break;
+                    }
+                    if current.status == runtime::AgenticProgramStatus::Verified
+                        && goal.completion == harness_contract::goal::GoalCompletion::Satisfied {
+                        assert_eq!(current.objective_verdict.as_ref().expect("original Program verdict").terminal_fence,
+                            goal.terminal.as_ref().expect("original Goal terminal").terminal_fence);
+                        let reviewer = current.tasks[&task].reviewed_by.as_deref().expect("original independent Task reviewer");
+                        assert_ne!(Some(reviewer), actor["actor_id"].as_str(), "reviewer must differ from original claimant");
+                        let request_revision = current.completion_request.as_ref().expect("original completion request").program_revision;
+                        let program_key = format!("program-conclusion:{request_revision}");
+                        let program_event = runtime.event_reader().list_stream(&format!("agentic-program:{program_id}"))
+                            .unwrap().into_iter().find(|event| event.idempotency_key.as_deref() == Some(program_key.as_str()))
+                            .expect("original Program conclusion event");
+                        let goal_key = format!("program-conclusion:agentic-objective:{program_id}:request:{request_revision}");
+                        let goal_event = runtime.event_reader().list_stream(&format!("goal:{}", goal.id))
+                            .unwrap().into_iter().find(|event| event.idempotency_key.as_deref() == Some(goal_key.as_str()))
+                            .expect("original Goal conclusion event");
+                        assert_eq!(program_event.transaction_id, goal_event.transaction_id, "Goal and Program must share the original conclusion transaction");
+                        assert_eq!(program_event.commit_cursor, goal_event.commit_cursor);
+                        original_conclusion_observed = true;
+                    }
+                    let request = tokio::select! {
+                        request = provider.next() => request,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
+                    };
+                    let is_child = c_route_owner(&services, &request, &session, &turn, &graph_id, &program_id, Some(&task))
+                        .await.expect("original request owner for review chain");
+                    let has_result = |call: &str| request.body["messages"].as_array().is_some_and(|messages|
+                        messages.iter().any(|message| message["role"] == "tool" && message["tool_call_id"] == call));
+                    let selected = current.tasks.get(&task).and_then(|task| task.artifact_refs.first())
+                        .and_then(|reference| current.artifacts.get(reference).map(|artifact| (reference.clone(), artifact.content_ref.clone())));
+                    let tool_reply = |id: &str, name: &str, input: Value| json!({"role":"assistant", "content":null, "tool_calls":[{
+                        "index":0,"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}
+                    }]});
+                    let finish_original_turn = original_conclusion_observed && !is_child && has_result("d-objective-review");
+                    let answer = if finish_original_turn {
+                        c_require_original_tool_success(&services, &request, &session, &turn, &program_id,
+                            "d-objective-review", "objective_review", Some("objective_review")).expect("original objective review outcome");
+                        json!({"role":"assistant","content":"The bounded task was independently reviewed."})
+                    } else if is_child && has_result("d-original-submit") {
+                        json!({"role":"assistant","content":"I submitted the bounded result."})
+                    } else if is_child && !reviewer_read_sent {
+                        let (_, selector) = selected.as_ref().expect("original submitted artifact before independent review");
+                        reviewer_read_sent = true;
+                        tool_reply("d-review-read", "evidence_retrieve", json!({"evidence_ref":selector}))
+                    } else if is_child && has_result("d-review-read") && !task_review_sent {
+                        c_require_original_tool_success(&services, &request, &session, &turn, &program_id,
+                            "d-review-read", "evidence_retrieve", None).expect("original reviewer read outcome");
+                        let (_, selector) = selected.as_ref().expect("original reviewed artifact");
+                        task_review_sent = true;
+                        tool_reply("d-task-review", "task_review", json!({"task_ref":task,"decision":"accept",
+                            "reason":"The submitted result satisfies the bounded task.","evidence_refs":[selector]}))
+                    } else if is_child && has_result("d-task-review") {
+                        c_require_original_tool_success(&services, &request, &session, &turn, &program_id,
+                            "d-task-review", "task_review", Some("task_review")).expect("original task review outcome");
+                        json!({"role":"assistant","content":"The independent task review is complete."})
+                    } else if !is_child && current.tasks.get(&task).is_none_or(|task|
+                        task.status != runtime::AgenticTaskStatus::Accepted) {
+                        wait_index += 1;
+                        tool_reply(&format!("d-wait-{wait_index}"), "state_inspect", json!({"scope_ref":program_id,"wait_for_workers":true}))
+                    } else if !is_child && !root_read_sent {
+                        let (_, selector) = selected.as_ref().expect("accepted original artifact");
+                        root_read_sent = true;
+                        root_read_call = "d-root-read".into();
+                        tool_reply(&root_read_call, "read_ref", json!({"reference":selector}))
+                    } else if !is_child && root_read_sent && !root_read_complete && has_result(&root_read_call) {
+                        let (reference, selector) = selected.as_ref().expect("accepted original artifact");
+                        let (next, end, total, source_hash, source_bytes) = c_verified_root_artifact_page(&services, &request, &session, &turn, &graph_id,
+                            &root_read_call, selector, root_read_end, root_read_total,
+                            root_read_source.as_ref().map(|(hash, bytes)| (hash.as_str(), *bytes)))
+                            .expect("original root artifact read and receipt");
+                        root_read_source = Some((source_hash, source_bytes));
+                        root_read_end = end;
+                        root_read_total = Some(total);
+                        match next {
+                            Some(next) => {
+                                root_read_page = root_read_page.checked_add(1).expect("root read page overflow");
+                                root_read_call = format!("d-root-read-{root_read_page}");
+                                tool_reply(&root_read_call, "read_ref", next)
+                            }
+                            None => {
+                                root_read_complete = true;
+                                if external_goal_probe {
+                                    let backend = Arc::new(runtime_postgres::PostgresRuntimeEventStore::new(services.topology.postgres_executor.clone())
+                                        .expect("original PG runtime backend"));
+                                    let predicate_backend = Arc::clone(&backend);
+                                    let predicate_match = Arc::clone(&external_review_match);
+                                    let predicate_session = session.clone();
+                                    let predicate_turn = turn.clone();
+                                    let predicate_root = graph_id.clone();
+                                    let predicate_program = program_id.clone();
+                                    let goal_id = goal.id.clone();
+                                    let predicate_goal = goal_id.clone();
+                                    let goals = Arc::clone(runtime.goal_store());
+                                    let action_result = Arc::clone(&external_goal_result);
+                                    let action_match = Arc::clone(&external_review_match);
+                                    let goal_stream = format!("goal:{goal_id}");
+                                    runtime.fixture_arm_original_goal_read(graph_id.clone(), "d-objective-review".into(), goal_stream,
+                                        move |store, graph, node, attempt| {
+                                            match c_original_review_for_external_goal(store, &predicate_backend, graph, node, attempt,
+                                                &predicate_session, &predicate_turn, &predicate_root, &predicate_program, &predicate_goal) {
+                                                Ok(original) => { *predicate_match.lock().unwrap() = Some(original); true }
+                                                Err(_) => false,
+                                            }
+                                        },
+                                        move |store, _, node, attempt| {
+                                            let result = action_match.lock().unwrap().take().ok_or_else(|| "original review match missing".to_string())
+                                                .and_then(|original| c_append_external_goal(store, &goals, &backend, &goal_id, &original))
+                                                .map(|(tx, old, new)| (tx, old, new, node.to_owned(), attempt));
+                                            match &result {
+                                                Ok((_, old, new, _, _)) => eprintln!("EXTERNAL_GOAL_HOOK hit=true update=committed old_head={old} new_head={new}"),
+                                                Err(_) => eprintln!("EXTERNAL_GOAL_HOOK hit=true update=unknown"),
+                                            }
+                                            *action_result.lock().unwrap() = Some(result);
+                                        });
+                                }
+                                if cas_probe {
+                                    let goal_id = goal.id.clone();
+                                    let goal_stream = format!("goal:{goal_id}");
+                                    let program_stream = format!("agentic-program:{program_id}");
+                                    let goals = Arc::clone(runtime.goal_store());
+                                    let hook_result = Arc::clone(&conclusion_hook_result);
+                                    let attempt_result = Arc::clone(&conclusion_attempt_result);
+                                    runtime.fixture_arm_original_conclusion(program_id.clone(), goal_id.clone(),
+                                        move |transaction| {
+                                            let update = (|| -> Result<(String, u64, u64), String> {
+                                                let matches: Vec<_> = transaction.expected_streams.iter().filter(|source| source.stream_id == goal_stream).collect();
+                                                let [source] = matches.as_slice() else { return Err("original Goal source missing or ambiguous".into()); };
+                                                if transaction.expected_streams.iter().filter(|source| source.stream_id == program_stream).count() != 1 {
+                                                    return Err("original Program source missing or ambiguous".into());
+                                                }
+                                                let before = goals.get(&goal_id).map_err(|e| e.to_string())?.ok_or("original Goal missing")?;
+                                                goals.revise(&goal_id, before.revision, before.user_sequence + 1, "concurrent user constraint", |goal| {
+                                                    goal.constraints.push("concurrent user constraint".into());
+                                                    vec!["constraints".into()]
+                                                }).map_err(|e| e.to_string())?;
+                                                Ok((transaction.transaction_id.clone(), source.expected_revision, source.expected_revision + 1))
+                                            })();
+                                            *hook_result.lock().unwrap() = Some(update);
+                                        },
+                                        move |reached, observation| { *attempt_result.lock().unwrap() = Some((reached, observation)); }
+                                    ).expect("arm original conclusion owner probe");
+                                }
+                                let criterion = goal.user_intent_criterion_id.as_ref().expect("original Goal criterion");
+                                objective_review_sent = true;
+                                tool_reply("d-objective-review", "objective_review", json!({"criterion_ref":criterion,"decision":"satisfied",
+                                    "result_refs":[reference],"evidence_refs":[selector],"reason":"The independent result meets the original objective."}))
+                            }
+                        }
+                    } else if !is_child && has_result("d-objective-review") && !completion_sent {
+                        c_require_original_tool_success(&services, &request, &session, &turn, &program_id,
+                            "d-objective-review", "objective_review", Some("objective_review")).expect("original objective review outcome");
+                        let (reference, selector) = selected.as_ref().expect("reviewed original artifact");
+                        completion_sent = true;
+                        tool_reply("d-completion", "objective_complete_request", json!({"result_refs":[reference],"evidence_refs":[selector],"unresolved":[],"blocked":false}))
+                    } else if !is_child && has_result("d-completion") {
+                        c_require_original_tool_success(&services, &request, &session, &turn, &program_id,
+                            "d-completion", "objective_complete_request", Some("objective_complete_request")).expect("original completion request outcome");
+                        json!({"role":"assistant","content":"The bounded task was independently reviewed."})
+                    } else {
+                        panic!("unexpected original provider request in review chain");
+                    };
+                    request.reply.send(answer).expect("send original loopback response");
+                    if finish_original_turn { break; }
+                }
+            }).await;
+            if external_goal_probe {
+                let hook = external_goal_result.lock().unwrap();
+                match hook.as_ref() {
+                    None => eprintln!("EXTERNAL_GOAL_RESULT hit=false result=unknown"),
+                    Some(Err(_)) => eprintln!("EXTERNAL_GOAL_RESULT hit=true update=unknown"),
+                    Some(Ok((_, old, new, _, _))) => eprintln!("EXTERNAL_GOAL_RESULT hit=true update=committed old_head={old} new_head={new}"),
+                }
+                if original_conclusion_observed {
+                    panic!("external Goal mutation must not be treated as a successful original conclusion");
+                }
+                let (original_tx, _, _, _, _) = hook.as_ref().and_then(|result| result.as_ref().ok())
+                    .expect("external Goal probe must hit and commit the original Goal owner update");
+                let events = runtime.event_reader().list_stream(&format!("agentic-program:{program_id}"))
+                    .expect("original Program events after external Goal update");
+                let original_actions: Vec<_> = events.iter().filter(|event| event.kind == "agentic.action_applied"
+                    && event.transaction_id == *original_tx
+                    && event.payload["envelope"]["action"]["kind"] == "objective_review").collect();
+                assert_eq!(original_actions.len(), 1, "the original review must remain committed once");
+                let original_key = original_actions[0].payload["envelope"]["action_id"].as_str()
+                    .expect("original review action ID");
+                assert_eq!(events.iter().filter(|event| event.kind == "agentic.action_applied"
+                    && event.payload["envelope"]["action_id"] == original_key).count(), 1,
+                    "the original review action must not be applied twice");
+                let current = runtime.agent_action_service().project(&program_id).expect("original Program after external update");
+                let goal = runtime.goal_store().get(&format!("goal:{graph_id}")).expect("Goal after external update")
+                    .expect("original Goal after external update");
+                assert_ne!(current.status, runtime::AgenticProgramStatus::Verified, "external Goal change cannot produce a verified Program");
+                assert_ne!(goal.completion, harness_contract::goal::GoalCompletion::Satisfied, "external Goal change cannot produce a satisfied Goal");
+                eprintln!("EXTERNAL_GOAL_RESULT original_review_count=1 program_status={:?} goal_completion={:?}",
+                    current.status, goal.completion);
+            }
+            chain_result.expect("original review-to-conclusion deadline");
+            if external_goal_probe {
+                assert!(external_goal_rejection_observed, "external Goal rejection was not observed at the original node CAS");
+            } else if cas_probe {
+                assert!(cas_observed, "original Goal CAS probe must reach the checked commit");
+            } else {
+                assert!(original_conclusion_observed, "real Goal and Program conclusion must be observed");
+            }
+        }
+        if cas_probe {
+            let (transaction_id, old, new) = conclusion_hook_result.lock().unwrap().take()
+                .expect("original conclusion hook did not execute").expect("original Goal owner update failed");
+            let (reached, observation) = conclusion_attempt_result.lock().unwrap().take().expect("original attempt observation missing");
+            assert!(reached, "original conclusion append hook was not reached");
+            let observation = observation.expect("first original checked append observation missing");
+            assert_eq!(observation.transaction_id, transaction_id);
+            match observation.outcome {
+                runtime::execution_core::services::ConclusionAttemptOutcome::Stale { stream_id, expected, actual } => {
+                    assert_eq!(stream_id, format!("goal:goal:{graph_id}")); assert_eq!(expected, old); assert_eq!(actual, new);
+                }
+                other => panic!("first original Goal CAS did not reject as expected: {other:?}"),
+            }
+            assert!(observation.original_receipt.expect("original receipt lookup failed").is_none(), "target transaction receipt already exists at observation");
+            assert_eq!(observation.events.len(), 2, "original Goal/Program events required");
+            let revision = transaction_id.strip_prefix(&format!("program-conclusion:{program_id}:")).and_then(|value| value.parse::<u64>().ok()).expect("original conclusion transaction identity");
+            let goal_key = format!("program-conclusion:agentic-objective:{program_id}:request:{revision}");
+            let program_key = format!("program-conclusion:{revision}");
+            assert!(observation.events.iter().any(|event| event.stream_id == format!("goal:goal:{graph_id}") && event.idempotency_key.as_deref() == Some(goal_key.as_str())));
+            assert!(observation.events.iter().any(|event| event.stream_id == format!("agentic-program:{program_id}") && event.idempotency_key.as_deref() == Some(program_key.as_str())));
+            for event in observation.events { assert!(event.observed.expect("original event lookup failed").is_none(), "target event exists at observation"); }
+            eprintln!("ORIGINAL_CONCLUSION_CAS reached=true stale=true goal_head={old}->{new} receipt=absent goal_event=absent program_event=absent");
+        }
+        // The non-conclusion variants stop after observing a claim. Close admission, request
+        // cancellation through the original Session owner, and drain the same
+        // turn before stopping its supervisor; do not synthesize a Goal result.
+        let active = services.runtime.stop_accepting_for_recovery();
+        let signalled = if original_conclusion_observed {
+            false
+        } else {
+            let mut cancellation_handed_off = false;
+            let mut cancellation_error = None;
+            for _ in 0..3 {
+                let current = services.session.runtime_input(&request_id).await
+                    .expect("read original Session input before cancellation")
+                    .expect("original Session input missing before cancellation");
+                assert_eq!(current.session_id, session, "cancellation input Session changed");
+                assert_eq!(current.turn_id, turn, "cancellation input turn changed");
+                assert_eq!(current.input_id, input.input_id, "cancellation input identity changed");
+                let application_settled = current.application_receipt.as_ref().is_none_or(|receipt| {
+                    use harness_contract::input_disposition::{InputApplicationCancellationState, InputApplicationState};
+                    match receipt.state {
+                        InputApplicationState::Failed => receipt.cancellation.as_ref().is_none_or(|cancel|
+                            cancel.state == InputApplicationCancellationState::Settled),
+                        InputApplicationState::Applied => receipt.cancellation.as_ref().is_some_and(|cancel|
+                            cancel.state == InputApplicationCancellationState::Settled),
+                        InputApplicationState::Prepared | InputApplicationState::Materializing => false,
+                    }
+                });
+                if matches!(current.status, session::SessionRuntimeInputStatus::Completed | session::SessionRuntimeInputStatus::Cancelled)
+                    && application_settled {
+                    cancellation_handed_off = true;
+                    break;
+                }
+                match services.session.cancel_input(
+                    &session,
+                    harness_contract::turn::SessionInputId::from_string(input.input_id.to_string()),
+                    "local claim fixture completed",
+                ).await {
+                    Ok(_) => { cancellation_handed_off = true; break; }
+                    Err(error) if error.starts_with("stale session execution fence:") => cancellation_error = Some(error),
+                    Err(error) => panic!("original Session input cancellation failed: {error}"),
+                }
+            }
+            assert!(cancellation_handed_off, "original Session input cancellation remains unknown: {cancellation_error:?}");
+            let signalled = services.session.cancel_active_execution(
+                &session, &turn, &graph_id, "local claim fixture completed")
+                .expect("original bound turn cancellation signal");
+            runtime.cancel_execution_tree(&graph_id, "local claim fixture completed").await
+                .expect("original execution tree cancellation");
+            signalled
+        };
+        let drain = services.runtime.wait_for_active_turns(active.len(), Duration::from_secs(30)).await;
+        eprintln!("claim fixture cancellation: bound_turn_signal={signalled} remaining_turns={:?} workers={:?}",
+            drain.remaining_turn_ids, services.supervisor.health().workers);
+        assert!(drain.remaining_turn_ids.is_empty(), "original Session turn did not drain");
+        if original_conclusion_observed {
+            let persisted = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let terminal = services.topology.runtime_event_store
+                        .session_terminal_for_execution(&session, &graph_id, &turn)
+                        .expect("read original Runtime terminal outbox");
+                    if let Some(terminal) = terminal.filter(|terminal| terminal.status == "materialized") {
+                        assert_eq!(terminal.session_id, session);
+                        assert_eq!(terminal.execution_id.as_deref(), Some(graph_id.as_str()));
+                        assert_eq!(terminal.turn_id.as_deref(), Some(turn.as_str()));
+                        assert_eq!(terminal.request_id.as_deref(), Some(request_id.as_str()));
+                        let payload = crate::session_runtime_bridge::load_terminal_payload(
+                            &services.topology.artifact_store, &terminal).await.expect("original terminal payload");
+                        assert_eq!(payload.ingress_message_id.as_deref(), Some(input.message_id.as_str()));
+                        assert_eq!(payload.goal_completion, harness_contract::goal::GoalCompletion::Satisfied);
+                        assert_eq!(payload.text, "The bounded task was independently reviewed.", "original terminal payload text differs");
+                        let messages = services.topology.session_store.get_messages(&session, 0, 10_001)
+                            .await.expect("read original Session messages");
+                        assert!(messages.len() < 10_001, "original Session messages exceed assertion bound");
+                        let matches: Vec<_> = messages.iter().filter(|message|
+                            message.stable_message_id == terminal.message_id).collect();
+                        let [message] = matches.as_slice() else { panic!("original terminal message identity missing or duplicate"); };
+                        assert_eq!(message.session_id, session);
+                        assert_eq!(message.role, "assistant");
+                        let body: Value = serde_json::from_str(&message.content_json).expect("original terminal message JSON");
+                        let blocks = body.as_array().expect("original terminal content blocks");
+                        let text_blocks: Vec<&str> = blocks.iter().filter(|block| block["type"] == "text")
+                            .map(|block| block["text"].as_str().expect("original terminal text block malformed"))
+                            .collect();
+                        assert!(!text_blocks.is_empty(), "original terminal text is missing");
+                        assert_eq!(text_blocks.concat(), payload.text, "original terminal message text differs from payload");
+                        for block in blocks {
+                            assert_eq!(block["cowd_turn_id"], turn);
+                            assert_eq!(block["cowd_turn_ingress_message_id"], input.message_id.to_string());
+                            assert_eq!(block["cowd_execution_id"], graph_id);
+                        }
+                        break (message.sequence, terminal.commit_cursor);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await.expect("original Session terminal answer was not materialized");
+            eprintln!("ORIGINAL_SESSION_TERMINAL materialized=true unique=true sequence={} runtime_cursor={}", persisted.0, persisted.1);
+        }
+        if external_goal_probe {
+            let hit = external_goal_result.lock().unwrap().clone()
+                .expect("external Goal hook result missing")
+                .expect("external Goal original update is unknown");
+            let events = runtime.event_reader().list_stream(&format!("agentic-program:{program_id}"))
+                .expect("original Program events after drain");
+            let original: Vec<_> = events.iter().filter(|event| event.kind == "agentic.action_applied"
+                && event.transaction_id == hit.0
+                && event.payload["envelope"]["action"]["kind"] == "objective_review").collect();
+            let [original] = original.as_slice() else { panic!("original review action missing or ambiguous after drain"); };
+            let key = original.payload["envelope"]["action_id"].as_str().expect("original review action ID");
+            let calls = services.physical_calls.lock().unwrap();
+            let matching: Vec<_> = calls.iter().filter(|call|
+                call.tool_use_id == "d-objective-review" && call.tool_name == "objective_review").collect();
+            let [call] = matching.as_slice() else {
+                panic!("original objective review physical execution count was {}, expected one", matching.len());
+            };
+            assert_eq!(call.idempotency_key, key, "physical call must match original applied action");
+            assert_eq!(call.attempt, Some(hit.4), "physical call attempt must match original ticket");
+            assert!(call.parent_execution.as_ref().is_some_and(|parent|
+                parent.execution_id == graph_id && parent.node_id == hit.3),
+                "physical call must match original graph and node");
+            eprintln!("EXTERNAL_GOAL_RESULT original_review_physical_calls=1 after_drain=true");
+        }
+    }).catch_unwind().await;
+    if let Err(panic) = &run {
+        let identity = identity.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let (turn, graph) = identity.map(|(turn, graph)| (turn, Some(graph)))
+            .unwrap_or_else(|| ("unknown-before-admission".into(), None));
+        let failure = panic.downcast_ref::<String>().map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("non-string panic");
+        let packed = services.topology.session_store.get_session_domain_events_by_kind_limited(
+            &session, "context.provider_request_packed", 0, 10_001).await;
+        let packed_facts = packed.as_ref().ok().map(|rows| rows.iter().filter_map(|row|
+            session::SessionDomainEvent::from_session_event(row).ok().map(|event| json!({
+                "sequence":event.sequence, "session_id":event.session_id,
+                "execution_id":event.payload["execution_id"], "turn_id":event.payload["turn_id"],
+                "request_id":event.payload["request_id"], "body_sha256":event.payload["body_sha256"],
+                "step_render":event.payload["step_render"]
+            }))).collect::<Vec<_>>());
+        // Preserve only the original admission already returned to this fixture;
+        // do not launch a blocking backend query while unwinding the failed run.
+        let ingress_admission = ingress_admission.try_lock().ok().and_then(|value| value.clone());
+        let active_turn = match services.runtime.active_turns.state.try_lock() {
+            Ok(state) => match state.controls.get(&turn) {
+                Some(control) if control.session_id == session && control.execution_id.as_deref() == graph.as_deref() => "matching_active_owner",
+                Some(_) => "owner_identity_differs",
+                None => "not_found",
+            },
+            Err(_) => "unknown_lock_busy",
+        };
+        let route_facts = json!({"wire":provider.wire_facts.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            "original_admission":ingress_admission, "active_turn_owner":active_turn,
+            "original_input_current_status":"unknown_not_queried",
+            "original_terminal_current_status":"unknown_not_queried",
+            "session_packed":packed_facts, "packed_error":packed.as_ref().err().map(ToString::to_string),
+            "packed_limit":10001, "packed_possibly_truncated":packed.as_ref().ok().is_some_and(|rows| rows.len() >= 10001)});
+        c_export_original_failure(&runtime, &services.physical_calls, &session, &turn, graph, &provider.model,
+            failure, "Gateway Session turn binds original claim control; installation unobserved on early failure",
+            "Gateway Session ingress owns Goal; inspect original Goal event", None, Some(route_facts)).await;
+    }
+    drop(runtime);
+    drop(provider);
+    let cleanup = std::panic::AssertUnwindSafe(services.stop()).catch_unwind().await;
+    if let Err(panic) = run { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
+}

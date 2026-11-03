@@ -160,9 +160,22 @@ pub enum ApiError {
         provider: String,
         reason: String,
     },
+    /// A physical send was refused before HTTP because its identity or durable
+    /// pre-send confirmation could not be established.
+    PhysicalSendGate {
+        reason: String,
+    },
 }
 
 impl ApiError {
+    #[must_use]
+    pub fn is_physical_send_gate(&self) -> bool {
+        match self {
+            Self::PhysicalSendGate { .. } => true,
+            Self::RetriesExhausted { last_error, .. } => last_error.is_physical_send_gate(),
+            _ => false,
+        }
+    }
     /// Attach decoder evidence without changing failure or retry classification.
     /// Only fixed decoder labels may enter the public metadata surface.
     #[must_use]
@@ -386,7 +399,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => false,
+            | Self::InvalidProviderConfig { .. }
+            | Self::PhysicalSendGate { .. } => false,
         }
     }
 
@@ -407,7 +421,7 @@ impl ApiError {
             {
                 ProviderFailureScope::Account
             }
-            Self::NoProviderConfigured { .. } | Self::InvalidProviderConfig { .. } => {
+            Self::NoProviderConfigured { .. } | Self::InvalidProviderConfig { .. } | Self::PhysicalSendGate { .. } => {
                 ProviderFailureScope::Configuration
             }
             Self::ContextWindowExceeded { .. }
@@ -489,7 +503,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => false,
+            | Self::InvalidProviderConfig { .. }
+            | Self::PhysicalSendGate { .. } => false,
         }
     }
 
@@ -523,7 +538,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => false,
+            | Self::InvalidProviderConfig { .. }
+            | Self::PhysicalSendGate { .. } => false,
         }
     }
 
@@ -555,7 +571,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => None,
+            | Self::InvalidProviderConfig { .. }
+            | Self::PhysicalSendGate { .. } => None,
         }
     }
 
@@ -578,7 +595,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => None,
+            | Self::InvalidProviderConfig { .. }
+            | Self::PhysicalSendGate { .. } => None,
         }
     }
 
@@ -609,6 +627,7 @@ impl ApiError {
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
             Self::NoProviderConfigured { .. } => "provider_auth",
             Self::InvalidProviderConfig { .. } => "runtime_io",
+            Self::PhysicalSendGate { .. } => "physical_send_gate",
         }
     }
 
@@ -636,7 +655,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => false,
+            | Self::InvalidProviderConfig { .. }
+            | Self::PhysicalSendGate { .. } => false,
         }
     }
 }
@@ -763,6 +783,7 @@ impl Display for ApiError {
             Self::InvalidProviderConfig { provider, reason } => {
                 write!(f, "invalid provider config for {provider}: {reason}")
             }
+            Self::PhysicalSendGate { reason } => write!(f, "physical send refused: {reason}"),
         }
     }
 }

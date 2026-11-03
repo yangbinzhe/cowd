@@ -27,8 +27,10 @@ async fn c4_root_file_discovery_and_publication_need_no_program_or_team() {
     ).unwrap();
     assert!(discovery["matches"].as_array().unwrap().iter().any(|entry| entry.as_str() == Some("artifact_publish")));
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None, action_id: None, session_id: Some("c4-file-session"), authorized_scopes: &[],
         memory_context: None, reality_context: None, model_lease: Some("fixture"), parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None, permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
     let input = json!({"source":"file","path":workspace.join("result.txt").to_str().unwrap(),

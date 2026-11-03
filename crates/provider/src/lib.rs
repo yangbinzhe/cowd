@@ -12,6 +12,8 @@
 mod client;
 mod error;
 mod http_client;
+mod launcher_attestation;
+mod physical_send;
 mod providers;
 mod sse;
 mod types;
@@ -22,7 +24,12 @@ pub use client::{
     ProviderClient, ProviderWireHeader, ProviderWireRequest, MAX_PREPARED_WIRE_BYTES,
 };
 pub use error::{ApiError, CompatibilityToolProtocolFailure};
+pub use launcher_attestation::{LauncherAttestation, LauncherAttestationVerifier, LauncherSigningKey, VerifiedLauncherIdentity};
 pub use http_client::{build_http_client, build_http_client_with, ProxyConfig};
+pub use physical_send::{
+    authorize_physical_send, body_digest, DiagnosticPhysicalSend, PhysicalSendAuthority, PhysicalSendConfirmation,
+    PhysicalSendReceipt, PhysicalSendRequest,
+};
 pub use model_protocol::provider_catalog::{
     ProviderCatalog, ProviderCatalogInput, ProviderCatalogModel, ProviderCatalogProfile,
     ProviderCatalogProvider, ProviderCatalogSource, ProviderCatalogTransform,

@@ -125,7 +125,11 @@ pub(super) fn validate_executor_domain_events(
 ) -> Result<(), ExecutionCommitError> {
     if domain_events
         .iter()
-        .any(|event| event.event.kind.starts_with("execution.effect."))
+        .any(|event| event.event.kind.starts_with("execution.effect.")
+            || event.event.kind == "execution_node.agent_batch_member"
+            || event.event.kind == "execution_node.agent_batch_prefix"
+            || event.event.kind == "execution_node.agent_batch_manifest"
+            || event.event.kind == "execution_node.agent_batch_pending")
     {
         return Err(ExecutionCommitError::InvalidCommand(
             "executor domain input cannot author reserved execution effect facts".into(),
@@ -213,7 +217,7 @@ mod reserved_node_effect_452_tests {
     }
 }
 
-pub(super) fn graph_identity_refs(graph: &ExecutionGraph) -> Vec<RuntimeEventRef> {
+pub(in crate::execution_core::graph) fn graph_identity_refs(graph: &ExecutionGraph) -> Vec<RuntimeEventRef> {
     let mut refs = vec![RuntimeEventRef {
         kind: "execution_graph".to_string(),
         id: graph.id.clone(),
@@ -393,6 +397,7 @@ pub(super) fn root_index_receipt_event(
                 "effect_kind":effect_kind,
                 "effect_scope":request.authorization.as_ref().map(|authorization| &authorization.scope),
                 "authorized_scopes":request.authorized_scopes,
+                "outcome_truncated":tool_effect_outcome_requires_truncation(outcome),
                 "outcome":bounded_tool_effect_outcome(outcome),
             }),
         },
@@ -437,6 +442,7 @@ pub(super) fn delegated_agent_receipt_event(
                 "effect_kind": effect_kind,
                 "effect_scope": request.authorization.as_ref().map(|authorization| &authorization.scope),
                 "authorized_scopes": request.authorized_scopes,
+                "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
                 "outcome": bounded_tool_effect_outcome(outcome),
             }),
         },
@@ -561,6 +567,23 @@ fn receipt_identity_digest<T: serde::Serialize>(
 pub(crate) fn receipt_replay_contract(
     request: &crate::RuntimeToolExecutionRequest,
 ) -> Result<serde_json::Value, ExecutionCommitError> {
+    if request.step_binding.is_none() {
+        let hook = request.tool_progress.original_governed_hook()
+            .map_err(ExecutionCommitError::InvalidCommand)?
+            .ok_or_else(|| ExecutionCommitError::InvalidCommand("original unbound call owner missing".into()))?;
+        let facts = hook.nonstep_receipt_facts(request).map_err(ExecutionCommitError::InvalidCommand)?;
+        return Ok(json!({
+            "original_unbound_call_digest": receipt_identity_digest(b"tool-effect-original-unbound-v1\0", &facts)?,
+            "session_id":hook.original_session_id(), "parent_execution":hook.original_parent(),
+            "parent_execution_attempt":hook.original_attempt(),
+            "plan_id":hook.original_plan_id(), "plan_revision":hook.original_plan_revision(),
+            "call_id":request.tool_use_id, "tool_name":request.tool_name,
+            "authorization_digest":receipt_identity_digest(b"tool-effect-authorization-v1\0", &hook.original_authorization())?,
+            "payload_digest":canonical_tool_payload(&request.input)?,
+            "policy_revision":request.policy_revision, "authorized_scopes":request.authorized_scopes,
+            "sandbox_posture":request.sandbox_posture, "observation_wave_sequence":request.observation_wave_sequence,
+        }));
+    }
     let (Some(binding), Some(invocation)) = (&request.step_binding, &request.compiled_invocation)
     else {
         return Ok(serde_json::Value::Null);
@@ -917,7 +940,7 @@ pub(super) fn status_name(status: ExecutionNodeStatus) -> &'static str {
     }
 }
 
-pub(super) fn graph_status(graph: &ExecutionGraph) -> Option<&'static str> {
+pub(in crate::execution_core::graph) fn graph_status(graph: &ExecutionGraph) -> Option<&'static str> {
     let statuses = graph.node_statuses.values().copied().collect::<Vec<_>>();
     if statuses.is_empty() {
         return Some("planned");

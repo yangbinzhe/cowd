@@ -24,7 +24,34 @@ pub struct PostgresRuntimeEventStore {
     recent_interleave: Arc<std::sync::Mutex<Option<RuntimeEventInput>>>,
 }
 
+struct PgOwnedCommitGuard<'a>(&'a dyn runtime::RuntimeTransactionCommitControl, bool);
+impl Drop for PgOwnedCommitGuard<'_> {
+    fn drop(&mut self) {
+        if !self.1 { self.0.finish(runtime::RuntimeTransactionOutcome::Unknown); }
+    }
+}
+
 impl PostgresRuntimeEventStore {
+    fn append_owned_cancellable_inner(
+        &self, request: AppendTransactionRequest, control: &dyn runtime::RuntimeTransactionCommitControl,
+    ) -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        if !control.begin().map_err(RuntimeEventStoreError::InvalidTransaction)? { return Ok(None); }
+        let mut guard = PgOwnedCommitGuard(control, false);
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        let receipt = append_transaction_in_tx(&mut tx, &request, None)?;
+        control.before_commit();
+        if !control.commit_wins().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+            pg(tx.rollback())?;
+            control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+            guard.1 = true;
+            return Ok(None);
+        }
+        pg(tx.commit())?;
+        control.finish(runtime::RuntimeTransactionOutcome::Committed);
+        guard.1 = true;
+        Ok(Some(receipt))
+    }
     fn put_source_checkpoint(
         &self,
         projection_id: &str,
@@ -151,10 +178,15 @@ impl PostgresRuntimeEventStore {
         max_bytes: usize,
         descending: bool,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        // An unbounded head-only cursor is a legitimate request: clamp it to
+        // the representable range instead of failing, so the read is not blind
+        // exactly when a diagnostic needs it.
         let after_sequence =
-            to_i64(after_sequence, "after_sequence").map_err(|error| error.to_string())?;
+            to_i64(after_sequence.min(i64::MAX as u64), "after_sequence")
+                .map_err(|error| error.to_string())?;
         let through_sequence =
-            to_i64(through_sequence, "through_sequence").map_err(|error| error.to_string())?;
+            to_i64(through_sequence.min(i64::MAX as u64), "through_sequence")
+                .map_err(|error| error.to_string())?;
         if max_events == 0 || max_bytes == 0 || through_sequence <= after_sequence {
             return Ok(Vec::new());
         }
@@ -259,6 +291,96 @@ impl PostgresRuntimeEventStore {
     }
 }
 
+impl PostgresRuntimeEventStore {
+    fn append_checked_owned_tx(
+        &self, request: CheckedAppendRequest, terminal: Option<&SessionTerminalInput>,
+        validator: &dyn CheckedSourceValidator,
+        control: &dyn runtime::RuntimeTransactionCommitControl,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        request.identity_hash()?;
+        if validator.frame_digest() != request.frame_digest {
+            return Err(RuntimeEventStoreError::InvalidTransaction("source frame mismatch".into()));
+        }
+        // Identify an already committed transaction under the original
+        // transaction advisory lock before considering a new cancellation.
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        pg(tx.query_one(
+            "SELECT set_config('statement_timeout', $1, true)",
+            &[&format!("{}ms", request.budget.max_lock_millis)],
+        ))?;
+        // Do not allow search_path fallback to resolve Session and Runtime
+        // tables from different schemas. The selected production topology
+        // constructs both adapters from the same scoped executor.
+        let same_schema: bool = pg(tx.query_one(
+            "SELECT COALESCE(to_regclass('session_records') = to_regclass(format('%I.session_records', current_schema())), false) AND COALESCE(to_regclass('session_runtime_outbox') = to_regclass(format('%I.session_runtime_outbox', current_schema())), false) AND COALESCE(to_regclass('runtime_commits') = to_regclass(format('%I.runtime_commits', current_schema())), false) AND COALESCE(to_regclass('runtime_events') = to_regclass(format('%I.runtime_events', current_schema())), false)",
+            &[],
+        ))?.try_get(0).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+        if !same_schema {
+            return Err(RuntimeEventStoreError::InvalidTransaction("Session and Runtime transaction schemas differ".into()));
+        }
+        // Match the existing checked owner's transaction identity lock. This
+        // makes the duplicate probe and subsequent append one decision.
+        let transaction_lock = format!("cowd-runtime-event-transaction:{}", request.transaction.transaction_id);
+        pg(tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&transaction_lock]))?;
+        let already_committed = pg(tx.query_opt(
+            "SELECT 1 FROM runtime_commits WHERE transaction_id=$1",
+            &[&request.transaction.transaction_id],
+        ))?.is_some();
+        if !already_committed {
+            session_postgres::lock_runtime_input_claim_with_consumed_tx(
+                &mut tx, claim.session_id, claim.ingress_message_id, claim.turn_id, claim.fence,
+                claim.consumed_input_sequence,
+            ).map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+        }
+        let commit = match append_transaction_in_tx_checked(
+            &mut tx, &request.transaction, terminal, Some((&request, validator)),
+        ) {
+            Ok(commit) => commit,
+            Err(error @ (RuntimeEventStoreError::StaleRevision { .. }
+                | RuntimeEventStoreError::TransactionConflict { .. }
+                | RuntimeEventStoreError::CurrentMemberAuthorityExpired)) => {
+                // The backend, not a missing receipt, proves this attempt did
+                // not commit. If rollback itself fails, preserve Unknown.
+                pg(tx.rollback())?;
+                control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+                return Err(RuntimeEventStoreError::CheckedAttemptRolledBack(Box::new(error)));
+            }
+            Err(error) => return Err(error),
+        };
+        let row = pg(tx.query_one(
+            "SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1",
+            &[&request.transaction.transaction_id],
+        ))?;
+        let evidence: Option<Value> = pg(row.try_get(0))?;
+        let validation = serde_json::from_value(evidence.ok_or_else(|| {
+            RuntimeEventStoreError::Corrupt("checked commit missing source evidence".into())
+        })?)?;
+        if commit.duplicate {
+            pg(tx.commit())?;
+            return Ok(Some(CheckedAppendReceipt { commit, validation }));
+        }
+        if !control.begin().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+            pg(tx.rollback())?;
+            return Ok(None);
+        }
+        let mut guard = PgOwnedCommitGuard(control, false);
+        control.before_commit();
+        if !control.commit_wins().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+            pg(tx.rollback())?;
+            control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+            guard.1 = true;
+            return Ok(None);
+        }
+        pg(tx.commit())?;
+        control.finish(runtime::RuntimeTransactionOutcome::Committed);
+        guard.1 = true;
+        Ok(Some(CheckedAppendReceipt { commit, validation }))
+    }
+
+}
+
 impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     /// Deadline-bounded reader for the fixture evidence oracle.  Without it a
     /// PostgreSQL-backed run can never reach a business verdict: the oracle
@@ -273,7 +395,9 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         if Instant::now() >= request.deadline {
             return Err("Unavailable: deadline exhausted before read");
         }
-        let after_sequence = to_i64(request.after_sequence, "after_sequence")
+        // PostgreSQL sequence values are signed BIGINT. An unbounded
+        // head-only cursor lies beyond every representable stored sequence.
+        let after_sequence = to_i64(request.after_sequence.min(i64::MAX as u64), "after_sequence")
             .map_err(|_| "Unavailable: sequence bound overflow")?;
         // The oracle asks for an open-ended range; clamp instead of failing so
         // an unbounded request still reads every event that exists.
@@ -546,6 +670,36 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         }
         Ok(lines)
     }
+    fn original_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        if transaction_id.trim().is_empty() {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original transaction identity missing".into()));
+        }
+        let mut connection = self.executor.checkout_online_read()?;
+        if pg(connection.query_opt("SELECT 1 FROM runtime_commits WHERE transaction_id=$1", &[&transaction_id]))?.is_none() {
+            return Ok(None);
+        }
+        load_receipt(&mut connection, transaction_id, true).map(Some)
+    }
+
+    fn original_checked_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if transaction_id.trim().is_empty() {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original transaction identity missing".into()));
+        }
+        let mut connection = self.executor.checkout_online_read()?;
+        let mut tx = pg(connection.transaction())?;
+        let Some(row) = pg(tx.query_opt("SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1", &[&transaction_id]))? else {
+            return Ok(None);
+        };
+        let value: Option<Value> = pg(row.try_get(0))?;
+        let validation = serde_json::from_value(value.ok_or_else(||
+            RuntimeEventStoreError::InvalidTransaction("original transaction is not checked".into()))?)?;
+        let commit = load_receipt(&mut tx, transaction_id, true)?;
+        pg(tx.commit())?;
+        Ok(Some(CheckedAppendReceipt { commit, validation }))
+    }
+
     fn transaction_stream_revision_exact(
         &self,
         transaction_id: &str,
@@ -957,6 +1111,13 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         Ok(receipt)
     }
 
+    fn append_transaction_cancellable(
+        &self, request: AppendTransactionRequest,
+        control: &dyn runtime::RuntimeTransactionCommitControl,
+    ) -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        self.append_owned_cancellable_inner(request, control)
+    }
+
     fn append_checked_transaction(
         &self,
         request: CheckedAppendRequest,
@@ -990,6 +1151,46 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         })?)?;
         pg(tx.commit())?;
         Ok(CheckedAppendReceipt { commit, validation })
+    }
+
+    fn append_checked_transaction_cancellable(
+        &self, request: CheckedAppendRequest, validator: &dyn CheckedSourceValidator,
+        control: &dyn runtime::RuntimeTransactionCommitControl,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        self.append_checked_owned_tx(request, None, validator, control, claim)
+    }
+
+    fn original_checked_terminal_winner(
+        &self, request: &CheckedAppendRequest, terminal: &SessionTerminalInput,
+        validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if validator.frame_digest() != request.frame_digest { return Err(RuntimeEventStoreError::InvalidTransaction("source frame mismatch".into())); }
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        let lock = format!("cowd-runtime-event-transaction:{}", request.transaction.transaction_id);
+        pg(tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&lock]))?;
+        if pg(tx.query_opt("SELECT 1 FROM runtime_commits WHERE transaction_id=$1", &[&request.transaction.transaction_id]))?.is_none() {
+            pg(tx.rollback())?;
+            return Ok(None);
+        }
+        // The original helper checks checked identity AND the terminal outbox
+        // content on duplicate; the terminal is not in checked identity_hash.
+        let commit = append_transaction_in_tx_checked(&mut tx, &request.transaction, Some(terminal), Some((request, validator)))?;
+        if !commit.duplicate { return Err(RuntimeEventStoreError::Corrupt("terminal winner was not duplicate".into())); }
+        let row = pg(tx.query_one("SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1", &[&request.transaction.transaction_id]))?;
+        let evidence: Option<Value> = pg(row.try_get(0))?;
+        let validation = serde_json::from_value(evidence.ok_or_else(|| RuntimeEventStoreError::Corrupt("checked terminal evidence missing".into()))?)?;
+        pg(tx.commit())?;
+        Ok(Some(CheckedAppendReceipt { commit, validation }))
+    }
+
+    fn append_checked_terminal_cancellable(
+        &self, request: CheckedAppendRequest, terminal: SessionTerminalInput,
+        validator: &dyn CheckedSourceValidator, control: &dyn runtime::RuntimeTransactionCommitControl,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        self.append_checked_owned_tx(request, Some(&terminal), validator, control, claim)
     }
 
     fn append_transaction_with_terminal(

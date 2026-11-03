@@ -39,8 +39,9 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 fn bounded_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("failed to construct no-redirect OpenAI transport")
 }
 // Some DeepSeek-compatible deployments emit a documented DSML envelope in
 // `content` instead of OpenAI's structured `tool_calls`. This is intentionally
@@ -178,6 +179,11 @@ pub struct OpenAiCompatClient {
     initial_backoff: Duration,
     max_backoff: Duration,
     override_provider_name: Option<String>,
+    /// The installed physical-send authority. `None` refuses every send.
+    authority: Option<std::sync::Arc<crate::physical_send::PhysicalSendAuthority>>,
+    diagnostic_send: Option<std::sync::Arc<crate::physical_send::DiagnosticPhysicalSend>>,
+    original_request_id: Option<String>,
+    send_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl OpenAiCompatClient {
@@ -259,6 +265,10 @@ impl OpenAiCompatClient {
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
             override_provider_name: None,
+            authority: None,
+            diagnostic_send: None,
+            original_request_id: None,
+            send_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -311,6 +321,10 @@ impl OpenAiCompatClient {
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
             override_provider_name: Some(provider_name.into()),
+            authority: None,
+            diagnostic_send: None,
+            original_request_id: None,
+            send_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -356,6 +370,34 @@ impl OpenAiCompatClient {
     #[must_use]
     pub const fn wire_protocol(&self) -> OpenAiWireProtocol {
         self.config.wire_protocol
+    }
+
+    /// Install the physical-send authority. Without one every send is refused.
+    #[must_use]
+    pub fn with_original_provider_request_id(mut self, request_id: String) -> Self {
+        self.original_request_id = Some(request_id); self
+    }
+
+    #[must_use]
+    pub fn with_diagnostic_physical_send(mut self, diagnostic: std::sync::Arc<crate::physical_send::DiagnosticPhysicalSend>) -> Self {
+        self.diagnostic_send = Some(diagnostic); self
+    }
+
+    #[must_use]
+    pub fn with_physical_send_authority(
+        mut self,
+        authority: std::sync::Arc<crate::physical_send::PhysicalSendAuthority>,
+    ) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    /// A unique id per physical send. A receipt is consumed once.
+    fn next_send_id(&self, label: &str) -> String {
+        let counter = self
+            .send_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{label}#{counter}")
     }
 
     pub async fn send_message(
@@ -550,6 +592,18 @@ impl OpenAiCompatClient {
             protocol,
             &self.preparation_binding()?,
         )?;
+        crate::physical_send::authorize_physical_send_or_diagnostic(
+            self.authority.as_deref(), self.diagnostic_send.as_deref(),
+            &crate::physical_send::PhysicalSendRequest {
+                send_id: self.next_send_id("openai"),
+                endpoint: request_url.clone(),
+                method: "POST".to_string(),
+                protocol: protocol.to_string(),
+                model: request.model.clone(),
+                body_sha256: prepared.wire_request().body_sha256.clone(),
+            }, self.original_request_id.as_deref(),
+        )
+        .await?;
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
@@ -3564,6 +3618,10 @@ impl StringExt for String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn default_openai_compat_client_refuses_redirects() {
+        crate::http_client::fixture_assert_redirect_refused(super::bounded_http_client()).await;
+    }
     use super::{
         build_chat_completion_request, build_responses_request, chat_completions_endpoint,
         is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,

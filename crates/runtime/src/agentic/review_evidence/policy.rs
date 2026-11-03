@@ -21,6 +21,7 @@ pub(crate) struct ProofInputSnapshot {
     pub task_refs: Vec<String>,
     pub artifact_refs: Vec<String>,
     pub reviewer_execution_refs: BTreeSet<String>,
+    pub(super) reviewer_packet: Option<harness_contract::agent::AgentTaskPacket>,
     pub retiring_optional_task_refs: BTreeSet<String>,
     pub semantic_digest: String,
     pub policy_digest: String,
@@ -30,9 +31,63 @@ pub(crate) struct ProofInputSnapshot {
     /// It is a CANDIDATE that every entry re-binds against the durable
     /// evidence; a snapshot without one exempts nothing.
     pub current_review_effect_key: Option<String>,
+    pub(super) dependency_frame: ConclusionMaterialDependencies,
+    pub(super) pre_authenticated_session_source: Option<ExpectedStreamRevision>,
+}
+
+/// The actual dependencies independently recovered for this proof, not a
+/// list supplied by a caller. Its outer prepared proof binds store and use.
+pub(crate) struct ConclusionMaterialDependencies {
+    session_source: ExpectedStreamRevision,
+    historical_session_cut: Option<u64>,
+    session_id: String,
+    turn_id: String,
+    review_targets: Vec<harness_contract::goal::ProofEffectTarget>,
+    file_dependencies: Vec<ActualFileDependency>,
+    immutable_inputs: Vec<ActualImmutableInput>,
+    material_events: Vec<harness_contract::goal::ProofInputEvent>,
+    canonical_facts: Vec<serde_json::Value>,
+}
+
+impl ConclusionMaterialDependencies {
+    #[cfg(test)]
+    pub(super) fn empty_for_coverage_test() -> Self {
+        Self { session_source: ExpectedStreamRevision { stream_id: String::new(), expected_revision: 0 }, historical_session_cut: None,
+            session_id: String::new(), turn_id: String::new(),
+            review_targets: Vec::new(), file_dependencies: Vec::new(), immutable_inputs: Vec::new(), material_events: Vec::new(), canonical_facts: Vec::new() }
+    }
+    pub(crate) fn session_source(&self) -> &ExpectedStreamRevision { &self.session_source }
+    pub(crate) fn historical_session_cut(&self) -> Option<u64> { self.historical_session_cut }
+    pub(crate) fn review_targets(&self) -> &[harness_contract::goal::ProofEffectTarget] { &self.review_targets }
+    pub(crate) fn material_events(&self) -> &[harness_contract::goal::ProofInputEvent] { &self.material_events }
+    pub(crate) fn canonical_facts(&self) -> &[serde_json::Value] { &self.canonical_facts }
+    pub(crate) fn file_dependencies(&self) -> impl Iterator<Item = (&harness_contract::goal::ProofEffectTarget, u64, u64, &str, &str)> {
+        self.file_dependencies.iter().map(|d| (&d.target, d.acquisition_cursor, d.consumer_cursor,
+            d.consumer_call_key.as_str(), d.source_sha256.as_str()))
+    }
+    pub(crate) fn protected_files(&self) -> impl Iterator<Item = (&harness_contract::goal::ProofEffectTarget, &str, u64)> {
+        self.file_dependencies.iter().map(|d| (&d.target, d.source_sha256.as_str(), d.source_bytes))
+    }
+    pub(crate) fn immutable_inputs(&self) -> impl Iterator<Item = (&harness_contract::context::ArtifactRef, &str, u64)> {
+        self.immutable_inputs.iter().map(|d| (&d.content, d.reference.as_str(), d.acquisition_cursor))
+    }
+
+    // Original material cuts and current mutable controls are kept separate.
+}
+
+/// A bounded historical Session view, not a current authorization or tail.
+#[derive(Clone, PartialEq)]
+pub(crate) struct HistoricalSessionCut {
+    source: ExpectedStreamRevision,
+    observed_revision: u64,
+}
+impl HistoricalSessionCut {
+    pub(super) fn source(&self) -> &ExpectedStreamRevision { &self.source }
+    pub(super) fn observed_revision(&self) -> u64 { self.observed_revision }
 }
 
 impl ProofInputSnapshot {
+    pub(crate) fn dependency_frame(&self) -> &ConclusionMaterialDependencies { &self.dependency_frame }
     pub(crate) fn reviewer_matches(
         &self,
         program: &AgenticProgramProjection,
@@ -93,6 +148,65 @@ impl CompletionAdmissionContext {
     }
 }
 
+
+/// Reuse the original Goal owner's sealed proof/coverage preparation when
+/// the same completion reaches its checked commit. The caller must first
+/// verify the prepared seal against this store and Program projection.
+pub(crate) fn completion_admission_context_from_prepared(
+    program: &AgenticProgramProjection,
+    envelope: &harness_contract::agent_action::AgentActionEnvelope,
+    prepared: &crate::execution_core::goal::PreparedProgramConclusion,
+) -> Result<Option<CompletionAdmissionContext>, String> {
+    use harness_contract::agent_action::AgentAction;
+    let AgentAction::ObjectiveCompleteRequest(input) = &envelope.action else { return Ok(None); };
+    if input.blocked || !program.tasks.values().any(|task| {
+        task.status == crate::agentic::program::AgenticTaskStatus::CancelRequested
+            && task.pending_retirement == Some(crate::agentic::program::AgenticTaskRetirement::Withdrawn)
+    }) { return Ok(None); }
+    if envelope.actor.program_id != program.program_id || envelope.actor.objective_id != program.objective_id
+        || envelope.actor.session_id != program.session_id || envelope.actor.turn_id != program.turn_id
+        || envelope.actor.root_execution_id != program.root_execution_id
+        || prepared.goal.session_id != program.session_id {
+        return Err("prepared completion context owner differs".into());
+    }
+    let request = program.completion_request.as_ref().ok_or("prepared completion request missing")?;
+    if request.action_id != envelope.action_id || request.requested_by != envelope.actor.actor_id
+        || request.result_refs != input.result_refs || request.evidence_refs != input.evidence_refs
+        || request.unresolved != input.unresolved {
+        return Err("prepared completion context request differs".into());
+    }
+    let conditions = super::required_review_conditions(&prepared.goal);
+    if conditions.is_empty() { return Err("prepared completion context has no required reviews".into()); }
+    let mut excluded: Option<BTreeSet<String>> = None;
+    let mut used = BTreeSet::new();
+    for condition in conditions {
+        let review = prepared.goal.reviews.iter().rev().find(|review| review.criterion_ref == condition)
+            .ok_or("prepared completion review missing")?;
+        let proof = review.verification.as_ref().ok_or("prepared completion review proof missing")?;
+        let (index, verified) = prepared.verified_proofs().iter().enumerate()
+            .find(|(index, verified)| !used.contains(index) && verified.condition() == condition
+                && verified.proof().matches_proof(proof))
+            .ok_or("prepared completion review is not sealed")?;
+        used.insert(index);
+        let retired = &verified.snapshot().retiring_optional_task_refs;
+        excluded = Some(match excluded {
+            None => retired.clone(),
+            Some(previous) => previous.intersection(retired).cloned().collect(),
+        });
+    }
+    if used.len() != prepared.verified_proofs().len() { return Err("prepared completion has unused proofs".into()); }
+    Ok(Some(CompletionAdmissionContext {
+        program_digest: super::proof_value_digest(program),
+        request_digest: super::proof_value_digest(input),
+        envelope_digest: super::proof_value_digest(envelope),
+        goal_id: prepared.goal.id.clone(),
+        goal_revision: prepared.expected_stream_revision,
+        goal_spec_revision: prepared.goal.spec_revision,
+        goal_spec_digest: prepared.goal.spec_digest.clone(),
+        excluded_tasks: excluded.ok_or("prepared completion review set missing")?,
+        sources: prepared.source_frame.sources().cloned().collect(),
+    }))
+}
 
 pub(crate) fn completion_admission_context(
     store: &std::sync::Arc<RuntimeEventStore>,
@@ -292,6 +406,190 @@ pub(crate) fn validate_applied_proof_inputs(
     })
 }
 
+/// Operation-local conclusion witness produced only by the original proof
+/// and call owners. Historical material cuts remain distinct from live heads.
+#[derive(Clone, PartialEq)]
+pub(crate) struct VerifiedConclusionProof {
+    carrier: crate::DurableRuntimeEvent,
+    original_proof: harness_contract::goal::ObjectiveReviewVerification,
+    proof_digest: String,
+    historical_cuts: std::collections::BTreeMap<String, u64>,
+    current_heads: Vec<ExpectedStreamRevision>,
+    historical_calls: Vec<super::AuthenticatedHistoricalPolicyCall>,
+}
+impl VerifiedConclusionProof {
+    pub(crate) fn matches_proof(&self, proof: &harness_contract::goal::ObjectiveReviewVerification) -> bool {
+        &self.original_proof == proof
+    }
+    pub(crate) fn frame_digest(&self) -> String {
+        let calls = self.historical_calls.iter().map(super::AuthenticatedHistoricalPolicyCall::binding_digest).collect::<Vec<_>>();
+        super::proof_value_digest(&(&self.carrier, &self.proof_digest, &self.historical_cuts, &self.current_heads, calls))
+    }
+    pub(crate) fn current_heads(&self) -> &[ExpectedStreamRevision] { &self.current_heads }
+    /// These are evidence of already completed calls, never authority for the
+    /// Supervisor's subsequent Goal/Program conclusion write.
+    pub(crate) fn authenticated_historical_calls(&self) -> &[super::AuthenticatedHistoricalPolicyCall] { &self.historical_calls }
+}
+
+pub(crate) fn validate_applied_proof_for_conclusion(
+    store: &std::sync::Arc<RuntimeEventStore>, program: &AgenticProgramProjection,
+    goal: &GoalContract, proof: &harness_contract::goal::ObjectiveReviewVerification,
+    readers: super::ResultContentReaders<'_>,
+) -> Result<(ProofInputSnapshot, VerifiedConclusionProof), String> {
+    with_authenticated_applied_review(store, program, proof, |identity| {
+        let super::current_review::ReviewActionIdentity::Applied(applied) = identity else {
+            return Err("conclusion requires an original applied review".into());
+        };
+        let inputs = proof.input_set.as_ref().ok_or("review original input cuts missing")?;
+        let session_source = format!("session:{}", program.session_id);
+        let pre_tail = match inputs.source_revisions.get(&session_source) {
+            Some(cut) => {
+                let head = store.stream_revision(&session_source).map_err(|error| error.to_string())?;
+                if *cut > head { return Err("review Session material cut is beyond head".into()); }
+                Some(HistoricalSessionCut {
+                    source: ExpectedStreamRevision { stream_id: session_source.clone(), expected_revision: *cut },
+                    observed_revision: head,
+                })
+            }
+            None => None,
+        };
+        let snapshot = validate_proof_inputs_for_action_with_tail(store, program, Some(goal), proof, readers, Some(identity), pre_tail.as_ref())?;
+        let mut matching = applied.program_events.iter().filter(|event|
+            event.payload["envelope"]["action_id"].as_str() == Some(applied.action_id));
+        let carrier = matching.next().ok_or("original review carrier missing")?.clone();
+        if matching.next().is_some() { return Err("original review carrier ambiguous".into()); }
+        let envelope: harness_contract::agent_action::AgentActionEnvelope = serde_json::from_value(carrier.payload["envelope"].clone())
+            .map_err(|_| "original review envelope malformed")?;
+        let mut historical_cuts = inputs.source_revisions.clone();
+        for (source, revision) in &proof.result_source_revisions {
+            if historical_cuts.insert(source.clone(), *revision).is_some_and(|old| old != *revision) {
+                return Err("review original cuts conflict".into());
+            }
+        }
+        let context = super::current_review::CurrentReviewContext {
+            action_id: &envelope.action_id, action: &envelope.action, actor: &envelope.actor,
+        };
+        let call = if let Some(packet) = snapshot.reviewer_packet.as_ref() {
+            let mut witness_cuts = historical_cuts.clone();
+            let expected_witness_cuts = witness_cuts.clone();
+            let call = super::current_review::authenticate_process_review_policy_call(store, program, packet, &context, &mut witness_cuts)?
+                .ok_or("original Process review call unavailable")?;
+            if witness_cuts != expected_witness_cuts { return Err("original review material cuts changed".into()); }
+            call
+        } else if carrier.payload.get("member_admission").is_some() {
+            super::current_review::authenticate_original_root_member_review(store, &carrier, &context, &historical_cuts)?
+        } else {
+            super::current_review::authenticate_original_single_review(store, &carrier, &context, &historical_cuts)?
+        };
+        let mut heads = std::collections::BTreeMap::new();
+        let approval_stream = call.approval().map(|approval| format!("approval:{}", approval.approval_id()));
+        for source in snapshot.sources.iter().chain(call.current_fences()) {
+            // The historical approval cut remains in the proof. Its current
+            // control is reconstructed below by its original owner, not by
+            // reusing that historical revision as a current fence.
+            if approval_stream.as_deref() == Some(source.stream_id.as_str()) { continue; }
+            if heads.insert(source.stream_id.clone(), source.expected_revision).is_some_and(|old| old != source.expected_revision) {
+                return Err("review current source heads conflict".into());
+            }
+        }
+        if let Some(cut) = &pre_tail {
+            if heads.get(&cut.source.stream_id) != Some(&cut.observed_revision) {
+                return Err("Session material head changed during proof validation".into());
+            }
+        }
+        // Keep exact existing material controls, rather than treating all
+        // Session activity as a material change. Artifact pins and the
+        // original Process owner's File leases survive the checked append.
+        let dependencies = &snapshot.dependency_frame;
+        let frame = readers.process_inputs;
+        let file_is_guarded = |dependency: &ActualFileDependency| frame.is_some_and(|frame|
+            frame.retains_exact_file(&dependency.target, &dependency.source_sha256, None));
+        let pinned_artifact = |content: &harness_contract::context::ArtifactRef| frame.is_some_and(|frame|
+            content.selector.starts_with("artifact://") && frame.retains_exact_artifact(content));
+        let guarded_file_content = |reference: &str, digest: &str, bytes: u64| {
+            dependencies.file_dependencies.iter().any(|dependency|
+                dependency.target.path.workspace_relative_path == reference
+                    && dependency.source_sha256.trim_start_matches("sha256:") == digest.trim_start_matches("sha256:")
+                    && frame.is_some_and(|frame| frame.retains_exact_file(&dependency.target, digest, Some(bytes))))
+        };
+        let materials_guarded = !proof.effect_source_refs.iter().any(|source| source == &session_source)
+            && !call.current_fences().iter().any(|source| source.stream_id == session_source)
+            && !proof.reads.is_empty()
+            && dependencies.file_dependencies.iter().all(file_is_guarded)
+            && dependencies.review_targets.iter().all(|target| dependencies.file_dependencies.iter()
+                .any(|dependency| dependency.target == *target && file_is_guarded(dependency)))
+            && inputs.result_refs.iter().chain(inputs.artifact_refs.iter())
+                .all(|reference| proof.reads.iter().any(|read| &read.result_ref == reference))
+            && dependencies.immutable_inputs.iter().all(|input| pinned_artifact(&input.content)
+                || guarded_file_content(&input.reference, &input.content.sha256, input.content.bytes))
+            && proof.reads.iter().all(|read| frame.is_some_and(|frame|
+                frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes))
+                || guarded_file_content(&read.content_ref, &read.sha256, read.bytes));
+        if pre_tail.is_none() && materials_guarded {
+            // The same original material decision applies when there was no
+            // pre-existing tail: do not turn later protocol activity into a
+            // material dependency solely because A saw no prior growth.
+            heads.remove(&session_source);
+        }
+        if let Some(cut) = &pre_tail {
+            if materials_guarded {
+                heads.remove(&cut.source.stream_id);
+            } else if cut.observed_revision != cut.source.expected_revision {
+                #[cfg(feature = "test-fixtures")]
+                if std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some() {
+                    let effect_sources_clear = !proof.effect_source_refs.iter().any(|source| source == &session_source);
+                    let call_fences_clear = !call.current_fences().iter().any(|source| source.stream_id == session_source);
+                    let files_guarded = dependencies.file_dependencies.iter().all(file_is_guarded);
+                    let targets_guarded = dependencies.review_targets.iter().all(|target| dependencies.file_dependencies.iter().any(|item| item.target == *target && file_is_guarded(item)));
+                    let refs_covered = inputs.result_refs.iter().chain(inputs.artifact_refs.iter()).all(|reference| proof.reads.iter().any(|read| &read.result_ref == reference));
+                    let immutable_guarded = dependencies.immutable_inputs.iter().all(|input| pinned_artifact(&input.content) || guarded_file_content(&input.reference, &input.content.sha256, input.content.bytes));
+                    let reads_guarded = proof.reads.iter().all(|read| frame.is_some_and(|frame| frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes)) || guarded_file_content(&read.content_ref, &read.sha256, read.bytes));
+                    let failed_files: Vec<_> = dependencies.file_dependencies.iter().enumerate().filter_map(|(i, item)| (!file_is_guarded(item)).then_some(i)).take(16).collect();
+                    let failed_targets: Vec<_> = dependencies.review_targets.iter().enumerate().filter_map(|(i, target)| (!dependencies.file_dependencies.iter().any(|item| item.target == *target && file_is_guarded(item))).then_some(i)).take(16).collect();
+                    let failed_refs: Vec<_> = inputs.result_refs.iter().chain(inputs.artifact_refs.iter()).enumerate().filter_map(|(i, reference)| (!proof.reads.iter().any(|read| &read.result_ref == reference)).then_some(i)).take(16).collect();
+                    let failed_immutable: Vec<_> = dependencies.immutable_inputs.iter().enumerate().filter_map(|(i, input)| (!(pinned_artifact(&input.content) || guarded_file_content(&input.reference, &input.content.sha256, input.content.bytes))).then_some(i)).take(16).collect();
+                    let failed_reads: Vec<_> = proof.reads.iter().enumerate().filter_map(|(i, read)| (!(frame.is_some_and(|frame| frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes)) || guarded_file_content(&read.content_ref, &read.sha256, read.bytes))).then_some(i)).take(16).collect();
+                    let read_matches: Vec<_> = proof.reads.iter().take(16).map(|read| {
+                        let selected = dependencies.immutable_inputs.iter().filter(|input| input.content.selector == read.content_ref).collect::<Vec<_>>();
+                        (selected.len(), selected.iter().filter(|input| input.content.sha256 == read.sha256).count(), selected.iter().filter(|input| input.content.bytes == read.bytes).count(), selected.iter().filter(|input| pinned_artifact(&input.content)).count(), frame.is_some_and(|frame| frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes)))
+                    }).collect();
+                    crate::execution_core::graph::k05_trace_emit(format!("REVIEW_MATERIAL_GUARD effect_sources_clear={effect_sources_clear} call_fences_clear={call_fences_clear} reads_present={} files_guarded={files_guarded} targets_guarded={targets_guarded} refs_covered={refs_covered} immutable_guarded={immutable_guarded} reads_guarded={reads_guarded} file_count={} target_count={} immutable_count={} read_count={} failed_files={failed_files:?} failed_refs={failed_refs:?} failed_targets={failed_targets:?} failed_immutable={failed_immutable:?} failed_reads={failed_reads:?} read_matches={read_matches:?}", !proof.reads.is_empty(), dependencies.file_dependencies.len(), dependencies.review_targets.len(), dependencies.immutable_inputs.len(), proof.reads.len()));
+                }
+                return Err("review material lacks an exact retained Artifact or File guard".into());
+            }
+
+        }
+        // Only a grant independently bound to this original review is a
+        // candidate for current approval control. A consumed or naturally
+        // expired once-grant is historical; an explicit revocation of this
+        // exact grant is not silently treated as one of those cases.
+        if let Some(approval) = call.approval() {
+            let current = crate::ApprovalQueue::capture_proof_control_from_store(
+                store, &program.session_id, approval.approval_id(),
+            )?;
+            if &current.request().context != approval.context() {
+                return Err("review approval current owner context differs".into());
+            }
+            let mut grants = current.grants().iter().filter(|grant|
+                grant.grant_id == approval.grant_id() && grant.approval_id == approval.approval_id());
+            let grant = grants.next().ok_or("review original approval grant is missing")?;
+            if grants.next().is_some() || grant.revoked_at_ms.is_some()
+                || grant.status == harness_contract::policy::approval::ApprovalGrantStatus::Revoked {
+                return Err("review original approval grant revoked or ambiguous".into());
+            }
+            let source = current.source();
+            if heads.insert(source.stream_id.clone(), source.expected_revision).is_some_and(|old| old != source.expected_revision) {
+                return Err("review approval current control conflicts with other source".into());
+            }
+        }
+        let current_heads = heads.into_iter().map(|(stream_id, expected_revision)|
+            ExpectedStreamRevision { stream_id, expected_revision }).collect();
+        let frame = VerifiedConclusionProof { carrier, original_proof: proof.clone(), proof_digest: super::proof_value_digest(proof),
+            historical_cuts, current_heads, historical_calls: vec![call] };
+        Ok((snapshot, frame))
+    })
+}
+
 /// Authenticate once from the original durable action, then consume its
 /// borrowed identity synchronously. Neither a stored proof key nor a failed
 /// live invocation can enter this persisted-review boundary.
@@ -370,6 +668,18 @@ pub(crate) fn validate_proof_inputs_for_action(
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
+    validate_proof_inputs_for_action_with_tail(store, program, goal, proof, readers, current_review, None)
+}
+
+fn validate_proof_inputs_for_action_with_tail(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    goal: Option<&GoalContract>,
+    proof: &harness_contract::goal::ObjectiveReviewVerification,
+    readers: super::ResultContentReaders<'_>,
+    current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
+    pre_tail: Option<&HistoricalSessionCut>,
+) -> Result<ProofInputSnapshot, String> {
     #[cfg(test)]
     let _observer = obs1120::Frame::enter(serde_json::json!({
         "callsite":format!("{}:{}", std::panic::Location::caller().file(), std::panic::Location::caller().line()),
@@ -394,13 +704,15 @@ pub(crate) fn validate_proof_inputs_for_action(
         })
         .transpose()?
         .flatten();
-    let snapshot = proof_input_snapshot_for_action(
+    let snapshot = proof_input_snapshot_for_phase(
         store,
         &current,
         current_goal.as_ref().map(|projection| &projection.goal),
         proof,
+        None,
         readers,
         current_review,
+        pre_tail,
     )?;
     if let Some(projection) = &current_goal {
         if !snapshot.sources.iter().any(|source| {
@@ -451,132 +763,6 @@ pub(crate) fn validate_proof_inputs_for_action(
     Ok(snapshot)
 }
 
-pub(crate) fn committed_proof_sources(
-    store: &std::sync::Arc<RuntimeEventStore>,
-    goal: &GoalContract,
-    readers: super::ResultContentReaders<'_>,
-) -> Result<Vec<ExpectedStreamRevision>, String> {
-    let mut sources = std::collections::BTreeMap::new();
-    let program = goal
-        .execution_binding
-        .as_ref()
-        .map(|binding| {
-            crate::AgentActionService::new(std::sync::Arc::clone(store))
-                .project(&binding.agentic_program_id)
-        })
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let program = program
-        .as_ref()
-        .ok_or("committed A has no Program binding")?;
-    if goal
-        .user_intent_criterion_id
-        .as_deref()
-        .is_none_or(str::is_empty)
-    {
-        return Err("committed A missing original intent condition".into());
-    }
-    for condition in super::required_review_conditions(goal) {
-        let review = goal
-            .reviews
-            .iter()
-            .rev()
-            .find(|review| review.criterion_ref == condition)
-            .ok_or_else(|| format!("committed A missing required review {condition}"))?;
-        let proof = review
-            .verification
-            .as_ref()
-            .ok_or_else(|| format!("committed A missing verification {condition}"))?;
-        let inputs = proof
-            .input_set
-            .as_ref()
-            .ok_or_else(|| format!("committed A unsupported required review {condition}"))?;
-        super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)?;
-        let mut results = review.result_refs.clone();
-        if goal.user_intent_criterion_id.as_ref() == Some(&condition) {
-            let request = program
-                .completion_request
-                .as_ref()
-                .ok_or("committed A missing completion request")?;
-            results.extend(crate::execution_core::goal::delivered_result_refs(
-                program,
-                goal,
-                &request.result_refs,
-            ));
-        }
-        for obligation in goal
-            .obligations
-            .iter()
-            .filter(|obligation| obligation.required && obligation.obligation_id == condition)
-        {
-            results.extend(obligation.artifact_refs.iter().cloned());
-        }
-        let snapshot = with_authenticated_applied_review(store, program, proof, |identity| {
-            proof_input_snapshot_for_phase(
-                store,
-                program,
-                Some(goal),
-                proof,
-                Some(&inputs.acceptance_policy_digest),
-                readers,
-                Some(identity),
-            )
-        })?;
-        super::validate_review_coverage(
-            goal, program, review, &results, &review.evidence_refs, &snapshot,
-        ).map_err(|error| format!("committed A review {condition}: {error}"))?;
-        if snapshot.semantic_digest != inputs.semantic_digest
-            || snapshot.work_digest != proof.work_manifest_digest
-            || proof.effect_manifest_digest.as_deref() != Some(snapshot.effects.digest.as_str())
-        {
-            return Err("committed A relevant effect or material changed; delivery requires authorized recovery".into());
-        }
-        for source in snapshot.sources {
-            if sources
-                .insert(source.stream_id, source.expected_revision)
-                .is_some_and(|previous| previous != source.expected_revision)
-            {
-                return Err("committed A current dependency cut changed".into());
-            }
-        }
-        for source in inputs.source_revisions.keys() {
-            let current = store
-                .stream_revision(source)
-                .map_err(|error| error.to_string())?;
-            if sources
-                .insert(source.clone(), current)
-                .is_some_and(|previous| previous != current)
-            {
-                return Err("committed A source changed between required reviews".into());
-            }
-        }
-        for material in &inputs.material_events {
-            verify_material_event(store, material, &mut sources)?;
-        }
-        for (source, expected) in &proof.result_source_revisions {
-            if sources.get(source) != Some(expected) {
-                return Err("committed A approval/result source changed; delivery requires authorized recovery".into());
-            }
-        }
-    }
-    for (source, expected) in &sources {
-        if store
-            .stream_revision(source)
-            .map_err(|error| error.to_string())?
-            != *expected
-        {
-            return Err("committed A source moved while preparing B".into());
-        }
-    }
-    Ok(sources
-        .into_iter()
-        .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
-            stream_id,
-            expected_revision,
-        })
-        .collect())
-}
-
 #[derive(Clone, Copy)]
 enum PinnedEventProjection {
     Effects,
@@ -607,6 +793,17 @@ fn pinned_stream_events(
     since_cursor: u64,
     projection: PinnedEventProjection,
 ) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+    pinned_stream_events_with_cut(store, source, sources, since_cursor, projection, None)
+}
+
+fn pinned_stream_events_with_cut(
+    store: &RuntimeEventStore,
+    source: &str,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+    since_cursor: u64,
+    projection: PinnedEventProjection,
+    authenticated_tail: Option<&HistoricalSessionCut>,
+) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
     let revision = store
         .stream_revision(source)
         .map_err(|error| error.to_string())?;
@@ -617,10 +814,18 @@ fn pinned_stream_events(
         return Err("proof source changed during validation".into());
     }
     let mut events = Vec::new();
-    let mut through = revision;
+    let mut through = match authenticated_tail {
+        Some(tail) if tail.source.stream_id == source && tail.observed_revision == revision
+            && tail.source.expected_revision <= revision => tail.source.expected_revision,
+        Some(_) => return Err("original Session material tail does not match current source".into()),
+        None => revision,
+    };
     loop {
         let page = store.list_stream_before(source, through, 64, 1024 * 1024)?;
         if page.is_empty() {
+            if authenticated_tail.is_some() && through > 0 {
+                return Err("original Session material page incomplete".into());
+            }
             break;
         }
         if store
@@ -639,6 +844,15 @@ fn pinned_stream_events(
                 expected = expected
                     .checked_sub(1)
                     .ok_or("receipt-index structural sequence underflow")?;
+            }
+        }
+        if authenticated_tail.is_some() {
+            let mut expected = through;
+            for event in &page {
+                if event.stream_id != source || event.sequence != expected {
+                    return Err("original Session material page sequence differs".into());
+                }
+                expected = expected.checked_sub(1).ok_or("original Session sequence underflow")?;
             }
         }
         through = page
@@ -2275,7 +2489,7 @@ fn r1_581_actual_read_phase_keeps_discovery_exact_and_revalidates_existing_cuts(
     let original = std::collections::BTreeMap::from([(source.to_string(), 1)]);
     assert!(actual_input_snapshot(&store, &program, &[], readers, Some(&original)).is_err());
     let current =
-        actual_input_snapshot_for_phase(&store, &program, &[], readers, Some(&original), true)
+        actual_input_snapshot_for_phase(&store, &program, &[], readers, Some(&original), true, None)
             .unwrap();
     assert_eq!(current.sources.get(source), Some(&2));
     for invalid in [
@@ -2289,6 +2503,7 @@ fn r1_581_actual_read_phase_keeps_discovery_exact_and_revalidates_existing_cuts(
             readers,
             Some(&invalid),
             true,
+            None,
         )
         .is_err());
     }
@@ -2391,6 +2606,7 @@ pub(super) struct ActualFileDependency {
     pub consumer_cursor: u64,
     pub consumer_call_key: String,
     pub source_sha256: String,
+    pub source_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -2416,6 +2632,16 @@ impl ActualImmutableInput {
             &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
         )
         .map_err(str::to_string)?;
+        // The acquisition is owned by its original physical producer, not by
+        // the consumer whose proof happens to discover it. Recover the packet
+        // from the original graph owner when this is an AgentTask acquisition;
+        // the existing packet, receipt and ticket checks below remain decisive.
+        let original_packet = if packet.is_none() && acquisition.step.run_ref.is_some() {
+            Some(super::results::result_packet(store, &acquisition.graph_id, program, &mut actual.sources)?)
+        } else {
+            None
+        };
+        let packet = packet.or(original_packet.as_ref());
         let intent = &primary.payload["replay"]["invocation"]["intent"];
         if intent["invocation_id"] != acquisition.invocation_id
             || intent["tool_name"] != acquisition.tool_name
@@ -2573,7 +2799,13 @@ impl ActualImmutableInput {
                 || acquisition.step.execution_id.as_deref() != Some(acquisition.graph_id.as_str())
                 || acquisition.step.run_ref.is_some()
             {
-                return Err("immutable acquisition has no authenticated root producer".into());
+                return Err(format!(
+                    "immutable acquisition has no authenticated root producer: call={} primary={} selected={} primary_match={} step_graph_match={} run_ref_present={}",
+                    acquisition.invocation_id, primary.event_id, original.event_id,
+                    original.event_id == primary.event_id,
+                    acquisition.step.execution_id.as_deref() == Some(acquisition.graph_id.as_str()),
+                    acquisition.step.run_ref.is_some(),
+                ));
             }
         }
         for original in super::results::process_ticket_start(store, &acquisition.graph_id,
@@ -2626,6 +2858,11 @@ impl ActualImmutableInput {
                 && packet.is_none_or(|packet| !packet.resource_scopes.contains(&content.visibility_scope)))
         {
             return Err("immutable acquisition conflicts with original content or grant".into());
+        }
+        if source_selector.starts_with("artifact://") {
+            if let Some(frame) = readers.process_inputs {
+                frame.retain_artifact(readers.artifacts.ok_or("immutable acquisition Artifact owner unavailable")?, &content)?;
+            }
         }
         let mut reference = requested.to_string();
         if let super::identity::MaterialIdentity::Publication(publication) = &requested_identity {
@@ -3031,7 +3268,11 @@ fn collect_actual_acquisition(
                 consumer_cursor: boundary.cursor,
                 consumer_call_key: boundary.call_key.clone(),
                 source_sha256: seal.body.source_sha256.clone(),
+                source_bytes: seal.body.source_bytes,
             };
+            if let Some(frame) = readers.process_inputs.filter(|frame| frame.has_original_file_workspace()) {
+                frame.retain_original_file(&dependency.target, &dependency.source_sha256, dependency.source_bytes)?;
+            }
             let identity = super::proof_value_digest(&serde_json::json!([
                 dependency.target,
                 boundary.call_key,
@@ -3050,7 +3291,12 @@ fn collect_actual_acquisition(
             let input = ActualImmutableInput::from_acquisition(
                 store, program, primary, index, session_events,
                 boundary.packet.as_ref(), readers, actual,
-            )?;
+            ).map_err(|error| {
+                if error.starts_with("immutable acquisition has no authenticated root producer") {
+                    format!("{error}; caller=actual_boundary producer={:?} packet_present={}",
+                        boundary.producer, boundary.packet.is_some())
+                } else { error }
+            })?;
             if !actual.immutable_inputs.contains(&input) {
                 actual.immutable_inputs.push(input);
             }
@@ -3447,6 +3693,17 @@ pub(super) fn primary_producer_immutable_inputs(
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
 ) -> Result<ActualInputSnapshot, String> {
+    primary_producer_immutable_inputs_with_tail(store, program, producers, readers, expected_cuts, None)
+}
+
+fn primary_producer_immutable_inputs_with_tail(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    producers: &[super::results::ResultProducer],
+    readers: super::ResultContentReaders<'_>,
+    expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
+    session_tail: Option<&HistoricalSessionCut>,
+) -> Result<ActualInputSnapshot, String> {
     let mut actual = ActualInputSnapshot {
         file_dependencies: Vec::new(),
         immutable_inputs: Vec::new(),
@@ -3455,7 +3712,13 @@ pub(super) fn primary_producer_immutable_inputs(
         canonical_facts: Vec::new(),
     };
     let source = format!("session:{}", program.session_id);
-    let events = super::results::result_source_events(store, &source, &mut actual.sources)?;
+    let events = match session_tail {
+        Some(tail) if tail.source.stream_id == source =>
+            super::results::result_source_events_at_session_cut(store, &source, &mut actual.sources,
+                tail.source.expected_revision, tail.observed_revision)?,
+        Some(_) => return Err("primary acquisition Session tail belongs to another source".into()),
+        None => super::results::result_source_events(store, &source, &mut actual.sources)?,
+    };
     let cut = match expected_cuts {
         Some(cuts) => *cuts
             .get(&source)
@@ -3536,7 +3799,12 @@ pub(super) fn primary_producer_immutable_inputs(
                 producer.packet.as_ref(),
                 readers,
                 &mut actual,
-            )?;
+            ).map_err(|error| {
+                if error.starts_with("immutable acquisition has no authenticated root producer") {
+                    format!("{error}; caller=primary_producer producer={:?} packet_present={}",
+                        producer.execution, producer.packet.is_some())
+                } else { error }
+            })?;
             if !actual.immutable_inputs.contains(&content) {
                 actual.immutable_inputs.push(content);
             }
@@ -3917,7 +4185,7 @@ pub(super) fn actual_input_snapshot(
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
 ) -> Result<ActualInputSnapshot, String> {
-    actual_input_snapshot_for_phase(store, program, boundaries, readers, expected_cuts, false)
+    actual_input_snapshot_for_phase(store, program, boundaries, readers, expected_cuts, false, None)
 }
 
 pub(super) fn actual_input_snapshot_for_phase(
@@ -3927,6 +4195,7 @@ pub(super) fn actual_input_snapshot_for_phase(
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
     allow_history_growth: bool,
+    session_tail: Option<&HistoricalSessionCut>,
 ) -> Result<ActualInputSnapshot, String> {
     let mut actual = ActualInputSnapshot {
         file_dependencies: Vec::new(),
@@ -3949,8 +4218,13 @@ pub(super) fn actual_input_snapshot_for_phase(
             .push(serde_json::json!({"grade":"bounded_process_history","execution":run}));
     }
     let session = format!("session:{}", program.session_id);
-    let session_events =
-        super::results::result_source_events(store, &session, &mut actual.sources)?;
+    let session_events = match session_tail {
+        Some(tail) if tail.source.stream_id == session =>
+            super::results::result_source_events_at_session_cut(store, &session, &mut actual.sources,
+                tail.source.expected_revision, tail.observed_revision)?,
+        Some(_) => return Err("original Session material tail belongs to another source".into()),
+        None => super::results::result_source_events(store, &session, &mut actual.sources)?,
+    };
     let mut seen_boundaries = BTreeSet::new();
     let mut windows = std::collections::BTreeMap::new();
     for boundary in boundaries {
@@ -4391,7 +4665,7 @@ fn admitted_intent_scope(
     )
 }
 
-fn authenticate_settled_effect(
+pub(super) fn authenticate_settled_effect(
     store: &std::sync::Arc<RuntimeEventStore>,
     intent: &crate::DurableRuntimeEvent,
     receipt: &crate::DurableRuntimeEvent,
@@ -4561,6 +4835,18 @@ pub(super) fn original_material_scope(
     .map(Some)
 }
 
+fn require_discovered_graph_genesis(
+    store: &RuntimeEventStore,
+    graph_id: &str,
+    discovery_cursor: u64,
+) -> Result<(), String> {
+    let genesis = store.list_stream_after(graph_id, 0, 1, 1, 4 * 1024 * 1024)?;
+    if genesis.first().is_none_or(|event| event.commit_cursor > discovery_cursor) {
+        return Err("proof physical lineage changed during discovery; retry current inputs".into());
+    }
+    Ok(())
+}
+
 /// Build a proof snapshot as a RECORD: no live action, so no exemption is
 /// derived and a stored proof can never grant one.
 pub(crate) fn proof_input_snapshot(
@@ -4570,7 +4856,7 @@ pub(crate) fn proof_input_snapshot(
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
 ) -> Result<ProofInputSnapshot, String> {
-    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, None)
+    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, None, None)
 }
 
 /// Build a proof snapshot against the LIVE action being applied.
@@ -4582,7 +4868,7 @@ pub(crate) fn proof_input_snapshot_for_action(
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
-    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, current_review)
+    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, current_review, None)
 }
 
 fn proof_input_snapshot_for_phase(
@@ -4593,6 +4879,7 @@ fn proof_input_snapshot_for_phase(
     accepted_policy_digest: Option<&str>,
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
+    pre_tail: Option<&HistoricalSessionCut>,
 ) -> Result<ProofInputSnapshot, String> {
     let inputs = proof.input_set.as_ref().ok_or("missing v2 proof inputs")?;
     if inputs.version != 2 {
@@ -4751,12 +5038,13 @@ fn proof_input_snapshot_for_phase(
             .commit_cursor;
         start_cursor = start_cursor.min(cursor);
     }
-    let session_events = pinned_stream_events(
+    let session_events = pinned_stream_events_with_cut(
         store,
         &session,
         &mut sources,
         start_cursor,
         PinnedEventProjection::EffectsAndPlans,
+        pre_tail,
     )?;
     let strategy = session_events.iter().find(|event| {
         event.kind.starts_with("runtime.strategy.")
@@ -4861,15 +5149,7 @@ fn proof_input_snapshot_for_phase(
         if !visited.insert(graph_id.clone()) {
             continue;
         }
-        let genesis = store.list_stream_after(&graph_id, 0, 1, 1, 4 * 1024 * 1024)?;
-        if genesis
-            .first()
-            .is_none_or(|event| event.commit_cursor > discovery_cursor)
-        {
-            return Err(
-                "proof physical lineage changed during discovery; retry current inputs".into(),
-            );
-        }
+        require_discovered_graph_genesis(store, &graph_id, discovery_cursor)?;
         let graph = graphs.load(&graph_id).map_err(|error| error.to_string())?;
         if graph
             .lineage
@@ -5519,6 +5799,10 @@ fn proof_input_snapshot_for_phase(
     // cannot borrow the review's exemption. Keep the current revision in the
     // original CAS even when this exact retirement has no semantic effect.
     let mut absorbed_graph_sources = std::collections::BTreeMap::new();
+    // Graph continuations can be planned after the review's material cut.
+    // Keep those original plan records separate from proof material; only the
+    // graph owner authenticates a plan selected by a continuation node.
+    let mut graph_plan_events = None;
     for (source, pinned) in &inputs.source_revisions {
         if !visited.contains(source) {
             continue;
@@ -5533,12 +5817,22 @@ fn proof_input_snapshot_for_phase(
             .as_ref()
             .is_none_or(|packet| packet.graph_id() != source)
         {
+            if graph_plan_events.is_none() {
+                let mut plans = session_events.clone();
+                if let Some(cut) = pre_tail {
+                    let later = crate::execution_core::goal::assessment::read_bounded_event_tail(
+                        store, &cut.source.stream_id, cut.source.expected_revision, cut.observed_revision,
+                    ).map_err(|error| error.to_string())?;
+                    plans.extend(later.into_iter().filter(|event| event.kind == "tool.execution_plan.created"));
+                }
+                graph_plan_events = Some(plans);
+            }
             if !super::current_review::graph_tail_preserves_work(
                 store,
                 source,
                 *pinned,
                 current,
-                &session_events,
+                graph_plan_events.as_deref().expect("graph plan view initialized"),
             )? {
                 return Err(format!(
                     "proof foreign graph work changed; {}",
@@ -5643,6 +5937,7 @@ fn proof_input_snapshot_for_phase(
             Some(&inputs.source_revisions),
             readers,
             !inputs.semantic_digest.is_empty(),
+            pre_tail,
         )?;
         if metadata.kind != read.result_kind {
             return Err(
@@ -5725,12 +6020,13 @@ fn proof_input_snapshot_for_phase(
                         .into(),
                 );
             }
-            let acquired = primary_producer_immutable_inputs(
+            let acquired = primary_producer_immutable_inputs_with_tail(
                 store,
                 program,
                 &metadata.producers,
                 readers,
                 Some(&inputs.source_revisions),
+                pre_tail,
             )?;
             require_actual_materials(&acquired.material_events, &inputs.material_events)?;
             for (source, revision) in acquired.sources {
@@ -5791,6 +6087,7 @@ fn proof_input_snapshot_for_phase(
                     Some(&inputs.source_revisions),
                     readers,
                     !inputs.semantic_digest.is_empty(),
+                    pre_tail,
                 )?;
                 input.validate_dependency(program, &reference, &recovered)?;
                 recovered.origin.require_strong()?;
@@ -5891,6 +6188,7 @@ fn proof_input_snapshot_for_phase(
             Some(&inputs.source_revisions),
             readers,
             !inputs.semantic_digest.is_empty(),
+            pre_tail,
         )?;
         pending_metadata.push((reference, metadata));
     }
@@ -5925,6 +6223,7 @@ fn proof_input_snapshot_for_phase(
         readers,
         Some(&inputs.source_revisions),
         !inputs.semantic_digest.is_empty(),
+        pre_tail,
     )?;
     if !inputs.required_scope_complete || actual.required_scopes() != inputs.required_scopes {
         return Err(
@@ -5957,7 +6256,11 @@ fn proof_input_snapshot_for_phase(
         let current = store
             .stream_revision(source)
             .map_err(|error| error.to_string())?;
-        if current != *revision && absorbed_graph_sources.get(source) != Some(revision) {
+        let authenticated_session_growth = pre_tail.is_some_and(|tail|
+            tail.source.stream_id == *source && tail.source.expected_revision == *revision
+                && tail.observed_revision == current);
+        if current != *revision && absorbed_graph_sources.get(source) != Some(revision)
+            && !authenticated_session_growth {
             return Err("proof external decision source changed".into());
         }
         sources.insert(source.clone(), current);
@@ -6441,11 +6744,22 @@ fn proof_input_snapshot_for_phase(
             expected_revision,
         })
         .collect::<Vec<_>>();
+    let dependency_frame = ConclusionMaterialDependencies {
+        session_source: ExpectedStreamRevision { stream_id: session.clone(), expected_revision: session_revision },
+        historical_session_cut: inputs.source_revisions.get(&session).copied(),
+        session_id: program.session_id.clone(), turn_id: program.turn_id.clone(),
+        review_targets,
+        file_dependencies: actual.file_dependencies.clone(),
+        immutable_inputs: actual.immutable_inputs.clone(),
+        material_events: actual.material_events.clone(),
+        canonical_facts: actual.canonical_facts.clone(),
+    };
     Ok(ProofInputSnapshot {
         work_digest,
         task_refs,
         artifact_refs,
         reviewer_execution_refs,
+        reviewer_packet: reviewer_delivery_packet.clone(),
         retiring_optional_task_refs: candidates
             .into_iter()
             .filter(|task| {
@@ -6465,6 +6779,8 @@ fn proof_input_snapshot_for_phase(
         },
         sources,
         current_review_effect_key,
+        dependency_frame,
+        pre_authenticated_session_source: pre_tail.map(|tail| tail.source.clone()),
     })
 }
 
@@ -7431,6 +7747,80 @@ mod tests {
         ));
     }
     #[test]
+    fn physical_lineage_genesis_arriving_after_discovery_requires_fresh_cut() {
+        use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage};
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let graph_id = "late-discovered-graph";
+        let cut = store.durable_commit_cursor().unwrap();
+        let writer = std::sync::Arc::clone(&store);
+        store.inject_read_fault_once(graph_id.into(), "list_stream_after", 1, move |_| {
+            let mut graph = ExecutionGraph::new("late graph at discovery boundary");
+            graph.id = graph_id.into();
+            graph.lineage = Some(ExecutionGraphLineage {
+                session_id: "lineage-session".into(), turn_id: "lineage-turn".into(),
+                root_task_id: "lineage-root".into(), task_id: "lineage-task".into(), generation: 1,
+            });
+            crate::ExecutionCommitService::new(writer).register_graph(graph).unwrap();
+        });
+        let error = require_discovered_graph_genesis(&store, graph_id, cut).unwrap_err();
+        assert_eq!(error, "proof physical lineage changed during discovery; retry current inputs");
+        let fresh_cut = store.durable_commit_cursor().unwrap();
+        assert!(fresh_cut > cut);
+        require_discovered_graph_genesis(&store, graph_id, fresh_cut)
+            .expect("the same durable genesis is visible at a fresh discovery cut");
+    }
+
+    #[test]
+    fn pinned_stream_rejects_final_page_boundary_race_then_reads_stable_cut() {
+        let store = RuntimeEventStore::for_test();
+        let source = "session:actual-final-page-race";
+        let append = |store: &RuntimeEventStore| {
+            store.append(crate::RuntimeEventInput {
+                stream_id: source.into(), scope: crate::RuntimeEventScope::Session,
+                kind: "test.source-advance".into(), status: None, actor: None,
+                refs: vec![], payload: serde_json::json!({}),
+            }).unwrap();
+        };
+        append(&store);
+        // The second revision read verifies the last non-empty page. Advance
+        // after it returns, so only the final page-boundary fence detects it.
+        store.inject_read_fault_once(source.into(), "stream_revision", 2, move |store| append(store));
+        let error = pinned_stream_events(
+            &store, source, &mut std::collections::BTreeMap::new(), 0,
+            PinnedEventProjection::Effects,
+        ).unwrap_err();
+        assert_eq!(error, "proof source changed at final page boundary; retry current inputs");
+        let mut stable_sources = std::collections::BTreeMap::new();
+        pinned_stream_events(&store, source, &mut stable_sources, 0, PinnedEventProjection::Effects)
+            .expect("a new read after the source stops advancing must succeed");
+        assert_eq!(stable_sources[source], 2);
+    }
+
+    #[test]
+    fn pinned_stream_rejects_real_paging_race_then_reads_stable_cut() {
+        let store = RuntimeEventStore::for_test();
+        let source = "session:actual-paging-race";
+        let append = |store: &RuntimeEventStore| {
+            store.append(crate::RuntimeEventInput {
+                stream_id: source.into(), scope: crate::RuntimeEventScope::Session,
+                kind: "test.source-advance".into(), status: None, actor: None,
+                refs: vec![], payload: serde_json::json!({}),
+            }).unwrap();
+        };
+        append(&store);
+        store.inject_read_fault_once(source.into(), "list_stream_before", 1, move |store| append(store));
+        let error = pinned_stream_events(
+            &store, source, &mut std::collections::BTreeMap::new(), 0,
+            PinnedEventProjection::Effects,
+        ).unwrap_err();
+        assert_eq!(error, "proof source changed while paging; retry current inputs");
+        let mut stable_sources = std::collections::BTreeMap::new();
+        pinned_stream_events(&store, source, &mut stable_sources, 0, PinnedEventProjection::Effects)
+            .expect("a fresh read after the source stops advancing must succeed");
+        assert_eq!(stable_sources[source], 2);
+    }
+
+    #[test]
     fn pinned_delivery_projection_preserves_confirmations_across_pages_without_effects() {
         let store = RuntimeEventStore::for_test();
         let source = "session:projection-only";
@@ -7749,7 +8139,7 @@ mod tests {
                 coverage:harness_contract::context::EvidenceCoverageKind::ScopedContent,
                 exact:true, physical_identity:Some("physical:input".into()), alias_checked:true,
             },
-            acquisition_cursor:10, consumer_cursor:20, consumer_call_key:"consumer".into(), source_sha256:"original-preimage".into(),
+            acquisition_cursor:10, consumer_cursor:20, consumer_call_key:"consumer".into(), source_sha256:"original-preimage".into(), source_bytes: 0,
         }
     }
 
@@ -8004,133 +8394,9 @@ mod tests {
         assert_eq!(scope.targets.len(), 1);
     }
 
-    async fn real_selected_material_chain_647(mode: u8) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        use harness_contract::agent_action::{AgentAction, AgentActionEnvelope, AgentActionStatus};
-        let material = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let retained = std::sync::Arc::clone(&material);
-        with_native_task_review_setup(
-            NativeTaskReviewCase::default(),
-            move |services, _, worker, input| {
-                Box::pin(async move {
-                    let content = services.artifact_store().write_bytes(
-                        harness_contract::context::ArtifactWriteDescriptor {
-                            media_type: "text/plain".into(),
-                            visibility_scope: format!("session:{}", worker.actor.session_id),
-                            expected_bytes: None, original_name: None,
-                        }, b"647 actual distinct derived material, not a raw summary alias",
-                    ).await.unwrap();
-                    let publication = services.submit_agent_action(&AgentActionEnvelope {
-                        action_id: "647-derived-material".into(), actor: worker.actor.clone(),
-                        expected_revision: None,
-                        action: AgentAction::ArtifactCommit(serde_json::from_value(serde_json::json!({
-                            "content_ref":content.selector,"kind":"note",
-                            "title":"An opaque independent material identity","relates_to":[]
-                        })).unwrap()),
-                    }).await.unwrap();
-                    assert_eq!(publication.status, AgentActionStatus::Applied, "{publication:?}");
-                    if mode != 2 {
-                        acquire_original_native_body(&services, &worker, "evidence_retrieve",
-                            "647-producer-reads-derived-material",
-                            serde_json::json!({"evidence_ref":content.selector})).await;
-                    }
-                    *retained.lock().unwrap() = Some((content, publication.changed_refs[0].clone()));
-                    input
-                })
-            },
-            move |services, envelope, donor| {
-                Box::pin(async move {
-                    let (content, derived_ref) = material.lock().unwrap().take().unwrap();
-                    let program = services.agent_action_service()
-                        .project(&envelope.actor.program_id).unwrap();
-                    let history = services.session_history_reader();
-                    let readers = super::super::ResultContentReaders {
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: history.as_deref(), process_inputs: None,
-                    };
-                    let goal = services.goal_store().get(&format!("goal:{}",
-                        envelope.actor.root_execution_id.as_ref().unwrap())).unwrap().unwrap();
-                    let mut recovered = Vec::new();
-                    for read in &donor.verification.reads {
-                        let selected = harness_contract::context::ArtifactRef::durable(
-                            &read.content_ref, &read.sha256, read.bytes,
-                            "application/octet-stream", format!("session:{}", program.session_id),
-                        );
-                        recovered.push(super::super::results::resolve_result_metadata(
-                            services.event_store(), &program, &read.result_ref,
-                            &selected, None, readers).unwrap());
-                    }
-                    assert!(!recovered.is_empty());
-                    assert_eq!(recovered.iter().any(|result| result.primary_inputs.iter().any(|input| input.content == content)),
-                        mode != 2, "only the selected producer's real acquisition may close D");
-                    let (_, actual) = real_review_actual_inputs(&services, &program, &donor.verification);
-                    assert!(actual.required_scopes().iter().any(|target|
-                        target.path.workspace_relative_path == "review-effect.txt"));
-                    assert!(actual.canonical_facts.iter().any(|fact|
-                        fact["grade"] == "acquired"
-                            && fact["acquisition"]["body"]["extent"]["kind"] == "file_lines"
-                            && fact["scope"]["scope_purposes"].as_array().is_some_and(|purposes|
-                                purposes.iter().any(|purpose| purpose["purpose"] == "input_read"))));
-                    proof_input_snapshot(services.event_store(), &program, Some(&goal),
-                        &donor.verification, readers).unwrap();
-                    let selected = &donor.verification.reads[0];
-                    let original = vec![selected.result_ref.clone(), selected.content_ref.clone(),
-                        derived_ref.clone(), content.selector.clone()];
-                    let aliases = super::super::canonical_review_result_refs(&program, &original).unwrap();
-                    assert_eq!(aliases.len(), 2);
-                    assert!(aliases.contains(&derived_ref));
-                    assert_ne!(selected.content_ref, content.selector);
-                    assert_eq!(original[0], selected.result_ref);
-                    assert_eq!(original[2], derived_ref);
-                    if mode == 1 {
-                        let mut omitted = donor.verification.clone();
-                        omitted.input_set.as_mut().unwrap().required_scopes.clear();
-                        assert!(proof_input_snapshot(services.event_store(), &program,
-                            Some(&goal), &omitted, readers).is_err());
-                        let primary = actual.material_events.iter().find(|material|
-                            verify_material_event(services.event_store(), material,
-                                &mut std::collections::BTreeMap::new()).is_ok_and(|event|
-                                    event.kind == "execution.read.receipt"
-                                        && event.payload[crate::context_evidence::READ_ACQUISITION_FIELD]
-                                            ["body"]["extent"]["kind"] == "file_lines")).unwrap();
-                        let mut omitted = donor.verification.clone();
-                        omitted.input_set.as_mut().unwrap().material_events.retain(|material|
-                            material.event_id != primary.event_id);
-                        assert!(proof_input_snapshot(services.event_store(), &program,
-                            Some(&goal), &omitted, readers).is_err());
-                        for result in &recovered {
-                            let mut cuts = donor.verification.input_set.as_ref().unwrap().source_revisions.clone();
-                            cuts.remove(&format!("session:{}", program.session_id));
-                            assert!(primary_producer_immutable_inputs(services.event_store(), &program,
-                                &result.producers, readers, Some(&cuts)).is_err());
-                        }
-                        let mut changed = program.clone();
-                        changed.artifacts.get_mut(&derived_ref).unwrap().content_ref =
-                            selected.content_ref.clone();
-                        assert!(proof_input_snapshot(services.event_store(), &changed,
-                            Some(&goal), &donor.verification, readers).is_err());
-                    }
-                })
-            },
-        ).await;
-    }
 
-    #[tokio::test]
-    async fn r1_647_selected_real_producer_material_reaches_protected_file_input() {
-        real_selected_material_chain_647(0).await;
-    }
 
-    #[tokio::test]
-    async fn r1_647_real_primary_chain_rejects_omitted_acquisition_cut_scope_and_retargeting() {
-        real_selected_material_chain_647(1).await;
-    }
 
-    #[tokio::test]
-    async fn r1_647_same_producer_unread_material_is_not_a_primary_alias() {
-        real_selected_material_chain_647(2).await;
-    }
 
     async fn acquire_original_native_body(
         services: &std::sync::Arc<crate::RuntimeServices>,
@@ -8343,885 +8609,12 @@ mod tests {
         (boundaries, actual)
     }
 
-    #[tokio::test]
-    async fn r1_actual_collector_recovers_omitted_inputs_and_rejects_foreign_unsealed_identity_through_final_proof(
-    ) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        with_native_task_review_setup(
-            NativeTaskReviewCase {
-                complete_goal: true,
-                ..Default::default()
-            },
-            |services, _, worker, input| {
-                Box::pin(async move {
-                    acquire_original_native_body(
-                        &services,
-                        &worker,
-                        "tool_search",
-                        "actual-input-catalog-body",
-                        serde_json::json!({"query":"read_file"}),
-                    )
-                    .await;
-                    let artifact = services
-                        .artifact_store()
-                        .write_bytes(
-                            harness_contract::context::ArtifactWriteDescriptor {
-                                media_type: "text/plain".into(),
-                                visibility_scope: format!("session:{}", worker.actor.session_id),
-                                expected_bytes: None,
-                                original_name: None,
-                            },
-                            b"real immutable producer input",
-                        )
-                        .await
-                        .unwrap();
-                    acquire_original_native_body(
-                        &services,
-                        &worker,
-                        "evidence_retrieve",
-                        "actual-input-immutable-body",
-                        serde_json::json!({"evidence_ref":artifact.selector}),
-                    )
-                    .await;
-                    input
-                })
-            },
-            |services, envelope, donor| {
-                Box::pin(async move {
-                    let program = services
-                        .agent_action_service()
-                        .project(&envelope.actor.program_id)
-                        .unwrap();
-                    let goal = services
-                        .goal_store()
-                        .get(&format!(
-                            "goal:{}",
-                            envelope.actor.root_execution_id.as_ref().unwrap()
-                        ))
-                        .unwrap()
-                        .unwrap();
-                    let history = services.session_history_reader();
-                    let readers = super::super::ResultContentReaders {
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: history.as_deref(),
-                        process_inputs: None,
-                    };
-                    let (boundaries, actual) =
-                        real_review_actual_inputs(&services, &program, &donor.verification);
-                    assert!(!actual.file_dependencies.is_empty());
-                    assert!(actual
-                        .canonical_facts
-                        .iter()
-                        .any(|fact| fact["grade"] == "acquired_immutable_receipt"));
-                    assert!(actual
-                        .canonical_facts
-                        .iter()
-                        .any(|fact| fact["grade"] == "acquired"
-                            && fact["acquisition"]["body"]["extent"]["kind"] == "artifact_chunks"
-                            && fact["scope"]["complete"] == false
-                            && fact["scope"]["targets"]
-                                .as_array()
-                                .is_some_and(Vec::is_empty)));
-                    proof_input_snapshot(
-                        services.event_store(),
-                        &program,
-                        Some(&goal),
-                        &donor.verification,
-                        readers,
-                    )
-                    .unwrap();
-                    let session_events = services
-                        .event_store()
-                        .list_stream(&format!("session:{}", program.session_id))
-                        .unwrap();
-                    let publication = session_events
-                        .iter()
-                        .find(|event| {
-                            event.kind == "tool.invocation.completed"
-                                && event.payload["tool_call_id"] == "native-publication-small"
-                        })
-                        .unwrap();
-                    let task =
-                        super::super::results::result_tool_plan(&session_events, publication)
-                            .unwrap()
-                            .unwrap();
-                    let primary = super::super::results::original_tool_primary(
-                        services.event_store(),
-                        publication,
-                        task,
-                        &mut Default::default(),
-                    )
-                    .unwrap();
-                    let body: serde_json::Value = serde_json::from_str(
-                        primary.payload["outcome"]["output"].as_str().unwrap(),
-                    )
-                    .unwrap();
-                    let source = body["content_ref"].as_str().unwrap();
-                    let content = services.artifact_store().resolve(source).unwrap();
-                    let early = super::super::results::resolve_result_metadata(
-                        services.event_store(),
-                        &program,
-                        source,
-                        &content,
-                        None,
-                        readers,
-                    )
-                    .unwrap();
-                    let early_inputs = actual_input_snapshot(
-                        services.event_store(),
-                        &program,
-                        &early.input_boundaries,
-                        readers,
-                        None,
-                    )
-                    .unwrap();
-                    let catalog = actual
-                        .material_events
-                        .iter()
-                        .find(|material| {
-                            let event = verify_material_event(
-                                services.event_store(),
-                                material,
-                                &mut Default::default(),
-                            )
-                            .unwrap();
-                            event.kind == "execution.read.receipt"
-                                && event.payload["tool_name"] == "tool_search"
-                        })
-                        .unwrap();
-                    assert!(!early_inputs
-                        .canonical_facts
-                        .iter()
-                        .any(|fact| fact["source"] == catalog.event_id));
-                    assert!(actual
-                        .canonical_facts
-                        .iter()
-                        .any(|fact| fact["source"] == catalog.event_id));
-                    let primary_ids = actual
-                        .material_events
-                        .iter()
-                        .filter(|material| {
-                            verify_material_event(
-                                services.event_store(),
-                                material,
-                                &mut Default::default(),
-                            )
-                            .unwrap()
-                            .kind
-                                == "execution.read.receipt"
-                        })
-                        .map(|material| material.event_id.clone())
-                        .collect::<BTreeSet<_>>();
-                    let index_ids = actual
-                        .material_events
-                        .iter()
-                        .filter(|material| {
-                            let event = verify_material_event(
-                                services.event_store(),
-                                material,
-                                &mut Default::default(),
-                            )
-                            .unwrap();
-                            event.kind == "execution.agent_tool.receipt"
-                                && event.payload["effect_kind"] == "read"
-                        })
-                        .map(|material| material.event_id.clone())
-                        .collect::<BTreeSet<_>>();
-                    assert!(!primary_ids.is_empty() && !index_ids.is_empty());
-                    for mode in ["primary", "index", "both", "both-empty-scopes"] {
-                        let mut proof = donor.verification.clone();
-                        let inputs = proof.input_set.as_mut().unwrap();
-                        inputs.material_events.retain(|material| {
-                            !(mode != "index" && primary_ids.contains(&material.event_id)
-                                || mode != "primary" && index_ids.contains(&material.event_id))
-                        });
-                        if mode == "both-empty-scopes" {
-                            inputs.required_scopes.clear();
-                        }
-                        assert!(
-                            proof_input_snapshot(
-                                services.event_store(),
-                                &program,
-                                Some(&goal),
-                                &proof,
-                                readers
-                            )
-                            .is_err(),
-                            "{mode}"
-                        );
-                        let mut rejected = envelope.clone();
-                        rejected.action_id = format!("actual-input-omission:{mode}");
-                        let cursor = services.event_store().durable_commit_cursor().unwrap();
-                        let before = services.goal_store().get(&goal.id).unwrap().unwrap();
-                        let applied = services
-                            .agent_action_service()
-                            .apply_verified_review(&rejected, &proof)
-                            .unwrap();
-                        assert_eq!(
-                            applied.status,
-                            harness_contract::agent_action::AgentActionStatus::Rejected,
-                            "{mode}"
-                        );
-                        assert_eq!(
-                            services.event_store().durable_commit_cursor().unwrap(),
-                            cursor
-                        );
-                        assert_eq!(
-                            services.goal_store().get(&goal.id).unwrap().unwrap(),
-                            before
-                        );
-                    }
-                    for fault in [
-                        "session",
-                        "run",
-                        "step",
-                        "call",
-                        "input",
-                        "compiled",
-                        "artifact-body",
-                        "artifact-hash",
-                        "artifact-chunk",
-                        "artifact-source",
-                        "artifact-producer",
-                        "artifact-attempt",
-                    ] {
-                        ACTUAL_READ_SOURCE_FAULT
-                            .scope(fault, async {
-                                assert!(
-                                    actual_input_snapshot(
-                                        services.event_store(),
-                                        &program,
-                                        &boundaries,
-                                        readers,
-                                        None
-                                    )
-                                    .is_err(),
-                                    "{fault}"
-                                );
-                                assert!(
-                                    proof_input_snapshot(
-                                        services.event_store(),
-                                        &program,
-                                        Some(&goal),
-                                        &donor.verification,
-                                        readers
-                                    )
-                                    .is_err(),
-                                    "{fault}"
-                                );
-                            })
-                            .await;
-                    }
-                    for boundary in &boundaries {
-                        let mut forged = boundary.clone();
-                        forged.call_key.push_str(":other-consumer");
-                        assert!(actual_input_snapshot(
-                            services.event_store(),
-                            &program,
-                            &[forged],
-                            readers,
-                            None
-                        )
-                        .is_err());
-                        let mut forged = boundary.clone();
-                        forged.cursor += 1;
-                        assert!(actual_input_snapshot(
-                            services.event_store(),
-                            &program,
-                            &[forged],
-                            readers,
-                            None
-                        )
-                        .is_err());
-                    }
-                    let accepted = services
-                        .agent_action_service()
-                        .apply_verified_review(&envelope, &donor.verification)
-                        .unwrap();
-                    assert_eq!(
-                        accepted.status,
-                        harness_contract::agent_action::AgentActionStatus::Applied,
-                        "{accepted:?}"
-                    );
-                })
-            },
-        )
-        .await;
-    }
 
-    async fn original_root_same_bytes_write(
-        services: &std::sync::Arc<crate::RuntimeServices>,
-        actor: &harness_contract::agent_action::AgentActorBinding,
-        call: &str,
-    ) -> u64 {
-        let root = actor.root_execution_id.as_deref().unwrap();
-        let node = format!("{root}:model");
-        let graph = crate::agentic::execution::reviewed_goal_fixture::bind_review_fixture_root(
-            services, services.commit_service(),
-            services.graph_state_store().load(root).unwrap(), &node,
-        );
-        let owner = services
-            .event_store()
-            .latest_for_stream(&format!("{root}:node:{node}"))
-            .unwrap()
-            .unwrap()
-            .activity_binding()
-            .unwrap();
-        let attempt = graph.recovery_cursor.node_attempts[&node];
-        let host = services.tool_execution_host().unwrap();
-        let lease = host.pin_step_catalog().unwrap();
-        let definitions = lease
-            .snapshot()
-            .catalog
-            .definitions(None)
-            .into_iter()
-            .filter(|definition| definition.name == "edit")
-            .map(|definition| crate::ProviderToolDefinition {
-                name: definition.name,
-                description: definition.description,
-                input_schema: definition.input_schema,
-            })
-            .collect::<Vec<_>>();
-        let identity = serde_json::from_value(serde_json::json!({
-            "step_id":format!("original-root-input-test:{}",uuid::Uuid::new_v4()),
-            "session_id":owner.session_id,"turn_id":owner.turn_id,"execution_id":root,
-            "actor_ref":actor.actor_id,"attempt":attempt,"build_ref":"original-c-review-fixture",
-        }))
-        .unwrap();
-        let step = std::sync::Arc::new(
-            crate::step_snapshot::BoundStep::bind(
-                identity,
-                lease.clone(),
-                &definitions,
-                &serde_json::json!({}),
-                &serde_json::json!({}),
-                Default::default(),
-                9_007_199_254_740_991,
-            )
-            .unwrap(),
-        );
-        let binding = crate::step_snapshot::StepCallBinding::provider(step, call);
-        let content =
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap();
-        let input =
-            serde_json::json!({"action":"write","path":"review-effect.txt","content":content});
-        let invocation = binding
-            .prepare_invocation(Some(lease), "edit", &input)
-            .unwrap();
-        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
-            &crate::tool_dispatch::ToolRequest {
-                tool_use_id: call.into(),
-                tool_name: "edit".into(),
-                input: input.to_string(),
-                depends_on: vec![],
-            },
-        );
-        request.session_id = Some(owner.session_id.clone());
-        request.governed_plan_id = root.into();
-        request.governed_plan_revision = 1;
-        request.observation_wave_sequence = 50_000;
-        request.policy_revision = 1;
-        request.idempotency_key = binding.effect_idempotency_key();
-        request.compiled_invocation = Some(invocation.clone());
-        request.step_binding = Some(binding);
-        let policy = crate::PermissionPolicy::new(PermissionMode::WorkspaceWrite);
-        request.sandbox_posture = policy.execution_policy_control().snapshot().sandbox_posture;
-        let assessed = crate::AuthorizationNegotiator::new().assess_effective(
-            &policy,
-            &crate::AuthorizationRequest {
-                principal_id: actor.actor_id.clone(),
-                capability: "edit".into(),
-                input: request.input.clone(),
-                idempotency_key: call.into(),
-                effect: invocation.effect.clone(),
-                parent_ceiling: PermissionMode::WorkspaceWrite,
-                parent_lease_id: None,
-                policy_revision: request.policy_revision,
-                recovery_scope: root.into(),
-                context: crate::PermissionContext::default(),
-                safe_alternatives: vec![],
-            },
-        );
-        request.authorization = Some(
-            crate::ToolPolicy
-                .authorize(
-                    &assessed.effective,
-                    &assessed.assessment,
-                    call,
-                    assessed.assessment.lease.clone().unwrap(),
-                    30,
-                )
-                .unwrap()
-                .authorization,
-        );
-        let (locks, _) = crate::bound_tool_batch::bound_effect_lock_requests(
-            services.path_identity_resolver(),
-            &invocation.effect,
-        )
-        .unwrap();
-        let _locks = services.scope_locks().acquire(locks, None).await.unwrap();
-        let scope = crate::bound_tool_batch::admitted_effect_scope(
-            &request,
-            &invocation.effect,
-            host.pin_step_catalog(),
-            services.path_identity_resolver(),
-        )
-        .unwrap();
-        let root_context = crate::CowdExecutionContext {
-            execution_id: root.into(),
-            session_id: owner.session_id.clone(),
-            turn_id: owner.turn_id.clone(),
-        };
-        services
-            .commit_service()
-            .begin_root_tool_effect(
-                &request,
-                &invocation.effect,
-                &root_context,
-                &scope,
-                &owner,
-                attempt,
-            )
-            .unwrap();
-        let outcome = host.execute_runtime_tool(&request).await;
-        assert_eq!(
-            outcome.status,
-            crate::RuntimeToolExecutionStatus::Executed,
-            "{outcome:?}"
-        );
-        services
-            .commit_service()
-            .commit_tool_effect(&request, &invocation.effect, &outcome)
-            .unwrap();
-        let receipt = services
-            .event_store()
-            .event_by_idempotency_key(
-                &format!("execution-effect:{}", request.idempotency_key),
-                &format!("{}:receipt", request.idempotency_key),
-            )
-            .unwrap()
-            .unwrap();
-        super::super::results::authenticate_root_receipt_owner(
-            services.event_store(),
-            &receipt,
-            &mut Default::default(),
-        )
-        .unwrap();
-        receipt.commit_cursor
-    }
 
-    #[tokio::test]
-    async fn r1_actual_collector_separates_preuse_consumer_from_real_reacquisition_and_reaches_goal(
-    ) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        use harness_contract::agent_action::{
-            AgentAction, AgentActionEnvelope, ArtifactCommitInput,
-        };
-        let facts = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let setup_facts = facts.clone();
-        with_native_task_review_setup(
-            NativeTaskReviewCase {
-                complete_goal: true,
-                commit_report: true,
-                ..Default::default()
-            },
-            move |services, root, worker, mut input| {
-                Box::pin(async move {
-                    let program = services
-                        .agent_action_service()
-                        .project(&worker.actor.program_id)
-                        .unwrap();
-                    let original = program
-                        .artifacts
-                        .values()
-                        .find(|artifact| {
-                            artifact.claim_execution_id == worker.actor.execution_id
-                                && artifact.relates_to.contains(&input.task_ref)
-                        })
-                        .unwrap()
-                        .content_ref
-                        .clone();
-                    let write = original_root_same_bytes_write(
-                        &services,
-                        &root.actor,
-                        "actual-preuse-write",
-                    )
-                    .await;
-                    let publish = |id: &str| AgentActionEnvelope {
-                        action_id: id.into(),
-                        actor: worker.actor.clone(),
-                        expected_revision: None,
-                        action: AgentAction::ArtifactCommit(ArtifactCommitInput {
-                            content_ref: original.clone(),
-                            kind: "report".into(),
-                            title: id.into(),
-                            relates_to: vec![input.task_ref.clone()],
-                        }),
-                    };
-                    let stale = services
-                        .submit_agent_action(&publish("actual-preuse-stale-consumer"))
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        stale.status,
-                        harness_contract::agent_action::AgentActionStatus::Applied
-                    );
-                    acquire_original_native_body(
-                        &services,
-                        &worker,
-                        "read_file",
-                        "actual-reacquired-before-use",
-                        serde_json::json!({"path":"review-effect.txt","complete":true}),
-                    )
-                    .await;
-                    let fresh = services
-                        .submit_agent_action(&publish("actual-preuse-fresh-consumer"))
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        fresh.status,
-                        harness_contract::agent_action::AgentActionStatus::Applied
-                    );
-                    input.artifact_refs = fresh.changed_refs.clone();
-                    input.deliverable = None;
-                    // The stale and fresh consumers commit the same original
-                    // content, so a content-level evidence ref is genuinely
-                    // ambiguous across their artifacts (the product refuses it,
-                    // correctly). Cite the fresh consumer's exact artifact.
-                    input.evidence_refs = fresh.changed_refs.clone();
-                    *setup_facts.lock().unwrap() = Some((
-                        stale.changed_refs[0].clone(),
-                        fresh.changed_refs[0].clone(),
-                        write,
-                    ));
-                    input
-                })
-            },
-            move |services, envelope, donor| {
-                Box::pin(async move {
-                    let (stale, fresh, write) = facts.lock().unwrap().clone().unwrap();
-                    let program = services
-                        .agent_action_service()
-                        .project(&envelope.actor.program_id)
-                        .unwrap();
-                    let history = services.session_history_reader();
-                    let readers = super::super::ResultContentReaders {
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: history.as_deref(),
-                        process_inputs: None,
-                    };
-                    for (reference, after) in [(&stale, false), (&fresh, true)] {
-                        let content = services
-                            .artifact_store()
-                            .resolve(&program.artifacts[reference].content_ref)
-                            .unwrap();
-                        let metadata = super::super::results::resolve_result_metadata(
-                            services.event_store(),
-                            &program,
-                            reference,
-                            &content,
-                            None,
-                            readers,
-                        )
-                        .unwrap();
-                        let actual = actual_input_snapshot(
-                            services.event_store(),
-                            &program,
-                            &metadata.input_boundaries,
-                            readers,
-                            None,
-                        )
-                        .unwrap();
-                        assert!(actual
-                            .file_dependencies
-                            .iter()
-                            .any(|dependency| dependency.consumer_cursor > write
-                                && (dependency.acquisition_cursor > write) == after));
-                    }
-                    let error = services
-                        .independent_result_review(&envelope.actor, &program, &[stale], None)
-                        .await
-                        .err()
-                        .expect(
-                            "the real earlier consumer cannot use a later producer reacquisition",
-                        );
-                    assert!(
-                        error.contains("cites results outside Task")
-                            || error.contains("proof_actual_input_stale_before_use"),
-                        "{error}"
-                    );
-                    let goal = services
-                        .goal_store()
-                        .get(&format!(
-                            "goal:{}",
-                            envelope.actor.root_execution_id.as_ref().unwrap()
-                        ))
-                        .unwrap()
-                        .unwrap();
-                    proof_input_snapshot(
-                        services.event_store(),
-                        &program,
-                        Some(&goal),
-                        &donor.verification,
-                        readers,
-                    )
-                    .unwrap();
-                    let applied = services
-                        .agent_action_service()
-                        .apply_verified_review(&envelope, &donor.verification)
-                        .unwrap();
-                    assert_eq!(
-                        applied.status,
-                        harness_contract::agent_action::AgentActionStatus::Applied,
-                        "{applied:?}"
-                    );
-                })
-            },
-        )
-        .await;
-    }
 
-    #[tokio::test]
-    async fn r1_actual_collector_rejects_real_write_after_independent_read_without_faking_postimage(
-    ) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_async, NativeTaskReviewCase,
-        };
-        with_native_task_review_async(NativeTaskReviewCase::default(),|services,envelope,_donor| Box::pin(async move {
-            let before = services.goal_store().get(&format!("goal:{}",envelope.actor.root_execution_id.as_ref().unwrap())).unwrap().unwrap();
-            original_root_same_bytes_write(&services,&envelope.actor,"actual-after-reviewer-read").await;
-            let program = services.agent_action_service().project(&envelope.actor.program_id).unwrap();
-            let references = match &envelope.action {
-                harness_contract::agent_action::AgentAction::TaskReview(input) => program.tasks[&input.task_ref].artifact_refs.clone(),
-                _ => unreachable!(),
-            };
-            let error = services.independent_result_review(&envelope.actor,&program,&references,None).await.err()
-                .expect("a fresh collector must reject old independent File observations after a real write");
-            assert!(error.contains("review_requires_effect_observation"),"{error}");
-            assert!(services.submit_agent_action(&envelope).await.is_err());
-            assert_eq!(services.goal_store().get(&before.id).unwrap().unwrap(),before);
-            assert!(program.tasks.values().any(|task|task.status == crate::AgenticTaskStatus::Submitted));
-        })).await;
-    }
 
-    /// The applied review is exempt; a SECOND unfinished review in the same
-    /// run is not.
-    ///
-    /// This is the business path: the real native task review, the real
-    /// Program, the real proof. The applied review settles its own call
-    /// (that is the self-dependency the exemption exists for), and a second
-    /// review of the same reviewer that is still in flight keeps the review
-    /// from accepting until it lands.
-    ///
-    /// The second review is INJECTED as a second planned review call of the
-    /// same reviewer - the real business fixture, with one extra durable plan
-    /// - not two genuinely concurrent model calls.
-    #[tokio::test]
-    async fn r1_a_second_unfinished_review_in_the_same_run_blocks_the_applied_review() {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_async, NativeTaskReviewCase,
-        };
-        for second_review in [false, true] {
-            with_native_task_review_async(
-                NativeTaskReviewCase {
-                    complete_goal: !second_review,
-                    ..NativeTaskReviewCase::default()
-                },
-                move |services, envelope, donor| Box::pin(async move {
-                    let program = services
-                        .agent_action_service()
-                        .project(&envelope.actor.program_id)
-                        .unwrap();
-                    let task_ref = match &envelope.action {
-                        harness_contract::agent_action::AgentAction::TaskReview(input) => {
-                            input.task_ref.clone()
-                        }
-                        _ => unreachable!(),
-                    };
-                    if second_review {
-                        // A second review call of the SAME reviewer, still in
-                        // flight: it has its own Step and its own effect
-                        // identity, so it is not the call the applied review
-                        // is performing.
-                        let reviewer_run = donor
-                            .verification
-                            .reviewer_execution_id
-                            .strip_prefix("agent-run:")
-                            .expect("a delegated reviewer")
-                            .to_string();
-                        let store = services.event_store();
-                        let events = store
-                            .list_stream(&format!("session:{}", program.session_id))
-                            .unwrap();
-                        let original = events
-                            .iter()
-                            .find(|event| event.kind == "tool.execution_plan.created")
-                            .expect("the reviewer's governed plan is durable");
-                        let mut payload = original.payload.clone();
-                        payload["plan_id"] =
-                            serde_json::json!(format!("r1-second-review:{}", uuid::Uuid::new_v4()));
-                        payload["tasks"] = serde_json::json!([{
-                            "tool_name": "task_review",
-                            "tool_call_id": "r1-second-review-call",
-                            "effect": {"effect_kind": "write"},
-                            "normalized_input": {
-                                "task_ref": task_ref,
-                                "decision": "accept",
-                                "reason": "a second review of the same Task",
-                                "evidence_refs": [],
-                            },
-                            "step_binding": {
-                                "origin": {
-                                    "origin_step_id": "r1-second-review-step",
-                                    "call_id": "r1-second-review-call",
-                                    "catalog_digest": "catalog",
-                                    "source": {"kind": "provider", "attempt_id": "attempt-1"},
-                                },
-                                "snapshot": {
-                                    "contract_version": 1,
-                                    "identity": {
-                                        "step_id": "r1-second-review-step",
-                                        "session_id": envelope.actor.session_id,
-                                        "turn_id": envelope.actor.turn_id,
-                                        "execution_id": reviewer_run,
-                                        "actor_ref": "runtime.agentic",
-                                        "run_ref": reviewer_run,
-                                        "build_ref": "build",
-                                    },
-                                    "provider_attempt": {
-                                        "attempt_id": "attempt-1",
-                                        "origin_step_id": "r1-second-review-step",
-                                        "model_profile_digest": "profile",
-                                        "request_digest": "request",
-                                    },
-                                    "catalog_digest": "catalog",
-                                    "tools": [],
-                                    "related_revisions": {},
-                                    "context_refs": [],
-                                    "expires_at_ms": 0,
-                                },
-                            },
-                        }]);
-                        store
-                            .append(crate::RuntimeEventInput {
-                                stream_id: original.stream_id.clone(),
-                                scope: original.scope,
-                                kind: original.kind.clone(),
-                                status: original.status.clone(),
-                                actor: original.actor.clone(),
-                                refs: original.refs.clone(),
-                                payload,
-                            })
-                            .unwrap();
-                    }
-                    let outcome = services.submit_agent_action(&envelope).await;
-                    if second_review {
-                        let error = outcome
-                            .err()
-                            .expect("a second unfinished review must block the applied review");
-                        assert!(
-                            error.contains("effect_review_pending"),
-                            "a second unfinished review in the same run must still block: {error}"
-                        );
-                        assert_eq!(
-                            services
-                                .agent_action_service()
-                                .project(&envelope.actor.program_id)
-                                .unwrap()
-                                .tasks[&task_ref]
-                                .status,
-                            crate::AgenticTaskStatus::Submitted
-                        );
-                    } else {
-                        let applied = outcome.expect("the applied review is applied");
-                        assert_eq!(
-                            applied.status,
-                            harness_contract::agent_action::AgentActionStatus::Applied,
-                            "{applied:?}"
-                        );
-                        assert_eq!(
-                            services
-                                .agent_action_service()
-                                .project(&envelope.actor.program_id)
-                                .unwrap()
-                                .tasks[&task_ref]
-                                .status,
-                            crate::AgenticTaskStatus::Accepted
-                        );
-                    }
-                }),
-            )
-            .await;
-        }
-    }
 
-    #[tokio::test]
-    async fn own877_real_task_review_rejects_pending_and_foreign_control_callback() {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_async, NativeTaskReviewCase,
-        };
-        for foreign in [false, true] {
-            with_native_task_review_async(NativeTaskReviewCase::default(),
-                move |services, envelope, _donor| Box::pin(async move {
-                    let program = services.agent_action_service().project(&envelope.actor.program_id).unwrap();
-                    let task_ref = match &envelope.action {
-                        harness_contract::agent_action::AgentAction::TaskReview(input) => &input.task_ref,
-                        _ => unreachable!(),
-                    };
-                    let before = services.goal_store().get(&format!("goal:{}",
-                        envelope.actor.root_execution_id.as_deref().unwrap())).unwrap().unwrap();
-                    let store = services.event_store();
-                    let events = store.list_stream(&format!("session:{}", program.session_id)).unwrap();
-                    let terminal = events.iter().find(|event|
-                        event.kind == "tool.invocation.completed"
-                            && event.payload["tool_call_id"] == "native-submit").unwrap();
-                    let original = events.iter().find(|event|
-                        event.kind == "tool.execution_plan.created"
-                            && event.payload["plan_id"] == terminal.payload["governed_plan_id"]).unwrap();
-                    let mut payload = original.payload.clone();
-                    let plan_id = format!("own877-unsettled-control:{}", uuid::Uuid::new_v4());
-                    payload["plan_id"] = serde_json::json!(plan_id);
-                    store.append(crate::RuntimeEventInput {
-                        stream_id: original.stream_id.clone(), scope: original.scope,
-                        kind: original.kind.clone(), status: original.status.clone(),
-                        actor: original.actor.clone(), refs: original.refs.clone(), payload,
-                    }).unwrap();
-                    if foreign {
-                        let mut payload = terminal.payload.clone();
-                        payload["governed_plan_id"] = serde_json::json!(plan_id);
-                        store.append(crate::RuntimeEventInput {
-                            stream_id: terminal.stream_id.clone(), scope: terminal.scope,
-                            kind: terminal.kind.clone(), status: terminal.status.clone(),
-                            actor: Some("foreign-runtime".into()), refs: terminal.refs.clone(), payload,
-                        }).unwrap();
-                    }
-                    let current = services.agent_action_service().project(&program.program_id).unwrap();
-                    let error = services.independent_result_review(&envelope.actor, &current,
-                        &current.tasks[task_ref].artifact_refs, None).await.err()
-                        .expect("an original control descriptor must not settle an unauthenticated or missing callback");
-                    assert!(error.contains("effect_review_pending"), "foreign={foreign}: {error}");
-                    assert!(services.submit_agent_action(&envelope).await.is_err());
-                    assert_eq!(services.goal_store().get(&before.id).unwrap().unwrap(), before);
-                    assert_eq!(services.agent_action_service().project(&program.program_id).unwrap()
-                        .tasks[task_ref].status, crate::AgenticTaskStatus::Submitted);
-                })).await;
-        }
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn bounded_process_explicit_body_selection_preserves_all_versions_through_original_review_and_goal_cas(
-    ) {
-        crate::agentic::execution::reviewed_goal_fixture::exercise_bounded_process_reviewed_goal_283().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn bounded_process_changed_full_input_after_review_is_rejected_at_actual_goal_cas() {
-        crate::agentic::execution::reviewed_goal_fixture::exercise_bounded_process_input_changed_before_final_290().await;
-    }
 }
 
 #[cfg(test)]
@@ -9233,245 +8626,6 @@ mod receipt_index_791_tests;
 mod own872_plan_owner_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn own872_real_native_callback_missing_foreign_actor_and_owner_never_settle() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(
-            |services, owner| async move {
-                let binding = owner.activity_binding().unwrap();
-                let graph = services
-                    .graph_state_store()
-                    .load(&binding.root_execution_id)
-                    .unwrap();
-                let packet = graph
-                    .nodes
-                    .iter()
-                    .find_map(|node| {
-                        if node.kind
-                            != harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-                        {
-                            return None;
-                        }
-                        serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(
-                            &node.payload_ref,
-                        )
-                        .ok()
-                    })
-                    .unwrap();
-                let store = services.event_store();
-                let events = store.list_stream(&owner.stream_id).unwrap();
-                let mut checked = BTreeSet::new();
-                for plan in events
-                    .iter()
-                    .filter(|event| event.kind == "tool.execution_plan.created")
-                {
-                    let Some(tasks) = plan.payload["tasks"].as_array() else {
-                        continue;
-                    };
-                    for task in tasks.iter().filter(|task| {
-                        matches!(
-                            task["tool_name"].as_str(),
-                            Some("task_claim" | "task_submit")
-                        )
-                    }) {
-                        let packets = std::collections::BTreeMap::from([(
-                            packet.graph_id().to_string(),
-                            packet.clone(),
-                        )]);
-                        let roots = BTreeSet::new();
-                        if !events.iter().any(|event| {
-                            event.kind == "tool.invocation.completed"
-                                && event.payload["governed_plan_id"] == plan.payload["plan_id"]
-                                && event.activity_binding().is_some_and(|binding| {
-                                    binding.root_execution_id == packet.graph_id()
-                                })
-                        }) {
-                            continue;
-                        }
-                        let original =
-                            delegated_plan_callback_owner(plan, &events, &roots, &packets).unwrap();
-                        let effects = authenticated_delegated_plan_settled(
-                            store,
-                            plan,
-                            &events,
-                            original,
-                            &mut Default::default(),
-                        )
-                        .unwrap()
-                        .expect("the authenticated plan is settled");
-                        let original_task = plan.payload["tasks"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .find(|original| original["tool_call_id"] == task["tool_call_id"])
-                            .unwrap();
-                        assert_eq!(
-                    effects.get(&format!(
-                        "{}:{}",
-                        plan.event_id,
-                        original_task["tool_call_id"].as_str().unwrap(),
-                    )),
-                    Some(original_task),
-                    "only the authenticated Task, never the whole Session plan, is an effect",
-                );
-                        let step: crate::step_snapshot::StepCallBinding =
-                            serde_json::from_value(original_task["step_binding"].clone()).unwrap();
-                        let key = step.effect_idempotency_key();
-                        let index_source = format!(
-                            "execution-agent-receipts:{}:{}:{}",
-                            packet.graph_id(),
-                            packet.node_id(),
-                            packet.attempt
-                        );
-                        let intent = store
-                            .event_by_idempotency_key(
-                                &index_source,
-                                &format!("agent-tool-intent:{key}"),
-                            )
-                            .unwrap()
-                            .unwrap();
-                        let receipt = store
-                            .event_by_idempotency_key(
-                                &index_source,
-                                &format!("agent-tool-receipt:{key}"),
-                            )
-                            .unwrap()
-                            .unwrap();
-                        admitted_intent_scope(store, &intent, &mut Default::default()).unwrap();
-                        let original = authenticate_settled_effect(
-                            store,
-                            &intent,
-                            &receipt,
-                            &mut Default::default(),
-                        )
-                        .unwrap();
-                        assert!(super::super::results::runtime_control_descriptor(&original));
-                        assert!(original.scopes.iter().all(|scope| scope.resource
-                            == harness_contract::policy::PermissionResource::Tool
-                            && scope.operation
-                                == harness_contract::policy::PermissionOperation::Control));
-                        let mut foreign_receipt = receipt.clone();
-                        foreign_receipt.payload["outcome"]["tool_name"] = serde_json::json!("edit");
-                        assert!(authenticate_settled_effect(
-                            store,
-                            &intent,
-                            &foreign_receipt,
-                            &mut Default::default(),
-                        )
-                        .is_err());
-                        assert!(task["step_binding"]["snapshot"]["identity"]["attempt"].is_null());
-                        for fault in ["foreign_attempt", "foreign_provider", "process_source"] {
-                            let mut invalid_plan = plan.clone();
-                            let task = invalid_plan.payload["tasks"]
-                                .as_array_mut()
-                                .unwrap()
-                                .iter_mut()
-                                .find(|changed| changed["tool_call_id"] == task["tool_call_id"])
-                                .unwrap();
-                            match fault {
-                                "foreign_attempt" => {
-                                    task["step_binding"]["snapshot"]["identity"]["attempt"] =
-                                        serde_json::json!(packet.attempt + 1)
-                                }
-                                "foreign_provider" => {
-                                    task["step_binding"]["origin"]["source"]["attempt_id"] =
-                                        serde_json::json!("foreign-provider-attempt")
-                                }
-                                "process_source" => {
-                                    task["step_binding"]["origin"]["source"] = serde_json::json!({
-                                        "kind":"process","worker_id":packet.run_id(),"sequence":1,
-                                    })
-                                }
-                                _ => unreachable!(),
-                            }
-                            let settled = delegated_plan_callback_owner(
-                                &invalid_plan,
-                                &events,
-                                &roots,
-                                &packets,
-                            )
-                            .map(|original| {
-                                authenticated_delegated_plan_settled(
-                                    store,
-                                    &invalid_plan,
-                                    &events,
-                                    original,
-                                    &mut Default::default(),
-                                )
-                            })
-                            .unwrap_or(Ok(None));
-                            assert!(!matches!(settled, Ok(Some(_))), "{fault}");
-                        }
-                        assert!(delegated_plan_callback_owner(
-                            plan,
-                            &events,
-                            &roots,
-                            &Default::default()
-                        )
-                        .is_none());
-                        let position = events
-                            .iter()
-                            .position(|terminal| {
-                                terminal.kind == "tool.invocation.completed"
-                                    && terminal.payload["governed_plan_id"]
-                                        == plan.payload["plan_id"]
-                                    && terminal.payload["tool_call_id"] == task["tool_call_id"]
-                            })
-                            .unwrap();
-                        for fault in [
-                            "missing", "actor", "owner", "run", "instance", "session", "turn",
-                            "schema", "scope", "status",
-                        ] {
-                            let mut invalid = events.clone();
-                            match fault {
-                                "missing" => {
-                                    invalid.remove(position);
-                                }
-                                "actor" => invalid[position].actor = Some("foreign".into()),
-                                "schema" => invalid[position].schema_version = 2,
-                                "scope" => {
-                                    invalid[position].scope = crate::RuntimeEventScope::Session
-                                }
-                                "status" => invalid[position].status = Some("running".into()),
-                                other => {
-                                    let field = match other {
-                                        "owner" => "root_execution_id",
-                                        "run" => "agent_run_id",
-                                        "instance" => "agent_instance_id",
-                                        "session" => "session_id",
-                                        "turn" => "turn_id",
-                                        _ => unreachable!(),
-                                    };
-                                    invalid[position].payload["_runtime_activity_binding"][field] =
-                                        serde_json::json!("foreign");
-                                }
-                            }
-                            let settled =
-                                delegated_plan_callback_owner(plan, &invalid, &roots, &packets)
-                                    .map(|original| {
-                                        authenticated_delegated_plan_settled(
-                                            store,
-                                            plan,
-                                            &invalid,
-                                            original,
-                                            &mut Default::default(),
-                                        )
-                                        .unwrap()
-                                        .is_some()
-                                    })
-                                    .unwrap_or(false);
-                            assert!(!settled, "{fault}");
-                        }
-                        checked.insert(task["tool_name"].as_str().unwrap().to_string());
-                    }
-                }
-                assert_eq!(
-                    checked,
-                    BTreeSet::from(["task_claim".to_string(), "task_submit".to_string()])
-                );
-            },
-        )
-        .await;
-    }
 
     #[test]
     fn own872_native_plan_owner_does_not_erase_unknown_or_pending_root_writes() {
@@ -9494,10 +8648,6 @@ mod own872_plan_owner_tests {
         assert!(delegated_plan_callback_owner(&plan, &[], &roots, &packets).is_none());
     }
 }
-
-#[cfg(test)]
-#[path = "policy_applied_carrier_tests.rs"]
-mod applied_carrier_tests;
 
 #[cfg(test)]
 mod read_auth_boundary_tests {
@@ -10008,5 +9158,29 @@ mod read_auth_boundary_tests {
                 format!("reader:{op}")
             );
         }
+    }
+
+    // Reuse the existing physical-delivery reader fixture. A different producer
+    // coordinate or selected primary receipt must not be accepted as this read.
+    #[test]
+    fn agent_delivery_rejects_foreign_producer_coordinates_and_primary() {
+        let (reader, program, packet, delivery) = agent();
+        let run = |reader: &mut Reader, event: DurableRuntimeEvent| {
+            review_delivery_snapshot_from_events(reader, &program, Some(&packet), vec![event], BTreeMap::new())
+        };
+        let mut good = reader.clone();
+        assert_eq!(run(&mut good, delivery.clone()).unwrap().reads.len(), 1);
+        for (field, value) in [("graph_id", json!("foreign-graph")), ("node_id", json!("foreign-node")),
+            ("attempt", json!(2)), ("session_id", json!("foreign-session"))] {
+            let mut changed = delivery.clone();
+            changed.payload["acquisition"][field] = value;
+            let mut source = reader.clone();
+            let result = run(&mut source, changed);
+            assert!(!matches!(result, Ok(snapshot) if !snapshot.reads.is_empty()), "foreign {field} accepted");
+        }
+        let mut substituted = reader.clone();
+        substituted.keys.get_mut(&(String::from("primary"), String::from("read"))).unwrap().event_id = "foreign-primary".into();
+        let result = run(&mut substituted, delivery);
+        assert!(!matches!(result, Ok(snapshot) if !snapshot.reads.is_empty()), "foreign primary accepted");
     }
 }

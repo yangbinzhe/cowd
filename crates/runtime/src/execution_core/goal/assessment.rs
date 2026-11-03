@@ -177,7 +177,7 @@ impl AssessmentSourceFrame {
         Self::capture(program, projection)
     }
 
-    fn capture(
+    pub(crate) fn capture(
         program: &AgenticProgramProjection,
         projection: &GoalProjection,
     ) -> Result<Self, AssessmentReadError> {

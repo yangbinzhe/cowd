@@ -317,9 +317,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 packet.policy_revision, live_session_policy.revision
             ));
         }
-        let bound_policy_control = Some(
-            crate::permissions::SessionExecutionPolicyControl::from_policy(live_session_policy),
-        );
+        // The delegated producer shares the actual published Session policy
+        // owner; the immutable packet ceiling remains enforced separately.
+        let bound_policy_control = live_policy_control.clone();
         let policy = permission_policy(
             bound_policy_control,
             packet.permission_ceiling,
@@ -528,14 +528,34 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         {
             cancellation.cancel();
         }
+        // Only the real root Session ingress can supply this parent control.
+        let resolved_parent = parent_execution_id
+            .as_deref()
+            .and_then(|execution_id| services.resolve_active_execution_bus_with_fence(execution_id));
+        let cancellation = if let Some((_, _, Some(original))) = resolved_parent.as_ref() {
+            if let Some((fence, root_control, claim, input, requested)) = original.for_lineage(packet.session_id(), &parent_lineage.turn_id) {
+                runtime.set_session_execution_fence(fence);
+                runtime.set_original_session_claim(Some(claim));
+                runtime.install_original_policy_input_context(input, requested);
+                crate::CancellationToken::linked(cancellation, root_control.token())
+            } else { cancellation }
+        } else { cancellation };
+        // The delegated run owner and every model step must consult the same
+        // turn-level cancellation home; a provider step stop remains separate.
+        let turn_id = packet.assignment.execution_identity.turn_id().unwrap_or(packet.run_id());
+        let control = crate::execution_core::services::TurnCancellationControl::operational_with_token(
+            &child_session_id,
+            turn_id,
+            packet.graph_id(),
+            cancellation.clone(),
+        );
+        runtime.install_provider_cancellation_control(Some(control))
+            .map_err(|error| format!("failed to install delegated turn cancellation control: {error}"))?;
         runtime.install_turn_control(cancellation, crate::HookAbortSignal::default());
         let child_bus = runtime.cowd_bus().cloned().ok_or_else(|| {
             "in-process Agent Runtime is missing its causal event bus".to_string()
         })?;
-        let resolved_parent = parent_execution_id
-            .as_deref()
-            .and_then(|execution_id| services.resolve_active_execution_bus(execution_id));
-        if let Some((root_execution_id, parent_bus)) = resolved_parent.as_ref() {
+        if let Some((root_execution_id, parent_bus, _)) = resolved_parent.as_ref() {
             child_bus.forward_to(
                 parent_bus,
                 crate::CowdExecutionLineage {
@@ -556,7 +576,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         }
         let root_execution_id = resolved_parent
             .as_ref()
-            .map(|(root_execution_id, _)| root_execution_id.clone())
+            .map(|(root_execution_id, _, _)| root_execution_id.clone())
             .unwrap_or_else(|| packet.graph_id().to_string());
         let activity_generation = parent_lineage.generation;
         let activity_id = format!(

@@ -2605,15 +2605,6 @@ where
                 return;
             }
         }
-        #[cfg(test)]
-        if kind == "tool.invocation.completed"
-            && input.payload["tool_call_id"].as_str().is_some_and(|call|
-                take_lifecycle_append_failure(&session_id, call))
-        {
-            // Simulate the original writer failing before the durable append;
-            // the effect receipt, if any, is left untouched.
-            return;
-        }
         // A retained original invocation can reach this writer again after a
         // retry. Key its original lifecycle, not the tool call label, so two
         // owners cannot append duplicate audit facts for the same invocation.

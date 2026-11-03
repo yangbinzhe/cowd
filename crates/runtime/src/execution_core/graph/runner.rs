@@ -32,6 +32,21 @@ use super::resources::{
 use super::state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
 use super::PHYSICAL_CLOSURE_BUDGET;
 
+// Keep this list aligned with the proof reader's explicitly retryable source
+// races. Other validation errors remain failures, including forged evidence.
+fn retryable_proof_source_change(error: &ExecutionCommitError) -> bool {
+    let ExecutionCommitError::InvalidCommand(reason) = error else {
+        return false;
+    };
+    matches!(reason.as_str(),
+        "proof source changed while paging; retry current inputs"
+        | "proof source changed at final page boundary; retry current inputs"
+        | "proof Program source changed; retry current inputs"
+        | "proof physical lineage changed during discovery; retry current inputs")
+        || reason.starts_with("proof Program source changed; retry current inputs; advanced=")
+        || reason.starts_with("proof source changed during validation; retry current inputs; source=")
+}
+
 // The semantic owner may rebuild post-tool observations and the next plan,
 // but cannot rewrite the physical outcome or discard any other read fence.
 fn accepts_goal_revalidation(
@@ -60,17 +75,18 @@ fn accepts_goal_revalidation(
 // is deliberately separate: tracing must never perform persistent I/O while
 // the graph or shared active-owner lock is held.
 #[cfg(feature = "test-fixtures")]
-fn k05_completion_trace_enabled(ticket: &NodeExecutionTicket) -> bool {
+pub(super) fn k05_completion_trace_enabled(ticket: &NodeExecutionTicket) -> bool {
     std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some()
         && crate::host::decode_tool_batch(&ticket.payload_ref).is_ok_and(|(calls, _)| {
             calls.iter().any(|call| {
-                call.id == "recovery-complete" && call.name == "objective_complete_request"
+                (call.id == "recovery-complete" && call.name == "objective_complete_request")
+                    || (call.id == "d-objective-review" && call.name == "objective_review")
             })
         })
 }
 
-#[cfg(feature = "test-fixtures")]
-fn k05_trace_emit(line: String) {
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) fn k05_trace_emit(line: String) {
     use std::sync::{mpsc, OnceLock};
     use std::sync::atomic::{AtomicU64, Ordering};
     static SENDER: OnceLock<Option<mpsc::SyncSender<String>>> = OnceLock::new();
@@ -88,12 +104,16 @@ fn k05_trace_emit(line: String) {
 }
 
 #[cfg(feature = "test-fixtures")]
-fn k05_completion_trace(ticket: &NodeExecutionTicket, stage: &'static str, revision: Option<u64>, ok: Option<bool>) {
+pub(crate) fn k05_completion_trace(ticket: &NodeExecutionTicket, stage: &'static str, revision: Option<u64>, ok: Option<bool>) {
     use sha2::{Digest, Sha256};
+    let call = if crate::host::decode_tool_batch(&ticket.payload_ref).is_ok_and(|(calls, _)|
+        calls.iter().any(|call| call.id == "d-objective-review" && call.name == "objective_review")) {
+        "d-objective-review"
+    } else { "recovery-complete" };
     k05_trace_emit(format!(
-        "k05_runner_stage graph_sha256={:x} node_sha256={:x} attempt={} stage={} revision={:?} ok={:?}",
+        "k05_runner_stage graph_sha256={:x} node_sha256={:x} attempt={} call={} stage={} revision={:?} ok={:?}",
         Sha256::digest(ticket.graph_id.as_bytes()), Sha256::digest(ticket.node_id.as_bytes()),
-        ticket.attempt, stage, revision, ok,
+        ticket.attempt, call, stage, revision, ok,
     ));
 }
 
@@ -106,6 +126,7 @@ fn k05_completion_cas_error(ticket: &NodeExecutionTicket, error: &ExecutionCommi
         ExecutionCommitError::StaleRevision { graph_id, expected, actual } =>
             ("graph_stale_revision", Some(graph_id.as_str()), Some(*expected), Some(*actual)),
         ExecutionCommitError::EventStore(_) => ("event_store_other", None, None, None),
+        ExecutionCommitError::EffectAdmissionUnknown { .. } => ("effect_admission_unknown", None, None, None),
         ExecutionCommitError::Transition(_) => ("transition", None, None, None),
         ExecutionCommitError::Serialization(_) => ("serialization", None, None, None),
         ExecutionCommitError::InvalidCommand(_) => ("invalid_command", None, None, None),
@@ -132,6 +153,30 @@ fn k05_completion_cas_error(ticket: &NodeExecutionTicket, error: &ExecutionCommi
         ticket.attempt, category, source_kind, source_sha, expected, actual,
         stream == Some(ticket.graph_id.as_str()),
     ));
+}
+
+// Local fixture diagnostic only; no payloads or authority are reconstructed.
+#[cfg(feature = "test-fixtures")]
+fn build16_callback_trace(graph: &str, node: &str, attempt: Option<u32>, phase: &str, detail: &str) {
+    if std::env::var_os("COWD_BUILD16_CALLBACK_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        && graph.starts_with("agent-tool-batch:")
+    {
+        let detail: String = detail.chars().take(512).collect();
+        eprintln!("BUILD16_CALLBACK graph={graph} node={node} attempt={attempt:?} phase={phase} detail={detail:?}");
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn build16_runner_error_kind(error: &ExecutionRunnerError) -> &'static str {
+    match error {
+        ExecutionRunnerError::Executor(_) => "executor",
+        ExecutionRunnerError::Commit(_) => "commit",
+        ExecutionRunnerError::State(_) => "state",
+        ExecutionRunnerError::CommandSuperseded { .. } => "superseded",
+        ExecutionRunnerError::TerminalWaveCleanup { .. } => "terminal_wave_cleanup",
+        ExecutionRunnerError::Driver(_) => "driver",
+        _ => "other",
+    }
 }
 
 #[derive(Debug, Error)]
@@ -172,6 +217,13 @@ pub enum ExecutionRunnerError {
     CommandSuperseded { node_id: String },
     #[error("runtime execution supervisor is unavailable: {0}")]
     SupervisorUnavailable(String),
+    #[error("terminal wave failed: {reason}; {phase} remains unresolved: {cleanup}")]
+    TerminalWaveCleanup {
+        reason: String,
+        phase: &'static str,
+        #[source]
+        cleanup: Box<ExecutionRunnerError>,
+    },
     #[error("runtime execution driver failed: {0}")]
     Driver(String),
 }
@@ -1332,6 +1384,14 @@ impl ExecutionGraphRunner {
         };
         #[cfg(feature = "test-fixtures")]
         if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "start_and_execute_return", None, Some(result.is_ok())); }
+        #[cfg(feature = "test-fixtures")]
+        {
+            let detail = match &result {
+                Ok((_, outcome)) => format!("result=ok status={:?}", outcome.result.status),
+                Err(error) => format!("result=error kind={} original_detail=private", build16_runner_error_kind(error)),
+            };
+            build16_callback_trace(graph_id, &node_id, expected_binding.as_ref().map(|b| b.attempt), "drive_return", &detail);
+        }
         if let Some(handoff) = handoff {
             let mut state = handoff.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.finished = true;
@@ -1577,7 +1637,33 @@ impl ExecutionGraphRunner {
         let disposition =
             self.commit_service
                 .binding_callback_disposition(&graph, &ticket.node_id, &binding)?;
+        #[cfg(feature = "test-fixtures")]
+        {
+            let state_name = match disposition {
+                CallbackDisposition::Commit => "committed_outcome",
+                CallbackDisposition::Abort => "canonical_retirement",
+                CallbackDisposition::Pending => "pending_no_outcome_or_retirement",
+            };
+            let snapshot = self.active.lock().await;
+            let live = snapshot.get(&(graph_id.to_string(), ticket.node_id.clone()))
+                .filter(|active| active.ticket == *ticket);
+            let detail = match live {
+                Some(active) => {
+                    let driver = active.cancel_outcome.state.lock().ok().map(|state|
+                        (state.polled, state.finished, state.outcome.is_some()));
+                    format!("disposition={state_name} requested_abort={requested_abort:?} node_status={:?} graph_attempt={:?} callback_completed={} release_blocked={} drain_completed={} driver_polled_finished_has_outcome={driver:?}",
+                        graph.node_statuses.get(&ticket.node_id), graph.recovery_cursor.node_attempts.get(&ticket.node_id),
+                        active.callback_completed, active.release_blocked, active.drain_completed)
+                },
+                None => format!("disposition={state_name} requested_abort={requested_abort:?} active=unknown"),
+            };
+            build16_callback_trace(graph_id, &ticket.node_id, Some(ticket.attempt), "callback_disposition", &detail);
+        }
         if disposition == CallbackDisposition::Pending {
+            tracing::warn!(graph_id = %graph_id, node_id = %ticket.node_id,
+                attempt = ticket.attempt, executor_kind = %ticket.executor_kind,
+                requested_abort = ?requested_abort, phase = "callback_pending",
+                "original callback has no committed outcome or retirement");
             if requested_abort.is_some() {
                 return Ok(());
             }
@@ -1591,7 +1677,15 @@ impl ExecutionGraphRunner {
         }
         let result = if disposition == CallbackDisposition::Abort {
             self.cancel_and_drain_locked(graph_id, executor, ticket)
-                .await?;
+                .await.map_err(|error| {
+                    #[cfg(feature = "test-fixtures")]
+                    build16_callback_trace(graph_id, &ticket.node_id, Some(ticket.attempt),
+                        "retirement_cancel_and_drain", &format!("result=error kind={} original_detail=private", build16_runner_error_kind(&error)));
+                    error
+                })?;
+            #[cfg(feature = "test-fixtures")]
+            build16_callback_trace(graph_id, &ticket.node_id, Some(ticket.attempt),
+                "retirement_cancel_and_drain", "result=ok");
             executor
                 .after_abort(
                     ticket,
@@ -1639,6 +1733,9 @@ impl ExecutionGraphRunner {
                 })
                 .await
                 .map_err(|_| {
+                    #[cfg(feature = "test-fixtures")]
+                    build16_callback_trace(graph_id, &ticket.node_id, Some(ticket.attempt),
+                        "physical_sources", "result=timeout");
                     // A physical closure that cannot be proven must name its own
                     // missing proof in production, not only inside the test
                     // harness: an unproven closure otherwise surfaces as one
@@ -1671,6 +1768,35 @@ impl ExecutionGraphRunner {
             }
             Err(error) => Err(error.into()),
         };
+        #[cfg(feature = "test-fixtures")]
+        build16_callback_trace(graph_id, &ticket.node_id, Some(ticket.attempt), "callback_and_physical_result",
+            &match &result { Ok(()) => "result=ok physical_sources=confirmed".into(),
+                Err(error) => format!("result=error physical_sources=unconfirmed kind={} original_detail=private", build16_runner_error_kind(error)) });
+        let result = if result.is_ok() && disposition == CallbackDisposition::Commit && ticket.executor_kind == "synthesize" {
+            let original_owner = {
+                let active = self.active.lock().await;
+                active.get(&(graph_id.to_string(), ticket.node_id.clone()))
+                    .filter(|owner| owner.ticket == *ticket && owner.binding == binding)
+                    .and_then(|owner| owner.cancel_outcome.state.lock().ok().and_then(|handoff| {
+                        if !handoff.finished { return None; }
+                        handoff.outcome.as_ref().and_then(|outcome| outcome.original_terminal_owner.as_ref().map(|owner| Arc::clone(&owner.0)))
+                    }))
+            };
+            if let Some(owner) = original_owner {
+                let ticket = ticket.clone();
+                tokio::task::spawn_blocking(move || owner.release_after_original_physical_close(&ticket)).await
+                    .map_err(|error| ExecutionRunnerError::Driver(format!("original terminal release task failed: {error}")))?
+                    .map_err(ExecutionRunnerError::Driver)
+            } else {
+                // A non-terminal Synthesize replan has no terminal owner and
+                // keeps its original callback behavior. For a terminal result,
+                // missing the live handoff is Unknown and must retain custody.
+                let document = self.commit_service.committed_host_transcript(ticket)?;
+                if document.terminal_completion.is_some() {
+                    Err(ExecutionRunnerError::Driver("original terminal handoff is unconfirmed".into()))
+                } else { result }
+            }
+        } else { result };
         if let Some(active) = self
             .active
             .lock()
@@ -1695,7 +1821,11 @@ impl ExecutionGraphRunner {
         let Some(gate) = self.binding_callback_gate(graph_id, ticket).await else {
             return Ok(());
         };
+        #[cfg(feature = "test-fixtures")]
+        if k05_completion_trace_enabled(ticket) { k05_completion_trace(ticket, "callback_gate_enter", None, None); }
         let _owner = gate.lock().await;
+        #[cfg(feature = "test-fixtures")]
+        if k05_completion_trace_enabled(ticket) { k05_completion_trace(ticket, "callback_gate_acquired", None, None); }
         self.complete_callback_locked(graph_id, executor, ticket, requested_abort)
             .await
     }
@@ -1899,6 +2029,9 @@ impl ExecutionGraphRunner {
                     .remove(graph_id)
                     .map_or_else(Vec::new, |batch| batch.pending)
             };
+            #[cfg(feature = "test-fixtures")]
+            let trace_nodes = pending.iter().map(|item| (item.transition.node_id.clone(),
+                item.expected_binding.as_ref().map(|binding| binding.attempt))).collect::<Vec<_>>();
             let coordination = self.graph_coordination_without_command(graph_id).await;
             match self.state_store.load_async(graph_id).await {
                 Ok(current) => {
@@ -1925,13 +2058,23 @@ impl ExecutionGraphRunner {
                                         })
                             })
                         {
+                            #[cfg(feature = "test-fixtures")]
+                            build16_callback_trace(graph_id, &pending.transition.node_id,
+                                pending.expected_binding.as_ref().map(|binding| binding.attempt),
+                                "terminal_wave_membership", "member=admitted");
                             admitted.push(pending.transition);
                             admitted_responses.push(pending.response);
                         } else {
+                            #[cfg(feature = "test-fixtures")]
+                            build16_callback_trace(graph_id, &pending.transition.node_id,
+                                pending.expected_binding.as_ref().map(|binding| binding.attempt),
+                                "terminal_wave_membership", "member=superseded");
                             superseded_responses.push(pending.response);
                         }
                     }
                     drop(active);
+                    #[cfg(feature = "test-fixtures")]
+                    let admitted_count = admitted.len();
                     let commit = if admitted.is_empty() {
                         Ok(())
                     } else {
@@ -1940,6 +2083,15 @@ impl ExecutionGraphRunner {
                             .await
                             .map(|_| ())
                     };
+                    #[cfg(feature = "test-fixtures")]
+                    for (node, attempt) in &trace_nodes {
+                        let detail = match &commit {
+                            Ok(()) if admitted_count == 0 => "scope=batch result=no_admitted_transition".to_string(),
+                            Ok(()) => format!("scope=batch result=committed admitted={admitted_count}"),
+                            Err(_) => format!("scope=batch result=error admitted={admitted_count} original_detail=private"),
+                        };
+                        build16_callback_trace(graph_id, node, *attempt, "terminal_wave_batch_commit", &detail);
+                    }
                     for response in superseded_responses {
                         let _ = response.send(TerminalCommitDisposition::Superseded);
                     }
@@ -1955,6 +2107,11 @@ impl ExecutionGraphRunner {
                             } else {
                                 self.converge_after_terminal_commit(graph_id).await
                             };
+                            #[cfg(feature = "test-fixtures")]
+                            for (node, attempt) in &trace_nodes {
+                                build16_callback_trace(graph_id, node, *attempt, "terminal_wave_batch_converge",
+                                    &match &convergence { Ok(()) => "scope=batch result=ok".into(), Err(error) => format!("scope=batch result=error kind={} original_detail=private", build16_runner_error_kind(error)) });
+                            }
                             if let Err(error) = convergence {
                                 let reason = error.to_string();
                                 for response in admitted_responses {
@@ -1984,6 +2141,10 @@ impl ExecutionGraphRunner {
                 Err(error) => {
                     drop(coordination);
                     let reason = error.to_string();
+                    #[cfg(feature = "test-fixtures")]
+                    for (node, attempt) in &trace_nodes {
+                        build16_callback_trace(graph_id, node, *attempt, "terminal_wave_batch_load", "scope=batch result=error original_detail=private");
+                    }
                     for pending in pending {
                         let _ = pending
                             .response
@@ -2115,6 +2276,13 @@ impl ExecutionGraphRunner {
                 .await?;
             #[cfg(feature = "test-fixtures")]
             if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "terminal_wave_return", None, None); }
+            #[cfg(feature = "test-fixtures")]
+            build16_callback_trace(graph_id, &node_id, Some(ticket.attempt), "terminal_wave_disposition",
+                match &disposition {
+                    TerminalCommitDisposition::Committed => "wave=committed",
+                    TerminalCommitDisposition::Superseded => "wave=superseded",
+                    TerminalCommitDisposition::Failed(_) => "wave=failed source=unknown original_detail=private",
+                });
             match disposition {
                 TerminalCommitDisposition::Committed => {
                     durable_progress.notify_one();
@@ -2145,15 +2313,23 @@ impl ExecutionGraphRunner {
                     return Ok(());
                 }
                 TerminalCommitDisposition::Failed(reason) => {
-                    self.complete_callback_observed(
+                    if let Err(cleanup) = self.complete_callback_observed(
                         graph_id,
                         &executor,
                         &ticket,
                         Some("terminal_wave_commit_failed"),
-                    )
-                    .await?;
-                    self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
-                        .await?;
+                    ).await {
+                        return Err(ExecutionRunnerError::TerminalWaveCleanup {
+                            reason, phase: "original callback", cleanup: Box::new(cleanup),
+                        });
+                    }
+                    if let Err(cleanup) = self.take_bound_active_node(
+                        graph_id, &node_id, expected_binding.as_ref(),
+                    ).await {
+                        return Err(ExecutionRunnerError::TerminalWaveCleanup {
+                            reason, phase: "original owner", cleanup: Box::new(cleanup),
+                        });
+                    }
                     return Err(ExecutionRunnerError::Driver(reason));
                 }
             }
@@ -2195,13 +2371,46 @@ impl ExecutionGraphRunner {
                     .await?;
                 return Ok(());
             }
-            let (_, ticket, _) = active_wave.as_ref().ok_or_else(|| {
+            let (original_executor, ticket, _) = active_wave.as_ref().ok_or_else(|| {
                 ExecutionRunnerError::Driver("atomic outcome binding missing".into())
             })?;
-            let mut outcome_sources = match self
-                .commit_service
-                .execution_outcome_sources(&current, ticket, &outcome)
-            {
+            // Rebuild from durable state after an explicitly retryable source
+            // change. Every attempt still validates the original carrier tail;
+            // an incompatible tail cannot be made valid by retrying it.
+            const MAX_SOURCE_PREPARATION_ATTEMPTS: usize = 3;
+            let mut preparation_attempt = 0;
+            let source_result = loop {
+                preparation_attempt += 1;
+                let result = self.commit_service.execution_outcome_sources(&current, ticket, &outcome);
+                if !matches!(&result, Err(error) if retryable_proof_source_change(error))
+                    || preparation_attempt >= MAX_SOURCE_PREPARATION_ATTEMPTS
+                {
+                    break result;
+                }
+                drop(coordination);
+                tokio::task::yield_now().await;
+                coordination = self.graph_coordination_without_command(graph_id).await;
+                current = self.state_store.load_async(graph_id).await?;
+                let original_owner_live = self.active.lock().await
+                    .get(&(graph_id.to_string(), node_id.clone()))
+                    .is_some_and(|owner| {
+                        Some(&owner.binding) == expected_binding.as_ref()
+                            && owner.ticket == *ticket
+                            && Arc::ptr_eq(&owner.executor, original_executor)
+                            && !owner.callback_completed
+                    });
+                if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running)
+                    || !expected_binding.as_ref().is_some_and(|binding| {
+                        current.recovery_cursor.node_attempts.get(&node_id) == Some(&binding.attempt)
+                    })
+                    || !original_owner_live
+                {
+                    return Err(ExecutionRunnerError::Driver(
+                        "node transition superseded during source preparation retry".into(),
+                    ));
+                }
+            };
+            let mut outcome_sources = match source_result {
                 Ok(sources) => sources,
                 Err(error) => {
                     // No outcome was committed.  This exact inconsistent
@@ -2399,7 +2608,12 @@ impl ExecutionGraphRunner {
                 })
                 .map(|active| (Arc::clone(&active.executor), active.ticket.clone()))
         };
-        self.converge_after_terminal_commit(graph_id).await?;
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "post_commit_converge_enter", None, None); }
+        let converged = self.converge_after_terminal_commit(graph_id).await;
+        #[cfg(feature = "test-fixtures")]
+        if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "post_commit_converge_return", None, Some(converged.is_ok())); }
+        converged?;
         durable_progress.notify_one();
         if let Some((executor, ticket)) = committed_executor {
             self.complete_callback_observed(
@@ -4176,6 +4390,37 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod goal_revalidation_fence_tests {
     use super::*;
+
+    #[test]
+    fn terminal_wave_cleanup_keeps_original_reason_and_typed_error_source() {
+        let cleanup = ExecutionRunnerError::Executor(NodeExecutorError::Cancel {
+            node_id: "node".into(), reason: "physical close pending".into(),
+        });
+        let error = ExecutionRunnerError::TerminalWaveCleanup {
+            reason: "terminal commit failed".into(), phase: "original owner", cleanup: Box::new(cleanup),
+        };
+        assert!(error.to_string().contains("terminal commit failed"));
+        let source = std::error::Error::source(&error).unwrap()
+            .downcast_ref::<ExecutionRunnerError>().unwrap();
+        assert!(matches!(source, ExecutionRunnerError::Executor(NodeExecutorError::Cancel { .. })));
+    }
+
+    #[test]
+    fn proof_source_retry_classifies_all_six_branches_without_accepting_other_errors() {
+        for message in [
+            "proof source changed while paging; retry current inputs",
+            "proof source changed at final page boundary; retry current inputs",
+            "proof Program source changed; retry current inputs",
+            "proof Program source changed; retry current inputs; advanced=6 head=24 [event]",
+            "proof physical lineage changed during discovery; retry current inputs",
+            "proof source changed during validation; retry current inputs; source=goal:x expected=1 actual=2 phase=final_source_fence; advanced=1 head=2 []",
+        ] {
+            assert!(retryable_proof_source_change(&ExecutionCommitError::InvalidCommand(message.into())), "{message}");
+        }
+        for message in ["proof Goal spec changed", "observation source conflicts with causal read-set", "proof Program source changed; retry current inputs; forged"] {
+            assert!(!retryable_proof_source_change(&ExecutionCommitError::InvalidCommand(message.into())), "{message}");
+        }
+    }
 
     #[test]
     fn goal_revalidation_preserves_physical_fact_and_every_other_source() {

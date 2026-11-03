@@ -26,6 +26,13 @@ pub enum ToolPolicyError {
 pub struct ToolPolicy;
 
 impl ToolPolicy {
+    /// Timeout selected for an individual agent-action batch member. This is
+    /// the member policy's own decision, captured before its authorization;
+    /// it is not copied from the enclosing tool invocation.
+    pub(crate) fn agent_action_member_timeout_secs(&self) -> u64 {
+        60
+    }
+
     pub fn authorize(
         &self,
         effective: &EffectiveToolAuthorizationDescriptor,

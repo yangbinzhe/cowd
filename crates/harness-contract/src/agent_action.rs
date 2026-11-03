@@ -208,6 +208,9 @@ pub struct TaskClaimInput {
 pub struct TaskReleaseInput {
     pub task_ref: String,
     pub reason: String,
+    /// Claim generation observed by the release owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_claim_generation: Option<u64>,
 }
 
 /// Retire failed or invalidated work in favor of one or more concrete successor
@@ -554,9 +557,19 @@ pub enum AgentActorKind {
     Supervisor,
 }
 
+/// Original physical graph node attempt authenticated by Runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OriginalAgentExecution {
+    pub graph_id: String,
+    pub node_id: String,
+    pub attempt: u32,
+}
+
 /// Trusted identity injected by Runtime. It is never accepted from model JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentActorBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_execution: Option<OriginalAgentExecution>,
     pub objective_id: String,
     pub program_id: String,
     pub session_id: String,
@@ -1143,6 +1156,7 @@ mod tests {
         let envelope = AgentActionEnvelope {
             action_id: "action-1".to_string(),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective-1".to_string(),
                 program_id: "program-1".to_string(),
                 session_id: "session-1".to_string(),

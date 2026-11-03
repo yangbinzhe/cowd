@@ -4711,7 +4711,7 @@ impl RuntimeService {
     pub(crate) async fn install_turn_control(
         &self,
         session_id: &str,
-        cancellation_token: runtime::CancellationToken,
+        cancellation_control: Arc<TurnCancellationControl>,
         hook_abort_signal: runtime::HookAbortSignal,
     ) -> Result<(), RuntimeTurnExecutionError> {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
@@ -4723,9 +4723,8 @@ impl RuntimeService {
                 "session {session_id} is already executing a turn"
             )));
         }
-        runtime_guard.install_turn_control(cancellation_token, hook_abort_signal);
         runtime_guard
-            .install_provider_cancellation_control(None)
+            .install_turn_control(cancellation_control, hook_abort_signal)
             .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
         Ok(())
     }

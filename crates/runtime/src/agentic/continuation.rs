@@ -263,6 +263,7 @@ mod tests {
     fn actor(turn: &str, root: &str) -> AgentActorBinding {
         let objective_id = root_objective_id("continuation-session", turn);
         AgentActorBinding {
+            original_execution: None,
             program_id: program_id_for_objective(&objective_id),
             objective_id,
             session_id: "continuation-session".into(),

@@ -4163,6 +4163,7 @@ mod readiness_tests {
                 "sha256":crate::context_evidence::read_sha256(content.as_bytes()),
                 "byteLength":content.len(),"endsWithNewline":false,
             }}).to_string()), error:None, evidence_ref:"partition-root-read".into(), observed_evidence:vec![],
+            pending_agent_batch: None,
         };
         services
             .commit_service()

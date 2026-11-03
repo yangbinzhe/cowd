@@ -129,6 +129,7 @@ pub(crate) mod tests {
                         error: None,
                         evidence_ref: format!("process-effect:{}", request.tool_use_id),
                         observed_evidence: vec![],
+                        pending_agent_batch: None,
                     };
                 }
                 "read_file" => {
@@ -149,31 +150,81 @@ pub(crate) mod tests {
                         error: None,
                         evidence_ref: format!("process-effect:{}", request.tool_use_id),
                         observed_evidence: vec![],
+                        pending_agent_batch: None,
                     };
                 }
                 _ => {}
             }
-            let actor = services
-                .resolve_agent_action_actor(request.parent_execution.as_ref().unwrap(), None)
-                .await
-                .unwrap();
-            let action:AgentAction=serde_json::from_value(serde_json::json!({"kind":request.tool_name,"input":serde_json::from_str::<serde_json::Value>(&request.input).unwrap()})).unwrap();
-            let observation = services
-                .submit_agent_action(&AgentActionEnvelope {
-                    action_id: request.idempotency_key.clone(),
-                    actor,
-                    expected_revision: None,
-                    action,
-                })
-                .await
-                .unwrap();
             crate::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
-                status: crate::RuntimeToolExecutionStatus::Executed,
+                status: crate::RuntimeToolExecutionStatus::BlockedPermission,
                 category: request.category,
-                output: Some(serde_json::to_string(&observation).unwrap()),
-                error: None,
+                output: None,
+                error: Some("original action invocation capability required".into()),
+                evidence_ref: String::new(),
+                observed_evidence: vec![],
+                pending_agent_batch: None,
+            }
+        }
+
+        async fn execute_runtime_tool_with_action_invocation(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+            capability: &crate::agentic::action_invocation::VerifiedActionInvocation,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            let result: Result<Result<AgentActionObservation, crate::AgentActionServiceError>, String> = async {
+                capability.validate_request(request).map_err(str::to_string)?;
+                let services = self.0.get().and_then(std::sync::Weak::upgrade)
+                    .ok_or("original Runtime unavailable")?;
+                let parent = request.parent_execution.as_ref().ok_or("original parent missing")?;
+                let attempt = request.parent_execution_attempt.ok_or("original attempt missing")?;
+                let actor = services.resolve_agent_action_actor_for_attempt(parent, attempt, None).await?;
+                let original_input = harness_contract::step::parse_strict_json(&request.input)
+                    .map_err(|error| error.to_string())?;
+                let mut action_input = original_input.clone();
+                let object = action_input.as_object_mut().ok_or("action input must be an object")?;
+                let expected_revision = match object.remove("expected_revision") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::Number(value)) => Some(value.as_u64().ok_or("invalid expected revision")?),
+                    Some(_) => return Err("invalid expected revision".into()),
+                };
+                if request.tool_name == "state_inspect" && (object.contains_key("entry_ref") || object.contains_key("scope_ref")) {
+                    object.remove("page_cursor");
+                    object.remove("query");
+                }
+                let action: AgentAction = serde_json::from_value(serde_json::json!({
+                    "kind":request.tool_name, "input":action_input,
+                })).map_err(|error| error.to_string())?;
+                let envelope = AgentActionEnvelope {
+                    action_id: request.idempotency_key.clone(), actor, expected_revision, action,
+                };
+                Ok(services.submit_delegated_tool_action(capability, &envelope, &request.tool_name, &original_input).await)
+            }.await;
+            let (status, output, error) = match result {
+                Ok(Err(crate::AgentActionServiceError::MemberUnknown(error))) =>
+                    (crate::RuntimeToolExecutionStatus::Unknown, None, Some(error)),
+                Ok(Err(error)) => (crate::RuntimeToolExecutionStatus::BlockedPermission, None, Some(error.to_string())),
+                Ok(Ok(observation)) if matches!(observation.status, AgentActionStatus::Rejected | AgentActionStatus::Blocked) => {
+                    let reason = observation.error.as_ref().map_or_else(
+                        || "original action rejected".to_string(),
+                        |error| format!("{}: {}", error.code, error.message),
+                    );
+                    (crate::RuntimeToolExecutionStatus::BlockedPermission, None, Some(reason))
+                }
+                Ok(Ok(observation)) => (crate::RuntimeToolExecutionStatus::Executed,
+                    Some(serde_json::to_string(&observation).expect("action observation serializes")), None),
+                Err(error) => (crate::RuntimeToolExecutionStatus::BlockedPermission, None, Some(error)),
+            };
+            crate::RuntimeToolExecutionOutcome {
+                pending_agent_batch: matches!(&status, crate::RuntimeToolExecutionStatus::Unknown).then(||
+                    crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::RecordedSink(request.tool_progress.clone()))),
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status,
+                category: request.category,
+                output,
+                error,
                 evidence_ref: format!("coordination-action:{}", request.tool_use_id),
                 observed_evidence: vec![],
             }
@@ -366,6 +417,7 @@ pub(crate) mod tests {
         );
         let actions = services.agent_action_service();
         let root = AgentActorBinding {
+            original_execution: None,
             objective_id: "coord-objective".into(),
             program_id: "coord-program".into(),
             session_id: "coord-session".into(),
@@ -587,356 +639,6 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn coordination_withdrawal_cancels_coordinator_and_legacy_primary() {
-        let fixture = fixture(false).await;
-        let mut withdraw = fixture.request.clone();
-        withdraw.action_id = "withdraw-coordinated-task".into();
-        withdraw.action = AgentAction::TaskWithdraw(TaskWithdrawInput {
-            task_ref: fixture.task_ref.clone(),
-            reason_ref: "source:withdrawn".into(),
-            evidence_refs: vec![],
-        });
-        let applied = fixture
-            .services
-            .submit_agent_action(&withdraw)
-            .await
-            .unwrap();
-        assert_eq!(applied.status, AgentActionStatus::Applied, "{applied:?}");
-        fixture
-            .services
-            .dispatch_agentic_followups(&withdraw, context(&withdraw))
-            .await
-            .unwrap();
-        for graph_id in [fixture.packet.graph_id(), "primary-execution"] {
-            let graph = fixture.services.graph_state_store().load(graph_id).unwrap();
-            assert!(
-                graph.node_statuses.values().all(|status| matches!(
-                    status,
-                    harness_contract::execution_graph::ExecutionNodeStatus::Cancelled
-                        | harness_contract::execution_graph::ExecutionNodeStatus::Completed
-                        | harness_contract::execution_graph::ExecutionNodeStatus::Failed
-                )),
-                "{graph:?}"
-            );
-        }
-        let projection = fixture
-            .services
-            .agent_action_service()
-            .project("coord-program")
-            .unwrap();
-        let task = &projection.tasks[&fixture.task_ref];
-        assert_eq!(task.status, AgenticTaskStatus::Withdrawn);
-        assert!(task.active_attempts.is_empty());
-        assert_eq!(task.failed_attempts, 0);
-        assert!(
-            projection.coordination_requests()[0]
-                .1
-                .coordination
-                .as_ref()
-                .unwrap()
-                .settled
-        );
-        assert!(fixture
-            .services
-            .recover_agentic_programs_on_startup()
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn coordination_terminal_recovery_uses_durable_reply_without_primary_failure() {
-        let fixture = fixture(false).await;
-        let reply = AgentActionEnvelope {
-            action_id: "reply-before-terminal".into(), actor: actor(&fixture).await, expected_revision: None,
-            action: AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
-                "topic_ref":format!("topic:{}", fixture.packet.agentic_binding.as_ref().unwrap().team_id),
-                "summary":"The boundary needs an empty-input check", "refs":[fixture.wake_ref]
-            })).unwrap()),
-        };
-        assert_eq!(
-            fixture
-                .services
-                .submit_agent_action(&reply)
-                .await
-                .unwrap()
-                .status,
-            AgentActionStatus::Applied
-        );
-        fixture
-            .services
-            .cancel_execution_tree(
-                fixture.packet.graph_id(),
-                "fixture physical exit after reply",
-            )
-            .await
-            .unwrap();
-        assert!(fixture
-            .services
-            .recover_agentic_programs_on_startup()
-            .await
-            .unwrap()
-            .is_empty());
-        let projection = fixture
-            .services
-            .agent_action_service()
-            .project("coord-program")
-            .unwrap();
-        let consumed = projection.coordination_requests()[0]
-            .1
-            .coordination
-            .as_ref()
-            .unwrap();
-        assert!(consumed.settled);
-        assert!(consumed.reason.is_none(), "{consumed:?}");
-        assert_eq!(projection.tasks[&fixture.task_ref].failed_attempts, 0);
-        assert_eq!(
-            projection.tasks[&fixture.task_ref]
-                .claim_execution_id
-                .as_deref(),
-            Some("primary-execution")
-        );
-    }
-
-    /// Controls the backend return, not the Graph executor's lifecycle facts.
-    /// The original AgentRuntime must publish admission/exit and settle the wake.
-    struct CoordinationExitBackend {
-        entered: tokio::sync::mpsc::UnboundedSender<AgentTaskPacket>,
-        release: tokio::sync::Semaphore,
-        returned: tokio::sync::mpsc::UnboundedSender<String>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::AgentRuntimeBackend for CoordinationExitBackend {
-        fn kind(&self) -> crate::AgentBackendKind {
-            crate::AgentBackendKind::InProcess
-        }
-        fn capabilities(&self) -> crate::AgentBackendCapabilities {
-            crate::AgentBackendCapabilities::in_process()
-        }
-        async fn execute(
-            &self,
-            packet: AgentTaskPacket,
-            _: crate::AgentModelSelection,
-        ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
-            self.entered.send(packet.clone()).unwrap();
-            self.release.acquire().await.unwrap().forget();
-            self.returned.send(packet.run_id().to_string()).unwrap();
-            Err("controlled backend returned without a coordination reply".into())
-        }
-    }
-
-    async fn finish_coordination_backend(
-        fixture: &Fixture,
-        packet: &AgentTaskPacket,
-        backend: &CoordinationExitBackend,
-        returned: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
-    ) {
-        assert!(
-            crate::agent_runtime::confirmed_run_exit(fixture.services.event_store(), packet)
-                .unwrap()
-                .is_none(),
-            "an entered backend is not a durable exit"
-        );
-        let cursor = fixture
-            .services
-            .event_store()
-            .durable_commit_cursor()
-            .unwrap();
-        let error = fixture
-            .services
-            .settle_abandoned_agentic_attempt(packet, "not returned")
-            .await
-            .unwrap_err();
-        assert_eq!(error, "Agent attempt awaits exact durable local exit");
-        assert_eq!(
-            fixture
-                .services
-                .event_store()
-                .durable_commit_cursor()
-                .unwrap(),
-            cursor
-        );
-        backend.release.add_permits(1);
-        assert_eq!(returned.recv().await.as_deref(), Some(packet.run_id()));
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let exited = crate::agent_runtime::confirmed_run_exit(
-                    fixture.services.event_store(),
-                    packet,
-                )
-                .unwrap()
-                .is_some();
-                let projection = fixture
-                    .services
-                    .agent_action_service()
-                    .project("coord-program")
-                    .unwrap();
-                if exited
-                    && !projection.tasks[&fixture.task_ref]
-                        .active_attempts
-                        .contains_key(packet.graph_id())
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the original owner must publish exit and automatically settle");
-        let mut foreign = packet.clone();
-        foreign.attempt += 1;
-        assert!(
-            crate::agent_runtime::confirmed_run_exit(fixture.services.event_store(), &foreign)
-                .is_err(),
-            "another attempt cannot borrow this run's durable exit"
-        );
-        foreign = packet.clone();
-        foreign
-            .agentic_binding
-            .as_mut()
-            .unwrap()
-            .membership_id
-            .push_str("-foreign");
-        assert!(
-            crate::agent_runtime::confirmed_run_exit(fixture.services.event_store(), &foreign)
-                .is_err(),
-            "another binding cannot borrow this run's durable exit"
-        );
-    }
-
-    #[tokio::test]
-    async fn coordination_concurrent_repeated_wake_keeps_one_registered_execution() {
-        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
-        let (returned_tx, mut returned) = tokio::sync::mpsc::unbounded_channel();
-        let backend = Arc::new(CoordinationExitBackend {
-            entered: entered_tx,
-            release: tokio::sync::Semaphore::new(0),
-            returned: returned_tx,
-        });
-        // Metadata only: this backend never invokes the Provider. An unavailable
-        // local endpoint also prevents a personal account or hidden fallback.
-        let provider = Arc::new(
-            crate::ProviderRegistry::new(crate::config::ProvidersConfig {
-                providers: std::collections::HashMap::from([(
-                    "coordination-test".into(),
-                    crate::config::ProviderConfig {
-                        name: "coordination-test".into(),
-                        base_url: "http://127.0.0.1:9/v1".into(),
-                        api_key: "not-an-account".into(),
-                        models: vec!["test".into()],
-                        protocol: Some("responses".into()),
-                        parallel_tool_calls: Default::default(),
-                        early_tool_start: Default::default(),
-                    },
-                )]),
-            })
-            .unwrap(),
-        );
-        let fixture = fixture_with_options(
-            false,
-            None,
-            Some(provider),
-            false,
-            false,
-            Some(backend.clone()),
-        )
-        .await;
-        let first = tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.run_id(), fixture.packet.run_id());
-        assert_eq!(first.agent_id(), fixture.packet.agent_id());
-        assert_eq!(first.attempt, fixture.packet.attempt);
-        assert_eq!(first.agentic_binding, fixture.packet.agentic_binding);
-        let mut workers = tokio::task::JoinSet::new();
-        for index in 0..16 {
-            let services = fixture.services.clone();
-            let mut request = fixture.request.clone();
-            request.action_id = format!("concurrent-help-{index}");
-            workers.spawn(async move {
-                let applied = services.submit_agent_action(&request).await.unwrap();
-                assert_eq!(applied.status, AgentActionStatus::Applied);
-                assert!(services
-                    .dispatch_agentic_followups(&request, context(&request))
-                    .await
-                    .unwrap()
-                    .is_empty());
-            });
-        }
-        while let Some(result) = workers.join_next().await {
-            result.unwrap();
-        }
-        let projection = fixture
-            .services
-            .agent_action_service()
-            .project("coord-program")
-            .unwrap();
-        assert_eq!(projection.coordination_requests().len(), 1);
-        assert_eq!(projection.tasks[&fixture.task_ref].active_attempts.len(), 1);
-        assert!(projection.tasks[&fixture.task_ref]
-            .active_attempts
-            .contains_key(fixture.packet.graph_id()));
-        finish_coordination_backend(&fixture, &fixture.packet, &backend, &mut returned).await;
-        let mut workers = tokio::task::JoinSet::new();
-        for index in 0..16 {
-            let services = fixture.services.clone();
-            let mut request = fixture.request.clone();
-            request.action_id = format!("concurrent-new-help-{index}");
-            if let AgentAction::MessagePublish(input) = &mut request.action {
-                input.summary = Some("New independent evidence in source B".into());
-            }
-            workers.spawn(async move {
-                let applied = services.submit_agent_action(&request).await.unwrap();
-                assert_eq!(applied.status, AgentActionStatus::Applied);
-                services
-                    .dispatch_agentic_followups(&request, context(&request))
-                    .await
-                    .unwrap()
-                    .len()
-            });
-        }
-        let mut admitted = 0;
-        while let Some(result) = workers.join_next().await {
-            admitted += result.unwrap();
-        }
-        assert_eq!(admitted, 1);
-        let projection = fixture
-            .services
-            .agent_action_service()
-            .project("coord-program")
-            .unwrap();
-        assert_eq!(projection.coordination_requests().len(), 2);
-        assert_eq!(projection.tasks[&fixture.task_ref].active_attempts.len(), 1);
-        let second = tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(second.run_id(), first.run_id());
-        assert!(projection.tasks[&fixture.task_ref]
-            .active_attempts
-            .contains_key(second.graph_id()));
-        let second_graph = fixture
-            .services
-            .graph_state_store()
-            .load(second.graph_id())
-            .unwrap();
-        let second_original: AgentTaskPacket =
-            serde_json::from_str(&second_graph.nodes[0].payload_ref).unwrap();
-        assert_eq!(second_original.run_id(), second.run_id());
-        finish_coordination_backend(&fixture, &second_original, &backend, &mut returned).await;
-        assert!(matches!(
-            entered.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        fixture.services.shutdown_maintenance().await;
-        let shutdown = fixture.services.shutdown_execution().await;
-        assert!(shutdown.errors.is_empty(), "{shutdown:?}");
-        assert_eq!(shutdown.forced_aborts, 0, "{shutdown:?}");
-    }
-
     fn context(envelope: &AgentActionEnvelope) -> crate::AgenticDispatchContext {
         crate::AgenticDispatchContext {
             session_id: envelope.actor.session_id.clone(),
@@ -1022,69 +724,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn coordination_actor_rejects_wrong_focus_and_task_claim() {
-        use harness_contract::execution::ExecutionIdentity;
-        let fixture = fixture(false).await;
-        let bound = actor(&fixture).await;
-        let denied = fixture
-            .services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "illegal-coordination-claim".into(),
-                actor: bound,
-                expected_revision: None,
-                action: AgentAction::TaskClaim(TaskClaimInput {
-                    task_ref: fixture.task_ref.clone(),
-                    reason: None,
-                }),
-            })
-            .await
-            .unwrap();
-        assert_eq!(denied.error.unwrap().code, "coordination_cannot_claim_task");
-        let mut packet = fixture.packet.clone();
-        let mut graph = fixture
-            .services
-            .graph_state_store()
-            .load(packet.graph_id())
-            .unwrap();
-        graph.id = "wrong-coordination-source".into();
-        packet.assignment.graph_id = graph.id.clone();
-        let graph_identity = ExecutionIdentity::for_task_graph(
-            "fixture",
-            "fixture-workspace",
-            packet.mission_id(),
-            packet.task_id(),
-            packet.session_id(),
-            fixture.turn_id(),
-            &graph.id,
-        )
-        .unwrap();
-        packet.assignment.execution_identity =
-            ExecutionIdentity::for_agent_node(&graph_identity, packet.run_id(), packet.node_id())
-                .unwrap();
-        packet.agentic_binding.as_mut().unwrap().focus = AgenticExecutionFocus::Coordination {
-            wake_ref: "nonexistent-wake".into(),
-        };
-        graph.nodes[0].payload_ref = serde_json::to_string(&packet).unwrap();
-        fixture
-            .services
-            .commit_service()
-            .register_graph(graph.clone())
-            .unwrap();
-        let error = fixture
-            .services
-            .resolve_agent_action_actor(
-                &harness_contract::execution_graph::ExecutionParentBinding {
-                    execution_id: graph.id,
-                    node_id: graph.nodes[0].id.clone(),
-                },
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error, "agent_actor_coordination_wake_missing");
-    }
-
-    #[tokio::test]
     async fn coordination_failure_and_epoch_change_do_not_punish_primary_work() {
         let fixture = fixture(false).await;
         fixture
@@ -1125,6 +764,7 @@ pub(crate) mod tests {
         release.action = AgentAction::TaskRelease(TaskReleaseInput {
             task_ref: fixture.task_ref.clone(),
             reason: "replan the source".into(),
+            expected_claim_generation: Some(actions.project("coord-program").unwrap().tasks[&fixture.task_ref].claim_generation),
         });
         assert_eq!(
             actions.apply(&release).unwrap().status,
@@ -1214,67 +854,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn coordination_release_preserves_primary_claim_and_cold_consumption() {
-        let fixture = fixture(false).await;
-        let actions = fixture.services.agent_action_service();
-        let bound = actor(&fixture).await;
-        let before = actions.project("coord-program").unwrap().tasks[&fixture.task_ref].clone();
-        let claim = fixture
-            .services
-            .submit_agent_action(&AgentActionEnvelope {
-                action_id: "coordinator-claim-forbidden".into(),
-                actor: bound.clone(),
-                expected_revision: None,
-                action: AgentAction::TaskClaim(TaskClaimInput {
-                    task_ref: fixture.task_ref.clone(),
-                    reason: None,
-                }),
-            })
-            .await
-            .unwrap();
-        assert_eq!(claim.error.unwrap().code, "coordination_cannot_claim_task");
-        let reply=AgentActionEnvelope{action_id:"reply".into(),actor:bound,expected_revision:None,action:AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
-            "topic_ref":format!("topic:{}",fixture.packet.agentic_binding.as_ref().unwrap().team_id),"summary":"Boundary condition needs an explicit empty-input check","refs":[fixture.wake_ref]
-        })).unwrap())};
-        assert_eq!(
-            fixture
-                .services
-                .submit_agent_action(&reply)
-                .await
-                .unwrap()
-                .status,
-            AgentActionStatus::Applied
-        );
-        fixture
-            .services
-            .settle_abandoned_agentic_attempt(&fixture.packet, "normal exit")
-            .await
-            .unwrap();
-        let cold = crate::AgentActionService::new(Arc::clone(fixture.services.event_store()))
-            .project("coord-program")
-            .unwrap();
-        let after = &cold.tasks[&fixture.task_ref];
-        assert_eq!(after.status, before.status);
-        assert_eq!(after.claim_execution_id, before.claim_execution_id);
-        assert_eq!(after.claim_generation, before.claim_generation);
-        assert_eq!(after.failed_attempts, 0);
-        assert!(after.active_attempts.is_empty());
-        assert!(
-            cold.coordination_requests()[0]
-                .1
-                .coordination
-                .as_ref()
-                .unwrap()
-                .settled
-        );
-        assert!(fixture
-            .services
-            .dispatch_ready_agentic_work("coord-program")
-            .await
-            .unwrap()
-            .is_empty());
-    }
+
 }
 
 impl AgenticProgramProjection {

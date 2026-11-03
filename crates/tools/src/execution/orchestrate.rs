@@ -123,33 +123,22 @@ pub(crate) fn original_static_file_scopes(
             // reduction certifiable by a lease that covers the declared inputs
             // instead of demanding a whole-workspace `read:.`.
             //
-            // An explicit empty set means no project files at all: the sandbox
-            // still materializes its read-only snapshot from the workspace root,
-            // so the root directory read is the honest declared scope there.
-            let files = input.get("input_files").and_then(Value::as_array);
-            match files {
-                Some(paths) if !paths.is_empty() => {
-                    if paths.len() > 64 {
-                        return Err("execute_code input_files exceeds the bounded set".into());
-                    }
-                    for path in paths {
-                        let Some(path) = path.as_str() else {
-                            return Err("execute_code input_files entries must be strings".into());
-                        };
-                        let normalized = path.trim().replace('\\', "/");
-                        if normalized.is_empty()
-                            || normalized.starts_with('/')
-                            || normalized.split('/').any(|part| part == "..")
-                        {
-                            return Err(
-                                "execute_code input_files entries must be workspace-relative"
-                                    .into(),
-                            );
-                        }
-                        add(read, Some(normalized), ProofEffectPurpose::InputRead);
-                    }
-                }
-                _ => add(read, Some(".".into()), ProofEffectPurpose::InputRead),
+            // An explicit empty set means no project files at all, and the
+            // sandbox materialises none - so the honest declared scope is
+            // empty, not the workspace root.
+            // Planning and execution must declare the same file set.
+            //
+            // The sandbox refuses a missing list and treats an empty list as
+            // "no project file". Planning used to project the workspace root
+            // for both, so the planned effect was strictly wider than the
+            // executed one - which is why a compute that touches nothing still
+            // demanded a whole-workspace lease and could never be certified
+            // under a read-only ceiling. A missing list now fails closed on
+            // both sides, and an empty list declares no file scope at all.
+            let paths = crate::sandbox_exec::bounded_compute_input_files(input)
+                .map_err(|error| format!("execute_code file contract: {error}"))?;
+            for path in paths {
+                add(read, Some(path), ProofEffectPurpose::InputRead);
             }
         }
         "workspace_snapshot" => {

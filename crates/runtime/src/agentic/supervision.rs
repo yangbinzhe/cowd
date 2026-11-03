@@ -904,6 +904,7 @@ pub(crate) fn apply_completion_request(
 /// Objective terminal. Program is only a consumer of the resulting GoalStore
 /// verdict; it cannot promote itself from request fields.
 pub(crate) fn reconcile_completion_request(
+    services: &crate::RuntimeServices,
     actions: &AgentActionService,
     supervisor: &crate::execution_core::goal::ObjectiveSupervisor,
     program_id: &str,
@@ -915,9 +916,24 @@ pub(crate) fn reconcile_completion_request(
         return Ok(None);
     }
     if projection.status == AgenticProgramStatus::Verified {
-        return Ok(Some(projection));
+        if actions.authenticated_existing_request_conclusion(&projection)
+            .map_err(|error| error.to_string())?
+        { return Ok(Some(projection)); }
+        return Err("verified Program lacks an authenticated original conclusion".into());
     }
     if projection.status != AgenticProgramStatus::CompletionRequested {
+        if projection.objective_verdict.is_some() && projection.completion_request.is_none() {
+            if actions.authenticated_existing_nonrequest_conclusion(&projection)
+                .map_err(|error| error.to_string())?
+            { return Ok(Some(projection)); }
+            return Err("non-request conclusion winner requires original trigger authentication".into());
+        }
+        if projection.objective_verdict.is_none() {
+            if let Some(action_id) = supervisor.goal_store().exhausted_completion_rejection(&projection)? {
+                let prepared = supervisor.goal_store().prepare_rejected_program_conclusion(&projection, &action_id)?;
+                return services.commit_owned_program_conclusion(&projection, prepared).map(Some).map_err(|error| error.to_string());
+            }
+        }
         return Ok(None);
     }
     let root_execution_id = projection
@@ -927,18 +943,83 @@ pub(crate) fn reconcile_completion_request(
     let goal_id = format!("goal:{root_execution_id}");
     if let Some(goal) = supervisor.goal_store().get(&goal_id)? {
         if goal.terminal.is_some() {
-            return actions
-                .bind_objective_verdict(program_id, &goal)
-                .map(Some)
-                .map_err(|error| error.to_string());
+            if actions.authenticated_existing_request_conclusion(&projection)
+                .map_err(|error| error.to_string())? {
+                return actions.project(program_id).map(Some).map_err(|error| error.to_string());
+            }
+            return Err("terminal Goal lacks an authenticated same-request Program conclusion".into());
         }
     }
 
-    let prepared = supervisor
-        .goal_store()
-        .prepare_program_conclusion(&projection)?;
-    actions
-        .commit_program_conclusion(&projection, prepared)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    let original_request = projection.completion_request.clone()
+        .ok_or_else(|| "completion request disappeared before reconciliation".to_string())?;
+    let mut current = projection;
+    for attempt in 0..3 {
+        let prepared = match supervisor.goal_store().prepare_program_conclusion(&current) {
+            Ok(prepared) => prepared,
+            Err(error) if attempt < 2 && retryable_conclusion_source_change(&error) => {
+                let refreshed = actions.project(program_id).map_err(|error| error.to_string())?;
+                if refreshed.completion_request.as_ref() != Some(&original_request) {
+                    if actions.authenticated_existing_request_conclusion(&current).map_err(|error| error.to_string())? {
+                        return Ok(Some(refreshed));
+                    }
+                    return Err("completion request changed during source retry".into());
+                }
+                current = refreshed;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match services.commit_owned_program_conclusion(&current, prepared) {
+            Ok(result) => return Ok(Some(result)),
+            Err(crate::AgentActionServiceError::Store(crate::RuntimeEventStoreError::StaleRevision { .. })) if attempt < 2 => {
+                let refreshed = actions.project(program_id).map_err(|error| error.to_string())?;
+                if refreshed.completion_request.as_ref() != Some(&original_request) {
+                    if actions.authenticated_existing_request_conclusion(&current).map_err(|error| error.to_string())? {
+                        return Ok(Some(refreshed));
+                    }
+                    return Err("completion request changed during transaction retry".into());
+                }
+                current = refreshed;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("completion source retry budget exhausted".into())
+}
+
+// These are the proof reader's explicit source-race diagnostics. Keep the
+// list narrow: policy, storage, identity and malformed-evidence errors are
+// not instructions to retry or to accept a conclusion.
+fn retryable_conclusion_source_change(reason: &str) -> bool {
+    matches!(reason,
+        "proof source changed while paging; retry current inputs"
+        | "proof source changed at final page boundary; retry current inputs"
+        | "proof Program source changed; retry current inputs"
+        | "proof physical lineage changed during discovery; retry current inputs")
+        || reason.starts_with("proof Program source changed; retry current inputs; advanced=")
+        || reason.starts_with("proof source changed during validation; retry current inputs; source=")
+}
+
+/// A Runtime-owned observation may close an exhausted Program without
+/// manufacturing an ObjectiveCompleteRequest. Goal and Program still commit
+/// through the same conclusion transaction.
+pub(crate) fn reconcile_runtime_stall(
+    services: &crate::RuntimeServices,
+    actions: &AgentActionService,
+    supervisor: &crate::execution_core::goal::ObjectiveSupervisor,
+    program_id: &str,
+    trigger: &harness_contract::goal::RuntimeObservation,
+) -> Result<AgenticProgramProjection, String> {
+    let projection = actions.project(program_id).map_err(|error| error.to_string())?;
+    if projection.objective_verdict.is_some() {
+        if actions.authenticated_existing_trigger_conclusion(
+            &projection, super::action_service::NonRequestConclusionTrigger::Runtime(trigger),
+        ).map_err(|error| error.to_string())? {
+            return Ok(projection);
+        }
+        return Err("runtime conclusion winner requires original transaction authentication".into());
+    }
+    let prepared = supervisor.goal_store().prepare_runtime_program_conclusion(&projection, trigger)?;
+    services.commit_owned_program_conclusion(&projection, prepared).map_err(|error| error.to_string())
 }

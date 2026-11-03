@@ -47,7 +47,7 @@ pub(super) fn attach_agentic_display(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum DispatchMode {
+pub(in crate::agentic) enum DispatchMode {
     Execute,
     Review,
     Coordination(u64),
@@ -114,14 +114,10 @@ pub(super) fn coordination_requests(
         .collect()
 }
 
-pub(super) fn task_ready_for_execution(task: &AgenticTaskProjection, observed_at_ms: u64) -> bool {
-    matches!(
-        task.status,
-        AgenticTaskStatus::Published | AgenticTaskStatus::Rework
-    ) || (task.status == AgenticTaskStatus::Claimed
-        && task
-            .lease_expires_at_ms
-            .is_some_and(|expires| expires <= observed_at_ms))
+pub(super) fn task_ready_for_execution(task: &AgenticTaskProjection, _observed_at_ms: u64) -> bool {
+    // Expiry is a liveness signal, not evidence that the old physical owner
+    // closed. Recovery must first settle and release that exact generation.
+    matches!(task.status, AgenticTaskStatus::Published | AgenticTaskStatus::Rework)
 }
 
 pub(super) fn dependencies_accepted(
@@ -341,7 +337,7 @@ pub(super) fn entity_ref_for_action(envelope: &AgentActionEnvelope) -> Option<St
     Some(format!("{prefix}:{}", &format!("{digest:x}")[..24]))
 }
 
-pub(super) fn deterministic_graph_id(
+pub(in crate::agentic) fn deterministic_graph_id(
     program_id: &str,
     task_ref: &str,
     agent_ref: &str,

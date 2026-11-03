@@ -14,6 +14,40 @@ use harness_contract::agent_action::{
 
 use crate::RuntimeServices;
 
+// Internal domain boundary: member submissions are never converted into a
+// semantic success merely to share the single-action control flow.
+enum OriginalIngressResult {
+    Single(AgentActionObservation),
+    SingleChecked(Result<AgentActionObservation, crate::AgentActionServiceError>),
+    PreparedMember(PreparedMemberChecked),
+}
+enum PreparedMemberChecked {
+    Committed(std::sync::Arc<crate::OriginalCommittedMember>, bool),
+    NoCommittedReceipt(AgentActionObservation),
+    Error(crate::AgentActionServiceError),
+}
+enum OriginalIngressMember {
+    Prepared(crate::step_snapshot::OriginalPreparedMemberCapability),
+}
+impl OriginalIngressResult {
+    fn into_single(self) -> Result<AgentActionObservation, String> {
+        match self {
+            Self::Single(observation) => Ok(observation),
+            Self::SingleChecked(result) => result.map_err(|error| error.to_string()),
+            Self::PreparedMember(_) => Err("unknown: member result reached single-action caller".into()),
+        }
+    }
+    fn into_single_typed(self) -> Result<AgentActionObservation, crate::AgentActionServiceError> {
+        match self {
+            Self::Single(observation) => Ok(observation),
+            Self::SingleChecked(result) => result,
+            Self::PreparedMember(_) => Err(crate::AgentActionServiceError::MemberUnknown(
+                "member result reached single-action caller".into(),
+            )),
+        }
+    }
+}
+
 /// A positive review verdict is rejected as "source changed; retry" while the
 /// underlying effect/strategy revision is being rewritten by concurrent
 /// writers. That is optimistic-concurrency, not a business failure, so the
@@ -120,6 +154,7 @@ fn runtime_supervisor_actor(
     execution_id: Option<String>,
 ) -> AgentActorBinding {
     AgentActorBinding {
+        original_execution: None,
         objective_id: program.objective_id.clone(),
         program_id: program.program_id.clone(),
         session_id: program.session_id.clone(),
@@ -140,6 +175,17 @@ fn runtime_supervisor_actor(
 }
 
 impl RuntimeServices {
+    /// Pre-grant replay reads the original semantic transaction only. The
+    /// Host must separately recover the original physical ToolBatch receipt.
+    pub(crate) fn verify_original_root_replay(
+        &self, witness: &crate::conversation::tool_plane::OriginalRootReplayWitness<'_>,
+    ) -> Result<crate::agentic::OriginalReplayedAction, String> {
+        if witness.original_action_event().kind != "agentic.action_applied" {
+            return Err("unknown: original completion rejection replay consumer unavailable".into());
+        }
+        self.agent_action_service().replay_single_original(witness).map_err(|error| error.to_string())
+    }
+
     /// Private authenticated-user cause. Public model ObjectiveUpdate still
     /// takes prepare_agentic_objective_action and cannot replace user_intent.
     pub(crate) fn commit_user_input_goal_revision(
@@ -171,6 +217,7 @@ impl RuntimeServices {
         let envelope = AgentActionEnvelope {
             action_id: format!("user-goal:{}:{}", original.id, frame.digest()?),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: program.objective_id.clone(),
                 program_id: program.program_id.clone(),
                 session_id: program.session_id.clone(),
@@ -448,22 +495,112 @@ impl RuntimeServices {
         (canonical != evidence_id).then_some(canonical)
     }
 
-    /// The sole public Program mutation ingress. actor is a trusted Runtime
-    /// binding constructed from Session/graph/run lineage, never a model JSON
-    /// object. Gateway only transports its DTO to this boundary.
-    pub async fn submit_agent_action(
+    /// Delegated ToolHost entry. The capability exists only during the
+    /// original admitted call and binds the exact action or batch member.
+    pub async fn submit_delegated_tool_action(
+        &self,
+        capability: &super::action_invocation::VerifiedActionInvocation,
+        envelope: &AgentActionEnvelope,
+        tool: &str,
+        original_input: &serde_json::Value,
+    ) -> Result<AgentActionObservation, crate::AgentActionServiceError> {
+        capability.validate_envelope(envelope, tool, original_input)
+            .map_err(|error| crate::AgentActionServiceError::EventStore(error.to_string()))?;
+        // Preserve checked-transaction uncertainty across the original caller.
+        self.submit_agent_action_from_owner(envelope, false, false, Some((capability, tool, original_input)), None)
+            .await.map_err(crate::AgentActionServiceError::EventStore)?.into_single_typed()
+    }
+
+    /// The candidate carries no grant. The original action transaction decides
+    /// member uniqueness and legacy ambiguity while holding the original owners.
+    pub async fn submit_agent_action_member(
+        &self, envelope: &AgentActionEnvelope,
+        capability: crate::step_snapshot::OriginalPreparedMemberCapability,
+    ) -> crate::tool_host::PreparedMemberSubmitOutcome {
+        use crate::tool_host::{OriginalBatchMemberStop, OriginalBatchMemberStopReason as Stop, PreparedMemberSubmitOutcome as Outcome};
+        let coordinate = capability.coordinate();
+        let reservation = capability.original_reservation();
+        let effect_fence = capability.original_effect_fence();
+        let make_stop = |coordinate, reason| OriginalBatchMemberStop::publish_with_owners(
+            coordinate, reason, std::sync::Arc::clone(&reservation), std::sync::Arc::clone(&effect_fence));
+        if let Err(error) = capability.matches_action_envelope(envelope) {
+            return Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeUnknown(error.to_string())));
+        }
+        let result = match self.submit_agent_action_from_owner(envelope, false, false, None,
+            Some(OriginalIngressMember::Prepared(capability))).await {
+            Ok(result) => result,
+            Err(error) => return Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeUnknown(error))),
+        };
+        match result {
+            OriginalIngressResult::PreparedMember(PreparedMemberChecked::Committed(handle, true)) => {
+                match crate::tool_host::OriginalMemberSubmitOutcome::from_original_submission(
+                    super::action_service::OriginalMemberSubmission::Committed(handle), self.event_store(), envelope) {
+                    crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) => {
+                        if matches!(member.observation(), crate::tool_host::OriginalMemberObservation::Unavailable) {
+                            Outcome::Stopped(make_stop(coordinate, Stop::CommittedObservationUnavailable(member)))
+                        } else { Outcome::Committed(member) }
+                    }
+                    crate::tool_host::OriginalMemberSubmitOutcome::CommittedUnbound(handle) =>
+                        Outcome::Stopped(make_stop(coordinate, Stop::CommittedUnbound(handle))),
+                    crate::tool_host::OriginalMemberSubmitOutcome::NoCommittedReceipt(observation) =>
+                        Outcome::Stopped(make_stop(coordinate, Stop::UnknownNoReceipt(observation))),
+                }
+            },
+            OriginalIngressResult::PreparedMember(PreparedMemberChecked::Committed(handle, false)) =>
+                Outcome::Stopped(make_stop(coordinate, Stop::CommittedUnbound(
+                    crate::tool_host::OriginalMemberUnboundCommit { handle, reason: "original committed member awaits owner reconciliation".into() }))),
+            OriginalIngressResult::PreparedMember(PreparedMemberChecked::NoCommittedReceipt(observation)) =>
+                Outcome::Stopped(make_stop(coordinate, Stop::UnknownNoReceipt(observation))),
+            OriginalIngressResult::PreparedMember(PreparedMemberChecked::Error(error)) =>
+                Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeError(error))),
+            _ => Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeUnknown("unexpected original member result".into()))),
+        }
+    }
+
+    // Only the original Runtime dispatch/recovery owners call this entry.
+    pub(super) async fn submit_runtime_supervisor_action(
         &self,
         envelope: &AgentActionEnvelope,
     ) -> Result<AgentActionObservation, String> {
+        if envelope.actor.kind != AgentActorKind::Supervisor || envelope.actor.original_execution.is_some() {
+            return Err("invalid Runtime supervisor action".into());
+        }
+        self.submit_agent_action_from_owner(envelope, false, true, None, None).await?.into_single()
+    }
+
+    // Only the Runtime completion owner below can select the internal path;
+    // caller-controlled actor fields are not proof of that provenance.
+    async fn submit_agent_action_from_owner(
+        &self,
+        envelope: &AgentActionEnvelope,
+        internal_completion: bool,
+        internal_supervisor: bool,
+        owner_call: Option<(&super::action_invocation::VerifiedActionInvocation, &str, &serde_json::Value)>,
+        member_call: Option<OriginalIngressMember>,
+    ) -> Result<OriginalIngressResult, String> {
         envelope.validate().map_err(|error| error.to_string())?;
+        if !internal_completion && !internal_supervisor && member_call.is_none() {
+            let (capability, tool, input) = owner_call.ok_or("original single-call capability missing")?;
+            capability.validate_envelope(envelope, tool, input).map_err(str::to_string)?;
+        }
+        if !internal_completion && !internal_supervisor && envelope.actor.original_execution.is_none() {
+            return Err("public agent action requires original authenticated execution".to_string());
+        }
         self.ensure_session_recovery_admitted(&envelope.actor.session_id)
             .map_err(|error| error.to_string())?;
         let actions = self.agent_action_service();
-        if let Some(replay) = actions
-            .replay_if_applied(envelope)
-            .map_err(|error| error.to_string())?
+        if member_call.is_none() && owner_call.is_none() {
+            if let Some(replay) = actions
+                .replay_if_applied(envelope)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(OriginalIngressResult::Single(replay));
+            }
+        }
+        if envelope.actor.kind == AgentActorKind::Root && envelope.actor.original_execution.is_none()
+            && !(internal_completion && matches!(&envelope.action, AgentAction::ObjectiveCompleteRequest(_)))
         {
-            return Ok(replay);
+            return Err("new root action requires original physical execution".to_string());
         }
         self.validate_agent_action_evidence(&envelope.actor, &envelope.action)
             .await?;
@@ -582,7 +719,140 @@ impl RuntimeServices {
         } else {
             None
         };
+        // Recheck after the asynchronous evidence/review work. A must still
+        // consume this owner in its checked+cancellable transaction; this
+        // process-local recheck is not a commit fence.
+        if let Some((capability, tool, input)) = owner_call {
+            capability.validate_envelope(envelope, tool, input).map_err(str::to_string)?;
+        }
         let verification = review.as_ref().map(|review| &review.verification);
+        if let Some(member) = member_call {
+            let goal = if matches!(envelope.action, AgentAction::ObjectiveUpdate(_) | AgentAction::ObjectiveReview(_)) {
+                let producers = review.as_ref().map_or(&[][..], |review| review.producers.as_slice());
+                let prepared = self.goal_store().prepare_agentic_objective_action(envelope, producers, verification)?;
+                Some((prepared.stream_id, prepared.expected_stream_revision, prepared.event))
+            } else {
+                None
+            };
+            let mut streams = vec![format!("agentic-program:{}", envelope.actor.program_id)];
+            streams.push(format!("session:{}", envelope.actor.session_id));
+            if matches!(envelope.action, AgentAction::TeamCreate(_))
+                || matches!(&envelope.action, AgentAction::TaskPublish(input) if !input.obligation_refs.is_empty()) {
+                if let Some(root) = envelope.actor.root_execution_id.as_deref() {
+                    streams.push(format!("goal:goal:{root}"));
+                }
+            }
+            if let Some((stream, _, _)) = &goal { streams.push(stream.clone()); }
+            if let Some(physical) = &envelope.actor.original_execution { streams.push(physical.graph_id.clone()); }
+            if let Some(proof) = verification {
+                if let Some(inputs) = &proof.input_set { streams.extend(inputs.source_revisions.keys().cloned()); }
+                streams.extend(proof.result_source_revisions.keys().cloned());
+                if !proof.independence_required || proof.effect_manifest_digest.is_some() {
+                    streams.push(format!("session:{}", envelope.actor.session_id));
+                    streams.extend(proof.effect_source_refs.iter().cloned());
+                }
+            }
+            return match member {
+                OriginalIngressMember::Prepared(candidate) => {
+                    candidate.matches_action_envelope(envelope).map_err(|error| error.to_string())?;
+                    let no_receipt = std::cell::RefCell::new(None);
+                    let committed = candidate.commit_checked(self, &streams, |held, sources, member, authority, reservation, effect_fence| {
+                        let (control, claim, cursor, outer_hook) = if let Some(host) = member.host() {
+                            let (control, claim, cursor) = host.locked_commit_context()
+                                .map_err(crate::AgentActionServiceError::MemberUnknown)?;
+                            let hook = host.original_outer_hook_owner()
+                                .map_err(crate::AgentActionServiceError::MemberUnknown)?;
+                            (control, claim, cursor, Some(hook))
+                        } else if let Some(process) = member.process() {
+                            let (control, claim, cursor) = process.locked_commit_context()
+                                .map_err(crate::AgentActionServiceError::MemberUnknown)?;
+                            (control, claim, cursor, None)
+                        } else {
+                            return Err(crate::AgentActionServiceError::MemberUnknown(
+                                "original member owner is unavailable".into()));
+                        };
+                        let authorization = authority.staged_authorization_for_original_action()
+                            .map_err(crate::AgentActionServiceError::MemberUnknown)?.authorization;
+                        // New authority events are part of A's checked append;
+                        // there are no prior consumed member events to invent.
+                        match actions.apply_member_locked(envelope, goal, verification, sources, held, control,
+                            &claim, cursor, member.prepared(), &authorization, member.ticket(), &[], authority, reservation, effect_fence, outer_hook.as_ref())? {
+                            super::action_service::OriginalMemberSubmission::Committed(handle) => Ok(handle),
+                            super::action_service::OriginalMemberSubmission::NoCommittedReceipt(observation) => {
+                                *no_receipt.borrow_mut() = Some(observation);
+                                Err(crate::AgentActionServiceError::MemberUnknown("original member has no committed receipt".into()))
+                            }
+                        }
+                    });
+                    let result = match (committed, no_receipt.into_inner()) {
+                        (Ok((handle, applied)), _) => PreparedMemberChecked::Committed(handle, applied),
+                        (Err(_), Some(observation)) => PreparedMemberChecked::NoCommittedReceipt(observation),
+                        (Err(error), None) => PreparedMemberChecked::Error(error),
+                    };
+                    Ok(OriginalIngressResult::PreparedMember(result))
+                }
+            };
+        }
+        if let Some((capability, tool, input)) = owner_call {
+            let root = capability.original_root_owner().map_err(str::to_string)?;
+            let goal = if matches!(envelope.action, AgentAction::ObjectiveUpdate(_) | AgentAction::ObjectiveReview(_)) {
+                let producers = review.as_ref().map_or(&[][..], |review| review.producers.as_slice());
+                let prepared = self.goal_store().prepare_agentic_objective_action(envelope, producers, verification)?;
+                Some((prepared.stream_id, prepared.expected_stream_revision, prepared.event))
+            } else { None };
+            let mut streams = vec![format!("agentic-program:{}", envelope.actor.program_id)];
+            if matches!(envelope.action, AgentAction::TeamCreate(_))
+                || matches!(&envelope.action, AgentAction::TaskPublish(input) if !input.obligation_refs.is_empty()) {
+                if let Some(root) = envelope.actor.root_execution_id.as_deref() {
+                    streams.push(format!("goal:goal:{root}"));
+                }
+            }
+            if let Some((stream, _, _)) = &goal { streams.push(stream.clone()); }
+            if let Some(physical) = &envelope.actor.original_execution { streams.push(physical.graph_id.clone()); }
+            if let Some(proof) = verification {
+                if let Some(inputs) = &proof.input_set { streams.extend(inputs.source_revisions.keys().cloned()); }
+                streams.extend(proof.result_source_revisions.keys().cloned());
+                if !proof.independence_required || proof.effect_manifest_digest.is_some() {
+                    streams.push(format!("session:{}", envelope.actor.session_id));
+                    streams.extend(proof.effect_source_refs.iter().cloned());
+                }
+            }
+            if let Some(root) = root {
+                return root.with_single_checked(self, &streams, |original| {
+                    let result = actions.apply_single_locked(envelope, goal, verification, capability, tool, input, original);
+                    let result = result.and_then(|submission| {
+                        let committed = submission.committed.is_some();
+                        if let Some(handle) = submission.committed {
+                            original.request().tool_progress.record_original_single(handle)
+                                .map_err(crate::AgentActionServiceError::MemberUnknown)?;
+                        }
+                        match submission.observation {
+                            Err(error) if committed => Err(crate::AgentActionServiceError::MemberUnknown(
+                                format!("original action committed; observation unavailable: {error}"))),
+                            result => result,
+                        }
+                    });
+                    Ok(OriginalIngressResult::SingleChecked(result))
+                });
+            }
+            return capability.with_original_delegated_checked(self, &streams, |delegated| {
+                let original = crate::conversation::tool_plane::OriginalSingleCheckedInputs::Delegated(delegated);
+                let result = actions.apply_single_locked(envelope, goal, verification, capability, tool, input, &original);
+                let result = result.and_then(|submission| {
+                    let committed = submission.committed.is_some();
+                    if let Some(handle) = submission.committed {
+                        original.request().tool_progress.record_original_single(handle)
+                            .map_err(crate::AgentActionServiceError::MemberUnknown)?;
+                    }
+                    match submission.observation {
+                        Err(error) if committed => Err(crate::AgentActionServiceError::MemberUnknown(
+                            format!("original action committed; observation unavailable: {error}"))),
+                        result => result,
+                    }
+                });
+                Ok(OriginalIngressResult::SingleChecked(result))
+            });
+        }
         if matches!(
             envelope.action,
             AgentAction::ObjectiveUpdate(_) | AgentAction::ObjectiveReview(_)
@@ -608,9 +878,13 @@ impl RuntimeServices {
             actions
                 .apply_verified_review(envelope, verification)
                 .map_err(|error| error.to_string())
+        } else if internal_completion {
+            actions.apply_runtime_root_completion(envelope).map_err(|error| error.to_string())
+        } else if internal_supervisor {
+            actions.apply_runtime_supervisor(envelope).map_err(|error| error.to_string())
         } else {
             actions.apply(envelope).map_err(|error| error.to_string())
-        }
+        }.map(OriginalIngressResult::Single)
     }
 
     /// When the Agent-first collaboration is objectively complete but the root
@@ -696,6 +970,7 @@ impl RuntimeServices {
             return Ok(false);
         }
         let actor = harness_contract::agent_action::AgentActorBinding {
+            original_execution: None,
             objective_id: program.objective_id.clone(),
             program_id: program.program_id.clone(),
             session_id: program.session_id.clone(),
@@ -719,7 +994,7 @@ impl RuntimeServices {
             expected_revision: None,
             action: AgentAction::ObjectiveCompleteRequest(input),
         };
-        let observation = self.submit_agent_action(&envelope).await?;
+        let observation = self.submit_agent_action_from_owner(&envelope, true, false, None, None).await?.into_single()?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Ok(false);
         }
@@ -765,7 +1040,7 @@ impl RuntimeServices {
         // Break the static recursion between submit_agent_action -> settle ->
         // submit_agent_action (the TaskAttemptFail action never re-enters the
         // positive-review branch, so this cannot loop at runtime).
-        let observation = Box::pin(self.submit_agent_action(&fail)).await?;
+        let observation = Box::pin(self.submit_runtime_supervisor_action(&fail)).await?;
         if observation.status != AgentActionStatus::Applied {
             return Err(observation
                 .error
@@ -1257,6 +1532,7 @@ mod tests {
             .build()
             .expect("services");
         let actor = harness_contract::agent_action::AgentActorBinding {
+            original_execution: None,
             objective_id: "objective".to_string(),
             program_id: "program".to_string(),
             session_id: "s1".to_string(),
@@ -1324,6 +1600,7 @@ mod tests {
 async fn action_evidence_validation_still_refuses_an_unmapped_logical_key() {
     let services = crate::RuntimeServices::in_memory().expect("runtime");
     let actor = AgentActorBinding {
+        original_execution: None,
         objective_id: "objective-1".into(),
         program_id: "program-1".into(),
         session_id: "session-1".into(),

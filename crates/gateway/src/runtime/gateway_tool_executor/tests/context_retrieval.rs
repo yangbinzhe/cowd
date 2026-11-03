@@ -247,6 +247,7 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
     }
     assert_eq!(restored, exact_content);
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("working-memory-pin"),
         session_id: Some("session-exact"),
@@ -255,6 +256,7 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
         reality_context: None,
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -832,6 +834,7 @@ async fn context_fact_directory_and_exact_evidence_use_runtime_data_lease_and_re
         matrix_snapshot_refs: vec![],
     };
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("fact-discovery"),
         session_id: Some("session-facts"),
@@ -840,6 +843,7 @@ async fn context_fact_directory_and_exact_evidence_use_runtime_data_lease_and_re
         reality_context: Some(&lease),
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -1096,6 +1100,7 @@ async fn context_matrix_directory_reads_complete_scoped_json_and_rejects_changed
         matrix_snapshot_refs: vec!["matrix:source_snapshot:allowed".into()],
     };
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("matrix-discovery"),
         session_id: Some("session-matrix"),
@@ -1104,6 +1109,7 @@ async fn context_matrix_directory_reads_complete_scoped_json_and_rejects_changed
         reality_context: Some(&lease),
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -1384,6 +1390,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor.bind_runtime_services(&services).unwrap();
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("session-discovery"),
         session_id: Some("session-000"),
@@ -1392,6 +1399,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         reality_context: None,
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -1584,4 +1592,5 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         .unwrap()
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .unwrap();
+
 }

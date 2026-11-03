@@ -620,3 +620,18 @@ pub struct AgenticArtifactProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_generation: Option<u64>,
 }
+
+/// Business generation from the exact Program owner registration. Physical
+/// node attempt and fence must be checked independently by the caller.
+pub(crate) fn registered_attempt_generation(
+    task: &AgenticTaskProjection,
+    scope: &harness_contract::agent::AgenticExecutionBinding,
+    execution_id: &str,
+    mode: harness_contract::agent_action::AgentAttemptMode,
+) -> Option<u64> {
+    task.active_attempts.get(execution_id).filter(|attempt| {
+        task.team_id == scope.task_team_id && attempt.execution_id == execution_id
+            && attempt.agent_id == scope.agent_id
+            && attempt.membership_id == scope.membership_id && attempt.mode == mode
+    }).map(|attempt| attempt.generation)
+}

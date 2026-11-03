@@ -632,12 +632,23 @@ impl std::fmt::Debug for TurnCancellationControl {
 impl TurnCancellationControl {
     /// Unbound helpers can stop work, but can never carry Requested evidence.
     pub fn operational(session_id: &str, turn_id: &str, execution_id: &str) -> Arc<Self> {
+        Self::operational_with_token(session_id, turn_id, execution_id, crate::CancellationToken::new())
+    }
+
+    /// Bind an unprivileged delegated turn to its existing physical run owner.
+    /// This control cannot authorize a Requested cancellation without ingress.
+    pub(crate) fn operational_with_token(
+        session_id: &str,
+        turn_id: &str,
+        execution_id: &str,
+        token: crate::CancellationToken,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session_id: session_id.into(),
             turn_id: turn_id.into(),
             execution_id: execution_id.into(),
             ingress: None,
-            token: crate::CancellationToken::new(),
+            token,
             first_cause: Mutex::new(TurnCancellationCause::None),
             step_wakeup: tokio::sync::Notify::new(),
         })
@@ -1685,6 +1696,199 @@ pub struct RuntimeServices {
 struct ActiveExecutionBus {
     generation: u64,
     bus: crate::CowdEventBus,
+    session_fence: Option<ActiveSessionFence>,
+}
+
+/// Original ingress-derived Session identity, created only by the active
+/// root execution lease after checking its original turn control.
+pub(crate) struct OriginalSessionClaim { ingress: crate::TurnIngressRef }
+impl std::fmt::Debug for OriginalSessionClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OriginalSessionClaim { .. }")
+    }
+}
+impl OriginalSessionClaim {
+    pub(crate) fn session_id(&self) -> &str { &self.ingress.session_id }
+    pub(crate) fn message_id(&self) -> &str { &self.ingress.message_id }
+    pub(crate) fn turn_id(&self) -> &str { &self.ingress.turn_id }
+    pub(crate) fn fence(&self) -> Result<session::SessionTerminalExecutionFence, String> {
+        Ok(session::SessionTerminalExecutionFence {
+            request_id: self.ingress.request_id.clone(),
+            input_sequence: usize::try_from(self.ingress.input_sequence).map_err(|_| "original input sequence overflow")?,
+            session_generation: self.ingress.session_generation,
+            claim_owner: self.ingress.claim_owner.clone(), claim_token: self.ingress.claim_token.clone(),
+            claim_fence_epoch: self.ingress.claim_revision,
+        })
+    }
+}
+
+
+#[derive(Clone)]
+pub(crate) struct ActiveSessionFence {
+    session_id: String,
+    turn_id: String,
+    fence: crate::SessionExecutionFence,
+    root_control: Arc<TurnCancellationControl>,
+    claim: Arc<OriginalSessionClaim>,
+    input: crate::SessionInputStream,
+    control_requested: Arc<crate::conversation::OriginalTurnInputControl>,
+    original_policy: crate::permissions::PermissionPolicy,
+    original_policy_owner: Option<Arc<crate::conversation::SharedPolicyOwner>>,
+}
+
+impl ActiveSessionFence {
+    pub(crate) fn for_lineage(&self, session_id: &str, turn_id: &str) -> Option<(crate::SessionExecutionFence, Arc<TurnCancellationControl>, Arc<OriginalSessionClaim>, crate::SessionInputStream, Arc<crate::conversation::OriginalTurnInputControl>)> {
+        (self.session_id == session_id && self.turn_id == turn_id)
+            .then(|| (self.fence.clone(), Arc::clone(&self.root_control), Arc::clone(&self.claim), self.input.clone(), Arc::clone(&self.control_requested)))
+    }
+
+    pub(crate) fn policy_owner_for_lineage(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        store: &Arc<crate::RuntimeEventStore>,
+    ) -> Option<Arc<crate::conversation::SharedPolicyOwner>> {
+        let owner = self.original_policy_owner.as_ref()?;
+        (self.session_id == session_id && self.turn_id == turn_id
+            && owner.matches_original_lineage(&self.claim, &self.original_policy.execution_policy_control(),
+                &self.control_requested, store)).then(|| Arc::clone(owner))
+    }
+}
+
+/// Original active turn owners used by a Program conclusion. These handles
+/// are taken from the active ingress registry, never reconstructed from a
+/// Program projection. The commit control is registered with both original
+/// cancellation paths and must be retained through the checked transaction.
+pub(crate) struct OriginalConclusionOwner {
+    pub(crate) claim: Arc<OriginalSessionClaim>,
+    pub(crate) input: crate::SessionInputStream,
+    pub(crate) control: Arc<crate::conversation::MemberCommitControl>,
+    policy: crate::permissions::PermissionPolicy,
+}
+
+/// Original live Session owner carried by the Synthesize outcome. Keep only
+/// its original store and policy-owner handles, not the Runtime service graph.
+pub(crate) struct OriginalTerminalCommitOwner {
+    store: std::sync::Weak<RuntimeEventStore>,
+    policy_controls: Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
+    admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
+    owner: OriginalConclusionOwner,
+    ticket: crate::execution_core::graph::NodeExecutionTicket,
+    terminal: Mutex<OriginalTerminalClosureState>,
+}
+
+#[derive(Default)]
+struct OriginalTerminalClosureState {
+    event: Option<crate::DurableRuntimeEvent>,
+    released: bool,
+}
+
+impl OriginalTerminalCommitOwner {
+    pub(crate) fn record_terminal(&self, ticket: &crate::execution_core::graph::NodeExecutionTicket, event: crate::DurableRuntimeEvent) -> Result<(), String> {
+        if self.ticket != *ticket { return Err("original terminal ticket differs".into()); }
+        let mut terminal = self.terminal.lock().map_err(|_| "original terminal owner poisoned")?;
+        if terminal.released { return Err("original terminal owner already released".into()); }
+        if terminal.event.as_ref().is_some_and(|old| old != &event) { return Err("original terminal event differs".into()); }
+        terminal.event = Some(event);
+        Ok(())
+    }
+
+    /// Called by the original runner only after the exact binding's callback,
+    /// driver return and physical-source witness have all completed.
+    pub(crate) fn release_after_original_physical_close(&self, ticket: &crate::execution_core::graph::NodeExecutionTicket) -> Result<(), String> {
+        if self.ticket != *ticket { return Err("original terminal release ticket differs".into()); }
+        let mut terminal = self.terminal.lock().map_err(|_| "original terminal owner poisoned")?;
+        if terminal.released { return Ok(()); }
+        let event = terminal.event.as_ref().ok_or("original authenticated terminal event unavailable")?.clone();
+        let store = self.store.upgrade().ok_or("original terminal store unavailable")?;
+        let metadata = event.payload.get("objective_verdict");
+        if let Some(metadata) = metadata {
+            let program_id = metadata["program_id"].as_str().ok_or("terminal Program identity missing")?;
+            let verdict = &metadata["verdict"];
+            let goal_id = verdict["goal_id"].as_str().ok_or("terminal Goal identity missing")?;
+            let authority = verdict["authority_revision"].as_u64().ok_or("terminal authority missing")?;
+            let a_cursor = metadata["a_commit_cursor"].as_u64().ok_or("terminal conclusion cursor missing")?;
+            let terminal_receipt = store.original_transaction_receipt(&event.transaction_id)
+                .map_err(|error| error.to_string())?.ok_or("terminal transaction receipt missing")?;
+            if terminal_receipt.commit_cursor != event.commit_cursor
+                || terminal_receipt.event_ids.get(event.transaction_index as usize) != Some(&event.event_id) {
+                return Err("terminal transaction event differs".into());
+            }
+            let program_stream = format!("agentic-program:{program_id}");
+            let conclusion = store.event_by_idempotency_key(&program_stream, &format!("program-conclusion:{authority}"))
+                .map_err(|error| error.to_string())?;
+            let fence = verdict["terminal_fence"].as_str().ok_or("terminal fence missing")?;
+            let bound = store.event_by_idempotency_key(&program_stream, &format!("agentic-objective-verdict:{fence}"))
+                .map_err(|error| error.to_string())?;
+            let original = match (conclusion, bound) {
+                (Some(first), Some(second)) if first == second => first,
+                (Some(first), None) | (None, Some(first)) => first,
+                (None, None) => return Err("original Program conclusion event missing".into()),
+                _ => return Err("original Program conclusion identities conflict".into()),
+            };
+            if original.kind != "agentic.objective_verdict_bound" || original.payload["program_id"] != program_id
+                || &original.payload["verdict"] != verdict || original.commit_cursor != a_cursor {
+                return Err("terminal Program conclusion differs".into());
+            }
+            let goal = GoalStore::new(Arc::clone(&store)).projection(goal_id)?
+                .ok_or("terminal Goal unavailable")?.goal;
+            let binding = goal.execution_binding.as_ref().ok_or("terminal Goal owner missing")?;
+            if binding.agentic_program_id != program_id || binding.root_execution_id != ticket.graph_id
+                || goal.revision != verdict["goal_revision"].as_u64().ok_or("terminal Goal revision missing")? {
+                return Err("terminal Goal binding differs".into());
+            }
+            match store.original_conclusion_proof_custody(&original.transaction_id, program_id, &goal)
+                .map_err(|error| error.to_string())? {
+                Some((proof, receipt)) => store.release_original_conclusion_proof(
+                    &original.transaction_id, &proof, &receipt, &original, &goal, &event,
+                ).map_err(|error| error.to_string())?,
+                None if goal.completion != harness_contract::goal::GoalCompletion::Satisfied => store.release_original_checked_terminal(&event).map_err(|error| error.to_string())?,
+                None => return Err("original conclusion proof custody unavailable".into()),
+            }
+        } else {
+            store.release_original_checked_terminal(&event).map_err(|error| error.to_string())?;
+        }
+        terminal.event = None;
+        terminal.released = true;
+        Ok(())
+    }
+
+    pub(crate) fn with_current<T>(&self, f: impl FnOnce(&crate::RuntimeOriginalSessionClaim<'_>, &Arc<crate::conversation::MemberCommitControl>) -> Result<T, String>) -> Result<T, String> {
+        let original = self.owner.policy.execution_policy_control();
+        with_original_session_policy_handles(&self.admission_blocks, &self.policy_controls, self.owner.claim.session_id(), &original, |_| {
+            let turn = harness_contract::turn::TurnId::from_string(self.owner.claim.turn_id());
+            if self.owner.input.active_turn_id().as_ref() != Some(&turn) { return Err("original terminal turn changed".into()); }
+            let fence = self.owner.claim.fence()?;
+            let cursor = self.owner.input.highest_consumed_cursor(&turn);
+            if self.owner.input.active_turn_id().as_ref() != Some(&turn) { return Err("original terminal turn changed while reading cursor".into()); }
+            let consumed_input_sequence = match cursor {
+                Some(cursor) if cursor.generation == fence.session_generation =>
+                    usize::try_from(cursor.sequence).map_err(|_| "terminal consumed cursor overflow")?.max(fence.input_sequence),
+                Some(_) => return Err("terminal consumed cursor generation mismatch".into()),
+                None => fence.input_sequence,
+            };
+            let claim = crate::RuntimeOriginalSessionClaim {
+                session_id: self.owner.claim.session_id(), ingress_message_id: self.owner.claim.message_id(),
+                turn_id: self.owner.claim.turn_id(), fence: &fence, consumed_input_sequence,
+            };
+            f(&claim, &self.owner.control)
+        })
+    }
+}
+
+/// Use the original shared policy-owner locks in the same order as admission.
+fn with_original_session_policy_handles<T>(
+    admission_blocks: &RwLock<BTreeMap<String, String>>,
+    policy_controls: &RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>,
+    session_id: &str, original: &crate::permissions::SessionExecutionPolicyControl,
+    f: impl FnOnce(&harness_contract::policy::SessionExecutionPolicy) -> Result<T, String>,
+) -> Result<T, String> {
+    let blocked = admission_blocks.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if blocked.contains_key(session_id) { return Err("Session policy admission is frozen".into()); }
+    let controls = policy_controls.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let current = controls.get(session_id).ok_or("original Session policy is unavailable")?;
+    if !current.same_owner(original) { return Err("original Session policy owner was replaced".into()); }
+    current.with_snapshot(f)
 }
 
 /// Process-local fail-fast single-flight for paid candidate evaluation. It
@@ -1734,6 +1938,57 @@ pub(crate) struct ActiveExecutionBusLease {
     buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
 }
 
+impl ActiveExecutionBusLease {
+    pub(crate) fn install_session_fence(
+        &self,
+        ingress: &crate::TurnIngressRef,
+        fence: crate::SessionExecutionFence,
+        root_control: Arc<TurnCancellationControl>,
+        input: crate::SessionInputStream,
+        control_requested: Arc<crate::conversation::OriginalTurnInputControl>,
+        original_policy: crate::permissions::PermissionPolicy,
+    ) -> Result<Arc<OriginalSessionClaim>, String> {
+        if root_control.ingress.as_ref() != Some(ingress)
+            || !root_control.matches_target(&ingress.session_id, &ingress.turn_id, &self.execution_id)
+        { return Err("original Session turn control does not match ingress".into()); }
+        if self.execution_id != crate::session_ingress_graph_id(
+            &ingress.session_id, &ingress.request_id, &ingress.turn_id,
+        ) {
+            return Err("Session ingress does not own the active execution bus".into());
+        }
+        let mut buses = self.buses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = buses.get_mut(&self.execution_id)
+            .filter(|active| active.generation == self.generation)
+            .ok_or_else(|| "Session execution bus binding is no longer current".to_string())?;
+        if active.session_fence.is_some() {
+            return Err("Session execution fence already installed".into());
+        }
+        let claim = Arc::new(OriginalSessionClaim { ingress: ingress.clone() });
+        claim.fence()?;
+        active.session_fence = Some(ActiveSessionFence {
+            session_id: ingress.session_id.clone(), turn_id: ingress.turn_id.clone(), fence, root_control,
+            claim: Arc::clone(&claim), input, control_requested, original_policy, original_policy_owner: None,
+        });
+        Ok(claim)
+    }
+
+    pub(crate) fn install_session_policy_owner(
+        &self,
+        owner: Arc<crate::conversation::SharedPolicyOwner>,
+    ) -> Result<(), String> {
+        let mut buses = self.buses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = buses.get_mut(&self.execution_id)
+            .filter(|active| active.generation == self.generation)
+            .and_then(|active| active.session_fence.as_mut())
+            .ok_or_else(|| "original Session execution owner is no longer current".to_string())?;
+        if owner.session_id() != active.session_id || active.original_policy_owner.is_some() {
+            return Err("original Session policy owner mismatch or already installed".into());
+        }
+        active.original_policy_owner = Some(owner);
+        Ok(())
+    }
+}
+
 impl Drop for ActiveExecutionBusLease {
     fn drop(&mut self) {
         self.bus.unbind_live_telemetry_observer(self.generation);
@@ -1748,6 +2003,39 @@ impl Drop for ActiveExecutionBusLease {
             buses.remove(&self.execution_id);
         }
     }
+}
+
+/// Read-only observation of the first targeted checked append, captured before
+/// the original reconciliation loop can retry. No observation grants authority.
+#[cfg(feature = "test-fixtures")]
+#[derive(Debug, Clone)]
+pub struct ConclusionAttemptObservation {
+    pub transaction_id: String,
+    pub outcome: ConclusionAttemptOutcome,
+    /// Point-in-time original transaction lookup after the attempt and before
+    /// retry. An error remains unknown; absence is not a future-state claim.
+    pub original_receipt: Result<Option<crate::AppendTransactionReceipt>, String>,
+    /// Individual intended events, read before a retry; callers must check
+    /// transaction identity on any existing event and treat errors as unknown.
+    pub events: Vec<ConclusionAttemptEvent>,
+}
+
+#[cfg(feature = "test-fixtures")]
+#[derive(Debug, Clone)]
+pub struct ConclusionAttemptEvent {
+    pub stream_id: String,
+    pub idempotency_key: Option<String>,
+    pub observed: Result<Option<crate::DurableRuntimeEvent>, String>,
+}
+
+#[cfg(feature = "test-fixtures")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConclusionAttemptOutcome {
+    Committed,
+    Cancelled,
+    Stale { stream_id: String, expected: u64, actual: u64 },
+    Conflict,
+    Error(String),
 }
 
 impl RuntimeServices {
@@ -2075,7 +2363,7 @@ impl RuntimeServices {
         )?;
         executor_registry.install_builtin_tool_batch(&tool_batch_executor)?;
         let process_input_verifier =
-            crate::agentic::review_evidence::ProcessInputVerifier::new(Arc::clone(&scope_locks));
+            crate::agentic::review_evidence::ProcessInputVerifier::with_workspace(Arc::clone(&scope_locks), workspace_root.clone());
         let session_query_port = Arc::new(OnceLock::new());
         let commit_service = ExecutionCommitService::with_hot_state(
             Arc::clone(&event_store),
@@ -2264,7 +2552,7 @@ impl RuntimeServices {
             graph_state_store.clone(),
             Arc::clone(&execution_supervisor),
             agentic_actions.clone(),
-            Arc::clone(&objective_supervisor),
+            Arc::clone(&agent_runtime),
         )?);
         let event_reactor = Arc::new(
             crate::RuntimeEventReactor::sealed(Arc::clone(&event_store), projection_lanes)
@@ -3388,6 +3676,16 @@ impl RuntimeServices {
         &self.event_store
     }
 
+    /// Test-only registration on this Runtime's original event store.
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_arm_original_goal_read(
+        &self, graph: String, call: String, goal_stream: String,
+        predicate: impl Fn(&RuntimeEventStore, &str, &str, u32) -> bool + Send + Sync + 'static,
+        action: impl FnOnce(&RuntimeEventStore, &str, &str, u32) + Send + 'static,
+    ) {
+        self.event_store.fixture_arm_original_goal_read(graph, call, goal_stream, predicate, action);
+    }
+
     /// Returns the single Agent-first collaboration mutation owner. The
     /// service is a cheap handle over the workspace event journal; callers do
     /// not receive direct event-store access.
@@ -3404,10 +3702,84 @@ impl RuntimeServices {
         program_id: &str,
     ) -> Result<Option<crate::AgenticProgramProjection>, String> {
         crate::agentic::supervision::reconcile_completion_request(
+            self,
             &self.agent_action_service(),
             self.objective_supervisor.as_ref(),
             program_id,
         )
+    }
+
+    /// Synchronously drive the original conclusion owner with a test-only
+    /// hook for exactly one Program transaction. The boolean is true only if
+    /// the original guarded commit point was reached on this same thread.
+    #[cfg(feature = "test-fixtures")]
+    pub fn reconcile_with_conclusion_append_hook_for_test(
+        &self, program_id: &str, transaction_id: &str,
+        hook: impl FnOnce(&crate::AppendTransactionRequest) + 'static,
+    ) -> (Result<Option<crate::AgenticProgramProjection>, String>, bool, Option<ConclusionAttemptObservation>) {
+        let prefix = format!("program-conclusion:{program_id}:");
+        if transaction_id.strip_prefix(&prefix).and_then(|revision| revision.parse::<u64>().ok()).is_none() {
+            return (Err("conclusion hook transaction does not match Program".into()), false, None);
+        }
+        crate::AgentActionService::with_targeted_conclusion_append_hook_for_test(
+            transaction_id.to_owned(), hook, || self.reconcile_agentic_completion_request(program_id),
+        )
+    }
+
+    /// Arm the existing original conclusion hook before the live owner reaches
+    /// its guarded commit. No authority is created by this fixture selector.
+    #[cfg(feature = "test-fixtures")]
+    pub fn fixture_arm_original_conclusion(
+        &self, program_id: String, goal_id: String,
+        hook: impl FnOnce(&crate::AppendTransactionRequest) + Send + 'static,
+        observe: impl FnOnce(bool, Option<ConclusionAttemptObservation>) + Send + 'static,
+    ) -> Result<(), String> {
+        self.event_store.fixture_arm_original_conclusion(program_id, goal_id, hook, observe)
+    }
+
+    /// Resolve an actor from the request's physical attempt and its original
+    /// graph-start ticket. The caller must also fence publication on the graph.
+    pub async fn resolve_agent_action_actor_for_attempt(
+        &self,
+        parent: &harness_contract::execution_graph::ExecutionParentBinding,
+        attempt: u32,
+        trusted_root: Option<harness_contract::agent_action::AgentActorBinding>,
+    ) -> Result<harness_contract::agent_action::AgentActorBinding, String> {
+        use harness_contract::execution_graph::ExecutionNodeStatus;
+        if attempt == 0 {
+            return Err("agent_actor_attempt_missing".into());
+        }
+        let graph = self.graph_state_store.load_async(&parent.execution_id).await
+            .map_err(|e| format!("agent_actor_graph_load_failed:{e}"))?;
+        if graph.id != parent.execution_id
+            || graph.node_statuses.get(&parent.node_id) != Some(&ExecutionNodeStatus::Running)
+            || graph.recovery_cursor.node_attempts.get(&parent.node_id) != Some(&attempt)
+        {
+            return Err("agent_actor_attempt_not_running".into());
+        }
+        let binding = self.graph_state_store.current_binding(&graph, &parent.node_id, attempt)
+            .map_err(|e| format!("agent_actor_original_binding_invalid:{e}"))?;
+        let (ticket, original_node) = self.graph_state_store
+            .binding_start_ticket(&graph, &parent.node_id, &binding)
+            .map_err(|e| format!("agent_actor_original_ticket_invalid:{e}"))?;
+        let start = crate::execution_core::graph::validate_node_ticket_start(
+            &self.event_store, &ticket, None,
+        ).map_err(|e| format!("agent_actor_original_start_invalid:{e}"))?;
+        if ticket.graph_id != parent.execution_id || ticket.node_id != parent.node_id
+            || ticket.attempt != attempt
+            || start.nodes.iter().find(|n| n.id == parent.node_id) != Some(&original_node)
+            || graph.nodes.iter().find(|n| n.id == parent.node_id) != Some(&original_node)
+        {
+            return Err("agent_actor_original_ticket_mismatch".into());
+        }
+        let mut actor = self.resolve_agent_action_actor(parent, trusted_root).await?;
+        if actor.original_execution.is_some() {
+            return Err("agent_actor_unexpected_original_execution".into());
+        }
+        actor.original_execution = Some(harness_contract::agent_action::OriginalAgentExecution {
+            graph_id: parent.execution_id.clone(), node_id: parent.node_id.clone(), attempt,
+        });
+        Ok(actor)
     }
 
     /// Resolve a delegated model's immutable Agent-first identity from the
@@ -3418,6 +3790,9 @@ impl RuntimeServices {
         parent: &harness_contract::execution_graph::ExecutionParentBinding,
         trusted_root: Option<harness_contract::agent_action::AgentActorBinding>,
     ) -> Result<harness_contract::agent_action::AgentActorBinding, String> {
+        if trusted_root.as_ref().is_some_and(|root| root.original_execution.is_some()) {
+            return Err("agent_actor_untrusted_original_execution".into());
+        }
         let graph = self
             .graph_state_store
             .load_async(&parent.execution_id)
@@ -3641,6 +4016,7 @@ impl RuntimeServices {
             return Err("agent_actor_display_identity_mismatch".to_string());
         }
         return Ok(harness_contract::agent_action::AgentActorBinding {
+            original_execution: None,
             objective_id: projection.objective_id,
             program_id: program_id.to_string(),
             session_id: projection.session_id,
@@ -3699,6 +4075,7 @@ impl RuntimeServices {
             ActiveExecutionBus {
                 generation,
                 bus: bus.clone(),
+                session_fence: None,
             },
         );
         drop(buses);
@@ -3730,6 +4107,13 @@ impl RuntimeServices {
         &self,
         execution_id: &str,
     ) -> Option<(String, crate::CowdEventBus)> {
+        self.resolve_active_execution_bus_with_fence(execution_id)
+            .map(|(id, bus, _)| (id, bus))
+    }
+
+    pub(crate) fn resolve_active_execution_bus_with_fence(
+        &self, execution_id: &str,
+    ) -> Option<(String, crate::CowdEventBus, Option<ActiveSessionFence>)> {
         const MAX_LINEAGE_DEPTH: usize = 32;
         let mut candidate = execution_id.to_string();
         let mut visited = std::collections::BTreeSet::new();
@@ -3737,8 +4121,11 @@ impl RuntimeServices {
             if !visited.insert(candidate.clone()) {
                 return None;
             }
-            if let Some(bus) = self.active_execution_bus(&candidate) {
-                return Some((candidate, bus));
+            let active = self.active_execution_buses.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&candidate).cloned();
+            if let Some(active) = active {
+                return Some((candidate, active.bus, active.session_fence));
             }
             candidate = self
                 .graph_state_store
@@ -3748,6 +4135,141 @@ impl RuntimeServices {
                 .execution_id;
         }
         None
+    }
+
+    pub(crate) fn commit_owned_program_conclusion(
+        &self, program: &crate::AgenticProgramProjection,
+        prepared: crate::execution_core::goal::PreparedProgramConclusion,
+    ) -> Result<crate::AgenticProgramProjection, crate::AgentActionServiceError> {
+        let actions = self.agent_action_service();
+        if program.completion_request.is_some()
+            && actions.authenticated_existing_request_conclusion(program)?
+        { return actions.project(&program.program_id); }
+        let owner = self.original_conclusion_owner(program)
+            .ok_or_else(|| crate::AgentActionServiceError::EventStore("original active Session conclusion owner unavailable".into()))?;
+        self.with_conclusion_policy(&owner, |_| {
+            let turn = harness_contract::turn::TurnId::from_string(owner.claim.turn_id());
+            if owner.input.active_turn_id().as_ref() != Some(&turn) {
+                return Err("original Session active turn changed".into());
+            }
+            let fence = owner.claim.fence()?;
+            let cursor = owner.input.highest_consumed_cursor(&turn);
+            if owner.input.active_turn_id().as_ref() != Some(&turn) {
+                return Err("original Session active turn changed while reading cursor".into());
+            }
+            let consumed = match cursor {
+                Some(cursor) if cursor.generation == fence.session_generation =>
+                    usize::try_from(cursor.sequence).map_err(|_| "original consumed input sequence overflow")?.max(fence.input_sequence),
+                Some(_) => return Err("original consumed cursor generation mismatch".into()),
+                None => fence.input_sequence,
+            };
+            #[cfg(feature = "test-fixtures")]
+            if prepared.goal.completion == harness_contract::goal::GoalCompletion::Satisfied {
+                if let Some(request) = program.completion_request.as_ref() {
+                    if let Some(probe) = self.event_store.fixture_take_original_conclusion(&program.program_id, &prepared.goal.id)? {
+                        let transaction_id = format!("program-conclusion:{}:{}", program.program_id, request.program_revision);
+                        let (result, reached, observation) = crate::AgentActionService::with_targeted_conclusion_append_hook_for_test(
+                            transaction_id, probe.hook,
+                            || actions.commit_program_conclusion_guarded(program, prepared, &owner, consumed));
+                        (probe.observe)(reached, observation);
+                        return Ok(result);
+                    }
+                }
+            }
+            Ok(actions.commit_program_conclusion_guarded(program, prepared, &owner, consumed))
+        }).map_err(crate::AgentActionServiceError::EventStore)?
+    }
+
+    pub(crate) fn original_terminal_owner(self: &Arc<Self>, ticket: &crate::execution_core::graph::NodeExecutionTicket, session: &str, turn: &str) -> Option<Arc<OriginalTerminalCommitOwner>> {
+        let (_, _, active) = self.resolve_active_execution_bus_with_fence(&ticket.graph_id)?;
+        let active = active?;
+        let (_, root_control, claim, input, requested) = active.for_lineage(session, turn)?;
+        if claim.session_id() != session || claim.turn_id() != turn { return None; }
+        let control = root_control.token().member_commit_control();
+        requested.register(&control);
+        let owner = OriginalConclusionOwner { claim, input, control, policy: active.original_policy.clone() };
+        Some(Arc::new(OriginalTerminalCommitOwner {
+            store: Arc::downgrade(&self.event_store),
+            policy_controls: Arc::clone(&self.session_execution_policy_controls),
+            admission_blocks: Arc::clone(&self.session_execution_policy_admission_blocks),
+            owner, ticket: ticket.clone(), terminal: Mutex::new(OriginalTerminalClosureState::default()),
+        }))
+    }
+
+    /// Borrow the active ingress's original policy, input and cancellation
+    /// control for the synchronous bounded decision transaction. No serialized
+    /// request or event can construct this owner.
+    pub(crate) fn with_original_bounded_decision<T>(
+        &self, ticket: &crate::execution_core::graph::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest,
+        stop: Option<&crate::bound_tool_batch::BoundToolStop>,
+        parent_stop: Option<&crate::bound_tool_batch::BoundToolStop>,
+        observation: &crate::execution_core::graph::executors::agent_tool::NoDispatchObservation,
+        f: impl FnOnce(&crate::RuntimeOriginalSessionClaim<'_>, &Arc<crate::conversation::MemberCommitControl>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let step = request.step_binding.as_ref().ok_or("bounded decision original Step unavailable")?;
+        let session = request.session_id.as_deref().ok_or("bounded decision original Session unavailable")?;
+        let turn = &step.snapshot.identity.turn_id;
+        if step.snapshot.identity.session_id != session || step.origin.call_id != request.tool_use_id {
+            return Err("bounded decision original Step differs".into());
+        }
+        let (_, _, active) = self.resolve_active_execution_bus_with_fence(&ticket.graph_id)
+            .ok_or("bounded decision active execution unavailable")?;
+        let active = active.ok_or("bounded decision active Session fence unavailable")?;
+        let policy_owner = active.policy_owner_for_lineage(session, turn, &self.event_store)
+            .ok_or("bounded decision original policy owner unavailable")?;
+        let (_, root_control, claim, input, requested) = active.for_lineage(session, turn)
+            .ok_or("bounded decision original Session turn differs")?;
+        let control = root_control.token().member_commit_control();
+        observation.register_bounded_control(ticket, &control)?;
+        requested.register(&control);
+        if let Some(stop) = stop { stop.register_commit_control(&control); }
+        if let Some(stop) = parent_stop { stop.register_commit_control(&control); }
+        let policy = policy_owner.original_policy_control();
+        self.with_original_session_policy(session, &policy, |snapshot| {
+            if snapshot.revision != request.policy_revision { return Err("bounded decision policy revision changed".into()); }
+            let turn_id = harness_contract::turn::TurnId::from_string(turn);
+            if input.active_turn_id().as_ref() != Some(&turn_id) { return Err("bounded decision original turn changed".into()); }
+            let fence = claim.fence()?;
+            let cursor = input.highest_consumed_cursor(&turn_id);
+            if input.active_turn_id().as_ref() != Some(&turn_id) { return Err("bounded decision original turn changed while reading cursor".into()); }
+            let consumed_input_sequence = match cursor {
+                Some(cursor) if cursor.generation == fence.session_generation => usize::try_from(cursor.sequence)
+                    .map_err(|_| "bounded decision consumed cursor overflow")?.max(fence.input_sequence),
+                Some(_) => return Err("bounded decision consumed cursor generation differs".into()),
+                None => fence.input_sequence,
+            };
+            let claim = crate::RuntimeOriginalSessionClaim { session_id:claim.session_id(), ingress_message_id:claim.message_id(),
+                turn_id:claim.turn_id(), fence:&fence, consumed_input_sequence };
+            f(&claim, &control)
+        })
+    }
+
+    /// Resolve the registered ingress owner for this exact Program lineage.
+    /// Missing or displaced ingress is not permission to write a conclusion.
+    pub(crate) fn original_conclusion_owner(
+        &self, program: &crate::AgenticProgramProjection,
+    ) -> Option<OriginalConclusionOwner> {
+        let execution_id = program.root_execution_id.as_deref()?;
+        let (_, _, active) = self.resolve_active_execution_bus_with_fence(execution_id)?;
+        let active = active?;
+        let (_, root_control, claim, input, requested) =
+            active.for_lineage(&program.session_id, &program.turn_id)?;
+        if claim.session_id() != program.session_id || claim.turn_id() != program.turn_id {
+            return None;
+        }
+        let control = root_control.token().member_commit_control();
+        requested.register(&control);
+        Some(OriginalConclusionOwner { claim, input, control, policy: active.original_policy.clone() })
+    }
+
+    pub(crate) fn with_conclusion_policy<T>(
+        &self, owner: &OriginalConclusionOwner,
+        f: impl FnOnce(&crate::permissions::PermissionPolicy) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_original_session_policy(owner.claim.session_id(), &owner.policy.execution_policy_control(), |snapshot| {
+            f(&owner.policy.bound_to_snapshot(snapshot))
+        })
     }
 
     /// Read-only durable event projection for Gateway and Surface consumers.
@@ -5403,6 +5925,19 @@ impl RuntimeServices {
             .cloned()
     }
 
+    /// Pin the original published policy owner and its live revision for a
+    /// synchronous caller. This does not authenticate durable Session claim
+    /// or replace the original transaction's checked source contract.
+    pub(crate) fn with_original_session_policy<T>(
+        &self, session_id: &str, original: &crate::permissions::SessionExecutionPolicyControl,
+        f: impl FnOnce(&harness_contract::policy::SessionExecutionPolicy) -> Result<T, String>,
+    ) -> Result<T, String> {
+        with_original_session_policy_handles(
+            &self.session_execution_policy_admission_blocks,
+            &self.session_execution_policy_controls, session_id, original, f,
+        )
+    }
+
     pub(crate) fn session_execution_policy_controls_handle(
         &self,
     ) -> Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>> {
@@ -6329,7 +6864,7 @@ fn agentic_program_wait_resolution_lane(
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
     actions: crate::AgentActionService,
-    objective_supervisor: Arc<ObjectiveSupervisor>,
+    agent_runtime: Arc<AgentRuntime>,
 ) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
     let descriptor = crate::RuntimeProjectionDescriptor::new(
         AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID,
@@ -6341,6 +6876,10 @@ fn agentic_program_wait_resolution_lane(
             crate::RuntimeProjectionEventInterest::new(
                 RuntimeEventScope::Program,
                 "agentic.objective_verdict_bound",
+            ),
+            crate::RuntimeProjectionEventInterest::new(
+                RuntimeEventScope::Program,
+                "agentic.completion_rejected",
             ),
         ]),
         256,
@@ -6354,8 +6893,9 @@ fn agentic_program_wait_resolution_lane(
             let graph_store = graph_store.clone();
             let supervisor = Arc::clone(&supervisor);
             let actions = actions.clone();
-            let objective_supervisor = Arc::clone(&objective_supervisor);
+            let agent_runtime = Arc::clone(&agent_runtime);
             Box::pin(async move {
+                let services = agent_runtime.services().ok_or("Program reconciliation lane has no bound RuntimeServices")?;
                 let checkpoint = event_store
                     .projection_checkpoint(AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID)
                     .map_err(|error| error.to_string())?;
@@ -6370,6 +6910,10 @@ fn agentic_program_wait_resolution_lane(
                     crate::RuntimeProjectionEventInterest::new(
                         RuntimeEventScope::Program,
                         "agentic.objective_verdict_bound",
+                    ),
+                    crate::RuntimeProjectionEventInterest::new(
+                        RuntimeEventScope::Program,
+                        "agentic.completion_rejected",
                     ),
                 ]);
                 let page = event_store
@@ -6410,11 +6954,7 @@ fn agentic_program_wait_resolution_lane(
                     if actions.program_recovery_is_excluded(program_id)? {
                         continue;
                     }
-                    crate::agentic::supervision::reconcile_completion_request(
-                        &actions,
-                        &objective_supervisor,
-                        program_id,
-                    )?;
+                    services.reconcile_agentic_completion_request(program_id)?;
                     resolved = resolved.saturating_add(
                         crate::execution_core::graph::executors::resolve_agentic_program_wait(
                             program_id,
@@ -6507,7 +7047,40 @@ fn settled_record_graph_result(
     }
 }
 
-fn agentic_settled_graph_resolution_lane(
+// A rejection can be consumed while a child is still active. Revisit the
+// original supervisor when that graph changes, before the existing barrier
+// resolver advances its checkpoint; otherwise the final work-cut may never be
+// assessed after the rejection event has already been checkpointed.
+pub(crate) async fn reconcile_rejections_for_settled_graph(
+    graph_id: &str,
+    services: &RuntimeServices,
+    actions: &crate::AgentActionService,
+    graph_store: &ExecutionGraphStateStore,
+) -> Result<(), String> {
+    let graph = match graph_store.load_current_async(graph_id.to_string()).await {
+        Ok(graph) => graph,
+        Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut program_ids = crate::execution_core::graph::executors::agentic_program_ids(&graph)
+        .into_iter().collect::<BTreeSet<_>>();
+    if let Some(binding) = services.goal_store().get(&format!("goal:{graph_id}"))?
+        .and_then(|goal| goal.execution_binding)
+    {
+        program_ids.insert(binding.agentic_program_id);
+    }
+    for program_id in program_ids {
+        if actions.program_recovery_is_excluded(&program_id)? {
+            continue;
+        }
+        if actions.project_if_exists(&program_id).map_err(|error| error.to_string())?.is_some() {
+            services.reconcile_agentic_completion_request(&program_id)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn agentic_settled_graph_resolution_lane(
     event_store: Arc<RuntimeEventStore>,
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
@@ -6594,7 +7167,7 @@ fn agentic_settled_graph_resolution_lane(
                             "session.cancellation_committed" => event.payload.get("execution_id"),
                             "runtime.strategy.outcome" => event.payload.get("execution_graph_ref"),
                             "runtime.outcome.recorded.v1" => event.payload.pointer("/identity/execution_graph_ref"),
-                            "goal.created" | "goal.completed" => event.payload.pointer("/goal/execution_binding/root_execution_id"),
+                            "goal.created" | "goal.revised" | "goal.completed" => event.payload.pointer("/goal/execution_binding/root_execution_id"),
                             _ => None,
                         };
                         if let Some(graph_id) = terminal_graph.and_then(serde_json::Value::as_str) {
@@ -6646,6 +7219,11 @@ fn agentic_settled_graph_resolution_lane(
                     {
                         graph_errors.push(error);
                     }
+                    if let Err(error) = reconcile_rejections_for_settled_graph(
+                        graph_id, services.as_ref(), &actions, &graph_store,
+                    ).await {
+                        graph_errors.push(error);
+                    }
                     if let Err(error) = crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                         graph_id, &actions, &graph_store, supervisor.as_ref(),
                     ).await {
@@ -6654,6 +7232,11 @@ fn agentic_settled_graph_resolution_lane(
                     match graph_store.child_links(graph_id) {
                         Ok(links) => {
                             for link in links {
+                                if let Err(error) = reconcile_rejections_for_settled_graph(
+                                    &link.child_execution_id, services.as_ref(), &actions, &graph_store,
+                                ).await {
+                                    graph_errors.push(format!("child {}: {error}", link.child_execution_id));
+                                }
                                 if let Err(error) = crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                                 &link.child_execution_id, &actions, &graph_store, supervisor.as_ref(),
                             ).await {
@@ -7029,6 +7612,7 @@ mod exact_exit_lane_tests {
                     action_id: format!("1145:{id}:{suffix}"),
                     action,
                     actor: harness_contract::agent_action::AgentActorBinding {
+                        original_execution: None,
                         objective_id: String::new(),
                         program_id: String::new(),
                         session_id: "session-1145-directory".into(),
@@ -8149,6 +8733,24 @@ pub(crate) mod requested_cancellation_source_tests {
             error,
             "original Requested cancellation control was released"
         );
+    }
+
+    #[test]
+    fn delegated_control_shares_owner_token_but_not_sibling_or_step_stop() {
+        let owner = crate::CancellationToken::new();
+        let sibling = crate::CancellationToken::new();
+        let control = TurnCancellationControl::operational_with_token(
+            "child-session", "child-turn", "child-execution", owner.clone(),
+        );
+        let sibling_control = TurnCancellationControl::operational_with_token(
+            "child-session", "other-turn", "other-execution", sibling.clone(),
+        );
+        control.notify_step_stop();
+        assert!(!control.is_cancelled());
+        owner.cancel();
+        assert!(control.is_cancelled());
+        assert!(!sibling_control.is_cancelled());
+        assert!(control.requested_source().is_none());
     }
 
     #[tokio::test]

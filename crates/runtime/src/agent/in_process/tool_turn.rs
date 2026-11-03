@@ -206,19 +206,25 @@ pub(super) fn agentic_task_protocol_pending(
     let task = projection.tasks.get(task_id).ok_or_else(|| {
         format!("Agent-first recovery Program `{program_id}` has no Task `{task_id}`")
     })?;
+    let business_generation = crate::agentic::registered_attempt_generation(
+        task, agentic, packet.graph_id(),
+        if mode == "review" { harness_contract::agent_action::AgentAttemptMode::Review }
+        else { harness_contract::agent_action::AgentAttemptMode::Execute },
+    );
     match mode {
         "execute" => Ok((matches!(
             task.status,
             crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Rework
         ) && task.claimant.is_none()
-            && task.claim_execution_id.is_none())
+            && task.claim_execution_id.is_none()
+            && business_generation == Some(task.claim_generation))
             || (task.status == crate::AgenticTaskStatus::Claimed
                 && task.claimant.as_deref() == Some(agent_id)
                 && task.claim_execution_id.as_deref() == Some(packet.graph_id())
-                && task.claim_generation == u64::from(packet.attempt))),
+                && business_generation.and_then(|generation| generation.checked_add(1)) == Some(task.claim_generation))),
         "review" => Ok(task.status == crate::AgenticTaskStatus::Submitted
             && task.claimant.as_deref() != Some(agent_id)
-            && task.review_generation.saturating_add(1) == u64::from(packet.attempt)),
+            && business_generation == Some(task.review_generation)),
         _ => Err(format!(
             "Agent-first recovery packet has unsupported attempt mode `{mode}`"
         )),
@@ -514,7 +520,115 @@ pub(super) fn agent_autonomy_checkpoint(
     }))
 }
 
+/// Private result of the original Agent packet ceiling evaluation.
+/// This is not a committed refusal or permission to dispatch.
+#[derive(Debug)]
+pub(crate) struct OriginalPacketScopeDenial {
+    request: crate::RuntimeToolExecutionRequest,
+    scopes: Vec<String>,
+    workspace_root: std::path::PathBuf,
+    violation: String,
+    store: std::sync::Weak<crate::runtime_event_store::RuntimeEventStore>,
+}
+impl OriginalPacketScopeDenial {
+    pub(crate) fn request(&self) -> &crate::RuntimeToolExecutionRequest { &self.request }
+    pub(crate) fn scopes(&self) -> &[String] { &self.scopes }
+    pub(crate) fn workspace_root(&self) -> &std::path::Path { &self.workspace_root }
+    pub(crate) fn violation(&self) -> &str { &self.violation }
+    pub(crate) fn belongs_to(&self, store: &std::sync::Arc<crate::runtime_event_store::RuntimeEventStore>) -> bool {
+        self.store.upgrade().is_some_and(|original| std::sync::Arc::ptr_eq(&original, store))
+    }
+}
+
 impl ScopedRuntimeToolExecutor {
+    fn bind_original_bounded_request(
+        &self,
+        request: &mut crate::RuntimeToolExecutionRequest,
+    ) -> Result<(), ToolError> {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        let trace_request = (request.parent_execution.as_ref().map(|p| p.execution_id.chars().take(64).collect::<String>()),
+            request.parent_execution.as_ref().map(|p| p.node_id.chars().take(64).collect::<String>()),
+            request.parent_execution_attempt, request.tool_use_id.chars().take(64).collect::<String>());
+        #[cfg(any(test, feature = "test-fixtures"))]
+        let trace = |stage: &'static str| {
+            if std::env::var_os("COWD_R622_TRACE").is_some() {
+                crate::execution_core::graph::k05_trace_emit(format!(
+                    "r622_toolbatch phase=bounded_request_binding parent_graph={:?} parent_node={:?} parent_attempt={:?} call={:?} stage={}",
+                    trace_request.0, trace_request.1, trace_request.2, trace_request.3, stage));
+            }
+        };
+        if !self.allowed_tools.contains(&request.tool_name)
+            || request.session_id.as_deref() != Some(self.session_id.as_str())
+            || request.policy_revision != self.policy_revision
+            || request.sandbox_posture != self.sandbox_posture
+            || request.parent_execution.as_ref().is_none_or(|parent|
+                parent.execution_id != self.execution_id || parent.node_id != self.node_id)
+            || request.parent_execution_attempt != Some(self.attempt)
+        {
+            #[cfg(any(test, feature = "test-fixtures"))] trace("packet_identity"); return Err(ToolError::new("bounded process does not match the original Agent packet"));
+        }
+        let binding = request.step_binding.as_ref()
+            .ok_or_else(|| { #[cfg(any(test, feature = "test-fixtures"))] trace("step_missing"); ToolError::new("bounded process original Step missing") })?;
+        let step = binding.resolve(self.host.pin_step_catalog())
+            .map_err(|error| { #[cfg(any(test, feature = "test-fixtures"))] trace("step_resolve"); ToolError::new(error.to_string()) })?;
+        step.validate_call(&binding.origin, &self.session_id, &request.tool_use_id,
+            &request.tool_name, &request.input, chrono::Utc::now().timestamp_millis())
+            .map_err(|error| { #[cfg(any(test, feature = "test-fixtures"))] trace("step_validate"); ToolError::new(error.to_string()) })?;
+        let input = harness_contract::step::parse_strict_json(&request.input)
+            .map_err(|error| { #[cfg(any(test, feature = "test-fixtures"))] trace("input_parse"); ToolError::new(error.to_string()) })?;
+        let effect = step.lease().describe_effect(&request.tool_name, &input);
+        if !tools::tool_orchestrator::effect_is_bounded_read_only_compute(&effect)
+            || request.compiled_invocation.as_ref().is_none_or(|invocation| invocation.effect != effect)
+        {
+            #[cfg(any(test, feature = "test-fixtures"))] trace("step_effect"); return Err(ToolError::new("bounded process differs from its original Step effect"));
+        }
+        if self.host.delegated_tool_effect_descriptor(&request.tool_name, &input).as_ref() != Some(&effect) {
+            #[cfg(any(test, feature = "test-fixtures"))] trace("host_effect"); return Err(ToolError::new("bounded process host effect differs from original Step"));
+        }
+        let normalized = normalize_delegated_resource_paths(&request.tool_name, &request.input,
+            &self.workspace_root, &self.path_identity_resolver, self.resource_scopes.as_deref()).map_err(|error| { #[cfg(any(test, feature = "test-fixtures"))] trace("normalize"); error })?;
+        if harness_contract::step::parse_strict_json(&normalized)
+            .map_err(|error| { #[cfg(any(test, feature = "test-fixtures"))] trace("normalized_parse"); ToolError::new(error.to_string()) })? != input {
+            #[cfg(any(test, feature = "test-fixtures"))] trace("normalized_mismatch"); return Err(ToolError::new("bounded process normalized input requires replan"));
+        }
+        if let Some(scopes) = self.resource_scopes.as_deref() {
+            self.enforce_original_effect_ceiling(&request.tool_name, &input, &effect, scopes).map_err(|error| {
+                #[cfg(any(test, feature = "test-fixtures"))] trace("scope_ceiling");
+                if error.is_unknown() { return error; }
+                let Some(original) = self.commit_service.as_ref() else { return error; };
+                let fact = OriginalPacketScopeDenial { request: request.clone(), scopes: scopes.to_vec(),
+                    workspace_root: self.workspace_root.clone(), violation: error.to_string(),
+                    store: original.original_store_weak() };
+                error.with_original_packet_scope_denial(std::sync::Arc::new(fact))
+            })?;
+        }
+        if let Some(authorization) = &request.authorization {
+            step.lease().validate_authorization(authorization, &request.tool_name, &input)
+                .map_err(|error| { #[cfg(any(test, feature = "test-fixtures"))] trace("authorization"); ToolError::new(error.to_string()) })?;
+        }
+        request.authorized_scopes = self.authorized_scopes_for_tool();
+        request.memory_context = Some(self.memory_context.clone());
+        request.reality_context = self.reality_context.clone();
+        request.model_lease = Some(self.model_lease.clone());
+        request.managed_invocation = self.managed_invocation.clone();
+        request.evaluation_isolated = self.evaluation_isolated();
+        Ok(())
+    }
+
+    fn check_original_bounded_request(&self, request: &crate::RuntimeToolExecutionRequest)
+        -> Result<(), ToolError> {
+        if request.authorization.is_none() {
+            return Err(ToolError::new("bounded process original authorization missing"));
+        }
+        let mut rebound = request.clone();
+        self.bind_original_bounded_request(&mut rebound)?;
+        if serde_json::to_value(&rebound).map_err(|error| ToolError::new(error.to_string()))?
+            != serde_json::to_value(request).map_err(|error| ToolError::new(error.to_string()))? {
+            return Err(ToolError::new("bounded process original packet context changed"));
+        }
+        Ok(())
+    }
+
     fn project_search_output(
         &self,
         lease: &tools::ToolHostLease,
@@ -566,6 +680,28 @@ impl ScopedRuntimeToolExecutor {
 
 #[async_trait::async_trait]
 impl ToolExecutor for ScopedRuntimeToolExecutor {
+    fn bind_bounded_process_request(&self, request: &mut crate::RuntimeToolExecutionRequest)
+        -> Result<(), ToolError> {
+        self.bind_original_bounded_request(request)
+    }
+
+    fn bounded_process_authority(&self, request: &crate::RuntimeToolExecutionRequest)
+        -> Result<crate::tool_host::BoundedProcessAuthority, ToolError> {
+        self.check_original_bounded_request(request)?;
+        self.host.bounded_process_authority(request)
+    }
+
+    fn bounded_process_lease(&self, request: &crate::RuntimeToolExecutionRequest)
+        -> Result<tools::ToolHostLease, ToolError> {
+        self.check_original_bounded_request(request)?;
+        self.host.bounded_process_lease(request)
+    }
+
+    fn bounded_process_plane(&self) -> Option<Arc<crate::ToolExecutionPlane>> {
+        self.host.bounded_process_plane().filter(|plane|
+            Arc::ptr_eq(plane.scope_locks(), &self.scope_locks))
+    }
+
     fn durable_tool_effect_parent(
         &self,
     ) -> Option<(
@@ -670,93 +806,6 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         receipt.descriptors = descriptors;
         receipt.query = "delegated-agent".into();
         receipt
-    }
-
-    async fn recover_step_tool_receipt(
-        &self,
-        call: &crate::conversation::ModelToolCall,
-    ) -> Result<
-        Option<(
-            harness_contract::tool::GovernedToolInvocation,
-            crate::RuntimeToolExecutionOutcome,
-            u64,
-        )>,
-        ToolError,
-    > {
-        let Some((binding, commit)) = call.binding.as_ref().zip(self.commit_service.as_ref())
-        else {
-            return Ok(None);
-        };
-        if call.name != "tool_search" && !self.allowed_tools.contains(&call.name) {
-            return Err(ToolError::new(
-                "receipt tool is outside the bound Agent allow-list",
-            ));
-        }
-        harness_contract::step::parse_strict_json(&call.input)
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        let input = normalize_delegated_resource_paths(
-            &call.name,
-            &call.input,
-            &self.workspace_root,
-            &self.path_identity_resolver,
-            self.resource_scopes.as_deref(),
-        )?;
-        let parent = harness_contract::execution_graph::ExecutionParentBinding {
-            execution_id: self.execution_id.clone(),
-            node_id: self.node_id.clone(),
-        };
-        let idempotency_key = binding.effect_idempotency_key();
-        let query = crate::execution_core::graph::ToolReceiptQuery {
-            step_binding: binding,
-            parent_execution: &parent,
-            session_id: &self.session_id,
-            policy_revision: self.policy_revision,
-            idempotency_key: &idempotency_key,
-            tool_use_id: &call.id,
-            tool_name: &call.name,
-            input: &input,
-        };
-        let Some(replay) = commit
-            .query_completed_agent_tool_effect(&query)
-            .map_err(|error| ToolError::new(error.to_string()))?
-        else {
-            return Ok(None);
-        };
-        if let Some(scopes) = &self.resource_scopes {
-            let mut accesses = crate::tool_host::effect_file_accesses(&replay.invocation.effect);
-            if replay.invocation.effect.effect_kind
-                == harness_contract::tool::ToolEffectKind::Unknown
-            {
-                accesses.push((".".into(), false));
-            }
-            for (path, _) in &accesses {
-                if !resource_path_is_authorized(&self.path_identity_resolver, path, scopes, false) {
-                    return Err(ToolError::new(
-                        "receipt read is outside the bound Agent resource lease",
-                    ));
-                }
-            }
-        }
-        let mut outcome = replay.outcome;
-        if call.name == "tool_search" {
-            let body = outcome
-                .output
-                .as_deref()
-                .ok_or_else(|| ToolError::new("retained search receipt has no output"))?;
-            let mut receipt: serde_json::Value = serde_json::from_str(body).map_err(|error| {
-                ToolError::new(format!("invalid retained search receipt: {error}"))
-            })?;
-            let object = receipt
-                .as_object_mut()
-                .ok_or_else(|| ToolError::new("retained search receipt is not an object"))?;
-            object.insert("activation_candidates".into(), serde_json::json!([]));
-            object.insert("provenance".into(), serde_json::json!("retained_replay"));
-            outcome.output = Some(
-                serde_json::to_string(&receipt)
-                    .map_err(|error| ToolError::new(error.to_string()))?,
-            );
-        }
-        Ok(Some((replay.invocation, outcome, replay.completed_at_ms)))
     }
 
     async fn execute_output(

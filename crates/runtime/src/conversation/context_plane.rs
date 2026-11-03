@@ -613,6 +613,9 @@ where
         if let Ok(mut guard) = self.turn_native_tool_sources.lock() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.turn_original_root_calls.lock() {
+            guard.clear();
+        }
         if let Ok(mut guard) = self.turn_native_root_owners.lock() {
             guard.clear();
         }
@@ -803,6 +806,42 @@ where
         Ok(())
     }
 
+    /// Capture root calls only from the original provider-result path.
+    /// Replays and downstream consumers must not mint this producer handle.
+    pub(super) fn remember_original_root_calls(
+        &self, calls: &[ModelToolCall],
+    ) -> Result<(), RuntimeError> {
+        let Some(bus) = self.cowd_bus.as_ref() else { return Ok(()); };
+        let Some(execution) = bus.current_execution_context() else { return Ok(()); };
+        if let Some(owner) = bus.current_activity_binding().filter(|owner| {
+            owner.agent_run_id.is_none() && owner.root_execution_id == execution.execution_id
+                && owner.session_id == execution.session_id && owner.turn_id == execution.turn_id
+        }) {
+            let mut originals = self.turn_original_root_calls.lock()
+                .map_err(|_| RuntimeError::new("original root tool source projection poisoned"))?;
+            for call in calls {
+                let Some(binding) = call.binding.as_ref() else { continue; };
+                if binding.snapshot.identity.session_id != self.session_id()
+                    || binding.snapshot.identity.turn_id != execution.turn_id
+                    || binding.snapshot.identity.execution_id.as_deref() != Some(execution.execution_id.as_str())
+                    || binding.origin.origin_step_id != binding.snapshot.identity.step_id
+                    || binding.origin.call_id != call.id || binding.origin.catalog_digest != binding.snapshot.catalog_digest
+                    || !matches!(&binding.origin.source, harness_contract::step::CallSource::Provider { attempt_id }
+                        if attempt_id == &binding.snapshot.provider_attempt.attempt_id) {
+                    continue;
+                }
+                let original = OriginalRootCall { call:call.clone(), execution:execution.clone(), owner:owner.clone() };
+                let original_key = binding.effect_idempotency_key();
+                if originals.get(&original_key).is_some_and(|existing|
+                    existing.call != original.call || existing.execution != original.execution) {
+                    return Err(RuntimeError::new("original root tool call identity conflict"));
+                }
+                originals.entry(original_key).or_insert(original);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn remember_native_tool_calls(
         &self,
         calls: &[ModelToolCall],
@@ -861,6 +900,33 @@ where
             );
         }
         Ok(())
+    }
+
+    /// Retrieve only a call actually captured from this turn's original
+    /// provider result; the caller cannot synthesize a handle from a request.
+    pub(crate) fn original_root_call(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        context: &crate::CowdExecutionContext,
+        owner: &harness_contract::projection::RuntimeActivityBinding,
+    ) -> Result<OriginalRootCall, RuntimeError> {
+        let original = self.turn_original_root_calls.lock()
+            .map_err(|_| RuntimeError::new("original root tool source projection poisoned"))?
+            .get(&request.idempotency_key).cloned()
+            .ok_or_else(|| RuntimeError::new("original root tool call unavailable"))?;
+        let effective = harness_contract::step::parse_strict_json(&request.input)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let initial = harness_contract::step::parse_strict_json(&original.call.input)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let invocation = request.compiled_invocation.as_ref()
+            .ok_or_else(|| RuntimeError::new("original root call invocation missing"))?;
+        if !original.matches_owner(context, owner) || original.call.name != request.tool_name
+            || original.call.binding != request.step_binding || initial != effective
+            || effective != invocation.intent.normalized_input
+            || request.step_binding.as_ref().is_none_or(|binding| binding.effect_idempotency_key() != request.idempotency_key) {
+            return Err(RuntimeError::new("original root call binding mismatch"));
+        }
+        Ok(original)
     }
 
     pub(super) fn capture_native_root_owner(
@@ -945,6 +1011,7 @@ where
     #[cfg(test)]
     pub(crate) fn clear_native_replay_cache_for_test(&self) {
         self.turn_native_tool_sources.lock().unwrap().clear();
+        self.turn_original_root_calls.lock().unwrap().clear();
         self.turn_native_root_owners.lock().unwrap().clear();
     }
 
@@ -4034,6 +4101,7 @@ mod immutable_native_acquisition_tests {
                 error: None,
                 evidence_ref: "immutable-original".into(),
                 observed_evidence: vec![],
+                pending_agent_batch: None,
             };
             if scoped {
                 let resolver =

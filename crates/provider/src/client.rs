@@ -200,6 +200,44 @@ pub enum ProviderClient {
 }
 
 impl ProviderClient {
+    /// Install the physical send authority.
+    ///
+    /// Without one, every provider send is refused before it leaves the
+    /// process. The authority carries an authenticated launcher identity and
+    /// the durable confirmation owner; it is never derived from the request.
+    #[must_use]
+    pub fn with_physical_send_authority(
+        self,
+        authority: std::sync::Arc<crate::PhysicalSendAuthority>,
+    ) -> Self {
+        match self {
+            Self::Anthropic(client) => {
+                Self::Anthropic(client.with_physical_send_authority(authority))
+            }
+            Self::Xai(client) => Self::Xai(client.with_physical_send_authority(authority)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_physical_send_authority(authority)),
+        }
+    }
+
+    /// Attach Runtime's request identity to this request-local client clone.
+    #[must_use]
+    pub fn with_original_provider_request_id(self, request_id: String) -> Self {
+        match self {
+            Self::Anthropic(client) => Self::Anthropic(client.with_original_provider_request_id(request_id)),
+            Self::Xai(client) => Self::Xai(client.with_original_provider_request_id(request_id)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_original_provider_request_id(request_id)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_diagnostic_physical_send(self, diagnostic: std::sync::Arc<crate::DiagnosticPhysicalSend>) -> Self {
+        match self {
+            Self::Anthropic(client) => Self::Anthropic(client.with_diagnostic_physical_send(diagnostic)),
+            Self::Xai(client) => Self::Xai(client.with_diagnostic_physical_send(diagnostic)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_diagnostic_physical_send(diagnostic)),
+        }
+    }
+
     /// Disable transport-owned retries so Runtime remains the sole recovery
     /// and fallback owner for a governed attempt.
     #[must_use]

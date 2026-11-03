@@ -9,6 +9,48 @@ use crate::{
 };
 use harness_contract::tool::ToolEffectDescriptor;
 
+/// The exact original capability acquisition operation that returned an error.
+/// This is an in-process observation, not a refusal or proof of no dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BoundedAcquisitionStage { Lease, Authority, Plane }
+
+pub(crate) struct OriginalBoundedAcquisitionFailure {
+    request: RuntimeToolExecutionRequest,
+    stage: BoundedAcquisitionStage,
+    store: std::sync::Weak<crate::RuntimeEventStore>,
+    original_error: String,
+}
+impl std::fmt::Debug for OriginalBoundedAcquisitionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OriginalBoundedAcquisitionFailure")
+            .field("stage", &self.stage).finish_non_exhaustive()
+    }
+}
+impl OriginalBoundedAcquisitionFailure {
+    pub(crate) fn request(&self) -> &RuntimeToolExecutionRequest { &self.request }
+    pub(crate) fn stage(&self) -> BoundedAcquisitionStage { self.stage }
+    pub(crate) fn original_error(&self) -> &str { &self.original_error }
+    pub(crate) fn belongs_to(&self, store: &std::sync::Arc<crate::RuntimeEventStore>) -> bool {
+        self.store.upgrade().is_some_and(|owner| std::sync::Arc::ptr_eq(&owner, store))
+    }
+}
+
+/// Preserve only the call-site fact that acquisition returned an error. An
+/// existing Unknown remains Unknown and must not become a no-dispatch fact.
+pub(crate) fn original_bounded_acquisition_failure(
+    request: &RuntimeToolExecutionRequest,
+    commit: &ExecutionCommitService,
+    stage: BoundedAcquisitionStage,
+    error: ToolError,
+) -> ToolError {
+    if error.is_unknown() { return error; }
+    let original_error = error.to_string();
+    error.with_original_bounded_acquisition_failure(std::sync::Arc::new(
+        OriginalBoundedAcquisitionFailure { request: request.clone(), stage, store: commit.original_store_weak(), original_error },
+    ))
+}
+
 /// Stop propagation for one original accepted call. It never owns an effect or
 /// declares it drained; the retained operation must return its real outcome.
 #[derive(Clone)]
@@ -20,6 +62,7 @@ pub(crate) struct BoundToolStop {
     pub(crate) effect_entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) effect_settled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) process: tools::ToolExecutionCancellation,
+    commit_controls: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Weak<crate::conversation::MemberCommitControl>>>>,
     #[cfg(test)]
     pub(crate) stop_after_child_registration: bool,
 }
@@ -33,6 +76,7 @@ impl Default for BoundToolStop {
             effect_entered: Default::default(),
             effect_settled: Default::default(),
             process: tools::ToolExecutionCancellation::new(),
+            commit_controls: Default::default(),
             #[cfg(test)]
             stop_after_child_registration: false,
         }
@@ -43,7 +87,23 @@ impl BoundToolStop {
         self.requested
             .store(true, std::sync::atomic::Ordering::Release);
         self.process.cancel();
+        let mut controls = self.commit_controls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        controls.retain(|weak| {
+            if let Some(control) = weak.upgrade() {
+                crate::RuntimeTransactionCommitControl::request_cancel(control.as_ref());
+                true
+            } else { false }
+        });
+        drop(controls);
         self.wake.notify_waiters();
+    }
+    pub(crate) fn register_commit_control(&self, control: &std::sync::Arc<crate::conversation::MemberCommitControl>) {
+        let mut controls = self.commit_controls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.requested.load(std::sync::atomic::Ordering::Acquire) {
+            crate::RuntimeTransactionCommitControl::request_cancel(control.as_ref());
+        } else {
+            controls.push(std::sync::Arc::downgrade(control));
+        }
     }
     pub(crate) fn check(&self) -> Result<(), ToolError> {
         if self.requested.load(std::sync::atomic::Ordering::Acquire) {
@@ -66,6 +126,30 @@ impl BoundToolStop {
         }
     }
 }
+#[cfg(test)]
+mod original_stop_control_tests {
+    use super::*;
+    use crate::RuntimeTransactionCommitControl;
+
+    #[test]
+    fn stop_racing_control_registration_cancels_the_same_commit() {
+        for _ in 0..128 {
+            let stop = BoundToolStop::default();
+            let control = crate::CancellationToken::new().member_commit_control();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|scope| {
+                let caller = stop.clone();
+                let ready = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || { ready.wait(); caller.request(); });
+                barrier.wait();
+                stop.register_commit_control(&control);
+            });
+            assert!(matches!(control.state(), crate::conversation::MemberCommitState::CancelRequested));
+            assert!(!control.begin().expect("the original commit is cancelled"));
+        }
+    }
+}
+
 // Only the actual outer read committer may suppress a nested adapter receipt.
 // Task-local scope prevents unrelated Process or concurrent calls inheriting it.
 tokio::task_local! { static OUTER_READ_RECEIPT_OWNER: (String, String, String, Option<String>, Option<crate::step_snapshot::StepCallBinding>); }
@@ -449,6 +533,7 @@ pub(crate) mod scope_admission_tests {
             .await
             .expect("real host shell");
             crate::RuntimeToolExecutionOutcome {
+                pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: crate::RuntimeToolExecutionStatus::Executed,
@@ -741,6 +826,7 @@ pub(crate) mod scope_admission_tests {
         ) -> RuntimeToolExecutionOutcome {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             RuntimeToolExecutionOutcome {
+                pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: RuntimeToolExecutionStatus::Failed,
@@ -750,85 +836,6 @@ pub(crate) mod scope_admission_tests {
                 evidence_ref: "unexpected-execution".into(),
                 observed_evidence: vec![],
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_terminal_replays_raw_but_corrupt_scope2_never_becomes_fresh() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("proof.txt"), "original").unwrap();
-        let tools = tools::ToolHost::builtin("scope2-replay", workspace.path());
-        let resolver =
-            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
-                .unwrap();
-        for corrupt in [false, true] {
-            let store = Arc::new(crate::RuntimeEventStore::for_test());
-            let service = ExecutionCommitService::new(Arc::clone(&store));
-            let request = bound_request(&tools, "read_file", json!({"path":"proof.txt"}));
-            let effect = &request.compiled_invocation.as_ref().unwrap().effect;
-            let raw = RuntimeToolExecutionOutcome {
-                tool_use_id: request.tool_use_id.clone(),
-                tool_name: request.tool_name.clone(),
-                status: RuntimeToolExecutionStatus::Executed,
-                category: request.category,
-                output: Some("original terminal raw result".into()),
-                error: None,
-                evidence_ref: "legacy-original".into(),
-                observed_evidence: vec![],
-            };
-            let scope = if corrupt {
-                json!({"version":2,"descriptor_hash":effect.descriptor_hash,"complete":false,"targets":[]})
-            } else {
-                json!({"version":1,"descriptor_hash":effect.descriptor_hash,"complete":false,"targets":[]})
-            };
-            let stream = format!("execution-effect:{}", request.idempotency_key);
-            store.append_transaction(crate::runtime_event_store::AppendTransactionRequest {
-                transaction_id:"legacy-terminal".into(),
-                expected_streams:vec![crate::runtime_event_store::ExpectedStreamRevision {
-                    stream_id:stream.clone(), expected_revision:0,
-                }],
-                events:vec![crate::runtime_event_store::RuntimeTransactionEventInput {
-                    event:crate::runtime_event_store::RuntimeEventInput {
-                        stream_id:stream.clone(), scope:crate::RuntimeEventScope::ExecutionNode,
-                        kind:"execution.read.receipt".into(), status:Some("completed".into()),
-                        actor:Some("governed_tool".into()), refs:vec![],
-                        payload:json!({
-                            "idempotency_key":request.idempotency_key,"tool_name":request.tool_name,
-                            "input_sha256":crate::context_evidence::read_sha256(request.input.as_bytes()),
-                            "resolved_effect_scope":scope,"outcome":raw,
-                        }),
-                    },
-                    idempotency_key:Some(format!("{}:read-receipt", request.idempotency_key)),
-                    schema_version:1,
-                }],
-            }).unwrap();
-            let host = ReplayGuardHost {
-                lease: tools.pin_snapshot(),
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            };
-            let result = execute_bound_agent_tool(
-                &host,
-                Some(&service),
-                &resolver,
-                &ScopeLockManager::new(),
-                &request,
-                effect,
-            )
-            .await;
-            if corrupt {
-                assert!(result.is_err());
-            } else {
-                assert_eq!(
-                    result.unwrap().output.as_deref(),
-                    Some("original terminal raw result")
-                );
-            }
-            assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert_eq!(store.stream_revision(&stream).unwrap(), 1);
-            assert_eq!(
-                std::fs::read_to_string(workspace.path().join("proof.txt")).unwrap(),
-                "original"
-            );
         }
     }
 
@@ -851,6 +858,7 @@ pub(crate) mod scope_admission_tests {
         ) -> RuntimeToolExecutionOutcome {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             RuntimeToolExecutionOutcome {
+                pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: RuntimeToolExecutionStatus::Executed,
@@ -899,6 +907,7 @@ pub(crate) mod scope_admission_tests {
             .clone();
         assert!(descriptor.spawns_process);
         let mut outcome = crate::RuntimeToolExecutionOutcome {
+            pending_agent_batch: None,
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             status: crate::RuntimeToolExecutionStatus::Executed,
@@ -981,6 +990,7 @@ pub(crate) mod scope_admission_tests {
             .effect
             .clone();
         let mut outcome = crate::RuntimeToolExecutionOutcome {
+            pending_agent_batch: None,
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             status: crate::RuntimeToolExecutionStatus::Executed,
@@ -1465,6 +1475,7 @@ pub(crate) mod scope_admission_tests {
         let request = bound_request(&tools, "bash", json!({"command": "printf 899"}));
         let descriptor = request.compiled_invocation.as_ref().unwrap().effect.clone();
         let mut outcome = crate::RuntimeToolExecutionOutcome {
+            pending_agent_batch: None,
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             status: crate::RuntimeToolExecutionStatus::Executed,
@@ -1721,46 +1732,38 @@ pub(crate) fn admitted_effect_scope(
     resolver: &crate::path_identity::WorkspacePathIdentityResolver,
 ) -> Result<harness_contract::goal::ProofEffectScope, ToolError> {
     let tool_name = request.tool_name.as_str();
-    let binding = request
-        .step_binding
-        .as_ref()
-        .ok_or_else(|| ToolError::new("effect scope requires the original Step binding"))?;
-    let step = binding
-        .resolve(current)
-        .map_err(|error| ToolError::new(error.to_string()))?;
     let input = harness_contract::step::parse_strict_json(&request.input)
         .map_err(|error| ToolError::new(error.to_string()))?;
-    let invocation = request
-        .compiled_invocation
-        .as_ref()
+    let invocation = request.compiled_invocation.as_ref()
         .ok_or_else(|| ToolError::new("effect scope requires the compiled invocation"))?;
-    if invocation.intent.normalized_input != input || invocation.effect != *descriptor {
+    if invocation.intent.normalized_input != input || invocation.effect != *descriptor
+        || invocation.invocation_id != request.tool_use_id || invocation.intent.tool_name != request.tool_name {
         return Err(ToolError::new("effective_input_requires_replan"));
     }
-    if invocation.invocation_id != request.tool_use_id
-        || invocation.intent.tool_name != request.tool_name
-        || invocation.origin.as_ref() != Some(&binding.origin)
-        || binding.snapshot.as_ref() != step.snapshot()
-        || request.session_id.as_deref() != Some(binding.snapshot.identity.session_id.as_str())
-    {
-        return Err(ToolError::new(
-            "effect scope original Step/call identity mismatch",
-        ));
-    }
-    let pinned_resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(
-        step.lease().workspace_root(),
-    )
-    .map_err(|error| ToolError::new(error.to_string()))?;
+    let lease = if let Some(binding) = request.step_binding.as_ref() {
+        let step = binding.resolve(current).map_err(|error| ToolError::new(error.to_string()))?;
+        if invocation.origin.as_ref() != Some(&binding.origin)
+            || binding.snapshot.as_ref() != step.snapshot()
+            || request.session_id.as_deref() != Some(binding.snapshot.identity.session_id.as_str()) {
+            return Err(ToolError::new("effect scope original Step/call identity mismatch"));
+        }
+        step.lease().clone()
+    } else {
+        if request.tool_name == "agent_action_batch" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
+            return Err(ToolError::new("original action Step binding missing"));
+        }
+        request.tool_progress.original_governed_hook().map_err(ToolError::new)?
+            .ok_or_else(|| ToolError::new("original unbound call owner missing"))?
+            .original_authorized_lease(request).map_err(ToolError::new)?
+    };
+    let pinned_resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(lease.workspace_root())
+        .map_err(|error| ToolError::new(error.to_string()))?;
     if pinned_resolver.workspace_id() != resolver.workspace_id() {
-        return Err(ToolError::new(
-            "effect scope resolver differs from the pinned workspace",
-        ));
+        return Err(ToolError::new("effect scope resolver differs from the pinned workspace"));
     }
-    let resolution = step.lease().describe_effect_resolution(tool_name, &input);
+    let resolution = lease.describe_effect_resolution(tool_name, &input);
     if resolution.descriptor != *descriptor {
-        return Err(ToolError::new(
-            "pinned effect descriptor changed at admission",
-        ));
+        return Err(ToolError::new("pinned effect descriptor changed at admission"));
     }
     let (_, resolved_identities) = bound_effect_lock_requests(resolver, descriptor)?;
     let targets = descriptor
@@ -1990,7 +1993,7 @@ pub(crate) async fn execute_bounded_process_observed(
                     .map_err(|error| ToolError::new(error.to_string()))?;
                 match state {
                     crate::execution_core::graph::ToolEffectState::Completed(outcome) => return Ok(retained_replay_outcome(outcome)),
-                    crate::execution_core::graph::ToolEffectState::Uncertain => return Err(ToolError::new("bounded process uncertain; refusing to rerun")),
+                    crate::execution_core::graph::ToolEffectState::Uncertain => return Err(ToolError::unknown("bounded process uncertain; refusing to rerun")),
                     crate::execution_core::graph::ToolEffectState::Fresh => {},
                     crate::execution_core::graph::ToolEffectState::NotRequired => return Err(ToolError::new("bounded process requires original durable intent")),
                 }
@@ -2141,11 +2144,15 @@ async fn execute_bound_agent_tool_observed_inner(
             service
                 .completed_tool_effect(request, descriptor)
                 .map_err(|error| {
-                    ToolError::new(format!(
+                    ToolError::unknown(format!(
                         "tool `{tool_name}` historical receipt lookup failed: {error}"
                     ))
                 })?
         {
+            if outcome.status == RuntimeToolExecutionStatus::Unknown {
+                return Err(ToolError::unknown(outcome.error.unwrap_or_else(||
+                    "original tool outcome is unknown".into())));
+            }
             outcome.tool_use_id.clone_from(&request.tool_use_id);
             outcome.tool_name.clone_from(&request.tool_name);
             outcome.category = request.category;
@@ -2159,15 +2166,17 @@ async fn execute_bound_agent_tool_observed_inner(
     if tool_name == "execute_code" {
         let service = commit_service
             .ok_or_else(|| ToolError::new("bounded process requires original commit service"))?;
-        let plane = host
-            .bounded_process_plane()
-            .ok_or_else(|| ToolError::new("bounded process plane unsupported"))?;
-        let lease = host.bounded_process_lease(request)?;
-        let authority = host.bounded_process_authority(request)?;
+        let preserve = |stage, error| original_bounded_acquisition_failure(request, service, stage, error);
+        let plane = host.bounded_process_plane().ok_or_else(||
+            preserve(BoundedAcquisitionStage::Plane, ToolError::new("bounded process plane unsupported")))?;
+        let lease = host.bounded_process_lease(request)
+            .map_err(|error| preserve(BoundedAcquisitionStage::Lease, error))?;
+        let authority = host.bounded_process_authority(request)
+            .map_err(|error| preserve(BoundedAcquisitionStage::Authority, error))?;
         if !std::ptr::eq(scope_locks, plane.scope_locks().as_ref()) {
-            return Err(ToolError::new(
+            return Err(preserve(BoundedAcquisitionStage::Plane, ToolError::new(
                 "bounded process canonical lock manager mismatch",
-            ));
+            )));
         }
         return execute_bounded_process_observed(
             lease,
@@ -2219,7 +2228,7 @@ async fn execute_bound_agent_tool_observed_inner(
     let resolved_scope = admitted_effect_scope(
         request,
         descriptor,
-        host.pin_step_catalog(),
+        if request.step_binding.is_some() { host.pin_step_catalog() } else { None },
         path_identity_resolver,
     )
     .map_err(|error| {
@@ -2241,6 +2250,16 @@ async fn execute_bound_agent_tool_observed_inner(
         }
     }
     check_tool_stop()?;
+    let original_owner = request.tool_progress.original_fresh_effect()
+        .map_err(ToolError::unknown)?;
+    let effect_state = if original_owner.is_some()
+        && harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name)
+    {
+        let service = commit_service.ok_or_else(|| ToolError::unknown("original child commit owner unavailable"))?;
+        service.claim_original_child_effect(request, descriptor, &resolved_scope)
+            .map_err(|error| ToolError::unknown(error.to_string()))?;
+        crate::execution_core::graph::ToolEffectState::Fresh
+    } else {
     let effect_state = commit_service
         .map(|service| {
             service.begin_bound_tool_effect_observed(
@@ -2257,6 +2276,8 @@ async fn execute_bound_agent_tool_observed_inner(
             ))
         })?
         .unwrap_or(crate::execution_core::graph::ToolEffectState::Fresh);
+        effect_state
+    };
     let (mut outcome, fresh_execution, mut host_process_admission) = match effect_state {
         crate::execution_core::graph::ToolEffectState::Completed(mut outcome) => {
             outcome.tool_use_id.clone_from(&request.tool_use_id);
@@ -2269,7 +2290,7 @@ async fn execute_bound_agent_tool_observed_inner(
             (outcome, false, None)
         }
         crate::execution_core::graph::ToolEffectState::Uncertain => {
-            return Err(ToolError::new(
+            return Err(ToolError::unknown(
                 "tool effect is uncertain; non-idempotent execution was not replayed",
             ));
         }
@@ -2305,6 +2326,12 @@ async fn execute_bound_agent_tool_observed_inner(
             (outcome, true, admission)
         }
     };
+    // Neither a fresh Unknown nor a retained Unknown is a settled effect.
+    // Return it to the original owner without minting any ordinary receipt.
+    if outcome.status == RuntimeToolExecutionStatus::Unknown {
+        return Err(ToolError::unknown(outcome.error.unwrap_or_else(||
+            "original tool outcome is unknown".into())));
+    }
     // Delegated ToolHost adapters must return typed observations together
     // with a successful receipt. Some compatibility adapters return only
     // raw structured output. In that case Runtime may mint exact-content

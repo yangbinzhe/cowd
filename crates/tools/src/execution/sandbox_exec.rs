@@ -482,32 +482,15 @@ fn terminal_from_observation(
     }
 }
 
-fn parse_input(input: &Value) -> Result<(String, Vec<u8>, Vec<String>, Duration), ToolHostError> {
-    let object = input
-        .as_object()
-        .ok_or_else(|| failure("bounded_input_object_required"))?;
-    if object.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "language" | "code" | "input_files" | "timeout_ms"
-        )
-    }) {
-        return Err(failure("bounded_unknown_input_field"));
-    }
-    let language = input
-        .get("language")
-        .and_then(Value::as_str)
-        .ok_or_else(|| failure("bounded_language_required"))?;
-    if !matches!(language, "python" | "javascript" | "bash") {
-        return Err(failure("bounded_language_unsupported"));
-    }
-    let code = input
-        .get("code")
-        .and_then(Value::as_str)
-        .ok_or_else(|| failure("bounded_code_required"))?;
-    if code.len() > 65536 {
-        return Err(failure("bounded_code_limit"));
-    }
+/// The one bounded-compute file-set contract.
+///
+/// Planning (the effect resolver) and execution (the sandbox) must agree on
+/// exactly which project files a compute may observe. A missing list is a
+/// refusal on both sides - never a licence to read the workspace root - and an
+/// empty list means *no project file at all*, which is what the sandbox
+/// materialises. Returning the normalized list lets the caller declare exactly
+/// that scope instead of projecting a wider one.
+pub fn bounded_compute_input_files(input: &Value) -> Result<Vec<String>, ToolHostError> {
     let files = input
         .get("input_files")
         .and_then(Value::as_array)
@@ -536,6 +519,36 @@ fn parse_input(input: &Value) -> Result<(String, Vec<u8>, Vec<String>, Duration)
             return Err(failure("bounded_input_path_invalid"));
         }
     }
+    Ok(paths.into_iter().collect())
+}
+
+fn parse_input(input: &Value) -> Result<(String, Vec<u8>, Vec<String>, Duration), ToolHostError> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| failure("bounded_input_object_required"))?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "language" | "code" | "input_files" | "timeout_ms"
+        )
+    }) {
+        return Err(failure("bounded_unknown_input_field"));
+    }
+    let language = input
+        .get("language")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failure("bounded_language_required"))?;
+    if !matches!(language, "python" | "javascript" | "bash") {
+        return Err(failure("bounded_language_unsupported"));
+    }
+    let code = input
+        .get("code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| failure("bounded_code_required"))?;
+    if code.len() > 65536 {
+        return Err(failure("bounded_code_limit"));
+    }
+    let paths = bounded_compute_input_files(input)?;
     let requested = match input.get("timeout_ms") {
         Some(value) => value
             .as_u64()
@@ -988,7 +1001,7 @@ fn run_snapshot_digest(
         return Err("bounded_authorization_expired".into());
     }
     let prepared = sandbox_launcher::prepare_bounded_command(spec, command, timeout, identity)
-        .map_err(|_| "bounded_launcher_prepare_failed")?;
+        .map_err(|error| error.bounded_preparation_reason_code())?;
     validate_snapshot(snapshot)?;
     Ok(prepared.run(cancellation))
 }

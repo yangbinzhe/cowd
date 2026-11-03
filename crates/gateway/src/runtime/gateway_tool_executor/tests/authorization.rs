@@ -29,6 +29,7 @@
         ];
         let admitted_scopes = ["session:session-root".to_string()];
         let binding = RuntimeToolExecutionBinding {
+            action_invocation: None,
             tool_lease: None,
             action_id: Some("root-action"),
             session_id: Some("session-root"),
@@ -36,6 +37,7 @@
             memory_context: None, reality_context: None,
             model_lease: Some("deepseek-v4-flash"),
             parent_execution: None,
+            parent_execution_attempt: None,
             execution_decision: Some(&decision),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         };
@@ -482,6 +484,7 @@
         ] {
             let decision = runtime::build_runtime_execution_decision(prompt, None);
             let actor = root_agent_action_actor(RuntimeToolExecutionBinding {
+            action_invocation: None,
                 tool_lease: None,
                 action_id: None,
                 session_id: Some("quantity-session"),
@@ -490,6 +493,7 @@
                 reality_context: None,
                 model_lease: Some("local-contract-only"),
                 parent_execution: None,
+                parent_execution_attempt: None,
                 execution_decision: Some(&decision),
                 permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             })
@@ -513,6 +517,7 @@
         let mut missing = decision.clone();
         missing.collaboration_obligation = None;
         let bind = |decision| RuntimeToolExecutionBinding {
+            action_invocation: None,
             tool_lease: None,
             action_id: None,
             session_id: Some("quantity-session"),
@@ -521,6 +526,7 @@
             reality_context: None,
             model_lease: Some("local-contract-only"),
             parent_execution: None,
+            parent_execution_attempt: None,
             execution_decision: Some(decision),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         };

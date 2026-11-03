@@ -312,7 +312,14 @@ pub(crate) fn resolve_orchestration_child_effect_resolution(
                 });
                 properties
             }
-            ("execute_code", "builtin.sandboxed_command") => resolve_effect_properties(resolver, tool_id, &Value::Null),
+            // The compute child's own declared file set is part of its
+            // contract, so it is resolved from the child's real input. A null
+            // input hid that declaration, which made the child unprovable
+            // and dropped every sibling effect with it - planning then
+            // described less than what the program may do.
+            ("execute_code", "builtin.sandboxed_command") => {
+                resolve_effect_properties(resolver, tool_id, input)
+            }
             _ => return Err(format!("tool_orchestrate cannot prove a bounded effect envelope for `{tool_id}` reference paths {references:?}")),
         }
     };
@@ -320,7 +327,29 @@ pub(crate) fn resolve_orchestration_child_effect_resolution(
         stricter_permission(properties.required_permission, catalog_permission);
     properties.idempotency = ToolIdempotency::Unknown;
     let mut assessment = effect_assessment(&properties, input);
-    assessment.data_sensitivity = DataClassification::Secret;
+    // A dynamic reference can hide a sensitive target or override an explicit
+    // classification. Only references confined to known non-sensitive data
+    // fields of a proven read-only effect retain the normal classification.
+    let sensitivity_dynamic = references.iter().any(|path| {
+        matches!(path.first().map(String::as_str), Some("contains_secrets" | "data_classification"))
+    });
+    // A bounded read-only compute child keeps the normal classification: it
+    // observes exactly its declared files inside the read-only sandbox. The
+    // sensitive-target rules in `data_classification` still apply unchanged,
+    // so a `.env` or credentials input stays Secret.
+    let bounded_child = is_bounded_read_only_compute(
+        properties.effect_kind,
+        properties.required_permission,
+        properties.uses_network,
+        properties.spawns_process,
+        properties.mutates_packages,
+        properties.mutates_system,
+        &properties.scopes,
+    );
+    if !data_only || sensitivity_dynamic || !(is_read_only_research_effect(&properties) || bounded_child)
+    {
+        assessment.data_sensitivity = DataClassification::Secret;
+    }
     if !data_only {
         assessment.novelty = EffectNovelty::NewTarget;
         assessment.blast_radius = EffectBlastRadius::Workspace;
@@ -563,6 +592,79 @@ fn effect_assessment(properties: &EffectProperties, input: &Value) -> EffectAsse
 /// tool and made a read-only session unable to enumerate the very corpus the
 /// scenario declares. Sensitivity is a property of what an effect does, not of
 /// whether its scope happens to name a target.
+/// Whether this effect is a **bounded read-only compute**.
+///
+/// A read-only ceiling does not forbid a process: it forbids *unbounded*
+/// authority. This predicate is the single contract statement for the narrow
+/// case the product actually supports - a real child process that
+///
+///   * declares its own effect as read-only,
+///   * uses no network, mutates no package and no system state,
+///   * may observe exactly the declared file scopes (each one an explicit,
+///     non-root target) and nothing else,
+///   * carries no Shell scope (an arbitrary command line is not bounded), and
+///   * is executed inside the kernel-enforced, network-off, read-only sandbox.
+///
+/// Anything outside that envelope - an unbounded file scope, the workspace
+/// root, a Shell scope, a write or control scope, network access - is NOT a
+/// bounded read-only compute and keeps the conservative Secret classification
+/// and the permission it implies.
+fn is_bounded_read_only_compute(
+    effect_kind: ToolEffectKind,
+    required_permission: ToolPermissionMode,
+    uses_network: bool,
+    spawns_process: bool,
+    mutates_packages: bool,
+    mutates_system: bool,
+    scopes: &[PermissionScope],
+) -> bool {
+    if effect_kind != ToolEffectKind::Process
+        || !spawns_process
+        || uses_network
+        || mutates_packages
+        || mutates_system
+        || required_permission != ToolPermissionMode::ReadOnly
+    {
+        return false;
+    }
+    scopes.iter().all(|scope| match scope.resource {
+        PermissionResource::File => {
+            scope.operation == PermissionOperation::Read
+                && scope
+                    .target
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .is_some_and(|target| target != ".")
+        }
+        // The invocation itself is what the lease authorizes; it grants no
+        // authority over any file, network or command line by itself.
+        PermissionResource::Tool => scope.operation == PermissionOperation::Call,
+        // A process that may run an arbitrary command line is not bounded, and
+        // neither is a tool that writes or controls the workspace.
+        PermissionResource::Shell => false,
+        PermissionResource::Network => false,
+        _ => false,
+    })
+}
+
+/// The public contract form of [`is_bounded_read_only_compute`], evaluated on
+/// the resolved effect descriptor. Runtime owns the permission decision, so the
+/// predicate lives with the tool contract it describes.
+pub fn effect_is_bounded_read_only_compute(
+    descriptor: &harness_contract::tool::ToolEffectDescriptor,
+) -> bool {
+    is_bounded_read_only_compute(
+        descriptor.effect_kind,
+        descriptor.required_permission,
+        descriptor.uses_network,
+        descriptor.spawns_process,
+        descriptor.mutates_packages,
+        descriptor.mutates_system,
+        &descriptor.scopes,
+    )
+}
+
 fn is_read_only_research_effect(properties: &EffectProperties) -> bool {
     properties.required_permission == ToolPermissionMode::ReadOnly
         && !properties.uses_network
@@ -760,7 +862,17 @@ fn resolve_base_effect_properties(
             // `effect_kind` and `spawns_process`.
             effect_kind: ToolEffectKind::Process,
             idempotency: ToolIdempotency::Unknown,
-            scopes: Vec::new(),
+            // The tool invocation itself is the capability the lease
+            // authorizes; the file scopes the process may observe are added
+            // from the request's declared  (and only from there).
+            // An empty scope set would mean "no invocation at all", which is
+            // not what this tool is, and it would leave the descriptor
+            // without any scope to certify.
+            scopes: vec![scope(
+                PermissionResource::Tool,
+                PermissionOperation::Call,
+                None,
+            )],
             required_permission: ToolPermissionMode::ReadOnly,
             approval_class: ToolApprovalClass::Policy,
             uses_network: false,
@@ -2716,7 +2828,8 @@ mod tests {
             "execute_code",
             &json!({
                 "language": "python",
-                "code": "print(sum(range(10)))"
+                "code": "print(sum(range(10)))",
+                "input_files": ["crates/tools/src/lib.rs"]
             }),
             ToolPermissionMode::ReadOnly,
         );

@@ -895,6 +895,9 @@ impl ScopedRuntimeToolExecutor {
                     .error
                     .unwrap_or_else(|| "checkpoint creation failed".into()),
             )),
+            RuntimeToolExecutionStatus::Unknown => Err(ToolError::unknown(
+                outcome.error.unwrap_or_else(|| "checkpoint outcome unknown".into()),
+            )),
         }
     }
 
@@ -931,7 +934,48 @@ impl ScopedRuntimeToolExecutor {
         } else {
             0
         };
-        let request = RuntimeToolExecutionRequest {
+        // A governed action already has an authorized request owned by its
+        // ToolBatch. Carry that exact request into the child graph: rebuilding
+        // it here changes the wave/scopes under the same effect identity.
+        let original = if harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name) {
+            match crate::tool_host::ORIGINAL_EFFECT_REQUEST.try_with(|slot| {
+                slot.lock().map_err(|_| ToolError::unknown("original request channel poisoned"))?.clone()
+                    .ok_or_else(|| ToolError::unknown("original delegated action request missing"))
+            }) {
+                Ok(result) => Some(result?),
+                // A direct Process producer has its own original owner; it is
+                // not a Ticket call and continues through that existing path.
+                Err(_) if crate::tool_host::ORIGINAL_MEMBER_PROGRESS.try_with(|_| ()).is_ok() =>
+                    return Err(ToolError::unknown("original Ticket action request channel missing")),
+                Err(_) => None,
+            }
+        } else { None };
+        let direct_process_origin = original.is_none();
+        let request = if let Some(original) = original {
+            if original.tool_progress.original_fresh_effect()
+                .map_err(ToolError::unknown)?.is_none()
+            {
+                return Err(ToolError::unknown("original Ticket effect admission missing"));
+            }
+            let original_input = serde_json::from_str::<serde_json::Value>(&original.input)
+                .map_err(|error| ToolError::unknown(format!("original delegated input invalid: {error}")))?;
+            let expected_parent = harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: self.execution_id.clone(), node_id: self.node_id.clone(),
+            };
+            if original.tool_name != tool_name
+                || original_input != input
+                || original.authorization.as_ref() != Some(&authorization)
+                || original.step_binding.as_ref() != step_binding
+                || original.session_id.as_deref() != Some(self.session_id.as_str())
+                || original.parent_execution.as_ref() != Some(&expected_parent)
+                || original.parent_execution_attempt != Some(self.attempt)
+                || original.sandbox_posture != self.sandbox_posture
+                || original.policy_revision != self.policy_revision
+            {
+                return Err(ToolError::unknown("original delegated action request identity mismatch"));
+            }
+            (*original).clone()
+        } else { RuntimeToolExecutionRequest {
             compiled_invocation: step_binding
                 .map(|binding| {
                     binding.prepare_invocation(self.host.pin_step_catalog(), tool_name, &input)
@@ -973,8 +1017,33 @@ impl ScopedRuntimeToolExecutor {
             evaluation_isolated: self.evaluation_isolated(),
             managed_invocation: None,
             tool_progress: crate::ToolProgressSink::default(),
-        };
-        let outcome = if tool_name == "artifact_materialize" {
+        }};
+        if direct_process_origin && harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name) {
+            request.tool_progress.install_original_effect_custody(crate::tool_host::OriginalEffectCustodyOrigin::DirectProcess)
+                .map_err(ToolError::unknown)?;
+        }
+        if tool_name == "agent_action_batch" {
+            if crate::agent_in_process_worker::current_original_process_batch_call().is_some() {
+                let pinned = self.host.pin_step_catalog().ok_or_else(|| ToolError::unknown("Process original ToolHost lease missing"))?;
+                crate::agent_in_process_worker::capture_original_process_members(&request, pinned)
+                    .map_err(ToolError::unknown)?;
+            }
+            let owner = if crate::agent_in_process_worker::current_original_process_batch_call().is_some() {
+                crate::agent_in_process_worker::original_process_batch_policy_owner().map_err(ToolError::unknown)?
+            } else {
+                crate::tool_host::DELEGATED_BATCH_POLICY_OWNER.try_with(Arc::clone)
+                    .map_err(|_| ToolError::new("original delegated batch policy owner missing"))?
+            };
+            request.tool_progress.install_batch_policy_owner(owner).map_err(ToolError::new)?;
+        }
+        let outcome = if tool_name == "agent_action_batch"
+            || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name) {
+            // The original dispatcher owns packet, node ticket and admission.
+            // A direct Host call has none of those signing credentials.
+            let dispatcher = self.tool_batch.as_ref().ok_or_else(||
+                ToolError::new("unknown: original delegated action owner unavailable"))?;
+            dispatcher.execute(request.clone()).await?
+        } else if tool_name == "artifact_materialize" {
             if let Some(dispatcher) = &self.tool_batch {
                 dispatcher.execute(request.clone()).await?
             } else {
@@ -991,6 +1060,11 @@ impl ScopedRuntimeToolExecutor {
             }
             self.host.execute_runtime_tool(&request).await
         };
+        // Unknown is not a completed read and must not mint a read receipt.
+        if outcome.status == RuntimeToolExecutionStatus::Unknown {
+            return Err(ToolError::unknown(outcome.error.unwrap_or_else(||
+                format!("{tool_name} outcome unknown"))));
+        }
         // Process direct calls have no outer receipt owner, even when they
         // carry a Step. Only suppress this commit inside the exact matching
         // outer governed read's task-local ownership scope.
@@ -1017,6 +1091,9 @@ impl ScopedRuntimeToolExecutor {
                     format!("{tool_name} execution failed").into()
                 })))
             }
+            RuntimeToolExecutionStatus::Unknown => Err(ToolError::unknown(
+                outcome.error.unwrap_or_else(|| format!("{tool_name} outcome unknown")),
+            )),
         }
     }
 
@@ -1029,7 +1106,7 @@ impl ScopedRuntimeToolExecutor {
         scopes
     }
 
-    fn evaluation_isolated(&self) -> bool {
+    pub(super) fn evaluation_isolated(&self) -> bool {
         self.resource_scopes.as_ref().is_some_and(|scopes| {
             scopes
                 .iter()
@@ -1056,17 +1133,27 @@ impl ScopedRuntimeToolExecutor {
         {
             return Ok(());
         }
-        let input = serde_json::from_str::<serde_json::Value>(input)
+        let value = serde_json::from_str::<serde_json::Value>(input)
             .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
-        if tool_name == "glob_search" {
-            enforce_glob_scope(&input, allowed_scopes)?;
-        }
         let descriptor = self
             .host
-            .delegated_tool_effect_descriptor(tool_name, &input)
+            .delegated_tool_effect_descriptor(tool_name, &value)
             .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
+        self.enforce_original_effect_ceiling(tool_name, &value, &descriptor, allowed_scopes)
+    }
+
+    pub(super) fn enforce_original_effect_ceiling(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        allowed_scopes: &[String],
+    ) -> Result<(), ToolError> {
+        if tool_name == "glob_search" {
+            enforce_glob_scope(input, allowed_scopes)?;
+        }
         if !crate::tool_host::effect_has_resource_lease(
-            &descriptor,
+            descriptor,
             allowed_scopes,
             |path, scopes, write| {
                 resource_path_is_authorized(&self.path_identity_resolver, path, scopes, write)
@@ -1192,6 +1279,23 @@ impl ScopedRuntimeToolExecutor {
             managed_invocation: self.managed_invocation.clone(),
             tool_progress: crate::ToolProgressSink::default(),
         };
+        if tool_name == "agent_action_batch" {
+            if crate::agent_in_process_worker::current_original_process_batch_call().is_some() {
+                let pinned = self.host.pin_step_catalog().ok_or_else(|| ToolError::unknown("Process original ToolHost lease missing"))?;
+                crate::agent_in_process_worker::capture_original_process_members(&request, pinned)
+                    .map_err(ToolError::unknown)?;
+            }
+            // C's retained OriginalAgentChildCall carries this same in-process
+            // sink through the physical owner. The serialized child payload
+            // cannot recreate or authorize the original policy owner.
+            let owner = if crate::agent_in_process_worker::current_original_process_batch_call().is_some() {
+                crate::agent_in_process_worker::original_process_batch_policy_owner().map_err(ToolError::unknown)?
+            } else {
+                crate::tool_host::DELEGATED_BATCH_POLICY_OWNER.try_with(Arc::clone)
+                    .map_err(|_| ToolError::unknown("original delegated batch policy owner unavailable"))?
+            };
+            request.tool_progress.install_batch_policy_owner(owner).map_err(ToolError::unknown)?;
+        }
         let mut outcome = if let Some(dispatcher) = &self.tool_batch {
             dispatcher.execute(request.clone()).await?
         } else {
@@ -1358,6 +1462,9 @@ impl ScopedRuntimeToolExecutor {
                 outcome
                     .error
                     .unwrap_or_else(|| "tool execution failed".into()),
+            )),
+            RuntimeToolExecutionStatus::Unknown => Err(ToolError::unknown(
+                outcome.error.unwrap_or_else(|| "tool outcome unknown".into()),
             )),
         }
     }

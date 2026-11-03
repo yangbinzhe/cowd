@@ -178,10 +178,16 @@ impl RuntimeEventStore {
             }
             let mut payload = input.event.payload.clone();
             if let Some(expected) = authored_metadata {
+                let metadata_key = if expected.get("record_type").and_then(serde_json::Value::as_str)
+                    == Some("objective_unresolved_v1") {
+                    "objective_unresolved"
+                } else {
+                    "objective_verdict"
+                };
                 if !expected.is_object()
                     || payload
                         .as_object_mut()
-                        .and_then(|object| object.remove("objective_verdict"))
+                        .and_then(|object| object.remove(metadata_key))
                         .as_ref()
                         != Some(expected)
                 {
@@ -260,10 +266,47 @@ impl RuntimeEventStore {
         self.publish_commit(receipt.commit_cursor);
         Ok(receipt)
     }
+    pub(crate) fn original_checked_terminal_winner_with_metadata(
+        &self, mut request: CheckedAppendRequest, terminal: &SessionTerminalInput,
+        authored_metadata: Option<&serde_json::Value>, validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        self.validate_content_publication(&mut request.transaction)?;
+        self.validate_terminal_publication_metadata(terminal, &request.transaction, authored_metadata)?;
+        let winner = self.backend.original_checked_terminal_winner(&request, terminal, validator)?;
+        if let Some(receipt) = winner.as_ref() { self.record_original_checked_terminal_winner(&request, terminal, receipt)?; }
+        Ok(winner)
+    }
+
+    pub(crate) fn append_checked_terminal_with_authored_metadata(
+        &self, mut request: CheckedAppendRequest, terminal: SessionTerminalInput,
+        authored_metadata: Option<&serde_json::Value>, validator: &dyn CheckedSourceValidator,
+        control: &Arc<crate::conversation::MemberCommitControl>, claim: &RuntimeOriginalSessionClaim<'_>,
+        terminal_owner: &Arc<crate::execution_core::services::OriginalTerminalCommitOwner>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        self.ensure_graph_transaction_recovery_admitted(&request.transaction)?;
+        self.ensure_session_recovery_admitted(&terminal.session_id).map_err(RuntimeEventStoreError::InvalidTransaction)?;
+        self.validate_content_publication(&mut request.transaction)?;
+        self.validate_terminal_publication_metadata(&terminal, &request.transaction, authored_metadata)?;
+        if request.frame_digest != validator.frame_digest() { return Err(RuntimeEventStoreError::InvalidTransaction("terminal source frame mismatch".into())); }
+        let stream_ids = request.transaction.expected_streams.iter().map(|source| source.stream_id.clone()).collect::<Vec<_>>();
+        let request = Arc::new(request);
+        self.retain_original_checked_terminal(Arc::clone(&request), terminal.clone(), Arc::clone(control), Arc::clone(terminal_owner))?;
+        let result = self.with_stream_locks(&stream_ids, ||
+            self.backend.append_checked_terminal_cancellable((*request).clone(), terminal, validator, control.as_ref(), claim));
+        self.finish_original_checked_terminal(&request, &result)?;
+        if let Ok(Some(receipt)) = result.as_ref() { self.publish_commit(receipt.commit.commit_cursor); }
+        result
+    }
+
     pub fn quiesced_content_roots(&self) -> QuiescedContentRoots {
         QuiescedContentRoots {
             backend: Arc::clone(&self.backend),
         }
+    }
+
+    pub(crate) fn original_checked_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        self.backend.original_checked_transaction_receipt(transaction_id)
     }
 
     pub fn transaction_stream_revision_exact(

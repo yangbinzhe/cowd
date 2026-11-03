@@ -1,3 +1,19 @@
+/// Keep the original owner's complete publication in the same-call transport
+/// even if its dedicated stop slot was unavailable, poisoned, or occupied.
+fn original_member_stop_error(
+    sink: &runtime::ToolProgressSink,
+    publication: runtime::tool_host::OriginalStopPublication,
+    message: &str,
+) -> ToolError {
+    let publication = std::sync::Arc::new(publication);
+    sink.record_original_stop_publication(std::sync::Arc::clone(&publication));
+    ToolError::unknown_with_agent_batch(
+        message,
+        runtime::PendingAgentBatch::new(
+            runtime::PendingAgentBatchValue::OriginalStopPublication(publication)),
+    )
+}
+
 /// Re-evaluate the root Agentic Program barrier in the same path as the mutation that
 /// may have settled it.
 ///
@@ -541,7 +557,7 @@ impl GatewayToolExecutor {
         self.execute_runtime_tool_with_binding(
             tool_name,
             value,
-            RuntimeToolExecutionBinding {
+            RuntimeToolExecutionBinding { action_invocation: None,
                 tool_lease: None,
                 action_id: None,
                 session_id: self.runtime_session_id.as_deref(),
@@ -550,6 +566,7 @@ impl GatewayToolExecutor {
                 reality_context: None,
                 model_lease: self.runtime_model_lease.as_deref(),
                 parent_execution: None,
+                parent_execution_attempt: None,
                 execution_decision: None,
                 permission_ceiling: self.runtime_permission_ceiling,
             },
@@ -563,10 +580,11 @@ impl GatewayToolExecutor {
     /// so validation, authorization, the durable commit and the physical
     /// follow-up dispatch are exactly the path a direct call takes: the batch
     /// can never grant a permission a direct call would be denied.
-    async fn execute_agent_action_batch(
+    pub(super) async fn execute_agent_action_batch(
         &self,
         mut value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
+        original: &runtime::RuntimeToolExecutionRequest,
     ) -> Result<String, ToolError> {
         const MAX_ACTIONS: usize = 25;
         let actions = value
@@ -592,74 +610,87 @@ impl GatewayToolExecutor {
             .to_string();
         let mut results = Vec::with_capacity(actions.len());
         for (index, entry) in actions.iter().enumerate() {
-            let inner_tool = entry
-                .get("tool")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    // Three live frames omitted `tool` on their later entries and
-                    // wrote `"input": {...}, "input": {...}` instead. The refusal
-                    // named the index and nothing else, so the model had to guess
-                    // what the field wanted. The allowed values are already the
-                    // single source of truth the enum owns.
-                    ToolError::new(format!(
-                        "agent_action_batch action[{index}] needs a `tool` naming one of: {}",
-                        harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.join(", ")
-                    ))
-                })?;
-            if !is_agent_action_tool(inner_tool) {
-                return Err(ToolError::new(format!(
-                    "agent_action_batch dispatches Agent actions only; `{inner_tool}` is not one"
-                )));
-            }
-            let mut inner_input = entry
-                .get("input")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            // Every reference field in this action goes through the same
-            // normalization a direct call gets. Runtime spells a one-shot Task
-            // deliverable `artifact:<24 hex>` and repeats it in a completion
-            // gap; without this a batch that cites it is refused for a review
-            // whose reading the model already did.
-            if let Some(object) = inner_input.as_object_mut() {
-                for field in ["reference", "evidence_ref"] {
-                    if let Some(raw) = object.get(field).and_then(|v| v.as_str()) {
-                        let normalized = runtime::normalize_bare_evidence_ref(raw);
-                        if normalized != raw {
-                            object.insert(field.to_string(), serde_json::Value::String(normalized));
+            let member_result: Result<(String, String), ToolError> = async {
+                let owner = original.tool_progress.batch_policy_owner().map_err(ToolError::unknown)?
+                    .ok_or_else(|| ToolError::unknown("batch original member policy owner missing"))?;
+                match owner.prepare_member_pregrant(original, index).await {
+                runtime::tool_host::AgentBatchMemberPregrant::Replay(member) => {
+                    let tool = entry.get("tool").and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| ToolError::unknown("replayed original member tool unavailable"))?.to_string();
+                    let output = match member.delivery() {
+                        runtime::tool_host::BatchMemberDelivery::Complete(outcome)
+                            if outcome.status == runtime::RuntimeToolExecutionStatus::Executed => outcome.output.clone(),
+                        _ => None,
+                    };
+                    original.tool_progress.record_original_member(index, std::sync::Arc::new(
+                        runtime::tool_host::OriginalMemberSubmitOutcome::Committed(member)));
+                    output.map(|output| (tool, output))
+                        .ok_or_else(|| ToolError::unknown("original member committed; Host delivery incomplete"))
+                }
+                runtime::tool_host::AgentBatchMemberPregrant::Candidate(candidate) => {
+                    let mut candidate = Some(candidate);
+                    let result: Result<(String, String), ToolError> = async {
+                        let inner_tool = entry.get("tool").and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| ToolError::new(format!("agent_action_batch action[{index}] needs a tool")))?;
+                        let prepared = candidate.as_ref().ok_or_else(|| ToolError::unknown("original candidate missing"))?;
+                        if !is_agent_action_tool(inner_tool) || prepared.tool() != inner_tool || prepared.index() != index {
+                            return Err(ToolError::new("original member tool or index mismatch"));
                         }
+                        let inner_input = prepared.normalized_member_input().clone();
+                        let member_ceiling = prepared.member_permission_ceiling()
+                            .map_err(|error| ToolError::unknown(error.to_string()))?;
+                        let action_id = format!("{parent_action_id}:{index}");
+                        let mut inner_binding = binding.for_batch_action(action_id.as_str());
+                        inner_binding.permission_ceiling = member_ceiling;
+                        let receipt = Box::pin(self.execute_runtime_tool_with_member(
+                            inner_tool, inner_input, inner_binding, Some(&mut candidate),
+                            Some((&original.tool_progress, index)),
+                        )).await?;
+                        Ok((inner_tool.to_string(), receipt))
+                    }.await;
+                    match (result, candidate) {
+                        (Err(error), Some(candidate)) => {
+                            let publication = candidate.stop_before_outcome_unknown(error.to_string());
+                            Err(original_member_stop_error(
+                                &original.tool_progress, publication,
+                                "original member stopped before a checked outcome",
+                            ))
+                        }
+                        (result, _) => result,
                     }
                 }
-                for field in ["evidence_refs", "result_refs", "artifact_refs"] {
-                    if let Some(array) = object.get_mut(field).and_then(|v| v.as_array_mut()) {
-                        for entry in array.iter_mut() {
-                            if let Some(raw) = entry.as_str() {
-                                let normalized = runtime::normalize_bare_evidence_ref(raw);
-                                if normalized != raw {
-                                    *entry = serde_json::Value::String(normalized);
-                                }
-                            }
-                        }
+                runtime::tool_host::AgentBatchMemberPregrant::Unknown { failure: _, stop } => {
+                    match stop {
+                        Some(publication) => Err(original_member_stop_error(
+                            &original.tool_progress, publication, "original member pregrant unresolved",
+                        )),
+                        None => Err(ToolError::unknown("original member pregrant unresolved without authenticated stop")),
                     }
                 }
+                }
+            }.await;
+            match member_result {
+                Ok((tool, receipt)) => results.push(serde_json::json!({
+                    "tool": tool,
+                    "receipt": serde_json::from_str::<serde_json::Value>(&receipt)
+                        .unwrap_or(serde_json::Value::String(receipt)),
+                })),
+                Err(error) => {
+                    let original_members = original.tool_progress.original_members();
+                    if !original_members.is_empty() || original.tool_progress.has_original_member_stop() {
+                        let prefix = runtime::PendingAgentBatch::new(
+                            runtime::PendingAgentBatchValue::RecordedSink(original.tool_progress.clone()),
+                        );
+                        let carrier = runtime::PendingAgentBatch::with_cause(
+                            prefix, error.pending_agent_batch().cloned(),
+                        );
+                        return Err(ToolError::unknown_with_agent_batch(
+                            "original batch has committed or unresolved members", carrier,
+                        ));
+                    }
+                    return Err(error);
+                }
             }
-            // Each action gets its own durable identity derived from this call,
-            // so retrying the whole batch is idempotent per action.
-            let action_id = format!("{parent_action_id}:{index}");
-            let inner_binding = RuntimeToolExecutionBinding {
-                action_id: Some(action_id.as_str()),
-                ..binding
-            };
-            let receipt = Box::pin(self.execute_runtime_tool_with_binding(
-                inner_tool,
-                inner_input,
-                inner_binding,
-            ))
-            .await?;
-            results.push(serde_json::json!({
-                "tool": inner_tool,
-                "receipt": serde_json::from_str::<serde_json::Value>(&receipt)
-                    .unwrap_or(serde_json::Value::String(receipt)),
-            }));
         }
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "type": "agent_action_batch",
@@ -672,9 +703,21 @@ impl GatewayToolExecutor {
     async fn execute_runtime_tool_with_binding(
         &self,
         tool_name: &str,
-        mut value: serde_json::Value,
+        value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        self.execute_runtime_tool_with_member(tool_name, value, binding, None, None).await
+    }
+
+    async fn execute_runtime_tool_with_member(
+        &self, tool_name: &str, mut value: serde_json::Value,
+        binding: RuntimeToolExecutionBinding<'_>,
+        mut member: Option<&mut Option<runtime::step_snapshot::OriginalPreparedMemberCapability>>,
+        member_results: Option<(&runtime::ToolProgressSink, usize)>,
+    ) -> Result<String, ToolError> {
+        if member.is_some() && !is_agent_action_tool(tool_name) {
+            return Err(ToolError::new("member admission requires an Agent action"));
+        }
         let repaired_fields = if binding.tool_lease.is_some() { Vec::new() } else {
             self.coerce_string_typed_structured_fields(tool_name, &mut value)
         };
@@ -686,7 +729,7 @@ impl GatewayToolExecutor {
             );
         }
         if tool_name == "agent_action_batch" {
-            return self.execute_agent_action_batch(value, binding).await;
+            return Err(ToolError::unknown("unknown: original batch request/owner unavailable"));
         }
         if matches!(tool_name, "artifact_publish" | "artifact_materialize") {
             return self
@@ -694,10 +737,15 @@ impl GatewayToolExecutor {
                 .await;
         }
         if is_agent_action_tool(tool_name) {
+            let original_action_input = value.clone();
             let services = self.upgrade_runtime_services().ok_or_else(|| {
                 ToolError::new("Agent action requires the workspace RuntimeServices")
             })?;
-            let actor = match binding.parent_execution {
+            let original_root = binding.action_invocation.and_then(|capability| capability.root_physical_owner());
+            let root_parent = original_root.as_ref().map(|physical| harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: physical.graph_id.clone(), node_id: physical.node_id.clone(),
+            });
+            let actor = match root_parent.as_ref().or(binding.parent_execution) {
                 Some(parent) => {
                     let trusted_root = binding
                         .execution_decision
@@ -714,7 +762,13 @@ impl GatewayToolExecutor {
                         .transpose()
                         .map_err(ToolError::new)?;
                     services
-                        .resolve_agent_action_actor(parent, trusted_root)
+                        .resolve_agent_action_actor_for_attempt(
+                            parent,
+                            original_root.as_ref().map(|p| p.attempt).or(binding.parent_execution_attempt).ok_or_else(|| ToolError::new(
+                                "Agent actions require the original node attempt",
+                            ))?,
+                            trusted_root,
+                        )
                         .await
                         .map_err(ToolError::new)?
                 }
@@ -775,10 +829,36 @@ impl GatewayToolExecutor {
                 expected_revision,
                 action,
             };
-            let mut observation = services
-                .submit_agent_action(&envelope)
-                .await
-                .map_err(ToolError::new)?;
+            let mut observation = match member.as_deref_mut() {
+                Some(candidate) => {
+                    let (sink, index) = member_results.ok_or_else(|| ToolError::unknown("original member result carrier unavailable"))?;
+                    let capability = candidate.take().ok_or_else(|| ToolError::unknown("original member candidate unavailable"))?;
+                    match services.submit_agent_action_member(&envelope, capability).await {
+                        runtime::tool_host::PreparedMemberSubmitOutcome::Committed(committed) => {
+                            let observation = match committed.observation() {
+                                runtime::tool_host::OriginalMemberObservation::Available(observation) => Some(observation.clone()),
+                                runtime::tool_host::OriginalMemberObservation::Unavailable => None,
+                            };
+                            sink.record_original_member(index, std::sync::Arc::new(
+                                runtime::tool_host::OriginalMemberSubmitOutcome::Committed(committed)));
+                            observation.ok_or_else(|| ToolError::unknown("original member committed; observation unavailable"))?
+                        }
+                        runtime::tool_host::PreparedMemberSubmitOutcome::Stopped(publication) =>
+                            return Err(original_member_stop_error(
+                                sink, publication, "original member checked outcome unresolved",
+                            )),
+                    }
+                },
+                None => {
+                    let capability = binding.action_invocation.ok_or_else(||
+                        ToolError::unknown("original single-call capability unavailable"))?;
+                    services.submit_delegated_tool_action(capability, &envelope, tool_name, &original_action_input)
+                        .await.map_err(|error| match error {
+                            runtime::AgentActionServiceError::MemberUnknown(_) => ToolError::unknown(error.to_string()),
+                            other => ToolError::new(other.to_string()),
+                        })?
+                }
+            };
             // `objective_complete_request` only commits the model-authored
             // request here. The durable Program projection lane is the sole
             // live reconciliation trigger: it asks ObjectiveSupervisor for a
@@ -999,14 +1079,32 @@ impl GatewayToolExecutor {
             let context = binding.memory_context.ok_or_else(|| {
                 ToolError::new("working_context requires the exact Runtime Memory binding")
             })?;
-            if binding.session_id != Some(context.session_id.as_str()) {
-                return Err(ToolError::new("working context Session binding mismatch"));
-            }
+            runtime::working_context::authorize_session_binding(
+                binding.session_id,
+                &context.session_id,
+            )
+            .map_err(ToolError::new)?;
             let services = self
                 .upgrade_runtime_services()
                 .ok_or_else(|| ToolError::new("working context Runtime unavailable"))?;
+            // The artifact visibility scopes this call is authorized for: the
+            // authenticated Session, plus the execution this turn belongs to.
+            // An authorized tool call is not a license to read every artifact.
+            let mut visibility_scopes = vec![format!("session:{}", context.session_id)];
+            if let Some(decision) = binding.execution_decision {
+                if let Some(execution) = decision.execution_graph_ref.as_ref() {
+                    if !execution.trim().is_empty() {
+                        visibility_scopes.push(format!("execution:{}", execution));
+                    }
+                }
+            }
             let output = services
-                .working_context_command(context, binding.action_id.unwrap_or(""), input)
+                .working_context_command(
+                    context,
+                    binding.action_id.unwrap_or(""),
+                    input,
+                    visibility_scopes,
+                )
                 .await
                 .map_err(ToolError::new)?;
             return serde_json::to_string(&output)

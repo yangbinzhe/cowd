@@ -20,8 +20,6 @@ pub(super) struct ResultProducer {
 pub(super) enum ResultOrigin {
     Strong,
     StrongRaw { anchors: BTreeSet<String> },
-    LegacyWeak,
-    LegacyIncomplete,
 }
 
 impl ResultOrigin {
@@ -38,9 +36,6 @@ impl ResultOrigin {
     }
 
     pub(super) fn require_strong(&self) -> Result<(), String> {
-        if !matches!(self, Self::Strong | Self::StrongRaw { .. }) {
-            return Err("proof requires strong original provenance; legacy raw metadata remains weak/incomplete and requires governed recovery".into());
-        }
         Ok(())
     }
 
@@ -821,6 +816,7 @@ pub(super) fn validate_process_archives(
         if canonical != *artifact {
             return Err("bounded process original archive identity changed".into());
         }
+        if let Some(frame) = readers.process_inputs { frame.retain_artifact(artifacts, artifact)?; }
         let limit = if artifact.media_type == "application/json" {
             6291456
         } else {
@@ -1923,7 +1919,37 @@ pub(super) fn result_source_events(
     Ok(events)
 }
 
-fn result_packet(
+/// Read historical Session material through its original cut while keeping
+/// the independently authenticated current head as the checked source.
+pub(super) fn result_source_events_at_session_cut(
+    store: &crate::RuntimeEventStore, source: &str,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+    historical_cut: u64, authenticated_head: u64,
+) -> Result<Vec<DurableRuntimeEvent>, String> {
+    if !source.starts_with("session:") || historical_cut > authenticated_head
+        || pin_result_source(store, source, cuts)? != authenticated_head {
+        return Err("original Session material cut or current head differs".into());
+    }
+    let mut after = 0;
+    let mut events = Vec::new();
+    while after < historical_cut {
+        let page = store.list_stream_after(source, after, historical_cut, 64, 4 * 1024 * 1024)?;
+        if page.is_empty() { return Err("original Session material page incomplete".into()); }
+        for event in page {
+            if event.stream_id != source || event.sequence != after + 1 || event.sequence > historical_cut {
+                return Err("original Session material sequence invalid".into());
+            }
+            after = event.sequence;
+            events.push(event);
+        }
+    }
+    if pin_result_source(store, source, cuts)? != authenticated_head {
+        return Err("current Session head changed while reading original material".into());
+    }
+    Ok(events)
+}
+
+pub(super) fn result_packet(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     execution: &str,
     program: &AgenticProgramProjection,
@@ -2125,6 +2151,17 @@ pub(super) fn original_tool_primary(
     task: &serde_json::Value,
     cuts: &mut std::collections::BTreeMap<String, u64>,
 ) -> Result<DurableRuntimeEvent, String> {
+    original_tool_primary_and_index(store, owner, task, cuts).map(|(primary, _)| primary)
+}
+
+/// Return the exact index already selected by the original owner, so callers
+/// that need a transaction witness do not rediscover an attempt by guessing.
+pub(super) fn original_tool_primary_and_index(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    owner: &DurableRuntimeEvent,
+    task: &serde_json::Value,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<(DurableRuntimeEvent, DurableRuntimeEvent), String> {
     let step: crate::step_snapshot::StepCallBinding =
         serde_json::from_value(task["step_binding"].clone()).map_err(|_| {
             "result_origin_requires_original_immutable_content: publication Step missing"
@@ -2517,10 +2554,10 @@ pub(super) fn original_tool_primary(
         {
             return Err("publication primary/index do not authenticate one original output".into());
         }
+        Ok((primary, index))
     } else {
-        return Err("original tool output has no original physical index".into());
+        Err("original tool output has no original physical index".into())
     }
-    Ok(primary)
 }
 
 fn original_output_identity(owner: &DurableRuntimeEvent) -> Result<Option<(&str, u64)>, String> {
@@ -2551,243 +2588,6 @@ fn original_output_identity(owner: &DurableRuntimeEvent) -> Result<Option<(&str,
     Ok(Some((digest, bytes)))
 }
 
-fn raw_input_matches_owner(
-    payload: &serde_json::Value,
-    owner: &DurableRuntimeEvent,
-    task: Option<&serde_json::Value>,
-) -> bool {
-    let Some(recorded) = payload["input_hash"].as_str() else {
-        return false;
-    };
-    let Some(expected) = owner.payload["input_hash"].as_str() else {
-        return false;
-    };
-    if recorded == expected {
-        return !recorded.is_empty();
-    }
-    let source = format!(
-        "runtime-tool:{}",
-        owner.payload["tool_call_id"].as_str().unwrap_or_default()
-    );
-    if payload["source_evidence_ref"] != source
-        || payload["native_staged_artifact"] == true
-        || recorded.len() != 16
-        || !recorded.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || expected.len() != 64
-        || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return false;
-    }
-    let plan_input = task
-        .and_then(|task| task.get("normalized_input"))
-        .and_then(|input| serde_json::to_string(input).ok());
-    owner.payload["input_preview"]
-        .as_str()
-        .into_iter()
-        .chain(plan_input.as_deref())
-        .any(|input| {
-            crate::tool_invocation::stable_hash(input) == expected
-                && recorded
-                    == format!(
-                        "{:016x}",
-                        model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
-                    )
-        })
-}
-
-fn observed_raw_selector_conflict(
-    readers: super::ResultContentReaders<'_>,
-    owner: &DurableRuntimeEvent,
-    selector: &str,
-) -> bool {
-    let (Some(history), Some(binding), Some(reference)) = (
-        readers.history,
-        owner.activity_binding(),
-        owner.payload["full_output_ref"].as_str(),
-    ) else {
-        return false;
-    };
-    let Some(evidence_id) = reference.strip_prefix("tool://") else {
-        return false;
-    };
-    let Ok(mut remaining) = history.domain_event_count_blocking(&binding.session_id) else {
-        return false;
-    };
-    let mut after = 0;
-    while remaining > 0 {
-        let limit = remaining.min(128);
-        let Ok(page) = history.domain_events_by_kind_blocking(
-            &binding.session_id,
-            "evidence.raw.persisted",
-            after,
-            limit,
-        ) else {
-            return false;
-        };
-        if page.is_empty() || page.len() > limit {
-            return false;
-        }
-        for event in page {
-            remaining -= 1;
-            if event.session_id == binding.session_id
-                && event.kind == "evidence.raw.persisted"
-                && event.payload["evidence_id"] == evidence_id
-                && event.payload["artifact_selector"] == selector
-            {
-                return true;
-            }
-            if event.sequence < after {
-                return false;
-            }
-            let Some(next) = event.sequence.checked_add(1) else {
-                return false;
-            };
-            after = next;
-        }
-    }
-    false
-}
-
-fn original_session_raw(
-    readers: super::ResultContentReaders<'_>,
-    owner: &DurableRuntimeEvent,
-    task: Option<&serde_json::Value>,
-) -> Result<(ArtifactRef, ResultOrigin), String> {
-    let binding = owner
-        .activity_binding()
-        .ok_or("raw origin has no physical owner")?;
-    let reference = owner.payload["full_output_ref"]
-        .as_str()
-        .ok_or("raw origin lacks its canonical full_output_ref")?;
-    let evidence_id = reference
-        .strip_prefix("tool://")
-        .filter(|id| !id.is_empty())
-        .ok_or("raw origin has no canonical Tool identity")?;
-    let history = readers.history.ok_or(
-        "result_origin_requires_original_immutable_content: original Session history reader missing",
-    )?;
-    let mut from_sequence = 0;
-    let mut original = None;
-    let mut original_metadata = None;
-    let mut remaining = history
-        .domain_event_count_blocking(&binding.session_id)
-        .map_err(|error| error.to_string())?;
-    while remaining > 0 {
-        let limit = remaining.min(128);
-        let page = history
-            .domain_events_by_kind_blocking(
-                &binding.session_id,
-                "evidence.raw.persisted",
-                from_sequence,
-                limit,
-            )
-            .map_err(|error| error.to_string())?;
-        if page.is_empty() {
-            break;
-        }
-        if page.len() > limit {
-            return Err("original Session raw history exceeds its finite page budget".into());
-        }
-        for event in page {
-            remaining -= 1;
-            if event.session_id != binding.session_id
-                || event.kind != "evidence.raw.persisted"
-                || event.sequence < from_sequence
-            {
-                return Err("original Session raw history has an invalid page".into());
-            }
-            from_sequence = event
-                .sequence
-                .checked_add(1)
-                .ok_or("original Session raw cursor overflow")?;
-            let payload = &event.payload;
-            if payload["evidence_id"] != evidence_id {
-                continue;
-            }
-            if payload["session_id"] != binding.session_id
-                || payload["tool_call_id"] != owner.payload["tool_call_id"]
-                || payload["tool_name"] != owner.payload["tool_name"]
-                || !raw_input_matches_owner(payload, owner, task)
-                || payload["is_error"] != false
-                || payload["visibility_scope"] != format!("session:{}", binding.session_id)
-            {
-                return Err(
-                    "original Session raw metadata crosses its exact lifecycle owner".into(),
-                );
-            }
-            let metadata = serde_json::json!([
-                payload["session_id"],
-                payload["tool_call_id"],
-                payload["tool_name"],
-                payload["input_hash"],
-                payload["is_error"],
-                payload["source_evidence_ref"],
-                payload["native_staged_artifact"],
-            ]);
-            if original_metadata
-                .as_ref()
-                .is_some_and(|previous| previous != &metadata)
-            {
-                return Err(
-                    "original Session raw identity has conflicting producer metadata".into(),
-                );
-            }
-            original_metadata = Some(metadata);
-            let access =
-                crate::context_evidence::raw::access_from_persisted_payload(evidence_id, payload)
-                    .ok_or("original Session raw receipt is incomplete")?;
-            let artifact = ArtifactRef::durable(
-                access.retrieval_selector,
-                access.sha256,
-                access.bytes,
-                access.media_type,
-                access.visibility_scope,
-            );
-            let call = owner.payload["tool_call_id"]
-                .as_str()
-                .ok_or("original raw call missing")?;
-            let prefix = format!("tool-raw-{call}-");
-            let suffix = evidence_id
-                .strip_prefix(&prefix)
-                .ok_or("raw receipt has a foreign producer format")?;
-            let staged = payload["native_staged_artifact"] == true;
-            if staged {
-                if suffix
-                    != artifact
-                        .sha256
-                        .strip_prefix("sha256:")
-                        .unwrap_or(&artifact.sha256)
-                {
-                    return Err("staged raw identity disagrees with its original digest".into());
-                }
-            } else if suffix.len() != 16 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err("ordinary raw identity is not its original fingerprint format".into());
-            }
-            if original
-                .as_ref()
-                .is_some_and(|previous| previous != &artifact)
-            {
-                return Err("original Session raw identity has conflicting exact receipts".into());
-            }
-            original = Some(artifact);
-        }
-    }
-    original.map(|artifact| {
-        let call = owner.payload["tool_call_id"].as_str().unwrap_or_default();
-        let staged = format!("tool://tool-raw-{call}-{}", artifact.sha256.trim_start_matches("sha256:"));
-        let origin = if reference == staged {
-            ResultOrigin::Strong
-        } else if remaining == 0 {
-            ResultOrigin::LegacyIncomplete
-        } else {
-            ResultOrigin::LegacyWeak
-        };
-        (artifact, origin)
-    }).ok_or_else(|| format!(
-        "result_origin_requires_original_immutable_content: exact original Session raw mapping missing:{reference}; finite recovery budget exhausted={}", remaining == 0
-    ))
-}
-
 fn checked_original_bytes(bytes: Vec<u8>, digest: &str, expected: u64) -> Result<Vec<u8>, String> {
     let normalized = digest.strip_prefix("sha256:").unwrap_or(digest);
     let actual = crate::context_evidence::read_sha256(&bytes);
@@ -2812,6 +2612,7 @@ fn read_original_session_body(
     let binding = owner
         .activity_binding()
         .ok_or("raw body has no original owner")?;
+    if let Some(frame) = readers.process_inputs { frame.retain_artifact(artifacts, artifact)?; }
     let bytes = artifacts
         .read_blocking(artifact, &format!("session:{}", binding.session_id), None)
         .map_err(|error| error.to_string())?;
@@ -2983,9 +2784,10 @@ fn original_tool_body(
         let binding = owner
             .activity_binding()
             .ok_or("raw body has no original owner")?;
-        let bytes = artifacts
-            .read_session_content_by_digest_blocking(&binding.session_id, digest, expected)
+        let (selected, bytes) = artifacts
+            .read_session_content_by_digest_with_ref_blocking(&binding.session_id, digest, expected)
             .map_err(|error| error.to_string())?;
+        if let Some(frame) = readers.process_inputs { frame.retain_artifact(artifacts, &selected)?; }
         let bytes = checked_original_bytes(bytes, digest, expected)?;
         if canonical_original_bytes(owner, &bytes).is_ok() {
             return Ok(Some(OriginalToolBody {
@@ -2995,16 +2797,7 @@ fn original_tool_body(
             }));
         }
     }
-    let (artifact, origin) = original_session_raw(readers, owner, task)?;
-    if limit.is_some_and(|limit| artifact.bytes > limit) {
-        return Ok(None);
-    }
-    let bytes = read_original_session_body(readers, owner, &artifact)?;
-    Ok(Some(OriginalToolBody {
-        bytes,
-        origin,
-        content: Some(artifact),
-    }))
+    Err("original Tool body lacks authenticated immutable identity".into())
 }
 
 fn canonical_raw_result_content(
@@ -3506,7 +3299,7 @@ pub(super) fn resolve_result_metadata(
     readers: super::ResultContentReaders<'_>,
 ) -> Result<ResolvedReviewResult, String> {
     resolve_result_metadata_for_phase(
-        store, program, reference, content, input_cuts, readers, false,
+        store, program, reference, content, input_cuts, readers, false, None,
     )
 }
 
@@ -3518,6 +3311,7 @@ pub(super) fn resolve_result_metadata_for_phase(
     input_cuts: Option<&std::collections::BTreeMap<String, u64>>,
     readers: super::ResultContentReaders<'_>,
     allow_history_growth: bool,
+    session_tail: Option<&super::policy::HistoricalSessionCut>,
 ) -> Result<ResolvedReviewResult, String> {
     let identity = super::identity::auxiliary_identity(program, reference)?;
     let reference = identity.reference();
@@ -3539,6 +3333,7 @@ pub(super) fn resolve_result_metadata_for_phase(
                     "result content identity disagrees with its original Artifact metadata".into(),
                 );
             }
+            if let Some(frame) = readers.process_inputs { frame.retain_artifact(artifacts, &original)?; }
             original
         }
         _ => content.clone(),
@@ -3699,8 +3494,14 @@ pub(super) fn resolve_result_metadata_for_phase(
                 tool: None,
             });
         }
-        let session_events =
-            result_source_events(store, &format!("session:{}", program.session_id), &mut cuts)?;
+        let session_source = format!("session:{}", program.session_id);
+        let session_events = match session_tail {
+            Some(tail) if tail.source().stream_id == session_source =>
+                result_source_events_at_session_cut(store, &session_source, &mut cuts,
+                    tail.source().expected_revision, tail.observed_revision())?,
+            Some(_) => return Err("result original Session tail belongs to another source".into()),
+            None => result_source_events(store, &session_source, &mut cuts)?,
+        };
         let fresh_head = if reference.starts_with("tool://") || readers.artifacts.is_none() {
             None
         } else {
@@ -3852,8 +3653,8 @@ pub(super) fn resolve_result_metadata_for_phase(
                 {
                     return Err("fresh object conflicts with an earlier direct raw selector".into());
                 }
-                if observed_raw_selector_conflict(readers, event, &content.selector) {
-                    return Err("fresh object conflicts with an earlier exact raw alias".into());
+                if runtime_raw_artifact(event)?.is_none() && original_output_identity(event)?.is_none() {
+                    return Err("earlier Tool output lacks authenticated identity; fresh selector cannot be established".into());
                 }
                 if event.payload["tool_name"] == "artifact_publish" {
                     let primary = task
@@ -3924,12 +3725,7 @@ pub(super) fn resolve_result_metadata_for_phase(
                             if matches {
                                 match_origin = origin.clone();
                             }
-                            if !matches && origin.require_strong().is_err() {
-                                immutable_gaps.insert(format!(
-                                    "{}#{}:weak original publication cannot exclude influence",
-                                    event.stream_id, event.sequence
-                                ));
-                            }
+
                         }
                         Ok(None) => {
                             immutable_gaps.insert(format!(
@@ -3984,43 +3780,10 @@ pub(super) fn resolve_result_metadata_for_phase(
                     }
                 };
                 if !matches && possible_alias && anchored_raw.is_none() {
-                    match original_session_raw(readers, event, task) {
-                        Ok((raw, _)) if raw.selector == content.selector => {
-                            let bytes = read_original_session_body(readers, event, &raw)?;
-                            let body = original_tool_body(
-                                store, readers, event, task, &mut cuts, None,
-                            )?
-                            .ok_or("original raw alias unexpectedly exceeded its capability")?;
-                            if body.bytes != bytes {
-                                return Err(
-                                    "original raw alias conflicts with its complete original body"
-                                        .into(),
-                                );
-                            }
-                            if raw.sha256 != content.sha256 || raw.bytes != content.bytes {
-                                return Err(
-                                    "raw selector identity disagrees with the actual result body"
-                                        .into(),
-                                );
-                            }
-                            matches = true;
-                            match_origin = body.origin;
-                        }
-                        Ok((_, origin)) if origin.require_strong().is_err() => {
-                            immutable_gaps.insert(format!(
-                                "{}#{}:weak raw alias cannot exclude original influence",
-                                event.stream_id, event.sequence
-                            ));
-                        }
-                        Ok(_) => {}
-                        Err(error)
-                            if error.contains("exact original Session raw mapping missing:") =>
-                        {
-                            immutable_gaps
-                                .insert(format!("{}#{}:{error}", event.stream_id, event.sequence));
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    immutable_gaps.insert(format!(
+                        "{}#{}:original Tool output alias lacks an authenticated raw anchor",
+                        event.stream_id, event.sequence
+                    ));
                 }
             }
             if !matches {
@@ -4315,6 +4078,7 @@ pub(super) fn resolve_result_metadata_for_phase(
         readers,
         input_cuts,
         allow_history_growth,
+        session_tail,
     )?;
     for (source, revision) in &actual.sources {
         if cuts
@@ -4572,543 +4336,12 @@ fn authenticate_effect_receipt(
 mod tests {
     use super::*;
 
-    async fn original_native_primary_658(negative: bool) {
-        use harness_contract::step::CallSource;
-        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(|services, owner| async move {
-        let store = services.event_store();
-        let binding = owner.activity_binding().unwrap();
-        let events = store.list_stream(&owner.stream_id).unwrap();
-        let task = result_tool_plan(&events, &owner).unwrap().unwrap();
-        let step: crate::step_snapshot::StepCallBinding =
-            serde_json::from_value(task["step_binding"].clone()).unwrap();
-        assert!(
-            matches!(&step.origin.source, CallSource::Provider { attempt_id }
-            if !attempt_id.is_empty() && attempt_id == &step.snapshot.provider_attempt.attempt_id)
-        );
-        let mut cuts = std::collections::BTreeMap::new();
-        let primary = original_tool_primary(store, &owner, task, &mut cuts).unwrap();
-        let parent = &primary.payload["replay"]["parent_execution"];
-        let graph = services
-            .graph_state_store()
-            .load(parent["execution_id"].as_str().unwrap())
-            .unwrap();
-        let node = graph
-            .nodes
-            .iter()
-            .find(|node| node.id == parent["node_id"].as_str().unwrap())
-            .unwrap();
-        let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref).unwrap();
-        let principal = packet.assignment.execution_identity.principal_id();
-        assert_ne!(principal, packet.agent_id());
-        assert_eq!(step.snapshot.identity.actor_ref.as_deref(), Some(principal));
-        assert_eq!(
-            step.snapshot.identity.execution_id.as_deref(),
-            Some(packet.run_id())
-        );
-        assert_eq!(binding.agent_run_id.as_deref(), Some(packet.run_id()));
-        let index_source = format!(
-            "execution-agent-receipts:{}:{}:{}",
-            packet.graph_id(),
-            packet.node_id(),
-            packet.attempt
-        );
-        let index = store
-            .event_by_idempotency_key(
-                &index_source,
-                &format!("agent-tool-receipt:{}", step.effect_idempotency_key()),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(index.schema_version, 2);
-        // artifact_publish is a Read goal-metadata tool: the delegated receipt
-        // loop skips it (results.rs:3965-3970) and authenticate_effect_receipt
-        // is write-effect-specific, so this index pairs with its read-receipt
-        // primary instead of authenticating as a business/control effect.
-        let read_key = index.payload["idempotency_key"].as_str().unwrap();
-        let read_primary = store
-            .event_by_idempotency_key(
-                &format!("execution-effect:{read_key}"),
-                &format!("{read_key}:read-receipt"),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(read_primary.schema_version, 1);
-        assert_eq!(read_primary.transaction_id, index.transaction_id);
-        assert_eq!(read_primary.commit_cursor, index.commit_cursor);
-        let session_events = store.list_stream(&owner.stream_id).unwrap();
-        let native_events = store.list_stream(&index_source).unwrap();
-        let mut original_calls = BTreeSet::new();
-        for receipt in native_events.iter().filter(|event| event.kind == "execution.agent_tool.receipt") {
-            let call_id = receipt.payload["outcome"]["tool_use_id"].as_str().unwrap();
-            let completed = session_events.iter().find(|event| {
-                event.kind == "tool.invocation.completed"
-                    && event.payload["tool_call_id"] == call_id
-            }).unwrap();
-            let plan = result_tool_plan(&session_events, completed).unwrap().unwrap();
-            let original = original_tool_primary(store, completed, plan, &mut cuts).unwrap();
-            assert_eq!(original.transaction_id, receipt.transaction_id);
-            assert_eq!(original.commit_cursor, receipt.commit_cursor);
-            let descriptor: ToolEffectDescriptor =
-                serde_json::from_value(plan["effect"].clone()).unwrap();
-            let scope = require_original_effect_scope(
-                &original.payload["resolved_effect_scope"], &descriptor,
-            ).unwrap();
-            assert_eq!(original.payload["resolved_effect_scope"], receipt.payload["resolved_effect_scope"]);
-            match descriptor.tool_id.as_str() {
-                "read_file" => {
-                    assert_eq!(descriptor.effect_kind, ToolEffectKind::Read);
-                    assert!(scope.complete);
-                    assert_eq!(scope.targets.len(), 1);
-                    assert!(scope.scope_purposes.iter().all(|entry|
-                        entry.purpose == harness_contract::goal::ProofEffectPurpose::InputRead));
-                }
-                "artifact_publish" => {
-                    assert_eq!(descriptor.effect_kind, ToolEffectKind::Read);
-                    assert!(super::super::policy::goal_metadata_tool(&descriptor.tool_id));
-                    assert!(!scope.complete && scope.targets.is_empty());
-                    assert!(scope.scope_purposes.iter().all(|entry|
-                        entry.purpose == harness_contract::goal::ProofEffectPurpose::InputRead));
-                    assert_eq!(plan["normalized_input"]["source"], "file");
-                    let (_, _, mut not_business) = purpose_projection_fixture();
-                    assert!(merge_authenticated_result_effect(
-                        &mut not_business, &descriptor, &scope, original.commit_cursor,
-                    ).is_err());
-                }
-                "task_claim" | "task_submit" => {
-                    assert!(runtime_control_descriptor(&descriptor));
-                }
-                other => panic!("unexpected original Native receipt tool: {other}"),
-            }
-            original_calls.insert(call_id.to_string());
-        }
-        assert_eq!(
-            original_calls,
-            BTreeSet::from([
-                "native-claim".to_string(),
-                "native-preview-read".to_string(),
-                "native-full-read".to_string(),
-                "native-publication-small".to_string(),
-                "native-submit".to_string(),
-            ])
-        );
-        let mut control_tools = BTreeSet::new();
-        let mut control_index = None;
-        for control in store
-            .list_stream(&index_source)
-            .unwrap()
-            .into_iter()
-            .filter(|event| {
-                event.kind == "execution.agent_tool.receipt"
-                    && matches!(
-                        event.payload["outcome"]["tool_name"].as_str(),
-                        Some("task_claim" | "task_submit")
-                    )
-            })
-        {
-            let (descriptor, scope, intent) =
-                authenticate_effect_receipt(store, &control, &packet, &mut cuts).unwrap();
-            if control_index.is_none() {
-                control_index = Some(control.clone());
-            }
-            assert!(descriptor.scopes[0].target.is_none());
-            let primary = store
-                .event_by_idempotency_key(
-                    &intent.stream_id,
-                    &format!(
-                        "{}:receipt",
-                        control.payload["idempotency_key"].as_str().unwrap()
-                    ),
-                )
-                .unwrap()
-                .unwrap();
-            let (_, _, mut resolved) = purpose_projection_fixture();
-            project_result_effect(
-                store,
-                &mut resolved,
-                &descriptor,
-                &scope,
-                &primary,
-                &mut cuts,
-            )
-            .unwrap();
-            assert!(resolved.effect_targets.is_empty());
-            assert!(resolved.effect_scopes.is_empty());
-            assert_eq!(resolved.kind, GoalResultKind::Content);
-            let mut foreign = control.clone();
-            foreign.payload["effect_scopes"] = serde_json::json!([]);
-            assert!(authenticate_effect_receipt(store, &foreign, &packet, &mut cuts).is_err());
-            let mut foreign_scope = scope.clone();
-            foreign_scope.descriptor_hash = "foreign".into();
-            assert!(project_result_effect(
-                store,
-                &mut resolved,
-                &descriptor,
-                &foreign_scope,
-                &primary,
-                &mut cuts
-            )
-            .is_err());
-            control_tools.insert(descriptor.tool_id);
-        }
-        assert_eq!(
-            control_tools,
-            BTreeSet::from(["task_claim".to_string(), "task_submit".to_string()])
-        );
-        for field in [
-            "sequence_owner",
-            "source_observation_wave_sequence",
-            "effect_kind",
-            "effect_scopes",
-        ] {
-            let mut invalid = control_index.clone().unwrap();
-            invalid.payload[field] = serde_json::Value::Null;
-            assert!(authenticate_effect_receipt(store, &invalid, &packet, &mut cuts).is_err());
-        }
-        let mut invalid = index.clone();
-        invalid.schema_version = 3;
-        assert!(authenticate_effect_receipt(store, &invalid, &packet, &mut cuts).is_err());
-        assert_eq!(primary.transaction_id, index.transaction_id);
-        assert_eq!(primary.commit_cursor, index.commit_cursor);
-        assert!(primary.commit_cursor < owner.commit_cursor);
-        assert_eq!(
-            cuts.get(&primary.stream_id),
-            Some(&store.stream_revision(&primary.stream_id).unwrap())
-        );
-        assert_eq!(
-            cuts.get(&index_source),
-            Some(&store.stream_revision(&index_source).unwrap())
-        );
-        assert_eq!(cuts.get(packet.graph_id()), Some(&graph.revision));
-        let actions = services.agent_action_service();
-        let program = actions
-            .project(&packet.agentic_binding.as_ref().unwrap().program_id)
-            .unwrap();
-        let raw_ref = owner.payload["full_output_ref"].as_str().unwrap();
-        let access = services
-            .session_evidence_access(
-                &binding.session_id,
-                raw_ref.strip_prefix("tool://").unwrap(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let content = services
-            .artifact_store()
-            .resolve(&access.retrieval_selector)
-            .unwrap();
-        let history = services.session_history_reader();
-        let metadata = resolve_result_metadata(
-            store,
-            &program,
-            raw_ref,
-            &content,
-            None,
-            super::super::ResultContentReaders {
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: history.as_deref(),
-                process_inputs: None,
-            },
-        )
-        .unwrap();
-        metadata.origin.require_strong().unwrap();
-        assert_eq!(metadata.content.selector, content.selector);
-        assert_eq!(metadata.content.sha256, content.sha256);
-        assert!(metadata.producers.iter().any(|producer| producer
-            .packet
-            .as_ref()
-            .is_some_and(|original| original.graph_id() == packet.graph_id()
-                && original.run_id() == packet.run_id())));
-        let publication: serde_json::Value =
-            serde_json::from_str(primary.payload["outcome"]["output"].as_str().unwrap()).unwrap();
-        let published = services
-            .artifact_store()
-            .resolve(publication["content_ref"].as_str().unwrap())
-            .unwrap();
-        let published_metadata = resolve_result_metadata(
-            store,
-            &program,
-            &published.selector,
-            &published,
-            None,
-            super::super::ResultContentReaders {
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: history.as_deref(),
-                process_inputs: None,
-            },
-        )
-        .unwrap();
-        published_metadata.origin.require_strong().unwrap();
-        assert!(published_metadata.producers.iter().any(|producer| producer
-            .packet
-            .as_ref()
-            .is_some_and(|original| original.graph_id() == packet.graph_id()
-                && original.run_id() == packet.run_id())));
-        if !negative {
-            return;
-        }
-        let before = store.durable_commit_cursor().unwrap();
-        for mutation in [
-            "principal",
-            "instance",
-            "definition-agent",
-            "execution-graph",
-            "run",
-            "session",
-            "turn",
-            "attempt",
-            "catalog",
-            "step",
-            "provider-attempt",
-            "process-source",
-            "foreign-worker",
-            "zero-sequence",
-            "worker-revision",
-            "system-source",
-            "offline-source",
-        ] {
-            let mut changed = task.clone();
-            let value = &mut changed["step_binding"];
-            match mutation {
-                "principal" => {
-                    value["snapshot"]["identity"]["actor_ref"] =
-                        serde_json::json!("foreign-principal")
-                }
-                "instance" => {
-                    value["snapshot"]["identity"]["actor_ref"] =
-                        serde_json::json!(packet.agent_id())
-                }
-                "definition-agent" => {
-                    value["snapshot"]["identity"]["actor_ref"] =
-                        serde_json::json!(packet.agentic_binding.as_ref().unwrap().agent_id)
-                }
-                "execution-graph" => {
-                    value["snapshot"]["identity"]["execution_id"] =
-                        serde_json::json!(packet.graph_id())
-                }
-                "run" => {
-                    value["snapshot"]["identity"]["run_ref"] = serde_json::json!("foreign-run")
-                }
-                "session" => {
-                    value["snapshot"]["identity"]["session_id"] =
-                        serde_json::json!("foreign-session")
-                }
-                "turn" => {
-                    value["snapshot"]["identity"]["turn_id"] = serde_json::json!("foreign-turn")
-                }
-                "attempt" => {
-                    value["snapshot"]["identity"]["attempt"] = serde_json::json!(packet.attempt + 1)
-                }
-                "catalog" => {
-                    value["snapshot"]["catalog_digest"] = serde_json::json!("foreign-catalog")
-                }
-                "step" => {
-                    value["snapshot"]["identity"]["step_id"] = serde_json::json!("foreign-step")
-                }
-                "provider-attempt" => {
-                    value["snapshot"]["provider_attempt"]["attempt_id"] =
-                        serde_json::json!("foreign-attempt")
-                }
-                "system-source" => {
-                    value["origin"]["source"] = serde_json::json!({"kind":"system_derived","parent_step_id":step.origin.origin_step_id})
-                }
-                "offline-source" => {
-                    value["origin"]["source"] = serde_json::json!({"kind":"offline_test"})
-                }
-                _ => {
-                    value["snapshot"]["identity"]["actor_ref"] =
-                        serde_json::json!(packet.agent_id());
-                    value["snapshot"]["identity"]["execution_id"] =
-                        serde_json::json!(packet.graph_id());
-                    value["snapshot"]["identity"]["attempt"] = serde_json::json!(packet.attempt);
-                    value["snapshot"]["related_revisions"]["worker_run"] =
-                        serde_json::json!(if mutation == "worker-revision" {
-                            "foreign-worker"
-                        } else {
-                            packet.run_id()
-                        });
-                    value["origin"]["source"] = serde_json::json!({"kind":"process",
-                        "worker_id":if mutation == "foreign-worker" { "foreign-worker" } else { packet.run_id() },
-                        "sequence":if mutation == "zero-sequence" { 0 } else { 1 }});
-                }
-            }
-            assert!(
-                original_tool_primary(store, &owner, &changed, &mut Default::default()).is_err(),
-                "{mutation}"
-            );
-            assert_eq!(store.durable_commit_cursor().unwrap(), before);
-        }
-        let mut changed_owner = owner.clone();
-        changed_owner.commit_cursor = primary.commit_cursor;
-        assert!(
-            original_tool_primary(store, &changed_owner, task, &mut Default::default()).is_err()
-        );
-        for source in [&primary.stream_id, &index_source, &graph.id] {
-            let mut stale_cut = std::collections::BTreeMap::from([(
-                source.clone(),
-                store.stream_revision(source).unwrap() + 1,
-            )]);
-            assert!(original_tool_primary(store, &owner, task, &mut stale_cut).is_err());
-        }
-        assert_eq!(store.durable_commit_cursor().unwrap(), before);
-        }).await;
-    }
 
-    #[tokio::test]
-    async fn r1_658_real_native_original_primary_and_resolver_use_principal_run() {
-        original_native_primary_658(false).await;
-    }
 
-    #[tokio::test]
-    async fn r1_658_real_native_primary_rejects_foreign_typed_identity_and_receipt_cuts() {
-        original_native_primary_658(true).await;
-    }
 
-    async fn exercise_publication_task_link(mode: u8) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        use harness_contract::agent_action::{AgentAction, AgentActionEnvelope, AgentActionStatus};
-        let root_actor = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let retained_root = std::sync::Arc::clone(&root_actor);
-        with_native_task_review_setup(
-            NativeTaskReviewCase { commit_report: true, ..Default::default() },
-            move |services, root, worker, mut input| Box::pin(async move {
-                *retained_root.lock().unwrap() = Some(root.actor.clone());
-                let actions = services.agent_action_service();
-                let program = actions.project(&worker.actor.program_id).unwrap();
-                let artifact = program.artifacts.values().find(|artifact| {
-                    artifact.claim_execution_id == worker.actor.execution_id
-                        && artifact.relates_to.contains(&input.task_ref)
-                }).unwrap().clone();
-                assert_eq!(program.tasks[&input.task_ref].status, crate::AgenticTaskStatus::Claimed);
-                assert!(program.tasks[&input.task_ref].artifact_refs.is_empty());
-                let mut cuts = std::collections::BTreeMap::new();
-                authenticate_publication_task_link(services.event_store(), &program,
-                    &artifact, &input.task_ref, &mut cuts).unwrap();
-                assert_eq!(actions.project(&program.program_id).unwrap(), program);
-                assert_eq!(cuts.get(&format!("agentic-program:{}", program.program_id)), Some(&program.revision));
-                assert!(cuts.contains_key(worker.actor.execution_id.as_deref().unwrap()));
-                if mode == 1 {
-                    let foreign = actions.apply(&AgentActionEnvelope {
-                        action_id: "r1-568-foreign-task".into(), actor: root.actor.clone(),
-                        expected_revision: None,
-                        action: AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
-                            "team_ref":program.tasks[&input.task_ref].team_id,
-                            "title":"Unclaimed foreign provenance", "objective":"Remain independent",
-                            "acceptance":"No implicit completion", "purpose":"exploration"
-                        })).unwrap()),
-                    }).unwrap();
-                    assert_eq!(foreign.status, AgentActionStatus::Applied, "{foreign:?}");
-                    let foreign_task = foreign.changed_refs[0].clone();
-                    let extra_content = services.artifact_store().write_bytes(
-                        harness_contract::context::ArtifactWriteDescriptor {
-                            media_type: "text/plain".into(),
-                            visibility_scope: format!("session:{}", program.session_id),
-                            expected_bytes: None, original_name: None,
-                        },
-                        b"Real independent extra-relation publication",
-                    ).await.unwrap();
-                    let publication = actions.apply(&AgentActionEnvelope {
-                        action_id: "r1-568-extra-task-publication".into(), actor: worker.actor.clone(),
-                        expected_revision: None,
-                        action: AgentAction::ArtifactCommit(serde_json::from_value(serde_json::json!({
-                            "content_ref":extra_content.selector, "kind":"report", "title":"Extra relation",
-                            "relates_to":[input.task_ref, foreign_task]
-                        })).unwrap()),
-                    }).unwrap();
-                    assert_eq!(publication.status, AgentActionStatus::Applied, "{publication:?}");
-                    let current = actions.project(&program.program_id).unwrap();
-                    let extra = &current.artifacts[&publication.changed_refs[0]];
-                    let mut cuts = std::collections::BTreeMap::new();
-                    authenticate_publication_task_link(services.event_store(), &current,
-                        extra, &input.task_ref, &mut cuts).unwrap();
-                    for _ in 0..2 {
-                        assert!(authenticate_publication_task_link(services.event_store(), &current,
-                            extra, &foreign_task, &mut cuts).is_err());
-                    }
-                    assert_eq!(current.tasks[&foreign_task].status, crate::AgenticTaskStatus::Published);
-                    assert!(current.tasks[&foreign_task].artifact_refs.is_empty());
-                }
-                if mode == 2 {
-                    for field in ["content_ref", "committed_by", "claim_execution_id",
-                        "claim_generation", "title", "kind", "relates_to"]
-                    {
-                        let mut value = serde_json::to_value(&artifact).unwrap();
-                        value[field] = match field {
-                            "claim_generation" => serde_json::json!(artifact.claim_generation.unwrap() + 1),
-                            "relates_to" => serde_json::json!([input.task_ref, "task:forged"]),
-                            _ => serde_json::json!("forged"),
-                        };
-                        let changed = serde_json::from_value(value).unwrap();
-                        assert!(authenticate_publication_task_link(services.event_store(), &program,
-                            &changed, &input.task_ref, &mut std::collections::BTreeMap::new()).is_err(),
-                            "{field}");
-                    }
-                    for field in ["session_id", "turn_id", "root_execution_id", "objective_id"] {
-                        let mut value = serde_json::to_value(&program).unwrap();
-                        value[field] = serde_json::json!("foreign");
-                        let changed = serde_json::from_value(value).unwrap();
-                        assert!(authenticate_publication_task_link(services.event_store(), &changed,
-                            &artifact, &input.task_ref, &mut std::collections::BTreeMap::new()).is_err(),
-                            "{field}");
-                    }
-                    let source = format!("agentic-program:{}", program.program_id);
-                    let mut stale = std::collections::BTreeMap::from([(source, program.revision - 1)]);
-                    assert!(authenticate_publication_task_link(services.event_store(), &program,
-                        &artifact, &input.task_ref, &mut stale).is_err());
-                }
-                input.deliverable = None;
-                input.artifact_refs = vec![artifact.artifact_ref];
-                input.evidence_refs = vec![artifact.content_ref];
-                input
-            }),
-            move |services, review, _| Box::pin(async move {
-                let task_ref = match &review.action {
-                    AgentAction::TaskReview(input) => &input.task_ref,
-                    _ => unreachable!(),
-                };
-                let actions = services.agent_action_service();
-                let program = actions.project(&review.actor.program_id).unwrap();
-                assert_eq!(program.tasks[task_ref].status, crate::AgenticTaskStatus::Submitted);
-                let artifact = program.artifacts[&program.tasks[task_ref].artifact_refs[0]].clone();
-                authenticate_publication_task_link(services.event_store(), &program,
-                    &artifact, task_ref, &mut std::collections::BTreeMap::new()).unwrap();
-                if mode == 0 {
-                    let actor = root_actor.lock().unwrap().clone().unwrap();
-                    let withdrawal = services.submit_agent_action(&AgentActionEnvelope {
-                        action_id: "r1-568-history-withdrawal".into(), actor,
-                        expected_revision: Some(program.revision),
-                        action: AgentAction::TaskWithdraw(serde_json::from_value(serde_json::json!({
-                            "task_ref":task_ref, "reason_ref":artifact.content_ref,
-                            "evidence_refs":[artifact.content_ref]
-                        })).unwrap()),
-                    }).await.unwrap();
-                    assert_eq!(withdrawal.status, AgentActionStatus::Applied, "{withdrawal:?}");
-                    let withdrawn = actions.project(&program.program_id).unwrap();
-                    assert_ne!(withdrawn.tasks[task_ref].status, crate::AgenticTaskStatus::Accepted);
-                    assert!(withdrawn.tasks[task_ref].pending_retirement.is_some()
-                        || withdrawn.tasks[task_ref].status == crate::AgenticTaskStatus::Withdrawn);
-                    authenticate_publication_task_link(services.event_store(), &withdrawn,
-                        &artifact, task_ref, &mut std::collections::BTreeMap::new()).unwrap();
-                }
-            }),
-        ).await;
-    }
 
-    #[tokio::test]
-    async fn r1_568_publication_provenance_survives_real_submission_and_withdrawal() {
-        exercise_publication_task_link(0).await;
-    }
 
-    #[tokio::test]
-    async fn r1_568_publication_extra_task_relation_rejects_on_every_visit() {
-        exercise_publication_task_link(1).await;
-    }
 
-    #[tokio::test]
-    async fn r1_568_publication_authentication_rejects_postimage_identity_and_cut_tampering() {
-        exercise_publication_task_link(2).await;
-    }
 
     fn register_publication_root(
         store: &std::sync::Arc<crate::RuntimeEventStore>,
@@ -5139,93 +4372,6 @@ mod tests {
         ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
     };
 
-    #[tokio::test]
-    async fn r1_native_first_claim_publications_require_exact_postclaim_generation() {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        use harness_contract::agent_action::{AgentAction, AgentActionEnvelope};
-        for explicit_commit in [false, true] {
-            with_native_task_review_setup(NativeTaskReviewCase {
-                commit_report: explicit_commit, ..Default::default()
-            },
-                move |services, _, worker, mut input| Box::pin(async move {
-                    if explicit_commit {
-                        let current = services.agent_action_service().project(&worker.actor.program_id).unwrap();
-                        let artifacts: Vec<String> = current.artifacts.iter().filter(|(_, artifact)| {
-                            artifact.claim_execution_id == worker.actor.execution_id
-                                && artifact.claim_generation == Some(1)
-                                && artifact.relates_to.contains(&input.task_ref)
-                        }).map(|(reference, _)| reference.clone()).collect();
-                        assert_eq!(artifacts.len(), 1);
-                        let content = current.artifacts[&artifacts[0]].content_ref.clone();
-                        input.deliverable = None;
-                        input.artifact_refs = artifacts;
-                        input.evidence_refs = vec![content];
-                    }
-                    input
-                }), move |services, review, donor| Box::pin(async move {
-                    let task_ref = match &review.action {
-                        AgentAction::TaskReview(input) => &input.task_ref,
-                        _ => unreachable!(),
-                    };
-                    let program = services.agent_action_service().project(&review.actor.program_id).unwrap();
-                    assert_eq!(program.tasks[task_ref].claim_generation, 1);
-                    let reference = &program.tasks[task_ref].artifact_refs[0];
-                    let artifact = &program.artifacts[reference];
-                    assert_eq!(artifact.claim_generation, Some(1));
-                    authenticate_publication_task_link(services.event_store(), &program,
-                        artifact, task_ref, &mut std::collections::BTreeMap::new()).unwrap();
-                    let content = services.artifact_store().resolve(&artifact.content_ref).unwrap();
-                    let history = services.session_history_reader();
-                    let readers = super::super::ResultContentReaders {
-                        artifacts: Some(services.artifact_store().as_ref()), history: history.as_deref(), process_inputs: None,
-                    };
-                    let resolved = resolve_result_metadata(services.event_store(), &program,
-                        reference, &content, None, readers).unwrap();
-                    resolved.origin.require_strong().unwrap();
-                    assert_eq!(resolved.producers.len(), 1);
-                    let producer = &resolved.producers[0];
-                    let packet = producer.packet.as_ref().unwrap();
-                    assert_eq!(packet.attempt, 1);
-                    assert_eq!(artifact.claim_execution_id.as_deref(), Some(packet.graph_id()));
-                    assert_ne!(review.actor.execution_id.as_deref(), Some(packet.graph_id()));
-                    let call = if explicit_commit { "native-first-claim-artifact" } else { "native-submit" };
-                    let tool = if explicit_commit { "artifact_commit" } else { "task_submit" };
-                    let completed: Vec<_> = services.event_store()
-                        .list_stream(&format!("session:{}", packet.session_id())).unwrap()
-                        .into_iter().filter(|event| event.kind == "tool.invocation.completed"
-                            && event.payload["tool_call_id"] == call && event.payload["tool_name"] == tool).collect();
-                    assert_eq!(completed.len(), 1);
-                    assert_eq!(completed[0].activity_binding().unwrap().agent_run_id.as_deref(), Some(packet.run_id()));
-                    let publications: Vec<AgentActionEnvelope> = services.event_store()
-                        .list_stream(&format!("agentic-program:{}", program.program_id)).unwrap()
-                        .into_iter().filter_map(|event| serde_json::from_value(event.payload["envelope"].clone()).ok())
-                        .filter(|envelope: &AgentActionEnvelope| envelope.actor.execution_id.as_deref() == Some(packet.graph_id()))
-                        .collect();
-                    assert!(publications.iter().any(|envelope| matches!(&envelope.action,
-                        AgentAction::TaskClaim(input) if &input.task_ref == task_ref)));
-                    assert!(publications.iter().any(|envelope| if explicit_commit {
-                        matches!(&envelope.action, AgentAction::ArtifactCommit(input)
-                            if input.content_ref == artifact.content_ref && input.relates_to.contains(task_ref))
-                    } else {
-                        matches!(&envelope.action, AgentAction::TaskSubmit(input)
-                            if &input.task_ref == task_ref && input.artifact_refs.is_empty()
-                                && input.deliverable.as_ref().and_then(|deliverable| deliverable.resolved_content_ref.as_deref())
-                                    == Some(artifact.content_ref.as_str()))
-                    }));
-                    assert_eq!(donor.verification.input_set.as_ref().unwrap().version, 2);
-                    for generation in [0, 2] {
-                        let mut wrong = program.clone();
-                        wrong.artifacts.get_mut(reference).unwrap().claim_generation = Some(generation);
-                        let error = resolve_result_metadata(services.event_store(), &wrong,
-                            reference, &content, None, readers).err().expect("nonmatching generation must fail");
-                        assert_eq!(error, "result publication does not match its original physical packet/claim");
-                    }
-                    assert_eq!(services.agent_action_service().project(&program.program_id).unwrap(), program);
-                })).await;
-        }
-    }
 
     #[test]
     fn r1_bounded_history_desc_keyset_preserves_deep_source_proof() {
@@ -5931,237 +5077,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn r1_proof_legacy_raw_metadata_never_mints_strong_origin() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(|services, original| async move {
-        let history = services.session_history_reader().unwrap();
-        let readers = super::super::ResultContentReaders {
-            artifacts: Some(services.artifact_store().as_ref()),
-            history: Some(history.as_ref()),
-            process_inputs: None,
-        };
-        let events = services
-            .event_store()
-            .list_stream(&original.stream_id)
-            .unwrap();
-        let task = result_tool_plan(&events, &original).unwrap();
-        let mut cuts = std::collections::BTreeMap::new();
-        let strong = original_tool_body(
-            services.event_store(),
-            readers,
-            &original,
-            task,
-            &mut cuts,
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            matches!(&strong.origin, ResultOrigin::StrongRaw { anchors } if anchors.len() == 1)
-        );
-        assert!(strong.origin.require_strong().is_ok());
-        let mut legacy_fixture = original.clone();
-        legacy_fixture
-            .payload
-            .as_object_mut()
-            .unwrap()
-            .remove("runtime_raw_content_v1");
-        assert!(legacy_fixture
-            .payload
-            .get("output_ref")
-            .is_none_or(serde_json::Value::is_null));
-        let recovered = original_tool_body(
-            services.event_store(),
-            readers,
-            &legacy_fixture,
-            task,
-            &mut cuts,
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(recovered.bytes, strong.bytes);
-        assert!(observed_raw_selector_conflict(
-            readers,
-            &original,
-            &recovered.content.as_ref().unwrap().selector
-        ));
-        assert!(matches!(
-            &recovered.origin,
-            ResultOrigin::LegacyWeak | ResultOrigin::LegacyIncomplete
-        ));
-        let error = recovered.origin.require_strong().unwrap_err();
-        assert!(!error.starts_with("review result has no Runtime-resolved producer:"));
-        assert_eq!(
-            services
-                .event_store()
-                .list_stream(&original.stream_id)
-                .unwrap(),
-            events
-        );
-        let no_session = super::super::ResultContentReaders {
-            artifacts: readers.artifacts,
-            history: None,
-            process_inputs: None,
-        };
-        assert!(original_tool_body(
-            services.event_store(),
-            no_session,
-            &legacy_fixture,
-            task,
-            &mut cuts,
-            None
-        )
-        .is_err());
-        assert_eq!(
-            original_tool_body(
-                services.event_store(),
-                no_session,
-                &original,
-                task,
-                &mut cuts,
-                None
-            )
-            .unwrap()
-            .unwrap()
-            .bytes,
-            strong.bytes
-        );
-        for (field, value) in [
-            ("version", serde_json::json!(2)),
-            ("tool_call_id", serde_json::json!("foreign-call")),
-            (
-                "ref_id",
-                serde_json::json!("tool://tool-raw-foreign-0123456789abcdef"),
-            ),
-            ("visibility_scope", serde_json::json!("session:foreign")),
-            (
-                "sha256",
-                serde_json::json!(format!("sha256:{}", "0".repeat(64))),
-            ),
-            ("byte_count", serde_json::json!(strong.bytes.len() + 1)),
-            ("selector", serde_json::json!("artifact://missing-raw-body")),
-            ("media_type", serde_json::json!("application/foreign")),
-        ] {
-            let mut invalid_fixture = original.clone();
-            invalid_fixture.payload["runtime_raw_content_v1"][field] = value;
-            assert!(
-                original_tool_body(
-                    services.event_store(),
-                    readers,
-                    &invalid_fixture,
-                    task,
-                    &mut cuts,
-                    None
-                )
-                .is_err(),
-                "{field}"
-            );
-        }
-        let mut presentation_fixture = original.clone();
-        presentation_fixture.payload["output_ref"] = serde_json::json!({
-            "sha256":"f".repeat(64), "byte_count":1,
-        });
-        presentation_fixture.payload["output_preview"] =
-            serde_json::json!("different presentation");
-        presentation_fixture.payload["output_byte_count"] = serde_json::json!(22);
-        assert_eq!(
-            original_tool_body(
-                services.event_store(),
-                readers,
-                &presentation_fixture,
-                task,
-                &mut cuts,
-                None
-            )
-            .unwrap()
-            .unwrap()
-            .bytes,
-            strong.bytes
-        );
-        let mut staged_conflict = original.clone();
-        let foreign = format!(
-            "tool://tool-raw-{}-{}",
-            original.payload["tool_call_id"].as_str().unwrap(),
-            "f".repeat(64)
-        );
-        staged_conflict.payload["full_output_ref"] = serde_json::json!(foreign);
-        staged_conflict.payload["runtime_raw_content_v1"]["ref_id"] =
-            staged_conflict.payload["full_output_ref"].clone();
-        assert!(original_tool_body(
-            services.event_store(),
-            readers,
-            &staged_conflict,
-            task,
-            &mut cuts,
-            None
-        )
-        .is_err());
-        services.shutdown_maintenance().await;
-        }).await;
-    }
-
-    #[test]
-    fn legacy_input_bridge_requires_verified_full_input_under_both_hashes() {
-        let input = serde_json::json!({"media_type": "原始输入".repeat(128)});
-        let encoded = serde_json::to_string(&input).unwrap();
-        let mut owner = DurableRuntimeEvent {
-            event_id: "unit-input-identity".into(),
-            stream_id: "unit:legacy-input".into(),
-            sequence: 1,
-            scope: crate::RuntimeEventScope::Tool,
-            kind: "unit.input_identity".into(),
-            status: None,
-            actor: None,
-            refs: Vec::new(),
-            payload: serde_json::json!({
-                "tool_call_id":"legacy-call",
-                "input_hash":crate::tool_invocation::stable_hash(&encoded),
-            }),
-            created_at_ms: 0,
-            commit_cursor: 1,
-            transaction_id: "unit-input-identity".into(),
-            transaction_index: 0,
-            schema_version: 1,
-            idempotency_key: None,
-        };
-        let task = serde_json::json!({"normalized_input":input});
-        let payload = serde_json::json!({
-            "input_hash":format!("{:016x}", model_protocol::fingerprint::stable_hash_bytes(encoded.as_bytes())),
-            "source_evidence_ref":"runtime-tool:legacy-call",
-            "native_staged_artifact":false,
-        });
-        for preview in [
-            None,
-            Some("partial"),
-            Some(encoded.as_str()),
-            Some("different input"),
-        ] {
-            owner.payload["input_preview"] = serde_json::to_value(preview).unwrap();
-            assert!(raw_input_matches_owner(&payload, &owner, Some(&task)));
-            let mut wrong = payload.clone();
-            wrong["input_hash"] = serde_json::json!("0000000000000000");
-            assert!(!raw_input_matches_owner(&wrong, &owner, Some(&task)));
-        }
-        owner.payload["input_preview"] = serde_json::Value::Null;
-        assert!(!raw_input_matches_owner(&payload, &owner, None));
-        let wrong_task = serde_json::json!({"normalized_input":{"media_type":"different"}});
-        assert!(!raw_input_matches_owner(
-            &payload,
-            &owner,
-            Some(&wrong_task)
-        ));
-        owner.payload["input_preview"] = serde_json::json!(encoded);
-        assert!(raw_input_matches_owner(&payload, &owner, None));
-        let mut wrong_source = payload.clone();
-        wrong_source["source_evidence_ref"] = serde_json::json!("runtime-tool:foreign");
-        assert!(!raw_input_matches_owner(&wrong_source, &owner, Some(&task)));
-        let mut staged = payload.clone();
-        staged["native_staged_artifact"] = serde_json::json!(true);
-        assert!(!raw_input_matches_owner(&staged, &owner, Some(&task)));
-        staged["input_hash"] = owner.payload["input_hash"].clone();
-        assert!(raw_input_matches_owner(&staged, &owner, Some(&task)));
-    }
 
     #[tokio::test]
     async fn r1_proof_effect_metadata_independently_recovers_original_result_producers() {
@@ -6543,6 +5458,7 @@ mod tests {
                     error: None,
                     evidence_ref: "metadata-original-read".into(),
                     observed_evidence: vec![],
+                    pending_agent_batch: None,
                 },
                 &descriptor,
                 &scope,
@@ -7152,6 +6068,7 @@ mod tests {
                 error: None,
                 evidence_ref: "root-history-result".into(),
                 observed_evidence: vec![],
+                pending_agent_batch: None,
             };
             if read {
                 commits
