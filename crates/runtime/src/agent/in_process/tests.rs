@@ -5019,6 +5019,44 @@ fn whole_workspace_lease_bounds_to_workspace_but_never_escapes() {
 }
 
 #[test]
+fn glob_batch_checks_each_actual_search_against_the_original_ceiling() {
+    let runtime = vec!["read:crates/runtime".to_string()];
+    let all = vec!["read:.".to_string()];
+    let allowed = serde_json::json!({"patterns":[
+        {"path":"crates/runtime/src", "pattern":"*.rs"},
+        {"path":"crates/runtime", "pattern":"src/*.rs"}
+    ]});
+    let original = allowed.clone();
+    enforce_glob_scope(&allowed, &runtime).expect("each actual child stays within the lease");
+    assert_eq!(allowed, original, "scope validation does not rewrite input");
+    let outside = serde_json::json!({"patterns":[
+        {"path":"crates/runtime/src", "pattern":"*.rs"},
+        {"path":"crates/gateway/src", "pattern":"*.rs"}
+    ]});
+    assert!(enforce_glob_scope(&outside, &runtime).is_err());
+    let shadow = serde_json::json!({"path":"crates/runtime", "pattern":"*.rs", "patterns":[
+        {"path":"crates/gateway", "pattern":"*.rs"}
+    ]});
+    assert!(enforce_glob_scope(&shadow, &runtime).is_err(), "batch takes dispatch precedence");
+    for path in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!(".")] {
+        let item = serde_json::json!({"patterns":[{"path":path,"pattern":"*.rs"}]});
+        assert!(enforce_glob_scope(&item, &all).is_ok());
+        assert!(enforce_glob_scope(&item, &runtime).is_err(), "root is not a narrow lease");
+    }
+    let omitted = serde_json::json!({"path":"crates/runtime", "patterns":[{"pattern":"*.rs"}]});
+    assert!(enforce_glob_scope(&omitted, &all).is_ok());
+    assert!(enforce_glob_scope(&omitted, &runtime).is_err(), "batch items do not inherit top-level path");
+    assert!(enforce_glob_scope(&serde_json::json!({"patterns":[]}), &runtime).is_ok(), "executor permits an empty batch");
+    for invalid in [serde_json::json!({"patterns":null}), serde_json::json!({"patterns":[{}]}),
+        serde_json::json!({"patterns":[{"path":123,"pattern":"*.rs"}]}),
+        serde_json::json!({"patterns":[{"path":"../outside","pattern":"*.rs"}]}),
+        serde_json::json!({"patterns":[{"path":"crates/runtime","pattern":"../*.rs"}]})] {
+        assert!(enforce_glob_scope(&invalid, &all).is_err(), "invalid item must not be authorized");
+    }
+    assert!(enforce_glob_scope(&serde_json::json!({"path":"crates/runtime", "pattern":"*.rs"}), &runtime).is_ok());
+}
+
+#[test]
 fn exact_new_artifact_scope_remains_narrow_and_writable() {
     let root = tempfile::tempdir().expect("workspace");
     let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
