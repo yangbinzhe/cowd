@@ -708,6 +708,7 @@ pub(crate) enum OriginalEffectCustodyOrigin {
 pub struct ToolProgressSink {
     callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     child_reads: std::sync::Arc<std::sync::Mutex<Option<Vec<tools::OrchestratedRead>>>>,
+    child_searches: std::sync::Arc<std::sync::Mutex<Option<Option<Vec<tools::OrchestratedSearch>>>>>,
     lifecycle_anchor: std::sync::Arc<std::sync::Mutex<Option<ToolLifecycleAnchor>>>,
     batch_policy_owner: std::sync::Arc<std::sync::Mutex<Option<std::sync::Weak<dyn AgentBatchPolicyOwner>>>>,
     original_fresh_effect: std::sync::Arc<std::sync::Mutex<Option<std::sync::Weak<crate::execution_core::graph::OriginalFreshEffectOwner>>>>,
@@ -726,6 +727,7 @@ impl ToolProgressSink {
     }
     pub(crate) fn same_original_channels(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.child_reads, &other.child_reads)
+            && std::sync::Arc::ptr_eq(&self.child_searches, &other.child_searches)
             && std::sync::Arc::ptr_eq(&self.lifecycle_anchor, &other.lifecycle_anchor)
             && std::sync::Arc::ptr_eq(&self.batch_policy_owner, &other.batch_policy_owner)
             && std::sync::Arc::ptr_eq(&self.original_fresh_effect, &other.original_fresh_effect)
@@ -899,11 +901,27 @@ impl ToolProgressSink {
             None => Ok(None),
         }
     }
-    pub fn record_child_reads(&self, reads: Vec<tools::OrchestratedRead>) -> Result<(), String> {
-        let mut slot = self.child_reads.lock().map_err(|_| "child read channel poisoned")?;
-        if slot.is_some() { return Err("child read channel already populated".into()); }
-        *slot = Some(reads);
+    /// Bind actual child candidates to this original per-call channel, not a durable receipt.
+    pub fn record_orchestrated_children(&self, children: &tools::OrchestratedChildren) -> Result<(), String> {
+        if let Some(reads) = &children.reads {
+            let mut slot = self.child_reads.lock().map_err(|_| "child read channel poisoned")?;
+            match slot.as_ref() {
+                Some(existing) if existing != reads => return Err("conflicting child read channel".into()),
+                Some(_) => {}, None => *slot = Some(reads.clone()),
+            }
+        }
+        if let Ok(mut slot) = self.child_searches.lock() {
+            match (&*slot, &children.searches) {
+                (_, None) => *slot = Some(None),
+                (Some(Some(existing)), Some(searches)) if existing != searches => *slot = Some(None),
+                (None, Some(searches)) => *slot = Some(Some(searches.clone())),
+                _ => {},
+            }
+        }
         Ok(())
+    }
+    pub(crate) fn child_searches(&self) -> Result<Option<Vec<tools::OrchestratedSearch>>, String> {
+        self.child_searches.lock().map(|slot| slot.clone().flatten()).map_err(|_| "child search channel poisoned".into())
     }
     pub(crate) fn child_reads(&self) -> Result<Option<Vec<tools::OrchestratedRead>>, String> {
         Ok(self.child_reads.lock().map_err(|_| "child read channel poisoned")?.clone())
@@ -1883,6 +1901,19 @@ pub(crate) fn discover_delegated_tool(
 #[cfg(test)]
 mod resource_projection_tests {
     use super::*;
+
+    #[test]
+    fn child_search_overflow_stays_unknown_on_same_channel() {
+        let sink = ToolProgressSink::default();
+        let complete = tools::OrchestratedChildren { reads: None, searches: Some(Vec::new()) };
+        let overflow = tools::OrchestratedChildren { reads: None, searches: None };
+        sink.record_orchestrated_children(&complete).unwrap();
+        assert!(sink.child_searches().unwrap().is_some());
+        sink.record_orchestrated_children(&overflow).unwrap();
+        assert!(sink.child_searches().unwrap().is_none());
+        sink.record_orchestrated_children(&complete).unwrap();
+        assert!(sink.child_searches().unwrap().is_none());
+    }
 
     /// A process that declares exactly its own file scope is not widened to
     /// the workspace root: the sandbox copies only those files, so demanding a

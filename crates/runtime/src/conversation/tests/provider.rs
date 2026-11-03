@@ -5230,11 +5230,9 @@ mod r1_native_real_wire {
             let input = serde_json::from_str(&request.input).unwrap();
             let result = if request.tool_name == "tool_orchestrate" {
                 step.lease().execute_with_orchestrated_read_trace(request.authorization.as_ref().unwrap(), &input)
-                    .and_then(|(output, reads)| {
-                        if let Some(reads) = reads {
-                            request.tool_progress.record_child_reads(reads)
-                                .map_err(tools::ToolHostError::Execution)?;
-                        }
+                    .and_then(|(output, children)| {
+                        request.tool_progress.record_orchestrated_children(&children)
+                            .map_err(tools::ToolHostError::Execution)?;
                         Ok(output)
                     })
             } else { step.lease()

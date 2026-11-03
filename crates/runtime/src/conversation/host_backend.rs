@@ -9020,6 +9020,7 @@ where
             prepared_tool_invocations,
             mut successful_observed_evidence,
             agentic_progress_refs,
+            orchestrated_search_coverage,
         ) = if let Some(host) = governed_host {
             let (
                 tool_authorizations,
@@ -9237,8 +9238,24 @@ where
             original_member_batches = member_batches;
             #[cfg(feature = "test-fixtures")]
             if rc_completion_trace { crate::execution_core::graph::k05_completion_trace(ticket, if rc_review_trace { "d-objective-review:host_compactor_returned" } else { "recovery-complete:host_compactor_returned" }, None, None); }
+            let successful_calls = successful_tool_call_ids(&messages);
+            let mut orchestrated_search_coverage = Some(BTreeSet::new());
+            for call in calls.iter().filter(|call| call.name.eq_ignore_ascii_case("tool_orchestrate")) {
+                let keys = if successful_calls.contains(&call.id) {
+                    prepared_requests.get(&call.id).and_then(|request| {
+                        let auth = tool_authorizations.get(&call.id)?;
+                        let invocation = prepared_tool_invocations.get(&call.id)?;
+                        original_orchestrated_search_coverage(request, auth, invocation)
+                    })
+                } else { None };
+                match (&mut orchestrated_search_coverage, keys) {
+                    (Some(current), Some(keys)) => current.extend(keys),
+                    _ => { orchestrated_search_coverage = None; break; }
+                }
+            }
             (
                 crate::conversation::ToolBatchStepResult {
+                    orchestrated_search_coverage: Some(BTreeSet::new()),
                     member_batches: Vec::new(),
                     refused_before_dispatch,
                     failed: messages
@@ -9256,6 +9273,7 @@ where
                 prepared_tool_invocations,
                 observed_evidence,
                 agentic_progress_refs,
+                orchestrated_search_coverage,
             )
         } else {
             let mut runtime = self.runtime.lock().await;
@@ -9382,12 +9400,14 @@ where
             original_member_batches = result.member_batches.clone();
             let orchestration_terminal_summary: Option<String> = None;
             let agentic_progress_refs = agentic_action_progress_refs(&result.messages);
+            let orchestrated_search_coverage = result.orchestrated_search_coverage.clone();
             (
                 result,
                 orchestration_terminal_summary,
                 prepared_tool_invocations,
                 observed_evidence,
                 agentic_progress_refs,
+                orchestrated_search_coverage,
             )
         };
         let successful_original_calls = successful_tool_call_ids(&result.messages);
@@ -9557,7 +9577,10 @@ where
                 && observation.has_verified_gain()
                 && observation.fingerprint == action_fingerprint
         });
-        let coverage_keys = tool_batch_coverage_keys(&calls);
+        let mut coverage_keys = calls.iter().filter(|call| !call.name.eq_ignore_ascii_case("tool_orchestrate"))
+            .flat_map(tool_call_coverage_keys).collect::<BTreeSet<_>>();
+        let coverage_complete = orchestrated_search_coverage.is_some();
+        if let Some(keys) = orchestrated_search_coverage { coverage_keys.extend(keys); }
         let scope_keys = tool_batch_scope_keys(&calls);
         let prior_observed_evidence = prior_observations
             .iter()
@@ -9704,12 +9727,12 @@ where
             })
             .cloned()
             .collect::<BTreeSet<_>>();
-        let low_novelty = failed == 0
+        let low_novelty = coverage_complete && failed == 0
             && agentic_progress_refs.is_empty()
             && !coverage_keys.is_empty()
             && novelty_target_bp > 0
             && coverage_novelty_bp < novelty_target_bp;
-        let evidence_saturated = failed == 0
+        let evidence_saturated = coverage_complete && failed == 0
             && agentic_progress_refs.is_empty()
             && !coverage_keys.is_empty()
             && newly_covered == 0
@@ -10423,6 +10446,12 @@ where
                 format!(
                     "tool batch reused an already-completed action calls={tool_calls}; retained receipt must be used before another identical request"
                 )
+            } else if failed_tools.is_empty() && scope_saturated && !coverage_complete {
+                format!(
+                    "tool batch completed calls={tool_calls} in a previously covered scope; search coverage remains unknown"
+                )
+            } else if failed_tools.is_empty() && !coverage_complete {
+                format!("tool batch completed calls={tool_calls}; search coverage remains unknown")
             } else if failed_tools.is_empty() && (scope_saturated || evidence_saturated) {
                 format!(
                     "tool batch completed calls={tool_calls} but added no new evidence coverage; retain receipts and converge"

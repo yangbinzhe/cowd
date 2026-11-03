@@ -1016,7 +1016,7 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
             let prepared = admission.prepared.take()
                 .ok_or_else(|| "tool batch original prepared request is missing".to_string())?;
             let original_request_slot = if prepared.bound_request.as_ref()
-                .is_some_and(|request| request.tool_name == "agent_action_batch"
+                .is_some_and(|request| request.tool_name == "tool_orchestrate" || request.tool_name == "agent_action_batch"
                     || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())) {
                 let slot = Arc::new(Mutex::new(None));
                 self.member_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2256,6 +2256,7 @@ where
             // model cannot act on.
             return Ok((
                 ToolBatchStepResult {
+                    orchestrated_search_coverage: Some(BTreeSet::new()),
                     member_batches: Vec::new(),
                     refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                     failed: refusal_messages.len(),
@@ -2359,6 +2360,7 @@ where
                 }
                 return Ok((
                     ToolBatchStepResult {
+                    orchestrated_search_coverage: Some(BTreeSet::new()),
                     member_batches: Vec::new(),
                         refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                         failed: messages.len(),
@@ -2437,6 +2439,7 @@ where
             let failed = count_failed_tool_results(&messages);
             return Ok((
                 ToolBatchStepResult {
+                    orchestrated_search_coverage: Some(BTreeSet::new()),
                     member_batches: Vec::new(),
                     refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                     failed,
@@ -2537,6 +2540,7 @@ where
         self.record_tool_strategy_validation(&validation, self.session_head().await.message_count);
         let mut max_concurrency_observed = 0;
         let mut parallel_batches = 0;
+        let mut orchestrated_search_coverage = Some(BTreeSet::new());
         let mut messages = refusal_messages;
         messages.extend(preflight_messages);
         let preflight_refusals = Mutex::new(Vec::new());
@@ -2607,9 +2611,29 @@ where
             let report = GovernedToolExecutor.execute(&plan, &ticket_context).await;
             {
                 let progress = ticket_context.member_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for call in calls.iter().filter(|call| call.name.eq_ignore_ascii_case("tool_orchestrate")) {
+                    let keys = report.outcomes.iter().find(|outcome| outcome.task_id == call.id).and_then(|outcome| {
+                        if !matches!(&outcome.terminal, GovernedToolTaskTerminal::Succeeded(_))
+                            || outcome.terminal_commit_error.is_some() || outcome.receipt.is_none() { return None; }
+                        let request = progress.get(&outcome.task_id)?.lock().ok()?.clone()?;
+                        let auth = request.authorization.as_ref()?;
+                        let invocation = request.compiled_invocation.as_ref()?;
+                        // Executor-owned paths need their own original durable receipt.
+                        if self.executor_owns_governed_effect(&request.tool_name, &invocation.effect) { return None; }
+                        crate::host::original_orchestrated_search_coverage(&request, auth, invocation)
+                    });
+                    match (&mut orchestrated_search_coverage, keys) {
+                        (Some(current), Some(keys)) => current.extend(keys),
+                        _ => { orchestrated_search_coverage = None; break; }
+                    }
+                }
+            }
+            {
+                let progress = ticket_context.member_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 for call in calls {
                     if let Some(request) = progress.get(&call.id).and_then(|slot|
                         slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()) {
+                        if request.tool_name == "tool_orchestrate" { continue; }
                         let carrier = crate::tool_host::OriginalMemberCallCarrier::from_original_request(request);
                         let cause = ticket_context.unknown_effects.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2739,6 +2763,7 @@ where
         let failed = count_failed_tool_results(&messages);
         Ok((
             ToolBatchStepResult {
+                orchestrated_search_coverage,
                 member_batches,
                 refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                 messages,
@@ -3495,14 +3520,10 @@ where
         if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
             if let Some(children) = execution.as_ref().ok().and_then(|draft| match draft {
                 harness_contract::context::ToolOutputDraft::InProcess { evidence, .. } =>
-                    evidence.downcast_ref::<Vec<tools::OrchestratedRead>>().map(Vec::as_slice),
+                    evidence.downcast_ref::<tools::OrchestratedChildren>(),
                 _ => None,
             }) {
-                match request.tool_progress.child_reads().map_err(ToolError::new)? {
-                    Some(existing) if existing.as_slice() != children => return Err(ToolError::new("conflicting child read channel")),
-                    Some(_) => {},
-                    None => request.tool_progress.record_child_reads(children.to_vec()).map_err(ToolError::new)?,
-                }
+                request.tool_progress.record_orchestrated_children(children).map_err(ToolError::new)?;
             }
         }
         let committed = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
@@ -4003,7 +4024,7 @@ where
                         ).map_err(RuntimeError::new)?;
                     }
                 }
-                if tool_name == "agent_action_batch"
+                if tool_name == "tool_orchestrate" || tool_name == "agent_action_batch"
                     || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name) {
                     crate::tool_host::ORIGINAL_EFFECT_REQUEST.try_with(|slot| {
                         let mut original = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

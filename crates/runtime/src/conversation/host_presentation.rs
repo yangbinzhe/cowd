@@ -5377,11 +5377,39 @@ pub(super) fn canonical_tool_input_for_governance(call: &ModelToolCall) -> Strin
 /// Direct file reads retain file-level detail; broad discovery tools collapse
 /// to their workspace/crate zone so repeatedly globbing or grepping the same
 /// area becomes visible to the Goal policy as low-novelty work.
-pub(super) fn tool_batch_coverage_keys(calls: &[ModelToolCall]) -> BTreeSet<String> {
-    calls
-        .iter()
-        .flat_map(tool_call_coverage_keys)
-        .collect::<BTreeSet<_>>()
+/// Derive novelty only from the original authorized executor's actual child searches.
+/// These keys are not read receipts and never satisfy an acceptance scope.
+pub(crate) fn original_orchestrated_search_coverage(
+    request: &crate::RuntimeToolExecutionRequest,
+    auth: &harness_contract::tool::ToolExecutionAuthorization,
+    invocation: &harness_contract::tool::GovernedToolInvocation,
+) -> Option<BTreeSet<String>> {
+    let mut result = BTreeSet::new();
+    let Some(binding) = request.step_binding.as_ref() else { return None; };
+    if request.tool_name != "tool_orchestrate" || invocation.invocation_id != request.tool_use_id
+        || binding.origin.call_id != request.tool_use_id || invocation.origin.as_ref() != Some(&binding.origin)
+        || Some(binding.snapshot.identity.session_id.as_str()) != request.session_id.as_deref()
+        || invocation.effect.tool_id != "tool_orchestrate" || invocation.effect.descriptor_hash != auth.descriptor_hash
+        || auth.tool_id != "tool_orchestrate" { return None; }
+    let Ok(Some(searches)) = request.tool_progress.child_searches() else { return None; };
+    if searches.is_empty() { return None; }
+    let mut positions = BTreeSet::new();
+    for child in &searches {
+        if child.tool_name() != "grep_search" { continue; }
+        let effect = child.effect();
+        if child.step_id().is_empty() || child.input_sha256().len() != 64 || child.output_sha256().len() != 64
+            || !positions.insert((child.step_index(), child.position()))
+            || child.parent_authorization() != auth || child.parent_request_id() != auth.request_id
+            || child.parent_descriptor_hash() != auth.descriptor_hash
+            || effect.tool_id != "grep_search" || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
+            || effect.uses_network || effect.spawns_process || effect.mutates_packages || effect.mutates_system
+            || effect.scopes.is_empty() || !effect.scopes.iter().all(|scope|
+                auth.authorization_lease.scopes.contains(scope) && invocation.effect.scopes.contains(scope)) {
+            return None;
+        }
+        result.insert(format!("discovery:{}", coverage_zone(child.base_path())));
+    }
+    Some(result)
 }
 
 /// Delegated evidence roles have a deliberately tighter contract. Main turns
@@ -5480,18 +5508,17 @@ pub(super) fn tool_batch_scope_keys(calls: &[ModelToolCall]) -> BTreeSet<String>
 pub(super) fn tool_call_coverage_keys(call: &ModelToolCall) -> Vec<String> {
     let value = serde_json::from_str::<serde_json::Value>(&call.input).ok();
     let name = call.name.to_ascii_lowercase();
+    if name == "tool_orchestrate" { return Vec::new(); }
     let paths = value.as_ref().map(coverage_paths).unwrap_or_default();
     let is_discovery = matches!(
         name.as_str(),
         "workspace_snapshot"
             | "glob_search"
-            | "tool_orchestrate"
             | "grep_search"
             | "lsp"
             | "toolsearch"
             | "tool_search"
             | "runtime_capabilities"
-            | "tool_orchestrate"
     );
     if is_discovery {
         let zones = if paths.is_empty() {

@@ -5665,6 +5665,135 @@ async fn b_scope_refusal_and_independent_read_reach_original_gateway_provider() 
     if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "run alone in an isolated process with an exclusive Session PG fixture"]
+async fn original_host_orchestrated_search_novelty_and_unknown() {
+    use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
+    use futures::FutureExt;
+    struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value { std::env::set_var(key, value); }
+                else { std::env::remove_var(key); }
+            }
+        }
+    }
+    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE",
+        "COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND"];
+    let _restore = Restore(keys.into_iter().map(|key| (key, std::env::var_os(key))).collect());
+    std::env::set_var("COWD_EVAL_HARNESS", "1");
+    std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
+    std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
+    // This independent test process sends only to its own loopback listener;
+    // the diagnostic capability is not a production send authorization.
+    std::env::set_var("COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND", "local loopback fixture");
+    eprintln!("b_scope_script stage=diagnostic_send_configured endpoint=loopback");
+    let root = fixture_root();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("target.txt"), "scope fixture content").unwrap();
+    std::fs::create_dir_all(workspace.join("docs")).unwrap();
+    std::fs::write(workspace.join("docs/a.txt"), "alpha document").unwrap();
+    let mut provider = LoopbackProvider::start("root").await;
+    let providers = provider_registry(&[&provider]);
+    let topology = SelectedStorageTopology::compose_for_test(&root.path().join("home"), &workspace).unwrap();
+    let services = RecoveryServices::start_with_diagnostic_loopback(root.path(), topology, providers).await;
+    let runtime = services.runtime.runtime_services();
+    let session = format!("b-scope-ingress:{}", uuid::Uuid::new_v4());
+    let identity = std::sync::Mutex::new(None::<(String, String, String)>);
+    let run = std::panic::AssertUnwindSafe(async {
+        let mut request = EnsureSessionRequest::new(&session, Some(provider.model.clone()), SessionSource::Tui);
+        request.owner_principal_id = Some("b-scope-local-fixture".into());
+        services.session.create_user_session(request).await.unwrap();
+        let control = json!({"corpus_id":"live-scenarios-v1", "workspace_fixture":"none",
+            "provider_constraint":"normal", "temperature_milli":0,
+            "resource_scopes":["read:target.txt", "read:docs"], "prompt":"Read target.txt."});
+        let envelope = harness_contract::turn::SessionInputEnvelope::text(&session,
+            harness_contract::turn::InputSourceKind::Tui,
+            &format!("COWD_EVAL_CONTROL {control}\nRead target.txt and report its content."));
+        let request_id = envelope.idempotency_key.clone();
+        let admitted = services.session.admit_input(envelope).await.unwrap();
+        let turn = admitted.turn_id;
+        let graph = admitted.execution_graph_id;
+        *identity.lock().unwrap() = Some((request_id.clone(), turn.clone(), graph.clone()));
+        let input = services.session.runtime_input(&request_id).await.unwrap().expect("original Session input");
+        assert_eq!(input.session_id, session);
+        assert_eq!(input.turn_id, turn);
+        provider.tool("novelty-discover", "tool_search", json!({"query":"select:read_file,tool_orchestrate"}), None).await;
+        let request = provider.next().await;
+        let tools = request.body["tools"].as_array().expect("original Step catalog");
+        for name in ["read_file", "tool_orchestrate"] {
+            assert!(tools.iter().any(|tool| tool["function"]["name"] == name), "original Step must expose {name}");
+        }
+        request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[
+            {"index":0,"id":"novelty-prior","type":"function","function":{"name":"read_file","arguments":json!({"path":"target.txt","complete":true}).to_string()}}
+        ]})).unwrap();
+        let request = provider.next().await;
+        assert!(request.body["messages"].as_array().unwrap().iter().any(|message|
+            message["role"] == "tool" && message["tool_call_id"] == "novelty-prior"));
+        let positive = json!({"steps":[{"id":"find","op":"call","tool":"grep_search",
+            "input":{"path":"docs","pattern":"alpha"}}]});
+        request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[
+            {"index":0,"id":"novelty-search","type":"function","function":{"name":"tool_orchestrate","arguments":positive.to_string()}}
+        ]})).unwrap();
+        let request = provider.next().await;
+        assert!(request.body["messages"].as_array().unwrap().iter().any(|message|
+            message["role"] == "tool" && message["tool_call_id"] == "novelty-search"));
+        let mixed = json!({"steps":[{"id":"find","op":"batch","calls":[
+            {"tool":"grep_search","input":{"path":"docs","pattern":"alpha"}},
+            {"tool":"read_file","input":{"path":"docs/a.txt","complete":true}}
+        ]}]});
+        request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[
+            {"index":0,"id":"novelty-mixed","type":"function","function":{"name":"tool_orchestrate","arguments":mixed.to_string()}},
+            {"index":1,"id":"novelty-direct","type":"function","function":{"name":"read_file","arguments":json!({"path":"target.txt","complete":true}).to_string()}}
+        ]})).unwrap();
+        let next = provider.next().await;
+        for call in ["novelty-mixed", "novelty-direct"] {
+            assert!(next.body["messages"].as_array().unwrap().iter().any(|message|
+                message["role"] == "tool" && message["tool_call_id"] == call), "same frame result {call}");
+        }
+        let observations = runtime.goal_store().observations(&format!("goal:{graph}")).unwrap();
+        let find = |id: &str| observations.iter().position(|observation|
+            observation.identity.graph_id == graph
+                && observation.evidence_refs.contains(&format!("tool_call:{id}")))
+            .expect("original same-graph ToolProgress");
+        let prior = find("novelty-prior");
+        let found = find("novelty-search");
+        let mixed_index = find("novelty-mixed");
+        assert!(prior < found && found < mixed_index);
+        assert!(observations[found].evidence_refs.contains(&"tool_coverage:discovery:docs".to_string()));
+        let mixed = &observations[mixed_index];
+        assert!(mixed.evidence_refs.contains(&"tool_call:novelty-direct".to_string()), "calls must share original batch");
+        assert!(mixed.evidence_refs.contains(&"tool_coverage:evidence:read_file:target.txt".to_string()));
+        assert!(!mixed.evidence_refs.contains(&"tool_coverage:discovery:docs".to_string()));
+        assert!(mixed.summary.contains("search coverage remains unknown"));
+        assert!(!mixed.summary.contains("no new evidence coverage"));
+        next.reply.send(json!({"role":"assistant","content":"alpha"})).unwrap();
+    }).catch_unwind().await;
+    let drain = std::panic::AssertUnwindSafe(async {
+    if let Some((request_id, turn, graph)) = identity.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        let active = services.runtime.stop_accepting_for_recovery();
+        if let Ok(Some(input)) = services.session.runtime_input(&request_id).await {
+            let _ = services.session.cancel_input(&session,
+                harness_contract::turn::SessionInputId::from_string(input.input_id.to_string()),
+                "local scope fixture complete").await;
+        }
+        let _ = services.session.cancel_active_execution(&session, &turn, &graph, "local scope fixture complete");
+        let _ = runtime.cancel_execution_tree(&graph, "local scope fixture complete").await;
+        let drain = services.runtime.wait_for_active_turns(active.len(), Duration::from_secs(30)).await;
+        assert!(drain.remaining_turn_ids.is_empty(), "original Session turn must drain");
+    }
+    }).catch_unwind().await;
+    drop(runtime);
+    drop(provider);
+    let cleanup = std::panic::AssertUnwindSafe(services.stop()).catch_unwind().await;
+    if let Err(panic) = run { std::panic::resume_unwind(panic); }
+    if let Err(panic) = drain { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
+}
+
+
 // Metadata-only fallback for either a missing private directory or a failed
 // private write. It never prints request/response bodies or raw error text.
 fn c_bounded_original_failure_summary(

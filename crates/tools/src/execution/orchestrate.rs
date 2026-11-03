@@ -151,7 +151,8 @@ pub(crate) fn original_static_file_scopes(
                     );
                 }
             } else {
-                add(read, None, ProofEffectPurpose::InputRead);
+                let default_root = input.get("roots").is_none_or(Value::is_null).then(|| ".".to_string());
+                add(read, default_root, ProofEffectPurpose::InputRead);
             }
         }
         "checkpoint" | "checkpoint_list" | "checkpoint_diff" => {
@@ -737,6 +738,10 @@ fn parse_preflight(input: &Value) -> Result<(OrchestrateInput, Vec<PreflightCall
     Ok((parsed, calls))
 }
 
+fn has_incomplete_search<'a>(items: impl Iterator<Item = (&'a str, bool)>) -> bool {
+    items.into_iter().any(|(tool, incomplete)| tool == "grep_search" && incomplete)
+}
+
 fn evaluate(
     lease: &ToolHostLease,
     step_index: usize,
@@ -777,6 +782,9 @@ fn evaluate(
                 call_tool_uncounted(lease, step_index, step_id, call.3, &call.1, &call.2)
             });
             *total_calls += items.len();
+            if has_incomplete_search(items.iter().zip(&results).map(|(item, result)| (item.1.as_str(), result.output.is_none()))) {
+                lease.discard_orchestrated_searches();
+            }
             let collect = matches!(on_error, Some(OnError::Collect));
             let mut object = Map::new();
             for (index, result) in results.into_iter().enumerate() {
@@ -823,6 +831,7 @@ fn evaluate(
                 ));
             }
             // Bounded parallel fan-out, matching `read_many`/`grep_many`.
+            if tool == "grep_search" && items.is_empty() { lease.discard_orchestrated_searches(); }
             let indexed = items.iter().cloned().enumerate().collect::<Vec<_>>();
             let results =
                 crate::executor::run_ordered_batch(indexed, max_concurrency, |(position, item)| {
@@ -830,6 +839,9 @@ fn evaluate(
                     call_tool_uncounted(lease, step_index, step_id, position, tool, &resolved)
                 });
             *total_calls += items.len();
+            if tool == "grep_search" && results.iter().any(|result| result.output.is_none()) {
+                lease.discard_orchestrated_searches();
+            }
             let collect = matches!(on_error, Some(OnError::Collect));
             let mut outputs = Vec::with_capacity(results.len());
             for result in results {
@@ -895,6 +907,7 @@ fn evaluate(
         } => {
             let resolved = resolve_value(input, state, None)?;
             bump(total_calls)?;
+            lease.discard_orchestrated_searches();
             run_compute(lease, language, code, &resolved)
         }
         StepKind::When {
@@ -906,6 +919,7 @@ fn evaluate(
                 let resolved = resolve_value(input, state, None)?;
                 call_tool(lease, step_index, step_id, 0, tool, &resolved, total_calls)
             } else {
+                if tool == "grep_search" { lease.discard_orchestrated_searches(); }
                 Ok(Value::Null)
             }
         }
@@ -921,6 +935,7 @@ fn evaluate(
                 ));
             }
             let mut last = Value::Null;
+            let before = *total_calls;
             for position in 0..*max {
                 if !eval_condition(condition, state, None)? {
                     break;
@@ -936,6 +951,7 @@ fn evaluate(
                     total_calls,
                 )?;
             }
+            if tool == "grep_search" && *total_calls == before { lease.discard_orchestrated_searches(); }
             Ok(last)
         }
     }
@@ -979,9 +995,21 @@ fn call_tool_uncounted(
             "tool_orchestrate cannot dispatch `{tool}`: not an allowed orchestration tool"
         ));
     }
-    let output = execute_with_lease(lease, tool, input)?;
+    // Other child tools are not represented by search novelty candidates.
+    if tool != "grep_search" { lease.discard_orchestrated_searches(); }
+    let output = match execute_with_lease(lease, tool, input) {
+        Ok(output) => output,
+        Err(error) => {
+            if tool == "grep_search" { lease.discard_orchestrated_searches(); }
+            return Err(error);
+        }
+    };
     if tool == "read_file" {
         lease.record_orchestrated_read(step_index, step_id, position, input, &output)?;
+    } else if tool == "grep_search" {
+        if lease.record_orchestrated_search(step_index, step_id, position, tool, input, &output).is_err() {
+            lease.discard_orchestrated_searches();
+        }
     }
     Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
 }
@@ -1197,6 +1225,19 @@ fn is_reference(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_worker_panic_marks_only_failed_search_incomplete() {
+        let results = crate::executor::run_ordered_batch(vec![0, 1], Some(2), |index| {
+            if index == 1 { panic!("intentional local worker panic"); }
+            Ok(serde_json::json!({"ok":true}))
+        });
+        assert!(has_incomplete_search(["read_file", "grep_search"].into_iter().zip(&results)
+            .map(|(tool, result)| (tool, result.output.is_none()))));
+        assert!(!has_incomplete_search(["grep_search", "read_file"].into_iter().zip(&results)
+            .map(|(tool, result)| (tool, result.output.is_none()))));
+    }
+
 
     #[test]
     fn compute_uses_explicit_empty_project_input_and_cannot_import_live_files() {

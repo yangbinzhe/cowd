@@ -146,16 +146,13 @@ impl GatewayToolExecutor {
             if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read
                 && !effect.uses_network && !effect.spawns_process
             {
-                let (output, reads) = runtime::ToolExecutionPlane::adapt_blocking(move || {
+                let (output, children) = runtime::ToolExecutionPlane::adapt_blocking(move || {
                     lease.execute_with_orchestrated_read_trace(&authorization, &value)
                         .map_err(|error| ToolError::new(error.to_string()))
                 }).await.map_err(|error| ToolError::new(error.to_string()))??;
-                return Ok(match reads {
-                    Some(reads) => harness_contract::context::ToolOutputDraft::InProcess {
-                        content: output,
-                        evidence: harness_contract::context::InProcessToolEvidence::new(reads),
-                    },
-                    None => harness_contract::context::ToolOutputDraft::bounded_inline(output),
+                return Ok(harness_contract::context::ToolOutputDraft::InProcess {
+                    content: output,
+                    evidence: harness_contract::context::InProcessToolEvidence::new(children),
                 });
             }
         }

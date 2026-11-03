@@ -335,7 +335,7 @@
         let harness_contract::context::ToolOutputDraft::InProcess { content, evidence } = output else {
             panic!("missing private child channel")
         };
-        let children = evidence.downcast_ref::<Vec<tools::OrchestratedRead>>().unwrap();
+        let children = evidence.downcast_ref::<tools::OrchestratedChildren>().unwrap().reads.as_ref().unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!((children[0].step_index(), children[0].position()), (0, 0));
         assert_eq!(children[0].parent_authorization(), &auth);

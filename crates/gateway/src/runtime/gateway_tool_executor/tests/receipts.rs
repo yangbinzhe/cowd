@@ -138,7 +138,7 @@
     }
 
     #[test]
-    fn read_many_only_mints_complete_success_children() {
+    fn unbound_orchestration_output_cannot_mint_child_evidence() {
         let services = runtime::RuntimeServices::in_memory().expect("runtime services");
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         executor
@@ -182,12 +182,7 @@
             &output.to_string(),
             "gateway-tool:read-many",
         );
-        assert_eq!(facts.len(), 1);
-        assert!(matches!(
-            &facts[0].target,
-            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
-                if scope.path.workspace_relative_path == "complete.txt"
-        ));
+        assert!(facts.is_empty(), "model-shaped output without the original child owner is not evidence");
     }
 
     #[test]

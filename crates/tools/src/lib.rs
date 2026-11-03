@@ -632,7 +632,7 @@ pub use executor::orchestrate::{requested_sub_call_tools, SubCallAuthorization};
 pub(crate) use executor::*;
 #[path = "host.rs"]
 pub mod host;
-pub use host::{OrchestratedRead, ToolHost, ToolHostError, ToolHostLease, ToolHostSnapshot};
+pub use host::{OrchestratedChildren, OrchestratedRead, OrchestratedSearch, ToolHost, ToolHostError, ToolHostLease, ToolHostSnapshot};
 #[path = "execution/background_jobs.rs"]
 pub mod background_jobs;
 #[path = "execution/bash.rs"]

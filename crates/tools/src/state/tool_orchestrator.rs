@@ -2122,7 +2122,9 @@ mod tests {
                 json!({"roots":["src","tests"],"path":"decoy"}),
                 vec![Some("src"), Some("tests")],
             ),
-            ("workspace_snapshot", json!({"path":"decoy"}), vec![None]),
+            ("workspace_snapshot", json!({"path":"decoy"}), vec![Some(".")]),
+            ("workspace_snapshot", json!({"roots":null}), vec![Some(".")]),
+            ("workspace_snapshot", json!({"roots":"bad"}), vec![None]),
             (
                 "vision_analyze",
                 json!({"image_path":"image.png","path":"decoy"}),

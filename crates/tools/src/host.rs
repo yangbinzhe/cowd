@@ -286,9 +286,53 @@ impl OrchestratedRead {
     }
 }
 
+/// Actual successful searches captured by the same private child execution owner.
+/// This is only a novelty candidate, not a file-read or authorization receipt.
+#[derive(Clone, PartialEq)]
+pub struct OrchestratedSearch {
+    step_index: usize,
+    step_id: String,
+    position: usize,
+    parent_request_id: String,
+    parent_descriptor_hash: String,
+    parent_authorization: ToolExecutionAuthorization,
+    effect: ToolEffectDescriptor,
+    tool_name: String,
+    input_sha256: String,
+    output_sha256: String,
+    base_path: String,
+}
+impl std::fmt::Debug for OrchestratedSearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratedSearch").field("step_index", &self.step_index)
+            .field("position", &self.position).finish_non_exhaustive()
+    }
+}
+impl OrchestratedSearch {
+    pub fn step_index(&self) -> usize { self.step_index }
+    pub fn step_id(&self) -> &str { &self.step_id }
+    pub fn position(&self) -> usize { self.position }
+    pub fn parent_request_id(&self) -> &str { &self.parent_request_id }
+    pub fn parent_descriptor_hash(&self) -> &str { &self.parent_descriptor_hash }
+    pub fn parent_authorization(&self) -> &ToolExecutionAuthorization { &self.parent_authorization }
+    pub fn effect(&self) -> &ToolEffectDescriptor { &self.effect }
+    pub fn tool_name(&self) -> &str { &self.tool_name }
+    pub fn input_sha256(&self) -> &str { &self.input_sha256 }
+    pub fn output_sha256(&self) -> &str { &self.output_sha256 }
+    pub fn base_path(&self) -> &str { &self.base_path }
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrchestratedChildren {
+    pub reads: Option<Vec<OrchestratedRead>>,
+    pub searches: Option<Vec<OrchestratedSearch>>,
+}
+
 #[derive(Default)]
 struct OrchestratedReadTrace {
     reads: Vec<OrchestratedRead>,
+    searches: Vec<OrchestratedSearch>,
+    search_bytes: usize,
+    search_overflow: bool,
     bytes: usize,
     overflow: bool,
     parent_request_id: String,
@@ -343,7 +387,7 @@ impl ToolHostLease {
         &self,
         authorization: &ToolExecutionAuthorization,
         input: &Value,
-    ) -> Result<(String, Option<Vec<OrchestratedRead>>), ToolHostError> {
+    ) -> Result<(String, OrchestratedChildren), ToolHostError> {
         if self.orchestrated_read_trace.is_some() {
             return Err(ToolHostError::Execution("nested read trace owner".into()));
         }
@@ -363,7 +407,59 @@ impl ToolHostLease {
             .lock()
             .map_err(|_| ToolHostError::Execution("read trace poisoned".into()))?;
         let reads = (!trace.overflow).then(|| std::mem::take(&mut trace.reads));
-        Ok((output, reads))
+        let searches = (!trace.search_overflow).then(|| std::mem::take(&mut trace.searches));
+        Ok((output, OrchestratedChildren { reads, searches }))
+    }
+
+    pub(crate) fn discard_orchestrated_searches(&self) {
+        if let Some(trace) = &self.orchestrated_read_trace {
+            if let Ok(mut trace) = trace.lock() { trace.search_overflow = true; trace.searches.clear(); }
+        }
+    }
+
+    pub(crate) fn record_orchestrated_search(
+        &self, step_index: usize, step_id: &str, position: usize, tool: &str, input: &Value, output: &str,
+    ) -> Result<(), String> {
+        let Some(trace) = &self.orchestrated_read_trace else { return Ok(()); };
+        let Ok(result) = serde_json::from_str::<Value>(output) else { self.discard_orchestrated_searches(); return Ok(()); };
+        let Some(base_path) = result.get("basePath").and_then(Value::as_str) else { self.discard_orchestrated_searches(); return Ok(()); };
+        if result.get("scanComplete").and_then(Value::as_bool) != Some(true)
+            || result.get("truncated").and_then(Value::as_bool) != Some(false)
+            || result.get("numFiles").and_then(Value::as_u64).is_none()
+            || result.get("omissions").and_then(Value::as_array).is_some_and(|items| !items.is_empty())
+            || result.get("continuationCursor").is_some_and(|v| !v.is_null())
+            || result.get("next_request").is_some_and(|v| !v.is_null()) { self.discard_orchestrated_searches(); return Ok(()); }
+        if tool != "grep_search" { return Ok(()); }
+        if tool == "grep_search" && result.get("omissions").and_then(Value::as_array).is_none() { self.discard_orchestrated_searches(); return Ok(()); }
+        let path = std::path::Path::new(base_path);
+        let relative = path.is_absolute().then(|| path.strip_prefix(self.path_policy.workspace_root()).ok()).flatten()
+            .filter(|path| path.components().all(|part| matches!(part, std::path::Component::Normal(_))))
+            .and_then(std::path::Path::to_str)
+            .filter(|path| !path.contains('\u{fffd}'));
+        let Some(base_path) = relative.map(|path| if path.is_empty() { "." } else { path }) else {
+            self.discard_orchestrated_searches();
+            return Ok(());
+        };
+        let effect = self.describe_effect(tool, input);
+        use sha2::{Digest, Sha256};
+        let input_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(input).map_err(|error| error.to_string())?));
+        let output_sha256 = format!("{:x}", Sha256::digest(output.as_bytes()));
+        let mut trace = trace.lock().map_err(|_| "search trace poisoned")?;
+        if effect.scopes.is_empty() || !effect.scopes.iter().all(|scope| trace.authorized_scopes.contains(scope)) {
+            trace.search_overflow = true; trace.searches.clear(); return Ok(());
+        }
+        let bytes = base_path.len().saturating_add(step_id.len());
+        if trace.searches.len() >= 400 || trace.search_bytes.saturating_add(bytes) > 1024 * 1024 {
+            trace.search_overflow = true; trace.searches.clear(); return Ok(());
+        }
+        if trace.search_overflow { return Ok(()); }
+        trace.search_bytes += bytes;
+        let parent_request_id = trace.parent_request_id.clone();
+        let parent_descriptor_hash = trace.parent_descriptor_hash.clone();
+        let parent_authorization = trace.parent_authorization.clone().ok_or("search trace parent authorization missing")?;
+        trace.searches.push(OrchestratedSearch { step_index, step_id: step_id.into(), position,
+            parent_request_id, parent_descriptor_hash, parent_authorization, effect, tool_name: tool.into(), input_sha256, output_sha256, base_path: base_path.into() });
+        Ok(())
     }
 
     pub(crate) fn record_orchestrated_read(
@@ -1771,7 +1867,7 @@ mod tests {
         let (output, reads) = lease
             .execute_with_orchestrated_read_trace(&auth, &input)
             .unwrap();
-        let reads = reads.unwrap();
+        let reads = reads.reads.unwrap();
         assert_eq!(reads.len(), 2);
         assert_eq!(
             reads
@@ -1806,7 +1902,96 @@ mod tests {
         let (_, next) = lease
             .execute_with_orchestrated_read_trace(&auth, &input)
             .unwrap();
-        assert_eq!(next.unwrap().len(), 2, "traces are invocation-local");
+        assert_eq!(next.reads.unwrap().len(), 2, "traces are invocation-local");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn orchestrated_search_trace_only_records_actual_success_under_parent_grant() {
+        let root = std::env::temp_dir().join(format!("cowd-child-search-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "pub mod alpha;\n").unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::create_dir_all(root.join("crates/example")).unwrap();
+        std::fs::write(root.join("docs/a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("crates/example/a.txt"), "alpha\n").unwrap();
+        let lease = test_host("child-search", &root).pin_snapshot();
+        let input = json!({"steps":[{"id":"find","op":"batch","on_error":"collect","calls":[
+            {"tool":"grep_search","input":{"path":".","pattern":"alpha"},"as":"ok"},
+            {"tool":"grep_search","input":{"path":".","pattern":"not-present"},"as":"zero"}
+        ]}]});
+        let auth = authorization(&lease.describe_effect("tool_orchestrate", &input), None);
+        let (_, children) = lease.execute_with_orchestrated_read_trace(&auth, &input).unwrap();
+        let searches = children.searches.unwrap();
+        assert_eq!(searches.len(), 2);
+        assert_eq!(searches.iter().map(|child| child.position()).collect::<std::collections::BTreeSet<_>>(), [0, 1].into_iter().collect());
+        let child = searches.iter().find(|child| child.position() == 0).unwrap();
+        assert_eq!((child.step_index(), child.step_id(), child.position()), (0, "find", 0));
+        assert_eq!(child.tool_name(), "grep_search");
+        assert_eq!(child.base_path(), ".");
+        assert_eq!(child.parent_authorization(), &auth);
+        assert_eq!(child.effect().tool_id, "grep_search");
+        assert_eq!(child.input_sha256().len(), 64);
+        assert_eq!(child.output_sha256().len(), 64);
+        assert!(children.reads.unwrap().is_empty());
+        let zoned = json!({"steps":[{"id":"zones","op":"batch","calls":[
+            {"tool":"grep_search","input":{"path":"docs","pattern":"alpha"}},
+            {"tool":"grep_search","input":{"path":"crates/example","pattern":"alpha"}}
+        ]}]});
+        let zoned_auth = authorization(&lease.describe_effect("tool_orchestrate", &zoned), None);
+        let (_, zoned_children) = lease.execute_with_orchestrated_read_trace(&zoned_auth, &zoned).unwrap();
+        let paths = zoned_children.searches.unwrap().into_iter().map(|search| search.base_path().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths, ["docs".to_string(), "crates/example".to_string()].into_iter().collect());
+        // An invalid producer path must poison the existing per-call trace even if a later path is valid.
+        let mut traced = lease.clone();
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
+            authorized_scopes: zoned_auth.authorization_lease.scopes.clone(),
+            parent_request_id: zoned_auth.request_id.clone(),
+            parent_descriptor_hash: zoned_auth.descriptor_hash.clone(),
+            parent_authorization: Some(zoned_auth.clone()),
+            ..OrchestratedReadTrace::default()
+        }));
+        traced.orchestrated_read_trace = Some(trace.clone());
+        let grep_input = json!({"path":"docs","pattern":"alpha"});
+        let output = |path: &str| json!({"basePath":path,"scanComplete":true,"truncated":false,
+            "numFiles":0,"omissions":[]}).to_string();
+        traced.record_orchestrated_search(0, "zones", 0, "grep_search", &grep_input,
+            &output("/outside-workspace")).unwrap();
+        let valid_path = root.join("docs");
+        traced.record_orchestrated_search(0, "zones", 1, "grep_search", &grep_input,
+            &output(valid_path.to_str().unwrap())).unwrap();
+        let guard = trace.lock().unwrap();
+        assert!(guard.search_overflow && guard.searches.is_empty());
+        drop(guard);
+        let traversal = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace::default()));
+        traced.orchestrated_read_trace = Some(traversal.clone());
+        traced.record_orchestrated_search(0, "zones", 0, "grep_search", &grep_input,
+            &output(root.join("../outside-workspace").to_str().unwrap())).unwrap();
+        assert!(traversal.lock().unwrap().search_overflow);
+        let lossy = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace::default()));
+        traced.orchestrated_read_trace = Some(lossy.clone());
+        traced.record_orchestrated_search(0, "zones", 0, "grep_search", &grep_input,
+            &output(root.join("bad\u{fffd}path").to_str().unwrap())).unwrap();
+        assert!(lossy.lock().unwrap().search_overflow);
+        let mut mixed = input.clone();
+        mixed["steps"][0]["calls"].as_array_mut().unwrap().push(json!({"tool":"read_file","input":{"path":"a.rs"},"as":"read"}));
+        let mixed_auth = authorization(&lease.describe_effect("tool_orchestrate", &mixed), None);
+        let (_, mixed_children) = lease.execute_with_orchestrated_read_trace(&mixed_auth, &mixed).unwrap();
+        assert!(mixed_children.searches.is_none(), "mixed child kinds cannot claim complete search-only coverage");
+        assert_eq!(mixed_children.reads.unwrap().len(), 1, "original read trace remains available");
+        let mut partial = input.clone();
+        partial["steps"][0]["calls"].as_array_mut().unwrap().push(json!({"tool":"grep_search","input":{"path":"missing","pattern":"alpha"},"as":"missing"}));
+        let auth = authorization(&lease.describe_effect("tool_orchestrate", &partial), None);
+        let (_, unknown) = lease.execute_with_orchestrated_read_trace(&auth, &partial).unwrap();
+        assert!(unknown.searches.is_none(), "a collected failure cannot prove complete search coverage");
+        let compute = json!({"steps":[
+            {"id":"find","op":"call","tool":"grep_search","input":{"path":".","pattern":"alpha"}},
+            {"id":"compute","op":"compute","language":"python","code":"print(1)","input":null}
+        ]});
+        let compute_auth = authorization(&lease.describe_effect("tool_orchestrate", &compute), None);
+        let (_, computed) = lease.execute_with_orchestrated_read_trace(&compute_auth, &compute).unwrap();
+        assert!(computed.searches.is_none(), "an executed compute is outside search-only coverage");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1824,7 +2009,7 @@ mod tests {
         let (_, reads) = lease
             .execute_with_orchestrated_read_trace(&auth, &input)
             .unwrap();
-        let reads = reads.unwrap();
+        let reads = reads.reads.unwrap();
         assert_eq!(reads.len(), 2);
         assert_eq!(
             reads

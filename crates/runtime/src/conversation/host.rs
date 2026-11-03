@@ -58,6 +58,7 @@ pub(crate) fn closure_mutation_tool_ids(rungs: &[String]) -> std::collections::B
 #[path = "host_presentation.rs"]
 mod host_presentation;
 use host_presentation::*;
+pub(crate) use host_presentation::original_orchestrated_search_coverage;
 #[path = "host_route.rs"]
 mod host_route;
 

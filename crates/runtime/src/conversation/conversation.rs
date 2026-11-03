@@ -4898,6 +4898,7 @@ impl From<(String, String)> for PreDispatchRefusal {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolBatchStepResult {
+    pub(crate) orchestrated_search_coverage: Option<std::collections::BTreeSet<String>>,
     pub(crate) member_batches: Vec<(String, PendingAgentBatch)>,
     pub(crate) refused_before_dispatch: Vec<PreDispatchRefusal>,
     pub messages: Vec<ConversationMessage>,

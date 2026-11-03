@@ -442,9 +442,8 @@ impl GatewayToolExecutor {
                 .and_then(|output| {
                     typed_observations = output.observations().to_vec();
                     if let harness_contract::context::ToolOutputDraft::InProcess { evidence, .. } = &output {
-                        if let Some(reads) = evidence.downcast_ref::<Vec<tools::OrchestratedRead>>() {
-                            request.tool_progress.record_child_reads(reads.clone())
-                                .map_err(ToolError::new)?;
+                        if let Some(children) = evidence.downcast_ref::<tools::OrchestratedChildren>() {
+                            request.tool_progress.record_orchestrated_children(children).map_err(ToolError::new)?;
                         }
                     }
                     Ok(output.model_text().to_string())
