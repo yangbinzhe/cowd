@@ -2094,8 +2094,33 @@ mod tests {
             ),
             (
                 "glob_search",
-                json!({"path":" ","pattern":"*.rs"}),
+                json!({"path":"crates/runtime","pattern":"**/*.rs"}),
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"patterns":[{"path":"src","pattern":"**/*.rs"},{"path":"tests","pattern":"nested/*.rs"}]}),
+                vec![Some("."), None],
+            ),
+            (
+                "glob_search",
+                json!({"path":"src","pattern":"{..,nested}/*.rs"}),
                 vec![None],
+            ),
+            (
+                "glob_search",
+                json!({"path":" ","pattern":"*.rs"}),
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"pattern":"crates"}),
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"patterns":[{"pattern":"*.rs"},{"path":null,"pattern":"**/*.rs"},{"path":"","pattern":"*.rs"},{"path":42,"pattern":"*.rs"}]}),
+                vec![Some("."), None],
             ),
             (
                 "grep_search",

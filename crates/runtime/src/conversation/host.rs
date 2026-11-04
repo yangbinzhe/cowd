@@ -5048,6 +5048,26 @@ mod evaluation_descriptor_scope_tests {
     use harness_contract::tool::{ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency, ToolPermissionMode};
 
     #[test]
+    fn recursive_glob_requires_workspace_read_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("recursive-glob-scope", root.path());
+        let effect = host.pin_snapshot().describe_effect("glob_search", &serde_json::json!({
+            "path":"crates/runtime", "pattern":"**/*.rs"
+        }));
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &effect, root.path()).unwrap(), None);
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates/runtime".into()], &effect, root.path()).unwrap().as_deref(), Some("read:."));
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(root.path().join("other")).unwrap();
+            std::os::unix::fs::symlink("other", root.path().join("alias")).unwrap();
+            let alias_effect = host.pin_snapshot().describe_effect("glob_search", &serde_json::json!({
+                "path":"alias", "pattern":"**/*.rs"
+            }));
+            assert_eq!(evaluation_descriptor_scope_violation(&["read:alias".into()], &alias_effect, root.path()).unwrap().as_deref(), Some("read:."));
+        }
+    }
+
+    #[test]
     fn composite_descriptor_cannot_hide_other_file_or_network_effects() {
         let mut effect = ToolEffectDescriptor {
             tool_id:"composite".into(), descriptor_hash:"fixture".into(), effect_kind:ToolEffectKind::Read,

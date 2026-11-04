@@ -85,6 +85,15 @@ pub(crate) fn original_static_file_scopes(
                 .map(|requests| requests.iter().collect::<Vec<_>>())
                 .unwrap_or_else(|| vec![input]);
             for request in requests {
+                let search_path = if tool_id == "glob_search" {
+                    match request.get("path") {
+                        None | Some(Value::Null) => Some(".".to_string()),
+                        Some(Value::String(value)) if value.trim().is_empty() => Some(".".to_string()),
+                        value => directory_path(value),
+                    }
+                } else {
+                    directory_path(request.get("path"))
+                };
                 // A glob pattern that escapes the workspace is not a bounded
                 // research read. Refuse it so the effect falls back to the
                 // conservative unknown envelope, which keeps the hard boundary
@@ -108,9 +117,15 @@ pub(crate) fn original_static_file_scopes(
                         .is_none_or(|pattern| {
                             pattern.contains('/') || pattern.contains('\\') || pattern == ".."
                         }) {
-                    None
+                    // Recursive traversal stays within the workspace, but the
+                    // requested base can itself resolve through a symlink.
+                    request.get("pattern").and_then(Value::as_str)
+                        .filter(|pattern| pattern.starts_with("**/")
+                            && !pattern.contains(['{', '}', '\\']))
+                        .and_then(|_| search_path.clone())
+                        .map(|_| ".".to_string())
                 } else {
-                    directory_path(request.get("path"))
+                    search_path
                 };
                 add(read, target, ProofEffectPurpose::InputRead);
             }
