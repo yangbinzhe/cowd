@@ -92,7 +92,10 @@ pub(crate) fn original_static_file_scopes(
                         value => directory_path(value),
                     }
                 } else {
-                    directory_path(request.get("path"))
+                    match request.get("path") {
+                        None | Some(Value::Null) => Some(".".to_string()),
+                        value => directory_path(value),
+                    }
                 };
                 // A glob pattern that escapes the workspace is not a bounded
                 // research read. Refuse it so the effect falls back to the
@@ -117,11 +120,10 @@ pub(crate) fn original_static_file_scopes(
                         .is_none_or(|pattern| {
                             pattern.contains('/') || pattern.contains('\\') || pattern == ".."
                         }) {
-                    // Recursive traversal stays within the workspace, but the
-                    // requested base can itself resolve through a symlink.
+                    // A nested search may resolve its base through a symlink,
+                    // so certify the workspace rather than a lexical subtree.
                     request.get("pattern").and_then(Value::as_str)
-                        .filter(|pattern| pattern.starts_with("**/")
-                            && !pattern.contains(['{', '}', '\\']))
+                        .filter(|pattern| !pattern.contains(['{', '}', '\\']))
                         .and_then(|_| search_path.clone())
                         .map(|_| ".".to_string())
                 } else {

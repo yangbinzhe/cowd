@@ -5056,6 +5056,16 @@ mod evaluation_descriptor_scope_tests {
         }));
         assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &effect, root.path()).unwrap(), None);
         assert_eq!(evaluation_descriptor_scope_violation(&["read:crates/runtime".into()], &effect, root.path()).unwrap().as_deref(), Some("read:."));
+        let nested = host.pin_snapshot().describe_effect("glob_search", &serde_json::json!({
+            "path":"crates", "pattern":"*/src/*.rs"
+        }));
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &nested, root.path()).unwrap(), None);
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates".into()], &nested, root.path()).unwrap().as_deref(), Some("read:."));
+        let grep = host.pin_snapshot().describe_effect("grep_search", &serde_json::json!({
+            "searches":[{"pattern":"a"},{"path":null,"pattern":"b"}]
+        }));
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &grep, root.path()).unwrap(), None);
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates".into()], &grep, root.path()).unwrap().as_deref(), Some("read:."));
         #[cfg(unix)]
         {
             std::fs::create_dir(root.path().join("other")).unwrap();
@@ -5064,6 +5074,10 @@ mod evaluation_descriptor_scope_tests {
                 "path":"alias", "pattern":"**/*.rs"
             }));
             assert_eq!(evaluation_descriptor_scope_violation(&["read:alias".into()], &alias_effect, root.path()).unwrap().as_deref(), Some("read:."));
+            let nested_alias = host.pin_snapshot().describe_effect("glob_search", &serde_json::json!({
+                "path":"alias", "pattern":"*/src/*.rs"
+            }));
+            assert_eq!(evaluation_descriptor_scope_violation(&["read:alias".into()], &nested_alias, root.path()).unwrap().as_deref(), Some("read:."));
         }
     }
 

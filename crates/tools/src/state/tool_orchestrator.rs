@@ -2090,7 +2090,12 @@ mod tests {
             (
                 "glob_search",
                 json!({"path":"src","pattern":"nested/*.rs"}),
-                vec![None],
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"path":"crates","pattern":"*/src/*.rs"}),
+                vec![Some(".")],
             ),
             (
                 "glob_search",
@@ -2100,7 +2105,7 @@ mod tests {
             (
                 "glob_search",
                 json!({"patterns":[{"path":"src","pattern":"**/*.rs"},{"path":"tests","pattern":"nested/*.rs"}]}),
-                vec![Some("."), None],
+                vec![Some(".")],
             ),
             (
                 "glob_search",
@@ -2126,6 +2131,16 @@ mod tests {
                 "grep_search",
                 json!({"path":"src","pattern":"needle"}),
                 vec![Some("src")],
+            ),
+            (
+                "grep_search",
+                json!({"pattern":"needle"}),
+                vec![Some(".")],
+            ),
+            (
+                "grep_search",
+                json!({"searches":[{"pattern":"a"},{"path":null,"pattern":"b"},{"path":" ","pattern":"c"},{"path":42,"pattern":"d"}]}),
+                vec![Some("."), None],
             ),
             (
                 "grep_search",

@@ -99,6 +99,17 @@ impl Default for RequestBudget {
 }
 
 impl RequestBudget {
+    pub(super) fn restart_after_cut_race(&mut self) -> Result<(), RuntimeServicesError> {
+        self.charge(1, 0)?;
+        let records = self.records;
+        let bytes = self.bytes;
+        *self = Self::default();
+        self.records = records;
+        self.bytes = bytes;
+        self.enable_incremental();
+        Ok(())
+    }
+
     pub(super) fn terminal_active(&self) -> bool {
         self.terminal_work.is_some()
     }
@@ -2152,9 +2163,33 @@ fn is_stale_graph_source(error: &RuntimeServicesError) -> bool {
         if message.contains("history prefix: graph source changed"))
 }
 
+pub(super) fn is_graph_ahead_of_cut(error: &RuntimeServicesError) -> bool {
+    matches!(error, RuntimeServicesError::Invariant(message)
+        if message == "history prefix: graph ahead of requested cut")
+}
+
 #[cfg(test)]
 mod canonical_request_413_tests {
     use super::*;
+
+    #[test]
+    fn cut_race_retry_keeps_work_budget_and_discards_attempt_state() {
+        let mut budget = RequestBudget::default();
+        budget.enable_incremental();
+        budget.charge(4, 128).unwrap();
+        budget.stream_heads.insert(("old".into(), 1), 1);
+        budget.incomplete = true;
+        budget.scope_progress = true;
+        budget.restart_after_cut_race().unwrap();
+        assert_eq!(budget.consumed_work(), (5, 128));
+        assert!(budget.stream_heads.is_empty());
+        assert!(!budget.incomplete && !budget.scope_progress);
+        assert!(budget.incremental);
+        assert!(is_graph_ahead_of_cut(&RuntimeServicesError::Invariant(
+            "history prefix: graph ahead of requested cut".into())));
+        assert!(!is_graph_ahead_of_cut(&RuntimeServicesError::Invariant(
+            "history source mutation fence changed".into())));
+    }
 
     #[tokio::test]
     async fn r1_703_verified_graph_body_reuse_preserves_raw_identity_cut_and_poisoning() {
