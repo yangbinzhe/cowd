@@ -638,9 +638,16 @@ impl GatewayToolExecutor {
                     ToolError::unknown("batch original member policy owner missing")
                 })?;
                 match owner.prepare_member_pregrant(original, index).await {
-                runtime::tool_host::AgentBatchMemberPregrant::Replay(_) => {
+                runtime::tool_host::AgentBatchMemberPregrant::Replay(member) => {
                     entry.get("tool").and_then(serde_json::Value::as_str)
                         .ok_or_else(|| ToolError::unknown("replayed original member tool unavailable"))?;
+                    // The original owner already committed this member. Keep that
+                    // certified outcome in the same-call sink: a rebuilt request
+                    // (new attempt) starts with an empty sink, and settlement
+                    // requires one owner outcome per member. Registration is
+                    // idempotent per index, so this never duplicates a member.
+                    original.tool_progress.record_original_member(index, std::sync::Arc::new(
+                        runtime::tool_host::OriginalMemberSubmitOutcome::Committed(member)));
                     Err(ToolError::unknown("original member committed; Host delivery incomplete"))
                 }
                 runtime::tool_host::AgentBatchMemberPregrant::Terminal(publication) => {

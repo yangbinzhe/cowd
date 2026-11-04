@@ -5842,6 +5842,21 @@ pub(super) fn graph_resource_scopes_for_tool_calls(
     scopes
 }
 
+/// Every call whose result was published to the transcript, whether that
+/// result reports success or failure. Publication is a delivery fact; whether
+/// the mutation committed is decided by the original owner, never by the
+/// transport outcome.
+pub(super) fn delivered_tool_call_ids(messages: &[ConversationMessage]) -> BTreeSet<String> {
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(super) fn successful_tool_call_ids(messages: &[ConversationMessage]) -> BTreeSet<String> {
     messages
         .iter()

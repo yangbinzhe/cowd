@@ -7892,6 +7892,80 @@ impl OriginalPostActionCommit {
     fn belongs_to(&self, store: &Arc<crate::RuntimeEventStore>) -> bool { match self { Self::Single(v) => v.belongs_to(store), Self::Member(v) => v.belongs_to(store), Self::Conclusion(v) => v.belongs_to(store), Self::Replay(v) => v.belongs_to(store) } }
 }
 
+/// The original owner's durable Program identity for one committed action:
+/// the transaction that wrote the Program event, that event's own kind and
+/// idempotency key, and the entity the action created. These are owner-written
+/// facts; they are what ties a Program advance back to a member.
+struct OriginalProgramAdvance {
+    transaction_id: String,
+    event_kind: String,
+    event_key: Option<String>,
+    entity_ref: Option<String>,
+}
+
+fn original_program_advance(
+    handle: &OriginalPostActionCommit,
+    program_stream: &str,
+) -> Option<OriginalProgramAdvance> {
+    let receipt = handle.receipt();
+    let request = handle.request()?;
+    let event = request.transaction.events.iter()
+        .find(|event| event.event.stream_id == program_stream)?;
+    Some(OriginalProgramAdvance {
+        transaction_id: receipt.transaction_id.clone(),
+        event_kind: event.event.kind.clone(),
+        event_key: event.idempotency_key.clone(),
+        entity_ref: event.event.payload.get("entity_ref").and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty()).map(str::to_owned),
+    })
+}
+
+/// Tie every Program event in the gap back to a member of this batch. The
+/// comparison is exact identity over owner-written facts: the writing
+/// transaction, the Program event's own kind and idempotency key, or the
+/// entity the member created. Anything else keeps the rejection, so an
+/// unrelated Program writer is never mistaken for this batch's advance.
+fn attribute_original_program_advance(
+    store: &Arc<crate::RuntimeEventStore>,
+    program_stream: &str,
+    after_revision: u64,
+    through_revision: u64,
+    advances: &[OriginalProgramAdvance],
+) -> Result<(), String> {
+    let events = store.list_stream_after(program_stream, after_revision, through_revision, 100, 1024 * 1024)
+        .map_err(|error| format!("original Program gap unreadable: {error}"))?;
+    // The page size is a bound, not a contract. A truncated page would hide
+    // every event past the bound from attribution, so an unrelated writer
+    // could slip through as if it belonged to this batch.
+    if events.len() as u64 != through_revision.saturating_sub(after_revision) {
+        return Err("original Program gap read truncated".into());
+    }
+    for event in events {
+        let attributed = advances.iter().any(|advance| {
+            advance.transaction_id == event.transaction_id
+                || (advance.event_key.is_some()
+                    && advance.event_kind == event.kind
+                    && advance.event_key == event.idempotency_key)
+                || advance.entity_ref.as_deref().is_some_and(|entity| original_program_event_names(entity, &event))
+        });
+        if !attributed {
+            return Err("Program changed between original actions".into());
+        }
+    }
+    Ok(())
+}
+
+/// The entity a Program event names, read from the owner-written reference
+/// fields only. This is an exact comparison against the entity a certified
+/// member created; it never infers a cause from payload similarity, a time
+/// window, or a plausible looking shape.
+fn original_program_event_names(entity: &str, event: &crate::DurableRuntimeEvent) -> bool {
+    let payload = &event.payload;
+    payload.get("entity_ref").and_then(serde_json::Value::as_str) == Some(entity)
+        || payload.get("task_ref").and_then(serde_json::Value::as_str) == Some(entity)
+        || payload.pointer("/envelope/action/input/task_ref").and_then(serde_json::Value::as_str) == Some(entity)
+}
+
 /// Reuse the original conclusion owner only for an authenticated completion
 /// request whose same-call result has not yet reached its original sink.
 fn publish_existing_original_conclusion<C: ApiClient, T: ToolExecutor>(
@@ -7953,6 +8027,7 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
     backend: &TurnToolBatchBackend<C, T>, ticket: &NodeExecutionTicket,
     before: &crate::execution_core::goal::GoalProjection,
     successful: &std::collections::BTreeSet<String>,
+    delivered: &std::collections::BTreeSet<String>,
     members: &[(String, crate::PendingAgentBatch)],
     replays: &BTreeMap<String, HostOriginalReplay>,
 ) -> Result<Option<(crate::execution_core::goal::GoalProjection, Option<(String, u64)>)>, String> {
@@ -8030,7 +8105,12 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
             }
             member.node_commit_fact(services.event_store(), ticket)?;
             let handle = member.same_owner_committed().ok_or("original member committed owner missing")?;
-            if !successful.contains(call_id) { return Err("original member delivery is unavailable".into()); }
+            // The member's outcome is certified by its original owner above.
+            // What the outer still needs is that the call produced a published
+            // result at all: a batch that never published anything has nothing
+            // the model could have seen. Publication is not success, so an
+            // error result still qualifies.
+            if !delivered.contains(call_id) { return Err("original member delivery is unavailable".into()); }
             let action_id = member.action().payload().pointer("/envelope/action_id")
                 .and_then(serde_json::Value::as_str).filter(|value| !value.is_empty())
                 .ok_or("original member action identity unavailable")?;
@@ -8060,6 +8140,13 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
     let mut source = before.clone();
     let mut program_source: Option<(String, u64)> = None;
     let mut changed = false;
+    // Every committed action of this node carries the original owner's
+    // Program identity. It is what a Program advance in the gap between two
+    // members is compared against.
+    let program_advances = binding.map(|binding| {
+        let program_stream = format!("agentic-program:{}", binding.agentic_program_id);
+        committed.iter().filter_map(|handle| original_program_advance(handle, &program_stream)).collect::<Vec<_>>()
+    }).unwrap_or_default();
     for handle in &committed {
         if !handle.belongs_to(services.event_store()) { return Err("original committed store differs".into()); }
         let observation = handle.observation();
@@ -8084,8 +8171,21 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
         }
         let program_stream = format!("agentic-program:{}", binding.agentic_program_id);
         if let Some(cut) = receipt.stream_revisions.iter().find(|cut| cut.stream_id == program_stream && cut.committed_revision > cut.expected_revision) {
-            if program_source.as_ref().is_some_and(|(stream, revision)| stream != &program_stream || *revision != cut.expected_revision) {
-                return Err("Program changed between original actions".into());
+            // The members of one batch advance the Program themselves. The
+            // advance is accepted only when every Program event between two
+            // members can be tied back to a member of this batch; an unrelated
+            // Program writer keeps the rejection.
+            if let Some((stream, revision)) = program_source.as_ref() {
+                if stream != &program_stream {
+                    return Err("Program changed between original actions".into());
+                }
+                if *revision != cut.expected_revision {
+                    if cut.expected_revision < *revision {
+                        return Err("Program changed between original actions".into());
+                    }
+                    attribute_original_program_advance(services.event_store(), &program_stream,
+                        *revision, cut.expected_revision, &program_advances)?;
+                }
             }
             program_source = Some((program_stream, cut.committed_revision));
         }
@@ -8110,6 +8210,23 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
         changed = true;
     }
     if changed && program_source.is_none() { return Err("original committed Program source missing".into()); }
+    if let Some((stream, revision)) = program_source.as_ref() {
+        // The node writes the Program back under its own fence. That fence has
+        // to be the certified head at settlement, otherwise the node's own
+        // transaction is stale against the Program this batch advanced.
+        // Everything between the last certified member cut and that head is
+        // still part of the same decision: it must be attributable to this
+        // batch before it may enter the node fence, exactly like the gaps
+        // between two members.
+        let head = services.event_store().stream_revision(stream).map_err(|error| error.to_string())?;
+        if head < *revision {
+            return Err("Program changed between original actions".into());
+        }
+        if head > *revision {
+            attribute_original_program_advance(services.event_store(), stream, *revision, head, &program_advances)?;
+        }
+        program_source = Some((stream.clone(), head));
+    }
     // This fixture-only read marks the exact same-call post-action boundary.
     // Its result is not a Goal source and never changes the production CAS.
     #[cfg(feature = "test-fixtures")]
@@ -9420,11 +9537,12 @@ where
             )
         };
         let successful_original_calls = successful_tool_call_ids(&result.messages);
+        let delivered_original_calls = delivered_tool_call_ids(&result.messages);
         let mut original_call_results = self.state.lock().await.pending_member_batches
             .get(&(ticket.node_id.clone(), ticket.attempt)).cloned().unwrap_or_default();
         original_call_results.extend(original_member_batches.iter().cloned());
         let committed_goal = original_committed_goal(self, ticket, &write_goal_source,
-            &successful_original_calls, &original_call_results, &original_replays)
+            &successful_original_calls, &delivered_original_calls, &original_call_results, &original_replays)
             .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
         let (write_goal_source, post_action_program_source) = committed_goal
             .unwrap_or_else(|| (write_goal_source.clone(), None));
