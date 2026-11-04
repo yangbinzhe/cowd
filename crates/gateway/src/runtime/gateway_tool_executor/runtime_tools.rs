@@ -1478,8 +1478,21 @@ impl GatewayToolExecutor {
             }))
             .map_err(|error| ToolError::new(error.to_string()))?);
         }
-        let (delegate, mut delegated) =
-            unified_read_delegation(&input.reference).map_err(ToolError::new)?;
+        let (delegate, mut delegated) = match input.program_directory_inspect_input().map_err(|error| ToolError::new(error.to_string()))? {
+            Some(derived) => ("state_inspect", derived),
+            None => unified_read_delegation(&input.reference, input.cursor.as_deref()).map_err(ToolError::new)?,
+        };
+        // A delegated Agent action needs the original owner's action
+        // capability for this same call. Without it the delegated action
+        // cannot be authorized, and the old opaque "original single-call
+        // capability unavailable" Unknown blocked the whole node. Name what
+        // is actually missing instead.
+        if is_agent_action_tool(delegate) && binding.action_invocation.is_none() {
+            return Err(ToolError::new(format!(
+                "`read_ref` cannot serve the reference `{}` in this call: the delegated reader `{delegate}` is an Agent action and this call carries no original action capability; call `{delegate}` directly with the same target",
+                input.reference
+            )));
+        }
         if let Some(limit) = input.limit {
             if delegate != "state_inspect" {
                 delegated["limit"] = serde_json::json!(limit);
@@ -1487,7 +1500,7 @@ impl GatewayToolExecutor {
         }
         if let Some(cursor) = input.cursor {
             match delegate {
-                "state_inspect" => delegated["page_cursor"] = serde_json::json!(cursor),
+                "state_inspect" => {},
                 "context_retrieve" => delegated["content_cursor"] = serde_json::json!(cursor),
                 _ => delegated["cursor"] = serde_json::json!(cursor),
             }
@@ -2127,7 +2140,7 @@ fn is_unified_read_tool(tool_name: &str) -> bool {
 /// spelling instead: an unambiguous scheme prefix with the wrong separator is a
 /// mistake worth naming, while a legacy bare id (no colon at all) still routes
 /// through the Program directory as before.
-fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json::Value), String> {
+fn unified_read_delegation(reference: &str, cursor: Option<&str>) -> Result<(&'static str, serde_json::Value), String> {
     use harness_contract::refs::Address;
     let address = Address::parse(reference).map_err(|error| error.to_string())?;
     if let Address::Bare(bare) = &address {
@@ -2141,6 +2154,9 @@ fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json:
                 ));
             }
         }
+    }
+    if let Some(input) = address.program_directory_inspect_input(cursor) {
+        return Ok(("state_inspect", input));
     }
     let delegation = match address {
         Address::Tool(id) => (
@@ -2167,16 +2183,11 @@ fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json:
             "context_retrieve",
             serde_json::json!({ "source": "matrix", "entry_ref": id }),
         ),
-        Address::Program(id)
-        | Address::Task(id)
-        | Address::Team(id)
-        | Address::Agent(id)
-        | Address::Topic(id)
-        | Address::Issue(id)
-        | Address::Criterion(id)
-        | Address::Obligation(id)
-        | Address::Review(id)
-        | Address::Bare(id) => ("state_inspect", serde_json::json!({ "entry_ref": id })),
+        Address::Program(_) | Address::Task(_) | Address::Team(_) | Address::Agent(_)
+        | Address::Topic(_) | Address::Issue(_) | Address::Criterion(_)
+        | Address::Obligation(_) | Address::Review(_) | Address::Bare(_) => {
+            return Err("reference is not a Program-directory target".into());
+        }
         Address::File(_) | Address::Dir(_) | Address::Node { .. } => {
             return Err(
                 "`read` resolves Runtime references (program/task/team/agent/topic/issue/criterion/obligation/review/tool/artifact/session/fact/matrix/memory). Use read_file, glob_search, or grep_search for file:// and dir:// content."
@@ -2193,35 +2204,38 @@ mod unified_read_tests {
 
     #[test]
     fn routes_each_scheme_to_its_authorized_reader() {
-        let (reader, value) = unified_read_delegation("task://task:abc").expect("task routes");
+        let (reader, value) = unified_read_delegation("task://task:abc", None).expect("task routes");
         assert_eq!(reader, "state_inspect");
         assert_eq!(value["entry_ref"], "task:abc");
+        let (reader, value) = unified_read_delegation("task://task:abc", Some("next")).expect("task routes");
+        assert_eq!(reader, "state_inspect");
+        assert_eq!(value, serde_json::json!({"entry_ref":"task:abc", "page_cursor":"next"}));
 
         let (reader, value) =
-            unified_read_delegation("tool://tool-raw-call_00_x-abc").expect("tool routes");
+            unified_read_delegation("tool://tool-raw-call_00_x-abc", None).expect("tool routes");
         assert_eq!(reader, "evidence_retrieve");
         assert_eq!(value["evidence_ref"], "tool://tool-raw-call_00_x-abc");
 
         let (reader, _) =
-            unified_read_delegation("artifact://sha256:deadbeef").expect("artifact routes");
+            unified_read_delegation("artifact://sha256:deadbeef", None).expect("artifact routes");
         assert_eq!(reader, "evidence_retrieve");
 
-        let (reader, value) = unified_read_delegation("session://sess:1").expect("session routes");
+        let (reader, value) = unified_read_delegation("session://sess:1", None).expect("session routes");
         assert_eq!(reader, "context_retrieve");
         assert_eq!(value["source"], "session_history");
 
         // A legacy bare id still resolves through the Program directory.
-        let (reader, value) = unified_read_delegation("task:abc").expect("bare routes");
+        let (reader, value) = unified_read_delegation("task:abc", None).expect("bare routes");
         assert_eq!(reader, "state_inspect");
         assert_eq!(value["entry_ref"], "task:abc");
     }
 
     #[test]
     fn file_and_dir_content_redirect_to_the_workspace_tools() {
-        assert!(unified_read_delegation("file://src/main.rs").is_err());
-        assert!(unified_read_delegation("dir://crates").is_err());
-        assert!(unified_read_delegation("node://g/n").is_err());
-        assert!(unified_read_delegation("weird://x").is_err());
+        assert!(unified_read_delegation("file://src/main.rs", None).is_err());
+        assert!(unified_read_delegation("dir://crates", None).is_err());
+        assert!(unified_read_delegation("node://g/n", None).is_err());
+        assert!(unified_read_delegation("weird://x", None).is_err());
     }
 
     /// Runtime spells a one-shot Task deliverable `artifact:<24 hex>` and
@@ -2247,7 +2261,7 @@ mod unified_read_tests {
             ("matrix:7", "matrix", "7"),
             ("memory:9", "memory", "9"),
         ] {
-            let error = unified_read_delegation(wrong)
+            let error = unified_read_delegation(wrong, None)
                 .expect_err("a durable scheme without `://` must not read silently");
             assert!(
                 error.contains(&format!("{scheme}://{id}")),
@@ -2262,13 +2276,13 @@ mod unified_read_tests {
     #[test]
     fn a_legacy_bare_id_still_routes_to_the_program_directory() {
         let (reader, value) =
-            unified_read_delegation("1890cf27e957ec7b95501c38").expect("bare routes");
+            unified_read_delegation("1890cf27e957ec7b95501c38", None).expect("bare routes");
         assert_eq!(reader, "state_inspect");
         assert_eq!(value["entry_ref"], "1890cf27e957ec7b95501c38");
 
         // A program-scoped key is not a durable evidence scheme either.
         let (reader, value) =
-            unified_read_delegation("task:1890cf27e957ec7b95501c38").expect("task key routes");
+            unified_read_delegation("task:1890cf27e957ec7b95501c38", None).expect("task key routes");
         assert_eq!(reader, "state_inspect");
         assert_eq!(value["entry_ref"], "task:1890cf27e957ec7b95501c38");
     }

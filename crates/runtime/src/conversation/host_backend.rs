@@ -7892,78 +7892,151 @@ impl OriginalPostActionCommit {
     fn belongs_to(&self, store: &Arc<crate::RuntimeEventStore>) -> bool { match self { Self::Single(v) => v.belongs_to(store), Self::Member(v) => v.belongs_to(store), Self::Conclusion(v) => v.belongs_to(store), Self::Replay(v) => v.belongs_to(store) } }
 }
 
-/// The original owner's durable Program identity for one committed action:
-/// the transaction that wrote the Program event, that event's own kind and
-/// idempotency key, and the entity the action created. These are owner-written
-/// facts; they are what ties a Program advance back to a member.
-struct OriginalProgramAdvance {
-    transaction_id: String,
-    event_kind: String,
-    event_key: Option<String>,
-    entity_ref: Option<String>,
-}
-
-fn original_program_advance(
+/// The entity one certified action of this node created, with the action kind
+/// that produced it. Only an applied action creates one; a rejected action has
+/// no effect to look for.
+fn original_applied_effect(
     handle: &OriginalPostActionCommit,
     program_stream: &str,
-) -> Option<OriginalProgramAdvance> {
-    let receipt = handle.receipt();
+) -> Option<(String, String)> {
+    if !handle.observation().is_some_and(|observation|
+        observation.status == harness_contract::agent_action::AgentActionStatus::Applied) {
+        return None;
+    }
     let request = handle.request()?;
     let event = request.transaction.events.iter()
         .find(|event| event.event.stream_id == program_stream)?;
-    Some(OriginalProgramAdvance {
-        transaction_id: receipt.transaction_id.clone(),
-        event_kind: event.event.kind.clone(),
-        event_key: event.idempotency_key.clone(),
-        entity_ref: event.event.payload.get("entity_ref").and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty()).map(str::to_owned),
-    })
+    let effect = event.event.payload.get("entity_ref").and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())?.to_string();
+    let kind = event.event.payload.pointer("/envelope/action/kind")
+        .and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+    Some((effect, kind))
 }
 
-/// Tie every Program event in the gap back to a member of this batch. The
-/// comparison is exact identity over owner-written facts: the writing
-/// transaction, the Program event's own kind and idempotency key, or the
-/// entity the member created. Anything else keeps the rejection, so an
-/// unrelated Program writer is never mistaken for this batch's advance.
-fn attribute_original_program_advance(
-    store: &Arc<crate::RuntimeEventStore>,
-    program_stream: &str,
-    after_revision: u64,
-    through_revision: u64,
-    advances: &[OriginalProgramAdvance],
-) -> Result<(), String> {
-    let events = store.list_stream_after(program_stream, after_revision, through_revision, 100, 1024 * 1024)
-        .map_err(|error| format!("original Program gap unreadable: {error}"))?;
-    // The page size is a bound, not a contract. A truncated page would hide
-    // every event past the bound from attribution, so an unrelated writer
-    // could slip through as if it belonged to this batch.
-    if events.len() as u64 != through_revision.saturating_sub(after_revision) {
-        return Err("original Program gap read truncated".into());
+/// The Program facts the visibility check needs, read from the certified
+/// projection. Kept as plain data so the judgment itself is testable without
+/// a Program behind it.
+#[derive(Debug, Default)]
+struct OriginalTaskView {
+    claim_generation: u64,
+    review_generation: u64,
+    /// A review records its reviewer even when the decision is Accept.
+    reviewed_by: bool,
+    /// A review that settled the Task: Accepted, Rework or Blocked.
+    review_outcome: bool,
+}
+
+#[derive(Debug, Default)]
+struct OriginalProgramEntityView {
+    tasks: std::collections::BTreeMap<String, OriginalTaskView>,
+    teams: std::collections::BTreeSet<String>,
+    agents: std::collections::BTreeSet<String>,
+    artifacts: std::collections::BTreeSet<String>,
+}
+
+fn original_program_entity_view(
+    projection: &crate::agentic::AgenticProgramProjection,
+) -> OriginalProgramEntityView {
+    OriginalProgramEntityView {
+        tasks: projection.tasks.iter().map(|(task_id, task)| {
+            (task_id.clone(), OriginalTaskView {
+                claim_generation: task.claim_generation,
+                review_generation: task.review_generation,
+                reviewed_by: task.reviewed_by.is_some(),
+                review_outcome: matches!(task.status,
+                    crate::agentic::AgenticTaskStatus::Accepted
+                    | crate::agentic::AgenticTaskStatus::Rework
+                    | crate::agentic::AgenticTaskStatus::Blocked),
+            })
+        }).collect(),
+        teams: projection.teams.keys().cloned().collect(),
+        agents: projection.agents.keys().cloned().collect(),
+        artifacts: projection.artifacts.keys().cloned().collect(),
     }
-    for event in events {
-        let attributed = advances.iter().any(|advance| {
-            advance.transaction_id == event.transaction_id
-                || (advance.event_key.is_some()
-                    && advance.event_kind == event.kind
-                    && advance.event_key == event.idempotency_key)
-                || advance.entity_ref.as_deref().is_some_and(|entity| original_program_event_names(entity, &event))
-        });
-        if !attributed {
-            return Err("Program changed between original actions".into());
+}
+
+/// What the certified Program projection says about one certified effect of
+/// this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginalEffectJudgment {
+    /// The projection carries this node's effect.
+    Carried,
+    /// The projection does not carry this node's effect.
+    NotCarried,
+    /// The effect has no Program entity to be carried by: a published message
+    /// is named by a digest in its own id space, not by a Program entry, so
+    /// there is nothing in the projection that could attest it. Its own
+    /// durable facts are the action event, its receipt and the topic owner's
+    /// entry.
+    NoEntityClaim,
+}
+
+/// Whether one certified effect of this node is carried by the certified
+/// Program projection. The lookup is kind-scoped: a Task effect is only
+/// satisfied by a Task, never by an entity of another kind that happens to
+/// carry the same id. For the actions that only move an existing Task, the
+/// projection's own facts must show that the move happened - a claim advances
+/// the claim generation, a review records its reviewer and settles the Task
+/// (an accepted review does not advance the review generation).
+fn original_effect_judgment(
+    view: &OriginalProgramEntityView,
+    effect: &str,
+    action_kind: &str,
+) -> OriginalEffectJudgment {
+    let (kind, id) = match effect.split_once(':') {
+        Some((kind, id)) if !id.is_empty() => (kind, id),
+        _ => return OriginalEffectJudgment::NotCarried,
+    };
+    match kind {
+        "task" => {
+            let Some(task) = view.tasks.get(effect).or_else(|| view.tasks.get(id)) else {
+                return OriginalEffectJudgment::NotCarried;
+            };
+            let carried = match action_kind {
+                "task_claim" => task.claim_generation > 0,
+                "task_review" => task.review_generation > 0 || task.reviewed_by || task.review_outcome,
+                _ => true,
+            };
+            if carried { OriginalEffectJudgment::Carried } else { OriginalEffectJudgment::NotCarried }
+        }
+        "team" => if view.teams.contains(effect) || view.teams.contains(id) {
+            OriginalEffectJudgment::Carried } else { OriginalEffectJudgment::NotCarried },
+        "agent" => if view.agents.contains(effect) || view.agents.contains(id) {
+            OriginalEffectJudgment::Carried } else { OriginalEffectJudgment::NotCarried },
+        "artifact" => if view.artifacts.contains(effect) || view.artifacts.contains(id) {
+            OriginalEffectJudgment::Carried } else { OriginalEffectJudgment::NotCarried },
+        "message" => OriginalEffectJudgment::NoEntityClaim,
+        _ => OriginalEffectJudgment::NotCarried,
+    }
+}
+
+/// Read the Program at the settlement head and confirm that every effect this
+/// node's certified actions created is visible in that projection. The
+/// revision the node then declares is one it actually read, not one it
+/// assumed.
+fn certify_original_program_head(
+    services: &Arc<crate::RuntimeServices>,
+    program_id: &str,
+    revision: u64,
+    effects: &[(String, String)],
+) -> Result<(), String> {
+    let store = services.event_store();
+    let stream = format!("agentic-program:{}", program_id);
+    let opened = store.event_by_idempotency_key(&stream, "agentic-program-opened")
+        .map_err(|error| error.to_string())?
+        .ok_or("original Program opening missing")?;
+    let actions = services.agent_action_service();
+    let projection = actions.project_snapshot_bounded(program_id, revision, &opened, None,
+        |after, through| store.list_stream_after(&stream, after, through, 100, 1024 * 1024),
+        |error| error.to_string())
+        .map_err(|error| format!("original Program projection unavailable: {error}"))?;
+    let view = original_program_entity_view(&projection);
+    for (effect, action_kind) in effects.iter() {
+        if original_effect_judgment(&view, effect, action_kind) == OriginalEffectJudgment::NotCarried {
+            return Err("original Program effect is not visible at the certified head".into());
         }
     }
     Ok(())
-}
-
-/// The entity a Program event names, read from the owner-written reference
-/// fields only. This is an exact comparison against the entity a certified
-/// member created; it never infers a cause from payload similarity, a time
-/// window, or a plausible looking shape.
-fn original_program_event_names(entity: &str, event: &crate::DurableRuntimeEvent) -> bool {
-    let payload = &event.payload;
-    payload.get("entity_ref").and_then(serde_json::Value::as_str) == Some(entity)
-        || payload.get("task_ref").and_then(serde_json::Value::as_str) == Some(entity)
-        || payload.pointer("/envelope/action/input/task_ref").and_then(serde_json::Value::as_str) == Some(entity)
 }
 
 /// Reuse the original conclusion owner only for an authenticated completion
@@ -8143,9 +8216,9 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
     // Every committed action of this node carries the original owner's
     // Program identity. It is what a Program advance in the gap between two
     // members is compared against.
-    let program_advances = binding.map(|binding| {
+    let program_effects = binding.map(|binding| {
         let program_stream = format!("agentic-program:{}", binding.agentic_program_id);
-        committed.iter().filter_map(|handle| original_program_advance(handle, &program_stream)).collect::<Vec<_>>()
+        committed.iter().filter_map(|handle| original_applied_effect(handle, &program_stream)).collect::<Vec<_>>()
     }).unwrap_or_default();
     for handle in &committed {
         if !handle.belongs_to(services.event_store()) { return Err("original committed store differs".into()); }
@@ -8171,22 +8244,12 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
         }
         let program_stream = format!("agentic-program:{}", binding.agentic_program_id);
         if let Some(cut) = receipt.stream_revisions.iter().find(|cut| cut.stream_id == program_stream && cut.committed_revision > cut.expected_revision) {
-            // The members of one batch advance the Program themselves. The
-            // advance is accepted only when every Program event between two
-            // members can be tied back to a member of this batch; an unrelated
-            // Program writer keeps the rejection.
-            if let Some((stream, revision)) = program_source.as_ref() {
-                if stream != &program_stream {
-                    return Err("Program changed between original actions".into());
-                }
-                if *revision != cut.expected_revision {
-                    if cut.expected_revision < *revision {
-                        return Err("Program changed between original actions".into());
-                    }
-                    attribute_original_program_advance(services.event_store(), &program_stream,
-                        *revision, cut.expected_revision, &program_advances)?;
-                }
-            }
+            // The Program revision this node's own certified actions produced.
+            // Who else advanced the Program in between is not this node's
+            // question: that fact is already durable in the events and their
+            // receipts, and re-deriving it here only produced a second
+            // authority that every legitimate concurrency looked like an
+            // anomaly.
             program_source = Some((program_stream, cut.committed_revision));
         }
         let goal_payload = if let Some(transaction) = transaction {
@@ -8211,20 +8274,20 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
     }
     if changed && program_source.is_none() { return Err("original committed Program source missing".into()); }
     if let Some((stream, revision)) = program_source.as_ref() {
-        // The node writes the Program back under its own fence. That fence has
-        // to be the certified head at settlement, otherwise the node's own
-        // transaction is stale against the Program this batch advanced.
-        // Everything between the last certified member cut and that head is
-        // still part of the same decision: it must be attributable to this
-        // batch before it may enter the node fence, exactly like the gaps
-        // between two members.
+        let program_id = binding.map(|binding| binding.agentic_program_id.as_str())
+            .ok_or("original committed Program binding missing")?;
+        // The node writes the Program back under its own fence, so that fence
+        // has to be the certified head at settlement. The head is not assumed:
+        // the Program projection at that revision is read, and every effect
+        // this node's own certified actions created must be visible in it. An
+        // unrelated writer that did not carry this node's work forward does
+        // not satisfy that check, and a Program that moves again after this
+        // read is rejected by the node transaction's own CAS.
         let head = services.event_store().stream_revision(stream).map_err(|error| error.to_string())?;
         if head < *revision {
             return Err("Program changed between original actions".into());
         }
-        if head > *revision {
-            attribute_original_program_advance(services.event_store(), stream, *revision, head, &program_advances)?;
-        }
+        certify_original_program_head(&services, program_id, head, &program_effects)?;
         program_source = Some((stream.clone(), head));
     }
     // This fixture-only read marks the exact same-call post-action boundary.
@@ -8847,8 +8910,13 @@ where
         let mut original_replays = BTreeMap::new();
         if let Some(issuer) = pregrant_action_issuer.as_deref() {
             for call in &calls {
-                if precompleted.contains_key(&call.id)
-                    || !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str()) { continue; }
+                let directory_read = if call.name == "read_ref" {
+                    harness_contract::step::parse_strict_json(&call.input).ok()
+                        .and_then(|input| crate::agentic::action_invocation::read_ref_directory_input(&input).ok().flatten()).is_some()
+                } else { false };
+                if (precompleted.contains_key(&call.id) && !directory_read)
+                    || (!directory_read && !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str())) { continue; }
+                if directory_read { precompleted.remove(&call.id); }
                 match pregrant_original_action_receipt(issuer, services.as_ref(), ticket, call) {
                     Ok(OriginalActionReceiptState::Complete(receipt)) => { original_replays.insert(call.id.clone(), receipt); }
                     Ok(OriginalActionReceiptState::Unobserved) => {},
@@ -9088,7 +9156,7 @@ where
                                 request,
                                 Some(&effect),
                             )).await;
-                            if harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str()) {
+                            if call.name == "read_ref" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str()) {
                                 single_captures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(call.id.clone(), capture);
                             }
                             prepared_effects.insert(call.id.clone(), effect);
@@ -12622,5 +12690,124 @@ mod closed_host_continuity_475_tests {
             ),
             terminal_satisfaction_since: None,
         }
+    }
+}
+
+/// Negative controls for the outer certification of a node's Program source.
+///
+/// The gap attribution this file used to carry is gone: it re-derived who
+/// advanced the Program, which was a second authority and made every
+/// legitimate concurrency look like an anomaly. What still refuses an
+/// unrelated Program write is the node transaction's own CAS, and what still
+/// refuses work that never reached the Program is the visibility check on
+/// this node's own certified effects. These tests pin both.
+#[cfg(test)]
+mod original_program_visibility_tests {
+    use super::{original_effect_judgment, OriginalEffectJudgment, OriginalProgramEntityView, OriginalTaskView};
+
+    fn view() -> OriginalProgramEntityView {
+        let mut view = OriginalProgramEntityView::default();
+        view.tasks.insert("task:abc".to_string(), OriginalTaskView {
+            claim_generation: 1, review_generation: 0, reviewed_by: false, review_outcome: false });
+        view.tasks.insert("task:accepted".to_string(), OriginalTaskView {
+            claim_generation: 1, review_generation: 0, reviewed_by: true, review_outcome: true });
+        view.tasks.insert("task:quiet".to_string(), OriginalTaskView::default());
+        view.teams.insert("team:abc".to_string());
+        view.agents.insert("agent:abc".to_string());
+        view.artifacts.insert("artifact:abc".to_string());
+        view
+    }
+
+    fn carried(view: &OriginalProgramEntityView, effect: &str, kind: &str) -> bool {
+        original_effect_judgment(view, effect, kind) == OriginalEffectJudgment::Carried
+    }
+
+    #[test]
+    fn original_effect_visibility_is_kind_scoped() {
+        let view = view();
+        // A Task effect is only satisfied by a Task. The same bare id owned by
+        // a Team or an Agent must not stand in for it.
+        assert!(carried(&view, "task:abc", "task_publish"));
+        assert!(!carried(&view, "task:missing", "task_publish"));
+        assert!(carried(&view, "team:abc", "team_create"));
+        assert!(carried(&view, "agent:abc", "agent_invite"));
+        assert!(carried(&view, "artifact:abc", "artifact_commit"));
+        // An unknown kind is never visible.
+        assert!(!carried(&view, "topic:abc", "message_publish"));
+    }
+
+    #[test]
+    fn original_task_effect_requires_the_matching_program_fact() {
+        let view = view();
+        // A claim is only carried when the projection's claim generation moved.
+        assert!(carried(&view, "task:abc", "task_claim"));
+        assert!(!carried(&view, "task:quiet", "task_claim"));
+        // A review is carried by the reviewer's own record or the settled
+        // status. An accepted review does not advance the review generation.
+        assert!(carried(&view, "task:accepted", "task_review"));
+        assert!(!carried(&view, "task:abc", "task_review"));
+    }
+
+    #[test]
+    fn original_message_effect_carries_no_program_entity_claim() {
+        let view = view();
+        // A published message is named by a digest in its own id space, so no
+        // Program entry can attest it. It must not be read as an unattested
+        // effect, and it must not be read as a carried one either.
+        assert_eq!(
+            original_effect_judgment(&view, "message:abc", "message_publish"),
+            OriginalEffectJudgment::NoEntityClaim);
+    }
+
+    #[test]
+    fn program_write_after_the_head_read_makes_the_node_transaction_stale() {
+        // The node declares the Program head it read. A write that lands
+        // after that read moves the head, and the node's own transaction -
+        // which fences on the declared revision - must fail closed.
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let stream = "agentic-program:test";
+        store.append(crate::RuntimeEventInput {
+            stream_id: stream.to_string(),
+            scope: crate::RuntimeEventScope::Program,
+            kind: "agentic.action_applied".to_string(),
+            status: Some("applied".to_string()),
+            actor: Some("runtime.agentic_action".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"entity_ref": null}),
+        }).expect("first Program write");
+        let head = store.stream_revision(stream).expect("Program head");
+        // An unrelated Program write lands after the node read the head.
+        store.append(crate::RuntimeEventInput {
+            stream_id: stream.to_string(),
+            scope: crate::RuntimeEventScope::Program,
+            kind: "agentic.action_applied".to_string(),
+            status: Some("applied".to_string()),
+            actor: Some("runtime.agentic_action".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"entity_ref": null}),
+        }).expect("second Program write");
+        let request = crate::AppendTransactionRequest {
+            transaction_id: "node-transition:test".to_string(),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: stream.to_string(),
+                expected_revision: head,
+            }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: stream.to_string(),
+                    scope: crate::RuntimeEventScope::Program,
+                    kind: "goal.revised".to_string(),
+                    status: Some("revised".to_string()),
+                    actor: Some("conversation_runtime".to_string()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({}),
+                },
+                idempotency_key: Some("goal-revised:test".to_string()),
+                schema_version: 1,
+            }],
+        };
+        let outcome = store.append_transaction(request);
+        assert!(matches!(outcome, Err(crate::RuntimeEventStoreError::StaleRevision { .. })),
+            "a Program write after the declared head must fail the node transaction closed");
     }
 }

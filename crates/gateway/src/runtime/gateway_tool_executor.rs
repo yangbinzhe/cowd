@@ -100,17 +100,7 @@ struct EvidenceRetrieveToolRequest {
 /// [`harness_contract::refs::Address`] URI; the handler delegates to the
 /// existing authorized Runtime reader for that scheme so authorization,
 /// revision fences and durability are unchanged.
-#[derive(Debug, Clone, Deserialize)]
-struct UnifiedReadRequest {
-    /// Canonical `scheme://target` reference.
-    reference: String,
-    /// Optional opaque continuation returned by a previous read.
-    #[serde(default)]
-    cursor: Option<String>,
-    /// Optional bounded page size.
-    #[serde(default)]
-    limit: Option<usize>,
-}
+use harness_contract::refs::UnifiedReadRequest;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -7514,7 +7514,9 @@ async fn execute_fenced_runtime_tool_owned(
     // Only direct actions take this path. Batch members own their own admission;
     // acquiring the outer scope here could deadlock or lend its authority to them.
 
-    let direct_action = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+    let read_ref_action = request.tool_name == "read_ref"
+        && single_capture.is_some_and(|capture| capture.read_ref_target().is_ok_and(|target| target.is_some()));
+    let direct_action = read_ref_action || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
         .contains(&request.tool_name.as_str());
     let locked = if direct_action {
         let acquired = async {

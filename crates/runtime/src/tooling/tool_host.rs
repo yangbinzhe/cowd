@@ -245,7 +245,7 @@ trait OriginalStopSink: Send + Sync {
 }
 
 #[derive(Default)]
-struct OriginalStopChannel {
+pub(crate) struct OriginalStopChannel {
     slot: std::sync::Mutex<Option<std::sync::Arc<OriginalBatchMemberStop>>>,
 }
 
@@ -897,6 +897,9 @@ impl ToolProgressSink {
     }
     pub fn callback(&self) -> Option<&std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
         self.callback.as_ref()
+    }
+    pub(crate) fn original_read_ref_identity(&self) -> std::sync::Weak<OriginalStopChannel> {
+        std::sync::Arc::downgrade(&self.member_stop)
     }
     pub(crate) fn install_original_effect_custody(&self, origin: OriginalEffectCustodyOrigin) -> Result<(), String> {
         let mut slot = self.original_effect_custody.lock().map_err(|_| "original custody channel poisoned")?;

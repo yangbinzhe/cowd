@@ -8,6 +8,23 @@
 
 use std::fmt;
 
+/// Original model-facing read request. Deriving a target does not authorize it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UnifiedReadRequest {
+    pub reference: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl UnifiedReadRequest {
+    /// Derive only the Program-directory reader input from this request.
+    pub fn program_directory_inspect_input(&self) -> Result<Option<serde_json::Value>, AddressError> {
+        Ok(Address::parse(&self.reference)?.program_directory_inspect_input(self.cursor.as_deref()))
+    }
+}
+
 /// A parsed model-facing reference. `Bare` preserves backward compatibility for
 /// a legacy entity id that carries no scheme, which the directory resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,6 +80,30 @@ impl fmt::Display for AddressError {
 }
 
 impl Address {
+    /// Return the Program-directory target only for references owned by that reader.
+    #[must_use]
+    pub fn program_directory_target(&self) -> Option<&str> {
+        match self {
+            Self::Program(id) | Self::Task(id) | Self::Team(id) | Self::Agent(id)
+            | Self::Topic(id) | Self::Issue(id) | Self::Criterion(id)
+            | Self::Obligation(id) | Self::Review(id) => Some(id),
+            Self::Bare(id) if !["artifact", "tool", "session", "fact", "matrix", "memory"]
+                .iter().any(|scheme| id.strip_prefix(scheme).is_some_and(|rest| rest.starts_with(':'))) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Derive the directory reader's input without granting authority to run it.
+    #[must_use]
+    pub fn program_directory_inspect_input(&self, cursor: Option<&str>) -> Option<serde_json::Value> {
+        self.program_directory_target().map(|target| {
+            let mut input = serde_json::json!({ "entry_ref": target });
+            if let Some(cursor) = cursor {
+                input["page_cursor"] = serde_json::Value::String(cursor.to_string());
+            }
+            input
+        })
+    }
     /// Parse a model-facing reference. A value without `://` is a legacy `Bare`
     /// id so older citations keep working during migration.
     pub fn parse(raw: &str) -> Result<Self, AddressError> {
@@ -213,6 +254,36 @@ mod tests {
         let address = Address::parse("task:abc").expect("bare id parses");
         assert_eq!(address, Address::Bare("task:abc".to_string()));
         assert_eq!(address.scheme(), "");
+    }
+
+    #[test]
+    fn program_directory_target_preserves_reference_ownership() {
+        for (raw, target) in [("goal:root", "goal:root"), ("task://task:abc", "task:abc")] {
+            let address = Address::parse(raw).unwrap();
+            assert_eq!(address.program_directory_target(), Some(target));
+            assert_eq!(address.program_directory_inspect_input(None), Some(serde_json::json!({"entry_ref":target})));
+            assert_eq!(address.program_directory_inspect_input(Some("next")), Some(serde_json::json!({"entry_ref":target,"page_cursor":"next"})));
+        }
+        for raw in ["artifact:abc", "tool:abc", "session:abc", "fact:abc", "matrix:abc", "memory:abc", "node://graph/node", "artifact://abc"] {
+            assert_eq!(Address::parse(raw).unwrap().program_directory_target(), None);
+            assert_eq!(Address::parse(raw).unwrap().program_directory_inspect_input(Some("next")), None);
+        }
+    }
+
+    #[test]
+    fn unified_read_derives_only_its_original_directory_target() {
+        let request: super::UnifiedReadRequest = serde_json::from_value(serde_json::json!({
+            "reference":"task://task:abc", "cursor":"next", "limit":5
+        })).unwrap();
+        assert_eq!(request.program_directory_inspect_input().unwrap(),
+            Some(serde_json::json!({"entry_ref":"task:abc", "page_cursor":"next"})));
+        let other: super::UnifiedReadRequest = serde_json::from_value(serde_json::json!({
+            "reference":"artifact://sha256:abc"
+        })).unwrap();
+        assert_eq!(other.program_directory_inspect_input().unwrap(), None);
+        assert!(serde_json::from_value::<super::UnifiedReadRequest>(serde_json::json!({
+            "reference":"task://task:abc", "cursor":1
+        })).is_err());
     }
 
     #[test]

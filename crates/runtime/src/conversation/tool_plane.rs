@@ -420,6 +420,7 @@ pub(crate) struct VerifiedRootActionOwner {
     single_control: Option<Arc<crate::conversation::MemberCommitControl>>,
     single_permission_context: Option<crate::PermissionContext>,
     single_original_decision: Option<crate::execution_core::RuntimeExecutionDecision>,
+    read_ref_target: Option<crate::conversation::turn_engine::OriginalReadRefTarget>,
     ticket: crate::execution_core::NodeExecutionTicket,
     request: crate::RuntimeToolExecutionRequest,
     activity: harness_contract::projection::RuntimeActivityBinding,
@@ -456,11 +457,14 @@ impl VerifiedRootActionOwner {
         let context = self.single_permission_context.as_ref().ok_or("original single-call permission context missing")?;
         let decision = self.single_original_decision.as_ref().ok_or("original single-call decision missing")?;
         owner.with_single_checked(services, &self.ticket, &self.request, &self.single_producer_events,
-            context, decision, Arc::clone(control), additional_streams, append)
+            context, decision, self.read_ref_target.as_ref(), Arc::clone(control), additional_streams, append)
     }
 
 
     pub(crate) fn original_request(&self) -> &crate::RuntimeToolExecutionRequest { &self.request }
+    pub(crate) fn read_ref_target(&self) -> Option<&crate::conversation::turn_engine::OriginalReadRefTarget> {
+        self.read_ref_target.as_ref()
+    }
     pub(crate) fn physical(&self) -> harness_contract::agent_action::OriginalAgentExecution {
         harness_contract::agent_action::OriginalAgentExecution { graph_id: self.ticket.graph_id.clone(), node_id: self.ticket.node_id.clone(), attempt: self.ticket.attempt }
     }
@@ -1349,7 +1353,11 @@ impl OwnedRootActionIssuer {
         let (calls, _) = crate::host::decode_tool_batch(&ticket.payload_ref).map_err(|e| ToolError::unknown(e.to_string()))?;
         let mut matches = calls.iter().filter(|call| call.id == call_id);
         let call = matches.next().ok_or_else(|| ToolError::unknown("original replay call absent"))?;
-        if matches.next().is_some() || !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str()) {
+        let directory_read = if call.name == "read_ref" {
+            let input = harness_contract::step::parse_strict_json(&call.input).map_err(|error| ToolError::unknown(error.to_string()))?;
+            crate::agentic::action_invocation::read_ref_directory_input(&input).map_err(ToolError::unknown)?.is_some()
+        } else { false };
+        if matches.next().is_some() || (!directory_read && !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str())) {
             return Err(ToolError::unknown("original replay call ambiguous or not a single action"));
         }
         let binding = call.binding.as_ref().ok_or_else(|| ToolError::unknown("original replay Step missing"))?;
@@ -1732,7 +1740,13 @@ impl OwnedRootActionIssuer {
         } else if request.parent_execution_attempt.is_some() {
             return Err(ToolError::new("root action attempt has no parent"));
         }
+        let read_ref_target = capture.read_ref_target().map_err(ToolError::unknown)?;
         if request.tool_name != "agent_action_batch"
+            && !(request.tool_name == "read_ref" && read_ref_target.as_ref().is_some_and(|target|
+                target.ticket == *ticket && target.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read
+                    && !target.effect.uses_network && !target.effect.spawns_process && !target.effect.scopes.is_empty()
+                    && target.effect.scopes.iter().all(|scope| scope.resource == harness_contract::policy::PermissionResource::Tool
+                        && scope.operation == harness_contract::policy::PermissionOperation::Read)))
             && !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
             return Err(ToolError::new("root action tool not recognized"));
         }
@@ -1816,6 +1830,7 @@ impl OwnedRootActionIssuer {
             single_control: Some(control),
             single_permission_context: Some(context),
             single_original_decision: Some(original_decision),
+            read_ref_target,
             shared_policy_owner: Some(producer_owner),
             ticket: ticket.clone(), request: request.clone(), activity, scope: recomputed, lease: step.lease().clone(),
             step_id: identity.step_id.clone(), call_id: request.tool_use_id.clone(),
@@ -3422,7 +3437,9 @@ where
             .map_err(|error| ToolError::new(error.to_string()))?;
         #[cfg(test)]
         if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_dispatch_enter call={}", request.tool_use_id); }
-        let execution = if root.is_some() && harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
+        let read_ref_action = request.tool_name == "read_ref" && current_original_single_capture()
+            .is_some_and(|capture| capture.read_ref_target().is_ok_and(|target| target.is_some()));
+        let execution = if root.is_some() && (read_ref_action || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())) {
             let ticket = original_ticket.ok_or_else(|| ToolError::new("unknown: original root ticket unavailable"))?;
             let capture = TICKET_ORIGINAL_SINGLE_CAPTURE.try_with(Arc::clone)
                 .map_err(|_| ToolError::unknown("original Ticket single-call producer unavailable"))?;
@@ -3783,7 +3800,7 @@ where
         } else if ticket.is_some() {
             return Err(RuntimeError::new("tool batch original prepared request is missing"));
         } else { None };
-        let single_capture = if ticket.is_some() && harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&task.tool_name.as_str()) {
+        let single_capture = if ticket.is_some() && (task.tool_name == "read_ref" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&task.tool_name.as_str())) {
             Some(Arc::new(OriginalSingleProducerCapture::default()))
         } else { None };
         let negotiate = async {

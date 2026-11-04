@@ -11,11 +11,44 @@ pub(crate) struct OriginalSingleProducerCapture {
     permission_context: std::sync::Mutex<Option<PermissionContext>>,
     original_decision: std::sync::Mutex<Option<crate::execution_core::RuntimeExecutionDecision>>,
     decision_conflict: std::sync::atomic::AtomicBool,
+    read_ref_target: std::sync::Mutex<Option<OriginalReadRefTarget>>,
+}
+
+/// The permission context of one original call, in the shape the Runtime
+/// writes into the original assessment event. The read_ref target decision and
+/// the check of its assessment event must use the same context: demanding a
+/// default one while deciding with the real one would refuse every session
+/// that carries an operator override.
+pub(crate) fn original_permission_context_json(context: &PermissionContext) -> serde_json::Value {
+    serde_json::json!({
+        "override_decision": context.override_decision().map(|value| match value {
+            crate::permissions::PermissionOverride::Allow => "allow",
+            crate::permissions::PermissionOverride::Deny => "deny",
+            crate::permissions::PermissionOverride::Ask => "ask",
+        }),
+        "override_reason": context.override_reason(),
+    })
+}
+
+/// Target granted by the same policy producer for one original read_ref call.
+/// This value is private and is not itself evidence that an action committed.
+#[derive(Debug, Clone)]
+pub(crate) struct OriginalReadRefTarget {
+    pub(crate) ticket: crate::execution_core::NodeExecutionTicket,
+    pub(crate) original_channel: std::sync::Weak<crate::tool_host::OriginalStopChannel>,
+    pub(crate) original_request: serde_json::Value,
+    pub(crate) input: serde_json::Value,
+    pub(crate) effect: harness_contract::tool::ToolEffectDescriptor,
+    pub(crate) authorization: harness_contract::tool::ToolExecutionAuthorization,
 }
 tokio::task_local! {
     static SINGLE_ORIGINAL_EVIDENCE: Arc<OriginalSingleProducerCapture>;
 }
 impl OriginalSingleProducerCapture {
+    pub(crate) fn read_ref_target(&self) -> Result<Option<OriginalReadRefTarget>, String> {
+        self.read_ref_target.lock().map(|value| value.clone())
+            .map_err(|_| "original read_ref target owner unavailable".to_string())
+    }
     pub(crate) fn bind_original_decision(&self, decision: &crate::execution_core::RuntimeExecutionDecision) {
         let mut original = self.original_decision.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match original.as_ref() {
@@ -65,6 +98,7 @@ pub(crate) struct RootSingleCheckedInputs<'a> {
     pub(crate) lease_event: &'a crate::DurableRuntimeEvent,
     pub(crate) original_events: &'a [crate::DurableRuntimeEvent],
     pub(crate) original_decision: &'a crate::execution_core::RuntimeExecutionDecision,
+    pub(crate) read_ref_target: Option<&'a OriginalReadRefTarget>,
     _original_owner_seal: (),
 }
 
@@ -101,6 +135,9 @@ impl<'a> OriginalSingleCheckedInputs<'a> {
     }
     pub(crate) fn original_decision(&self) -> Option<&crate::execution_core::RuntimeExecutionDecision> {
         match self { Self::Root(v) => Some(v.original_decision), Self::Delegated(v) => v.original_decision }
+    }
+    pub(crate) fn read_ref_target(&self) -> Option<&OriginalReadRefTarget> {
+        match self { Self::Root(v) => v.read_ref_target, Self::Delegated(_) => None }
     }
     pub(crate) fn is_delegated(&self) -> bool { matches!(self, Self::Delegated(_)) }
 }
@@ -713,6 +750,7 @@ impl SharedPolicyOwner {
         events: &[crate::DurableRuntimeEvent],
         permission_context: &PermissionContext,
         original_decision: &crate::execution_core::RuntimeExecutionDecision,
+        read_ref_target: Option<&OriginalReadRefTarget>,
         control: Arc<crate::conversation::MemberCommitControl>,
         additional_streams: &[String],
         append: impl FnOnce(&OriginalSingleCheckedInputs<'_>) -> Result<T, String>,
@@ -803,6 +841,69 @@ impl SharedPolicyOwner {
                         && event.payload["idempotency_key"].as_str() == Some(auth.request_id.as_str()) { consumed += 1; }
                 }
                 if assessed != 1 || consumed != 1 { return Err("original single-call assessment/lease provenance mismatch".into()); }
+                if request.tool_name == "read_ref" {
+                    let original_input = harness_contract::step::parse_strict_json(&request.input).map_err(|e| e.to_string())?;
+                    let derived = crate::agentic::action_invocation::read_ref_directory_input(&original_input)?;
+                    match (derived, read_ref_target) {
+                        (None, None) => {},
+                        (Some(derived), Some(target)) => {
+                            let mut original_request = serde_json::to_value(request).map_err(|e| e.to_string())?;
+                            let mut captured_request = target.original_request.clone();
+                            for value in [&mut original_request, &mut captured_request] {
+                                let object = value.as_object_mut().ok_or("original read_ref request invalid")?;
+                                object.remove("authorization"); object.remove("execution_decision");
+                            }
+                            if target.ticket != *ticket || !std::sync::Weak::ptr_eq(&target.original_channel, &request.tool_progress.original_read_ref_identity())
+                                || original_request != captured_request || target.input != derived
+                                || target.authorization.policy_revision != policy.revision {
+                                return Err("original read_ref target identity changed".into());
+                            }
+                            let target_text = serde_json::to_string(&derived).map_err(|e| e.to_string())?;
+                            let validated = step.validate_call(&binding.origin, session, &request.tool_use_id,
+                                "state_inspect", &target_text, chrono::Utc::now().timestamp_millis()).map_err(|e| e.to_string())?;
+                            if validated != derived || step.lease().describe_effect("state_inspect", &derived) != target.effect {
+                                return Err("original read_ref target Step or effect changed".into());
+                            }
+                            step.lease().validate_authorization(&target.authorization, "state_inspect", &derived).map_err(|e| e.to_string())?;
+                            let target_consumption = self.assessment.authorization_negotiator
+                                .original_consumption(&target.authorization.authorization_lease, &target.authorization.request_id)
+                                .ok_or("original read_ref target consumption unavailable")?;
+                            if !target_consumption.belongs_to(&self.assessment.authorization_negotiator)
+                                || target_consumption.lease != target.authorization.authorization_lease {
+                                return Err("original read_ref target consumption owner changed".into());
+                            }
+                            let target_transition = serde_json::to_value(&target_consumption.transition).map_err(|e| e.to_string())?;
+                            let target_lease = serde_json::to_value(&target.authorization.authorization_lease).map_err(|e| e.to_string())?;
+                            let derived_fact = serde_json::json!({"tool":"state_inspect", "input":derived, "effect":target.effect});
+                            let expected_ticket = serde_json::to_value(ticket).map_err(|e| e.to_string())?;
+                            let expected_step = serde_json::to_value(&request.step_binding).map_err(|e| e.to_string())?;
+                            let target_assessed = events.iter().filter(|event| {
+                                let fact = &event.payload["_call_refusal_binding"];
+                                let mut fact_request = fact["request"].clone();
+                                let Some(object) = fact_request.as_object_mut() else { return false; };
+                                object.remove("authorization"); object.remove("execution_decision");
+                                event.kind == "authorization.capability_assessed"
+                                    && event.actor.as_deref() == Some("conversation_runtime")
+                                    && event.stream_id == format!("session:{session}")
+                                    && fact["owner"]["ticket"] == expected_ticket
+                                    && fact["step_binding"] == expected_step
+                                    && fact["call_id"].as_str() == Some(request.tool_use_id.as_str())
+                                    && fact["effect_key"].as_str() == Some(request.idempotency_key.as_str())
+                                    && fact_request == original_request && fact["derived_target"] == derived_fact
+                                    && event.payload["capability"].as_str() == Some("state_inspect")
+                                    && event.payload["_original_permission_context"] == original_permission_context_json(permission_context)
+                                    && event.payload["lease"] == target_lease
+                            }).count();
+                            let target_consumed = events.iter().filter(|event| event.kind == "authorization.lease_transition"
+                                && event.actor.as_deref() == Some("conversation_runtime") && event.status.as_deref() == Some("consumed")
+                                && event.payload == target_transition).count();
+                            if target_assessed != 1 || target_consumed != 1 {
+                                return Err("original read_ref target producer events unavailable".into());
+                            }
+                        },
+                        _ => return Err("original read_ref target owner unavailable".into()),
+                    }
+                } else if read_ref_target.is_some() { return Err("original read_ref target attached to another call".into()); }
                 if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire)
                     || self.session_input_stream.active_turn_id().as_ref() != Some(&turn) {
                     return Err("original turn no longer active".into());
@@ -839,7 +940,7 @@ impl SharedPolicyOwner {
                         && event.payload["consume"] == coord(lease_event)).count();
                     if authorized != 1 { return Err("original completion call authorization event missing or ambiguous".into()); }
                 }
-                append(&OriginalSingleCheckedInputs::Root(RootSingleCheckedInputs { held, sources: &sources, control, claim, consumed_input_sequence, ticket, request, assessment_event, lease_event, original_events: events, original_decision, _original_owner_seal: () }))
+                append(&OriginalSingleCheckedInputs::Root(RootSingleCheckedInputs { held, sources: &sources, control, claim, consumed_input_sequence, ticket, request, assessment_event, lease_event, original_events: events, original_decision, read_ref_target, _original_owner_seal: () }))
             })
         })
     }
@@ -2964,12 +3065,12 @@ where
             || &invocation.effect != descriptor || effective != invocation.intent.normalized_input {
             return Err(RuntimeError::new("assessment original call or effective input mismatch"));
         }
-        let owner = match owner {
+        let (owner, original_ticket) = match owner {
             crate::execution_core::graph::CallRefusalOwner::Node(ticket) => {
                 if prepared_effect.is_none_or(|proof| !proof.matches(ticket, request)) {
                     return Err(RuntimeError::new("assessment original prepared effect unavailable"));
                 }
-                serde_json::json!({"kind":"node", "ticket":ticket})
+                (serde_json::json!({"kind":"node", "ticket":ticket}), (*ticket).clone())
             },
         };
         let binding = serde_json::json!({
@@ -2978,6 +3079,78 @@ where
             "effect_key":request.idempotency_key,
             "input_sha256":format!("sha256:{:x}", sha2::Sha256::digest(input.as_bytes())),
         });
+        if request.tool_name == "read_ref" {
+            if let Ok(Some(target_input)) = crate::agentic::action_invocation::read_ref_directory_input(&effective) {
+                // The derived target is decided by the same original owner
+                // under the same permission context as the outer call. A
+                // default context would silently widen a restricted call.
+                let target_context = permission_context.clone();
+                let outer = self.negotiate_tool_authorization_inner(descriptor, input, idempotency_key.clone(),
+                    permission_context, timeout_secs, prompter, Some(&binding)).await?;
+                let ToolAuthorizationDecision::Authorized(ref outer_decision) = outer else { return Ok(outer); };
+                let capture = match SINGLE_ORIGINAL_EVIDENCE.try_with(Arc::clone) {
+                    Ok(capture) => capture,
+                    Err(_) => return Ok(outer),
+                };
+                let bound = match step.resolve(self.tool_executor.pin_step_catalog()) {
+                    Ok(bound) => bound,
+                    Err(_) => return Ok(outer),
+                };
+                let target_text = serde_json::to_string(&target_input)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let validated = match bound.validate_call(&step.origin, self.session_id(), &request.tool_use_id,
+                    "state_inspect", &target_text, chrono::Utc::now().timestamp_millis()) {
+                    Ok(validated) => validated,
+                    Err(_) => return Ok(outer),
+                };
+                if validated != target_input { return Ok(outer); }
+                let target_effect = bound.lease().describe_effect("state_inspect", &target_input);
+                if target_effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
+                    || target_effect.uses_network || target_effect.spawns_process || target_effect.scopes.is_empty()
+                    || target_effect.scopes.iter().any(|scope|
+                        scope.resource != harness_contract::policy::PermissionResource::Tool
+                            || scope.operation != harness_contract::policy::PermissionOperation::Read) {
+                    return Ok(outer);
+                }
+                let producer = capture.owner().ok_or_else(|| RuntimeError::new("original read_ref policy producer unavailable"))?;
+                let claim = producer.original_session_claim.as_ref().ok_or_else(|| RuntimeError::new("original read_ref Session claim unavailable"))?;
+                if claim.session_id() != producer.identity.session_id.as_str() || producer.cancellation.is_cancelled()
+                    || producer.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(RuntimeError::new("original read_ref policy owner changed"));
+                }
+                claim.fence().map_err(RuntimeError::new)?;
+                let fence = producer.session_execution_fence.as_ref().ok_or_else(|| RuntimeError::new("original read_ref Session fence unavailable"))?;
+                fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(RuntimeError::new)?;
+                let mut target_binding = binding.clone();
+                target_binding["derived_target"] = serde_json::json!({"tool":"state_inspect", "input":target_input,
+                    "effect":target_effect});
+                let target = producer.negotiate_tool_authorization_inner(&target_effect, &target_text,
+                    format!("{idempotency_key}:read-ref-state-inspect"), target_context,
+                    timeout_secs, prompter, Some(&target_binding)).await?;
+                if producer.cancellation.is_cancelled() || producer.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(RuntimeError::new("original read_ref policy owner changed during target authorization"));
+                }
+                claim.fence().map_err(RuntimeError::new)?;
+                fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(RuntimeError::new)?;
+                let ToolAuthorizationDecision::Authorized(target_decision) = target else { return Ok(outer); };
+                let authorization = target_decision.authorization;
+                if authorization.policy_revision != request.policy_revision
+                    || outer_decision.authorization.policy_revision != request.policy_revision {
+                    return Err(RuntimeError::new("original read_ref target policy changed"));
+                }
+                bound.lease().validate_authorization(&authorization, "state_inspect", &target_input)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let proof = OriginalReadRefTarget { ticket: original_ticket,
+                    original_channel: request.tool_progress.original_read_ref_identity(),
+                    original_request: serde_json::to_value(request).map_err(|error| RuntimeError::new(error.to_string()))?,
+                    input: target_input, effect: target_effect, authorization };
+                let mut slot = capture.read_ref_target.lock()
+                    .map_err(|_| RuntimeError::new("original read_ref target owner unavailable"))?;
+                if slot.is_some() { return Err(RuntimeError::new("original read_ref target already prepared")); }
+                *slot = Some(proof);
+                return Ok(outer);
+            }
+        }
         if request.tool_name != harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID {
             return self.negotiate_tool_authorization_inner(descriptor, input, idempotency_key,
                 permission_context, timeout_secs, prompter, Some(&binding)).await;
@@ -3088,11 +3261,13 @@ where
         idempotency_key: String, permission_context: PermissionContext, timeout_secs: u64,
         prompter: &crate::permissions::SharedPrompter, binding: Option<&serde_json::Value>,
     ) -> Result<ToolAuthorizationDecision, RuntimeError> {
-        let owner = Arc::new(self.shared_policy_owner());
-        let _ = SINGLE_ORIGINAL_EVIDENCE.try_with(|capture| {
-            *capture.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
-            *capture.permission_context.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(permission_context.clone());
-        });
+        let owner = SINGLE_ORIGINAL_EVIDENCE.try_with(|capture| {
+            let mut original = capture.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let owner = Arc::clone(original.get_or_insert_with(|| Arc::new(self.shared_policy_owner())));
+            let mut context = capture.permission_context.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if context.is_none() { *context = Some(permission_context.clone()); }
+            owner
+        }).unwrap_or_else(|_| Arc::new(self.shared_policy_owner()));
         let result = owner.negotiate_tool_authorization_inner(
             descriptor, input, idempotency_key, permission_context, timeout_secs, prompter, binding,
         ).await;
@@ -3143,5 +3318,28 @@ where
             }
         }
         Ok(restored)
+    }
+}
+
+/// The read_ref target decision and the check of its assessment event must
+/// use the same permission context. These tests pin that shape.
+#[cfg(test)]
+mod original_permission_context_tests {
+    use super::original_permission_context_json;
+
+    #[test]
+    fn original_permission_context_matches_the_decision_context() {
+        let default = crate::PermissionContext::default();
+        assert_eq!(original_permission_context_json(&default),
+            serde_json::json!({"override_decision": null, "override_reason": null}));
+        let overridden = crate::PermissionContext::new(
+            Some(crate::permissions::PermissionOverride::Allow), Some("operator".to_string()));
+        assert_eq!(original_permission_context_json(&overridden),
+            serde_json::json!({"override_decision": "allow", "override_reason": "operator"}));
+        // An override session is not the default context. Demanding the
+        // default one while deciding with the real one would refuse every
+        // session that carries an operator override.
+        assert_ne!(original_permission_context_json(&overridden),
+            original_permission_context_json(&default));
     }
 }

@@ -6,6 +6,13 @@ use std::sync::Arc;
 use serde_json::Value;
 use harness_contract::agent_action::OriginalAgentExecution;
 
+/// Derive a directory target from the original call; this does not authorize it.
+pub(crate) fn read_ref_directory_input(input: &Value) -> Result<Option<Value>, String> {
+    let input: harness_contract::refs::UnifiedReadRequest = serde_json::from_value(input.clone())
+        .map_err(|error| error.to_string())?;
+    input.program_directory_inspect_input().map_err(|error| error.to_string())
+}
+
 /// Actual active Session ingress/control/policy owner for a verified
 /// delegated actor. It is a borrowed commit input, not a new signer.
 pub(crate) struct DelegatedOriginalSessionOwner {
@@ -266,6 +273,7 @@ pub(crate) struct OwnerAdmissionWitness {
     effect_key: String,
     outer_tool: String,
     outer_input: Value,
+    read_ref_target: Option<crate::conversation::OriginalReadRefTarget>,
     actor: Option<harness_contract::agent_action::AgentActorBinding>,
 }
 
@@ -290,6 +298,7 @@ struct ActionInvocationScope {
     effect_key: String,
     outer_tool: String,
     outer_input: Value,
+    read_ref_target: Option<crate::conversation::OriginalReadRefTarget>,
     actor: Option<harness_contract::agent_action::AgentActorBinding>,
     active: std::sync::atomic::AtomicBool,
 }
@@ -361,7 +370,7 @@ impl VerifiedActionInvocation {
             original_execution: witness.original_execution, root_owner: witness.root_owner,
             delegated_session_owner: witness.delegated_session_owner, step_id: witness.step_id,
             call_id: witness.call_id, effect_key: witness.effect_key,
-            outer_tool: witness.outer_tool, outer_input: witness.outer_input, actor: witness.actor,
+            outer_tool: witness.outer_tool, outer_input: witness.outer_input, read_ref_target: witness.read_ref_target, actor: witness.actor,
             active: std::sync::atomic::AtomicBool::new(true),
         }) })
     }
@@ -386,7 +395,12 @@ impl VerifiedActionInvocation {
                 scope.effect_key.clone(), scope.outer_tool.as_str(), scope.outer_input.clone()),
             _ => return Err("original action batch scope mismatch"),
         };
-        if expected_id != action_id || expected_tool != tool || &expected_input != input {
+        let derived = batch_index.is_none() && scope.outer_tool == "read_ref" && tool == "state_inspect"
+            && scope.read_ref_target.as_ref().is_some_and(|target|
+                &target.input == input && target.ticket.graph_id == original.graph_id
+                    && target.ticket.node_id == original.node_id && target.ticket.attempt == original.attempt
+                    && read_ref_directory_input(&scope.outer_input).is_ok_and(|derived| derived.as_ref() == Some(input)));
+        if expected_id != action_id || (!derived && (expected_tool != tool || &expected_input != input)) {
             return Err("action is not the original authorized call or batch entry");
         }
         Ok(())
@@ -443,9 +457,10 @@ pub(crate) async fn with_verified_root_owner<F, Fut, T>(
 where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Output = T> {
     let (session_id, turn_id, step_id, call_id, effect_key, outer_tool, outer_input) = proof.call_identity();
     let original_request = proof.original_request().clone();
+    let read_ref_target = proof.read_ref_target().cloned();
     let witness = OwnerAdmissionWitness {
         original_request, session_id, turn_id, original_execution: None, root_owner: Some(proof),
-        delegated_session_owner: None, step_id, call_id, effect_key, outer_tool, outer_input, actor: None,
+        delegated_session_owner: None, step_id, call_id, effect_key, outer_tool, outer_input, read_ref_target, actor: None,
     };
     let capability = VerifiedActionInvocation::from_owner(witness)?;
     struct Lifetime(Arc<ActionInvocationScope>);
@@ -586,7 +601,7 @@ where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Outpu
     let capability = VerifiedActionInvocation::from_owner(OwnerAdmissionWitness {
         original_request: request.clone(), session_id: actor.session_id.clone(), turn_id: actor.turn_id.clone(),
         original_execution: Some(original_execution), root_owner: None, delegated_session_owner, step_id: identity.step_id.clone(), call_id: request.tool_use_id.clone(),
-        effect_key: request.idempotency_key.clone(), outer_tool: request.tool_name.clone(), outer_input: input, actor: Some(actor),
+        effect_key: request.idempotency_key.clone(), outer_tool: request.tool_name.clone(), outer_input: input, read_ref_target: None, actor: Some(actor),
     }).map_err(str::to_string)?;
     struct InvocationLifetime(Arc<ActionInvocationScope>);
     impl Drop for InvocationLifetime {
@@ -635,13 +650,13 @@ mod tests {
         let capability = VerifiedActionInvocation::from_owner(OwnerAdmissionWitness {
             original_request: original_request.clone(), session_id: "session".into(), turn_id: "turn".into(), original_execution: Some(physical.clone()),
             root_owner: None, delegated_session_owner: None, step_id: "step".into(), call_id: "call".into(), effect_key: "effect".into(),
-            outer_tool: "state_inspect".into(), outer_input: input.clone(), actor: Some(actor),
+            outer_tool: "state_inspect".into(), outer_input: input.clone(), read_ref_target: None, actor: Some(actor),
         }).unwrap();
         let mismatched = OwnerAdmissionWitness {
             original_request: original_request.clone(), session_id: "other-session".into(), turn_id: "turn".into(),
             original_execution: Some(physical.clone()), root_owner: None, delegated_session_owner: None, step_id: "step".into(),
             call_id: "call".into(), effect_key: "effect".into(), outer_tool: "state_inspect".into(),
-            outer_input: input.clone(), actor: capability.scope.actor.clone(),
+            outer_input: input.clone(), read_ref_target: None, actor: capability.scope.actor.clone(),
         };
         assert!(VerifiedActionInvocation::from_owner(mismatched).is_err());
         let check = |owner: &OriginalAgentExecution, call: &str, value: &Value, index| {

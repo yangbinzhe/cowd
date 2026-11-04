@@ -2656,6 +2656,9 @@ impl AgentActionService {
         let ticket = original.ticket();
         let original_events = original.original_events();
         let original_decision = original.original_decision();
+        let derived_read = original.read_ref_target().is_some_and(|target|
+            request.tool_name == "read_ref" && tool == "state_inspect"
+                && target.ticket == *ticket && target.input == *input);
         let sources = original.sources();
         let locks = original.held();
         let control = original.control();
@@ -2671,7 +2674,7 @@ impl AgentActionService {
             || envelope.actor.session_id != claim.session_id() || envelope.actor.turn_id != claim.turn_id()
             || envelope.actor.original_execution.as_ref().is_none_or(|physical|
                 physical.graph_id != ticket.graph_id || physical.node_id != ticket.node_id || physical.attempt != ticket.attempt)
-            || request.tool_name != tool || request.session_id.as_deref() != Some(claim.session_id())
+            || (request.tool_name != tool && !derived_read) || request.session_id.as_deref() != Some(claim.session_id())
             || request.execution_decision.as_ref() != original_decision
             || (invocation.root_physical_owner().is_some() == original.is_delegated())
             || !sources.iter().any(|source| source.stream_id == ticket.graph_id)
@@ -2704,6 +2707,10 @@ impl AgentActionService {
             return Err(AgentActionServiceError::Corrupt("single action original assessment or consumption missing".into()));
         }
         let mut facts = json!({"ticket":ticket, "request":request, "authorization_events":event_refs});
+        if derived_read {
+            let target = original.read_ref_target().ok_or_else(|| AgentActionServiceError::Corrupt("original read_ref target missing".into()))?;
+            facts["read_ref_target"] = json!({"input":target.input, "effect":target.effect, "authorization":target.authorization});
+        }
         if !original.is_delegated() && matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_)) {
             // The sealed Root owner already authenticated this unique original
             // producer event under the source locks. Retain its coordinates,

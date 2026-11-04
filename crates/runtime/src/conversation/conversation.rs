@@ -25,7 +25,7 @@ use provider_plane::TurnProviderState;
 pub(crate) mod tool_plane;
 #[path = "turn_engine.rs"]
 mod turn_engine;
-pub(crate) use turn_engine::{capture_member_consumption, original_memory_authorization_identity, OriginalHostPreparedMember,
+pub(crate) use turn_engine::{capture_member_consumption, original_memory_authorization_identity, OriginalHostPreparedMember, OriginalReadRefTarget,
     PreparedHostMemberAssessment, SharedPolicyOwner};
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
