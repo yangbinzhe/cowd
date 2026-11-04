@@ -143,6 +143,7 @@ pub(crate) struct ProcessOriginalCommittedReplay {
 pub(crate) fn process_original_member_replay(
     process: Arc<crate::agent_in_process_worker::OriginalProcessBatchCall>,
     actions: &AgentActionService, original: &crate::RuntimeToolExecutionRequest, index: usize,
+    expected: Option<&Arc<OriginalCommittedMember>>,
 ) -> Result<Option<ProcessOriginalCommittedReplay>, crate::tool_host::BatchMemberUnknownReason> {
     use crate::tool_host::BatchMemberUnknownReason;
     let unavailable = || BatchMemberUnknownReason::OriginalTransactionFactsUnavailable;
@@ -151,6 +152,9 @@ pub(crate) fn process_original_member_replay(
         .map_err(|_| unavailable())? else { return Ok(None); };
     let committed = actions.recover_retained_original_member(&transaction_id)
         .map_err(|_| unavailable())?.ok_or_else(unavailable)?;
+    // A stopped winner must be this exact retained checked identity, before
+    // either hot authority application or release can run.
+    if expected.is_some_and(|winner| !winner.same_original_commit(&committed)) { return Err(unavailable()); }
     let authority = committed.authority().cloned().ok_or_else(unavailable)?;
     if !authority.member().matches(&member_guard) { return Err(unavailable()); }
     let approval_guard = authority.approval_guard(&member_guard).map_err(|_| unavailable())?;
@@ -188,6 +192,26 @@ pub struct OriginalCommittedMember {
     observation_error: Option<String>,
 }
 impl OriginalCommittedMember {
+    pub(crate) fn recover_original(store: &Arc<RuntimeEventStore>, transaction_id: &str)
+        -> crate::RuntimeEventStoreResult<Option<Arc<Self>>> {
+        let Some(original) = store.recover_retained_member(transaction_id)? else { return Ok(None); };
+        Ok(Some(Arc::new(OriginalCommittedMember {
+            append: CommittedActionAppend {
+                store: Arc::downgrade(store), request: original.request,
+                receipt: OriginalMemberCommitReceipt { commit: original.receipt, validation: None },
+                authority: Some(original.authority),
+            },
+            observation: None,
+            observation_error: Some("original committed observation is not available after recovery".into()),
+        })))
+    }
+
+    pub(crate) fn same_original_commit(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.append.store, &other.append.store)
+            && Arc::ptr_eq(&self.append.request, &other.append.request)
+            && self.append.receipt.commit == other.append.receipt.commit
+    }
+
     pub fn belongs_to(&self, store: &Arc<RuntimeEventStore>) -> bool {
         self.append.store.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, store))
     }
@@ -2337,16 +2361,7 @@ impl AgentActionService {
     pub(crate) fn recover_retained_original_member(
         &self, transaction_id: &str,
     ) -> Result<Option<Arc<OriginalCommittedMember>>, AgentActionServiceError> {
-        let Some(original) = self.store.recover_retained_member(transaction_id)? else { return Ok(None); };
-        Ok(Some(Arc::new(OriginalCommittedMember {
-            append: CommittedActionAppend {
-                store: Arc::downgrade(&self.store), request: original.request,
-                receipt: OriginalMemberCommitReceipt { commit: original.receipt, validation: None },
-                authority: Some(original.authority),
-            },
-            observation: None,
-            observation_error: Some("original committed observation is not available after recovery".into()),
-        })))
+        OriginalCommittedMember::recover_original(&self.store, transaction_id).map_err(AgentActionServiceError::Store)
     }
 
     /// The original authorization owner calls this only after matching the

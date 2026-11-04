@@ -746,7 +746,7 @@ where
             .get(provider_invocation_id)
             .filter(|source| source.call.name == tool_name)
             .cloned();
-        let has_nested = tool_name == "tool_orchestrate" && source.as_ref()
+        let has_nested = matches!(tool_name, "tool_orchestrate" | "grep_search") && source.as_ref()
             .and_then(|source| source.call.binding.as_ref())
             .and_then(|binding| {
                 let key = binding.effect_idempotency_key();
@@ -1331,7 +1331,7 @@ where
         &self,
         source: &NativeToolSource,
     ) -> Result<Option<(NativeReadAcquisition, Vec<serde_json::Value>)>, RuntimeError> {
-        if source.call.name != "tool_orchestrate" { return Ok(None); }
+        if !matches!(source.call.name.as_str(), "tool_orchestrate" | "grep_search") { return Ok(None); }
         let Some(store) = self.runtime_event_store.as_ref() else { return Ok(None); };
         let Some(binding) = source.call.binding.as_ref() else { return Ok(None); };
         let key = binding.effect_idempotency_key();
@@ -1798,7 +1798,7 @@ where
             else {
                 continue;
             };
-            if receipt.tool_name == "tool_orchestrate" {
+            if matches!(receipt.tool_name.as_str(), "tool_orchestrate" | "grep_search") {
                 let Some(source) = receipt.source.as_ref() else { continue; };
                 if crate::context_evidence::read_sha256(receipt.presentation.as_bytes()) != candidate.model_receipt_sha256
                     || receipt.presentation.len() as u64 != receipt.presentation_bytes
@@ -1813,7 +1813,10 @@ where
                         &source.call.input, &receipt.presentation, &child) else { continue; };
                     let Some(step_index) = child["step_index"].as_u64() else { continue; };
                     let Some(position) = child["position"].as_u64() else { continue; };
-                    let key = format!("native-child-read:{}:{}:{step_index}:{position}", wire.request_id, candidate.provider_invocation_id);
+                    let suffix = if child["tool_name"] == "grep_search" {
+                        format!(":grep:{}:{}", child["batch_index"], child["window_index"])
+                    } else { String::new() };
+                    let key = format!("native-child-read:{}:{}:{step_index}:{position}{suffix}", wire.request_id, candidate.provider_invocation_id);
                     let mut parent_identity = serde_json::to_value(&parent.seal).map_err(|e| RuntimeError::new(e.to_string()))?;
                     parent_identity.as_object_mut().ok_or_else(|| RuntimeError::new("nested parent identity invalid"))?.remove("body");
                     let payload = serde_json::json!({"schema_version":1,"parent":parent_identity,"source_input":source.call.input,

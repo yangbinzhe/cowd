@@ -440,7 +440,7 @@ impl ProcessMemberCustody {
         if let Some(fact) = pending {
             let index = fact.get("index").and_then(serde_json::Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok()).ok_or("Process terminal index unavailable")?;
-            if fact.get("state").and_then(serde_json::Value::as_str) != Some("confirmed_noncommit")
+            if !matches!(fact.get("state").and_then(serde_json::Value::as_str), Some("confirmed_noncommit" | "before_outcome_unknown" | "before_outcome_error" | "before_outcome_store_unknown"))
                 || !members.contains_key(&index) { return Err("Process terminal custody unavailable".into()); }
         }
         let mut units = Vec::with_capacity(members.len());
@@ -454,6 +454,7 @@ impl ProcessMemberCustody {
             let mut matching = outcomes.iter().filter(|(actual, _)| actual == index);
             let Some((_, outcome)) = matching.next() else {
                 let pending = pending.ok_or("Process member outcome unavailable")?;
+                child.request.tool_progress.reconcile_original_member_stop();
                 let publications = child.request.tool_progress.checked_original_stop_publications()?;
                 let [publication] = publications.as_slice() else { return Err("Process terminal publications conflict".into()); };
                 let crate::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() else { return Err("Process terminal publication unresolved".into()); };
@@ -467,10 +468,8 @@ impl ProcessMemberCustody {
                 let crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err("Process terminal unresolved".into()); };
                 child.store.validate_original_member_noncommit_node(terminal, &child.parent_ticket,
                     &child.request.idempotency_key, *index as u64, pending).map_err(|_| "Process terminal node fact differs")?;
-                let mut markers = terminal.request.transaction.events.iter().filter(|event| event.event.kind == "agentic.batch_member.index");
-                let marker = markers.next().ok_or("Process checked member identity unavailable")?;
-                if markers.next().is_some() || marker.event.payload["member_identity"].as_str() != Some(original.identity()) {
-                    return Err("Process checked member identity differs".into());
+                if !terminal.matches_prepared(original.identity(), &child.request) {
+                    return Err("Process original terminal member differs".into());
                 }
                 units.push(Arc::clone(unit));
                 continue;
@@ -632,8 +631,11 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
             Err(_) => return unknown(BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
                 "original member stop publication unavailable".into()),
         };
-        if !publications.is_empty() {
-            let terminal = (|| {
+        let retained_unknown = || AgentBatchMemberPregrant::Unknown { failure: BatchMemberUnknown {
+            index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable },
+            stop: if let [publication] = publications.as_slice() { Some(publication.as_ref().clone()) } else { None } };
+        let stopped_winner = if !publications.is_empty() {
+            let stopped = (|| {
                 if publications.len() != 1 { return None; }
                 let publication = &publications[0];
                 if publication.failure().is_some() { return None; }
@@ -646,36 +648,57 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
                     || stop.coordinate().outer_key() != original.idempotency_key
                     || stop.coordinate().step() != original.step_binding.as_ref()
                     || stop.coordinate().index() != index { return None; }
-                let OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return None; };
-                let reservation = stop.original_reservation()?;
-                let fence = stop.original_effect_fence()?;
-                let recovered = self.process.store().original_member_noncommit(reservation, fence).ok()??;
-                if !Arc::ptr_eq(&recovered.request, &terminal.request)
-                    || !Arc::ptr_eq(&recovered.transaction, &terminal.transaction)
-                    || recovered.receipt != terminal.receipt { return None; }
-                let guard = self.process.store().retained_original_noncommit_binding(terminal).ok()?;
-                let member = guard.process()?;
-                if !Arc::ptr_eq(member.owner(), &self.process) || member.ticket() != self.process.ticket()
-                    || member.index() != index || member.outer_key() != original.idempotency_key
-                    || member.original_request() != original
-                    || !member.original_request().tool_progress.same_original_channels(&original.tool_progress) { return None; }
-                self.process.store().validate_original_member_noncommit(terminal, self.process.ticket(),
-                    &original.idempotency_key, u64::try_from(index).ok()?).ok()?;
-                Some(Arc::clone(publication))
+                stop.reconcile_original();
+                Some(stop)
             })();
-            return match terminal {
-                Some(publication) => AgentBatchMemberPregrant::Terminal(publication),
-                None => unknown(BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
-                    "original member stop remains unresolved".into()),
-            };
-        }
-        match crate::agentic::process_original_member_replay(Arc::clone(&self.process), &self.process.actions, original, index) {
+            let Some(stop) = stopped else { return retained_unknown(); };
+            match stop.reason() {
+                OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) => {
+                    let valid = (|| {
+                        let reservation = stop.original_reservation()?;
+                        let fence = stop.original_effect_fence()?;
+                        let recovered = self.process.store().original_member_noncommit(reservation, fence).ok()??;
+                        if !terminal.same_original(&recovered) || !terminal.matches_request(original) { return None; }
+                        self.process.store().validate_original_member_noncommit(terminal, self.process.ticket(),
+                            &original.idempotency_key, u64::try_from(index).ok()?).ok()
+                    })();
+                    return if valid.is_some() { AgentBatchMemberPregrant::Terminal(Arc::clone(&publications[0])) }
+                        else { retained_unknown() };
+                },
+                OriginalBatchMemberStopReason::CommittedUnbound(winner) => {
+                    // Reentry after owner apply uses the same sink's typed committed
+                    // result. Missing observation still cannot authorize another action.
+                    let outcomes = original.tool_progress.original_members();
+                    let mut matching = outcomes.iter().filter(|(actual, _)| *actual == index);
+                    if let Some((_, outcome)) = matching.next() {
+                        if matching.next().is_some() { return retained_unknown(); }
+                        let crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else { return retained_unknown(); };
+                        if member.same_owner_committed().is_some_and(|handle| handle.authority().is_none()
+                            && handle.belongs_to(self.process.store()) && winner.original().same_original_commit(handle)) {
+                            return AgentBatchMemberPregrant::Replay(member.clone());
+                        }
+                        return retained_unknown();
+                    }
+                    Some(Arc::clone(winner.original()))
+                },
+                _ => return retained_unknown(),
+            }
+        } else { None };
+        match crate::agentic::process_original_member_replay(Arc::clone(&self.process), &self.process.actions, original, index, stopped_winner.as_ref()) {
             Ok(Some(replay)) => {
                 if let Err(reason) = replay.owner_applied {
+                    if stopped_winner.is_some() { return retained_unknown(); }
                     let stop = OriginalBatchMemberStop::publish(coordinate(), OriginalBatchMemberStopReason::CommittedUnbound(
                         crate::tool_host::OriginalMemberUnboundCommit { handle: replay.committed, reason }));
                     return AgentBatchMemberPregrant::Unknown { failure: BatchMemberUnknown { index,
                         reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable }, stop: Some(stop) };
+                }
+                if stopped_winner.is_some() {
+                    // Retain the completed owner handoff before returning across the
+                    // async caller boundary. Keep the original stop/publication intact.
+                    original.tool_progress.record_original_member(index, Arc::new(
+                        crate::tool_host::OriginalMemberSubmitOutcome::Committed(replay.member.clone())));
+                    return AgentBatchMemberPregrant::Replay(replay.member);
                 }
                 if matches!(replay.member.observation(), OriginalMemberObservation::Unavailable) {
                     let stop = OriginalBatchMemberStop::publish(coordinate(), OriginalBatchMemberStopReason::CommittedObservationUnavailable(replay.member));
@@ -684,7 +707,9 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
                 }
                 return AgentBatchMemberPregrant::Replay(replay.member);
             }
+            Ok(None) if stopped_winner.is_some() => return retained_unknown(),
             Ok(None) => {},
+            Err(_) if stopped_winner.is_some() => return retained_unknown(),
             Err(reason) => return unknown(reason, "original Process member could not be authenticated".into()),
         }
         let member = match self.member(original, index) {
@@ -716,12 +741,16 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
         // A retains the original append request and token before attempting the
         // effect marker. Any failure here can be an unknown append outcome.
         let fence = match self.process.store.acquire_original_member_preparation_fence(
-            reservation, original, self.process.ticket(), index, &fresh_effect,
+            reservation, original, self.process.ticket(), index, &fresh_effect, Arc::clone(self.process.claim()),
         ) {
             Ok(fence) => fence,
             Err(error) => {
-                let reason = error.to_string();
-                return unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason);
+                let error = Arc::new(error);
+                let reservation = Arc::clone(&member.reservation.get().expect("original reservation retained").token);
+                let stop = OriginalBatchMemberStop::publish_with_reservation(coordinate(),
+                    OriginalBatchMemberStopReason::BeforeOutcomeStoreError(Arc::clone(&error)), reservation);
+                return AgentBatchMemberPregrant::Unknown { failure: BatchMemberUnknown {
+                    index, reason: BatchMemberUnknownReason::OriginalOwnerStore(error) }, stop: Some(stop) };
             }
         };
         if member.effect_fence.set(Arc::clone(&fence)).is_err() {
@@ -732,18 +761,28 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
         // owner must supply the original approval; do not manufacture one.
         let authority = match member.prepare_authority_after_replay().await {
             Ok(authority) => authority,
-            Err(reason) => return unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason),
+            Err(reason) => {
+                let reservation = Arc::clone(&member.reservation.get().expect("original reservation retained").token);
+                let stop = OriginalBatchMemberStop::publish_with_owners(coordinate(),
+                    OriginalBatchMemberStopReason::BeforeOutcomeUnknown(reason.clone()), reservation, Arc::clone(&fence));
+                return AgentBatchMemberPregrant::Unknown { failure: BatchMemberUnknown {
+                    index, reason: BatchMemberUnknownReason::Preparation(reason) }, stop: Some(stop) };
+            }
         };
         let reservation = Arc::clone(&member.reservation.get().expect("original reservation retained").token);
-        match crate::step_snapshot::OriginalPreparedMemberCapability::from_process(member, authority, reservation, fence) {
+        match crate::step_snapshot::OriginalPreparedMemberCapability::from_process(member, authority, Arc::clone(&reservation), Arc::clone(&fence)) {
             Ok(candidate) => AgentBatchMemberPregrant::Candidate(candidate),
-            Err(reason) => unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason),
+            Err(reason) => {
+                let stop = OriginalBatchMemberStop::publish_with_owners(coordinate(),
+                    OriginalBatchMemberStopReason::BeforeOutcomeUnknown(reason.clone()), reservation, fence);
+                AgentBatchMemberPregrant::Unknown { failure: BatchMemberUnknown {
+                    index, reason: BatchMemberUnknownReason::Preparation(reason) }, stop: Some(stop) }
+            }
         }
     }
 
-
-
 }
+
 
 impl OriginalProcessBatchCall {
     pub(crate) fn outer_input_facts(&self) -> Option<&OriginalProcessOuterInputFacts> { self.outer_input_facts.get() }

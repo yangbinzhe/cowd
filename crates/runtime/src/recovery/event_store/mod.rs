@@ -106,6 +106,10 @@ pub(crate) struct OriginalMemberReservation {
 }
 
 impl OriginalMemberReservation {
+    pub(crate) fn recover_effect_fence(&self) -> RuntimeEventStoreResult<Option<Arc<OriginalMemberEffectFence>>> {
+        self.owner.upgrade().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original member owner unavailable".into()))?
+            .recover_original_member_preparation_fence(self)
+    }
     /// Authenticate only the still-held in-process reservation. This does not
     /// establish durable first-execution eligibility or grant execution rights.
     pub(crate) fn matches_original(
@@ -135,6 +139,24 @@ pub(crate) struct OriginalMemberEffectFence {
     request: Arc<AppendTransactionRequest>,
     receipt: StdMutex<Option<AppendTransactionReceipt>>,
     hook_entered: std::sync::atomic::AtomicBool,
+    original: std::sync::Weak<crate::RuntimeToolExecutionRequest>,
+    claim: Arc<crate::execution_core::services::OriginalSessionClaim>,
+    terminal: StdMutex<Option<(Arc<AppendTransactionRequest>, AppendTransactionReceipt)>>,
+}
+
+pub(crate) enum OriginalStoppedMember {
+    Noncommit(Arc<OriginalMemberNoncommit>),
+    Winner(Arc<crate::OriginalCommittedMember>),
+}
+impl OriginalMemberEffectFence {
+    pub(crate) fn settle_stop(self: &Arc<Self>, reservation: &OriginalMemberReservation)
+        -> RuntimeEventStoreResult<Option<OriginalStoppedMember>> {
+        let store = self.owner.upgrade().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original member store unavailable".into()))?;
+        if let Some(winner) = store.settle_original_member_stop(reservation, self)? {
+            return Ok(Some(OriginalStoppedMember::Winner(winner)));
+        }
+        Ok(store.original_member_noncommit(reservation, self)?.map(OriginalStoppedMember::Noncommit))
+    }
 }
 
 #[derive(Debug)]
@@ -167,11 +189,66 @@ enum OriginalMemberAttemptNoncommit { Cancelled, RolledBack }
 /// Private same-owner evidence; possession does not settle the outer node or its physical close.
 #[doc(hidden)]
 pub struct OriginalMemberNoncommit {
-    pub(crate) request: Arc<CheckedAppendRequest>,
+    identity: OriginalMemberNoncommitIdentity,
     pub(crate) transaction: Arc<AppendTransactionRequest>,
     pub(crate) receipt: AppendTransactionReceipt,
     fence: Arc<OriginalMemberEffectFence>,
     pub(crate) owner: std::sync::Weak<RuntimeEventStore>,
+}
+
+enum OriginalMemberNoncommitIdentity {
+    Checked(Arc<CheckedAppendRequest>),
+    Preparation,
+}
+impl OriginalMemberNoncommit {
+    pub(crate) fn checked_request(&self) -> Option<&Arc<CheckedAppendRequest>> {
+        match &self.identity { OriginalMemberNoncommitIdentity::Checked(request) => Some(request),
+            OriginalMemberNoncommitIdentity::Preparation => None }
+    }
+    fn custody_key(&self) -> String {
+        self.checked_request().map(|request| request.transaction.transaction_id.clone())
+            .unwrap_or_else(|| original_member_reservation_key(&self.fence.outer, self.fence.index))
+    }
+    fn matches_custody(&self, entry: &RetainedMemberEntry) -> RuntimeEventStoreResult<bool> {
+        match (&self.identity, entry) {
+            (OriginalMemberNoncommitIdentity::Checked(request), RetainedMemberEntry::Checked(owner)) =>
+                Ok(Arc::ptr_eq(&owner.request, request)
+                    && owner.member_terminal.as_ref().is_some_and(|(tx, receipt)| Arc::ptr_eq(tx, &self.transaction) && receipt == &self.receipt)
+                    && owner.effect_fence.as_ref().is_some_and(|fence| Arc::ptr_eq(fence, &self.fence))
+                    && owner.control.original_noncommit_reconciled().map_err(RuntimeEventStoreError::InvalidTransaction)?),
+            (OriginalMemberNoncommitIdentity::Preparation, RetainedMemberEntry::Reserved { nonce, effect: Some(fence), .. }) => {
+                let terminal = fence.terminal.lock().map_err(|_| RuntimeEventStoreError::Corrupt("member terminal custody unavailable".into()))?;
+                Ok(Arc::ptr_eq(nonce, &self.fence.nonce) && Arc::ptr_eq(fence, &self.fence)
+                    && terminal.as_ref().is_some_and(|(tx, receipt)| Arc::ptr_eq(tx, &self.transaction) && receipt == &self.receipt))
+            }
+            _ => Ok(false),
+        }
+    }
+    pub(crate) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.fence, &other.fence) && Arc::ptr_eq(&self.transaction, &other.transaction)
+            && self.receipt == other.receipt && match (self.checked_request(), other.checked_request()) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b), (None, None) => true, _ => false,
+            }
+    }
+    pub(crate) fn matches_request(&self, original: &crate::RuntimeToolExecutionRequest) -> bool {
+        self.fence.original.upgrade().is_some_and(|source| source.as_ref() == original
+            && source.tool_progress.same_original_channels(&original.tool_progress))
+    }
+    pub(crate) fn identity_fact(&self) -> RuntimeEventStoreResult<serde_json::Value> {
+        match self.checked_request() {
+            Some(request) => Ok(serde_json::json!({"kind":"checked", "transaction_id":request.transaction.transaction_id,
+                "request_hash":request.identity_hash()?})),
+            None => Ok(serde_json::json!({"kind":"preparation", "transaction_id":self.fence.request.transaction_id,
+                "request_hash":domain::request_hash(&self.fence.request)?})),
+        }
+    }
+    pub(crate) fn matches_prepared(&self, identity: &str, original: &crate::RuntimeToolExecutionRequest) -> bool {
+        if !self.matches_request(original) { return false; }
+        let Some(request) = self.checked_request() else { return true; };
+        let mut markers = request.transaction.events.iter().filter(|event| event.event.kind == "agentic.batch_member.index");
+        markers.next().is_some_and(|event| event.event.payload["member_identity"].as_str() == Some(identity))
+            && markers.next().is_none()
+    }
 }
 
 /// Original transaction and control remain owned while its commit outcome is unknown.
@@ -927,8 +1004,8 @@ impl RuntimeEventStore {
     ) -> RuntimeEventStoreResult<()> {
         self.validate_original_member_noncommit(terminal, ticket, outer, index)?;
         let effect_key = format!("original-first-effect:{}", transaction.transaction_id);
-        let member_key = &terminal.request.transaction.transaction_id;
-        if effect_key == *member_key {
+        let member_key = terminal.custody_key();
+        if effect_key == member_key {
             return Err(RuntimeEventStoreError::InvalidTransaction("original custody keys conflict".into()));
         }
         let mut retained = self.retained_checked_members.lock()
@@ -938,15 +1015,11 @@ impl RuntimeEventStore {
                 if Arc::ptr_eq(current, transaction) && Arc::ptr_eq(stored, owner) => {},
             _ => return Err(RuntimeEventStoreError::InvalidTransaction("original first effect owner changed".into())),
         }
-        match retained.get(member_key) {
-            Some(RetainedMemberEntry::Checked(current)) if Arc::ptr_eq(&current.request, &terminal.request)
-                && current.member_terminal.as_ref().is_some_and(|(tx, receipt)| Arc::ptr_eq(tx, &terminal.transaction) && receipt == &terminal.receipt)
-                && current.effect_fence.as_ref().is_some_and(|fence| Arc::ptr_eq(fence, &terminal.fence))
-                && current.control.original_noncommit_reconciled().map_err(RuntimeEventStoreError::InvalidTransaction)? => {},
-            _ => return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal custody changed".into())),
+        if !retained.get(&member_key).map(|entry| terminal.matches_custody(entry)).transpose()?.unwrap_or(false) {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal custody changed".into()));
         }
         retained.remove(&effect_key);
-        retained.remove(member_key);
+        retained.remove(&member_key);
         Ok(())
     }
 
@@ -973,14 +1046,10 @@ impl RuntimeEventStore {
             _ => return Err(RuntimeEventStoreError::InvalidTransaction("original first effect owner changed".into())),
         }
         let member_key = if let Some((terminal, _, _, _)) = terminal {
-            let key = &terminal.request.transaction.transaction_id;
-            if effect_key == *key { return Err(RuntimeEventStoreError::InvalidTransaction("original custody keys conflict".into())); }
-            match retained.get(key) {
-                Some(RetainedMemberEntry::Checked(current)) if Arc::ptr_eq(&current.request, &terminal.request)
-                    && current.member_terminal.as_ref().is_some_and(|(tx, receipt)| Arc::ptr_eq(tx, &terminal.transaction) && receipt == &terminal.receipt)
-                    && current.effect_fence.as_ref().is_some_and(|fence| Arc::ptr_eq(fence, &terminal.fence))
-                    && current.control.original_noncommit_reconciled().map_err(RuntimeEventStoreError::InvalidTransaction)? => {},
-                _ => return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal custody changed".into())),
+            let key = terminal.custody_key();
+            if effect_key == key { return Err(RuntimeEventStoreError::InvalidTransaction("original custody keys conflict".into())); }
+            if !retained.get(&key).map(|entry| terminal.matches_custody(entry)).transpose()?.unwrap_or(false) {
+                return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal custody changed".into()));
             }
             Some(key)
         } else { None };
@@ -990,7 +1059,7 @@ impl RuntimeEventStore {
         if slot.is_some() { return Err(RuntimeEventStoreError::InvalidTransaction("original Host release proof already present".into())); }
         *slot = Some(proof);
         retained.remove(&effect_key);
-        if let Some(key) = member_key { retained.remove(key); }
+        if let Some(key) = member_key { retained.remove(&key); }
         Ok(())
     }
 
@@ -1038,10 +1107,13 @@ impl RuntimeEventStore {
         original: &crate::RuntimeToolExecutionRequest,
         ticket: &crate::execution_core::graph::NodeExecutionTicket, index: usize,
         first_effect: &crate::execution_core::graph::OriginalFreshEffectOwner,
+        claim: Arc<crate::execution_core::services::OriginalSessionClaim>,
     ) -> RuntimeEventStoreResult<Arc<OriginalMemberEffectFence>> {
         use harness_contract::execution_graph::ExecutionNodeStatus;
         let index = u64::try_from(index).map_err(|_| RuntimeEventStoreError::InvalidTransaction("member index overflow".into()))?;
-        if !first_effect.matches_original(self, original) {
+        if original.session_id.as_deref() != Some(claim.session_id())
+            || original.step_binding.as_ref().is_none_or(|step| step.snapshot.identity.turn_id != claim.turn_id())
+            || !first_effect.matches_original(self, original) {
             return Err(RuntimeEventStoreError::InvalidTransaction("original first effect owner unavailable".into()));
         }
         if !reservation.matches_original(self, &original.idempotency_key, index, ticket) {
@@ -1102,6 +1174,7 @@ impl RuntimeEventStore {
                         kind: "execution.effect.member_preparation".into(), status: Some("inflight".into()),
                         actor: Some("execution_commit_service".into()), refs: vec![RuntimeEventRef { kind: "execution_graph".into(), id: graph_stream.clone() }],
                         payload: serde_json::json!({"ticket":ticket,"outer_key":original.idempotency_key,"member_index":index,
+                            "session_id":claim.session_id(),"turn_id":claim.turn_id(),
                             "tool_use_id":original.tool_use_id,"input_sha256":format!("sha256:{:x}", Sha256::digest(original.input.as_bytes())),
                             "intent_event_id":intent.event_id,"intent_transaction_id":intent.transaction_id}) },
                     idempotency_key: Some(key), schema_version: 1,
@@ -1109,7 +1182,8 @@ impl RuntimeEventStore {
             };
             let fence = Arc::new(OriginalMemberEffectFence { owner: Arc::downgrade(self), nonce: Arc::clone(&reservation.nonce),
                 outer: original.idempotency_key.clone(), index, ticket: ticket.clone(), request: Arc::new(transaction), receipt: StdMutex::new(None),
-                hook_entered: std::sync::atomic::AtomicBool::new(false) });
+                hook_entered: std::sync::atomic::AtomicBool::new(false), original: Arc::downgrade(first_effect.original_request()),
+                claim, terminal: StdMutex::new(None) });
             {
                 let mut owners = self.retained_checked_members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 match owners.get_mut(&original_member_reservation_key(&reservation.outer, reservation.index)) {
@@ -1179,6 +1253,9 @@ impl RuntimeEventStore {
                 if Arc::ptr_eq(nonce, &reservation.nonce) && Arc::ptr_eq(current, fence) => {},
             _ => return Err(RuntimeEventStoreError::InvalidTransaction("original member fence custody changed".into())),
         }
+        if fence.terminal.lock().map_err(|_| RuntimeEventStoreError::Corrupt("original terminal unavailable".into()))?.is_some() {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original member is terminal before hook".into()));
+        }
         fence.hook_entered.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire).map_err(|_| RuntimeEventStoreError::InvalidTransaction(
                 "original member hook outcome remains unknown".into()))?;
@@ -1210,6 +1287,9 @@ impl RuntimeEventStore {
             || !Arc::ptr_eq(&fence.nonce, &reservation.nonce) || fence.outer != reservation.outer
             || fence.index != reservation.index || fence.ticket != reservation.ticket {
             return Err(RuntimeEventStoreError::InvalidTransaction("original member effect fence mismatch".into()));
+        }
+        if fence.terminal.lock().map_err(|_| RuntimeEventStoreError::Corrupt("original terminal unavailable".into()))?.is_some() {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original member preparation is terminal".into()));
         }
         let stream = &fence.request.events[0].event.stream_id;
         if !locks.streams.contains(stream) { return Err(RuntimeEventStoreError::InvalidTransaction("original member effect source is not locked".into())); }
@@ -1425,7 +1505,8 @@ impl RuntimeEventStore {
                     let error_kind = error_kind.as_ref().and_then(serde_json::Value::as_str);
                     if !matches!((reason, error_kind),
                         (Some("cancelled"), Some("cancelled")) |
-                        (Some("rolled_back"), Some("stale_revision" | "current_member_authority_expired")))
+                        (Some("rolled_back"), Some("stale_revision" | "current_member_authority_expired")) |
+                        (Some("abandoned"), Some("original_owner_stopped")))
                         || transaction.events.len() != 1 || actual_event != terminal_event
                         || transaction.transaction_id != format!("member-noncommit:{checked_hash}")
                         || receipt.transaction_id != transaction.transaction_id || receipt.commit_cursor == 0
@@ -1585,6 +1666,120 @@ impl RuntimeEventStore {
         Ok(())
     }
 
+    /// Decide only a stopped original owner. Source locks also exclude the
+    /// Reserved -> Checked handoff; a lookup or an error is never noncommit.
+    pub(crate) fn settle_original_member_stop(
+        self: &Arc<Self>, reservation: &OriginalMemberReservation, fence: &Arc<OriginalMemberEffectFence>,
+    ) -> RuntimeEventStoreResult<Option<Arc<crate::OriginalCommittedMember>>> {
+        if !std::ptr::eq(reservation.owner.as_ptr(), Arc::as_ptr(self)) || !std::ptr::eq(fence.owner.as_ptr(), Arc::as_ptr(self))
+            || !Arc::ptr_eq(&reservation.nonce, &fence.nonce) || reservation.ticket != fence.ticket
+            || reservation.outer != fence.outer || reservation.index != fence.index {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original stopped member owner differs".into()));
+        }
+        let checked = {
+            let retained = self.retained_checked_members.lock().map_err(|_| RuntimeEventStoreError::Corrupt("member custody unavailable".into()))?;
+            let mut matches = retained.values().filter_map(|entry| match entry {
+                RetainedMemberEntry::Checked(owner) if owner.effect_fence.as_ref().is_some_and(|f| Arc::ptr_eq(f, fence)) => Some(Arc::clone(&owner.request)),
+                _ => None,
+            });
+            let checked = matches.next();
+            if matches.next().is_some() { return Err(RuntimeEventStoreError::Corrupt("member custody ambiguous".into())); }
+            if checked.is_none() && !matches!(retained.get(&original_member_reservation_key(&fence.outer, fence.index)),
+                Some(RetainedMemberEntry::Reserved { nonce, effect: Some(current), .. }) if Arc::ptr_eq(nonce, &fence.nonce) && Arc::ptr_eq(current, fence)) {
+                return Err(RuntimeEventStoreError::InvalidTransaction("original member custody missing".into()));
+            }
+            checked
+        };
+        let mut streams = fence.request.expected_streams.iter().map(|s| s.stream_id.clone()).collect::<Vec<_>>();
+        if let Some(request) = &checked { streams.extend(request.transaction.expected_streams.iter().map(|s| s.stream_id.clone())); }
+        streams.sort(); streams.dedup();
+        self.with_authenticated_stream_locks(&streams, |_| {
+            // Recheck after waiting: a new checked owner must never be closed as preparation-only.
+            {
+                let retained = self.retained_checked_members.lock().map_err(|_| RuntimeEventStoreError::Corrupt("member custody unavailable".into()))?;
+                let valid = match &checked {
+                    Some(request) => matches!(retained.get(&request.transaction.transaction_id), Some(RetainedMemberEntry::Checked(owner))
+                        if Arc::ptr_eq(&owner.request, request) && owner.effect_fence.as_ref().is_some_and(|f| Arc::ptr_eq(f, fence))),
+                    None => matches!(retained.get(&original_member_reservation_key(&fence.outer, fence.index)),
+                        Some(RetainedMemberEntry::Reserved { nonce, effect: Some(current), .. }) if Arc::ptr_eq(nonce, &fence.nonce) && Arc::ptr_eq(current, fence)),
+                };
+                if !valid { return Err(RuntimeEventStoreError::InvalidTransaction("original member changed during settlement".into())); }
+            }
+            let preparation_receipt = match fence.receipt.lock().map_err(|_| RuntimeEventStoreError::Corrupt("preparation receipt unavailable".into()))?.clone() {
+                Some(receipt) => receipt,
+                None => self.backend.original_transaction_receipt(&fence.request.transaction_id)?
+                    .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("preparation outcome unknown".into()))?,
+            };
+            let mut payload = serde_json::json!({"ticket":fence.ticket,"outer_key":fence.outer,"member_index":fence.index,
+                "preparation_transaction_id":fence.request.transaction_id,"preparation_request_hash":preparation_receipt.request_hash});
+            let terminal_transaction_id = if let Some(request) = &checked {
+                let hash = request.identity_hash()?;
+                payload["checked_transaction_id"] = serde_json::json!(request.transaction.transaction_id);
+                payload["checked_request_hash"] = serde_json::json!(hash);
+                format!("member-noncommit:{hash}")
+            } else {
+                payload["decision_identity"] = serde_json::json!("preparation");
+                format!("member-preparation-noncommit:{}", preparation_receipt.request_hash)
+            };
+            let terminal_event = RuntimeTransactionEventInput {
+                event: RuntimeEventInput { stream_id: format!("execution-effect:{}", fence.outer),
+                    scope: RuntimeEventScope::ExecutionNode, kind: "execution.effect.member_noncommit".into(),
+                    status: Some("not_committed".into()), actor: Some("execution_commit_service".into()),
+                    refs: fence.request.events[0].event.refs.clone(), payload },
+                idempotency_key: Some(format!("agentic-member:{}", fence.index)), schema_version: 1,
+            };
+            let claim_fence = fence.claim.fence().map_err(RuntimeEventStoreError::InvalidTransaction)?;
+            let claim = RuntimeOriginalSessionClaim { session_id: fence.claim.session_id(), ingress_message_id: fence.claim.message_id(),
+                turn_id: fence.claim.turn_id(), fence: &claim_fence, consumed_input_sequence: claim_fence.input_sequence };
+            let decision = self.backend.settle_original_member(checked.as_deref(), OriginalMemberDecisionInput {
+                preparation: (*fence.request).clone(), preparation_receipt,
+                terminal_transaction_id: terminal_transaction_id.clone(), terminal_event: terminal_event.clone(),
+            }, &claim)?;
+            match decision {
+                OriginalMemberDecision::Committed(receipt) => {
+                    let request = checked.as_ref().ok_or_else(|| RuntimeEventStoreError::Corrupt("winner has no retained checked identity".into()))?;
+                    if receipt.commit.transaction_id != request.transaction.transaction_id || receipt.commit.request_hash != request.identity_hash()? {
+                        return Err(RuntimeEventStoreError::Corrupt("original winner differs".into()));
+                    }
+                    crate::OriginalCommittedMember::recover_original(self, &receipt.commit.transaction_id)
+                }
+                OriginalMemberDecision::ConfirmedNoncommit { transaction, receipt } => {
+                    let mut event = transaction.events.first().cloned().ok_or_else(|| RuntimeEventStoreError::Corrupt("member terminal event missing".into()))?;
+                    let payload = event.event.payload.as_object_mut().ok_or_else(|| RuntimeEventStoreError::Corrupt("member terminal payload missing".into()))?;
+                    let reason = payload.remove("noncommit_reason"); let kind = payload.remove("noncommit_error_kind");
+                    if !matches!((reason.as_ref().and_then(serde_json::Value::as_str), kind.as_ref().and_then(serde_json::Value::as_str)),
+                        (Some("abandoned"), Some("original_owner_stopped")) | (Some("cancelled"), Some("cancelled"))
+                        | (Some("rolled_back"), Some("stale_revision" | "current_member_authority_expired")))
+                        || event != terminal_event || transaction.events.len() != 1 || transaction.transaction_id != terminal_transaction_id
+                        || receipt.transaction_id != terminal_transaction_id || receipt.request_hash != domain::request_hash(&transaction)?
+                        || receipt.commit_cursor == 0 || receipt.event_ids.len() != 1 || receipt.event_ids[0].is_empty()
+                        || transaction.expected_streams.len() != 1 || receipt.stream_revisions.len() != 1
+                        || transaction.expected_streams[0].stream_id != terminal_event.event.stream_id
+                        || receipt.stream_revisions[0].stream_id != terminal_event.event.stream_id
+                        || receipt.stream_revisions[0].expected_revision != transaction.expected_streams[0].expected_revision
+                        || receipt.stream_revisions[0].expected_revision.checked_add(1) != Some(receipt.stream_revisions[0].committed_revision) {
+                        return Err(RuntimeEventStoreError::Corrupt("original member terminal differs".into()));
+                    }
+                    let cursor = receipt.commit_cursor;
+                    if let Some(request) = &checked {
+                        let mut retained = self.retained_checked_members.lock().map_err(|_| RuntimeEventStoreError::Corrupt("member custody unavailable".into()))?;
+                        let Some(RetainedMemberEntry::Checked(owner)) = retained.get_mut(&request.transaction.transaction_id) else {
+                            return Err(RuntimeEventStoreError::Corrupt("member custody disappeared".into()));
+                        };
+                        if !Arc::ptr_eq(&owner.request, request) { return Err(RuntimeEventStoreError::Corrupt("member custody changed".into())); }
+                        owner.control.reconcile_original_noncommit().map_err(RuntimeEventStoreError::InvalidTransaction)?;
+                        if owner.member_terminal.is_none() { owner.member_terminal = Some((Arc::new(transaction), receipt)); }
+                    } else {
+                        let mut terminal = fence.terminal.lock().map_err(|_| RuntimeEventStoreError::Corrupt("member terminal unavailable".into()))?;
+                        if terminal.is_none() { *terminal = Some((Arc::new(transaction), receipt)); }
+                    }
+                    self.publish_commit(cursor);
+                    Ok(None)
+                }
+            }
+        })
+    }
+
     /// Borrow only the decision retained by this exact original reservation and fence.
     /// Absence is Unknown and never authorizes another member attempt.
     pub(crate) fn original_member_noncommit(
@@ -1597,6 +1792,17 @@ impl RuntimeEventStore {
         }
         let retained = self.retained_checked_members.lock()
             .map_err(|_| RuntimeEventStoreError::Corrupt("original member custody unavailable".into()))?;
+        if let Some(RetainedMemberEntry::Reserved { nonce, effect: Some(current), .. }) =
+            retained.get(&original_member_reservation_key(&fence.outer, fence.index)) {
+            if !Arc::ptr_eq(nonce, &fence.nonce) || !std::ptr::eq(Arc::as_ptr(current), fence) {
+                return Err(RuntimeEventStoreError::Corrupt("original preparation custody differs".into()));
+            }
+            let terminal = current.terminal.lock().map_err(|_| RuntimeEventStoreError::Corrupt("original terminal unavailable".into()))?;
+            return Ok(terminal.as_ref().map(|(transaction, receipt)| Arc::new(OriginalMemberNoncommit {
+                identity: OriginalMemberNoncommitIdentity::Preparation, transaction: Arc::clone(transaction), receipt: receipt.clone(),
+                fence: Arc::clone(current), owner: fence.owner.clone(),
+            })));
+        }
         let mut matches = retained.values().filter_map(|entry| match entry {
             RetainedMemberEntry::Checked(owner) if owner.effect_fence.as_ref()
                 .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), fence)) => Some(owner),
@@ -1612,7 +1818,7 @@ impl RuntimeEventStore {
         }
         let original_fence = owner.effect_fence.as_ref().ok_or_else(|| RuntimeEventStoreError::Corrupt("original member terminal fence unavailable".into()))?;
         Ok(Some(Arc::new(OriginalMemberNoncommit {
-            request: Arc::clone(&owner.request), transaction: Arc::clone(transaction), receipt: receipt.clone(),
+            identity: OriginalMemberNoncommitIdentity::Checked(Arc::clone(&owner.request)), transaction: Arc::clone(transaction), receipt: receipt.clone(),
             fence: Arc::clone(original_fence), owner: fence.owner.clone(),
         })))
     }
@@ -1622,25 +1828,13 @@ impl RuntimeEventStore {
         &self, terminal: &OriginalMemberNoncommit,
         ticket: &crate::execution_core::graph::NodeExecutionTicket, outer: &str, index: u64,
     ) -> RuntimeEventStoreResult<()> {
-        if !std::ptr::eq(terminal.owner.as_ptr(), self)
-            || original_member_identity(&terminal.request)? != Some((outer.to_owned(), index)) {
+        if !std::ptr::eq(terminal.owner.as_ptr(), self) || terminal.fence.ticket != *ticket
+            || terminal.fence.outer != outer || terminal.fence.index != index {
             return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal owner mismatch".into()));
         }
         let retained = self.retained_checked_members.lock()
             .map_err(|_| RuntimeEventStoreError::Corrupt("original member custody unavailable".into()))?;
-        let Some(RetainedMemberEntry::Checked(owner)) = retained.get(&terminal.request.transaction.transaction_id) else {
-            return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal custody unavailable".into()));
-        };
-        let Some((transaction, receipt)) = &owner.member_terminal else {
-            return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal unavailable".into()));
-        };
-        let Some(fence) = &owner.effect_fence else {
-            return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal fence unavailable".into()));
-        };
-        if !Arc::ptr_eq(&owner.request, &terminal.request) || !Arc::ptr_eq(transaction, &terminal.transaction)
-            || receipt != &terminal.receipt || !Arc::ptr_eq(fence, &terminal.fence)
-            || fence.ticket != *ticket || fence.outer != outer || fence.index != index
-            || !owner.control.original_noncommit_reconciled().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+        if !retained.get(&terminal.custody_key()).map(|entry| terminal.matches_custody(entry)).transpose()?.unwrap_or(false) {
             return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal custody differs".into()));
         }
         Ok(())
@@ -1654,11 +1848,20 @@ impl RuntimeEventStore {
         pending: &serde_json::Value,
     ) -> RuntimeEventStoreResult<()> {
         self.validate_original_member_noncommit(terminal, ticket, outer, index)?;
+        // A node may have durably recorded Unknown before the original decision
+        // reply arrived. Its authenticated pending fact is not rewritten: this
+        // same-owner terminal is the additional evidence permitting closure.
+        if pending["index"].as_u64() == Some(index)
+            && matches!(pending["state"].as_str(), Some("before_outcome_unknown" | "before_outcome_error" | "before_outcome_store_unknown"))
+            && pending.get("candidate_transaction_id").is_none()
+            && pending.get("candidate_request_hash").is_none() && pending.get("candidate_commit_cursor").is_none() {
+            return Ok(());
+        }
         let event = terminal.transaction.events.first()
             .ok_or_else(|| RuntimeEventStoreError::Corrupt("original member terminal missing".into()))?;
-        let hash = terminal.request.identity_hash()?;
+        let identity = terminal.identity_fact()?;
         if pending["state"] != "confirmed_noncommit" || pending["index"].as_u64() != Some(index)
-            || pending["checked_request_hash"].as_str() != Some(hash.as_str())
+            || pending["decision_identity"] != identity
             || pending["terminal_transaction_id"].as_str() != Some(terminal.receipt.transaction_id.as_str())
             || pending["terminal_request_hash"].as_str() != Some(terminal.receipt.request_hash.as_str())
             || pending["terminal_commit_cursor"].as_u64() != Some(terminal.receipt.commit_cursor)
@@ -1667,30 +1870,6 @@ impl RuntimeEventStore {
             return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal node fact differs".into()));
         }
         Ok(())
-    }
-
-    /// Recover the same live member guard; the terminal alone grants no execution authority.
-    pub(crate) fn retained_original_noncommit_binding(
-        &self, terminal: &OriginalMemberNoncommit,
-    ) -> RuntimeEventStoreResult<crate::authorization_negotiator::PreparedMemberBinding> {
-        if !std::ptr::eq(terminal.owner.as_ptr(), self) {
-            return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal store differs".into()));
-        }
-        let retained = self.retained_checked_members.lock()
-            .map_err(|_| RuntimeEventStoreError::Corrupt("original member custody unavailable".into()))?;
-        let Some(RetainedMemberEntry::Checked(owner)) = retained.get(&terminal.request.transaction.transaction_id) else {
-            return Err(RuntimeEventStoreError::InvalidTransaction("original member custody unavailable".into()));
-        };
-        let Some((transaction, receipt)) = &owner.member_terminal else {
-            return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal unavailable".into()));
-        };
-        if !Arc::ptr_eq(&owner.request, &terminal.request) || !Arc::ptr_eq(transaction, &terminal.transaction)
-            || receipt != &terminal.receipt || owner.effect_fence.as_ref().is_none_or(|fence| !Arc::ptr_eq(fence, &terminal.fence))
-            || !owner.control.original_noncommit_reconciled().map_err(RuntimeEventStoreError::InvalidTransaction)? {
-            return Err(RuntimeEventStoreError::InvalidTransaction("original member terminal custody differs".into()));
-        }
-        owner.authority.as_ref().and_then(|authority| authority.member().upgrade())
-            .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original member live owner unavailable".into()))
     }
 
     pub(crate) fn recover_retained_member(

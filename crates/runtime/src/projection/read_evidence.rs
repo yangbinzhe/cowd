@@ -590,14 +590,16 @@ pub async fn read_evidence(
                         attempt:read.parent.acquisition.attempt,
                     },
                 };
-                let identity = format!("{}#child:{}:{}", read.parent.tool_invocation_id, read.step_index, read.position);
+                let child = &record.payload["child"];
+                let suffix = if child["tool_name"] == "grep_search" { format!(":grep:{}:{}", child["batch_index"], child["window_index"]) } else { String::new() };
+                let identity = format!("{}#child:{}:{}{suffix}", read.parent.tool_invocation_id, read.step_index, read.position);
                 page.reads.push(VerifiedReadEvidence {
                     path:target.path.clone(), scope:harness_contract::policy::PermissionScope {
                         resource:target.declared_scope.resource.clone(), operation:target.declared_scope.operation.clone(),
                         target:Some(target.path.workspace_relative_path.clone()),
                     }, recipient,
                     step:read.parent.acquisition.step.clone(), call_id:read.parent.tool_invocation_id.clone(),
-                    tool_name:"read_file".into(), invocation_id:identity,
+                    tool_name:child["tool_name"].as_str().unwrap_or("read_file").into(), invocation_id:identity,
                     delivery:event_ref(record), acquisition:event_ref(&read.primary), index:event_ref(&read.index),
                     source_sha256:read.body.source_sha256.clone(), source_bytes:read.body.source_bytes,
                     delivered_extent:Some(extent(&read.extent)), grade:ReadEvidenceGrade::ProviderModelObserved,

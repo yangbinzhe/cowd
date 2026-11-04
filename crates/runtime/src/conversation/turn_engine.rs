@@ -595,6 +595,9 @@ impl OriginalHostPreparedMember {
 }
 
 impl SharedPolicyOwner {
+    pub(crate) fn original_member_claim(&self) -> Result<Arc<crate::execution_core::services::OriginalSessionClaim>, String> {
+        self.original_session_claim.clone().ok_or_else(|| "original member Session claim unavailable".into())
+    }
     pub(crate) fn register_original_control(&self, control: &Arc<crate::conversation::MemberCommitControl>) {
         self.cancellation.register_member_commit_control(control);
         self.control_requested.register(control);

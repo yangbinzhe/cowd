@@ -5831,6 +5831,179 @@ async fn original_host_orchestrated_search_novelty_and_unknown() {
 }
 
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "run alone in an isolated process with an exclusive Session PG fixture"]
+async fn grep_samecall_original_ingress_receipt_wire_and_projection() {
+    use sha2::{Digest, Sha256};
+    for mode in ["direct", "batch", "child_call", "child_batch", "child_search_batch", "count", "filenames", "page", "truncated"] {
+    use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
+    use futures::FutureExt;
+    struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value { std::env::set_var(key, value); }
+                else { std::env::remove_var(key); }
+            }
+        }
+    }
+    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE",
+        "COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND"];
+    let _restore = Restore(keys.into_iter().map(|key| (key, std::env::var_os(key))).collect());
+    std::env::set_var("COWD_EVAL_HARNESS", "1");
+    std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
+    std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
+    // This independent test process sends only to its own loopback listener;
+    // the diagnostic capability is not a production send authorization.
+    std::env::set_var("COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND", "local loopback fixture");
+    let root = fixture_root();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("target.txt"), "alpha\nbeta\n").unwrap();
+    std::fs::create_dir_all(workspace.join("docs")).unwrap();
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        std::fs::write(workspace.join("docs").join(name), "alpha\nbeta\n").unwrap();
+    }
+    let long_body = (0..5000).map(|i| format!("row {i:05}: original bytes exceed provider presentation capacity\n")).collect::<String>();
+    std::fs::write(workspace.join("long.txt"), &long_body).unwrap();
+    let mut provider = LoopbackProvider::start("root").await;
+    let providers = provider_registry(&[&provider]);
+    let topology = SelectedStorageTopology::compose_for_test(&root.path().join("home"), &workspace).unwrap();
+    let services = RecoveryServices::start_with_diagnostic_loopback(root.path(), topology, providers).await;
+    let runtime = services.runtime.runtime_services();
+    let session = format!("b-scope-ingress:{}", uuid::Uuid::new_v4());
+    let identity = std::sync::Mutex::new(None::<(String, String, String)>);
+    let run = std::panic::AssertUnwindSafe(async {
+        let mut request = EnsureSessionRequest::new(&session, Some(provider.model.clone()), SessionSource::Tui);
+        request.owner_principal_id = Some("b-scope-local-fixture".into());
+        services.session.create_user_session(request).await.unwrap();
+        let control = json!({"corpus_id":"live-scenarios-v1", "workspace_fixture":"none",
+            "provider_constraint":"normal", "temperature_milli":0,
+            "resource_scopes":["read:target.txt", "read:docs", "read:long.txt"], "prompt":"Read target.txt."});
+        let envelope = harness_contract::turn::SessionInputEnvelope::text(&session,
+            harness_contract::turn::InputSourceKind::Tui,
+            &format!("COWD_EVAL_CONTROL {control}\nRead target.txt and report its content."));
+        let request_id = envelope.idempotency_key.clone();
+        let admitted = services.session.admit_input(envelope).await.unwrap();
+        let turn = admitted.turn_id;
+        let graph = admitted.execution_graph_id;
+        *identity.lock().unwrap() = Some((request_id.clone(), turn.clone(), graph.clone()));
+        let input = services.session.runtime_input(&request_id).await.unwrap().expect("original Session input");
+        assert_eq!(input.session_id, session);
+        assert_eq!(input.turn_id, turn);
+        provider.tool("grep-discover", "tool_search", json!({"query":"select:grep_search,tool_orchestrate"}), None).await;
+        let request = provider.next().await;
+        let tools = request.body["tools"].as_array().expect("original Step catalog");
+        for name in ["grep_search", "tool_orchestrate"] {
+            assert!(tools.iter().any(|tool| tool["function"]["name"] == name), "original Step must expose {name}");
+        }
+        let search = json!({"pattern":".*","path":"docs","glob":"*.txt"});
+        let (tool, input, expected) = match mode {
+            "direct" => ("grep_search", search.clone(), 4),
+            "batch" => ("grep_search", json!({"searches":[search,search]}), 8),
+            "child_call" => ("tool_orchestrate", json!({"steps":[{"id":"g","op":"call","tool":"grep_search","input":search}]}), 4),
+            "child_batch" => ("tool_orchestrate", json!({"steps":[{"id":"g","op":"batch","calls":[{"tool":"grep_search","input":search,"as":"g"}]}]}), 4),
+            "child_search_batch" => ("tool_orchestrate", json!({"steps":[{"id":"g","op":"batch","calls":[{"tool":"grep_search","input":{"searches":[search,search]},"as":"g"}]}]}), 8),
+            "count" => ("grep_search", json!({"pattern":".*","path":"docs","output_mode":"count"}), 0),
+            "filenames" => ("grep_search", json!({"pattern":".*","path":"docs","output_mode":"files_with_matches"}), 0),
+            "page" => ("grep_search", json!({"pattern":".*","path":"docs","head_limit":1}), 0),
+            _ => ("grep_search", json!({"pattern":".*","path":"long.txt","head_limit":10000}), 0),
+        };
+        request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[
+            {"index":0,"id":"grep-original","type":"function","function":{"name":tool,"arguments":input.to_string()}}
+        ]})).unwrap();
+        let next = provider.next().await;
+        let wire = next.body["messages"].as_array().unwrap().iter().find(|message|
+            message["role"] == "tool" && message["tool_call_id"] == "grep-original").expect("original grep provider presentation");
+        assert!(!wire.to_string().contains("directory_ancestry"));
+        assert!(!wire.to_string().contains("physical_identity"));
+        let active = runtime.graph_state_store().load(&graph).unwrap();
+        let models = active.nodes.iter().filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::InlineModel
+            && active.node_statuses.get(&node.id) == Some(&harness_contract::execution_graph::ExecutionNodeStatus::Running))
+            .map(|node| node.id.clone()).collect::<Vec<_>>();
+        assert!(!models.is_empty(), "original provider Model node must own the pending wire request");
+        next.reply.send(json!({"role":"assistant","content":"Read-only search completed."})).unwrap();
+        // Negative assertions also wait for the actual consuming Model node to
+        // finish confirmation; checking an early empty stream would be vacuous.
+        durable_until(|| {
+            let settled = runtime.graph_state_store().load(&graph).ok()?;
+            models.iter().all(|id| settled.node_statuses.get(id).is_some_and(|status| status.is_terminal())).then_some(())
+        }).await;
+        let physical = services.physical_calls.lock().unwrap().iter().find(|call| call.tool_use_id == "grep-original").unwrap().clone();
+        assert_eq!(physical.tool_name, tool);
+        let primary = runtime.event_reader().list_stream(&format!("execution-effect:{}", physical.idempotency_key)).unwrap()
+            .into_iter().find(|event| event.payload["child_read_acquisitions_v1"].is_array())
+            .or_else(|| runtime.event_reader().list_stream(&format!("execution-effect:{}", physical.idempotency_key)).unwrap().into_iter().find(|event| matches!(event.kind.as_str(), "execution.effect.receipt" | "execution.read.receipt")))
+            .expect("original authorized ToolHost primary receipt");
+        assert_eq!(primary.payload["outcome"]["status"], "executed", "{mode}: {}", primary.payload);
+        assert_eq!(primary.payload["replay"]["call_id"], "grep-original");
+        let parent = physical.parent_execution.as_ref().expect("original Model ticket owner");
+        assert_eq!(parent.execution_id, graph);
+        let index = runtime.event_reader().list_stream(&format!("execution-agent-receipts:{}:{}:{}", parent.execution_id,
+            parent.node_id, physical.attempt.unwrap())).unwrap().into_iter()
+            .find(|event| event.idempotency_key.as_deref() == Some(format!("agent-tool-receipt:{}",physical.idempotency_key).as_str())).unwrap();
+        assert_eq!(primary.transaction_id, index.transaction_id);
+        assert_eq!(primary.commit_cursor, index.commit_cursor);
+        assert_eq!(primary.payload["outcome"], index.payload["outcome"]);
+        assert_eq!(primary.payload["child_read_acquisitions_v1"], index.payload["child_read_acquisitions_v1"]);
+        let children = primary.payload["child_read_acquisitions_v1"].as_array().cloned().unwrap_or_default();
+        let acquired = if mode == "truncated" { 1 } else { expected };
+        assert_eq!(children.len(), acquired, "{mode}: {}", primary.payload);
+        if expected > 0 {
+            durable_until(|| runtime.event_reader().list_stream(&format!("session:{session}")).unwrap().into_iter()
+                .find(|event| event.kind == "context.nested_read_model_observed" && event.payload["child"]["parent_tool_use_id"] == "grep-original")).await;
+        }
+        let deliveries = runtime.event_reader().list_stream(&format!("session:{session}")).unwrap().into_iter()
+            .filter(|event| event.kind == "context.nested_read_model_observed" && event.payload["child"]["parent_tool_use_id"] == "grep-original").collect::<Vec<_>>();
+        assert_eq!(deliveries.len(), expected, "{mode}");
+        let mut ids = std::collections::BTreeSet::new();
+        for delivery in &deliveries {
+            assert!(ids.insert(delivery.idempotency_key.clone()));
+            let child = &delivery.payload["child"];
+            assert!(children.contains(child), "delivery must reference its original primary child");
+            assert_eq!(child["body"]["source_sha256"], format!("sha256:{:x}", Sha256::digest(b"alpha\nbeta\n")));
+            assert_eq!(child["body"]["source_bytes"], 11);
+            assert_eq!(child["directory_ancestry"][0], "docs");
+            assert_eq!(delivery.payload["delivered_extent"]["line_count"], 2);
+            assert_eq!(delivery.payload["delivered_extent"]["source_omitted"], false);
+            assert_eq!(delivery.payload["parent"]["step"]["turn_id"], turn);
+            assert_eq!(delivery.payload["parent"]["graph_id"], graph);
+        }
+        let context = harness_contract::projection::ProjectionQueryContext {
+            principal:"grep-original-ingress".into(), workspace_id:runtime.workspace_key().into(),
+            session_scopes:vec![session.clone()], mission_scopes:vec![],
+            visibility_grants:vec![format!("workspace:{}",runtime.workspace_key()),"resource:*".into()],
+            detail_scope:harness_contract::projection::ProjectionDetailScope::Full, authorization_revision:1,
+        };
+        let page = runtime::execution_projection::read_evidence(&runtime, &graph, &context, Default::default()).await.unwrap();
+        assert!(!page.incomplete, "{mode}: {page:?}");
+        let reads = page.reads.iter().filter(|read| read.tool_name == "grep_search").collect::<Vec<_>>();
+        assert_eq!(reads.len(), expected, "{mode}: {page:?}");
+        assert!(reads.iter().all(|read| read.body_delivered));
+    }).catch_unwind().await;
+    let drain = std::panic::AssertUnwindSafe(async {
+    if let Some((request_id, turn, graph)) = identity.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        let active = services.runtime.stop_accepting_for_recovery();
+        if let Ok(Some(input)) = services.session.runtime_input(&request_id).await {
+            let _ = services.session.cancel_input(&session,
+                harness_contract::turn::SessionInputId::from_string(input.input_id.to_string()),
+                "local scope fixture complete").await;
+        }
+        let _ = services.session.cancel_active_execution(&session, &turn, &graph, "local scope fixture complete");
+        let _ = runtime.cancel_execution_tree(&graph, "local scope fixture complete").await;
+        let drain = services.runtime.wait_for_active_turns(active.len(), Duration::from_secs(30)).await;
+        assert!(drain.remaining_turn_ids.is_empty(), "original Session turn must drain");
+    }
+    }).catch_unwind().await;
+    drop(runtime);
+    drop(provider);
+    let cleanup = std::panic::AssertUnwindSafe(services.stop()).catch_unwind().await;
+    if let Err(panic) = run { std::panic::resume_unwind(panic); }
+    if let Err(panic) = drain { std::panic::resume_unwind(panic); }
+    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
+    }
+}
+
 // Metadata-only fallback for either a missing private directory or a failed
 // private write. It never prints request/response bodies or raw error text.
 fn c_bounded_original_failure_summary(

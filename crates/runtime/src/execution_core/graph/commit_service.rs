@@ -7656,6 +7656,10 @@ impl ExecutionCommitService {
                 return Err(invalid("original Host release carrier differs"));
             }
             let actual = carrier.verified_host_settlements(ticket, &self.event_store, facts, pending).map_err(|error| invalid(&error))?;
+            // Also authenticate the real closed observation's complete registration
+            // set. This permits a sealed preparation terminal with no unit, but
+            // rejects a unit registered before a failed carrier insertion.
+            carrier.verify_host_physical_members(ticket, close).map_err(|error| invalid(&error))?;
             let same_publication = match (terminal_publication.as_ref(), publication) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
             };
@@ -7727,13 +7731,7 @@ impl ExecutionCommitService {
         let crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err(invalid()); };
         let index = u64::try_from(boundary.index).map_err(|_| invalid())?;
         self.event_store.validate_original_member_noncommit(terminal, source_ticket, &request.idempotency_key, index)?;
-        let member_guard = self.event_store.retained_original_noncommit_binding(terminal)?;
-        let member_request = if let Some(host) = member_guard.host() { host.original_request() }
-            else if let Some(process) = member_guard.process() { process.original_request() }
-            else { return Err(invalid()); };
-        if member_request != request || !member_request.tool_progress.same_original_channels(&request.tool_progress) {
-            return Err(invalid());
-        }
+        if !terminal.matches_request(request) { return Err(invalid()); }
         let members = request.tool_progress.checked_original_members().map_err(|_| invalid())?;
         if members.len() != boundary.index { return Err(invalid()); }
         let mut parts = Vec::with_capacity(members.len() + 2);
@@ -9092,10 +9090,10 @@ impl ExecutionCommitService {
                     },
                     crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) => {
                         self.event_store.validate_original_member_noncommit(terminal, coordinate.ticket(), outer, index as u64)?;
-                        let checked_hash = terminal.request.identity_hash()?;
+                        let identity = terminal.identity_fact()?;
                         let payload = &terminal.transaction.events[0].event.payload;
                         json!({"index":index,"state":"confirmed_noncommit",
-                            "checked_request_hash":checked_hash, "terminal_transaction_id":terminal.receipt.transaction_id,
+                            "decision_identity":identity, "terminal_transaction_id":terminal.receipt.transaction_id,
                             "terminal_request_hash":terminal.receipt.request_hash, "terminal_commit_cursor":terminal.receipt.commit_cursor,
                             "noncommit_reason":payload["noncommit_reason"], "noncommit_error_kind":payload["noncommit_error_kind"]})
                     }
@@ -9352,8 +9350,12 @@ impl ExecutionCommitService {
                 && !pending.contains_key("candidate_commit_cursor") && !pending.contains_key("candidate_request_hash") => {},
             Some("confirmed_noncommit") if matches!((pending.get("noncommit_reason").and_then(serde_json::Value::as_str),
                     pending.get("noncommit_error_kind").and_then(serde_json::Value::as_str)),
-                    (Some("cancelled"), Some("cancelled")) | (Some("rolled_back"), Some("stale_revision" | "current_member_authority_expired")))
-                && pending.get("checked_request_hash").and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty())
+                    (Some("cancelled"), Some("cancelled")) | (Some("rolled_back"), Some("stale_revision" | "current_member_authority_expired"))
+                    | (Some("abandoned"), Some("original_owner_stopped")))
+                && pending.get("decision_identity").is_some_and(|identity|
+                    matches!(identity["kind"].as_str(), Some("checked" | "preparation"))
+                    && identity["transaction_id"].as_str().is_some_and(|s| !s.is_empty())
+                    && identity["request_hash"].as_str().is_some_and(|s| !s.is_empty()))
                 && pending.get("terminal_transaction_id").and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty())
                 && pending.get("terminal_request_hash").and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty())
                 && pending.get("terminal_commit_cursor").and_then(serde_json::Value::as_u64).is_some_and(|value| value > 0) => {},

@@ -971,14 +971,14 @@ impl OriginalPreparedMemberCapability {
     /// first confirm durable cancellation; a failed or unknown result retains
     /// both original owners and is never treated as rollback.
     pub fn cancel_before_submit(self) -> OriginalPreparedMemberCancellation {
-        // The effect owner does not yet provide confirmed durable cancellation.
-        // Keep both owners alive through the typed stop; dropping a local token
-        // cannot establish that the persisted preparation was rolled back.
+        // The stop producer asks the original backend for a winner or a
+        // durable noncommit. The carrier stays mandatory until physical closure;
+        // even a confirmed decision is not a standalone Cancelled acknowledgement.
         OriginalPreparedMemberCancellation::Unknown(
             crate::tool_host::OriginalBatchMemberStop::publish_with_owners(
                 self.coordinate(),
                 crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeUnknown(
-                    "original member durable cancellation is unavailable".into()),
+                    "original member cancelled before submit".into()),
                 Arc::clone(&self.reservation), Arc::clone(&self.effect_fence)))
     }
 

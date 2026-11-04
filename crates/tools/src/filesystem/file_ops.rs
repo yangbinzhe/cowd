@@ -251,6 +251,38 @@ pub struct GrepSearchOutput {
     pub coverage: serde_json::Value,
 }
 
+/// Private same-open-file facts. Never serialized into the public search output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepReadWindow {
+    pub(crate) path: String,
+    pub(crate) relative_path: String,
+    pub(crate) physical_identity: String,
+    pub(crate) directory_ancestry: Option<(String, String, String)>,
+    pub(crate) source_sha256: String,
+    pub(crate) source_bytes: u64,
+    pub(crate) total_lines: u64,
+    pub(crate) ends_with_newline: bool,
+    pub(crate) start_line: u64,
+    pub(crate) line_count: u64,
+    pub(crate) body: String,
+    pub(crate) presentation: String,
+    pub(crate) output_row: usize,
+}
+impl GrepReadWindow {
+    pub fn path(&self) -> &str { &self.path }
+    pub fn relative_path(&self) -> &str { &self.relative_path }
+    pub fn physical_identity(&self) -> &str { &self.physical_identity }
+    pub fn directory_ancestry(&self) -> Option<&(String, String, String)> { self.directory_ancestry.as_ref() }
+    pub fn source_sha256(&self) -> &str { &self.source_sha256 }
+    pub fn source_bytes(&self) -> u64 { self.source_bytes }
+    pub fn total_lines(&self) -> u64 { self.total_lines }
+    pub fn ends_with_newline(&self) -> bool { self.ends_with_newline }
+    pub fn start_line(&self) -> u64 { self.start_line }
+    pub fn body(&self) -> &str { &self.body }
+    pub fn presentation(&self) -> &str { &self.presentation }
+    pub fn output_row(&self) -> usize { self.output_row }
+}
+
 /// Read exact bytes from one opened file, including CRLF and trailing newlines.
 /// The caller supplies the revision it observed; a changing source is not published.
 pub fn snapshot_file(
@@ -570,7 +602,7 @@ pub fn edit_file(
 /// Expands a glob pattern and returns matching filenames.
 #[path = "search.rs"]
 mod search;
-pub(crate) use search::glob_search_page;
+pub(crate) use search::{glob_search_page, grep_search_with_windows};
 pub use search::{glob_search, glob_search_with_options, grep_search};
 
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {

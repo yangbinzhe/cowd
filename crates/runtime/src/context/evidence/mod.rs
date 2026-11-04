@@ -1,5 +1,7 @@
 pub mod projection;
 pub mod raw;
+mod grep;
+pub(crate) use grep::{grep_original_input_matches, grep_read_target};
 
 use harness_contract::context::EvidenceContentKind;
 use harness_contract::reality::EvidenceRef;
@@ -14,7 +16,7 @@ pub use projection::audit_projection;
 pub(crate) const READ_ACQUISITION_FIELD: &str = "read_acquisition_v1";
 pub(crate) const CHILD_READ_ACQUISITIONS_FIELD: &str = "child_read_acquisitions_v1";
 pub(crate) fn native_read_candidate_tool(name: &str) -> bool {
-    matches!(name, "read_file" | "read_ref" | "evidence_retrieve" | "tool_orchestrate")
+    matches!(name, "read_file" | "read_ref" | "evidence_retrieve" | "tool_orchestrate" | "grep_search")
 }
 pub(crate) const NATIVE_DELIVERY_KIND: &str = "context.model_input_observed";
 pub(crate) const PROCESS_DELIVERY_KIND: &str = "context.agent_channel_sent";
@@ -492,8 +494,8 @@ pub(crate) fn child_read_acquisitions(
 ) -> Option<Vec<serde_json::Value>> {
     let auth = request.authorization.as_ref()?;
     let parent = request.compiled_invocation.as_ref()?;
-    if request.tool_name != "tool_orchestrate" || !scope.complete
-        || parent.effect.tool_id != "tool_orchestrate"
+    if !matches!(request.tool_name.as_str(), "tool_orchestrate" | "grep_search") || !scope.complete
+        || parent.effect.tool_id != request.tool_name
         || parent.effect.descriptor_hash != auth.descriptor_hash || auth.request_id.is_empty()
         || parent.invocation_id != request.tool_use_id
         || request.step_binding.as_ref().is_none_or(|binding| binding.origin.call_id != request.tool_use_id
@@ -508,8 +510,8 @@ pub(crate) fn child_read_acquisitions(
         if child.parent_request_id() != auth.request_id
             || child.parent_descriptor_hash() != auth.descriptor_hash
             || child.parent_authorization() != auth
-            || !positions.insert((child.step_index(), child.position()))
-            || effect.tool_id != "read_file"
+            || !positions.insert((child.step_index(), child.position(), child.grep_batch_index()))
+            || !matches!(effect.tool_id.as_str(), "read_file" | "grep_search")
             || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
             || effect.uses_network || effect.spawns_process || effect.mutates_packages || effect.mutates_system
             || effect.scopes.is_empty()
@@ -517,6 +519,11 @@ pub(crate) fn child_read_acquisitions(
                 && parent.effect.scopes.contains(s)
                 && scope.targets.iter().filter(|t| &t.declared_scope == s).count() == 1)
         { return None; }
+        if effect.tool_id == "grep_search" {
+            records.extend(grep::acquisitions(request, scope, child)?);
+            if records.len() > 400 { return None; }
+            continue;
+        }
         let body = read_body_seal("read_file", child.output())?;
         let output: serde_json::Value = serde_json::from_str(child.output()).ok()?;
         let content = output["file"]["content"].as_str()?;
@@ -558,6 +565,9 @@ pub(crate) fn child_read_presented_extent(
     presentation: &str,
     child: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    if child["tool_name"] == "grep_search" {
+        return grep::presented_extent(parent_input, presentation, child);
+    }
     let input: serde_json::Value = serde_json::from_str(parent_input).ok()?;
     let steps = input["steps"].as_array()?;
     let index = usize::try_from(child["step_index"].as_u64()?).ok()?;
@@ -1472,6 +1482,60 @@ fn truncate_head_tail(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_samecall_target_requires_original_file_identity() {
+        use harness_contract::context::{EvidenceCoverageKind, WorkspaceAccessMode};
+        use harness_contract::goal::{ProofEffectScope, ProofEffectTarget};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "original\n").unwrap();
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let path = resolver.resolve_existing("a.txt").unwrap();
+        let admitted = resolver.physical_file_identity_at_admission(&path).unwrap().unwrap();
+        let lease = tools::ToolHost::builtin("grep-identity", root.path()).pin_snapshot();
+        let resolution = lease.describe_effect_resolution("grep_search", &serde_json::json!({"path":"a.txt","pattern":".*"}));
+        let scope = ProofEffectScope {
+            version:2, descriptor_hash:resolution.descriptor.descriptor_hash.clone(), complete:true,
+            scope_purposes:resolution.scope_purposes,
+            targets:vec![ProofEffectTarget { path:path.clone(), declared_scope:resolution.descriptor.scopes[0].clone(),
+                access_mode:WorkspaceAccessMode::Read, coverage:EvidenceCoverageKind::ScopedContent,
+                exact:true, alias_checked:true, physical_identity:Some(admitted.clone()) }],
+        };
+        // Candidate validation only; these values are not appended as a receipt.
+        let mut child = serde_json::json!({"relative_path":"a.txt","physical_identity":admitted,
+            "effect":resolution.descriptor,"body":{"source_sha256":super::read_sha256(b"original\n")}});
+        assert!(super::grep_read_target(&scope, &child).is_some());
+        let mut missing = scope.clone(); missing.targets[0].physical_identity = None;
+        assert!(super::grep_read_target(&missing, &child).is_none());
+        std::fs::rename(root.path().join("a.txt"), root.path().join("old.txt")).unwrap();
+        std::fs::write(root.path().join("a.txt"), "replacement\n").unwrap();
+        child["physical_identity"] = serde_json::json!(resolver.physical_file_identity_at_admission(&path).unwrap().unwrap());
+        assert!(super::grep_read_target(&scope, &child).is_none());
+        let directory = resolver.resolve_existing(".").unwrap();
+        assert!(resolver.physical_file_identity_at_admission(&directory).unwrap().is_none());
+        let mut directory_scope = scope; directory_scope.targets[0].path = directory;
+        directory_scope.targets[0].physical_identity = None;
+        assert!(super::grep_read_target(&directory_scope, &child).is_none(), "lexical prefix is not ancestry");
+    }
+
+    #[test]
+    fn grep_samecall_delivery_rejects_summary_wrong_window_and_child_input() {
+        let input = serde_json::json!({"pattern":"hit","path":"a.txt"});
+        let mut child = serde_json::json!({"parent_tool_name":"grep_search","step_index":0,"step_id":"","position":0,
+            "input":input,"input_sha256":super::read_sha256(&serde_json::to_vec(&input).unwrap()),
+            "tool_name":"grep_search","output_row":0,"presentation":"a.txt:1:hit",
+            "body":{"extent":{"kind":"file_lines","start_line":1,"line_count":1}}});
+        let presented = "Tool `grep_search` completed. Evidence: tool://original. {\"mode\":\"content\",\"content\":\"a.txt:1:hit\"}";
+        assert!(super::child_read_presented_extent(&input.to_string(), presented, &child).is_some());
+        assert!(super::child_read_presented_extent(&input.to_string(), "summary only", &child).is_none());
+        assert!(super::child_read_presented_extent(&input.to_string(), &presented[..presented.len()-1], &child).is_none());
+        child["output_row"] = serde_json::json!(1);
+        assert!(super::child_read_presented_extent(&input.to_string(), presented, &child).is_none());
+        child["output_row"] = serde_json::json!(0);
+        child["input"]["path"] = serde_json::json!("foreign.txt");
+        assert!(super::child_read_presented_extent(&input.to_string(), presented, &child).is_none());
+    }
+
     #[test]
     fn child_preview_requires_original_position_and_exact_content() {
         let input = serde_json::json!({"steps":[{"id":"r","op":"batch","calls":[{"tool":"read_file","input":{"path":"a"}}]}]}).to_string();

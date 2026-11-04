@@ -866,6 +866,14 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync + std::any::An
     ) -> RuntimeEventStoreResult<OriginalMemberDecision> {
         Err(RuntimeEventStoreError::InvalidTransaction("backend has no original member decision owner".into()))
     }
+    /// Settle an abandoned original member without executing its action. The checked
+    /// identity, when present, is the actual retained request, never reconstructed.
+    fn settle_original_member(
+        &self, _checked: Option<&CheckedAppendRequest>, _member: OriginalMemberDecisionInput,
+        _claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<OriginalMemberDecision> {
+        Err(RuntimeEventStoreError::InvalidTransaction("backend has no original member settlement owner".into()))
+    }
     /// Authenticate an already committed checked terminal. Absence means only
     /// that no winner was observed, never that an earlier attempt rolled back.
     fn original_checked_terminal_winner(

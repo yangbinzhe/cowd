@@ -445,6 +445,25 @@ impl NoDispatchObservation {
             None => { state.member_custody.insert(key, unit); Ok(()) }
         }
     }
+    /// The drained original observation, not an empty caller list, proves which
+    /// member units were actually registered. Registration is closed here.
+    pub(crate) fn verify_closed_member_custody(
+        &self, ticket: &NodeExecutionTicket, call_id: &str,
+        expected: &[(usize, Arc<crate::tool_host::OriginalMemberSettlement>)],
+    ) -> Result<(), String> {
+        if !self.ticket_matches(ticket) || !self.calls.iter().any(|call| call.call_id == call_id) {
+            return Err("original physical member call differs".into());
+        }
+        let state = self.state.lock().map_err(|_| "original physical member custody unavailable")?;
+        if !state.closed { return Err("original physical member registration remains open".into()); }
+        let actual = state.member_custody.iter().filter(|((call, _), _)| call == call_id)
+            .map(|((_, index), unit)| (*index, unit)).collect::<Vec<_>>();
+        if actual.len() != expected.len() || actual.iter().zip(expected).any(|((index, unit), (wanted, original))|
+            index != wanted || !Arc::ptr_eq(unit, original)) {
+            return Err("original physical member registration differs".into());
+        }
+        Ok(())
+    }
     pub(crate) fn member_custody_is_unresolved(&self) -> bool {
         match self.state.lock() {
             Ok(state) => state.member_custody.values().any(|unit| !unit.is_settled()),
@@ -2933,6 +2952,29 @@ pub(crate) mod carrier_437_tests {
             };
             let observation = NoDispatchObservation::new(&ticket).unwrap();
             (workspace, request, ticket, observation)
+        }
+
+        #[test]
+        fn closed_member_custody_authenticates_empty_prefix_and_exact_units() {
+            let (_workspace, request, ticket, observation) = observed_request();
+            assert!(observation.verify_closed_member_custody(&ticket, &request.tool_use_id, &[]).is_err());
+            observation.close();
+            observation.verify_closed_member_custody(&ticket, &request.tool_use_id, &[]).unwrap();
+            assert!(observation.verify_closed_member_custody(&ticket, "foreign-call", &[]).is_err());
+            let mut wrong_ticket = ticket.clone(); wrong_ticket.attempt += 1;
+            assert!(observation.verify_closed_member_custody(&wrong_ticket, &request.tool_use_id, &[]).is_err());
+
+            let (_workspace, request, ticket, observation) = observed_request();
+            let unit = Arc::new(crate::tool_host::OriginalMemberSettlement::default());
+            observation.register_member_custody(&ticket, &request.tool_use_id, 0, Arc::clone(&unit)).unwrap();
+            observation.close();
+            // A registered prefix cannot disappear, including a failed carrier insertion.
+            assert!(observation.verify_closed_member_custody(&ticket, &request.tool_use_id, &[]).is_err());
+            observation.verify_closed_member_custody(&ticket, &request.tool_use_id, &[(0, Arc::clone(&unit))]).unwrap();
+            let foreign = Arc::new(crate::tool_host::OriginalMemberSettlement::default());
+            assert!(observation.verify_closed_member_custody(&ticket, &request.tool_use_id, &[(0, foreign)]).is_err());
+            assert!(observation.verify_closed_member_custody(&ticket, &request.tool_use_id, &[(1, Arc::clone(&unit))]).is_err());
+            assert!(observation.register_member_custody(&ticket, &request.tool_use_id, 1, unit).is_err());
         }
 
         fn failed_outcome() -> NodeExecutionOutcome {

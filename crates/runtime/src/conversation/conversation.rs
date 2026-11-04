@@ -132,10 +132,23 @@ impl MemberCommitControl {
     pub(crate) fn reconcile_original_noncommit(&self) -> Result<(), String> {
         let mut state = self.0.lock().map_err(|_| "member transaction control unavailable")?;
         match *state {
-            MemberCommitState::Unknown => { *state = MemberCommitState::RolledBack; Ok(()) }
+            MemberCommitState::Unknown | MemberCommitState::Ready | MemberCommitState::CancelRequested => { *state = MemberCommitState::RolledBack; Ok(()) }
             MemberCommitState::RolledBack => Ok(()),
             _ => Err("member transaction control conflicts with noncommit".into()),
         }
+    }
+}
+#[test]
+fn original_noncommit_reconciliation_preserves_running_and_committed_controls() {
+    for state in [MemberCommitState::Ready, MemberCommitState::CancelRequested, MemberCommitState::Unknown, MemberCommitState::RolledBack] {
+        let control = MemberCommitControl(std::sync::Mutex::new(state));
+        control.reconcile_original_noncommit().unwrap();
+        assert!(control.original_noncommit_reconciled().unwrap());
+    }
+    for state in [MemberCommitState::Running, MemberCommitState::Committing, MemberCommitState::Committed] {
+        let control = MemberCommitControl(std::sync::Mutex::new(state));
+        assert!(control.reconcile_original_noncommit().is_err());
+        assert_eq!(control.state(), state);
     }
 }
 impl crate::RuntimeTransactionCommitControl for MemberCommitControl {

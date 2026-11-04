@@ -153,6 +153,8 @@ impl ToolHost {
         ToolHostLease {
             local_network_trace: None,
             orchestrated_read_trace: None,
+            read_location: None,
+            grep_batch_index: None,
             workspace_id: self.workspace_id.clone(),
             workspace_root: self.workspace_root.clone(),
             path_policy,
@@ -219,6 +221,8 @@ fn bounded_workspace_directory(root: &Path) -> Option<Arc<std::fs::File>> {
 pub struct ToolHostLease {
     local_network_trace: Option<Arc<std::sync::Mutex<local_network::LocalNetworkTrace>>>,
     orchestrated_read_trace: Option<Arc<std::sync::Mutex<OrchestratedReadTrace>>>,
+    read_location: Option<(usize, String, usize)>,
+    grep_batch_index: Option<usize>,
     workspace_id: String,
     workspace_root: PathBuf,
     path_policy: Arc<WorkspacePathPolicy>,
@@ -236,6 +240,8 @@ pub struct ToolHostLease {
 /// proof of commit or delivery to a model.
 #[derive(Clone, PartialEq)]
 pub struct OrchestratedRead {
+    grep_windows: Option<Vec<crate::file_ops::GrepReadWindow>>,
+    grep_batch_index: Option<usize>,
     ordinal: usize,
     step_index: usize,
     step_id: String,
@@ -256,6 +262,8 @@ impl std::fmt::Debug for OrchestratedRead {
 }
 
 impl OrchestratedRead {
+    pub fn grep_windows(&self) -> Option<&[crate::file_ops::GrepReadWindow]> { self.grep_windows.as_deref() }
+    pub fn grep_batch_index(&self) -> Option<usize> { self.grep_batch_index }
     pub fn ordinal(&self) -> usize {
         self.ordinal
     }
@@ -388,11 +396,16 @@ impl ToolHostLease {
         authorization: &ToolExecutionAuthorization,
         input: &Value,
     ) -> Result<(String, OrchestratedChildren), ToolHostError> {
-        if self.orchestrated_read_trace.is_some() {
-            return Err(ToolHostError::Execution("nested read trace owner".into()));
+        self.execute_with_read_trace(authorization, "tool_orchestrate", input)
+    }
+
+    pub fn execute_with_read_trace(
+        &self, authorization: &ToolExecutionAuthorization, tool: &str, input: &Value,
+    ) -> Result<(String, OrchestratedChildren), ToolHostError> {
+        if self.orchestrated_read_trace.is_some() || !matches!(tool, "tool_orchestrate" | "grep_search") {
+            return Err(ToolHostError::Execution("invalid read trace owner".into()));
         }
-        let (canonical, value) =
-            self.authorize_and_canonicalize(authorization, "tool_orchestrate", input)?;
+        let (canonical, value) = self.authorize_and_canonicalize(authorization, tool, input)?;
         let mut lease = self.for_authorized_read_cache(authorization)?;
         let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
             authorized_scopes: authorization.authorization_lease.scopes.clone(),
@@ -403,9 +416,9 @@ impl ToolHostLease {
         }));
         lease.orchestrated_read_trace = Some(Arc::clone(&trace));
         let output = lease.dispatch_sync(&canonical, value)?;
-        let mut trace = trace
-            .lock()
-            .map_err(|_| ToolHostError::Execution("read trace poisoned".into()))?;
+        let Ok(mut trace) = trace.lock() else {
+            return Ok((output, OrchestratedChildren { reads: None, searches: None }));
+        };
         let reads = (!trace.overflow).then(|| std::mem::take(&mut trace.reads));
         let searches = (!trace.search_overflow).then(|| std::mem::take(&mut trace.searches));
         Ok((output, OrchestratedChildren { reads, searches }))
@@ -501,6 +514,8 @@ impl ToolHostLease {
         let parent_descriptor_hash = trace.parent_descriptor_hash.clone();
         let parent_authorization = trace.parent_authorization.clone().ok_or("read trace parent authorization missing")?;
         trace.reads.push(OrchestratedRead {
+            grep_windows: None,
+            grep_batch_index: None,
             ordinal,
             step_index,
             step_id: step_id.into(),
@@ -513,6 +528,39 @@ impl ToolHostLease {
             effect,
         });
         Ok(())
+    }
+
+    pub(crate) fn with_read_location(&self, step: usize, id: &str, position: usize) -> Self {
+        let mut lease = self.clone(); lease.read_location = Some((step, id.into(), position)); lease
+    }
+    pub(crate) fn with_grep_batch_index(&self, index: usize) -> Self {
+        let mut lease = self.clone(); lease.grep_batch_index = Some(index); lease
+    }
+    pub(crate) fn grep_bounded_root(&self) -> Option<&std::fs::File> { self.bounded_root.as_deref() }
+    pub(crate) fn captures_reads(&self) -> bool { self.orchestrated_read_trace.is_some() }
+    pub(crate) fn record_grep_windows(&self, input: &Value, output: &str,
+        windows: Option<Vec<crate::file_ops::GrepReadWindow>>) -> Result<(), String> {
+        let Some(trace) = &self.orchestrated_read_trace else { return Ok(()); };
+        let Some(windows) = windows.filter(|windows| !windows.is_empty()) else { return Ok(()); };
+        let effect = self.describe_effect("grep_search", input);
+        let mut trace = trace.lock().map_err(|_| "read trace poisoned")?;
+        if effect.scopes.is_empty() || !effect.scopes.iter().all(|scope| trace.authorized_scopes.contains(scope)) { return Ok(()); }
+        let bytes = output.len().saturating_add(serde_json::to_vec(input).map_err(|e| e.to_string())?.len())
+            .saturating_add(windows.iter().map(|w| w.body.len() + w.presentation.len() + w.path.len() + w.relative_path.len() + w.directory_ancestry.as_ref().map_or(0, |(path, root, directory)| path.len() + root.len() + directory.len())).sum::<usize>());
+        if trace.reads.len() >= 400 || trace.bytes.saturating_add(bytes) > 4 * 1024 * 1024 {
+            trace.overflow = true; trace.reads.clear(); return Ok(());
+        }
+        if trace.overflow { return Ok(()); }
+        trace.bytes += bytes;
+        let (step_index, step_id, position) = self.read_location.clone().unwrap_or((0, String::new(), 0));
+        let child = OrchestratedRead {
+            ordinal: trace.reads.len() + 1, step_index, step_id, position,
+            parent_request_id: trace.parent_request_id.clone(), parent_descriptor_hash: trace.parent_descriptor_hash.clone(),
+            parent_authorization: trace.parent_authorization.clone().ok_or("grep parent missing")?,
+            input: input.clone(), output: output.into(), effect,
+            grep_windows: Some(windows), grep_batch_index: self.grep_batch_index,
+        };
+        trace.reads.push(child); Ok(())
     }
 
     pub(crate) fn read_cache_authority_digest(&self) -> Option<&str> {
@@ -1848,6 +1896,116 @@ mod tests {
             timeout_lease: "timeout-lease".to_string(),
             idempotency_key,
         }
+    }
+
+    #[test]
+    fn grep_samecall_private_windows_are_original_and_contiguous() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-windows-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = "hit one\r\nmissing\r\nhit two\r\n";
+        std::fs::write(root.as_path().join("a.txt"), source).unwrap();
+        let lease = test_host("grep-windows", root.as_path()).pin_snapshot();
+        let input = json!({"pattern":"hit","path":"a.txt"});
+        let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+        let (output, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        let reads = children.reads.unwrap();
+        assert_eq!(reads.len(), 1);
+        let windows = reads[0].grep_windows().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!((windows[0].start_line(), windows[1].start_line()), (1,3));
+        assert_eq!(windows[0].body(), "hit one");
+        assert_eq!(windows[0].source_bytes(), source.len() as u64);
+        use sha2::{Digest, Sha256};
+        assert_eq!(windows[0].source_sha256(), format!("sha256:{:x}",Sha256::digest(source.as_bytes())));
+        std::fs::write(root.as_path().join("a.txt"), "new bytes").unwrap();
+        assert_eq!(windows[1].body(), "hit two");
+        assert!(!output.contains("physical_identity"));
+        assert!(!output.contains("source_sha256"));
+        for extra in [json!({"output_mode":"count"}), json!({"output_mode":"files_with_matches"}), json!({"head_limit":1})] {
+            std::fs::write(root.as_path().join("a.txt"), source).unwrap();
+            let mut input = input.clone(); input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+            let (_, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+            assert!(children.reads.unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_samecall_private_trace_failure_keeps_business_result() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-trace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit original\n").unwrap();
+        let lease = test_host("grep-trace", &root).pin_snapshot();
+        let input = json!({"pattern":"hit","path":"a.txt"});
+        let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+        let original = lease.execute(&auth, "grep_search", &input).unwrap();
+        for poison in [false, true] {
+            let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
+                authorized_scopes: auth.authorization_lease.scopes.clone(),
+                ..OrchestratedReadTrace::default()
+            }));
+            if poison {
+                let worker = trace.clone();
+                assert!(std::thread::spawn(move || {
+                    let _guard = worker.lock().unwrap();
+                    panic!("private trace unavailable");
+                }).join().is_err());
+            }
+            let mut unavailable = lease.clone();
+            unavailable.orchestrated_read_trace = Some(trace.clone());
+            assert_eq!(unavailable.execute(&auth, "grep_search", &input).unwrap(), original);
+            if !poison { assert!(trace.lock().unwrap().reads.is_empty()); }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_samecall_non_utf8_keeps_original_output_and_only_known_sibling_evidence() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::env::temp_dir().join(format!("cowd-grep-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let bad_name = std::ffi::OsString::from_vec(b"bad-\xff.txt".to_vec());
+        std::fs::write(root.join(bad_name), "hit invalid name\n").unwrap();
+        std::fs::write(root.join("valid.txt"), "hit valid name\n").unwrap();
+        let lease = test_host("grep-path", &root).pin_snapshot();
+        let input = json!({"pattern":"hit","path":"."});
+        let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+        let original = lease.execute(&auth, "grep_search", &input).unwrap();
+        let (output, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        assert_eq!(output, original);
+        assert!(output.contains("hit invalid name"));
+        let reads = children.reads.unwrap();
+        assert_eq!(reads.len(), 1);
+        let windows = reads[0].grep_windows().unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].relative_path(), "valid.txt");
+        assert_eq!(windows[0].directory_ancestry().unwrap().0, ".");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_samecall_replaced_lease_root_keeps_output_without_ancestry() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-root-{}", uuid::Uuid::new_v4()));
+        let old = root.with_extension("old");
+        std::fs::create_dir(&root).unwrap();
+        let lease = test_host("grep-root", &root).pin_snapshot();
+        std::fs::rename(&root, &old).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit replacement\n").unwrap();
+        let input = json!({"pattern":"hit","path":"."});
+        let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+        let original = lease.execute(&auth, "grep_search", &input).unwrap();
+        let (output, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        assert_eq!(output, original);
+        assert!(output.contains("hit replacement"));
+        for read in children.reads.unwrap() {
+            for window in read.grep_windows().unwrap() { assert!(window.directory_ancestry().is_none()); }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(old).unwrap();
     }
 
     #[test]

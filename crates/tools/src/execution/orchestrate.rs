@@ -1014,7 +1014,8 @@ fn call_tool_uncounted(
     }
     // Other child tools are not represented by search novelty candidates.
     if tool != "grep_search" { lease.discard_orchestrated_searches(); }
-    let output = match execute_with_lease(lease, tool, input) {
+    let located = lease.with_read_location(step_index, step_id, position);
+    let output = match execute_with_lease(&located, tool, input) {
         Ok(output) => output,
         Err(error) => {
             if tool == "grep_search" { lease.discard_orchestrated_searches(); }

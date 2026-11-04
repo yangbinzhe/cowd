@@ -80,6 +80,13 @@ impl OriginalPhysicalClose {
     pub(crate) fn matches_observation(&self, observation: &std::sync::Weak<super::agent_tool::NoDispatchObservation>) -> bool {
         std::sync::Weak::ptr_eq(observation, &Arc::downgrade(&self.observation))
     }
+    pub(crate) fn verify_member_custody(
+        &self, ticket: &NodeExecutionTicket, call_id: &str,
+        expected: &[(usize, Arc<crate::tool_host::OriginalMemberSettlement>)],
+    ) -> Result<(), String> {
+        if !self.matches_original_ticket(ticket) { return Err("original physical close ticket differs".into()); }
+        self.observation.verify_closed_member_custody(ticket, call_id, expected)
+    }
     pub(crate) fn original_agent_child(&self) -> Option<&OriginalAgentChildCall> {
         self.original_child.as_deref()
     }

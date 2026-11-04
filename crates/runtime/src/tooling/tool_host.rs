@@ -72,6 +72,14 @@ impl OriginalMemberCallCarrier {
             None => { members.insert(index, (std::sync::Arc::clone(member), unit)); Ok(()) }
         }
     }
+    pub(crate) fn verify_host_physical_members(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+        close: &crate::execution_core::graph::executors::OriginalPhysicalClose,
+    ) -> Result<(), String> {
+        let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        let expected = members.iter().map(|(index, (_, unit))| (*index, std::sync::Arc::clone(unit))).collect::<Vec<_>>();
+        close.verify_member_custody(ticket, &self.original_request.tool_use_id, &expected)
+    }
     pub(crate) fn host_release_slot(&self) -> &std::sync::Mutex<Option<std::sync::Arc<OriginalEffectReleaseProof>>> {
         &self.host_release
     }
@@ -93,6 +101,7 @@ impl OriginalMemberCallCarrier {
             || proof.pending.as_ref() != pending || !same_publication || proof.outer_receipt.commit_cursor == 0 {
             return Err("original Host release proof differs".into());
         }
+        self.verify_host_physical_members(ticket, close)?;
         let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
         if members.len() != proof.members.len() { return Err("original Host release member set differs".into()); }
         let mut units = Vec::with_capacity(members.len());
@@ -117,12 +126,31 @@ impl OriginalMemberCallCarrier {
     ) -> Result<Vec<std::sync::Arc<OriginalMemberSettlement>>, String> {
         let outcomes = self.original_request.tool_progress.original_members();
         let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        if outcomes.len() != facts.len() || outcomes.iter().any(|(index, _)| !members.contains_key(index)) {
+            return Err("original Host committed prefix registration differs".into());
+        }
         if let Some(pending) = pending {
             let index = pending.get("index").and_then(serde_json::Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok()).ok_or("original Host terminal index unavailable")?;
-            if pending.get("state").and_then(serde_json::Value::as_str) != Some("confirmed_noncommit")
-                || !members.contains_key(&index) {
+            if !matches!(pending.get("state").and_then(serde_json::Value::as_str), Some("confirmed_noncommit" | "before_outcome_unknown" | "before_outcome_error" | "before_outcome_store_unknown")) {
                 return Err("original Host terminal member custody unavailable".into());
+            }
+            if !members.contains_key(&index) {
+                // Preparation may fail before a hook/member unit exists. Only its
+                // sealed fence terminal can prove there is no unit to drain.
+                let publications = self.original_request.tool_progress.checked_original_stop_publications()?;
+                let [publication] = publications.as_slice() else { return Err("original preparation stop unavailable".into()); };
+                let OriginalStopPublication::Recorded(stop) = publication.as_ref() else { return Err("original preparation stop unresolved".into()); };
+                let OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err("original preparation unresolved".into()); };
+                let OriginalStopRead::Available(Some(current)) = self.original_request.tool_progress.original_member_stop() else { return Err("original preparation stop slot unavailable".into()); };
+                if !std::sync::Arc::ptr_eq(stop, &current)
+                    || terminal.checked_request().is_some() || !terminal.matches_request(&self.original_request)
+                    || !stop.recorded_in_original_sink() || !stop.belongs_to_original_sink(&self.original_request.tool_progress)
+                    || stop.coordinate().index() != index || stop.coordinate().ticket() != ticket {
+                    return Err("original preparation custody differs".into());
+                }
+                store.validate_original_member_noncommit_node(terminal, ticket, &self.original_request.idempotency_key, index as u64, pending)
+                    .map_err(|_| "original preparation terminal differs")?;
             }
         }
         for (index, (original, _)) in members.iter() {
@@ -147,10 +175,8 @@ impl OriginalMemberCallCarrier {
                 let OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err("original Host terminal unresolved".into()); };
                 store.validate_original_member_noncommit_node(terminal, ticket, &self.original_request.idempotency_key, *index as u64, pending)
                     .map_err(|_| "original Host terminal node fact differs")?;
-                let mut markers = terminal.request.transaction.events.iter().filter(|event| event.event.kind == "agentic.batch_member.index");
-                let marker = markers.next().ok_or("original Host checked member identity unavailable")?;
-                if markers.next().is_some() || marker.event.payload["member_identity"].as_str() != Some(original.prepared().identity.as_str()) {
-                    return Err("original Host checked member identity differs".into());
+                if !terminal.matches_prepared(&original.prepared().identity, &self.original_request) {
+                    return Err("original Host terminal member differs".into());
                 }
                 continue;
             };
@@ -261,6 +287,8 @@ impl OriginalBatchMemberCoordinate {
 pub struct OriginalBatchMemberStop {
     coordinate: OriginalBatchMemberCoordinate,
     reason: OriginalBatchMemberStopReason,
+    resolution: std::sync::OnceLock<OriginalBatchMemberStopReason>,
+    recovered_effect_fence: std::sync::OnceLock<std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>>,
     recorded: std::sync::atomic::AtomicBool,
     reservation: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>>,
     effect_fence: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>>,
@@ -271,30 +299,66 @@ impl OriginalBatchMemberStop {
     }
     pub(crate) fn publish_with_reservation(coordinate: OriginalBatchMemberCoordinate, reason: OriginalBatchMemberStopReason,
         reservation: std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>) -> OriginalStopPublication {
+        if let Ok(Some(fence)) = reservation.recover_effect_fence() {
+            return Self::publish_with_owners(coordinate, reason, reservation, fence);
+        }
         Self::publish_owned(coordinate, reason, Some(reservation), None)
     }
     pub(crate) fn publish_with_owners(coordinate: OriginalBatchMemberCoordinate, reason: OriginalBatchMemberStopReason,
         reservation: std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>,
         effect_fence: std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>) -> OriginalStopPublication {
+        let reason = match reason {
+            OriginalBatchMemberStopReason::BeforeOutcomeUnknown(_)
+            | OriginalBatchMemberStopReason::BeforeOutcomeError(_)
+            | OriginalBatchMemberStopReason::BeforeOutcomeStoreError(_) => {
+                match effect_fence.settle_stop(&reservation) {
+                    Ok(Some(crate::runtime_event_store::OriginalStoppedMember::Noncommit(terminal))) =>
+                        OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal),
+                    Ok(Some(crate::runtime_event_store::OriginalStoppedMember::Winner(handle))) =>
+                        OriginalBatchMemberStopReason::CommittedUnbound(OriginalMemberUnboundCommit {
+                            handle, reason: "original winner awaits owner reconciliation".into(),
+                        }),
+                    Ok(None) | Err(_) => reason,
+                }
+            }
+            _ => reason,
+        };
         Self::publish_owned(coordinate, reason, Some(reservation), Some(effect_fence))
     }
     fn publish_owned(coordinate: OriginalBatchMemberCoordinate, reason: OriginalBatchMemberStopReason,
         reservation: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>>,
         effect_fence: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>>) -> OriginalStopPublication {
         let sink = coordinate.sink.upgrade();
-        let stop = std::sync::Arc::new(Self { coordinate, reason, recorded: std::sync::atomic::AtomicBool::new(false), reservation, effect_fence });
+        let stop = std::sync::Arc::new(Self { coordinate, reason, resolution: std::sync::OnceLock::new(), recovered_effect_fence: std::sync::OnceLock::new(), recorded: std::sync::atomic::AtomicBool::new(false), reservation, effect_fence });
         match sink {
             Some(sink) => sink.record(stop),
             None => OriginalStopPublication::Unknown { current: stop, previous: None, failure: OriginalStopRecordFailure::SinkUnavailable },
         }
     }
     pub fn coordinate(&self) -> &OriginalBatchMemberCoordinate { &self.coordinate }
-    pub fn reason(&self) -> &OriginalBatchMemberStopReason { &self.reason }
+    pub fn reason(&self) -> &OriginalBatchMemberStopReason { self.resolution.get().unwrap_or(&self.reason) }
+    pub(crate) fn reconcile_original(&self) {
+        if self.resolution.get().is_some() || !matches!(&self.reason,
+            OriginalBatchMemberStopReason::BeforeOutcomeUnknown(_) | OriginalBatchMemberStopReason::BeforeOutcomeError(_)
+            | OriginalBatchMemberStopReason::BeforeOutcomeStoreError(_)) { return; }
+        let Some(reservation) = &self.reservation else { return; };
+        if self.original_effect_fence().is_none() {
+            if let Ok(Some(fence)) = reservation.recover_effect_fence() { let _ = self.recovered_effect_fence.set(fence); }
+        }
+        let Some(fence) = self.original_effect_fence() else { return; };
+        let reason = match fence.settle_stop(reservation) {
+            Ok(Some(crate::runtime_event_store::OriginalStoppedMember::Noncommit(terminal))) => OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal),
+            Ok(Some(crate::runtime_event_store::OriginalStoppedMember::Winner(handle))) => OriginalBatchMemberStopReason::CommittedUnbound(
+                OriginalMemberUnboundCommit { handle, reason: "original winner awaits owner reconciliation".into() }),
+            Ok(None) | Err(_) => return,
+        };
+        let _ = self.resolution.set(reason);
+    }
     pub fn recorded_in_original_sink(&self) -> bool { self.recorded.load(std::sync::atomic::Ordering::Acquire) }
     pub fn has_original_reservation(&self) -> bool { self.reservation.is_some() }
-    pub fn has_original_effect_fence(&self) -> bool { self.effect_fence.is_some() }
+    pub fn has_original_effect_fence(&self) -> bool { self.original_effect_fence().is_some() }
     pub(crate) fn original_reservation(&self) -> Option<&std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>> { self.reservation.as_ref() }
-    pub(crate) fn original_effect_fence(&self) -> Option<&std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>> { self.effect_fence.as_ref() }
+    pub(crate) fn original_effect_fence(&self) -> Option<&std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>> { self.effect_fence.as_ref().or_else(|| self.recovered_effect_fence.get()) }
     /// Checks the original sink identity only; publication may have failed.
     pub fn belongs_to_original_sink(&self, sink: &ToolProgressSink) -> bool {
         let original: std::sync::Arc<dyn OriginalStopSink> = sink.member_stop.clone();
@@ -303,6 +367,7 @@ impl OriginalBatchMemberStop {
 }
 /// Publication failure never discards the new stop. A conflicting or
 /// poisoned slot also returns its existing stop to the original caller.
+#[derive(Clone)]
 pub enum OriginalStopPublication {
     Recorded(std::sync::Arc<OriginalBatchMemberStop>),
     Unknown {
@@ -917,8 +982,13 @@ impl ToolProgressSink {
     }
     /// In-process transport only: values were minted by the original owner.
     /// This slot is not a durable receipt, admission, or proof of delivery.
+    /// Exactly one owner outcome is kept per member index: a later observation
+    /// of an already recorded index is a duplicate and is not appended, so the
+    /// one-outcome-per-index invariant stays intact for the Host and Process
+    /// validators.
     pub fn record_original_member(&self, index: usize, result: std::sync::Arc<OriginalMemberSubmitOutcome>) {
         let mut values = self.member_results.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if values.iter().any(|(recorded, _)| *recorded == index) { return; }
         values.push((index, result));
     }
     pub(crate) fn checked_original_members(&self) -> Result<Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)>, String> {
@@ -937,7 +1007,20 @@ impl ToolProgressSink {
     /// Same-call transport for direct owner publications; it grants nothing.
     pub fn record_original_stop_publication(&self, publication: std::sync::Arc<OriginalStopPublication>) {
         let mut values = self.stop_publications.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !values.iter().any(|old| std::sync::Arc::ptr_eq(old, &publication)) { values.push(publication); }
+        if !values.iter().any(|old| std::sync::Arc::ptr_eq(old, &publication)
+            || matches!((old.as_ref(), publication.as_ref()), (OriginalStopPublication::Recorded(a), OriginalStopPublication::Recorded(b))
+                if std::sync::Arc::ptr_eq(a, b))) { values.push(publication); }
+    }
+    /// Re-enter only this call's already recorded stop before replaying its prefix.
+    /// No coordinates or decoded request can create a settlement owner here.
+    pub fn reconcile_original_member_stop(&self) {
+        let Ok(publications) = self.checked_original_stop_publications() else { return; };
+        let [publication] = publications.as_slice() else { return; };
+        let OriginalStopPublication::Recorded(stop) = publication.as_ref() else { return; };
+        let OriginalStopRead::Available(Some(current)) = self.original_member_stop() else { return; };
+        if std::sync::Arc::ptr_eq(stop, &current) && stop.recorded_in_original_sink() && stop.belongs_to_original_sink(self) {
+            stop.reconcile_original();
+        }
     }
     pub fn original_stop_publications(&self) -> Vec<std::sync::Arc<OriginalStopPublication>> {
         self.stop_publications.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()

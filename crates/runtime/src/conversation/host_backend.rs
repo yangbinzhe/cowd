@@ -11329,7 +11329,11 @@ where
                 let Some(original) = original else { continue; };
                 let request = original.original_request();
                 let pending_fact = pending_member_facts.get(&request.idempotency_key).map(|(_, fact)| fact);
-                let terminal_publication = if pending_fact.is_some_and(|fact| fact["state"] == "confirmed_noncommit") {
+                let terminal_publication = if pending_fact.is_some_and(|fact| matches!(fact["state"].as_str(),
+                    Some("confirmed_noncommit" | "before_outcome_unknown" | "before_outcome_error" | "before_outcome_store_unknown"))) {
+                    // The node fact stays unchanged. Only this original stop may
+                    // supply later terminal evidence to the existing receipt/close validators.
+                    request.tool_progress.reconcile_original_member_stop();
                     match request.tool_progress.checked_original_stop_publications() {
                         Ok(publications) if publications.len() == 1 => {
                             let publication = &publications[0];
@@ -11337,8 +11341,15 @@ where
                                 (crate::tool_host::OriginalStopPublication::Recorded(stop),
                                     crate::tool_host::OriginalStopRead::Available(Some(current)))
                                     if Arc::ptr_eq(stop, &current)
+                                        && stop.recorded_in_original_sink()
                                         && stop.belongs_to_original_sink(&request.tool_progress)
-                                        && matches!(stop.reason(), crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)) =>
+                                        && stop.coordinate().ticket() == ticket
+                                        && stop.coordinate().outer_key() == request.idempotency_key
+                                        && stop.coordinate().call_id() == request.tool_use_id
+                                        && stop.coordinate().step() == request.step_binding.as_ref()
+                                        && pending_fact.and_then(|fact| fact["index"].as_u64()) == u64::try_from(stop.coordinate().index()).ok()
+                                        && matches!(stop.reason(), crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal)
+                                            if terminal.matches_request(request)) =>
                                     Some(Arc::clone(publication)),
                                 _ => None,
                             }
@@ -11420,9 +11431,9 @@ where
                     Ok(Some(owner)) if owner.original_request().tool_use_id == call_id
                         && owner.original_request().tool_progress.same_original_channels(&request.tool_progress) => {
                             match original.verified_host_settlements(ticket, services.event_store(), facts, pending_fact) {
-                                Ok(units) if terminal_publication.is_some() && units.is_empty() => {
-                                    settlement_error.get_or_insert("original terminal member settlement unit unavailable".to_string());
-                                },
+                                // A preparation-only terminal may have no unit. The release
+                                // owner verifies the real closed observation's exact member
+                                // set together with the sealed terminal and node receipts.
                                 Ok(units) => candidates.push((call_id, Some(owner), units, Arc::clone(&original), facts.to_vec(), pending_fact.cloned(), terminal_publication.clone())),
                                 Err(reason) => { settlement_error.get_or_insert(reason); }
                             }

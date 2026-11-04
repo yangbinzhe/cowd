@@ -998,7 +998,7 @@ pub(crate) fn verify_nested_read(
     let payload = &event.payload;
     let material = nested_parent_material(payload)?;
     let seal = &material.acquisition;
-    if seal.tool_name != "tool_orchestrate" || seal.session_id != session || seal.step.turn_id != turn
+    if !matches!(seal.tool_name.as_str(), "tool_orchestrate" | "grep_search") || seal.session_id != session || seal.step.turn_id != turn
         || event.stream_id != format!("session:{session}") { return Ok(None); }
     let ReadDeliveryTransport::NativeProviderContinuation { raw_ref, .. } = &material.transport else { return Ok(None); };
     let owner_event = match (&material.recipient, packet) {
@@ -1016,10 +1016,10 @@ pub(crate) fn verify_nested_read(
                 || seal.node_id != packet.node_id() || seal.attempt != packet.attempt
                 || seal.step.run_ref.as_deref() != Some(packet.run_id())
                 || seal.step.actor_ref.as_deref() != Some(packet.agent_id())
-                || !packet.allowed_tools.contains(&"tool_orchestrate".to_string())
-                || !packet.allowed_tools.contains(&"read_file".to_string())
-                || !packet.binding.as_ref().is_some_and(|b| b.tool_contract_refs.contains(&"tool_orchestrate".to_string())
-                    && b.tool_contract_refs.contains(&"read_file".to_string())) { return Ok(None); }
+                || !packet.allowed_tools.contains(&seal.tool_name)
+                || !packet.allowed_tools.iter().any(|t| Some(t.as_str()) == payload["child"]["tool_name"].as_str())
+                || !packet.binding.as_ref().is_some_and(|b| b.tool_contract_refs.contains(&seal.tool_name)
+                    && b.tool_contract_refs.iter().any(|t| Some(t.as_str()) == payload["child"]["tool_name"].as_str())) { return Ok(None); }
             None
         }
         _ => return Ok(None),
@@ -1076,10 +1076,12 @@ pub(crate) fn verify_nested_read(
     let children = primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].as_array().ok_or("nested children absent")?;
     if children.iter().filter(|candidate| *candidate == child).count() != 1 || child["schema_version"] != 1
         || child["parent_tool_use_id"] != seal.invocation_id || child["parent_idempotency_key"] != key
-        || child["parent_descriptor_hash"] != descriptor.descriptor_hash || child["tool_name"] != "read_file" { return Err("nested child is foreign".into()); }
+        || child["parent_descriptor_hash"] != descriptor.descriptor_hash
+        || !matches!(child["tool_name"].as_str(), Some("read_file" | "grep_search")) { return Err("nested child is foreign".into()); }
     let step_index = child["step_index"].as_u64().ok_or("nested step missing")?;
     let position = child["position"].as_u64().ok_or("nested position missing")?;
-    if children.iter().filter(|other| other["step_index"] == step_index && other["position"] == position).count() != 1 { return Err("ambiguous nested position".into()); }
+    if children.iter().filter(|other| other["step_index"] == step_index && other["position"] == position
+        && other["batch_index"] == child["batch_index"] && other["window_index"] == child["window_index"]).count() != 1 { return Err("ambiguous nested position".into()); }
     let original_input = primary.payload["original_input"].as_str().ok_or("nested original input absent")?;
     let source_input = payload["source_input"].as_str().ok_or("nested source input absent")?;
     if crate::context_evidence::read_sha256(original_input.as_bytes()) != seal.input_sha256
@@ -1095,6 +1097,15 @@ pub(crate) fn verify_nested_read(
         || primary.payload["replay"]["invocation"]["origin"] != seal.origin
         || primary.payload["replay"]["invocation"]["invocation_id"] != seal.invocation_id
     { return Err("nested original compiled input mismatch".into()); }
+    let target = if child["tool_name"] == "grep_search" {
+        if child["parent_tool_name"] != seal.tool_name || !crate::context_evidence::grep_original_input_matches(&parent_input, child) {
+            return Err("grep original input mismatch".into());
+        }
+        let effect: harness_contract::tool::ToolEffectDescriptor = serde_json::from_value(child["effect"].clone()).map_err(|e| e.to_string())?;
+        if !effect.scopes.iter().all(|s| descriptor.scopes.contains(s)) { return Err("grep original scope mismatch".into()); }
+        let scope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).map_err(|e| e.to_string())?;
+        crate::context_evidence::grep_read_target(&scope, child).ok_or("grep original target unknown")?
+    } else {
     let step = parent_input["steps"].as_array().and_then(|steps| steps.get(step_index as usize)).ok_or("nested step absent")?;
     let call = step["calls"].as_array().and_then(|calls| calls.get(position as usize)).ok_or("nested call absent")?;
     if step["id"] != child["step_id"] || step["op"] != "batch" || call["tool"] != "read_file" || call["input"] != child["input"]
@@ -1111,6 +1122,8 @@ pub(crate) fn verify_nested_read(
         || target.declared_scope.resource != harness_contract::policy::PermissionResource::File
         || target.declared_scope.operation != harness_contract::policy::PermissionOperation::Read
         || target.path.object_kind != harness_contract::context::WorkspaceObjectKind::File { return Err("nested child scope invalid".into()); }
+        target
+    };
     let body: crate::context_evidence::ReadBodySeal = serde_json::from_value(child["body"].clone()).map_err(|e| e.to_string())?;
     let extent: ReadExtent = serde_json::from_value(payload["delivered_extent"].clone()).map_err(|e| e.to_string())?;
     let ReadExtent::FileLines {start_line,line_count,total_lines,ends_with_newline,body_sha256,body_bytes,source_omitted} = &extent else { return Err("nested extent invalid".into()); };

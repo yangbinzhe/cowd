@@ -610,6 +610,7 @@ impl GatewayToolExecutor {
             .to_string();
         // Reuse an existing same-call terminal before considering any prefix
         // for replay. Runtime still authenticates and closes the boundary.
+        original.tool_progress.reconcile_original_member_stop();
         let publications = original.tool_progress.original_stop_publications();
         if let [publication] = publications.as_slice() {
             if let runtime::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() {
@@ -637,11 +638,9 @@ impl GatewayToolExecutor {
                     ToolError::unknown("batch original member policy owner missing")
                 })?;
                 match owner.prepare_member_pregrant(original, index).await {
-                runtime::tool_host::AgentBatchMemberPregrant::Replay(member) => {
+                runtime::tool_host::AgentBatchMemberPregrant::Replay(_) => {
                     entry.get("tool").and_then(serde_json::Value::as_str)
                         .ok_or_else(|| ToolError::unknown("replayed original member tool unavailable"))?;
-                    original.tool_progress.record_original_member(index, std::sync::Arc::new(
-                        runtime::tool_host::OriginalMemberSubmitOutcome::Committed(member)));
                     Err(ToolError::unknown("original member committed; Host delivery incomplete"))
                 }
                 runtime::tool_host::AgentBatchMemberPregrant::Terminal(publication) => {

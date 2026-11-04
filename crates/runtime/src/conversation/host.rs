@@ -6598,10 +6598,21 @@ impl OriginalBatchPolicyOwner {
     ) -> Result<Option<RetainedOriginalHostMember>, crate::tool_host::BatchMemberUnknownReason> {
         use crate::tool_host::BatchMemberUnknownReason;
         let unavailable = || BatchMemberUnknownReason::OriginalTransactionFactsUnavailable;
+        if let Ok(publications) = original.tool_progress.checked_original_stop_publications() {
+            if let [publication] = publications.as_slice() {
+                if let crate::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() {
+                    if stop.belongs_to_original_sink(&original.tool_progress) && stop.coordinate().ticket() == &self.ticket
+                        && stop.coordinate().index() == index { stop.reconcile_original(); }
+                }
+            }
+        }
         let stream = format!("execution-effect:{}", original.idempotency_key);
         let key = format!("agentic-member:{index}");
         let Some(marker) = self.event_store.event_by_idempotency_key(&stream, &key)
-            .map_err(|_| unavailable())? else { return Ok(None); };
+            .map_err(|_| unavailable())? else {
+                if original.tool_progress.has_original_member_stop() { return Err(unavailable()); }
+                return Ok(None);
+            };
         if marker.kind == "execution.effect.member_noncommit" {
             let publications = original.tool_progress.checked_original_stop_publications()
                 .map_err(|_| unavailable())?;
@@ -6627,26 +6638,12 @@ impl OriginalBatchPolicyOwner {
             let fence = stop.original_effect_fence().ok_or_else(unavailable)?;
             let retained = self.event_store.original_member_noncommit(reservation, fence)
                 .map_err(|_| unavailable())?.ok_or_else(unavailable)?;
-            if !Arc::ptr_eq(&terminal.request, &retained.request)
-                || !Arc::ptr_eq(&terminal.transaction, &retained.transaction)
-                || terminal.receipt != retained.receipt {
+            if !terminal.same_original(&retained) || !terminal.matches_request(original) {
                 return Err(unavailable());
             }
             let member_index = u64::try_from(index).map_err(|_| unavailable())?;
             self.event_store.validate_original_member_noncommit(terminal, &self.ticket, &original.idempotency_key, member_index)
                 .map_err(|_| unavailable())?;
-            let member_guard = self.event_store.retained_original_noncommit_binding(terminal)
-                .map_err(|_| unavailable())?;
-            let host = member_guard.host().ok_or_else(unavailable)?;
-            let source = host.original_request();
-            let source_hook = source.tool_progress.original_governed_hook().map_err(|_| unavailable())?.ok_or_else(unavailable)?;
-            let request_hook = original.tool_progress.original_governed_hook().map_err(|_| unavailable())?.ok_or_else(unavailable)?;
-            if !Arc::ptr_eq(host.owner(), &self.owner) || !Arc::ptr_eq(host.store(), &self.event_store)
-                || !Arc::ptr_eq(&source_hook, &request_hook) || host.ticket() != &self.ticket
-                || host.prepared().index != index || host.prepared().outer_key != original.idempotency_key
-                || source != original || !source.tool_progress.same_original_channels(&original.tool_progress) {
-                return Err(unavailable());
-            }
             let transaction = &terminal.transaction;
             let receipt = &terminal.receipt;
             let [event] = transaction.events.as_slice() else { return Err(unavailable()); };
@@ -6884,6 +6881,7 @@ impl OriginalBatchPolicyOwner {
         // exclusive rights before the first hook or approval can run.
         let effect_fence = self.event_store.acquire_original_member_preparation_fence(
             &reservation, original, &self.ticket, index, fresh_effect,
+            self.owner.original_member_claim().map_err(before_fence)?,
         ).map_err(|error| {
             OriginalHostPreparationFailure {
                 reason: OriginalHostPreparationFailureReason::OriginalOwnerStore(Arc::new(error)), effect_fence: None,
@@ -7170,6 +7168,12 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
             Err(reason) => {
                 if let Ok(witness) = self.prepare_member_replay_witness_from_outer(original, index, &outer) {
                     return AgentBatchMemberPregrant::Replay(crate::tool_host::AuthenticatedBatchMember::from_original_witness(witness));
+                }
+                if let Ok(publications) = original.tool_progress.checked_original_stop_publications() {
+                    if let [publication] = publications.as_slice() {
+                        return AgentBatchMemberPregrant::Unknown { failure: BatchMemberUnknown { index, reason },
+                            stop: Some(publication.as_ref().clone()) };
+                    }
                 }
                 let stop = crate::tool_host::OriginalBatchMemberStop::publish(coordinate,
                     crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeUnknown("original retained member is unresolved".into()));
