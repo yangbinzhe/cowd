@@ -5,6 +5,7 @@ use harness_contract::context::ArtifactRef;
 const CONTENT_SCHEMA: u32 = 2;
 const INLINE_BYTES: usize = 16 * 1024;
 
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContentEnvelope {
@@ -1233,18 +1234,45 @@ impl RuntimeEventStore {
     ) -> Result<serde_json::Value, String> {
         observation_classifier(value)
     }
-    pub(crate) fn resolve_read_record(
-        &self,
-        mut record: DurableRuntimeEvent,
-    ) -> Result<DurableRuntimeEvent, String> {
-        let body_bytes = if record.scope == RuntimeEventScope::ExecutionGraph {
+    /// The largest content body a reader inlines. Content above it is addressed
+    /// by a durable reference, so a reader returns the reference form instead
+    /// of failing the read.
+    pub(crate) const MAX_HYDRATED_CONTENT_BYTES: u64 = 1024 * 1024;
+
+    /// The content size a record declares, when it carries content at all.
+    pub(crate) fn declared_content_bytes(record: &DurableRuntimeEvent) -> Option<u64> {
+        if record.scope == RuntimeEventScope::ExecutionGraph {
             record.payload["bytes"].as_u64()
         } else if record.kind == "goal.observation" {
             record.payload["observation_body"]["bytes"].as_u64()
         } else {
             None
-        };
-        if body_bytes.is_some_and(|bytes| bytes > 1024 * 1024) {
+        }
+    }
+
+    /// Resolve one record for a reader that has a byte budget. A record whose
+    /// content is larger than the budget stays in its reference form
+    /// (metadata + sha256 + bytes + media_type + visibility_scope) instead of
+    /// failing the whole read: one large record must not poison a page. The
+    /// content is already addressed by a durable artifact, so the reference
+    /// stays authenticatable and the body can be fetched on demand.
+    pub fn resolve_read_record_within(
+        &self,
+        record: DurableRuntimeEvent,
+        max_body_bytes: u64,
+    ) -> Result<DurableRuntimeEvent, String> {
+        if Self::declared_content_bytes(&record).is_some_and(|bytes| bytes > max_body_bytes) {
+            return Ok(record);
+        }
+        self.resolve_read_record(record)
+    }
+
+    pub(crate) fn resolve_read_record(
+        &self,
+        mut record: DurableRuntimeEvent,
+    ) -> Result<DurableRuntimeEvent, String> {
+        let body_bytes = Self::declared_content_bytes(&record);
+        if body_bytes.is_some_and(|bytes| bytes > Self::MAX_HYDRATED_CONTENT_BYTES) {
             return Err(
                 RuntimeEventStoreError::HistoryBudgetExceeded(record.event_id.clone()).to_string(),
             );
@@ -2938,5 +2966,62 @@ mod verified_observation_tests {
                 .resolve_content("session:owner", &missing, &origin)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod oversized_content_read_tests {
+    use super::ports::DurableRuntimeEvent;
+    use super::RuntimeEventStore;
+    use crate::RuntimeEventScope;
+
+    fn observation_record(bytes: u64) -> DurableRuntimeEvent {
+        DurableRuntimeEvent {
+            event_id: "event-oversized".to_string(),
+            stream_id: "goal:goal-1".to_string(),
+            sequence: 1,
+            scope: RuntimeEventScope::Session,
+            kind: "goal.observation".to_string(),
+            status: Some("observed".to_string()),
+            actor: None,
+            refs: Vec::new(),
+            payload: serde_json::json!({
+                "observation_schema": 2,
+                "session_id": "session-1",
+                "observation_body": {"content_schema": 2, "sha256": "sha256:0", "bytes": bytes,
+                    "body": {"type": "ArtifactRef", "artifact": {"artifact_ref": "artifact://a",
+                        "media_type": "application/json", "visibility_scope": "session:session-1",
+                        "sha256": "sha256:0", "bytes": bytes, "content_ref": "artifact://a"}}},
+            }),
+            created_at_ms: 0,
+            commit_cursor: 1,
+            transaction_id: "tx-1".to_string(),
+            transaction_index: 0,
+            schema_version: 2,
+            idempotency_key: Some("goal-observation:1".to_string()),
+        }
+    }
+
+    #[test]
+    fn oversized_content_reads_as_a_reference_instead_of_failing_the_page() {
+        let store = RuntimeEventStore::for_test();
+        let record = observation_record(2 * 1024 * 1024);
+        // The strict read still refuses: the internal consumers that need the
+        // body keep exactly the behaviour they had.
+        let strict = store
+            .resolve_read_record(record.clone())
+            .expect_err("the strict read still refuses an oversized body");
+        assert!(strict.contains("HistoryBudgetExceeded"), "unexpected strict error: {strict}");
+        // The budgeted read returns the record in its reference form: one large
+        // record must not fail the whole page.
+        let resolved = store
+            .resolve_read_record_within(
+                record.clone(),
+                RuntimeEventStore::MAX_HYDRATED_CONTENT_BYTES,
+            )
+            .expect("the reference form is returned");
+        assert_eq!(resolved.event_id, record.event_id);
+        assert_eq!(resolved.payload["observation_body"]["bytes"], 2 * 1024 * 1024);
+        assert!(resolved.payload.get("observation").is_none(), "the body is not inlined");
     }
 }

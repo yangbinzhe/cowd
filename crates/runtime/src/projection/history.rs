@@ -819,7 +819,10 @@ impl RequestBudget {
         } else {
             services
                 .event_store()
-                .resolve_read_record(record.clone())
+                .resolve_read_record_within(
+                    record.clone(),
+                    crate::RuntimeEventStore::MAX_HYDRATED_CONTENT_BYTES,
+                )
                 .map_err(error)?
         };
         let actual = serde_json::to_vec(&event)

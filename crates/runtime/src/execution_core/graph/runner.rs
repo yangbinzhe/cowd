@@ -1709,7 +1709,7 @@ impl ExecutionGraphRunner {
                 let observed = tokio::time::timeout(PHYSICAL_CLOSURE_BUDGET, async {
                     loop {
                         let current = self.state_store.load_async(graph_id).await?;
-                        if self
+                        match self
                             .commit_service
                             .binding_physical_sources_with_witness(
                                 &current,
@@ -1719,10 +1719,19 @@ impl ExecutionGraphRunner {
                                     .as_ref()
                                     .and_then(|observation| observation.witness())
                                     .as_ref(),
-                            )?
-                            .is_some()
-                        {
-                            return Ok::<(), ExecutionRunnerError>(());
+                            )? {
+                            super::commit_service::PhysicalClosureProof::Proven(_) => {
+                                return Ok::<(), ExecutionRunnerError>(());
+                            }
+                            super::commit_service::PhysicalClosureProof::Unprovable { ring, reason } => {
+                                // A ring that can never hold must not spend the
+                                // whole physical-closure budget: name it and
+                                // fail closed now.
+                                return Err(ExecutionRunnerError::Driver(format!(
+                                    "physical closure unprovable: {ring}: {reason}"
+                                )));
+                            }
+                            super::commit_service::PhysicalClosureProof::Pending => {}
                         }
                         changes.changed().await.map_err(|_| {
                             ExecutionRunnerError::Driver(

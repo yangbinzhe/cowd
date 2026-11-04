@@ -1367,7 +1367,12 @@ impl RuntimeEventReader {
             }
             // A single record still has to fit. Resolve it once to measure its
             // exact public representation; envelope overhead is only a bound.
-            let event = self.store.resolve_read_record(event)?;
+            // One oversized record must not fail the whole page: a record whose
+            // content is already addressed by a durable reference stays in that
+            // reference form and its body can be fetched on demand.
+            let event = self
+                .store
+                .resolve_read_record_within(event, crate::RuntimeEventStore::MAX_HYDRATED_CONTENT_BYTES)?;
             let bytes = serde_json::to_vec(&event)
                 .map_err(|error| error.to_string())?
                 .len();

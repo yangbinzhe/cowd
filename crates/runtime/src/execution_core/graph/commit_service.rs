@@ -3305,6 +3305,15 @@ fn merge_outcome_source_revisions(
     Ok(())
 }
 
+/// Whether a node's physical closure can be proven. `Pending` means the
+/// durable facts that could still prove it have not landed; `Unprovable` names
+/// a ring that can never hold for this node, so waiting cannot help.
+pub(crate) enum PhysicalClosureProof {
+    Proven(Vec<ExpectedStreamRevision>),
+    Pending,
+    Unprovable { ring: &'static str, reason: String },
+}
+
 impl ExecutionCommitService {
     /// Reload a Root refusal from the original producer handle and committed
     /// sources. This is read-only and does not re-authorize the call.
@@ -12242,13 +12251,17 @@ impl ExecutionCommitService {
                 "NoDispatch callback or original lease closure missing".into(),
             ));
         }
-        self.binding_physical_sources_with_witness(graph, node, binding, witness)?
-            .map(Some)
-            .ok_or_else(|| {
-                ExecutionCommitError::InvalidCommand(
-                    "NoDispatch current physical sources are incomplete".into(),
-                )
-            })
+        match self.binding_physical_sources_with_witness(graph, node, binding, witness)? {
+            PhysicalClosureProof::Proven(sources) => Ok(Some(sources)),
+            PhysicalClosureProof::Pending => Err(ExecutionCommitError::InvalidCommand(
+                "NoDispatch current physical sources are incomplete".into(),
+            )),
+            PhysicalClosureProof::Unprovable { ring, reason } => {
+                Err(ExecutionCommitError::InvalidCommand(format!(
+                    "NoDispatch current physical sources are incomplete: {ring}: {reason}"
+                )))
+            }
+        }
     }
 
     fn canonical_no_dispatch_fact(
@@ -13424,7 +13437,7 @@ impl ExecutionCommitService {
         node: &str,
         binding: &ExecutionNodeBinding,
         witness: Option<&super::executors::agent_tool::NoDispatchWitness>,
-    ) -> Result<Option<Vec<ExpectedStreamRevision>>, ExecutionCommitError> {
+    ) -> Result<PhysicalClosureProof, ExecutionCommitError> {
         let store = ExecutionGraphStateStore::new(self.event_store.clone());
         let (ticket, spec) = store
             .binding_start_ticket(graph, node, binding)
@@ -13452,7 +13465,13 @@ impl ExecutionCommitService {
         let mut sources = Vec::new();
         if let Some(fact) = &fact {
             let Some(current) = self.no_dispatch_physical_sources(fact)? else {
-                return Ok(None);
+                // The fact is built from committed evidence: once it exists its
+                // physical sources either hold or can never hold. Name the ring
+                // instead of spending a budget that cannot change it.
+                return Ok(PhysicalClosureProof::Unprovable {
+                    ring: "no-dispatch physical sources",
+                    reason: self.no_dispatch_unprovable_reason(fact),
+                });
             };
             sources.extend(current.into_iter().map(|(stream_id, expected_revision)| {
                 ExpectedStreamRevision {
@@ -13467,16 +13486,22 @@ impl ExecutionCommitService {
                 crate::agent_runtime::authenticated_run_lifecycle(&self.event_store, &packet)
                     .map_err(ExecutionCommitError::InvalidCommand)?;
             if !lifecycle.closed_for_governed_effects() {
-                return Ok(None);
+                // The agent run's exit is durable and notifies on commit, so
+                // this ring is still pending rather than permanently unprovable.
+                return Ok(PhysicalClosureProof::Pending);
             }
             let Some((_, exit_sources)) =
                 crate::agent_runtime::confirmed_run_exit(&self.event_store, &packet)
                     .map_err(ExecutionCommitError::InvalidCommand)?
             else {
-                return Ok(None);
+                return Ok(PhysicalClosureProof::Pending);
             };
             if lifecycle.sources != exit_sources {
-                return Ok(None);
+                // Two durable facts disagree; no later commit reconciles them.
+                return Ok(PhysicalClosureProof::Unprovable {
+                    ring: "agent run lifecycle",
+                    reason: "lifecycle sources differ from the confirmed run exit".to_string(),
+                });
             }
             sources.extend(exit_sources);
         }
@@ -13493,20 +13518,18 @@ impl ExecutionCommitService {
             eprintln!("r622_toolbatch phase=physical_branch precommitted={} retired={} witness={} canonical_no_dispatch={}", precommitted, retired, witness.is_some(), fact.is_some());
         }
         let leaf = if precommitted {
-            if !self.committed_host_transcript(&ticket)?.messages.is_empty() {
-                #[cfg(test)]
-                if std::env::var_os("COWD_R622_TRACE").is_some() { eprintln!("r622_toolbatch phase=physical_missing reason=precommitted_transcript_nonempty"); }
-                return Ok(None);
-            }
+            let transcript_nonempty = !self.committed_host_transcript(&ticket)?.messages.is_empty();
             let stream_id = format!(
                 "execution-agent-receipts:{}:{}:{}",
                 graph.id, node, binding.attempt
             );
             let expected_revision = self.event_store.stream_revision(&stream_id)?;
-            if expected_revision != 0 {
+            if let Some((ring, reason)) =
+                Self::precommitted_unprovable_reason(transcript_nonempty, expected_revision)
+            {
                 #[cfg(test)]
-                if std::env::var_os("COWD_R622_TRACE").is_some() { eprintln!("r622_toolbatch phase=physical_missing reason=precommitted_receipt_stream_nonempty"); }
-                return Ok(None);
+                if std::env::var_os("COWD_R622_TRACE").is_some() { eprintln!("r622_toolbatch phase=physical_missing reason={reason}"); }
+                return Ok(PhysicalClosureProof::Unprovable { ring, reason });
             }
             vec![ExpectedStreamRevision {
                 stream_id,
@@ -13528,17 +13551,67 @@ impl ExecutionCommitService {
                 fact.as_ref(),
             )?
             else {
-                return Ok(None);
+                return Ok(PhysicalClosureProof::Pending);
             };
             leaf
         };
         sources.extend(leaf);
         for source in &sources {
             if self.event_store.stream_revision(&source.stream_id)? != source.expected_revision {
-                return Ok(None);
+                // A source moved under the proof: read it again.
+                return Ok(PhysicalClosureProof::Pending);
             }
         }
-        Ok(Some(sources))
+        Ok(PhysicalClosureProof::Proven(sources))
+    }
+
+    /// Name why a no-dispatch fact can never prove its physical sources.
+    fn no_dispatch_unprovable_reason(
+        &self,
+        fact: &super::executors::agent_tool::NoDispatchFact,
+    ) -> String {
+        let mut heads = Vec::new();
+        for call in &fact.calls {
+            if let Some(key) = &call.effect_key {
+                let stream = format!("execution-effect:{key}");
+                let head = self.event_store.stream_revision(&stream).unwrap_or(0);
+                heads.push((stream, head));
+            }
+        }
+        Self::no_dispatch_effect_stream_reason(&heads)
+    }
+
+    /// A no-dispatch fact may only describe calls whose effect stream is
+    /// empty: a non-empty stream means the effect did happen, so this fact can
+    /// never prove it away.
+    fn no_dispatch_effect_stream_reason(heads: &[(String, u64)]) -> String {
+        for (stream, head) in heads {
+            if *head != 0 {
+                return format!("effect stream {stream} is not empty (head {head})");
+            }
+        }
+        "refusal or assessment evidence does not match the fact".to_string()
+    }
+
+    /// Why a precommitted terminal can never close: the node's committed result
+    /// says the effects were precommitted while a durable fact says otherwise.
+    fn precommitted_unprovable_reason(
+        transcript_nonempty: bool,
+        receipt_stream_head: u64,
+    ) -> Option<(&'static str, String)> {
+        if transcript_nonempty {
+            return Some((
+                "precommitted terminal",
+                "host transcript is not empty for a precommitted terminal".to_string(),
+            ));
+        }
+        if receipt_stream_head != 0 {
+            return Some((
+                "precommitted terminal",
+                "agent receipt stream is not empty for a precommitted terminal".to_string(),
+            ));
+        }
+        None
     }
 
     pub(super) async fn authenticated_lease_recovery(
@@ -13784,17 +13857,23 @@ impl ExecutionCommitService {
         let mut closure = released.closure().clone();
         let mut release_sources = released.sources().to_vec();
         if closure.source == "normal_release" {
-            release_sources.extend(
-                self.binding_physical_sources_with_witness(
-                    graph,
-                    &closure.node_id,
-                    &closure.binding,
-                    witness,
-                )?
-                .ok_or_else(|| {
-                    invalid("normal binding physical closure is not positively proven")
-                })?,
-            );
+            let physical_sources = match self.binding_physical_sources_with_witness(
+                graph,
+                &closure.node_id,
+                &closure.binding,
+                witness,
+            )? {
+                PhysicalClosureProof::Proven(sources) => sources,
+                PhysicalClosureProof::Pending => {
+                    return Err(invalid("normal binding physical closure is not positively proven"));
+                }
+                PhysicalClosureProof::Unprovable { ring, reason } => {
+                    return Err(invalid(&format!(
+                        "normal binding physical closure is not positively proven: {ring}: {reason}"
+                    )));
+                }
+            };
+            release_sources.extend(physical_sources);
         }
         let (ticket, _) = ExecutionGraphStateStore::new(self.event_store.clone())
             .binding_start_ticket(graph, &closure.node_id, &closure.binding)
@@ -15483,5 +15562,39 @@ mod host_process_quiescence_tests {
         closure.backend = "bubblewrap+landlock+seccomp+pid1".into();
         closure.namespace_inode = 7;
         assert!(crate::host_process_closure::validate_host_process_fact(&foreign).is_err());
+    }
+}
+
+#[cfg(test)]
+mod physical_closure_reason_tests {
+    use super::ExecutionCommitService;
+
+    #[test]
+    fn a_non_empty_effect_stream_names_the_no_dispatch_ring() {
+        let reason = ExecutionCommitService::no_dispatch_effect_stream_reason(&[
+            ("execution-effect:key-1".to_string(), 0),
+            ("execution-effect:key-2".to_string(), 3),
+        ]);
+        assert!(reason.contains("execution-effect:key-2"), "unexpected reason: {reason}");
+        assert!(reason.contains("not empty"), "unexpected reason: {reason}");
+        // Every effect stream empty: the fact's own evidence does not match.
+        let reason = ExecutionCommitService::no_dispatch_effect_stream_reason(&[
+            ("execution-effect:key-1".to_string(), 0),
+        ]);
+        assert!(reason.contains("refusal or assessment evidence"), "unexpected reason: {reason}");
+    }
+
+    #[test]
+    fn a_precommitted_terminal_contradiction_is_named_and_permanent() {
+        let (ring, reason) = ExecutionCommitService::precommitted_unprovable_reason(true, 0)
+            .expect("a non-empty transcript contradicts a precommitted terminal");
+        assert_eq!(ring, "precommitted terminal");
+        assert!(reason.contains("host transcript"), "unexpected reason: {reason}");
+        let (ring, reason) = ExecutionCommitService::precommitted_unprovable_reason(false, 2)
+            .expect("a non-empty receipt stream contradicts a precommitted terminal");
+        assert_eq!(ring, "precommitted terminal");
+        assert!(reason.contains("receipt stream"), "unexpected reason: {reason}");
+        // Nothing contradicts it: the node may still close this way.
+        assert!(ExecutionCommitService::precommitted_unprovable_reason(false, 0).is_none());
     }
 }
