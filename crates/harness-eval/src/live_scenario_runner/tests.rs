@@ -4351,6 +4351,82 @@ fn u7_literal_case(fixture: &U7MemoryFixture) -> Value {
 }
 
 #[test]
+fn failed_u7_observation_keeps_the_admitted_turn_without_passing_the_phase() {
+    let source = u7_literal_case(&u7_literal_fixture());
+    let mut trace = source["trace"].as_array().unwrap().clone();
+    trace[1]["response"]["events"][0]["payload"]["output_preview"] = json!(
+        "{\n  \"selected\": [],\n  \"kind\": \"authorized_lexical_catalog\",\n  \"complete\": true\n}"
+    );
+    let spec = LiveScenarioSpec {
+        id: "u7-absence",
+        prompt: "observe absence",
+        acceptance: LiveAcceptance::Contains("absent"),
+        timeout: LiveScenarioTimeout::tool(),
+    };
+    let leaf = failed_scenario_with_session_execution_and_program(
+        spec,
+        started_now(),
+        trace,
+        "s-original".into(),
+        Some("graph-original".into()),
+        Some("turn-original".into()),
+        "receipt_observation_deadline_elapsed".into(),
+        json!({"timeline":{"events":[]}}),
+        None,
+    );
+    assert_eq!(leaf["turn_id"], "turn-original");
+    assert_eq!(
+        u7_empty_retrieval_observation(&leaf, "s-original", "independent-project"),
+        Some(true)
+    );
+    assert_eq!(leaf["status"], "failed");
+    assert!(!u7_phase_delivery_passed(&leaf));
+
+    let mut wrong_turn = leaf.clone();
+    wrong_turn["turn_id"] = json!("foreign-turn");
+    assert_eq!(
+        u7_empty_retrieval_observation(&wrong_turn, "s-original", "independent-project"),
+        Some(false)
+    );
+    wrong_turn["turn_id"] = Value::Null;
+    assert_eq!(
+        u7_empty_retrieval_observation(&wrong_turn, "s-original", "independent-project"),
+        None
+    );
+    let mut no_timeline = leaf;
+    no_timeline["trace"] = json!([]);
+    assert_eq!(
+        u7_empty_retrieval_observation(&no_timeline, "s-original", "independent-project"),
+        None
+    );
+}
+
+// The report must be able to tell "no matching retrieval was observed" from
+// "the receipts could not be read". A null `absence_retrieval_proven` plus an
+// explicit label keeps the two apart; neither may be read as false or true.
+#[test]
+fn u7_absence_report_labels_an_unreadable_receipt_set_as_unevaluable() {
+    let observed = u7_empty_retrieval_observation(
+        &json!({"session_id":"s","execution_id":"g","turn_id":"t","trace":[
+            {"channel":"timeline","response":{"events":[]}}]}),
+        "s",
+        "lookup",
+    );
+    assert_eq!(observed, Some(false), "an empty but readable event set is a real absence");
+    let unreadable = u7_empty_retrieval_observation(
+        &json!({"session_id":"s","execution_id":"g","trace":[]}),
+        "s",
+        "lookup",
+    );
+    assert_eq!(unreadable, None, "a missing turn id is not an observed absence");
+    let report = json!({"absence_retrieval_proven": unreadable,
+        "absence_retrieval_evaluation": match unreadable {
+            None => "unevaluable", Some(true) => "proven", Some(false) => "absent" }});
+    assert_eq!(report["absence_retrieval_proven"], Value::Null);
+    assert_eq!(report["absence_retrieval_evaluation"], "unevaluable");
+}
+
+#[test]
 fn u7_memory_requires_bound_retrieval_and_answer_not_one_context_implementation() {
     let fixture = u7_literal_fixture();
     let answer = "WH-literal-527 OUT-literal-893";
@@ -5197,11 +5273,13 @@ fn deadline_expired_leaf_retains_its_collected_evidence() {
         Vec::new(),
         "session-b".to_string(),
         Some("execution-b".to_string()),
+        Some("turn-b".to_string()),
         "receipt_observation_deadline_elapsed".to_string(),
         diagnostics,
         None,
     );
     assert_eq!(leaf["status"], "failed", "the leaf still fails");
+    assert_eq!(leaf["turn_id"], "turn-b");
     assert_eq!(
         leaf["error"], "receipt_observation_deadline_elapsed",
         "the reason is preserved"

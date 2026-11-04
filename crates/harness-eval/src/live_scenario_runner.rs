@@ -283,6 +283,26 @@ fn u7_memory_receipt_previews<'a>(case: &'a Value, session: &str, lookup: &str) 
         .collect()
 }
 
+fn u7_empty_retrieval_observation(case: &Value, session: &str, lookup: &str) -> Option<bool> {
+    if session.is_empty()
+        || case["session_id"].as_str() != Some(session)
+        || case["execution_id"].as_str().filter(|id| !id.is_empty()).is_none()
+        || case["turn_id"].as_str().filter(|id| !id.is_empty()).is_none()
+        || !case["trace"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["channel"] == "timeline" && row["response"]["events"].is_array()
+            })
+        })
+    {
+        return None;
+    }
+    Some(u7_memory_receipt_previews(case, session, lookup).iter().any(|preview| {
+        preview.starts_with("{\n  \"selected\": []")
+            && preview.contains("\"kind\": \"authorized_lexical_catalog\"")
+            && preview.contains("\"complete\": true")
+    }))
+}
+
 fn u7_memory_checks(
     fixture: &U7MemoryFixture,
     session: &str,
@@ -342,6 +362,7 @@ fn u7_memory_checks(
             && u7_persisted_record(&row["readback"], id, &fixture.content)
     });
     let retrieval = seed_verified
+        && u7_empty_retrieval_observation(case, session, &fixture.lookup).is_some()
         && seed_id.is_some_and(|id| {
             u7_memory_receipt_previews(case, session, &fixture.lookup)
                 .iter()
@@ -353,9 +374,20 @@ fn u7_memory_checks(
                 })
         });
     let terminal = u7_terminal_business(case, session);
+    // Keep the retrieval fact readable in the report too: a case whose receipts
+    // cannot be read is not the same observation as a readable case with no
+    // matching receipt.
+    let retrieval_evaluation = if u7_empty_retrieval_observation(case, session, &fixture.lookup).is_none() {
+        "unevaluable"
+    } else if retrieval {
+        "seed_matched"
+    } else {
+        "no_matching_receipt"
+    };
     json!({"passed": seed_verified && retrieval && correct && terminal,
         "business_passed":seed_verified && retrieval && correct && terminal,
         "authorized_persistent_seed_verified":seed_verified, "bound_memory_retrieval_observed":retrieval,
+        "retrieval_evaluation":retrieval_evaluation,
         "root_success_and_public_ack":terminal,
         "retrieval_evidence_kind":"durable_bound_tool_receipt_preview", "full_result_body_verified":false,
         "persisted_context_memory_selected":selected, "automatic_context_selection_required":false,
@@ -3971,18 +4003,13 @@ impl LiveScenarioRunner {
             let absence = self.run_prepared_scenario(spec, telemetry, None);
             let absence_session = absence["session_id"].as_str().unwrap_or_default();
             let answer = absence["u7_terminal_answer"].as_str().unwrap_or_default();
-            let query_empty = u7_memory_receipt_previews(&absence, absence_session, &old.lookup)
-                .iter()
-                .any(|preview| {
-                    preview.starts_with("{\n  \"selected\": []")
-                        && preview.contains("\"kind\": \"authorized_lexical_catalog\"")
-                        && preview.contains("\"complete\": true")
-                });
+            let query_empty =
+                u7_empty_retrieval_observation(&absence, absence_session, &old.lookup);
             let secrets_absent = !u7_contains_any_secret(answer, &old, &corrected);
             let absence_passed = u7_phase_delivery_passed(&absence)
                 && absence["session_id"] != phases[0]["session_id"]
                 && absence["execution_id"] != phases[0]["execution_id"]
-                && query_empty
+                && query_empty == Some(true)
                 && u7_explicit_absence(answer)
                 && !answer.to_ascii_lowercase().contains("wh-")
                 && !answer.to_ascii_lowercase().contains("out-")
@@ -4002,7 +4029,16 @@ impl LiveScenarioRunner {
                 checks.push(json!({"name":"same_memory_id_correction","passed":true,"phase":"A"}));
                 checks.push(json!({"name":"delete_real_restart_no_resurrection","passed":absence_passed,"phase":"B"}));
             }
-            result["u7_lifecycle"] = json!({"passed":absence_passed,"memory_id":id,"correction_passed":true,"delete_status":204,"deleted_active_projection":deleted_readback,"restarted_active_projection":after_restart,"restart":restart,"absence_retrieval_proven":query_empty,"old_and_new_secrets_absent":secrets_absent,"phase_results":phases,"claim_scope":"correction plus logical deletion/no resurrection in active retrieval; no claim of all auxiliary bytes erased"});
+            // `absence_retrieval_proven` is null when the receipts could not be
+            // read at all, which is not the same claim as false ("readable and
+            // no matching retrieval"). The companion label states which of the
+            // three it is, so a report reader never has to infer it.
+            let absence_retrieval_evaluation = match query_empty {
+                None => "unevaluable",
+                Some(true) => "proven",
+                Some(false) => "absent",
+            };
+            result["u7_lifecycle"] = json!({"passed":absence_passed,"memory_id":id,"correction_passed":true,"delete_status":204,"deleted_active_projection":deleted_readback,"restarted_active_projection":after_restart,"restart":restart,"absence_retrieval_proven":query_empty,"absence_retrieval_evaluation":absence_retrieval_evaluation,"old_and_new_secrets_absent":secrets_absent,"phase_results":phases,"claim_scope":"correction plus logical deletion/no resurrection in active retrieval; no claim of all auxiliary bytes erased"});
             // Same original report, each phase retains its own Session/turn/usage.
             // Aggregate counters only; never merge the two phases' identity proofs.
             let mut metrics = phases[0]["metrics"].clone();
@@ -4387,6 +4423,7 @@ impl LiveScenarioRunner {
                 trace,
                 session_id,
                 execution_id,
+                turn_id,
                 terminal_error,
                 diagnostics,
                 agentic_program,
@@ -8469,6 +8506,7 @@ fn failed_scenario_with_session_and_execution(
         trace,
         session_id,
         execution_id,
+        None,
         error,
         diagnostics,
         None,
@@ -8496,6 +8534,7 @@ fn failed_scenario_with_session_execution_and_program(
     trace: Vec<Value>,
     session_id: String,
     execution_id: Option<String>,
+    turn_id: Option<String>,
     error: String,
     diagnostics: Value,
     agentic_program: Option<runtime::AgenticProgramProjection>,
@@ -8537,6 +8576,7 @@ fn failed_scenario_with_session_execution_and_program(
         "status": "failed",
         "session_id": if session_id.is_empty() { Value::Null } else { Value::String(session_id) },
         "execution_id": execution_id,
+        "turn_id": turn_id,
         "elapsed_ms": started.elapsed().as_millis(),
         "error": error,
         "metrics": metrics,
