@@ -180,6 +180,25 @@ pub enum RuntimeEventStoreError {
     Storage(#[from] storage::StorageError),
 }
 
+impl RuntimeEventStoreError {
+    pub(crate) fn fixed_kind(&self) -> &'static str {
+        match self {
+            Self::HistoryBudgetExceeded(_) => "history_budget_exceeded",
+            Self::UnknownScope(_) => "unknown_scope",
+            Self::Corrupt(_) => "corrupt",
+            Self::TransactionConflict { .. } => "transaction_conflict",
+            Self::StaleRevision { .. } => "stale_revision",
+            Self::CheckedAttemptRolledBack(_) => "checked_attempt_rolled_back",
+            Self::CurrentMemberAuthorityExpired => "current_member_authority_expired",
+            Self::InvalidTransaction(_) => "invalid_transaction",
+            Self::DecisionLeaseAlreadyConsumed { .. } => "decision_lease_already_consumed",
+            Self::Serialization(_) => "serialization",
+            Self::Io(_) => "io",
+            Self::Storage(_) => "storage",
+        }
+    }
+}
+
 pub type RuntimeEventStoreResult<T> = Result<T, RuntimeEventStoreError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -429,6 +448,23 @@ pub struct CheckedSourceEvidence {
 pub struct CheckedAppendReceipt {
     pub commit: AppendTransactionReceipt,
     pub validation: CheckedSourceEvidence,
+}
+
+/// Original member preparation and proposed same-key terminal, supplied by the Runtime owner.
+/// A backend must authenticate every field before it returns a confirmed decision.
+#[doc(hidden)]
+pub struct OriginalMemberDecisionInput {
+    pub preparation: AppendTransactionRequest,
+    pub preparation_receipt: AppendTransactionReceipt,
+    pub terminal_transaction_id: String,
+    pub terminal_event: RuntimeTransactionEventInput,
+}
+
+/// Backend decisions are not public authorization; Runtime must bind the result to its retained owner.
+#[doc(hidden)]
+pub enum OriginalMemberDecision {
+    Committed(CheckedAppendReceipt),
+    ConfirmedNoncommit { receipt: AppendTransactionReceipt, transaction: AppendTransactionRequest },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -820,6 +856,15 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync + std::any::An
         Err(RuntimeEventStoreError::InvalidTransaction(
             "backend has no checked cancellable transaction owner".into(),
         ))
+    }
+    /// Decide the original member under the backend's transaction and source locks.
+    /// Unsupported or unverified outcomes must fail closed; errors never certify noncommit.
+    fn append_original_member_decision(
+        &self, _request: CheckedAppendRequest, _member: OriginalMemberDecisionInput,
+        _validator: &dyn CheckedSourceValidator, _control: &dyn RuntimeTransactionCommitControl,
+        _claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<OriginalMemberDecision> {
+        Err(RuntimeEventStoreError::InvalidTransaction("backend has no original member decision owner".into()))
     }
     /// Authenticate an already committed checked terminal. Absence means only
     /// that no winner was observed, never that an earlier attempt rolled back.

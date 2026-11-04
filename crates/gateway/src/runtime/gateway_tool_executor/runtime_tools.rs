@@ -608,6 +608,26 @@ impl GatewayToolExecutor {
                 ToolError::new("agent_action_batch requires a durable Runtime invocation id")
             })?
             .to_string();
+        // Reuse an existing same-call terminal before considering any prefix
+        // for replay. Runtime still authenticates and closes the boundary.
+        let publications = original.tool_progress.original_stop_publications();
+        if let [publication] = publications.as_slice() {
+            if let runtime::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() {
+                if matches!(stop.reason(), runtime::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)) {
+                    let boundary = runtime::PendingAgentBatch::original_terminal_boundary(
+                        original.tool_progress.clone(), std::sync::Arc::clone(publication), stop.coordinate().index(), actions.len(),
+                    );
+                    return match boundary {
+                        Ok(boundary) => Err(ToolError::original_terminal_batch(boundary)),
+                        Err(_) => Err(ToolError::unknown_with_agent_batch(
+                            "original member terminal boundary unresolved",
+                            runtime::PendingAgentBatch::new(runtime::PendingAgentBatchValue::OriginalStopPublication(
+                                std::sync::Arc::clone(publication))),
+                        )),
+                    };
+                }
+            }
+        }
         let mut results = Vec::with_capacity(actions.len());
         for (index, entry) in actions.iter().enumerate() {
             let member_result: Result<(String, String), ToolError> = async {
@@ -623,6 +643,14 @@ impl GatewayToolExecutor {
                     original.tool_progress.record_original_member(index, std::sync::Arc::new(
                         runtime::tool_host::OriginalMemberSubmitOutcome::Committed(member)));
                     Err(ToolError::unknown("original member committed; Host delivery incomplete"))
+                }
+                runtime::tool_host::AgentBatchMemberPregrant::Terminal(publication) => {
+                    // Preserve the original terminal until the outer/node/physical owners close it.
+                    Err(ToolError::unknown_with_agent_batch(
+                        "original member terminal awaits original closure",
+                        runtime::PendingAgentBatch::new(
+                            runtime::PendingAgentBatchValue::OriginalStopPublication(publication)),
+                    ))
                 }
                 runtime::tool_host::AgentBatchMemberPregrant::Candidate(candidate) => {
                     let mut candidate = Some(candidate);
@@ -679,6 +707,21 @@ impl GatewayToolExecutor {
                         .unwrap_or(serde_json::Value::String(receipt)),
                 })),
                 Err(error) => {
+                    // The original owner carries this terminal separately from
+                    // delivery; never turn another failure into a noncommit.
+                    if let Some(runtime::PendingAgentBatchValue::OriginalStopPublication(publication)) =
+                        error.pending_agent_batch().map(|pending| pending.value())
+                    {
+                        if matches!(publication.as_ref(), runtime::tool_host::OriginalStopPublication::Recorded(stop)
+                            if matches!(stop.reason(), runtime::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)))
+                        {
+                            if let Ok(terminal) = runtime::PendingAgentBatch::original_terminal_boundary(
+                                original.tool_progress.clone(), std::sync::Arc::clone(publication), index, actions.len(),
+                            ) {
+                                return Err(ToolError::original_terminal_batch(terminal));
+                            }
+                        }
+                    }
                     let original_members = original.tool_progress.original_members();
                     if !original_members.is_empty() || original.tool_progress.has_original_member_stop() {
                         let prefix = runtime::PendingAgentBatch::new(

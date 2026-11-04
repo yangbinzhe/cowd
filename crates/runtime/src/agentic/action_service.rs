@@ -846,6 +846,26 @@ pub enum AgentActionServiceError {
     MemberUnknown(String),
 }
 
+impl AgentActionServiceError {
+    pub(crate) fn fixed_kind(&self) -> &'static str {
+        match self {
+            Self::Store(_) => "store",
+            Self::EventStore(_) => "event_store",
+            Self::Serialization(_) => "serialization",
+            Self::Corrupt(_) => "corrupt",
+            Self::MemberCancelled => "member_cancelled",
+            Self::MemberUnknown(_) => "member_unknown",
+        }
+    }
+
+    pub(crate) fn fixed_store_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::Store(error) => Some(error.fixed_kind()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentActionService {
     store: Arc<RuntimeEventStore>,

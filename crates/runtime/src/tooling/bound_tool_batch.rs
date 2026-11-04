@@ -1,5 +1,6 @@
 //! Shared, bound Agent leaf effect and durable receipt execution.
 //! Native and Process callers use this owner; graph/container lifecycles stay in Runner.
+use std::sync::Arc;
 use crate::execution_core::graph::{
     ExecutionCommitService, ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
 };
@@ -2087,6 +2088,7 @@ pub(crate) async fn execute_bound_agent_tool(
         request,
         descriptor,
         None,
+        None,
     )
     .await
 }
@@ -2101,6 +2103,7 @@ pub(crate) fn execute_bound_agent_tool_observed<'a>(
     observation: Option<
         &'a crate::execution_core::graph::executors::agent_tool::NoDispatchObservation,
     >,
+    original_child: Option<(crate::execution_core::NodeExecutionTicket, Arc<crate::execution_core::graph::executors::OriginalAgentChildCall>)>,
 ) -> futures::future::BoxFuture<'a, Result<RuntimeToolExecutionOutcome, ToolError>> {
     // The actual default-stack fault was the nested inline observed/core poll
     // (1157 first SIGSEGV). Construct only captures here; the original body is
@@ -2114,6 +2117,7 @@ pub(crate) fn execute_bound_agent_tool_observed<'a>(
             request,
             descriptor,
             observation,
+            original_child,
         )
         .await;
         if result.is_ok() {
@@ -2136,6 +2140,7 @@ async fn execute_bound_agent_tool_observed_inner(
     observation: Option<
         &crate::execution_core::graph::executors::agent_tool::NoDispatchObservation,
     >,
+    original_child: Option<(crate::execution_core::NodeExecutionTicket, Arc<crate::execution_core::graph::executors::OriginalAgentChildCall>)>,
 ) -> Result<RuntimeToolExecutionOutcome, ToolError> {
     let tool_name = request.tool_name.as_str();
     let sequence = request.observation_wave_sequence;
@@ -2150,8 +2155,8 @@ async fn execute_bound_agent_tool_observed_inner(
                 })?
         {
             if outcome.status == RuntimeToolExecutionStatus::Unknown {
-                return Err(ToolError::unknown(outcome.error.unwrap_or_else(||
-                    "original tool outcome is unknown".into())));
+                return Err(ToolError::unknown_with_optional_agent_batch(outcome.error.unwrap_or_else(||
+                    "original tool outcome is unknown".into()), outcome.pending_agent_batch));
             }
             outcome.tool_use_id.clone_from(&request.tool_use_id);
             outcome.tool_name.clone_from(&request.tool_name);
@@ -2329,8 +2334,27 @@ async fn execute_bound_agent_tool_observed_inner(
     // Neither a fresh Unknown nor a retained Unknown is a settled effect.
     // Return it to the original owner without minting any ordinary receipt.
     if outcome.status == RuntimeToolExecutionStatus::Unknown {
-        return Err(ToolError::unknown(outcome.error.unwrap_or_else(||
-            "original tool outcome is unknown".into())));
+        if let (Some(service), Some((ticket, child)), Some(pending)) =
+            (commit_service, original_child.as_ref(), outcome.pending_agent_batch.as_ref()) {
+            let service = (*service).clone();
+            let ticket = ticket.clone();
+            let child = Arc::clone(child);
+            let parent_stop = child.stop.clone();
+            let request = request.clone();
+            let pending = pending.clone();
+            let authenticated = tokio::task::spawn_blocking(move ||
+                service.original_terminal_batch_message(&ticket, &request, &pending, Some(&child))).await;
+            if let Ok(Ok(Some(message))) = authenticated {
+                if check_tool_stop().is_ok() && parent_stop.as_ref().is_some_and(|stop| stop.check().is_ok()) {
+                    outcome.status = RuntimeToolExecutionStatus::Failed;
+                    outcome.error = Some(message);
+                }
+            }
+        }
+        if outcome.status == RuntimeToolExecutionStatus::Unknown {
+            return Err(ToolError::unknown_with_optional_agent_batch(outcome.error.unwrap_or_else(||
+                "original tool outcome is unknown".into()), outcome.pending_agent_batch));
+        }
     }
     // Delegated ToolHost adapters must return typed observations together
     // with a successful receipt. Some compatibility adapters return only
@@ -2462,9 +2486,11 @@ async fn execute_bound_agent_tool_observed_inner(
                 commit_service.commit_tool_effect(&request, &descriptor, &outcome)
             };
             if let Err(error) = committed {
-                return Err(ToolError::new(format!(
-                    "tool `{tool_name}` completed but durable receipt commit failed: {error}"
-                )));
+                let reason = format!("tool `{tool_name}` completed but durable receipt commit failed: {error}");
+                return Err(match outcome.pending_agent_batch.clone() {
+                    Some(pending) => ToolError::unknown_with_agent_batch(reason, pending),
+                    None => ToolError::new(reason),
+                });
             }
         }
     }

@@ -74,6 +74,12 @@ impl OriginalPhysicalClose {
     pub(crate) fn matches_original_ticket(&self, ticket: &NodeExecutionTicket) -> bool {
         &self.ticket == ticket && self.observation.ticket_matches(ticket)
     }
+    pub(crate) fn observation_weak(&self) -> std::sync::Weak<super::agent_tool::NoDispatchObservation> {
+        Arc::downgrade(&self.observation)
+    }
+    pub(crate) fn matches_observation(&self, observation: &std::sync::Weak<super::agent_tool::NoDispatchObservation>) -> bool {
+        std::sync::Weak::ptr_eq(observation, &Arc::downgrade(&self.observation))
+    }
     pub(crate) fn original_agent_child(&self) -> Option<&OriginalAgentChildCall> {
         self.original_child.as_deref()
     }
@@ -106,6 +112,7 @@ pub(crate) struct OriginalAgentChildCall {
     pub(crate) provider_capture: Option<Arc<crate::conversation::tool_plane::OriginalSingleProducerCapture>>,
     pub(crate) stop: Option<crate::bound_tool_batch::BoundToolStop>,
     pub(crate) process_members: Option<Arc<crate::agent_in_process_worker::ProcessMemberCustody>>,
+    pub(crate) release_proof: Arc<std::sync::Mutex<Option<Arc<crate::tool_host::OriginalEffectReleaseProof>>>>,
     child_payload: String,
 }
 pub(crate) struct PendingAgentChildCall {
@@ -196,7 +203,7 @@ impl ScopedNodeExecutor {
             return Err("invalid original child call".into());
         }
         let key = (graph_id.to_owned(), node_id.to_owned(), 0, String::new());
-        let call = Arc::new(OriginalAgentChildCall { request, parent_ticket, packet, store, provider_capture, stop, process_members, child_payload: payload.to_owned() });
+        let call = Arc::new(OriginalAgentChildCall { request, parent_ticket, packet, store, provider_capture, stop, process_members, release_proof: Default::default(), child_payload: payload.to_owned() });
         let mut physical = self.physical.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if physical.contains_key(&key) || physical.keys().any(|k| k.0 == graph_id && k.1 == node_id && k.2 > 0) {
             return Err("original child call already admitted".into());

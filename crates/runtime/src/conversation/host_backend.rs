@@ -8350,6 +8350,8 @@ fn partial_member_messages(
                         "member encountered an error before a committed result; rollback is unproven",
                     crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeStoreError(_) =>
                         "member storage outcome is unknown; rollback is unproven",
+                    crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_) =>
+                        "member noncommit is authenticated; node and physical closure remain pending",
                     crate::tool_host::OriginalBatchMemberStopReason::UnknownNoReceipt(_) =>
                         "no commit receipt was observed; outcome remains unknown",
                     crate::tool_host::OriginalBatchMemberStopReason::CommittedObservationUnavailable(_) =>
@@ -8357,7 +8359,14 @@ fn partial_member_messages(
                     crate::tool_host::OriginalBatchMemberStopReason::CommittedUnbound(_) =>
                         "candidate original transaction committed; association with this member unverified",
                 };
-                parts.push(format!("member {index}: {status}"));
+                let category = match stop.reason() {
+                    crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeError(error) => {
+                        let store = error.fixed_store_kind().map(|kind| format!("/{kind}")).unwrap_or_default();
+                        format!(" [{}{store}]", error.fixed_kind())
+                    },
+                    _ => String::new(),
+                };
+                parts.push(format!("member {index}: {status}{category}"));
             }
         }
         if parts.is_empty() { continue; }
@@ -11205,11 +11214,11 @@ where
         let commits = services.commit_service().clone();
         // Only the original node owner may enumerate the manifest from the
         // node transaction. An empty manifest makes no claim about rollback.
-        let (unresolved_outers, committed_member_facts) = tokio::task::spawn_blocking(move || -> Result<(std::collections::BTreeSet<String>, std::collections::BTreeMap<String, Vec<serde_json::Value>>), String> {
+        let (pending_member_facts, committed_member_facts) = tokio::task::spawn_blocking(move || -> Result<(std::collections::BTreeMap<String, (String, serde_json::Value)>, std::collections::BTreeMap<String, Vec<serde_json::Value>>), String> {
             let outers = commits.original_batch_outers_after_commit(&original_ticket)
                 .map_err(|error| error.to_string())?;
             let mut seen = std::collections::BTreeSet::new();
-            let mut unresolved_outers = std::collections::BTreeSet::new();
+            let mut pending_member_facts = std::collections::BTreeMap::new();
             let mut committed_member_facts = std::collections::BTreeMap::new();
             for outer in outers {
                 if !seen.insert(outer.clone()) { return Err("duplicate committed batch outer".into()); }
@@ -11217,14 +11226,21 @@ where
                     call.name == "agent_action_batch" && call.binding.as_ref()
                         .is_some_and(|binding| binding.effect_idempotency_key() == outer)
                 });
-                if matching.next().is_none() || matching.next().is_some() {
+                let Some(call) = matching.next() else { return Err("committed batch outer has no original call".into()); };
+                if matching.next().is_some() {
                     return Err("committed batch outer does not match one original call".into());
                 }
                 let members = commits.original_batch_members_after_commit(&original_ticket, &outer)
                     .map_err(|error| error.to_string())?;
                 let pending = commits.original_batch_pending_after_commit(&original_ticket, &outer)
                     .map_err(|error| error.to_string())?;
-                if pending.is_some() { unresolved_outers.insert(outer.clone()); }
+                if let Some(pending) = &pending {
+                    if pending.payload()["call_id"].as_str() != Some(call.id.as_str())
+                        || calls.iter().filter(|candidate| candidate.id == call.id).count() != 1 {
+                        return Err("committed batch pending call differs or is ambiguous".into());
+                    }
+                    pending_member_facts.insert(outer.clone(), (call.id.clone(), pending.payload()["pending"].clone()));
+                }
                 if members.is_empty() && pending.is_none() {
                     return Err("committed batch manifest has neither prefix nor pending fact".into());
                 }
@@ -11232,9 +11248,9 @@ where
                 // the complete Host result or downstream effects were delivered.
                 committed_member_facts.insert(outer, members.iter().map(|member| member.payload().clone()).collect());
             }
-            Ok((unresolved_outers, committed_member_facts))
-        }).await.map_err(|error| NodeExecutorError::Poll { node_id: node_id.clone(), reason: error.to_string() })?
-          .map_err(|reason| NodeExecutorError::Poll { node_id, reason })?;
+            Ok((pending_member_facts, committed_member_facts))
+        }).await.map_err(|error| NodeExecutorError::Uncertain { node_id: node_id.clone(), reason: error.to_string() })?
+          .map_err(|reason| NodeExecutorError::Uncertain { node_id, reason })?;
         let retained_replays = self.state.lock().await.pending_member_batches
             .get(&(ticket.node_id.clone(), ticket.attempt)).cloned().unwrap_or_default();
         let mut settled_packet_scope = Vec::new();
@@ -11294,15 +11310,12 @@ where
             let mut grouped = std::collections::BTreeMap::<String, Vec<crate::PendingAgentBatch>>::new();
             for (call_id, pending) in retained { grouped.entry(call_id).or_default().push(pending); }
             let mut candidates = Vec::new();
+            let replay_close = crate::execution_core::graph::executors::current_original_physical_close(ticket);
             for (call_id, items) in grouped {
                 let mut original: Option<Arc<crate::tool_host::OriginalMemberCallCarrier>> = None;
                 let mut unverified = false;
                 for pending in &items {
-                    if matches!(pending.value(), crate::PendingAgentBatchValue::WithCause { .. }) {
-                        unverified = true;
-                        continue;
-                    }
-                    if let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.value() {
+                    if let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.primary_value() {
                         if carrier.original_request().tool_use_id != call_id {
                             unverified = true;
                         } else if let Some(existing) = &original {
@@ -11313,58 +11326,114 @@ where
                         } else { original = Some(Arc::clone(carrier)); }
                     }
                 }
-                let Some(original) = original else {
-                    continue;
-                };
+                let Some(original) = original else { continue; };
                 let request = original.original_request();
-                for pending in &items {
+                let pending_fact = pending_member_facts.get(&request.idempotency_key).map(|(_, fact)| fact);
+                let terminal_publication = if pending_fact.is_some_and(|fact| fact["state"] == "confirmed_noncommit") {
+                    match request.tool_progress.checked_original_stop_publications() {
+                        Ok(publications) if publications.len() == 1 => {
+                            let publication = &publications[0];
+                            match (publication.as_ref(), request.tool_progress.original_member_stop()) {
+                                (crate::tool_host::OriginalStopPublication::Recorded(stop),
+                                    crate::tool_host::OriginalStopRead::Available(Some(current)))
+                                    if Arc::ptr_eq(stop, &current)
+                                        && stop.belongs_to_original_sink(&request.tool_progress)
+                                        && matches!(stop.reason(), crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)) =>
+                                    Some(Arc::clone(publication)),
+                                _ => None,
+                            }
+                        },
+                        _ => None,
+                    }
+                } else { None };
+                // Only the exact recorded terminal may resolve a WithCause;
+                // preserve all other independent causes as unresolved.
+                fn same_terminal_carrier(
+                    pending: &crate::PendingAgentBatch,
+                    request: &crate::RuntimeToolExecutionRequest,
+                    publication: &Arc<crate::tool_host::OriginalStopPublication>,
+                ) -> bool {
                     match pending.value() {
-                        crate::PendingAgentBatchValue::OriginalCall(_) => {}
-                        crate::PendingAgentBatchValue::RecordedSink(sink) => {
-                            if !request.tool_progress.same_original_channels(sink) {
+                        crate::PendingAgentBatchValue::WithCause { primary, cause } =>
+                            same_terminal_carrier(primary, request, publication) && same_terminal_carrier(cause, request, publication),
+                        crate::PendingAgentBatchValue::OriginalCall(carrier) =>
+                            carrier.original_request() == request
+                                && carrier.original_request().tool_progress.same_original_channels(&request.tool_progress),
+                        crate::PendingAgentBatchValue::RecordedSink(sink) => request.tool_progress.same_original_channels(sink),
+                        crate::PendingAgentBatchValue::Recorded(recorded) => {
+                            let actual = request.tool_progress.original_members();
+                            recorded.len() == actual.len() && recorded.iter().zip(&actual).all(|((i,a),(j,b))|
+                                i == j && Arc::ptr_eq(a,b))
+                        },
+                        crate::PendingAgentBatchValue::OriginalStopPublication(other) => Arc::ptr_eq(other, publication),
+                        crate::PendingAgentBatchValue::OriginalTerminalBoundary(boundary) => {
+                            Arc::ptr_eq(&boundary.publication, publication)
+                                && boundary.sink.same_original_channels(&request.tool_progress)
+                                && boundary.index == publication.current().coordinate().index()
+                                && serde_json::from_str::<serde_json::Value>(&request.input).ok()
+                                    .and_then(|value| value.get("actions").and_then(serde_json::Value::as_array).map(Vec::len))
+                                    == Some(boundary.total)
+                        },
+                        _ => false,
+                    }
+                }
+                for pending in &items {
+                    if let Some(publication) = &terminal_publication {
+                        if !same_terminal_carrier(pending, request, publication) { unverified = true; }
+                        continue;
+                    }
+                    match pending.value() {
+                        crate::PendingAgentBatchValue::OriginalCall(carrier) => {
+                            if carrier.original_request() != request
+                                || !request.tool_progress.same_original_channels(&carrier.original_request().tool_progress) {
                                 unverified = true;
                             }
-                        }
+                        },
+                        crate::PendingAgentBatchValue::RecordedSink(sink) => {
+                            if !request.tool_progress.same_original_channels(sink) { unverified = true; }
+                        },
                         crate::PendingAgentBatchValue::Recorded(recorded) => {
                             let actual = request.tool_progress.original_members();
                             if recorded.len() != actual.len() || recorded.iter().zip(&actual).any(|((i,a),(j,b))|
-                                i != j || !Arc::ptr_eq(a,b)) {
-                                unverified = true;
-                            }
-                        }
-                        _ => {
-                            unverified = true;
-                        }
+                                i != j || !Arc::ptr_eq(a,b)) { unverified = true; }
+                        },
+                        _ => { unverified = true; }
                     }
                 }
-                if unverified || request.tool_progress.has_original_member_stop() {
+                if unverified || (request.tool_progress.has_original_member_stop() && terminal_publication.is_none()) {
                     continue;
                 }
-                match request.tool_progress.original_fresh_effect() {
-                    Ok(Some(_)) if unresolved_outers.contains(&request.idempotency_key) => {
+                let facts = committed_member_facts.get(&request.idempotency_key).map(Vec::as_slice).unwrap_or(&[]);
+                if let Some(close) = &replay_close {
+                    match original.verified_host_release(ticket, close, services.event_store(), facts, pending_fact, terminal_publication.as_ref()) {
+                        Ok(Some(units)) => {
+                            for unit in units { unit.mark_settled(); }
+                            settled_calls.insert(call_id);
+                            continue;
+                        },
+                        Ok(None) => {},
+                        Err(reason) => { settlement_error.get_or_insert(reason); continue; }
                     }
+                }
+                match request.tool_progress.original_fresh_effect() {
+                    Ok(Some(_)) if pending_fact.is_some() && terminal_publication.is_none() => {},
                     Ok(Some(owner)) if owner.original_request().tool_use_id == call_id
-                        && owner.original_request().tool_progress.same_original_channels(&request.tool_progress) =>
-                        {
-                            let facts = committed_member_facts.get(&request.idempotency_key).map(Vec::as_slice).unwrap_or(&[]);
-                            match original.verified_host_settlements(ticket, services.event_store(), facts) {
-                                Ok(units) => candidates.push((call_id, Some(owner), units)),
+                        && owner.original_request().tool_progress.same_original_channels(&request.tool_progress) => {
+                            match original.verified_host_settlements(ticket, services.event_store(), facts, pending_fact) {
+                                Ok(units) if terminal_publication.is_some() && units.is_empty() => {
+                                    settlement_error.get_or_insert("original terminal member settlement unit unavailable".to_string());
+                                },
+                                Ok(units) => candidates.push((call_id, Some(owner), units, Arc::clone(&original), facts.to_vec(), pending_fact.cloned(), terminal_publication.clone())),
                                 Err(reason) => { settlement_error.get_or_insert(reason); }
                             }
                         },
-                    Ok(Some(_)) => {
-                        settlement_error.get_or_insert("original effect owner does not match call sink".to_string());
-                    }
-                    Ok(None) if request.compiled_invocation.as_ref().is_some_and(|invocation|
-                        invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read) =>
-                        {
-                            candidates.push((call_id, None, Vec::new()))
+                    Ok(Some(_)) => { settlement_error.get_or_insert("original effect owner does not match call sink".to_string()); },
+                    Ok(None) if pending_fact.is_none() && request.compiled_invocation.as_ref().is_some_and(|invocation|
+                        invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read) => {
+                            candidates.push((call_id, None, Vec::new(), Arc::clone(&original), facts.to_vec(), None, None))
                         },
-                    Ok(None) => {
-                    } // no proof that an unknown mutation was not retained
-                    Err(reason) => {
-                        settlement_error.get_or_insert(reason);
-                    }
+                    Ok(None) => {},
+                    Err(reason) => { settlement_error.get_or_insert(reason); }
                 }
             }
             if !candidates.is_empty() {
@@ -11374,16 +11443,13 @@ where
                     let (settled, failed) = tokio::task::spawn_blocking(move || {
                         let mut settled = Vec::new();
                         let mut failures = Vec::new();
-                        let mut released = Vec::new();
-                        for (call_id, owner, units) in candidates {
+                        for (call_id, owner, units, carrier, facts, pending, publication) in candidates {
                             if let Some(owner) = owner {
-                                if !released.iter().any(|prior| Arc::ptr_eq(prior, &owner)) {
-                                    if let Err(error) = commits.release_original_first_effect_after_node(&original_ticket, &close, &owner) {
-                                        failures.push(error.to_string());
-                                        continue;
-                                    }
-                                    released.push(owner);
-                                } else {
+                                if let Err(error) = commits.release_original_host_effect_after_node(
+                                    &original_ticket, &close, &owner, &carrier, &facts, pending.as_ref(), publication.as_ref(), &units,
+                                ) {
+                                    failures.push(error.to_string());
+                                    continue;
                                 }
                             }
                             for unit in units { unit.mark_settled(); }
@@ -11435,34 +11501,35 @@ where
                 }
             }
         }
-        // ScopedNodeExecutor calls this original backend only after
-        // close_and_drain succeeds. A pending fact is not proof that its
-        // original owner has resolved or transferred the live carrier.
+        // Keep each original carrier, including its release proof, until the
+        // whole callback can finish; another call or later read may fail.
+        let observation_unresolved = services.tool_batch_executor().binding_observation(ticket)
+            .is_some_and(|observation| observation.member_custody_is_unresolved());
         let mut state = self.state.lock().await;
+        let member_custody_unresolved = state.pending_member_batches.get(&(ticket.node_id.clone(), ticket.attempt))
+            .is_some_and(|entries| entries.iter().any(|(call_id, pending)| {
+                if settled_calls.contains(call_id) { return false; }
+                match pending.primary_value() {
+                    crate::PendingAgentBatchValue::OriginalCall(carrier) => carrier.has_unsettled_host_members()
+                        || pending_member_facts.contains_key(&carrier.original_request().idempotency_key),
+                    _ => false,
+                }
+            }));
+        if let Some(reason) = settlement_error {
+            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason });
+        }
+        let node_pending_unsettled = pending_member_facts.values().any(|(call_id, _)| !settled_calls.contains(call_id));
+        if node_pending_unsettled || member_custody_unresolved || observation_unresolved {
+            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original member custody remains unresolved".into() });
+        }
         state.pending_transcript.remove(&ticket.node_id);
         if let Some(retained) = state.pending_member_batches.get_mut(&(ticket.node_id.clone(), ticket.attempt)) {
-            #[cfg(feature = "test-fixtures")]
-            let before_retain = retained.len();
             retained.retain(|(call_id, pending)| {
                 if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) {
                     !settled_packet_scope.iter().any(|(settled, _)| settled == pending)
                 } else { !settled_calls.contains(call_id) }
             });
             if retained.is_empty() { state.pending_member_batches.remove(&(ticket.node_id.clone(), ticket.attempt)); }
-        } else {
-        }
-        let member_custody_unresolved = state.pending_member_batches.get(&(ticket.node_id.clone(), ticket.attempt))
-            .is_some_and(|entries| entries.iter().any(|(_, pending)| match pending.primary_value() {
-                crate::PendingAgentBatchValue::OriginalCall(carrier) => carrier.has_unsettled_host_members(),
-                _ => false,
-            }));
-        drop(state);
-        if let Some(reason) = settlement_error {
-            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason });
-        }
-        if member_custody_unresolved || services.tool_batch_executor().binding_observation(ticket)
-            .is_some_and(|observation| observation.member_custody_is_unresolved()) {
-            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original member custody remains unresolved".into() });
         }
         Ok(())
     }

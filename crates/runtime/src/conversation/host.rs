@@ -6550,19 +6550,90 @@ impl OriginalMemberReplayWitness {
     pub(crate) fn action_receipt(&self) -> &crate::AppendTransactionReceipt { &self.action_receipt }
 }
 
+enum RetainedOriginalHostMember {
+    Committed(crate::tool_host::AuthenticatedBatchMember),
+    Terminal(Arc<crate::tool_host::OriginalStopPublication>),
+}
+
 impl OriginalBatchPolicyOwner {
     /// Recover only an uncertain in-process checked append retained by the
     /// original action owner. This is not a query for Fresh or a general
     /// durable replay reader; absence or a different owner remains unknown.
     fn read_retained_original_member(
         &self, original: &crate::RuntimeToolExecutionRequest, index: usize,
-    ) -> Result<Option<crate::tool_host::AuthenticatedBatchMember>, crate::tool_host::BatchMemberUnknownReason> {
+    ) -> Result<Option<RetainedOriginalHostMember>, crate::tool_host::BatchMemberUnknownReason> {
         use crate::tool_host::BatchMemberUnknownReason;
         let unavailable = || BatchMemberUnknownReason::OriginalTransactionFactsUnavailable;
         let stream = format!("execution-effect:{}", original.idempotency_key);
         let key = format!("agentic-member:{index}");
         let Some(marker) = self.event_store.event_by_idempotency_key(&stream, &key)
             .map_err(|_| unavailable())? else { return Ok(None); };
+        if marker.kind == "execution.effect.member_noncommit" {
+            let publications = original.tool_progress.checked_original_stop_publications()
+                .map_err(|_| unavailable())?;
+            let [publication] = publications.as_slice() else { return Err(unavailable()); };
+            let crate::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() else {
+                return Err(unavailable());
+            };
+            let crate::tool_host::OriginalStopRead::Available(Some(current)) = original.tool_progress.original_member_stop() else {
+                return Err(unavailable());
+            };
+            let coordinate = stop.coordinate();
+            if !Arc::ptr_eq(stop, &current) || !stop.recorded_in_original_sink()
+                || !stop.belongs_to_original_sink(&original.tool_progress)
+                || coordinate.ticket() != &self.ticket || coordinate.outer_key() != original.idempotency_key
+                || coordinate.call_id() != original.tool_use_id || coordinate.index() != index
+                || coordinate.step() != original.step_binding.as_ref() {
+                return Err(unavailable());
+            }
+            let crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else {
+                return Err(unavailable());
+            };
+            let reservation = stop.original_reservation().ok_or_else(unavailable)?;
+            let fence = stop.original_effect_fence().ok_or_else(unavailable)?;
+            let retained = self.event_store.original_member_noncommit(reservation, fence)
+                .map_err(|_| unavailable())?.ok_or_else(unavailable)?;
+            if !Arc::ptr_eq(&terminal.request, &retained.request)
+                || !Arc::ptr_eq(&terminal.transaction, &retained.transaction)
+                || terminal.receipt != retained.receipt {
+                return Err(unavailable());
+            }
+            let member_index = u64::try_from(index).map_err(|_| unavailable())?;
+            self.event_store.validate_original_member_noncommit(terminal, &self.ticket, &original.idempotency_key, member_index)
+                .map_err(|_| unavailable())?;
+            let member_guard = self.event_store.retained_original_noncommit_binding(terminal)
+                .map_err(|_| unavailable())?;
+            let host = member_guard.host().ok_or_else(unavailable)?;
+            let source = host.original_request();
+            let source_hook = source.tool_progress.original_governed_hook().map_err(|_| unavailable())?.ok_or_else(unavailable)?;
+            let request_hook = original.tool_progress.original_governed_hook().map_err(|_| unavailable())?.ok_or_else(unavailable)?;
+            if !Arc::ptr_eq(host.owner(), &self.owner) || !Arc::ptr_eq(host.store(), &self.event_store)
+                || !Arc::ptr_eq(&source_hook, &request_hook) || host.ticket() != &self.ticket
+                || host.prepared().index != index || host.prepared().outer_key != original.idempotency_key
+                || source != original || !source.tool_progress.same_original_channels(&original.tool_progress) {
+                return Err(unavailable());
+            }
+            let transaction = &terminal.transaction;
+            let receipt = &terminal.receipt;
+            let [event] = transaction.events.as_slice() else { return Err(unavailable()); };
+            let [expected] = transaction.expected_streams.as_slice() else { return Err(unavailable()); };
+            let [revision] = receipt.stream_revisions.as_slice() else { return Err(unavailable()); };
+            if marker.stream_id != stream || marker.scope != event.event.scope
+                || marker.kind != event.event.kind || marker.status != event.event.status
+                || marker.actor != event.event.actor || marker.refs != event.event.refs
+                || marker.payload != event.event.payload || marker.schema_version != event.schema_version
+                || marker.idempotency_key != event.idempotency_key || marker.idempotency_key.as_deref() != Some(key.as_str())
+                || event.event.stream_id != stream || expected.stream_id != stream || revision.stream_id != stream
+                || revision.expected_revision != expected.expected_revision
+                || expected.expected_revision.checked_add(1) != Some(revision.committed_revision)
+                || marker.sequence != revision.committed_revision || marker.transaction_index != 0
+                || marker.transaction_id != transaction.transaction_id || receipt.transaction_id != transaction.transaction_id
+                || marker.commit_cursor == 0 || receipt.commit_cursor != marker.commit_cursor
+                || receipt.event_ids.as_slice() != [marker.event_id.clone()] {
+                return Err(unavailable());
+            }
+            return Ok(Some(RetainedOriginalHostMember::Terminal(Arc::clone(publication))));
+        }
         let handle = self.action_service.recover_retained_original_member(&marker.transaction_id)
             .map_err(|_| unavailable())?.ok_or_else(unavailable)?;
         let authority = handle.authority().ok_or_else(unavailable)?;
@@ -6614,7 +6685,7 @@ impl OriginalBatchPolicyOwner {
         let envelope = serde_json::from_value(action.event.payload.get("envelope").cloned().ok_or_else(unavailable)?)
             .map_err(|_| unavailable())?;
         crate::tool_host::AuthenticatedBatchMember::from_original_committed(handle, &self.event_store, &envelope)
-            .map(Some).map_err(|_| unavailable())
+            .map(|member| Some(RetainedOriginalHostMember::Committed(member))).map_err(|_| unavailable())
     }
 
     // Locate only in the original outer effect stream, never from a model
@@ -7055,8 +7126,11 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
             };
         }
         match self.read_retained_original_member(original, index) {
-            Ok(Some(member)) => {
+            Ok(Some(RetainedOriginalHostMember::Committed(member))) => {
                 return AgentBatchMemberPregrant::Replay(member);
+            },
+            Ok(Some(RetainedOriginalHostMember::Terminal(publication))) => {
+                return AgentBatchMemberPregrant::Terminal(publication);
             },
             Ok(None) => {},
             Err(reason) => {
@@ -7590,9 +7664,19 @@ async fn execute_fenced_runtime_tool_owned(
                 },
             };
             if outcome.status == crate::RuntimeToolExecutionStatus::Unknown {
-                // The physical effect may have committed. Preserve its owner
-                // result and leave the intent unsettled for reconciliation.
-                return outcome;
+                let terminal = match (original_ticket, outcome.pending_agent_batch.as_ref()) {
+                    (Some(ticket), Some(pending)) => commit_service.original_terminal_batch_message(ticket, request, pending, None),
+                    _ => Ok(None),
+                };
+                match terminal {
+                    Ok(Some(message)) => {
+                        // The member decision is known; the outer effect still needs its own receipt.
+                        outcome.status = crate::RuntimeToolExecutionStatus::Failed;
+                        outcome.error = Some(message);
+                    }
+                    // The physical effect may have committed. Preserve the original carrier.
+                    Ok(None) | Err(_) => return outcome,
+                }
             }
             // A process-class effect owns a physical process tree, so its
             // durable receipt must carry the honest quiescence proof. The
@@ -7695,7 +7779,7 @@ async fn execute_fenced_runtime_tool_owned(
                     )),
                     evidence_ref: format!("tool-effect-receipt-failed:{}", request.idempotency_key),
                     observed_evidence: Vec::new(),
-                    pending_agent_batch: outcome.pending_agent_batch.clone(),
+                    pending_agent_batch: outcome.pending_agent_batch.clone().map(crate::PendingAgentBatch::with_unresolved_marker),
                 };
             }
             outcome

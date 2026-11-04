@@ -5382,6 +5382,43 @@ fn round437_original_six_team_batch_crosses_host_to_next_node_on_default_stack()
         &harness_contract::agent_action::program_id_for_objective(&harness_contract::agent_action::root_objective_id(&session_id, &admission.turn_id)),
     ).unwrap();
     assert_eq!(program.teams.len(), 6, "every original action must commit before the next model input");
+    // Check the member indices against the actual action and transaction receipt.
+    use runtime::RuntimeEventStoreBackend as _;
+    let runtime = services.runtime.runtime_services();
+    let program_stream = format!("agentic-program:{}", program.program_id);
+    let events = runtime.event_reader().all_events(100_001).unwrap();
+    assert!(events.len() < 100_001, "original event history was truncated");
+    let mut members: Vec<_> = events.iter().filter(|event| {
+        event.kind == "agentic.batch_member.index"
+            && event.payload["ticket"]["graph_id"] == admission.execution_graph_id
+            && event.payload["program_stream"] == program_stream
+    }).collect();
+    members.sort_by_key(|event| event.payload["member_index"].as_u64());
+    assert_eq!(members.len(), 6, "each original batch member needs one committed index");
+    let outer = members[0].payload["outer_key"].as_str().unwrap();
+    let backend = runtime_postgres::PostgresRuntimeEventStore::new(services.topology.postgres_executor.clone()).unwrap();
+    for (index, member) in members.iter().enumerate() {
+        assert_eq!(member.payload["member_index"].as_u64(), Some(index as u64));
+        assert_eq!(member.payload["outer_key"].as_str(), Some(outer));
+        let position = member.payload["program_event_index"].as_u64().unwrap() as usize;
+        let action = events.iter().find(|event| event.transaction_id == member.transaction_id
+            && event.transaction_index as usize == position).expect("original member action missing");
+        assert_eq!(action.stream_id, program_stream);
+        assert_eq!(action.kind, "agentic.action_applied");
+        assert_eq!(member.payload["program_event_kind"].as_str(), Some(action.kind.as_str()));
+        assert_eq!(member.payload["program_event_key"].as_str(), action.idempotency_key.as_deref());
+        assert_eq!(action.payload["member_admission"]["original_hook"]["outer_request"]["tool_use_id"],
+            "round437-original-batch");
+        assert_eq!(action.payload["member_admission"]["original_hook"]["outer_request"]["idempotency_key"].as_str(), Some(outer));
+        assert_eq!(action.commit_cursor, member.commit_cursor);
+        let receipt = backend.original_transaction_receipt(&member.transaction_id).unwrap()
+            .expect("original member transaction receipt missing");
+        assert_eq!(receipt.commit_cursor, member.commit_cursor);
+        assert_eq!(receipt.event_ids.get(position), Some(&action.event_id));
+        assert_eq!(receipt.event_ids.get(member.transaction_index as usize), Some(&member.event_id));
+    }
+    drop(backend);
+    drop(runtime);
     drop(provider);
     services.runtime.runtime_services().cancel_execution_tree(&admission.execution_graph_id, "round437 local reproduction complete").await.unwrap();
     services.stop().await;

@@ -121,6 +121,22 @@ impl MemberCommitControl {
     pub(crate) fn state(&self) -> MemberCommitState {
         *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    pub(crate) fn original_noncommit_reconciled(&self) -> Result<bool, String> {
+        self.0.lock().map(|state| *state == MemberCommitState::RolledBack)
+            .map_err(|_| "member transaction control unavailable".into())
+    }
+
+    /// Only the original checked owner may call this after authenticating the
+    /// same member's durable noncommit decision and receipt.
+    pub(crate) fn reconcile_original_noncommit(&self) -> Result<(), String> {
+        let mut state = self.0.lock().map_err(|_| "member transaction control unavailable")?;
+        match *state {
+            MemberCommitState::Unknown => { *state = MemberCommitState::RolledBack; Ok(()) }
+            MemberCommitState::RolledBack => Ok(()),
+            _ => Err("member transaction control conflicts with noncommit".into()),
+        }
+    }
 }
 impl crate::RuntimeTransactionCommitControl for MemberCommitControl {
     fn request_cancel(&self) -> bool {
@@ -3929,6 +3945,14 @@ impl OriginalBoundedAcquisitionPending {
     pub(crate) fn receipt(&self) -> Option<&std::sync::Arc<crate::execution_core::graph::CommittedCallRefusal>> { self.receipt.as_ref() }
 }
 
+/// A boundary recorded by the original sequential producer, not a receipt or authorization.
+pub struct OriginalTerminalBatchBoundary {
+    pub(crate) sink: crate::ToolProgressSink,
+    pub(crate) publication: std::sync::Arc<crate::tool_host::OriginalStopPublication>,
+    pub(crate) index: usize,
+    pub(crate) total: usize,
+}
+
 pub enum PendingAgentBatchValue {
     OriginalBoundedAcquisition(std::sync::Arc<OriginalBoundedAcquisitionPending>),
     OriginalPacketScope(std::sync::Arc<OriginalPacketScopePending>),
@@ -3942,6 +3966,10 @@ pub enum PendingAgentBatchValue {
     /// Direct original-owner publication, including current, previous and
     /// failure when the original sink could not record the stop.
     OriginalStopPublication(std::sync::Arc<crate::tool_host::OriginalStopPublication>),
+    /// Original sequential producer's terminal boundary; Runtime must authenticate it.
+    OriginalTerminalBoundary(OriginalTerminalBatchBoundary),
+    /// A separate unresolved phase, never evidence that a member may be settled.
+    UnresolvedContext,
     /// Preserve an independently returned stop beside the same-call prefix.
     WithCause { primary: PendingAgentBatch, cause: PendingAgentBatch },
     Calls(Vec<(String, PendingAgentBatch)>),
@@ -3949,6 +3977,34 @@ pub enum PendingAgentBatchValue {
 
 impl PendingAgentBatch {
     pub fn new(value: PendingAgentBatchValue) -> Self { Self(std::sync::Arc::new(value)) }
+    /// Called at the original sequential loop's terminal return; does not authenticate a receipt.
+    pub fn original_terminal_boundary(
+        sink: crate::ToolProgressSink, publication: std::sync::Arc<crate::tool_host::OriginalStopPublication>,
+        index: usize, total: usize,
+    ) -> Result<Self, String> {
+        if total == 0 || total > 25 || index >= total { return Err("original terminal batch bounds differ".into()); }
+        let crate::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() else {
+            return Err("original terminal publication unresolved".into());
+        };
+        let crate::tool_host::OriginalStopRead::Available(Some(current)) = sink.original_member_stop() else {
+            return Err("original terminal stop unavailable".into());
+        };
+        let publications = sink.checked_original_stop_publications()?;
+        if publications.len() != 1 || !std::sync::Arc::ptr_eq(&publications[0], &publication)
+            || !std::sync::Arc::ptr_eq(stop, &current) || !stop.recorded_in_original_sink()
+            || !stop.belongs_to_original_sink(&sink) || stop.coordinate().index() != index
+            || !matches!(stop.reason(), crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)) {
+            return Err("original terminal publication differs".into());
+        }
+        let members = sink.checked_original_members()?;
+        if members.len() != index || members.iter().enumerate().any(|(expected, (actual, result))|
+            expected != *actual || !matches!(result.as_ref(), crate::tool_host::OriginalMemberSubmitOutcome::Committed(_))) {
+            return Err("original terminal prefix unavailable".into());
+        }
+        Ok(Self::new(PendingAgentBatchValue::OriginalTerminalBoundary(OriginalTerminalBatchBoundary {
+            sink, publication, index, total,
+        })))
+    }
     pub fn value(&self) -> &PendingAgentBatchValue { &self.0 }
     pub fn primary_value(&self) -> &PendingAgentBatchValue {
         match self.value() {
@@ -3956,9 +4012,40 @@ impl PendingAgentBatch {
             value => value,
         }
     }
+    pub(crate) fn original_terminal_boundary_ref(&self) -> Option<&OriginalTerminalBatchBoundary> {
+        match self.value() {
+            PendingAgentBatchValue::OriginalTerminalBoundary(boundary) => Some(boundary),
+            PendingAgentBatchValue::WithCause { primary, cause } => match (primary.original_terminal_boundary_ref(), cause.original_terminal_boundary_ref()) {
+                (Some(_), Some(_)) => None,
+                (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+                (None, None) => None,
+            },
+            _ => None,
+        }
+    }
+    pub(crate) fn same_original_terminal_carrier(
+        &self, request: &crate::RuntimeToolExecutionRequest, boundary: &OriginalTerminalBatchBoundary,
+    ) -> bool {
+        match self.value() {
+            PendingAgentBatchValue::WithCause { primary, cause } =>
+                primary.same_original_terminal_carrier(request, boundary) && cause.same_original_terminal_carrier(request, boundary),
+            PendingAgentBatchValue::OriginalTerminalBoundary(value) => std::ptr::eq(value, boundary),
+            PendingAgentBatchValue::OriginalCall(carrier) => carrier.original_request() == request
+                && carrier.original_request().tool_progress.same_original_channels(&request.tool_progress),
+            PendingAgentBatchValue::RecordedSink(sink) => request.tool_progress.same_original_channels(sink),
+            PendingAgentBatchValue::Recorded(recorded) => {
+                let Ok(actual) = request.tool_progress.checked_original_members() else { return false; };
+                recorded.len() == actual.len() && recorded.iter().zip(&actual).all(|((i, a), (j, b))|
+                    i == j && std::sync::Arc::ptr_eq(a, b))
+            },
+            PendingAgentBatchValue::OriginalStopPublication(publication) => std::sync::Arc::ptr_eq(publication, &boundary.publication),
+            _ => false,
+        }
+    }
     pub fn original_stop_publication(&self) -> Option<&std::sync::Arc<crate::tool_host::OriginalStopPublication>> {
         match self.value() {
             PendingAgentBatchValue::OriginalStopPublication(publication) => Some(publication),
+            PendingAgentBatchValue::OriginalTerminalBoundary(boundary) => Some(&boundary.publication),
             PendingAgentBatchValue::OriginalCall(carrier) if carrier.stop_publications().len() == 1 =>
                 carrier.stop_publications().first(),
             PendingAgentBatchValue::WithCause { primary, cause } =>
@@ -3976,6 +4063,7 @@ impl PendingAgentBatch {
     ) {
         match self.value() {
             PendingAgentBatchValue::OriginalStopPublication(publication) => visitor(publication),
+            PendingAgentBatchValue::OriginalTerminalBoundary(boundary) => visitor(&boundary.publication),
             PendingAgentBatchValue::WithCause { primary, cause } => {
                 primary.visit_original_stop_publications(visitor);
                 cause.visit_original_stop_publications(visitor);
@@ -3987,6 +4075,11 @@ impl PendingAgentBatch {
         }
     }
 
+    pub(crate) fn with_unresolved_marker(self) -> Self {
+        if self.original_terminal_boundary_ref().is_some() {
+            Self::with_cause(self, Some(Self::new(PendingAgentBatchValue::UnresolvedContext)))
+        } else { self }
+    }
     pub fn with_cause(primary: PendingAgentBatch, cause: Option<PendingAgentBatch>) -> Self {
         match cause {
             Some(cause) => Self::new(PendingAgentBatchValue::WithCause { primary, cause }),
@@ -4157,16 +4250,28 @@ impl ToolError {
         Self { message: message.into(), unknown: true, failure: None, pre_effect_refusal: None, original_bounded_acquisition_failure: None, original_packet_scope_denial: None, original_packet_scope_receipt: None, original_packet_scope_request: None, pending_agent_batch: None, secondary_failures: Vec::new(), original_child_drive: None, original_child_close: None, original_child_receipt: None, original_child_cancel: None }
     }
 
+    /// Carry the original producer boundary; Runtime still authenticates and closes the outer effect.
+    pub fn original_terminal_batch(pending: PendingAgentBatch) -> Self {
+        if !matches!(pending.value(), PendingAgentBatchValue::OriginalTerminalBoundary(_)) {
+            return Self::unknown_with_agent_batch("original terminal boundary unavailable", pending);
+        }
+        // The member decision is preserved by the typed carrier; the outer effect
+        // remains unresolved until its original Runtime owner authenticates it.
+        let mut error = Self::unknown("original member terminal awaits original batch closure");
+        error.pending_agent_batch = Some(pending);
+        error
+    }
+
     /// Preserve the original owner result without interpreting it as delivery.
     pub fn unknown_with_agent_batch(message: impl Into<String>, pending: PendingAgentBatch) -> Self {
         let mut error = Self::unknown(message);
-        error.pending_agent_batch = Some(pending);
+        error.pending_agent_batch = Some(pending.with_unresolved_marker());
         error
     }
 
     pub fn unknown_with_optional_agent_batch(message: impl Into<String>, pending: Option<PendingAgentBatch>) -> Self {
         let mut error = Self::unknown(message);
-        error.pending_agent_batch = pending;
+        error.pending_agent_batch = pending.map(PendingAgentBatch::with_unresolved_marker);
         error
     }
 
@@ -4185,6 +4290,9 @@ impl ToolError {
             (Some(original), _) => Some(original),
             (None, extra) => extra,
         };
+        if let Some(original) = self.pending_agent_batch.take() {
+            self.pending_agent_batch = Some(original.with_unresolved_marker());
+        }
         self
     }
 

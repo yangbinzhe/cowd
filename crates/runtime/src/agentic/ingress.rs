@@ -552,7 +552,12 @@ impl RuntimeServices {
             OriginalIngressResult::PreparedMember(PreparedMemberChecked::NoCommittedReceipt(observation)) =>
                 Outcome::Stopped(make_stop(coordinate, Stop::UnknownNoReceipt(observation))),
             OriginalIngressResult::PreparedMember(PreparedMemberChecked::Error(error)) => {
-                Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeError(error)))
+                let reason = match self.event_store().original_member_noncommit(&reservation, &effect_fence) {
+                    Ok(Some(terminal)) => Stop::ConfirmedNoncommit(terminal),
+                    // Missing, ambiguous or inaccessible custody remains the original Unknown.
+                    Ok(None) | Err(_) => Stop::BeforeOutcomeError(error),
+                };
+                Outcome::Stopped(make_stop(coordinate, reason))
             },
             _ => Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeUnknown("unexpected original member result".into()))),
         }

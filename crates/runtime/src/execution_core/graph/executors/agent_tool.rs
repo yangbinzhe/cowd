@@ -2198,6 +2198,7 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
                         request,
                         &descriptor,
                         observation.as_deref(),
+                        original_child.as_ref().map(|child| (ticket.clone(), Arc::clone(child))),
                     ),
                 ),
         )
@@ -2299,7 +2300,47 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
         };
         // Leaf effect/receipt has committed under its admission. The graph
         // outcome below is the delivery fence; callers only read it after commit.
-        let result = agent_tool_outcome(&outcome).map_err(|error| fail(error.to_string()))?;
+        let mut result = agent_tool_outcome(&outcome).map_err(|error| fail(error.to_string()))?;
+        if request.tool_name == "agent_action_batch" {
+            let child = original_child.as_ref().ok_or_else(|| NodeExecutorError::Uncertain {
+                node_id: ticket.node_id.clone(), reason: "original Agent batch child unavailable".into(),
+            })?;
+            if child.request.as_ref() != request || !child.request.tool_progress.same_original_channels(&request.tool_progress) {
+                return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original Agent batch request differs".into() });
+            }
+            let sink = &child.request.tool_progress;
+            let members = sink.checked_original_members().map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+            let publications = sink.checked_original_stop_publications().map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+            let stop = sink.original_member_stop();
+            let publication = match (publications.as_slice(), stop) {
+                ([], crate::tool_host::OriginalStopRead::Available(None)) => None,
+                ([publication], crate::tool_host::OriginalStopRead::Available(Some(current)))
+                    if publication.failure().is_none() && Arc::ptr_eq(publication.current(), &current)
+                        && current.recorded_in_original_sink() && current.belongs_to_original_sink(sink) => Some(Arc::clone(publication)),
+                _ => return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original Agent batch stop unavailable or conflicting".into() }),
+            };
+            if !members.is_empty() || publication.is_some() {
+                let mut prefix = crate::tool_host::AuthenticatedBatchPrefix::new();
+                for (index, outcome) in &members {
+                    let crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else { break; };
+                    if member.index() != *index || prefix.push(member.clone()).is_err() {
+                        return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original Agent batch prefix differs".into() });
+                    }
+                }
+                let carrier = Arc::new(crate::tool_host::OriginalMemberCallCarrier::from_original_request(Arc::clone(&child.request)));
+                if carrier.outcomes().len() != members.len() || carrier.outcomes().iter().zip(&members)
+                    .any(|((left_index, left), (right_index, right))| left_index != right_index || !Arc::ptr_eq(left, right))
+                    || carrier.stop_publications().len() != publications.len()
+                    || carrier.stop_publications().iter().zip(&publications).any(|(left, right)| !Arc::ptr_eq(left, right)) {
+                    return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original Agent batch carrier changed".into() });
+                }
+                if !prefix.members().is_empty() {
+                    services.commit_service().attach_original_batch_members(&mut result, Arc::new(prefix))
+                        .map_err(|error| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
+                }
+                services.commit_service().attach_original_batch_pending(&mut result, carrier, publication);
+            }
+        }
         drop(admission);
         Ok(result)
     }
@@ -2321,12 +2362,18 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
         if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read { return Ok(()); }
         let close = super::current_original_physical_close(ticket)
             .ok_or_else(|| unknown("original Agent child physical close unavailable".into()))?;
-        let child = close.original_agent_child()
-            .ok_or_else(|| unknown("original Agent child request unavailable after close".into()))?;
-        let owner = child.request.tool_progress.original_fresh_effect().map_err(&unknown)?;
+        if close.original_agent_child().is_none() {
+            return Err(unknown("original Agent child request unavailable after close".into()));
+        }
         let commits = services.commit_service().clone();
         let original_ticket = ticket.clone();
-        tokio::task::spawn_blocking(move || match owner {
+        tokio::task::spawn_blocking(move || {
+            if commits.reuse_original_child_release_after_node(&original_ticket, &close)? { return Ok(()); }
+            let child = close.original_agent_child().ok_or_else(||
+                crate::execution_core::graph::ExecutionCommitError::InvalidCommand("original Agent child request unavailable after close".into()))?;
+            let owner = child.request.tool_progress.original_fresh_effect()
+                .map_err(crate::execution_core::graph::ExecutionCommitError::InvalidCommand)?;
+            match owner {
             Some(owner) if harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&owner.original_request().tool_name.as_str()) => {
                 match owner.original_request().tool_progress.original_effect_custody()
                     .map_err(crate::execution_core::graph::ExecutionCommitError::InvalidCommand)? {
@@ -2342,6 +2389,7 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
             },
             Some(owner) => commits.release_original_first_effect_after_node(&original_ticket, &close, &owner),
             None => commits.validate_original_child_without_fresh_after_node(&original_ticket, &close),
+            }
         }).await.map_err(|error| unknown(error.to_string()))?
           .map_err(|error| unknown(error.to_string()))
     }

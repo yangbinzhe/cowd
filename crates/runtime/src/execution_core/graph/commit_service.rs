@@ -7440,12 +7440,59 @@ impl ExecutionCommitService {
         Ok(())
     }
 
+    /// Reuse a sealed same-child release after callback interruption, never a missing custody entry.
+    pub(crate) fn reuse_original_child_release_after_node(
+        &self, ticket: &super::registry::NodeExecutionTicket,
+        close: &super::executors::OriginalPhysicalClose,
+    ) -> Result<bool, ExecutionCommitError> {
+        let invalid = || ExecutionCommitError::InvalidCommand("original child release proof differs".into());
+        let child = close.original_agent_child().ok_or_else(invalid)?;
+        let proof = child.release_proof.lock().map_err(|_| invalid())?.clone();
+        let Some(proof) = proof else { return Ok(false); };
+        if &proof.ticket != ticket || !close.matches_original_ticket(ticket) || !close.matches_observation(&proof.observation)
+            || !Arc::ptr_eq(&child.store, &self.event_store)
+            || !proof.owner.matches_original(&self.event_store, &child.request) {
+            return Err(invalid());
+        }
+        let (parent, _) = self.original_batch_child_source(ticket, Some(child))?.ok_or_else(invalid)?;
+        if parent != child.parent_ticket { return Err(invalid()); }
+        let mut facts = Vec::new();
+        let mut pending = None;
+        for outer in self.original_batch_outers_after_commit(ticket)? {
+            facts.extend(self.original_batch_members_after_commit(ticket, &outer)?.into_iter().map(|value| value.payload().clone()));
+            if let Some(value) = self.original_batch_pending_after_commit(ticket, &outer)? {
+                if outer != child.request.idempotency_key || pending.is_some() { return Err(invalid()); }
+                pending = Some(value.payload()["pending"].clone());
+            }
+        }
+        if facts != proof.facts || pending != proof.pending { return Err(invalid()); }
+        if let Some(publication) = &proof.publication {
+            let publications = child.request.tool_progress.checked_original_stop_publications().map_err(|_| invalid())?;
+            if publications.len() != 1 || !Arc::ptr_eq(&publications[0], publication)
+                || publication.failure().is_some() { return Err(invalid()); }
+        } else if pending.is_some() { return Err(invalid()); }
+        let receipt = self.event_store.original_transaction_receipt(&proof.outer_receipt.transaction_id)?.ok_or_else(invalid)?;
+        let mut actual_revisions = receipt.stream_revisions.clone();
+        let mut original_revisions = proof.outer_receipt.stream_revisions.clone();
+        actual_revisions.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
+        original_revisions.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
+        if receipt.commit_cursor != proof.outer_receipt.commit_cursor || receipt.request_hash != proof.outer_receipt.request_hash
+            || receipt.event_ids != proof.outer_receipt.event_ids || actual_revisions != original_revisions { return Err(invalid()); }
+        let units = match &child.process_members {
+            Some(members) => members.verified_release_units(child, &proof.members).map_err(|_| invalid())?,
+            None if proof.members.is_empty() && pending.is_none() => Vec::new(),
+            None => return Err(invalid()),
+        };
+        for unit in units { unit.mark_settled(); }
+        Ok(true)
+    }
+
     pub(crate) fn release_original_first_effect_after_node(
         &self, ticket: &super::registry::NodeExecutionTicket,
         close: &super::executors::OriginalPhysicalClose,
         owner: &Arc<OriginalFreshEffectOwner>,
     ) -> Result<(), ExecutionCommitError> {
-        self.settle_original_first_effect_after_node(ticket, close, owner, false)
+        self.settle_original_first_effect_after_node(ticket, close, owner, false, None)
     }
 
     pub(crate) fn defer_original_first_effect_for_parent(
@@ -7456,13 +7503,29 @@ impl ExecutionCommitService {
         if close.original_agent_child().is_none() {
             return Err(ExecutionCommitError::InvalidCommand("original child owner required".into()));
         }
-        self.settle_original_first_effect_after_node(ticket, close, owner, true)
+        self.settle_original_first_effect_after_node(ticket, close, owner, true, None)
+    }
+
+    /// Host supplies its original carrier so the release survives callback cancellation.
+    pub(crate) fn release_original_host_effect_after_node(
+        &self, ticket: &super::registry::NodeExecutionTicket,
+        close: &super::executors::OriginalPhysicalClose,
+        owner: &Arc<OriginalFreshEffectOwner>,
+        carrier: &crate::tool_host::OriginalMemberCallCarrier,
+        facts: &[serde_json::Value], pending: Option<&serde_json::Value>,
+        publication: Option<&Arc<crate::tool_host::OriginalStopPublication>>,
+        units: &[Arc<crate::tool_host::OriginalMemberSettlement>],
+    ) -> Result<(), ExecutionCommitError> {
+        self.settle_original_first_effect_after_node(ticket, close, owner, false,
+            Some((carrier, facts, pending, publication, units)))
     }
 
     fn settle_original_first_effect_after_node(
         &self, ticket: &super::registry::NodeExecutionTicket,
         close: &super::executors::OriginalPhysicalClose,
         owner: &Arc<OriginalFreshEffectOwner>, defer_parent: bool,
+        host: Option<(&crate::tool_host::OriginalMemberCallCarrier, &[serde_json::Value], Option<&serde_json::Value>,
+            Option<&Arc<crate::tool_host::OriginalStopPublication>>, &[Arc<crate::tool_host::OriginalMemberSettlement>])>,
     ) -> Result<(), ExecutionCommitError> {
         let invalid = |reason: &str| ExecutionCommitError::InvalidCommand(reason.into());
         if !close.matches_original_ticket(ticket) || !owner.matches_original(&self.event_store, owner.request.as_ref()) {
@@ -7511,16 +7574,49 @@ impl ExecutionCommitService {
         // This reads only facts already committed with the original node; an
         // unresolved member keeps the live owner and its original error.
         let mut member_facts = Vec::new();
+        let mut host_node_facts = None;
+        let mut terminal_member = None;
+        let mut terminal_node_fact = None;
+        let mut terminal_publication = None;
         for outer in self.original_batch_outers_after_commit(ticket)? {
-            member_facts.extend(self.original_batch_members_after_commit(ticket, &outer)?
-                .into_iter().map(|member| member.payload().clone()));
-            if self.original_batch_pending_after_commit(ticket, &outer)?.is_some() {
-                return Err(invalid("original batch member outcome remains unresolved"));
+            let outer_facts = self.original_batch_members_after_commit(ticket, &outer)?
+                .into_iter().map(|member| member.payload().clone()).collect::<Vec<_>>();
+            if outer == request.idempotency_key { host_node_facts = Some(outer_facts.clone()); }
+            member_facts.extend(outer_facts);
+            if let Some(pending) = self.original_batch_pending_after_commit(ticket, &outer)? {
+                if outer != request.idempotency_key || terminal_member.is_some() {
+                    return Err(invalid("original batch member outcome remains unresolved"));
+                }
+                let publications = request.tool_progress.checked_original_stop_publications()
+                    .map_err(|_| invalid("original member stop publications unavailable"))?;
+                let [publication] = publications.as_slice() else { return Err(invalid("original member stop publications conflict")); };
+                let crate::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() else {
+                    return Err(invalid("original member stop publication unresolved"));
+                };
+                let crate::tool_host::OriginalStopRead::Available(Some(current)) = request.tool_progress.original_member_stop() else {
+                    return Err(invalid("original member stop slot unavailable"));
+                };
+                if !Arc::ptr_eq(stop, &current) || !stop.recorded_in_original_sink()
+                    || !stop.belongs_to_original_sink(&request.tool_progress)
+                    || stop.coordinate().outer_key() != outer || stop.coordinate().call_id() != request.tool_use_id
+                    || stop.coordinate().step() != request.step_binding.as_ref() {
+                    return Err(invalid("original member stop identity differs"));
+                }
+                let crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else {
+                    return Err(invalid("original batch member outcome remains unresolved"));
+                };
+                let index = u64::try_from(stop.coordinate().index()).map_err(|_| invalid("original member index overflow"))?;
+                self.event_store.validate_original_member_noncommit_node(terminal, stop.coordinate().ticket(), &outer, index,
+                    &pending.payload()["pending"])?;
+                terminal_node_fact = Some(pending.payload()["pending"].clone());
+                terminal_publication = Some(Arc::clone(publication));
+                terminal_member = Some((Arc::clone(terminal), stop.coordinate().ticket().clone(), outer, index));
             }
         }
         let process_units = match close.original_agent_child() {
             Some(child) => match &child.process_members {
-                Some(members) => members.verified_units(ticket, child, &member_facts).map_err(|error| invalid(&error))?,
+                Some(members) => members.verified_units(ticket, child, &member_facts, terminal_node_fact.as_ref()).map_err(|error| invalid(&error))?,
+                None if terminal_node_fact.is_some() => return Err(invalid("original Process terminal custody unavailable")),
                 None => Vec::new(),
             },
             None => Vec::new(),
@@ -7554,9 +7650,105 @@ impl ExecutionCommitService {
             // its own physical node. Keep the existing original custody.
             return Ok(());
         }
-        self.event_store.release_original_first_effect_owner(&transaction, owner)?;
+        if let Some((carrier, facts, pending, publication, units)) = host {
+            if close.original_agent_child().is_some() || carrier.original_request() != request.as_ref()
+                || !carrier.original_request().tool_progress.same_original_channels(&request.tool_progress) {
+                return Err(invalid("original Host release carrier differs"));
+            }
+            let actual = carrier.verified_host_settlements(ticket, &self.event_store, facts, pending).map_err(|error| invalid(&error))?;
+            let same_publication = match (terminal_publication.as_ref(), publication) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
+            };
+            if actual.len() != units.len() || actual.iter().zip(units).any(|(left, right)| !Arc::ptr_eq(left, right))
+                || host_node_facts.as_deref().unwrap_or(&[]) != facts || terminal_node_fact.as_ref() != pending
+                || !same_publication || terminal_member.is_some() != pending.is_some() {
+                return Err(invalid("original Host release units differ"));
+            }
+            let proof = Arc::new(crate::tool_host::OriginalEffectReleaseProof {
+                owner: Arc::clone(owner), ticket: ticket.clone(), observation: close.observation_weak(),
+                members: units.iter().map(Arc::downgrade).collect(), facts: facts.to_vec(), pending: pending.cloned(),
+                publication: publication.cloned(), outer_receipt: receipt.clone(),
+            });
+            self.event_store.release_original_effect_with_proof(&transaction, owner,
+                terminal_member.as_ref().map(|(terminal, member_ticket, outer, index)|
+                    (terminal.as_ref(), member_ticket, outer.as_str(), *index)), carrier.host_release_slot(), proof)?;
+        } else if let Some(child) = close.original_agent_child() {
+            let proof = Arc::new(crate::tool_host::OriginalEffectReleaseProof {
+                owner: Arc::clone(owner), ticket: ticket.clone(), observation: close.observation_weak(),
+                members: process_units.iter().map(Arc::downgrade).collect(), facts: member_facts.clone(),
+                pending: terminal_node_fact.clone(), publication: terminal_publication.clone(), outer_receipt: receipt.clone(),
+            });
+            self.event_store.release_original_effect_with_proof(&transaction, owner,
+                terminal_member.as_ref().map(|(terminal, member_ticket, outer, index)|
+                    (terminal.as_ref(), member_ticket, outer.as_str(), *index)), child.release_proof.as_ref(), proof)?;
+        } else if let Some((terminal, member_ticket, outer, index)) = terminal_member {
+            self.event_store.release_original_first_effect_with_noncommit(&transaction, owner, &terminal, &member_ticket, &outer, index)?;
+        } else {
+            self.event_store.release_original_first_effect_owner(&transaction, owner)?;
+        }
         for unit in process_units { unit.mark_settled(); }
         Ok(())
+    }
+
+    /// Authenticate the original sequential batch boundary before settling its outer effect.
+    /// This does not authenticate node commit or physical close.
+    pub(crate) fn original_terminal_batch_message(
+        &self, ticket: &super::registry::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest, pending: &crate::PendingAgentBatch,
+        child: Option<&super::executors::OriginalAgentChildCall>,
+    ) -> Result<Option<String>, ExecutionCommitError> {
+        let Some(boundary) = pending.original_terminal_boundary_ref() else { return Ok(None); };
+        let invalid = || ExecutionCommitError::InvalidCommand("original terminal batch identity unavailable".into());
+        if request.tool_name != "agent_action_batch" || !boundary.sink.same_original_channels(&request.tool_progress)
+            || !pending.same_original_terminal_carrier(request, boundary) {
+            return Err(invalid());
+        }
+        let value: serde_json::Value = serde_json::from_str(&request.input).map_err(|_| invalid())?;
+        let actions = value.get("actions").and_then(serde_json::Value::as_array).ok_or_else(invalid)?;
+        if actions.len() != boundary.total || boundary.index >= actions.len() { return Err(invalid()); }
+        let crate::tool_host::OriginalStopPublication::Recorded(stop) = boundary.publication.as_ref() else { return Err(invalid()); };
+        let crate::tool_host::OriginalStopRead::Available(Some(current)) = request.tool_progress.original_member_stop() else { return Err(invalid()); };
+        let source_ticket = stop.coordinate().ticket();
+        if source_ticket != ticket {
+            let child = child.ok_or_else(invalid)?;
+            let (parent, _) = self.original_batch_child_source(ticket, Some(child))?.ok_or_else(invalid)?;
+            if &parent != source_ticket || child.request.as_ref() != request
+                || !child.request.tool_progress.same_original_channels(&request.tool_progress) {
+                return Err(invalid());
+            }
+        }
+        if !Arc::ptr_eq(&stop, &current) || !stop.recorded_in_original_sink()
+            || !stop.belongs_to_original_sink(&request.tool_progress)
+            || stop.coordinate().call_id() != request.tool_use_id || stop.coordinate().outer_key() != request.idempotency_key
+            || stop.coordinate().step() != request.step_binding.as_ref() || stop.coordinate().index() != boundary.index {
+            return Err(invalid());
+        }
+        super::executors::agent_tool::validate_original_call_request(ticket, request).map_err(|_| invalid())?;
+        let crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err(invalid()); };
+        let index = u64::try_from(boundary.index).map_err(|_| invalid())?;
+        self.event_store.validate_original_member_noncommit(terminal, source_ticket, &request.idempotency_key, index)?;
+        let member_guard = self.event_store.retained_original_noncommit_binding(terminal)?;
+        let member_request = if let Some(host) = member_guard.host() { host.original_request() }
+            else if let Some(process) = member_guard.process() { process.original_request() }
+            else { return Err(invalid()); };
+        if member_request != request || !member_request.tool_progress.same_original_channels(&request.tool_progress) {
+            return Err(invalid());
+        }
+        let members = request.tool_progress.checked_original_members().map_err(|_| invalid())?;
+        if members.len() != boundary.index { return Err(invalid()); }
+        let mut parts = Vec::with_capacity(members.len() + 2);
+        for (expected, (index, outcome)) in members.iter().enumerate() {
+            let crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else { return Err(invalid()); };
+            if *index != expected || member.index() != expected { return Err(invalid()); }
+            member.node_commit_fact(&self.event_store, source_ticket).map_err(|_| invalid())?;
+            let crate::tool_host::OriginalMemberObservation::Available(observation) = member.observation() else { return Err(invalid()); };
+            parts.push(format!("member {expected}: committed; {}", serde_json::to_string(observation)?));
+        }
+        let event = terminal.transaction.events.first().ok_or_else(invalid)?;
+        let reason = event.event.payload["noncommit_error_kind"].as_str().ok_or_else(invalid)?;
+        parts.push(format!("member {}: confirmed noncommit ({reason})", boundary.index));
+        parts.push(format!("members {}..{} were not executed", boundary.index + 1, boundary.total));
+        Ok(Some(parts.join("; ")))
     }
 
     pub fn commit_tool_effect(
@@ -8890,27 +9082,29 @@ impl ExecutionCommitService {
                 let state = match stop.reason() {
                     crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeUnknown(_) =>
                         json!({"index":index,"state":"before_outcome_unknown"}),
-                    crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeError(_) =>
-                        json!({"index":index,"state":"before_outcome_error"}),
+                    crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeError(error) => {
+                        let mut fact = json!({"index":index,"state":"before_outcome_error",
+                            "action_error_kind":error.fixed_kind()});
+                        if let Some(kind) = error.fixed_store_kind() {
+                            fact["store_error_kind"] = json!(kind);
+                        }
+                        fact
+                    },
+                    crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) => {
+                        self.event_store.validate_original_member_noncommit(terminal, coordinate.ticket(), outer, index as u64)?;
+                        let checked_hash = terminal.request.identity_hash()?;
+                        let payload = &terminal.transaction.events[0].event.payload;
+                        json!({"index":index,"state":"confirmed_noncommit",
+                            "checked_request_hash":checked_hash, "terminal_transaction_id":terminal.receipt.transaction_id,
+                            "terminal_request_hash":terminal.receipt.request_hash, "terminal_commit_cursor":terminal.receipt.commit_cursor,
+                            "noncommit_reason":payload["noncommit_reason"], "noncommit_error_kind":payload["noncommit_error_kind"]})
+                    }
                     crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeStoreError(error) => {
                         // The actual error and original owners remain in the
                         // private stop carrier. The durable fact records a
                         // typed category only; it is not a refusal or a
                         // determination that the member transaction rolled back.
-                        let kind = match error.as_ref() {
-                            RuntimeEventStoreError::HistoryBudgetExceeded(_) => "history_budget_exceeded",
-                            RuntimeEventStoreError::UnknownScope(_) => "unknown_scope",
-                            RuntimeEventStoreError::Corrupt(_) => "corrupt",
-                            RuntimeEventStoreError::TransactionConflict { .. } => "transaction_conflict",
-                            RuntimeEventStoreError::StaleRevision { .. } => "stale_revision",
-                            RuntimeEventStoreError::CheckedAttemptRolledBack(_) => "checked_attempt_rolled_back",
-                            RuntimeEventStoreError::CurrentMemberAuthorityExpired => "current_member_authority_expired",
-                            RuntimeEventStoreError::InvalidTransaction(_) => "invalid_transaction",
-                            RuntimeEventStoreError::DecisionLeaseAlreadyConsumed { .. } => "decision_lease_already_consumed",
-                            RuntimeEventStoreError::Serialization(_) => "serialization",
-                            RuntimeEventStoreError::Io(_) => "io",
-                            RuntimeEventStoreError::Storage(_) => "storage",
-                        };
+                        let kind = error.fixed_kind();
                         json!({"index":index,"state":"before_outcome_store_unknown", "store_error_kind":kind,
                             "has_original_reservation":stop.has_original_reservation(),
                             "has_original_effect_fence":stop.has_original_effect_fence()})
@@ -9126,6 +9320,20 @@ impl ExecutionCommitService {
         if pending.get("index").and_then(serde_json::Value::as_u64).is_none() {
             return Err(ExecutionCommitError::InvalidCommand("node pending member index missing".into()));
         }
+        let valid_error_category = |fact: &serde_json::Map<String, serde_json::Value>| {
+            let action = fact.get("action_error_kind");
+            let store = fact.get("store_error_kind");
+            match (action, store) {
+                (None, None) => true, // Existing schema 1 facts predate categories.
+                (Some(serde_json::Value::String(action)), Some(serde_json::Value::String(store))) if action == "store" => matches!(store.as_str(),
+                    "history_budget_exceeded" | "unknown_scope" | "corrupt" | "transaction_conflict" | "stale_revision"
+                    | "checked_attempt_rolled_back" | "current_member_authority_expired" | "invalid_transaction"
+                    | "decision_lease_already_consumed" | "serialization" | "io" | "storage"),
+                (Some(serde_json::Value::String(action)), None) => matches!(action.as_str(),
+                    "event_store" | "serialization" | "corrupt" | "member_cancelled" | "member_unknown"),
+                _ => false,
+            }
+        };
         match pending.get("state").and_then(serde_json::Value::as_str) {
             Some("committed_unbound") if pending.get("candidate_transaction_id").and_then(serde_json::Value::as_str).is_some_and(|id| !id.is_empty())
                 && pending.get("candidate_request_hash").and_then(serde_json::Value::as_str).is_some_and(|hash| !hash.is_empty())
@@ -9133,13 +9341,22 @@ impl ExecutionCommitService {
             Some("stop_conflict") if pending.get("facts").and_then(serde_json::Value::as_array).is_some_and(|facts| {
                 !facts.is_empty() && facts.iter().all(|fact| {
                     fact.get("index").and_then(serde_json::Value::as_u64).is_some()
+                        && (fact.get("state").and_then(serde_json::Value::as_str) != Some("before_outcome_error")
+                            || fact.as_object().is_some_and(&valid_error_category))
                         && matches!(fact.get("state").and_then(serde_json::Value::as_str),
-                            Some("unbound_stop" | "before_outcome_unknown" | "before_outcome_error"
+                            Some("unbound_stop" | "before_outcome_unknown" | "before_outcome_error" | "confirmed_noncommit"
                                 | "before_outcome_store_unknown" | "unknown_no_receipt" | "committed_observation_unavailable" | "committed_unbound"))
                 })
             }) => {},
             Some("unbound_stop") if !pending.contains_key("candidate_transaction_id")
                 && !pending.contains_key("candidate_commit_cursor") && !pending.contains_key("candidate_request_hash") => {},
+            Some("confirmed_noncommit") if matches!((pending.get("noncommit_reason").and_then(serde_json::Value::as_str),
+                    pending.get("noncommit_error_kind").and_then(serde_json::Value::as_str)),
+                    (Some("cancelled"), Some("cancelled")) | (Some("rolled_back"), Some("stale_revision" | "current_member_authority_expired")))
+                && pending.get("checked_request_hash").and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty())
+                && pending.get("terminal_transaction_id").and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty())
+                && pending.get("terminal_request_hash").and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty())
+                && pending.get("terminal_commit_cursor").and_then(serde_json::Value::as_u64).is_some_and(|value| value > 0) => {},
             Some("before_outcome_store_unknown") if pending.get("store_error_kind").and_then(serde_json::Value::as_str).is_some_and(|kind| matches!(kind,
                 "history_budget_exceeded" | "unknown_scope" | "corrupt" | "transaction_conflict" | "stale_revision"
                 | "checked_attempt_rolled_back" | "current_member_authority_expired" | "invalid_transaction"
@@ -9148,7 +9365,9 @@ impl ExecutionCommitService {
                 && pending.get("has_original_effect_fence").and_then(serde_json::Value::as_bool).is_some()
                 && !pending.contains_key("candidate_transaction_id")
                 && !pending.contains_key("candidate_commit_cursor") && !pending.contains_key("candidate_request_hash") => {},
-            Some("before_outcome_unknown" | "before_outcome_error") if !pending.contains_key("candidate_transaction_id")
+            Some("before_outcome_unknown" | "before_outcome_error") if
+                (pending.get("state").and_then(serde_json::Value::as_str) != Some("before_outcome_error") || valid_error_category(pending))
+                && !pending.contains_key("candidate_transaction_id")
                 && !pending.contains_key("candidate_commit_cursor") && !pending.contains_key("candidate_request_hash") => {},
             Some("committed_observation_unavailable") if !pending.contains_key("candidate_transaction_id")
                 && !pending.contains_key("candidate_commit_cursor") && !pending.contains_key("candidate_request_hash") => {},

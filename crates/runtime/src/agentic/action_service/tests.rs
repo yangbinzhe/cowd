@@ -4553,3 +4553,16 @@ fn opened_quantity_decoder_rejects_malformed_present_authority() {
     assert_eq!(legacy.exact_team_count, Some(3));
     assert!(legacy.validate_team_quantity_contract().is_ok());
 }
+
+#[test]
+fn original_member_error_categories_never_include_error_details() {
+    let error = AgentActionServiceError::Corrupt("private action detail".into());
+    assert_eq!(error.fixed_kind(), "corrupt");
+    assert_eq!(error.fixed_store_kind(), None);
+    let error = AgentActionServiceError::Store(RuntimeEventStoreError::UnknownScope("private scope".into()));
+    assert_eq!(error.fixed_kind(), "store");
+    assert_eq!(error.fixed_store_kind(), Some("unknown_scope"));
+    let error = AgentActionServiceError::MemberCancelled;
+    assert_eq!(error.fixed_kind(), "member_cancelled");
+    assert_eq!(error.fixed_store_kind(), None);
+}

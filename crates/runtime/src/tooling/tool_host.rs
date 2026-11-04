@@ -13,6 +13,18 @@ impl OriginalMemberSettlement {
     pub(crate) fn mark_settled(&self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
 }
 
+/// Sealed only by the original node owner at the atomic custody handoff.
+pub(crate) struct OriginalEffectReleaseProof {
+    pub(crate) owner: std::sync::Arc<crate::execution_core::graph::OriginalFreshEffectOwner>,
+    pub(crate) ticket: crate::execution_core::NodeExecutionTicket,
+    pub(crate) observation: std::sync::Weak<crate::execution_core::graph::executors::agent_tool::NoDispatchObservation>,
+    pub(crate) members: Vec<std::sync::Weak<OriginalMemberSettlement>>,
+    pub(crate) facts: Vec<serde_json::Value>,
+    pub(crate) pending: Option<serde_json::Value>,
+    pub(crate) publication: Option<std::sync::Arc<OriginalStopPublication>>,
+    pub(crate) outer_receipt: crate::AppendTransactionReceipt,
+}
+
 /// Same-call transport retained by the Runtime producer. This is not proof of
 /// ownership: the original node owner must authenticate the ticket and Step.
 #[derive(Clone)]
@@ -21,12 +33,13 @@ pub struct OriginalMemberCallCarrier {
     outcomes: Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)>,
     stop_publications: Vec<std::sync::Arc<OriginalStopPublication>>,
     host_members: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<usize, (std::sync::Arc<crate::conversation::OriginalHostPreparedMember>, std::sync::Arc<OriginalMemberSettlement>)>>>,
+    host_release: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<OriginalEffectReleaseProof>>>>,
 }
 impl OriginalMemberCallCarrier {
     pub(crate) fn from_original_request(original_request: std::sync::Arc<RuntimeToolExecutionRequest>) -> Self {
         let outcomes = original_request.tool_progress.original_members();
         let stop_publications = original_request.tool_progress.original_stop_publications();
-        Self { original_request, outcomes, stop_publications, host_members: Default::default() }
+        Self { original_request, outcomes, stop_publications, host_members: Default::default(), host_release: Default::default() }
     }
     /// Retain the exact Host preparation under its original node carrier.
     pub(crate) fn retain_host_member(
@@ -59,6 +72,38 @@ impl OriginalMemberCallCarrier {
             None => { members.insert(index, (std::sync::Arc::clone(member), unit)); Ok(()) }
         }
     }
+    pub(crate) fn host_release_slot(&self) -> &std::sync::Mutex<Option<std::sync::Arc<OriginalEffectReleaseProof>>> {
+        &self.host_release
+    }
+    /// Reuse only the original owner's sealed completion for this same close.
+    pub(crate) fn verified_host_release(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+        close: &crate::execution_core::graph::executors::OriginalPhysicalClose,
+        store: &std::sync::Arc<crate::RuntimeEventStore>, facts: &[serde_json::Value],
+        pending: Option<&serde_json::Value>, publication: Option<&std::sync::Arc<OriginalStopPublication>>,
+    ) -> Result<Option<Vec<std::sync::Arc<OriginalMemberSettlement>>>, String> {
+        let proof = self.host_release.lock().map_err(|_| "original Host release proof unavailable")?.clone();
+        let Some(proof) = proof else { return Ok(None); };
+        let same_publication = match (&proof.publication, publication) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true, _ => false,
+        };
+        if &proof.ticket != ticket || !close.matches_original_ticket(ticket) || !close.matches_observation(&proof.observation)
+            || !proof.owner.matches_original(store, &self.original_request) || proof.facts != facts
+            || proof.pending.as_ref() != pending || !same_publication || proof.outer_receipt.commit_cursor == 0 {
+            return Err("original Host release proof differs".into());
+        }
+        let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        if members.len() != proof.members.len() { return Err("original Host release member set differs".into()); }
+        let mut units = Vec::with_capacity(members.len());
+        for ((_, (_, unit)), expected) in members.iter().zip(&proof.members) {
+            if !std::sync::Weak::ptr_eq(expected, &std::sync::Arc::downgrade(unit)) {
+                return Err("original Host release member identity differs".into());
+            }
+            units.push(std::sync::Arc::clone(unit));
+        }
+        Ok(Some(units))
+    }
     pub(crate) fn has_unsettled_host_members(&self) -> bool {
         match self.host_members.lock() {
             Ok(members) => members.values().any(|(_, unit)| !unit.is_settled()),
@@ -68,17 +113,52 @@ impl OriginalMemberCallCarrier {
     /// Transfer only members already authenticated in this node's committed prefix.
     pub(crate) fn verified_host_settlements(
         &self, ticket: &crate::execution_core::NodeExecutionTicket,
-        store: &std::sync::Arc<crate::RuntimeEventStore>, facts: &[serde_json::Value],
+        store: &std::sync::Arc<crate::RuntimeEventStore>, facts: &[serde_json::Value], pending: Option<&serde_json::Value>,
     ) -> Result<Vec<std::sync::Arc<OriginalMemberSettlement>>, String> {
         let outcomes = self.original_request.tool_progress.original_members();
         let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        if let Some(pending) = pending {
+            let index = pending.get("index").and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok()).ok_or("original Host terminal index unavailable")?;
+            if pending.get("state").and_then(serde_json::Value::as_str) != Some("confirmed_noncommit")
+                || !members.contains_key(&index) {
+                return Err("original Host terminal member custody unavailable".into());
+            }
+        }
         for (index, (original, _)) in members.iter() {
             if original.ticket() != ticket || original.prepared().index != *index {
                 return Err("original Host member settlement identity differs".into());
             }
             let mut matching = outcomes.iter().filter(|(actual, _)| actual == index);
-            let (_, outcome) = matching.next().ok_or("original Host member result unavailable")?;
+            let Some((_, outcome)) = matching.next() else {
+                let pending = pending.ok_or("original Host member result unavailable")?;
+                let publications = self.original_request.tool_progress.checked_original_stop_publications()?;
+                let [publication] = publications.as_slice() else { return Err("original Host terminal publications conflict".into()); };
+                let OriginalStopPublication::Recorded(stop) = publication.as_ref() else { return Err("original Host terminal publication unresolved".into()); };
+                let OriginalStopRead::Available(Some(current)) = self.original_request.tool_progress.original_member_stop() else { return Err("original Host terminal slot unavailable".into()); };
+                if !std::sync::Arc::ptr_eq(stop, &current) || !stop.recorded_in_original_sink()
+                    || !stop.belongs_to_original_sink(&self.original_request.tool_progress)
+                    || stop.coordinate().ticket() != ticket || stop.coordinate().index() != *index
+                    || stop.coordinate().call_id() != self.original_request.tool_use_id
+                    || stop.coordinate().outer_key() != self.original_request.idempotency_key
+                    || stop.coordinate().step() != self.original_request.step_binding.as_ref() {
+                    return Err("original Host terminal stop differs".into());
+                }
+                let OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err("original Host terminal unresolved".into()); };
+                store.validate_original_member_noncommit_node(terminal, ticket, &self.original_request.idempotency_key, *index as u64, pending)
+                    .map_err(|_| "original Host terminal node fact differs")?;
+                let mut markers = terminal.request.transaction.events.iter().filter(|event| event.event.kind == "agentic.batch_member.index");
+                let marker = markers.next().ok_or("original Host checked member identity unavailable")?;
+                if markers.next().is_some() || marker.event.payload["member_identity"].as_str() != Some(original.prepared().identity.as_str()) {
+                    return Err("original Host checked member identity differs".into());
+                }
+                continue;
+            };
             if matching.next().is_some() { return Err("original Host member results conflict".into()); }
+            if pending.is_some_and(|fact| fact.get("index").and_then(serde_json::Value::as_u64)
+                == u64::try_from(*index).ok()) {
+                return Err("original Host terminal conflicts with committed member".into());
+            }
             let OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else {
                 return Err("original Host member result remains unresolved".into());
             };
@@ -124,6 +204,8 @@ pub enum AgentBatchMemberResolution {
 /// Only the original checked action owner may resolve it to a commit.
 pub enum AgentBatchMemberPregrant {
     Replay(AuthenticatedBatchMember),
+    /// The original member has a terminal noncommit; outer and physical close still apply.
+    Terminal(std::sync::Arc<OriginalStopPublication>),
     Candidate(crate::step_snapshot::OriginalPreparedMemberCapability),
     /// A stop exists only after the original ticket/call was verified.
     Unknown { failure: BatchMemberUnknown, stop: Option<OriginalStopPublication> },
@@ -212,6 +294,7 @@ impl OriginalBatchMemberStop {
     pub fn has_original_reservation(&self) -> bool { self.reservation.is_some() }
     pub fn has_original_effect_fence(&self) -> bool { self.effect_fence.is_some() }
     pub(crate) fn original_reservation(&self) -> Option<&std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>> { self.reservation.as_ref() }
+    pub(crate) fn original_effect_fence(&self) -> Option<&std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>> { self.effect_fence.as_ref() }
     /// Checks the original sink identity only; publication may have failed.
     pub fn belongs_to_original_sink(&self, sink: &ToolProgressSink) -> bool {
         let original: std::sync::Arc<dyn OriginalStopSink> = sink.member_stop.clone();
@@ -280,6 +363,9 @@ impl OriginalStopPublication {
 pub enum OriginalBatchMemberStopReason {
     BeforeOutcomeUnknown(String),
     BeforeOutcomeError(crate::agentic::AgentActionServiceError),
+    /// The original backend authenticated this member's noncommit terminal.
+    /// Node and physical closure remain independently required.
+    ConfirmedNoncommit(std::sync::Arc<crate::OriginalMemberNoncommit>),
     BeforeOutcomeStoreError(std::sync::Arc<crate::RuntimeEventStoreError>),
     UnknownNoReceipt(harness_contract::agent_action::AgentActionObservation),
     /// The action committed at this index, but its observation is unavailable.
@@ -835,6 +921,10 @@ impl ToolProgressSink {
         let mut values = self.member_results.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         values.push((index, result));
     }
+    pub(crate) fn checked_original_members(&self) -> Result<Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)>, String> {
+        self.member_results.lock().map(|values| values.clone())
+            .map_err(|_| "original member results unavailable".into())
+    }
     pub fn original_members(&self) -> Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)> {
         self.member_results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
@@ -851,6 +941,10 @@ impl ToolProgressSink {
     }
     pub fn original_stop_publications(&self) -> Vec<std::sync::Arc<OriginalStopPublication>> {
         self.stop_publications.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+    pub(crate) fn checked_original_stop_publications(&self) -> Result<Vec<std::sync::Arc<OriginalStopPublication>>, String> {
+        self.stop_publications.lock().map(|values| values.clone())
+            .map_err(|_| "original stop publications unavailable".into())
     }
     /// Publish an owner-created stop only to the original request's own sink.
     pub fn record_original_member_stop(&self, stop: std::sync::Arc<OriginalBatchMemberStop>) -> OriginalStopPublication {

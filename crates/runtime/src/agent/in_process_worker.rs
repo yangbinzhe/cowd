@@ -431,12 +431,18 @@ impl ProcessMemberCustody {
     pub(crate) fn verified_units(
         &self, ticket: &crate::execution_core::NodeExecutionTicket,
         child: &crate::execution_core::graph::executors::OriginalAgentChildCall,
-        facts: &[serde_json::Value],
+        facts: &[serde_json::Value], pending: Option<&serde_json::Value>,
     ) -> Result<Vec<Arc<crate::tool_host::OriginalMemberSettlement>>, String> {
         let binding = self.binding.lock().map_err(|_| "Process child binding unavailable")?;
         if binding.as_ref().is_none_or(|(original, _)| original != ticket) { return Err("Process child ticket differs".into()); }
         let members = self.members.lock().map_err(|_| "Process member custody unavailable")?;
         let outcomes = child.request.tool_progress.original_members();
+        if let Some(fact) = pending {
+            let index = fact.get("index").and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok()).ok_or("Process terminal index unavailable")?;
+            if fact.get("state").and_then(serde_json::Value::as_str) != Some("confirmed_noncommit")
+                || !members.contains_key(&index) { return Err("Process terminal custody unavailable".into()); }
+        }
         let mut units = Vec::with_capacity(members.len());
         for (index, (original, unit)) in members.iter() {
             let original = original.upgrade().ok_or("Process member owner unavailable")?;
@@ -446,8 +452,33 @@ impl ProcessMemberCustody {
                 return Err("Process member original identity differs".into());
             }
             let mut matching = outcomes.iter().filter(|(actual, _)| actual == index);
-            let (_, outcome) = matching.next().ok_or("Process member outcome unavailable")?;
-            if matching.next().is_some() { return Err("Process member outcome conflicts".into()); }
+            let Some((_, outcome)) = matching.next() else {
+                let pending = pending.ok_or("Process member outcome unavailable")?;
+                let publications = child.request.tool_progress.checked_original_stop_publications()?;
+                let [publication] = publications.as_slice() else { return Err("Process terminal publications conflict".into()); };
+                let crate::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() else { return Err("Process terminal publication unresolved".into()); };
+                let crate::tool_host::OriginalStopRead::Available(Some(current)) = child.request.tool_progress.original_member_stop() else { return Err("Process terminal slot unavailable".into()); };
+                if !Arc::ptr_eq(stop, &current) || !stop.recorded_in_original_sink()
+                    || !stop.belongs_to_original_sink(&child.request.tool_progress)
+                    || stop.coordinate().ticket() != &child.parent_ticket || stop.coordinate().index() != *index
+                    || stop.coordinate().call_id() != child.request.tool_use_id
+                    || stop.coordinate().outer_key() != child.request.idempotency_key
+                    || stop.coordinate().step() != child.request.step_binding.as_ref() { return Err("Process terminal stop differs".into()); }
+                let crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err("Process terminal unresolved".into()); };
+                child.store.validate_original_member_noncommit_node(terminal, &child.parent_ticket,
+                    &child.request.idempotency_key, *index as u64, pending).map_err(|_| "Process terminal node fact differs")?;
+                let mut markers = terminal.request.transaction.events.iter().filter(|event| event.event.kind == "agentic.batch_member.index");
+                let marker = markers.next().ok_or("Process checked member identity unavailable")?;
+                if markers.next().is_some() || marker.event.payload["member_identity"].as_str() != Some(original.identity()) {
+                    return Err("Process checked member identity differs".into());
+                }
+                units.push(Arc::clone(unit));
+                continue;
+            };
+            if matching.next().is_some() || pending.is_some_and(|fact|
+                fact.get("index").and_then(serde_json::Value::as_u64) == u64::try_from(*index).ok()) {
+                return Err("Process member outcome conflicts".into());
+            }
             let crate::tool_host::OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else {
                 return Err("Process member outcome unresolved".into());
             };
@@ -462,6 +493,26 @@ impl ProcessMemberCustody {
                 source.as_object_mut().is_some_and(|obj| { obj.remove("source_ticket"); obj.remove("original_child_registration"); true })
                     && source == expected
             }) { return Err("Process member absent from original node".into()); }
+            units.push(Arc::clone(unit));
+        }
+        Ok(units)
+    }
+    pub(crate) fn verified_release_units(
+        &self, child: &crate::execution_core::graph::executors::OriginalAgentChildCall,
+        expected: &[std::sync::Weak<crate::tool_host::OriginalMemberSettlement>],
+    ) -> Result<Vec<Arc<crate::tool_host::OriginalMemberSettlement>>, String> {
+        if self.unregistered.load(Ordering::Acquire) { return Err("Process member custody unresolved".into()); }
+        let members = self.members.lock().map_err(|_| "Process member custody unavailable")?;
+        if members.len() != expected.len() { return Err("Process release member set differs".into()); }
+        let mut units = Vec::with_capacity(members.len());
+        for ((index, (member, unit)), prior) in members.iter().zip(expected) {
+            let member = member.upgrade().ok_or("Process member owner unavailable")?;
+            if member.index() != *index || member.ticket() != &child.parent_ticket
+                || member.original_request() != child.request.as_ref()
+                || !member.original_request().tool_progress.same_original_channels(&child.request.tool_progress)
+                || !std::sync::Weak::ptr_eq(prior, &Arc::downgrade(unit)) {
+                return Err("Process release member identity differs".into());
+            }
             units.push(Arc::clone(unit));
         }
         Ok(units)
@@ -574,6 +625,50 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
             failure: BatchMemberUnknown { index, reason },
             stop: Some(OriginalBatchMemberStop::publish(coordinate(), OriginalBatchMemberStopReason::BeforeOutcomeUnknown(detail))),
         };
+        // A retained terminal is a result of this member, not a new admission.
+        // Preserve the original publication and require the same live owner.
+        let publications = match original.tool_progress.checked_original_stop_publications() {
+            Ok(values) => values,
+            Err(_) => return unknown(BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
+                "original member stop publication unavailable".into()),
+        };
+        if !publications.is_empty() {
+            let terminal = (|| {
+                if publications.len() != 1 { return None; }
+                let publication = &publications[0];
+                if publication.failure().is_some() { return None; }
+                let stop = publication.current();
+                let slot = original.tool_progress.original_member_stop();
+                if !matches!(slot, crate::tool_host::OriginalStopRead::Available(Some(ref value)) if Arc::ptr_eq(value, stop))
+                    || !stop.recorded_in_original_sink() || !stop.belongs_to_original_sink(&original.tool_progress)
+                    || stop.coordinate().ticket() != self.process.ticket()
+                    || stop.coordinate().call_id() != original.tool_use_id
+                    || stop.coordinate().outer_key() != original.idempotency_key
+                    || stop.coordinate().step() != original.step_binding.as_ref()
+                    || stop.coordinate().index() != index { return None; }
+                let OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return None; };
+                let reservation = stop.original_reservation()?;
+                let fence = stop.original_effect_fence()?;
+                let recovered = self.process.store().original_member_noncommit(reservation, fence).ok()??;
+                if !Arc::ptr_eq(&recovered.request, &terminal.request)
+                    || !Arc::ptr_eq(&recovered.transaction, &terminal.transaction)
+                    || recovered.receipt != terminal.receipt { return None; }
+                let guard = self.process.store().retained_original_noncommit_binding(terminal).ok()?;
+                let member = guard.process()?;
+                if !Arc::ptr_eq(member.owner(), &self.process) || member.ticket() != self.process.ticket()
+                    || member.index() != index || member.outer_key() != original.idempotency_key
+                    || member.original_request() != original
+                    || !member.original_request().tool_progress.same_original_channels(&original.tool_progress) { return None; }
+                self.process.store().validate_original_member_noncommit(terminal, self.process.ticket(),
+                    &original.idempotency_key, u64::try_from(index).ok()?).ok()?;
+                Some(Arc::clone(publication))
+            })();
+            return match terminal {
+                Some(publication) => AgentBatchMemberPregrant::Terminal(publication),
+                None => unknown(BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
+                    "original member stop remains unresolved".into()),
+            };
+        }
         match crate::agentic::process_original_member_replay(Arc::clone(&self.process), &self.process.actions, original, index) {
             Ok(Some(replay)) => {
                 if let Err(reason) = replay.owner_applied {

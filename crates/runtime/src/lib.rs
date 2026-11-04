@@ -692,6 +692,7 @@ pub use runtime_event_replay::{
 pub use runtime_event_store::{
     decode_session_terminal_artifact_ref, encode_session_terminal_artifact_ref,
     AppendTransactionReceipt, AppendTransactionRequest, CheckedAppendReceipt, CheckedAppendRequest,
+    OriginalMemberDecision, OriginalMemberDecisionInput, OriginalMemberNoncommit,
     CheckedSourceEvidence, CheckedSourceValidator, CommittedEventBatch, CommittedStreamRevision,
     DurableRuntimeEvent, ExpectedStreamRevision, PreparedContentRoot, PreparedReconciliationReport,
     QuiescedContentRoots, RuntimeBoundedEventLookup, RuntimeEventInput, RuntimeEventRecord,
