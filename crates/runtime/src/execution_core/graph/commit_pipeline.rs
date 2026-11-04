@@ -652,7 +652,7 @@ fn canonical_tool_value(input: &serde_json::Value) -> Result<String, ExecutionCo
         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
 }
 
-fn canonical_tool_payload(input: &str) -> Result<String, ExecutionCommitError> {
+pub(crate) fn canonical_tool_payload(input: &str) -> Result<String, ExecutionCommitError> {
     let value = harness_contract::step::parse_strict_json(input)
         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
     canonical_tool_value(&value)

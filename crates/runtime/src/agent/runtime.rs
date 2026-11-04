@@ -352,6 +352,51 @@ impl RunExitFact {
 /// fact with one reason, whoever happens to write it.
 pub(crate) const CANCELLED_BY_COMMAND: &str = "agent cancelled by command";
 
+/// The run lifecycle stream advanced while it was read. The owner of the
+/// lifecycle documents this as a retryable source change, not a trust
+/// violation: the caller reads the lifecycle again and decides on the fresh
+/// view, so a closure must treat it as unsettled rather than as a fact that
+/// can never hold.
+pub(crate) const LIFECYCLE_SOURCE_CHANGED: &str = "Agent exit source changed during authentication";
+
+/// One read of the run lifecycle: the exit fact and the sources of that
+/// same read. Two reads can disagree whenever a concurrent commit lands
+/// between them, so the exit and the sources it belongs to must come from
+/// one read.
+pub(crate) struct ConfirmedRunExitSnapshot {
+    pub(crate) closed_for_governed_effects: bool,
+    pub(crate) sources: Vec<ExpectedStreamRevision>,
+}
+
+impl ConfirmedRunExitSnapshot {
+    /// The sources a closure may consume from this one read. A run whose
+    /// exit is not closed for governed effects has no source yet: the
+    /// closure waits for it rather than claiming it.
+    pub(crate) fn exit_sources(&self) -> Option<Vec<ExpectedStreamRevision>> {
+        if !self.closed_for_governed_effects {
+            return None;
+        }
+        Some(self.sources.clone())
+    }
+}
+
+/// Read the run lifecycle once and keep the exit fact and the sources of
+/// that same read together. A consumer that compared two reads would read
+/// a concurrent commit as a contradiction between two durable facts.
+pub(crate) fn confirmed_run_exit_snapshot(
+    store: &RuntimeEventStore,
+    packet: &AgentTaskPacket,
+) -> Result<Option<ConfirmedRunExitSnapshot>, String> {
+    let lifecycle = authenticated_run_lifecycle(store, packet)?;
+    if !lifecycle.exit.as_ref().is_some_and(RunExitFact::positive) {
+        return Ok(None);
+    }
+    Ok(Some(ConfirmedRunExitSnapshot {
+        closed_for_governed_effects: lifecycle.closed_for_governed_effects(),
+        sources: lifecycle.sources,
+    }))
+}
+
 pub(crate) fn confirmed_run_exit(
     store: &RuntimeEventStore,
     packet: &AgentTaskPacket,
@@ -423,7 +468,7 @@ pub(crate) fn authenticated_run_lifecycle(
         .map_err(|error| error.to_string())?
         != revision
     {
-        return Err("Agent exit source changed during authentication".into());
+        return Err(LIFECYCLE_SOURCE_CHANGED.into());
     }
     Ok(lifecycle)
 }
@@ -475,7 +520,7 @@ fn authenticate_run_lifecycle_records(
             // The caller reads the lifecycle again and decides on the fresh
             // view, so this is a retryable source change rather than a trust
             // violation.
-            return Err("Agent exit source changed during authentication".into());
+            return Err(LIFECYCLE_SOURCE_CHANGED.into());
         }
         if event.scope != RuntimeEventScope::Agent
             || event.actor.as_deref() != Some("agent_runtime")
@@ -6251,6 +6296,87 @@ mod tests {
             binding.data_lease.team_id = Some(team_run_id.to_string());
         }
         packet
+    }
+
+    /// A concurrent commit between two lifecycle reads is a read race, not a
+    /// contradiction between two durable facts. The confirmed exit and the
+    /// sources it belongs to must come from one read, so the closure of the
+    /// run is neither refused nor reported as unprovable.
+    #[test]
+    fn own_confirmed_run_exit_keeps_the_exit_and_its_sources_in_one_read() {
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        ));
+        let packet = task("own-lifecycle-one-read");
+        let packet_sha256 = run_packet_sha256(&packet).expect("packet digest");
+        let owner_epoch = uuid::Uuid::new_v4().to_string();
+        let backend_digest = "a".repeat(64);
+        let admitted = RunExitFact {
+            schema_version: 1,
+            agent_id: packet.agent_id().to_string(),
+            run_id: packet.run_id().to_string(),
+            graph_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
+            attempt: packet.attempt,
+            packet_sha256: packet_sha256.clone(),
+            backend_packet_sha256: None,
+            owner_epoch: owner_epoch.clone(),
+            backend: AgentBackendKind::InProcess,
+            phase: LocalRunPhase::Admitted,
+            process_envelope: None,
+        };
+        runtime
+            .persist_run_fact(&admitted, "agent.run_admitted")
+            .expect("run admission");
+        let backend = RunExitFact {
+            backend_packet_sha256: Some(backend_digest.clone()),
+            phase: LocalRunPhase::BackendPending,
+            ..admitted.clone()
+        };
+        runtime
+            .persist_run_fact(&backend, "agent.backend_admitted")
+            .expect("backend admission");
+        let exit = RunExitFact {
+            phase: LocalRunPhase::LocalReturned,
+            ..backend.clone()
+        };
+        runtime
+            .persist_run_fact(&exit, "agent.local_exit")
+            .expect("local exit");
+
+        // One read: the exit and the sources of that read belong together.
+        let snapshot = confirmed_run_exit_snapshot(&runtime.event_store, &packet)
+            .expect("lifecycle read")
+            .expect("a positive local exit is confirmed");
+        assert!(snapshot.closed_for_governed_effects);
+        let read_revision = snapshot.sources[0].expected_revision;
+        assert!(
+            snapshot.exit_sources().is_some(),
+            "one read keeps the closure decidable"
+        );
+
+        // A concurrent commit on the same agent stream advances the
+        // revision between two reads: the two reads would disagree even
+        // though both describe the same durable run.
+        let competing = RunExitFact {
+            run_id: "run-own-lifecycle-one-read-competing".to_string(),
+            ..admitted.clone()
+        };
+        runtime
+            .persist_run_fact(&competing, "agent.run_admitted")
+            .expect("competing admission");
+        let second = authenticated_run_lifecycle(&runtime.event_store, &packet)
+            .expect("lifecycle read after the concurrent commit");
+        assert_ne!(
+            second.sources[0].expected_revision, read_revision,
+            "two reads disagree when a concurrent commit lands between them"
+        );
+        // The snapshot the closure consumes still holds the exit and the
+        // sources of one read, so the run is not refused and no closure is
+        // reported as structurally unprovable.
+        assert_eq!(snapshot.sources[0].expected_revision, read_revision);
+        assert!(snapshot.exit_sources().is_some());
     }
 
     #[test]

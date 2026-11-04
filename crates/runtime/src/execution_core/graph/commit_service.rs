@@ -3314,6 +3314,16 @@ pub(crate) enum PhysicalClosureProof {
     Unprovable { ring: &'static str, reason: String },
 }
 
+
+/// What the owner's receipt says about the planned call it answers.
+#[derive(Debug)]
+enum PlannedCallIdentity {
+    /// The receipt answers this planned call.
+    Matches,
+    /// The receipt does not answer this planned call. The reason carries
+    /// both sides, so the difference stays visible in the error text.
+    Foreign(String),
+}
 impl ExecutionCommitService {
     /// Reload a Root refusal from the original producer handle and committed
     /// sources. This is read-only and does not re-authorize the call.
@@ -11958,6 +11968,7 @@ impl ExecutionCommitService {
                 &spec,
                 false,
                 Some(&fact),
+                &mut None,
             )?
             .ok_or_else(|| {
                 invalid("NoDispatch has incomplete or contradictory original leaf history".into())
@@ -12587,6 +12598,7 @@ impl ExecutionCommitService {
             spec,
             retired,
             fact.as_ref(),
+            &mut None,
         )
     }
 
@@ -12598,6 +12610,7 @@ impl ExecutionCommitService {
         spec: &ExecutionNodeSpec,
         retired: bool,
         no_dispatch: Option<&super::executors::agent_tool::NoDispatchFact>,
+        unprovable: &mut Option<(&'static str, String)>,
     ) -> Result<Option<Vec<ExpectedStreamRevision>>, ExecutionCommitError> {
         let invalid = |reason: &str| ExecutionCommitError::InvalidCommand(reason.into());
         let bound: Option<crate::RuntimeToolExecutionRequest> = if spec.kind
@@ -12639,6 +12652,23 @@ impl ExecutionCommitService {
         let mut receipts = BTreeSet::new();
         let mut calls = BTreeMap::new();
         let mut primary_sources = BTreeMap::new();
+        // The counts the next run needs to read the branch off the error
+        // text: how many calls the node planned, how many receipts the
+        // owner wrote, and how many calls the no-dispatch fact covers.
+        let planned_count = crate::step_snapshot::decode_persisted_tool_batch_value(&spec.payload_ref)
+            .ok()
+            .and_then(|payload| payload["calls"].as_array().map(|planned| planned.len()));
+        let leaf_counts = |receipts: usize| {
+            format!(
+                "planned={} receipts={} no_dispatch={}",
+                planned_count.map_or_else(|| "?".to_string(), |count| count.to_string()),
+                receipts,
+                no_dispatch.map_or(0, |fact| fact.calls.len())
+            )
+        };
+        // Differences between the planned call and the form the owner
+        // executed. They are reported, never dropped.
+        let mut derived_shapes: Vec<String> = Vec::new();
         while after < head {
             let page = self
                 .event_store
@@ -12687,6 +12717,13 @@ impl ExecutionCommitService {
                 {
                     return Err(invalid("lease recovery effect terminal key mismatch"));
                 }
+                // A call refused before dispatch has no effect at all, so it
+                // has no primary receipt either: the no-dispatch fact is its
+                // proof. Require the primary only for calls the fact does not
+                // cover, so a genuinely missing member still fails here.
+                if !Self::primary_receipt_required(no_dispatch, key) {
+                    continue;
+                }
                 let primary_stream = format!("execution-effect:{key}");
                 let primary_head = self.event_store.stream_revision(&primary_stream)?;
                 let primary = self
@@ -12699,6 +12736,7 @@ impl ExecutionCommitService {
                 let Some(primary) = primary else {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=primary_receipt_missing")); }
+                    *unprovable = Some(("primary_receipt_missing", format!("primary_receipt_missing {}", leaf_counts(receipts.len()))));
                     return Ok(None);
                 };
                 let read = primary.kind == "execution.read.receipt";
@@ -12769,6 +12807,7 @@ impl ExecutionCommitService {
                     .map_err(|error| invalid(&error.to_string()))?
                     .is_none()
                     {
+                        *unprovable = Some(("read_terminal_missing", format!("read_terminal_missing {}", leaf_counts(receipts.len()))));
                         return Ok(None);
                     }
                 } else {
@@ -12786,6 +12825,7 @@ impl ExecutionCommitService {
                 if !Self::lease_recovery_process_closed(&outcome, &effect) {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=process_not_closed")); }
+                    *unprovable = Some(("process_not_closed", format!("process_not_closed {}", leaf_counts(receipts.len()))));
                     return Ok(None);
                 }
                 if !receipts.insert(key.to_string()) {
@@ -12801,6 +12841,7 @@ impl ExecutionCommitService {
                         primary.payload["input_sha256"].clone(),
                         key.to_string(),
                         replay["origin"].clone(),
+                        replay["payload_digest"].clone(),
                     ),
                 );
             }
@@ -12830,6 +12871,7 @@ impl ExecutionCommitService {
         if !intents.is_subset(&receipts) {
             #[cfg(any(test, feature = "test-fixtures"))]
             if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=intent_without_terminal_receipt")); }
+            *unprovable = Some(("intent_without_terminal_receipt", format!("intent_without_terminal_receipt {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
             return Ok(None);
         }
         if let Some(fact) = no_dispatch {
@@ -12838,6 +12880,7 @@ impl ExecutionCommitService {
             if self.no_dispatch_physical_sources(fact)?.is_none() {
                 #[cfg(any(test, feature = "test-fixtures"))]
                 if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=no_dispatch_sources")); }
+                *unprovable = Some(("no_dispatch_sources", format!("no_dispatch_sources {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
                 return Ok(None);
             }
             if fact
@@ -12858,13 +12901,14 @@ impl ExecutionCommitService {
                     fact.calls.iter().any(|call| {
                         call.effect_key.as_deref() == Some(request.idempotency_key.as_str())
                     })
-                }) && !calls.values().any(|(name, input, key, _)| {
+                }) && !calls.values().any(|(name, input, key, _, _)| {
                     *name == request.tool_name
                         && *input == expected
                         && key == &request.idempotency_key
                 }) {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=bound_call_receipt_or_no_dispatch")); }
+                    *unprovable = Some(("bound_call_receipt_or_no_dispatch", format!("bound_call_receipt_or_no_dispatch {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
                     return Ok(None);
                 }
             } else {
@@ -12873,14 +12917,21 @@ impl ExecutionCommitService {
                 let Some(planned) = payload["calls"].as_array() else {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_calls_absent")); }
+                    *unprovable = Some(("planned_calls_absent", format!("planned_calls_absent {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
                     return Ok(None);
                 };
-                if !retired
-                    && calls.len() + no_dispatch.map_or(0, |fact| fact.calls.len()) != planned.len()
-                {
+                // The node's own committed result is the authority on which
+                // of its planned calls ran. The closure proves the physical
+                // closure of the effects that exist: a planned call that was
+                // never dispatched has no effect to close, and a dispatched
+                // call without its terminal receipt is already held by the
+                // intent check above. Re-counting the planned list here
+                // would deny the node's own certified outcome and spend the
+                // closure budget on it. The counts stay in the ring reasons
+                // so the next run reads the branch off the error text.
+                if calls.len() + no_dispatch.map_or(0, |fact| fact.calls.len()) != planned.len() {
                     #[cfg(any(test, feature = "test-fixtures"))]
-                    if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_receipt_count_mismatch planned={} receipts={} no_dispatch={}", planned.len(), calls.len(), no_dispatch.map_or(0, |fact| fact.calls.len()))); }
-                    return Ok(None);
+                    if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_planned_gap {}", leaf_counts(receipts.len()))); }
                 }
                 if calls.keys().any(|id| {
                     !planned
@@ -12889,14 +12940,17 @@ impl ExecutionCommitService {
                 }) {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=foreign_call_receipt")); }
+                    *unprovable = Some(("foreign_call_receipt", format!("foreign_call_receipt {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
                     return Ok(None);
                 }
                 let mut seen = BTreeSet::new();
                 for call in planned {
                     let Some(id) = call["id"].as_str() else {
+                        *unprovable = Some(("planned_call_id_missing", format!("planned_call_id_missing {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
                     };
                     let Some(input) = call["input"].as_str() else {
+                        *unprovable = Some(("planned_call_input_missing", format!("planned_call_input_missing {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
                     };
                     if no_dispatch
@@ -12908,19 +12962,48 @@ impl ExecutionCommitService {
                         continue;
                     }
                     if !seen.insert(id) {
+                        *unprovable = Some(("planned_call_seen_twice", format!("planned_call_seen_twice {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
                     }
-                    let digest = json!(format!("sha256:{:x}", Sha256::digest(input.as_bytes())));
-                    if !calls.get(id).is_some_and(|(name, actual, _, origin)| {
-                        *name == call["name"]
-                            && *actual == digest
-                            && call.get("origin").is_none_or(|expected| expected == origin)
-                    }) {
+                    let Some((name, actual, _, origin, certified)) = calls.get(id) else {
+                        // The planned call has no receipt at all: the member
+                        // has no terminal fact of its own.
                         #[cfg(any(test, feature = "test-fixtures"))]
-                        if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_receipt_identity_mismatch")); }
+                        if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_receipt_identity_mismatch missing={id} {}", leaf_counts(receipts.len()))); }
+                        *unprovable = Some(("planned_receipt_identity_mismatch", format!("receipt missing for planned call {id} {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
+                    };
+                    match Self::planned_call_identity(
+                        call["name"].as_str(),
+                        input,
+                        call.get("origin"),
+                        // The receipt's tool name is owner-written JSON; the
+                        // comparison takes it as the string it is. A receipt
+                        // without a string tool name cannot match a planned
+                        // name, so it is reported as a difference instead.
+                        name.as_str().unwrap_or_default(),
+                        actual,
+                        origin,
+                        certified.as_str(),
+                    ) {
+                        PlannedCallIdentity::Matches => {}
+                        PlannedCallIdentity::Foreign(reason) => {
+                            #[cfg(any(test, feature = "test-fixtures"))]
+                            if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_receipt_identity_mismatch {reason} {}", leaf_counts(receipts.len()))); }
+                            *unprovable = Some(("planned_receipt_identity_mismatch", format!("{reason} {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                            return Ok(None);
+                        }
                     }
                 }
+            }
+        }
+        if !derived_shapes.is_empty() {
+            #[cfg(any(test, feature = "test-fixtures"))]
+            if trace_leaf {
+                crate::execution_core::graph::k05_trace_emit(format!(
+                    "r622_toolbatch phase=physical_derived_shape {}",
+                    derived_shapes.join(" | ")
+                ));
             }
         }
         let mut sources = vec![ExpectedStreamRevision {
@@ -13482,27 +13565,27 @@ impl ExecutionCommitService {
         }
         if spec.kind == ExecutionNodeKind::AgentTask {
             let packet: AgentTaskPacket = serde_json::from_str(&ticket.payload_ref)?;
-            let lifecycle =
-                crate::agent_runtime::authenticated_run_lifecycle(&self.event_store, &packet)
-                    .map_err(ExecutionCommitError::InvalidCommand)?;
-            if !lifecycle.closed_for_governed_effects() {
+            let snapshot = match crate::agent_runtime::confirmed_run_exit_snapshot(
+                &self.event_store,
+                &packet,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) if error == crate::agent_runtime::LIFECYCLE_SOURCE_CHANGED => {
+                    // The lifecycle stream advanced while it was read. The
+                    // owner of the lifecycle documents this as a retryable
+                    // source change, so the closure is unsettled and reads
+                    // again on the fresh view; it is not a fact that can never
+                    // hold.
+                    return Ok(PhysicalClosureProof::Pending);
+                }
+                Err(error) => return Err(ExecutionCommitError::InvalidCommand(error)),
+            };
+            let Some(exit_sources) = snapshot.as_ref().and_then(|snapshot| snapshot.exit_sources())
+            else {
                 // The agent run's exit is durable and notifies on commit, so
                 // this ring is still pending rather than permanently unprovable.
                 return Ok(PhysicalClosureProof::Pending);
-            }
-            let Some((_, exit_sources)) =
-                crate::agent_runtime::confirmed_run_exit(&self.event_store, &packet)
-                    .map_err(ExecutionCommitError::InvalidCommand)?
-            else {
-                return Ok(PhysicalClosureProof::Pending);
             };
-            if lifecycle.sources != exit_sources {
-                // Two durable facts disagree; no later commit reconciles them.
-                return Ok(PhysicalClosureProof::Unprovable {
-                    ring: "agent run lifecycle",
-                    reason: "lifecycle sources differ from the confirmed run exit".to_string(),
-                });
-            }
             sources.extend(exit_sources);
         }
         let precommitted = spec.kind == ExecutionNodeKind::ToolBatch
@@ -13542,6 +13625,7 @@ impl ExecutionCommitService {
                         || CallbackDisposition::from_result(node, result)
                             == CallbackDisposition::Abort
                 });
+            let mut leaf_unprovable = None;
             let Some(leaf) = self.lease_recovery_leaf_sources_with_fact(
                 graph,
                 node,
@@ -13549,8 +13633,21 @@ impl ExecutionCommitService {
                 &spec,
                 partial,
                 fact.as_ref(),
+                &mut leaf_unprovable,
             )?
             else {
+                // Every leaf source failure is decided by durable facts that
+                // are written before the node commits, so waiting cannot change
+                // it. Name the ring instead of spending the closure budget.
+                if let Some((ring, reason)) = leaf_unprovable {
+                    // The trace helper is test-gated in production builds, so the
+                    // named ring always travels in the error text itself.
+                    #[cfg(any(test, feature = "test-fixtures"))]
+                    crate::execution_core::graph::k05_trace_emit(format!(
+                        "r622_toolbatch phase=physical_missing reason={ring}"
+                    ));
+                    return Ok(PhysicalClosureProof::Unprovable { ring, reason });
+                }
                 return Ok(PhysicalClosureProof::Pending);
             };
             leaf
@@ -13563,6 +13660,78 @@ impl ExecutionCommitService {
             }
         }
         Ok(PhysicalClosureProof::Proven(sources))
+    }
+
+    /// Compare the owner's receipt with the planned call it answers.
+    ///
+    /// The call id (the key the receipt is filed under) and the Step origin
+    /// are the owner's own identity facts: the runtime does not rewrite
+    /// them when it derives the effective call, so they stay a veto. The
+    /// tool name and the input digest describe *what the owner executed*:
+    /// the runtime derives both for sanctioned calls, so a difference there
+    /// is reported and never silently dropped.
+    fn planned_call_identity(
+        planned_name: Option<&str>,
+        planned_input: &str,
+        planned_origin: Option<&serde_json::Value>,
+        receipt_name: &str,
+        receipt_input_sha256: &serde_json::Value,
+        receipt_origin: &serde_json::Value,
+        receipt_certified_digest: Option<&str>,
+    ) -> PlannedCallIdentity {
+        if !planned_origin.is_none_or(|expected| expected == receipt_origin) {
+            return PlannedCallIdentity::Foreign(format!(
+                "origin differs: planned={} receipt={receipt_origin}",
+                planned_origin.map_or_else(|| "none".to_string(), |value| value.to_string()),
+            ));
+        }
+        let digest = format!("sha256:{:x}", Sha256::digest(planned_input.as_bytes()));
+        let receipt_digest = receipt_input_sha256.as_str().unwrap_or_default();
+        // The owner certified the executed input twice: the raw digest it
+        // wrote, and the canonical payload digest in its replay contract.
+        // Compare against the owner's own expectation first; the raw digest
+        // stays the fallback when the owner certified no canonical one.
+        let certified = receipt_certified_digest
+            .and_then(|certified| {
+                canonical_tool_payload(planned_input)
+                    .ok()
+                    .map(|canonical| canonical == certified)
+            })
+            .unwrap_or(false);
+        if planned_name.is_none_or(|name| name == receipt_name)
+            && (receipt_digest == digest || certified)
+        {
+            return PlannedCallIdentity::Matches;
+        }
+        PlannedCallIdentity::Foreign(format!(
+            "tool differs: planned={} receipt={receipt_name}; input differs: planned={digest} receipt={receipt_digest} certified={certified}",
+            planned_name.unwrap_or("?"),
+        ))
+    }
+
+    /// The differences between the planned calls and the forms their owners
+    /// executed. They travel in the ring reason so a receipt that answers a
+    /// derived form stays visible instead of being silently dropped.
+    fn leaf_shape_note(derived_shapes: &[String]) -> String {
+        if derived_shapes.is_empty() {
+            return String::new();
+        }
+        format!(" derived_shapes=[{}]", derived_shapes.join(" | "))
+    }
+
+    /// Whether the primary receipt of this effect key is required. A call that
+    /// was refused before dispatch produced no effect at all, and the
+    /// no-dispatch fact is its proof; such a call must not be required to
+    /// carry a primary receipt. A call the fact does not cover still has to
+    /// present its own primary receipt, so a genuinely missing member stays
+    /// missing.
+    fn primary_receipt_required(
+        no_dispatch: Option<&super::executors::agent_tool::NoDispatchFact>,
+        key: &str,
+    ) -> bool {
+        !no_dispatch.is_some_and(|fact| {
+            fact.calls.iter().any(|call| call.effect_key.as_deref() == Some(key))
+        })
     }
 
     /// Name why a no-dispatch fact can never prove its physical sources.
@@ -13763,6 +13932,7 @@ impl ExecutionCommitService {
                         .as_ref()
                         .is_some_and(|(result, _)| result.status != ExecutionNodeStatus::Completed),
                 original_no_dispatch.as_ref(),
+                &mut None,
             )?
             else {
                 return Ok(None);
@@ -14894,7 +15064,7 @@ mod recovery_physical_450_tests {
         };
         let before = events.durable_commit_cursor().unwrap();
         let sources = commits
-            .lease_recovery_leaf_sources_with_fact(&graph, &spec.id, &binding, &spec, false, None)
+            .lease_recovery_leaf_sources_with_fact(&graph, &spec.id, &binding, &spec, false, None, &mut None)
             .unwrap()
             .unwrap();
         assert_eq!(sources.len(), 1);
@@ -15596,5 +15766,303 @@ mod physical_closure_reason_tests {
         assert!(reason.contains("receipt stream"), "unexpected reason: {reason}");
         // Nothing contradicts it: the node may still close this way.
         assert!(ExecutionCommitService::precommitted_unprovable_reason(false, 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod no_dispatch_ordering_tests {
+    use super::ExecutionCommitService;
+    use crate::execution_core::graph::executors::agent_tool::{NoDispatchCall, NoDispatchFact};
+    use crate::execution_core::graph::registry::NodeExecutionTicket;
+
+    fn fact(effect_key: &str) -> NoDispatchFact {
+        NoDispatchFact {
+            ticket: NodeExecutionTicket {
+                graph_id: "graph-1".to_string(),
+                node_id: "node-1".to_string(),
+                executor_kind: "tool_batch".to_string(),
+                service_class: Default::default(),
+                attempt: 1,
+                idempotency_key: "node-1:attempt".to_string(),
+                payload_ref: "{}".to_string(),
+            },
+            calls: vec![NoDispatchCall {
+                call_id: "call-1".to_string(),
+                tool_name: "read_file".to_string(),
+                input_sha256: "sha256:1".to_string(),
+                effect_key: Some(effect_key.to_string()),
+                request_sha256: Some("sha256:2".to_string()),
+                reason: "refused before dispatch".to_string(),
+                refusal_event_id: Some("event-1".to_string()),
+            }],
+            never_polled: true,
+            result_sha256: None,
+            historical_sources: std::collections::BTreeMap::new(),
+            start: None,
+            bounded_owners: std::collections::BTreeMap::new(),
+            original_node: None,
+        }
+    }
+
+    #[test]
+    fn a_no_dispatch_covered_call_needs_no_primary_receipt() {
+        let fact = fact("key-covered");
+        // The covered call is refused before dispatch: it never produced an
+        // effect, so it must not be required to carry a primary receipt.
+        assert!(!ExecutionCommitService::primary_receipt_required(Some(&fact), "key-covered"));
+        // A call the fact does not cover still has to present its own primary
+        // receipt: a genuinely missing member stays missing.
+        assert!(ExecutionCommitService::primary_receipt_required(Some(&fact), "key-other"));
+        assert!(ExecutionCommitService::primary_receipt_required(None, "key-covered"));
+    }
+}
+
+#[cfg(test)]
+mod planned_call_identity_tests {
+    use super::ExecutionCommitService;
+
+    fn digest(input: &str) -> String {
+        format!("sha256:{:x}", sha2::Sha256::digest(input.as_bytes()))
+    }
+
+    use sha2::Digest as _;
+
+    /// The owner's receipt answers the planned call exactly: same tool, same
+    /// input, same Step origin.
+    #[test]
+    fn an_exact_receipt_matches_the_planned_call() {
+        let input = "{\"path\":\"crates/runtime\"}";
+        let origin = serde_json::json!({"origin_step_id":"step-1","call_id":"call-1"});
+        match ExecutionCommitService::planned_call_identity(
+            Some("read_file"),
+            input,
+            Some(&origin),
+            "read_file",
+            &serde_json::json!(digest(input)),
+            &origin,
+            None,
+        ) {
+            PlannedCallIdentity::Matches => {}
+            other => panic!("an exact receipt must match: {other:?}"),
+        }
+    }
+
+    /// The owner's certified expectation is the canonical payload digest it
+    /// wrote into the receipt. When that canonical form is the planned call,
+    /// the receipt answers it even if the raw bytes were re-serialized.
+    #[test]
+    fn the_owners_certified_digest_is_the_comparison_basis() {
+        let planned = "{\"path\":\"crates/runtime\"}";
+        let reserialized = "{ \"path\": \"crates/runtime\" }";
+        let origin = serde_json::json!({"origin_step_id":"step-1","call_id":"call-1"});
+        let certified = super::canonical_tool_payload(planned).expect("canonical payload");
+        match ExecutionCommitService::planned_call_identity(
+            Some("read_file"),
+            planned,
+            Some(&origin),
+            "read_file",
+            &serde_json::json!(digest(reserialized)),
+            &origin,
+            Some(certified.as_str()),
+        ) {
+            PlannedCallIdentity::Matches => {}
+            other => panic!("the owner's certified digest must match: {other:?}"),
+        }
+    }
+
+    /// A receipt that answers another call is refused, and the refusal names
+    /// both sides: the planned tool and input, and the receipt's own.
+    #[test]
+    fn a_receipt_of_another_call_is_refused_with_both_sides() {
+        let planned = "{\"reference\":\"crates/runtime/src/lib.rs\"}";
+        let origin = serde_json::json!({"origin_step_id":"step-1","call_id":"call-1"});
+        match ExecutionCommitService::planned_call_identity(
+            Some("read_ref"),
+            planned,
+            Some(&origin),
+            "state_inspect",
+            &serde_json::json!(digest("{\"target\":\"crates/runtime/src/lib.rs\"}")),
+            &origin,
+            None,
+        ) {
+            PlannedCallIdentity::Foreign(reason) => {
+                assert!(reason.contains("read_ref"), "{reason}");
+                assert!(reason.contains("state_inspect"), "{reason}");
+                assert!(reason.contains(&digest(planned)), "{reason}");
+                assert!(reason.contains(&digest("{\"target\":\"crates/runtime/src/lib.rs\"}")), "{reason}");
+            }
+            other => panic!("a receipt of another call must be refused: {other:?}"),
+        }
+    }
+
+    /// The receipt answers another call of another Step: that is a real
+    /// anomaly and stays a refusal.
+    #[test]
+    fn a_receipt_of_another_origin_is_refused() {
+        let input = "{}";
+        let planned_origin = serde_json::json!({"origin_step_id":"step-1","call_id":"call-1"});
+        let foreign_origin = serde_json::json!({"origin_step_id":"step-2","call_id":"call-2"});
+        match ExecutionCommitService::planned_call_identity(
+            Some("read_file"),
+            input,
+            Some(&planned_origin),
+            "read_file",
+            &serde_json::json!(digest(input)),
+            &foreign_origin,
+            None,
+        ) {
+            PlannedCallIdentity::Foreign(reason) => {
+                assert!(reason.contains("origin differs"), "{reason}");
+            }
+            other => panic!("a foreign receipt must be refused: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod physical_closure_ring_tests {
+    use super::*;
+
+    /// Append one receipt-index event the way the effect owner writes it:
+    /// the index stream carries the dispatch intent or the terminal receipt
+    /// of the same call.
+    fn append_index_event(
+        events: &RuntimeEventStore,
+        stream_id: &str,
+        key: &str,
+        kind: &str,
+        idempotency_key: String,
+    ) {
+        let revision = events.stream_revision(stream_id).expect("index head");
+        let transaction = AppendTransactionRequest {
+            transaction_id: format!("ring-test:{key}:{kind}"),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: stream_id.to_string(),
+                expected_revision: revision,
+            }],
+            events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: stream_id.to_string(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: kind.to_string(),
+                    status: Some("inflight".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload: json!({"idempotency_key": key, "tool_name": "read_file", "sequence": 1}),
+                },
+                idempotency_key: Some(idempotency_key),
+                schema_version: 1,
+            }],
+        };
+        events.append_transaction(transaction).expect("index event");
+    }
+
+    fn root_batch(
+        name: &str,
+    ) -> (
+        Arc<RuntimeEventStore>,
+        ExecutionCommitService,
+        ExecutionGraph,
+        ExecutionNodeSpec,
+        ExecutionNodeBinding,
+    ) {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(events.clone());
+        let graph = ExecutionGraph::new(name.to_string());
+        let payload = crate::step_snapshot::encode_persisted_tool_batch(&json!({
+            "session_id": format!("{name}-session"), "step_snapshots":{}, "calls":[]
+        }))
+        .expect("persisted batch");
+        let spec = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", payload);
+        let binding = ExecutionNodeBinding {
+            executor_kind: "tool_batch".into(),
+            ticket_idempotency_key: spec.idempotency_key.clone(),
+            attempt: 3,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        (events, commits, graph, spec, binding)
+    }
+
+    /// A dispatched call whose terminal receipt has not landed yet is still
+    /// in flight. The closure names the missing ring and never claims the
+    /// node; it does not read the missing terminal as a contradiction.
+    #[test]
+    fn an_intent_without_a_terminal_receipt_is_named_and_never_closed() {
+        let (events, commits, graph, spec, binding) = root_batch("ring original intent");
+        let key = "ring-original-intent";
+        let stream = format!(
+            "execution-agent-receipts:{}:{}:{}",
+            graph.id, spec.id, binding.attempt
+        );
+        append_index_event(
+            &events,
+            &stream,
+            key,
+            "execution.agent_tool.intent",
+            format!("agent-tool-intent:{key}"),
+        );
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                false,
+                None,
+                &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "an in-flight call must not close the node"
+        );
+        assert_eq!(
+            unprovable.map(|ring| ring.0),
+            Some("intent_without_terminal_receipt"),
+            "the missing terminal receipt is named"
+        );
+    }
+
+    /// An indexed terminal receipt without its effect receipt is a missing
+    /// member: the closure names it and never closes the node.
+    #[test]
+    fn a_receipt_without_its_primary_is_named_and_never_closed() {
+        let (events, commits, graph, spec, binding) = root_batch("ring original primary");
+        let key = "ring-original-primary";
+        let stream = format!(
+            "execution-agent-receipts:{}:{}:{}",
+            graph.id, spec.id, binding.attempt
+        );
+        append_index_event(
+            &events,
+            &stream,
+            key,
+            "execution.agent_tool.receipt",
+            format!("agent-tool-receipt:{key}"),
+        );
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                false,
+                None,
+                &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "a member without its effect receipt must not close the node"
+        );
+        assert_eq!(
+            unprovable.map(|ring| ring.0),
+            Some("primary_receipt_missing"),
+            "the missing effect receipt is named"
+        );
     }
 }
