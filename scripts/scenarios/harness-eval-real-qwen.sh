@@ -391,6 +391,7 @@ import json, pathlib, sys
 root, original, cleanup, gateway_exit = sys.argv[1:5]
 owned = {int(p): (start, group == '1') for p,start,group in (v.split(':') for v in sys.argv[5:])}
 remaining = []
+unreaped = []
 groups = {pid for pid, (_,group) in owned.items() if group}
 for entry in pathlib.Path('/proc').iterdir():
     if not entry.name.isdigit(): continue
@@ -398,9 +399,17 @@ for entry in pathlib.Path('/proc').iterdir():
     try: f = (entry/'stat').read_text().rsplit(') ',1)[1].split()
     except (FileNotFoundError, ProcessLookupError, PermissionError): continue
     if (pid in owned and f[19] == owned[pid][0]) or (int(f[2]) in groups and int(f[3]) == int(f[2])):
-        remaining.append({'pid':pid,'state':f[0],'starttime':f[19],'pgid':int(f[2]),'sid':int(f[3])})
+        record = {'pid':pid,'state':f[0],'starttime':f[19],'pgid':int(f[2]),'sid':int(f[3])}
+        if f[0] == 'Z':
+            # A process that already exited and that nobody reaped yet holds
+            # no resource and is not running, so it is not a live owned
+            # process. It is still reported: a child that was never reaped is
+            # a real defect of this run and must stay visible.
+            unreaped.append(record)
+        else:
+            remaining.append(record)
 with (pathlib.Path(root)/'cleanup-result.json').open('x') as out:
-    json.dump({'business_exit':int(original),'cleanup_failed':bool(int(cleanup)) or bool(remaining), 'gateway_wait_status':gateway_exit,'remaining_owned':remaining},out)
+    json.dump({'business_exit':int(original),'cleanup_failed':bool(int(cleanup)) or bool(remaining), 'gateway_wait_status':gateway_exit,'remaining_owned':remaining,'unreaped_zombies':unreaped},out)
 raise SystemExit(1 if remaining else 0)
 PY
   then :; else secondary=1; fi

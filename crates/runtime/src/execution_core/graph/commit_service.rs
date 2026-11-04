@@ -11677,6 +11677,63 @@ impl ExecutionCommitService {
             }
     }
 
+    /// Why the fact's physical sources could not be derived, when the reason
+    /// is the effect stream of a refused call. That stream is keyed by the
+    /// call, not by the attempt, so it may still be written by the owner
+    /// (the evidence has not arrived yet) or hold the residue of another
+    /// attempt. A committed effect of this very attempt contradicts the
+    /// no-dispatch classification itself.
+    fn no_dispatch_effect_stream_verdict(
+        &self,
+        fact: &super::executors::agent_tool::NoDispatchFact,
+    ) -> Result<Option<(&'static str, String)>, ExecutionCommitError> {
+        for call in fact.calls.iter() {
+            let Some(key) = &call.effect_key else {
+                continue;
+            };
+            let stream = format!("execution-effect:{key}");
+            let head = self.event_store.stream_revision(&stream)?;
+            if head == 0 {
+                continue;
+            }
+            let primary = self
+                .event_store
+                .event_by_idempotency_key(&stream, &format!("{key}:receipt"))
+                .or(self
+                    .event_store
+                    .event_by_idempotency_key(&stream, &format!("{key}:read-receipt")))?;
+            let attempt = primary.as_ref().and_then(|event| {
+                event.payload["root_effect_owner"]["binding"]["attempt"]
+                    .as_u64()
+                    .and_then(|attempt| u32::try_from(attempt).ok())
+                    .or_else(|| {
+                        event
+                            .refs
+                            .iter()
+                            .find(|reference| reference.kind == "agent_attempt")
+                            .and_then(|reference| reference.id.parse::<u32>().ok())
+                    })
+            });
+            if attempt == Some(fact.ticket.attempt) {
+                return Ok(Some((
+                    "no_dispatch_contradicts_committed_effect",
+                    format!(
+                        "call={} attempt={} committed an effect for a refused call",
+                        call.call_id, fact.ticket.attempt
+                    ),
+                )));
+            }
+            return Ok(Some((
+                "no_dispatch_effect_stream_nonempty",
+                format!(
+                    "call={} effect_stream_head={head} effect_attempt={:?} claim_attempt={}",
+                    call.call_id, attempt, fact.ticket.attempt
+                ),
+            )));
+        }
+        Ok(None)
+    }
+
     fn no_dispatch_physical_sources(
         &self,
         fact: &super::executors::agent_tool::NoDispatchFact,
@@ -12857,9 +12914,21 @@ impl ExecutionCommitService {
                             let id = call["id"].as_str().unwrap_or("unknown");
                             let input = call["input"].as_str();
                             let receipt = calls.get(id);
-                            let name_matches = receipt.is_some_and(|(name, _, _, _)| *name == call["name"]);
-                            let input_matches = receipt.zip(input).is_some_and(|((_, actual, _, _), input)| *actual == json!(format!("sha256:{:x}", Sha256::digest(input.as_bytes()))));
-                            let origin_matches = receipt.is_some_and(|(_, _, _, origin)| call.get("origin").is_none_or(|expected| expected == origin));
+                            let name_matches = receipt.is_some_and(|(name, _input_digest, _key, _origin, _certified)| *name == call["name"]);
+                            // The comparison basis is the owner's own certified expectation
+                            // first (the canonical payload digest it recorded), with the
+                            // raw digest as the fallback. It is the same comparison the
+                            // closure itself makes, so the trace cannot report a
+                            // difference the closure accepted, or hide one it refused.
+                            let input_matches = receipt.zip(input).is_some_and(|((_name, actual, _key, _origin, certified), input)| {
+                                let raw = *actual == json!(format!("sha256:{:x}", Sha256::digest(input.as_bytes())));
+                                let certified = certified.as_str().is_some_and(|certified| {
+                                    commit_pipeline::canonical_tool_payload(input)
+                                        .is_ok_and(|canonical| canonical == certified)
+                                });
+                                raw || certified
+                            });
+                            let origin_matches = receipt.is_some_and(|(_name, _input_digest, _key, origin, _certified)| call.get("origin").is_none_or(|expected| expected == origin));
                             let no_dispatch_match = no_dispatch.is_some_and(|fact| fact.calls.iter().any(|entry| entry.call_id == id));
                             crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_planned call={} name={} receipt={} name_match={} input_match={} origin_match={} no_dispatch={}",
                                 id.chars().take(96).collect::<String>(), call["name"].as_str().unwrap_or("unknown").chars().take(96).collect::<String>(), receipt.is_some(), name_matches, input_matches, origin_matches, no_dispatch_match));
@@ -12878,6 +12947,20 @@ impl ExecutionCommitService {
             fact.validate_identity(&fact.ticket)
                 .map_err(ExecutionCommitError::InvalidCommand)?;
             if self.no_dispatch_physical_sources(fact)?.is_none() {
+                if let Some((ring, reason)) = self.no_dispatch_effect_stream_verdict(fact)? {
+                    if ring == "no_dispatch_effect_stream_nonempty" {
+                        // The effect stream of a refused call is keyed by the
+                        // call, not by the attempt: the owner may still be
+                        // finishing, or the stream holds the residue of another
+                        // attempt. The evidence has not arrived yet, so the
+                        // closure keeps waiting.
+                        #[cfg(any(test, feature = "test-fixtures"))]
+                        if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason={ring} {reason}")); }
+                        return Ok(None);
+                    }
+                    *unprovable = Some((ring, reason));
+                    return Ok(None);
+                }
                 #[cfg(any(test, feature = "test-fixtures"))]
                 if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=no_dispatch_sources")); }
                 *unprovable = Some(("no_dispatch_sources", format!("no_dispatch_sources {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
@@ -15820,6 +15903,7 @@ mod no_dispatch_ordering_tests {
 #[cfg(test)]
 mod planned_call_identity_tests {
     use super::ExecutionCommitService;
+    use super::PlannedCallIdentity;
 
     fn digest(input: &str) -> String {
         format!("sha256:{:x}", sha2::Sha256::digest(input.as_bytes()))

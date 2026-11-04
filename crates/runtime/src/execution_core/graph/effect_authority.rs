@@ -139,6 +139,202 @@ impl ExecutionCommitService {
         self.tool_effect_authority_for_original_effect(request, Some(effect), &|_| {})
     }
 
+    /// Whether this call is a read-only effect, by the product's own compiled
+    /// effect kind: the same classification the tool registry produced, not
+    /// a new rule invented here.
+    fn is_read_only_effect(request: &crate::RuntimeToolExecutionRequest) -> bool {
+        let Some(invocation) = request.compiled_invocation.as_ref() else {
+            return false;
+        };
+        let effect = &invocation.effect;
+        // The same shape the product already accepts for a read that may
+        // stand in for its caller (the read_ref target check in
+        // `turn_engine`): a pure read — no network, no spawned process, and
+        // every declared scope a read. The scope resource is the tool's own
+        // (a file read declares File/Read, a tool read declares Tool/Read);
+        // only the operation has to be a read, so a file reader stays a pure
+        // read. A `Read` effect that spawns a process (the builtin
+        // readonly_process tools, `lsp` and `vision_analyze`) is not one of
+        // them.
+        if effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
+            || effect.uses_network
+            || effect.spawns_process
+            || effect.scopes.is_empty()
+            || effect
+                .scopes
+                .iter()
+                .any(|scope| scope.operation != harness_contract::policy::PermissionOperation::Read)
+        {
+            return false;
+        }
+        // The compiled invocation must be this call: the model cannot name a
+        // read to obtain a read-only exemption for another one.
+        let Ok(request_input) = harness_contract::step::parse_strict_json(&request.input) else {
+            return false;
+        };
+        invocation.invocation_id == request.tool_use_id
+            && invocation.intent.tool_name == request.tool_name
+            && invocation.intent.normalized_input == request_input
+    }
+
+    /// The sources the read-only exemption declares: the Program source
+    /// only. The claim path additionally fences the root goal stream; the
+    /// exemption must never declare more than the claim path does.
+    fn read_only_exemption_sources(
+        program_id: &str,
+        program_revision: u64,
+    ) -> Vec<ExpectedStreamRevision> {
+        vec![ExpectedStreamRevision {
+            stream_id: format!("agentic-program:{program_id}"),
+            expected_revision: program_revision,
+        }]
+    }
+
+    /// Whether a read-only call may precede the Task claim. The product's own
+    /// effect classification decides read-only, and the scope checks are a
+    /// precondition: the exemption can never bypass them.
+    fn read_only_claim_exemption(
+        read_only: bool,
+        focus: &AgenticExecutionFocus,
+        scope_authorized: bool,
+    ) -> bool {
+        scope_authorized
+            && read_only
+            && matches!(focus, AgenticExecutionFocus::TaskExecute { .. })
+    }
+
+    /// The planned claim call for this Task in this agent's graph, when the
+    /// same batch plans it next to the call being admitted. It is a
+    /// diagnostic hint only: it never authorizes anything and never changes
+    /// a verdict.
+    fn planned_claim_for_task(
+        &self,
+        graph: &ExecutionGraph,
+        task_ref: &str,
+    ) -> Option<String> {
+        for node in graph.nodes.iter() {
+            if node.kind != ExecutionNodeKind::ToolBatch {
+                continue;
+            }
+            let Ok(payload) = crate::step_snapshot::decode_persisted_tool_batch_value(&node.payload_ref)
+            else {
+                continue;
+            };
+            let Some(calls) = payload["calls"].as_array() else {
+                continue;
+            };
+            for call in calls {
+                if call["name"].as_str() != Some("task_claim") {
+                    continue;
+                }
+                let input = call["input"].as_str().unwrap_or_default();
+                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) else {
+                    continue;
+                };
+                if parsed.get("task_ref").and_then(|value| value.as_str()) == Some(task_ref) {
+                    return Some(call["id"].as_str().unwrap_or("task_claim").to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// The named verdict of the Task claim rules. The Task claim and the
+    /// attempt are the ones recorded for the graph that executes the effect,
+    /// compared literally; every identity fact of the claim stays a strict
+    /// equality. Each conjunct is named so the error text says which one was
+    /// false.
+    #[allow(clippy::too_many_arguments)]
+    fn task_claim_verdict(
+        task_ref: &str,
+        status: &AgenticTaskStatus,
+        task_team_id: &str,
+        scope_team_id: &str,
+        claimant: Option<&str>,
+        scope_agent_id: &str,
+        claim_execution_id: Option<&str>,
+        claim_generation: u64,
+        lease_expires_at_ms: Option<u64>,
+        cancel_requested_by: bool,
+        pending_retirement: bool,
+        attempt: Option<(&str, &str, &str, AgentAttemptMode, u64)>,
+        scope_membership_id: &str,
+        effect_graph_id: &str,
+        now_ms: u64,
+        same_batch_claim: Option<&str>,
+    ) -> Result<(), String> {
+        if *status != AgenticTaskStatus::Claimed {
+            return Err(match same_batch_claim {
+                Some(planned) => format!(
+                    "claim_not_yet_durable_in_same_batch task_ref={task_ref} status={status:?} the same batch plans this Task's claim (call={planned}); the claim's authorization must be durable before a sibling call is admitted"
+                ),
+                None => format!(
+                    "claim_status_mismatch task_ref={task_ref} status={status:?}"
+                ),
+            });
+        }
+        if task_team_id != scope_team_id {
+            return Err(format!(
+                "claim_team_mismatch task_ref={task_ref} claim_team={task_team_id} scope_team={scope_team_id}"
+            ));
+        }
+        if claimant != Some(scope_agent_id) {
+            return Err(format!(
+                "claim_owner_mismatch task_ref={task_ref} claimant={claimant:?} agent={scope_agent_id}"
+            ));
+        }
+        if claim_execution_id != Some(effect_graph_id) {
+            return Err(format!(
+                "claim_execution_graph_mismatch task_ref={task_ref} claim_graph={} effect_graph={effect_graph_id}",
+                claim_execution_id.unwrap_or("none")
+            ));
+        }
+        let Some((attempt_execution_id, attempt_agent_id, attempt_membership_id, attempt_mode, attempt_generation)) =
+            attempt
+        else {
+            return Err(format!(
+                "active_attempt_missing task_ref={task_ref} effect_graph={effect_graph_id} claim_generation={claim_generation}"
+            ));
+        };
+        if attempt_agent_id != scope_agent_id {
+            return Err(format!(
+                "active_attempt_owner_mismatch task_ref={task_ref} attempt_agent={attempt_agent_id} agent={scope_agent_id}"
+            ));
+        }
+        if attempt_membership_id != scope_membership_id {
+            return Err(format!(
+                "active_attempt_membership_mismatch task_ref={task_ref} attempt_membership={attempt_membership_id} membership={scope_membership_id}"
+            ));
+        }
+        if attempt_mode != AgentAttemptMode::Execute {
+            return Err(format!(
+                "active_attempt_mode_mismatch task_ref={task_ref} mode={attempt_mode:?}"
+            ));
+        }
+        if attempt_generation.checked_add(1) != Some(claim_generation) {
+            return Err(format!(
+                "claim_generation_mismatch task_ref={task_ref} claim_generation={claim_generation} attempt_generation={attempt_generation}"
+            ));
+        }
+        if attempt_execution_id != effect_graph_id {
+            return Err(format!(
+                "active_attempt_execution_mismatch task_ref={task_ref} attempt_graph={attempt_execution_id} effect_graph={effect_graph_id}"
+            ));
+        }
+        if lease_expires_at_ms.is_none_or(|expires| expires <= now_ms) {
+            return Err(format!(
+                "claim_lease_expired task_ref={task_ref} expires={lease_expires_at_ms:?} now_ms={now_ms}"
+            ));
+        }
+        if cancel_requested_by {
+            return Err(format!("claim_cancelled task_ref={task_ref}"));
+        }
+        if pending_retirement {
+            return Err(format!("claim_pending_retirement task_ref={task_ref}"));
+        }
+        Ok(())
+    }
+
     fn tool_effect_authority_for_original_effect(
         &self, request: &crate::RuntimeToolExecutionRequest,
         read_effect: Option<&ToolEffectDescriptor>, refused: &dyn Fn(&str),
@@ -303,35 +499,70 @@ impl ExecutionCommitService {
             });
             return Ok(sources);
         }
+        // A read-only call is not an effect on the Task's work: it may run
+        // before the Task is claimed. The classification is the product's own
+        // compiled effect kind, not a new rule, and every scope check above
+        // (Program state, team membership, agent activity) still applies.
+        // The scope checks above return Err when they fail, so reaching this
+        // point means the Program, the team membership and the agent's
+        // activity all authorize this call. The read-only exemption is
+        // decided after them and never bypasses them.
+        if Self::read_only_claim_exemption(
+            Self::is_read_only_effect(request),
+            &scope.focus,
+            true,
+        ) {
+            // Known difference (B2): the exemption path declares the Program
+            // source only and does not fence the root goal stream the claim
+            // path fences. The direction is safe — the exemption is the
+            // relaxation, and the claim path keeps its goal fence — so it is
+            // recorded here rather than changed.
+            sources.extend(Self::read_only_exemption_sources(
+                &program.program_id,
+                program.revision,
+            ));
+            return Ok(sources);
+        }
         if !matches!(scope.focus, AgenticExecutionFocus::TaskExecute { .. }) {
             return Err(denied("ordinary writes require an active Task execution claim"));
         }
-        if task.status != AgenticTaskStatus::Claimed
-            || task.team_id != scope.task_team_id
-            || task.claimant.as_deref() != Some(scope.agent_id.as_str())
-            || task.claim_execution_id.as_deref() != Some(packet.graph_id())
-            || !task.active_attempts.get(packet.graph_id()).is_some_and(|attempt| {
-                attempt.generation.checked_add(1) == Some(task.claim_generation)
-            })
-            || task
-                .lease_expires_at_ms
-                .is_none_or(|expires| expires <= now_ms)
-            || task.cancel_requested_by.is_some()
-            || task.pending_retirement.is_some()
-            || !task
-                .active_attempts
-                .get(packet.graph_id())
-                .is_some_and(|attempt| {
-                    attempt.execution_id == packet.graph_id()
-                        && attempt.agent_id == scope.agent_id
-                        && attempt.membership_id == scope.membership_id
-                        && attempt.mode == AgentAttemptMode::Execute
-                        && attempt.generation.checked_add(1) == Some(task.claim_generation)
-                })
-        {
-            return Err(denied(
-                "Task claim, generation, lease or active attempt is stale",
-            ));
+        // The claim and the attempt are the ones recorded for the graph that
+        // executes this effect, compared literally.
+        let attempt = task.active_attempts.get(packet.graph_id());
+        // The same batch may plan this Task's claim next to the call that is
+        // being admitted; the claim is then not durable yet. Name it, so the
+        // next run's error text says "the claim was still in flight" instead
+        // of a generic stale claim.
+        let same_batch_claim = self.planned_claim_for_task(&graph, task_ref);
+        // Every conjunct is named, so the next run's error text says which one
+        // was false; the verdict itself is a pure function of the facts.
+        if let Err(reason) = Self::task_claim_verdict(
+            task_ref,
+            &task.status,
+            &task.team_id,
+            &scope.task_team_id,
+            task.claimant.as_deref(),
+            &scope.agent_id,
+            task.claim_execution_id.as_deref(),
+            task.claim_generation,
+            task.lease_expires_at_ms,
+            task.cancel_requested_by.is_some(),
+            task.pending_retirement.is_some(),
+            attempt.map(|attempt| {
+                (
+                    attempt.execution_id.as_str(),
+                    attempt.agent_id.as_str(),
+                    attempt.membership_id.as_str(),
+                    attempt.mode,
+                    attempt.generation,
+                )
+            }),
+            &scope.membership_id,
+            packet.graph_id(),
+            now_ms,
+            same_batch_claim.as_deref(),
+        ) {
+            return Err(denied(&reason));
         }
         sources.push(ExpectedStreamRevision {
             stream_id: format!("agentic-program:{}", program.program_id),
@@ -1167,5 +1398,561 @@ impl ExecutionCommitService {
             expected_revision: program.as_ref().map_or(0, |program| program.revision),
         });
         Ok(sources)
+    }
+}
+
+#[cfg(test)]
+mod task_claim_verdict_tests {
+    use super::ExecutionCommitService;
+    use crate::AgenticTaskStatus;
+    use harness_contract::agent::AgenticExecutionFocus;
+    use harness_contract::agent_action::AgentAttemptMode;
+
+    fn attempt<'a>(
+        execution_id: &'a str,
+        agent_id: &'a str,
+        membership_id: &'a str,
+        mode: AgentAttemptMode,
+        generation: u64,
+    ) -> (&'a str, &'a str, &'a str, AgentAttemptMode, u64) {
+        (execution_id, agent_id, membership_id, mode, generation)
+    }
+
+    /// The Task claim is made in the graph that executes the effect and the
+    /// attempt is registered under that graph: the admission holds.
+    #[test]
+    fn a_claim_on_the_effects_own_graph_is_accepted() {
+        let verdict = ExecutionCommitService::task_claim_verdict(
+            "task:1",
+            &AgenticTaskStatus::Claimed,
+            "team-1",
+            "team-1",
+            Some("agent-1"),
+            "agent-1",
+            Some("agentic-graph:agent"),
+            1,
+            Some(9_999_999_999_999),
+            false,
+            false,
+            Some(attempt(
+                "agentic-graph:agent",
+                "agent-1",
+                "membership-1",
+                AgentAttemptMode::Execute,
+                0,
+            )),
+            "membership-1",
+            "agentic-graph:agent",
+            1_000,
+            None,
+        );
+        assert!(verdict.is_ok(), "{verdict:?}");
+    }
+
+    /// A claim recorded for another graph is refused, and the refusal names
+    /// both graph ids.
+    #[test]
+    fn a_claim_from_another_graph_is_named() {
+        let verdict = ExecutionCommitService::task_claim_verdict(
+            "task:1",
+            &AgenticTaskStatus::Claimed,
+            "team-1",
+            "team-1",
+            Some("agent-1"),
+            "agent-1",
+            Some("agentic-graph:other"),
+            1,
+            Some(9_999_999_999_999),
+            false,
+            false,
+            Some(attempt(
+                "agentic-graph:other",
+                "agent-1",
+                "membership-1",
+                AgentAttemptMode::Execute,
+                0,
+            )),
+            "membership-1",
+            "agentic-graph:agent",
+            1_000,
+            None,
+        );
+        assert!(
+            verdict
+                .as_ref().err().map(String::as_str)
+                .is_some_and(|reason| reason.starts_with("claim_execution_graph_mismatch")),
+            "{verdict:?}"
+        );
+    }
+
+    /// The identity of the attempt stays strict: a different agent and a
+    /// different membership are still refused.
+    #[test]
+    fn the_attempt_identity_stays_strict() {
+        for (agent, membership, expected) in [
+            ("agent-2", "membership-1", "active_attempt_owner_mismatch"),
+            ("agent-1", "membership-2", "active_attempt_membership_mismatch"),
+        ] {
+            let verdict = ExecutionCommitService::task_claim_verdict(
+                "task:1",
+                &AgenticTaskStatus::Claimed,
+                "team-1",
+                "team-1",
+                Some("agent-1"),
+                "agent-1",
+                Some("agentic-graph:agent"),
+                1,
+                Some(9_999_999_999_999),
+                false,
+                false,
+                Some(attempt(
+                    "agentic-graph:agent",
+                    agent,
+                    membership,
+                    AgentAttemptMode::Execute,
+                    0,
+                )),
+                "membership-1",
+                "agentic-graph:agent",
+                1_000,
+                None,
+            );
+            assert!(
+                verdict.as_ref().err().map(String::as_str).is_some_and(|reason| reason.starts_with(expected)),
+                "{agent}/{membership}: {verdict:?}"
+            );
+        }
+    }
+
+    /// A call whose Task has no durable claim is refused: only a read-only
+    /// effect may precede the claim, and that exemption is decided by the
+    /// product's own effect classification before this verdict.
+    #[test]
+    fn a_call_without_a_durable_claim_is_denied() {
+        let verdict = ExecutionCommitService::task_claim_verdict(
+            "task:1",
+            &AgenticTaskStatus::Published,
+            "team-1",
+            "team-1",
+            None,
+            "agent-1",
+            None,
+            0,
+            None,
+            false,
+            false,
+            Some(attempt(
+                "agentic-graph:agent",
+                "agent-1",
+                "membership-1",
+                AgentAttemptMode::Execute,
+                0,
+            )),
+            "membership-1",
+            "agentic-graph:agent",
+            1_000,
+            None,
+        );
+        assert!(
+            verdict
+                .as_ref().err().map(String::as_str)
+                .is_some_and(|reason| reason.starts_with("claim_status_mismatch")),
+            "{verdict:?}"
+        );
+    }
+
+    /// When the same batch plans this Task's claim next to the call being
+    /// admitted, the refusal says the claim was still in flight.
+    #[test]
+    fn a_claim_planned_in_the_same_batch_is_named() {
+        let verdict = ExecutionCommitService::task_claim_verdict(
+            "task:1",
+            &AgenticTaskStatus::Published,
+            "team-1",
+            "team-1",
+            None,
+            "agent-1",
+            None,
+            0,
+            None,
+            false,
+            false,
+            Some(attempt(
+                "agentic-graph:agent",
+                "agent-1",
+                "membership-1",
+                AgentAttemptMode::Execute,
+                0,
+            )),
+            "membership-1",
+            "agentic-graph:agent",
+            1_000,
+            Some("chatcmpl-tool-claim-1"),
+        );
+        assert!(
+            verdict.as_ref().err().map(String::as_str).is_some_and(|reason| reason
+                .starts_with("claim_not_yet_durable_in_same_batch")),
+            "{verdict:?}"
+        );
+        assert!(
+            verdict
+                .as_ref().err().map(String::as_str)
+                .is_some_and(|reason| reason.contains("chatcmpl-tool-claim-1")),
+            "{verdict:?}"
+        );
+    }
+
+    /// A review-mode attempt and an expired lease are named separately.
+    #[test]
+    fn the_generation_mode_and_lease_conjuncts_are_named() {
+        let base = |mode, lease, now| {
+            ExecutionCommitService::task_claim_verdict(
+                "task:1",
+                &AgenticTaskStatus::Claimed,
+                "team-1",
+                "team-1",
+                Some("agent-1"),
+                "agent-1",
+                Some("agentic-graph:agent"),
+                1,
+                lease,
+                false,
+                false,
+                Some(attempt(
+                    "agentic-graph:agent",
+                    "agent-1",
+                    "membership-1",
+                    mode,
+                    0,
+                )),
+                "membership-1",
+                "agentic-graph:agent",
+                now,
+                None,
+            )
+        };
+        assert!(
+            base(AgentAttemptMode::Review, Some(9_999_999_999_999), 1_000)
+                .as_ref().err().map(String::as_str)
+                .is_some_and(|reason| reason.starts_with("active_attempt_mode_mismatch")),
+        );
+        assert!(
+            base(AgentAttemptMode::Execute, Some(500), 1_000)
+                .as_ref().err().map(String::as_str)
+                .is_some_and(|reason| reason.starts_with("claim_lease_expired")),
+        );
+        assert!(base(AgentAttemptMode::Execute, Some(9_999_999_999_999), 1_000).is_ok());
+    }
+
+    /// The other side of the exemption: a read-only call is exempt only
+    /// after the scope checks passed. With the scope checks not passed the
+    /// exemption does not apply, so the call is refused as well.
+    #[test]
+    fn a_read_only_call_is_exempt_only_after_the_scope_checks_passed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("effect-authority-read-test", workspace.path());
+        let input = serde_json::json!({"path":"crates/runtime/src/lib.rs"});
+        let effect = host.pin_snapshot().describe_effect("read_file", &input);
+        assert_eq!(effect.effect_kind, harness_contract::tool::ToolEffectKind::Read);
+        let invocation = harness_contract::tool::GovernedToolInvocation {
+            origin: None,
+            contract_version: crate::governed_tool_plan::GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
+            invocation_id: "call-read".into(),
+            intent: harness_contract::tool::ToolIntent {
+                invocation_id: "call-read".into(),
+                tool_name: "read_file".into(),
+                normalized_input: input.clone(),
+            },
+            resource_demand: harness_contract::tool::ResourceDemand {
+                tool_slots: 1,
+                process_slots: 0,
+                network_slots: 0,
+                cpu_weight: 1,
+                memory_bytes: 0,
+                scopes: vec![],
+            },
+            effect,
+            explicit_dependencies: vec![],
+            compiled_dependencies: vec![],
+            catalog_revision: 1,
+            descriptor_set_hash: "sha256:test-descriptor-set".into(),
+            idempotency_key: "call-read".into(),
+        };
+        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: "call-read".into(),
+                tool_name: "read_file".into(),
+                input: input.to_string(),
+                depends_on: vec![],
+            },
+        );
+        request.compiled_invocation = Some(invocation);
+        // The product's own classification says this call is read-only.
+        assert!(ExecutionCommitService::is_read_only_effect(&request));
+        // The scope checks are a precondition: without them the exemption
+        // does not apply, so the call is refused like any other.
+        assert!(
+            !ExecutionCommitService::read_only_claim_exemption(
+                true,
+                &AgenticExecutionFocus::TaskExecute {
+                    task_ref: "task:1".into()
+                },
+                false,
+            ),
+            "the read-only exemption never bypasses the scope checks"
+        );
+        // With the scope checks passed the exemption does apply, and it stays
+        // inside the TaskExecute focus.
+        assert!(ExecutionCommitService::read_only_claim_exemption(
+            true,
+            &AgenticExecutionFocus::TaskExecute {
+                task_ref: "task:1".into()
+            },
+            true,
+        ));
+        assert!(!ExecutionCommitService::read_only_claim_exemption(
+            true,
+            &AgenticExecutionFocus::TaskReview {
+                task_ref: "task:1".into()
+            },
+            true,
+        ));
+    }
+
+    /// B1: a `Read` effect that spawns a process (the builtin
+    /// readonly_process tools, `lsp` and `vision_analyze`) is not a pure
+    /// read, so the exemption must not cover it and a Task without a claim
+    /// still refuses it.
+    #[test]
+    fn a_read_effect_that_spawns_a_process_is_not_exempt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("effect-authority-process-test", workspace.path());
+        let input = serde_json::json!({"path":"crates/runtime/src/lib.rs"});
+        // The shape of the builtin readonly_process tools (`lsp` and
+        // `vision_analyze`): a Read effect that spawns a process. The LSP
+        // surface is not part of the builtin catalog, so the shape is built
+        // from a real read effect instead of from that tool.
+        let mut effect = host.pin_snapshot().describe_effect("read_file", &input);
+        assert_eq!(effect.effect_kind, harness_contract::tool::ToolEffectKind::Read);
+        effect.spawns_process = true;
+        assert!(
+            effect.spawns_process,
+            "the builtin readonly_process tools spawn a process"
+        );
+        let invocation = harness_contract::tool::GovernedToolInvocation {
+            origin: None,
+            contract_version: crate::governed_tool_plan::GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
+            invocation_id: "call-lsp".into(),
+            intent: harness_contract::tool::ToolIntent {
+                invocation_id: "call-lsp".into(),
+                tool_name: "lsp".into(),
+                normalized_input: input.clone(),
+            },
+            resource_demand: harness_contract::tool::ResourceDemand {
+                tool_slots: 1,
+                process_slots: 1,
+                network_slots: 0,
+                cpu_weight: 1,
+                memory_bytes: 0,
+                scopes: vec![],
+            },
+            effect,
+            explicit_dependencies: vec![],
+            compiled_dependencies: vec![],
+            catalog_revision: 1,
+            descriptor_set_hash: "sha256:test-descriptor-set".into(),
+            idempotency_key: "call-lsp".into(),
+        };
+        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: "call-lsp".into(),
+                tool_name: "lsp".into(),
+                input: input.to_string(),
+                depends_on: vec![],
+            },
+        );
+        request.compiled_invocation = Some(invocation);
+        assert!(
+            !ExecutionCommitService::is_read_only_effect(&request),
+            "a read that spawns a process never takes the read-only exemption"
+        );
+        let reason = ExecutionCommitService::task_claim_verdict(
+            "task:1",
+            &AgenticTaskStatus::Published,
+            "team-1",
+            "team-1",
+            None,
+            "agent-1",
+            None,
+            0,
+            None,
+            false,
+            false,
+            None,
+            "membership-1",
+            "agentic-graph:agent",
+            1_000,
+            None,
+        )
+        .expect_err("a Task without a claim must refuse it");
+        assert!(reason.starts_with("claim_status_mismatch"), "{reason}");
+    }
+
+    /// The compiled invocation must be the same call as the request: a model
+    /// cannot name a read to obtain the exemption for another call.
+    #[test]
+    fn a_compiled_invocation_that_is_not_this_call_is_not_exempt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("effect-authority-mismatch-test", workspace.path());
+        let read_input = serde_json::json!({"path":"crates/runtime/src/lib.rs"});
+        let effect = host.pin_snapshot().describe_effect("read_file", &read_input);
+        assert_eq!(effect.effect_kind, harness_contract::tool::ToolEffectKind::Read);
+        let invocation = harness_contract::tool::GovernedToolInvocation {
+            origin: None,
+            contract_version: crate::governed_tool_plan::GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
+            invocation_id: "call-read".into(),
+            intent: harness_contract::tool::ToolIntent {
+                invocation_id: "call-read".into(),
+                tool_name: "read_file".into(),
+                normalized_input: read_input.clone(),
+            },
+            resource_demand: harness_contract::tool::ResourceDemand {
+                tool_slots: 1,
+                process_slots: 0,
+                network_slots: 0,
+                cpu_weight: 1,
+                memory_bytes: 0,
+                scopes: vec![],
+            },
+            effect,
+            explicit_dependencies: vec![],
+            compiled_dependencies: vec![],
+            catalog_revision: 1,
+            descriptor_set_hash: "sha256:test-descriptor-set".into(),
+            idempotency_key: "call-read".into(),
+        };
+        // The request is a different call than the compiled invocation.
+        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: "call-other".into(),
+                tool_name: "edit".into(),
+                input: "{\"action\":\"write\"}".into(),
+                depends_on: vec![],
+            },
+        );
+        request.compiled_invocation = Some(invocation);
+        assert!(
+            !ExecutionCommitService::is_read_only_effect(&request),
+            "a compiled invocation for another call never grants the exemption"
+        );
+    }
+
+    /// The exemption declares the Program source only: it must never declare
+    /// more sources than the claim path does (which also fences the root goal
+    /// stream). The difference itself is recorded as known (B2).
+    #[test]
+    fn the_read_only_exemption_declares_the_program_source_only() {
+        let sources =
+            ExecutionCommitService::read_only_exemption_sources("program-1", 7);
+        assert_eq!(sources.len(), 1, "the exemption declares one source");
+        assert_eq!(sources[0].stream_id, "agentic-program:program-1");
+        assert_eq!(sources[0].expected_revision, 7);
+    }
+
+    /// The exemption is confined to the TaskExecute focus.
+    #[test]
+    fn the_read_only_exemption_is_confined_to_task_execute() {
+        for focus in [
+            AgenticExecutionFocus::TaskReview {
+                task_ref: "task:1".into(),
+            },
+            AgenticExecutionFocus::Coordination {
+                wake_ref: "wake:1".into(),
+            },
+            AgenticExecutionFocus::ObjectiveReview {
+                criterion_refs: vec!["criterion:1".into()],
+            },
+        ] {
+            assert!(
+                !ExecutionCommitService::read_only_claim_exemption(true, &focus, true),
+                "{focus:?} never takes the read-only exemption"
+            );
+        }
+        assert!(ExecutionCommitService::read_only_claim_exemption(
+            true,
+            &AgenticExecutionFocus::TaskExecute {
+                task_ref: "task:1".into()
+            },
+            true,
+        ));
+    }
+
+    /// The counter-example to the read-only exemption: an effective call is
+    /// not read-only, so the exemption cannot apply to it, and a Task that was
+    /// never claimed still refuses it. These are the two decisions the
+    /// authority itself makes, in that order, for a TaskExecute scope.
+    #[test]
+    fn an_effective_call_without_a_claim_is_still_refused() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("effect-authority-test", workspace.path());
+        let input = serde_json::json!({"action":"write","path":"proof.txt","content":"x"});
+        let effect = host.pin_snapshot().describe_effect("edit", &input);
+        assert_ne!(effect.effect_kind, harness_contract::tool::ToolEffectKind::Read);
+        let invocation = harness_contract::tool::GovernedToolInvocation {
+            origin: None,
+            contract_version: crate::governed_tool_plan::GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
+            invocation_id: "call-1".into(),
+            intent: harness_contract::tool::ToolIntent {
+                invocation_id: "call-1".into(),
+                tool_name: "edit".into(),
+                normalized_input: input.clone(),
+            },
+            resource_demand: harness_contract::tool::ResourceDemand {
+                tool_slots: 1,
+                process_slots: 1,
+                network_slots: 0,
+                cpu_weight: 1,
+                memory_bytes: 0,
+                scopes: vec![],
+            },
+            effect,
+            explicit_dependencies: vec![],
+            compiled_dependencies: vec![],
+            catalog_revision: 1,
+            descriptor_set_hash: "sha256:test-descriptor-set".into(),
+            idempotency_key: "call-1".into(),
+        };
+        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: "call-1".into(),
+                tool_name: "edit".into(),
+                input: input.to_string(),
+                depends_on: vec![],
+            },
+        );
+        request.compiled_invocation = Some(invocation);
+        // The read-only exemption cannot apply to this call.
+        assert!(!ExecutionCommitService::is_read_only_effect(&request));
+        // And the claim conjuncts refuse a Task that was never claimed.
+        let reason = ExecutionCommitService::task_claim_verdict(
+            "task:1",
+            &AgenticTaskStatus::Published,
+            "team-1",
+            "team-1",
+            None,
+            "agent-1",
+            None,
+            0,
+            None,
+            false,
+            false,
+            None,
+            "membership-1",
+            "agentic-graph:agent",
+            1_000,
+            None,
+        )
+        .expect_err("an effective call without a claim must be refused");
+        assert!(reason.starts_with("claim_status_mismatch"), "{reason}");
     }
 }
