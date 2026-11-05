@@ -270,12 +270,24 @@ fn operator_requirement_summary(projection: &AgenticProgramProjection) -> String
     shortened
 }
 
-/// Persist executor admission before a physical graph is started.  This is
-/// an effect-outbox record, not a model claim: the Agent still decides whether
-/// to claim, submit, review, release, or replan when it runs.
+/// Persist executor admission before a physical graph is started.
+///
+/// This is an effect-outbox record and, for an Execute dispatch, the one
+/// writer of the Task's claim fence.  The dispatch decision already named the
+/// Agent and the physical graph that will run this Task, so the fence is
+/// written from that decision instead of being re-derived from a separate
+/// `task_claim` action: the Agent still decides whether to submit, review,
+/// release, or replan when it runs, but the admission it was dispatched under
+/// is already durable.
+///
+/// A Review or Coordination dispatch writes no claim.  The reviewer keeps the
+/// read path it has today, and the coordination consumer keeps its own
+/// consumption record; a second claim writer for those modes would give the
+/// Task two names for one execution.
 pub(crate) fn apply_task_attempt_dispatch(
     projection: &mut AgenticProgramProjection,
     input: &TaskAttemptDispatchInput,
+    applied_at_ms: u64,
 ) {
     let Some(task) = projection.tasks.get_mut(&input.task_ref) else {
         return;
@@ -290,6 +302,20 @@ pub(crate) fn apply_task_attempt_dispatch(
             generation: input.generation,
         },
     );
+    if input.mode == AgentAttemptMode::Execute {
+        // The fence names exactly the attempt that was just admitted, and its
+        // generation is that attempt's generation plus one - the same equation
+        // the admission authority checks when it decides an effect.
+        task.status = AgenticTaskStatus::Claimed;
+        task.claimant = Some(input.agent_ref.clone());
+        task.claim_execution_id = Some(input.execution_id.clone());
+        task.claim_generation = input.generation.saturating_add(1);
+        // The claim time is part of the fence, not a decoration: a publication
+        // is authenticated against the claim that was live when it was made,
+        // and a claim without a time cannot be one.
+        task.claimed_at_ms = Some(applied_at_ms);
+        task.lease_expires_at_ms = Some(applied_at_ms.saturating_add(claim_lease_ms()));
+    }
     if input.mode == AgentAttemptMode::Coordination {
         if let Some(entry) = projection
             .topics
@@ -1212,6 +1238,7 @@ mod tests {
                     },
                     generation: 0,
                 },
+                1_000,
             );
         }
         let withdrawal = TaskWithdrawInput {
@@ -1258,6 +1285,666 @@ mod tests {
             AgenticTaskStatus::Withdrawn
         );
         assert!(projection.tasks["task"].active_attempts.is_empty());
+    }
+}
+
+/// The seven paths that end a Task's claim, and the state each one leaves.
+/// A fence that is written once has to be ended exactly once too: these
+/// assertions say what every ending leaves behind, so a path that forgets to
+/// release the claim - or a path that releases it early - cannot pass
+/// unnoticed.
+#[cfg(test)]
+mod post_state_tests {
+    use super::*;
+    use harness_contract::agent_action::{
+        AgentAction, AgentActorBinding, AgentActorKind, AgentAttemptMode, MessagePublishInput,
+        TaskAttemptFailInput, TaskIntent, TaskIntentKind, TaskOneShotDeliverable,
+        TaskReleaseInput, TaskReviewDecision, TaskReviewInput, TaskSubmitInput, TaskSupersedeInput,
+        TaskWithdrawInput,
+    };
+
+    fn task() -> AgenticTaskProjection {
+        AgenticTaskProjection {
+            task_id: "task".to_string(),
+            team_id: "team".to_string(),
+            title: "task".to_string(),
+            objective: "objective".to_string(),
+            acceptance: "durable evidence".to_string(),
+            acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
+            required_capabilities: Vec::new(),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            depends_on: Vec::new(),
+            status: AgenticTaskStatus::Published,
+            claimant: None,
+            claim_generation: 0,
+            claim_execution_id: None,
+            claimed_at_ms: None,
+            lease_expires_at_ms: None,
+            claim_renewal_streak: 0,
+            active_attempts: Default::default(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            review_reason: None,
+            reviewed_by: None,
+            failed_attempts: 0,
+            review_generation: 0,
+            failed_review_attempts: 0,
+            last_failure: None,
+            replacement_task_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            superseded_reason: None,
+            superseded_by: None,
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
+        }
+    }
+
+    fn envelope(execution_id: &str, agent_id: &str, action: AgentAction) -> AgentActionEnvelope {
+        AgentActionEnvelope {
+            action_id: format!("action:{execution_id}:{agent_id}"),
+            actor: AgentActorBinding {
+                original_execution: None,
+                objective_id: "objective".to_string(),
+                program_id: "program".to_string(),
+                session_id: "session".to_string(),
+                turn_id: "turn".to_string(),
+                root_execution_id: Some("root".to_string()),
+                required_team_count: 1,
+                exact_team_count: None,
+                objective_summary: "objective".to_string(),
+                model_lease: "model".to_string(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: Vec::new(),
+                actor_id: agent_id.to_string(),
+                kind: AgentActorKind::Agent,
+                execution_id: Some(execution_id.to_string()),
+                team_id: Some("team".to_string()),
+                agent_id: Some(agent_id.to_string()),
+            },
+            expected_revision: None,
+            action,
+        }
+    }
+
+    /// A Task whose Execute dispatch has already written the fence.
+    fn dispatched() -> AgenticProgramProjection {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert("task".to_string(), task());
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &TaskAttemptDispatchInput {
+                task_ref: "task".to_string(),
+                execution_id: "execute-graph".to_string(),
+                agent_ref: "agent".to_string(),
+                membership_id: "membership:agent:team".to_string(),
+                mode: AgentAttemptMode::Execute,
+                generation: 0,
+            },
+            1_000,
+        );
+        projection
+    }
+
+    fn attempt_fail(reason: &str, retryable: bool) -> TaskAttemptFailInput {
+        TaskAttemptFailInput {
+            task_ref: "task".to_string(),
+            execution_id: "execute-graph".to_string(),
+            mode: AgentAttemptMode::Execute,
+            reason: reason.to_string(),
+            retryable,
+        }
+    }
+
+    /// The generation equation in one named place: the fence belongs to the
+    /// attempt that holds it, one generation ahead of it.  A live pair is the
+    /// claim's *own* attempt - a Task whose submitter already submitted has
+    /// no live attempt for its claim, and the equation then applies to nobody
+    /// else's attempt either.
+    fn claim_generation_matches_its_attempt(task: &AgenticTaskProjection) -> Option<bool> {
+        let attempt = task
+            .active_attempts
+            .get(task.claim_execution_id.as_deref()?)?;
+        Some(attempt.generation + 1 == task.claim_generation)
+    }
+
+    /// Path 1 - a failed attempt takes the fence with it and returns the Task
+    /// to the market.
+    #[test]
+    fn a_failed_attempt_leaves_no_claim_behind() {
+        let mut projection = dispatched();
+        apply_task_attempt_fail(&mut projection, &attempt_fail("the worker died", true));
+        let task = &projection.tasks["task"];
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert_eq!(task.status, AgenticTaskStatus::Rework);
+    }
+
+    /// Path 2 - an explicit release ends the fence and hands the Task back.
+    #[test]
+    fn a_released_task_carries_no_claim() {
+        let mut projection = dispatched();
+        let input = TaskReleaseInput {
+            task_ref: "task".to_string(),
+            reason: "the work is not needed".to_string(),
+            expected_claim_generation: None,
+        };
+        apply_task_release(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskRelease(input.clone()),
+            ),
+            &input,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Published);
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert_eq!(task.claim_renewal_streak, 0);
+        assert!(task.active_attempts.is_empty());
+    }
+
+    /// Path 3 - an accepted Task keeps the claim that produced it.  The
+    /// acceptance ends the work, not the fence: the claim still names the
+    /// execution that wrote the deliverable.
+    #[test]
+    fn an_accepted_task_keeps_the_claim_that_produced_it() {
+        let mut projection = dispatched();
+        let submit = TaskSubmitInput {
+            task_ref: "task".to_string(),
+            artifact_refs: vec!["artifact:deliverable".to_string()],
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: None,
+        };
+        apply_task_submit(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskSubmit(submit.clone()),
+            ),
+            &submit,
+        );
+        let review = TaskReviewInput {
+            task_ref: "task".to_string(),
+            decision: TaskReviewDecision::Accept,
+            reason: "the evidence is there".to_string(),
+            operator_requirement: None,
+            evidence_refs: Vec::new(),
+        };
+        apply_task_review(
+            &mut projection,
+            &envelope(
+                "review-graph",
+                "reviewer",
+                AgentAction::TaskReview(review.clone()),
+            ),
+            &review,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Accepted);
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(task.claimed_at_ms, Some(1_000));
+        assert_eq!(task.lease_expires_at_ms, Some(1_000 + claim_lease_ms()));
+    }
+
+    /// Path 5 - a withdrawal is two stages: the cancellation is the
+    /// intermediate state, the retirement is the end of it.  The claim is
+    /// released when the Task is actually retired.
+    #[test]
+    fn a_withdrawn_task_ends_retired_with_no_claim() {
+        let mut projection = dispatched();
+        let input = TaskWithdrawInput {
+            task_ref: "task".to_string(),
+            reason_ref: "artifact://withdrawal-reason".to_string(),
+            evidence_refs: Vec::new(),
+        };
+        apply_task_withdraw(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskWithdraw(input.clone()),
+            ),
+            &input,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::CancelRequested);
+        assert_eq!(
+            task.pending_retirement,
+            Some(AgenticTaskRetirement::Withdrawn)
+        );
+        apply_task_attempt_fail(&mut projection, &attempt_fail("cancelled", false));
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Withdrawn);
+        assert_eq!(task.pending_retirement, None);
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+    }
+
+    /// Path 7 - a supersession is the same two stages as a withdrawal.
+    #[test]
+    fn a_superseded_task_ends_retired_with_no_claim() {
+        let mut projection = dispatched();
+        let input = TaskSupersedeInput {
+            task_ref: "task".to_string(),
+            replacement_task_refs: vec!["task:next".to_string()],
+            reason: "the plan changed".to_string(),
+            evidence_refs: Vec::new(),
+        };
+        apply_task_supersede(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskSupersede(input.clone()),
+            ),
+            &input,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::CancelRequested);
+        assert_eq!(
+            task.pending_retirement,
+            Some(AgenticTaskRetirement::Superseded)
+        );
+        apply_task_attempt_fail(&mut projection, &attempt_fail("cancelled", false));
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Superseded);
+        assert_eq!(task.pending_retirement, None);
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+    }
+
+    /// B9 - the residual claim of an accepted Task is load-bearing, not
+    /// decoration.  The artifact was stamped with the claim that was live
+    /// when it was published, and the publication provenance gate reads the
+    /// Task's claim against the artifact's: clearing the claim on acceptance
+    /// would orphan every deliverable published under it.
+    #[test]
+    fn the_accepted_residual_claim_is_the_one_the_artifact_was_stamped_with() {
+        let mut projection = dispatched();
+        let submit = TaskSubmitInput {
+            task_ref: "task".to_string(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 0,
+                kind: "report".to_string(),
+                title: "report".to_string(),
+                resolved_content_ref: Some("artifact://content".to_string()),
+            }),
+        };
+        apply_task_submit(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskSubmit(submit.clone()),
+            ),
+            &submit,
+        );
+        let artifact_ref = projection.tasks["task"]
+            .artifact_refs
+            .first()
+            .cloned()
+            .expect("the submitted artifact");
+        let review = TaskReviewInput {
+            task_ref: "task".to_string(),
+            decision: TaskReviewDecision::Accept,
+            reason: "the evidence is there".to_string(),
+            operator_requirement: None,
+            evidence_refs: Vec::new(),
+        };
+        apply_task_review(
+            &mut projection,
+            &envelope(
+                "review-graph",
+                "reviewer",
+                AgentAction::TaskReview(review.clone()),
+            ),
+            &review,
+        );
+        let task = &projection.tasks["task"];
+        let artifact = &projection.artifacts[&artifact_ref];
+        assert_eq!(task.status, AgenticTaskStatus::Accepted);
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(artifact.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(artifact.claim_generation, Some(task.claim_generation));
+        assert_eq!(task.claimed_at_ms, Some(1_000));
+        let lease = task.lease_expires_at_ms.expect("the residual lease");
+        assert!(lease > 1_000 && lease < u64::MAX, "the lease is finite");
+        // The submit removed the submitter's attempt, so the claim has no
+        // live attempt of its own: the equation applies to nobody.
+        assert_eq!(claim_generation_matches_its_attempt(task), None);
+        // Nothing holds the accepted Task open.
+        assert_eq!(task.pending_retirement, None);
+        assert_eq!(task.cancel_requested_by, None);
+        assert!(task.active_attempts.is_empty());
+    }
+
+    /// B5 - a review dispatch must not put a second name on the work.  The
+    /// Task keeps the claim that names the executor, the artifact keeps the
+    /// same execution, and the reviewer's attempt does not take either over.
+    #[test]
+    fn a_review_dispatch_leaves_the_artifact_and_the_task_naming_the_same_execution() {
+        let mut projection = dispatched();
+        let submit = TaskSubmitInput {
+            task_ref: "task".to_string(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 0,
+                kind: "report".to_string(),
+                title: "report".to_string(),
+                resolved_content_ref: Some("artifact://content".to_string()),
+            }),
+        };
+        apply_task_submit(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskSubmit(submit.clone()),
+            ),
+            &submit,
+        );
+        let artifact_ref = projection.tasks["task"]
+            .artifact_refs
+            .first()
+            .cloned()
+            .expect("the submitted artifact");
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &TaskAttemptDispatchInput {
+                task_ref: "task".to_string(),
+                execution_id: "review-graph".to_string(),
+                agent_ref: "reviewer".to_string(),
+                membership_id: "membership:reviewer:team".to_string(),
+                mode: AgentAttemptMode::Review,
+                generation: 0,
+            },
+            2_000,
+        );
+        let task = &projection.tasks["task"];
+        let artifact = &projection.artifacts[&artifact_ref];
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(artifact.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(artifact.claim_generation, Some(task.claim_generation));
+        // The reviewer's attempt is live; the claim's own attempt is not, so
+        // the equation has no pair to hold.
+        assert_eq!(claim_generation_matches_its_attempt(task), None);
+        assert_eq!(
+            task.active_attempts.get("review-graph").map(|a| a.mode),
+            Some(AgentAttemptMode::Review)
+        );
+    }
+
+    /// The dispatched executor that does not take the Task must not leave a
+    /// claim hanging.  Whatever it said on the topic - including a decline it
+    /// published through the message channel - the executor's exit settles
+    /// the attempt, the fence goes with it, and the Task is back in the
+    /// market instead of held by a claim nobody can renew.
+    #[test]
+    fn a_dispatched_executor_that_leaves_leaves_no_hanging_claim() {
+        let mut projection = dispatched();
+        let decline = MessagePublishInput {
+            topic_ref: "topic:program".to_string(),
+            summary: Some("this task does not fit my role".to_string()),
+            content_ref: None,
+            refs: vec!["task".to_string()],
+            recipients: Vec::new(),
+            intent: Some(TaskIntent {
+                task_ref: "task".to_string(),
+                kind: TaskIntentKind::Decline,
+                reason_ref: None,
+                requested_capability_refs: Vec::new(),
+            }),
+            issue_dispositions: Vec::new(),
+        };
+        let revision = projection.revision + 1;
+        super::super::topic::apply_message_publish(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::MessagePublish(decline.clone()),
+            ),
+            &decline,
+            Some("topic:program:1"),
+            revision,
+        );
+        apply_task_attempt_fail(&mut projection, &attempt_fail("the executor left", false));
+        let task = &projection.tasks["task"];
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert_eq!(task.status, AgenticTaskStatus::Published);
+        assert_eq!(task.pending_retirement, None);
+    }
+
+    /// Path 6 - the stranded-attempt sweep settles a lapsed attempt through
+    /// the same failure action, so a lease that already ran out does not keep
+    /// the claim alive: the sweep does not clear the claim itself, the
+    /// settlement it emits does.
+    #[test]
+    fn an_expired_lease_does_not_keep_the_claim_alive() {
+        let mut projection = dispatched();
+        projection
+            .tasks
+            .get_mut("task")
+            .expect("task")
+            .lease_expires_at_ms = Some(500);
+        apply_task_attempt_fail(
+            &mut projection,
+            &attempt_fail("startup recovered a terminal Agent graph", false),
+        );
+        let task = &projection.tasks["task"];
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+    }
+}
+
+/// The dispatch decision already named the Agent and the physical graph that
+/// will run the Task, so it is the one writer of the Task's claim fence.  A
+/// second writer - the Agent's own `task_claim` - would let the admission be
+/// re-derived from a different ledger than the dispatch that produced it.
+#[cfg(test)]
+mod dispatch_fence_tests {
+    use super::*;
+    use harness_contract::agent_action::{AgentAction, AgentAttemptMode, TaskClaimInput};
+
+    fn published_task() -> AgenticTaskProjection {
+        AgenticTaskProjection {
+            task_id: "task".to_string(),
+            team_id: "team".to_string(),
+            title: "task".to_string(),
+            objective: "objective".to_string(),
+            acceptance: "durable evidence".to_string(),
+            acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
+            required_capabilities: Vec::new(),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            depends_on: Vec::new(),
+            status: AgenticTaskStatus::Published,
+            claimant: None,
+            claim_generation: 0,
+            claim_execution_id: None,
+            claimed_at_ms: None,
+            lease_expires_at_ms: None,
+            claim_renewal_streak: 0,
+            active_attempts: Default::default(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            review_reason: None,
+            reviewed_by: None,
+            failed_attempts: 0,
+            review_generation: 0,
+            failed_review_attempts: 0,
+            last_failure: None,
+            replacement_task_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            superseded_reason: None,
+            superseded_by: None,
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
+        }
+    }
+
+    fn claim_envelope(execution_id: &str) -> AgentActionEnvelope {
+        AgentActionEnvelope {
+            action_id: format!("claim:{execution_id}"),
+            actor: harness_contract::agent_action::AgentActorBinding {
+                original_execution: None,
+                objective_id: "objective".to_string(),
+                program_id: "program".to_string(),
+                session_id: "session".to_string(),
+                turn_id: "turn".to_string(),
+                root_execution_id: Some("root".to_string()),
+                required_team_count: 1,
+                exact_team_count: None,
+                objective_summary: "long-running task".to_string(),
+                model_lease: "model".to_string(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: Vec::new(),
+                actor_id: "agent".to_string(),
+                kind: harness_contract::agent_action::AgentActorKind::Agent,
+                execution_id: Some(execution_id.to_string()),
+                team_id: Some("team".to_string()),
+                agent_id: Some("agent".to_string()),
+            },
+            expected_revision: None,
+            action: AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: "task".to_string(),
+                reason: None,
+            }),
+        }
+    }
+
+    fn dispatch(mode: AgentAttemptMode, execution_id: &str, generation: u64) -> TaskAttemptDispatchInput {
+        TaskAttemptDispatchInput {
+            task_ref: "task".to_string(),
+            execution_id: execution_id.to_string(),
+            agent_ref: "agent".to_string(),
+            membership_id: "membership:agent:team".to_string(),
+            mode,
+            generation,
+        }
+    }
+
+    /// The five fields of the fence, and the generation equation the admission
+    /// authority checks: the fence belongs to the attempt that was admitted.
+    #[test]
+    fn the_execute_dispatch_writes_the_claim_fence() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert("task".to_string(), published_task());
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &dispatch(AgentAttemptMode::Execute, "execute-graph", 4),
+            1_000,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Claimed);
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(task.claim_generation, 5);
+        assert_eq!(task.claimed_at_ms, Some(1_000));
+        assert_eq!(task.lease_expires_at_ms, Some(1_000 + claim_lease_ms()));
+        let attempt = task
+            .active_attempts
+            .get("execute-graph")
+            .expect("the dispatched attempt");
+        assert_eq!(attempt.generation + 1, task.claim_generation);
+        assert_eq!(attempt.mode, AgentAttemptMode::Execute);
+    }
+
+    /// The writer stays single.  The Agent's own `task_claim` after the
+    /// dispatch is a renewal of that fence, not a second claim: it cannot move
+    /// the generation, so the equation that binds the fence to its attempt
+    /// survives it, and the only thing it may change is how long the fence
+    /// holds.
+    #[test]
+    fn the_agents_own_claim_after_the_dispatch_is_a_renewal() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert("task".to_string(), published_task());
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &dispatch(AgentAttemptMode::Execute, "execute-graph", 4),
+            1_000,
+        );
+        let envelope = claim_envelope("execute-graph");
+        let input = match &envelope.action {
+            AgentAction::TaskClaim(input) => input,
+            _ => unreachable!(),
+        };
+        apply_task_claim(&mut projection, &envelope, input, 2_000);
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Claimed);
+        assert_eq!(task.claim_generation, 5);
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(task.lease_expires_at_ms, Some(2_000 + claim_lease_ms()));
+        assert_eq!(task.claim_renewal_streak, 1);
+    }
+
+    /// Only the Execute dispatch writes a claim.  A reviewer has no fence of
+    /// its own: its reads keep going down the review path, and the Task keeps
+    /// the one claim that names the execution that will do the work.
+    #[test]
+    fn a_review_dispatch_writes_no_claim() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert("task".to_string(), published_task());
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &dispatch(AgentAttemptMode::Review, "review-graph", 0),
+            1_000,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Published);
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claim_generation, 0);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert_eq!(
+            task.active_attempts.get("review-graph").map(|a| a.mode),
+            Some(AgentAttemptMode::Review)
+        );
     }
 }
 

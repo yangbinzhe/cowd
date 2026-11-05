@@ -4474,6 +4474,9 @@ mod tests {
 
     #[tokio::test]
     async fn r194_original_writer_replays_frozen_observation_and_rejects_stale_claim() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         // This is the writer/CAS boundary with a synthetic response identity,
         // not evidence that a real SDK response was opened or cancelled.
         let root = tempfile::tempdir().unwrap();
@@ -4601,6 +4604,9 @@ mod tests {
 
     #[tokio::test]
     async fn r189_actual_sdk_cancel_uses_original_requested_and_session_writer() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         use crate::execution_core::graph::*;
         struct WriterBarrier {
             original: Arc<dyn super::ProviderWireEvidenceWriter>,

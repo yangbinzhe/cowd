@@ -1491,6 +1491,9 @@ mod tests {
     /// of guessing variants until the repetition guard blocks it.
     #[tokio::test]
     async fn corrupted_evidence_suffix_is_refused_with_the_canonical_receipt_named() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         use harness_contract::agent_action::{AgentActorKind, TaskSubmitInput};
         use harness_contract::reality::EvidenceRef;
 

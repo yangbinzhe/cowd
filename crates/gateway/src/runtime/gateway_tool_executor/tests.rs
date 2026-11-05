@@ -58,4 +58,5 @@ mod tests {
     include!("tests/context_retrieval.rs");
     include!("tests/receipts.rs");
     include!("tests/runtime_binding_lifetime.rs");
+    include!("tests/local_network_routing.rs");
 }

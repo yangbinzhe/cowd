@@ -3588,6 +3588,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_nonterminal_scoped_nodes_require_exact_ticket() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         for kind in SCOPED_KINDS {
             let (_root, services) = fixture();
             let graph = single_node_graph(kind);
@@ -3648,6 +3651,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_missing_status_and_waiting_external_are_nonterminal() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         for kind in SCOPED_KINDS {
             let (_root, services) = fixture();
             let mut graph = single_node_graph(kind);
@@ -3692,6 +3698,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_terminal_predecessors_do_not_require_live_backends() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let backend = ReadinessBackend::new();
         let queries = Arc::new(Mutex::new(Vec::new()));
@@ -3718,6 +3727,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_terminal_only_graph_needs_no_live_resolver() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let backend = ReadinessBackend::new();
         let queries = Arc::new(Mutex::new(Vec::new()));
@@ -3753,6 +3765,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_foreign_or_expired_synthesize_resolver_is_not_bound() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let graph = single_node_graph("synthesize");
         let backend = ReadinessBackend::new();
@@ -3772,6 +3787,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_default_attempt_and_agent_executor_semantics_are_preserved() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let mut graph = single_node_graph("tool_batch");
         graph.recovery_cursor.node_attempts.clear();
@@ -3904,6 +3922,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_terminal_predecessor_unbound_synthesize_stays_deferred() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let before = persist_ready_synthesize(&services);
         let backend = ReadinessBackend::new();
@@ -3950,6 +3971,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_partition_keeps_healthy_graph_live_and_blocks_original_failed_graph() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let healthy =
             persist_ready_synthesize_for_session(&services, Some("healthy-recovery-session"));
@@ -4068,6 +4092,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_partition_keeps_original_governed_root_read_receipt() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         use crate::bound_tool_batch::scope_admission_tests::bound_request;
         use crate::execution_core::graph::ExecutionNodeBinding;
         use serde_json::json;
@@ -4240,6 +4267,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_release_missing_graph_propagates_actual_load_error() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let before = persist_ready_synthesize(&services);
         let backend = ReadinessBackend::new();
@@ -4290,6 +4320,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_release_closed_supervisor_retains_closed_gate_and_deferred() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let before = persist_ready_synthesize(&services);
         let backend = ReadinessBackend::new();
@@ -4334,6 +4367,9 @@ mod readiness_tests {
 
     #[tokio::test]
     async fn r1_recovery_bound_synthesize_resumes_original_graph() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_root, services) = fixture();
         let before = persist_ready_synthesize(&services);
         let backend = ReadinessBackend::new();

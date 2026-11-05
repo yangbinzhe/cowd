@@ -1737,6 +1737,100 @@ mod task_claim_verdict_tests {
         assert!(base(AgentAttemptMode::Execute, Some(9_999_999_999_999), 1_000).is_ok());
     }
 
+    /// B9 - the residual claim of an accepted Task authorizes nothing: the
+    /// acceptance is what the authority reads, and the lease the claim
+    /// carries is finite, so the claim cannot become a permanent fence over
+    /// a Task that is already done.
+    #[test]
+    fn the_residual_claim_of_an_accepted_task_authorizes_nothing() {
+        use crate::agentic::work_market::apply_task_attempt_dispatch;
+        use crate::agentic::{AgenticProgramProjection, AgenticTaskProjection};
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptDispatchInput};
+
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task".to_string(),
+            AgenticTaskProjection {
+                task_id: "task".to_string(),
+                team_id: "team".to_string(),
+                title: "task".to_string(),
+                objective: "objective".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                depends_on: Vec::new(),
+                status: crate::agentic::AgenticTaskStatus::Published,
+                claimant: None,
+                claim_generation: 0,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                claim_renewal_streak: 0,
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &TaskAttemptDispatchInput {
+                task_ref: "task".to_string(),
+                execution_id: "agentic-graph:agent".to_string(),
+                agent_ref: "agent-1".to_string(),
+                membership_id: "membership-1".to_string(),
+                mode: AgentAttemptMode::Execute,
+                generation: 0,
+            },
+            1_000,
+        );
+        let task = &projection.tasks["task"];
+        let lease = task.lease_expires_at_ms.expect("the lease");
+        let verdict = ExecutionCommitService::task_claim_verdict(
+            "task",
+            &AgenticTaskStatus::Accepted,
+            &task.team_id,
+            &task.team_id,
+            task.claimant.as_deref(),
+            "agent-1",
+            task.claim_execution_id.as_deref(),
+            task.claim_generation,
+            task.lease_expires_at_ms,
+            false,
+            false,
+            None,
+            "membership-1",
+            "agentic-graph:agent",
+            lease + 1,
+            None,
+        );
+        assert!(
+            verdict
+                .as_ref().err().map(String::as_str)
+                .is_some_and(|reason| reason.starts_with("claim_status_mismatch")),
+            "{verdict:?}"
+        );
+    }
+
     /// The other side of the exemption: a read-only call is exempt only
     /// after the scope checks passed. With the scope checks not passed the
     /// exemption does not apply, so the call is refused as well.
@@ -2138,6 +2232,120 @@ mod task_claim_verdict_tests {
                 "a read that mutates {mutate} never takes the read-only exemption"
             );
         }
+    }
+
+    /// The fence the Execute dispatch writes is what admits an effect, so the
+    /// verdict has to be read against that fence and not against a claim the
+    /// Agent asserted later: the dispatched executor is admitted without a
+    /// separate `task_claim`, and every other Agent on the same Task is still
+    /// refused.
+    #[test]
+    fn the_dispatch_fence_admits_its_own_executor_and_no_other_agent() {
+        use crate::agentic::work_market::apply_task_attempt_dispatch;
+        use crate::agentic::{AgenticProgramProjection, AgenticTaskProjection};
+        use harness_contract::agent_action::TaskAttemptDispatchInput;
+
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task".to_string(),
+            AgenticTaskProjection {
+                task_id: "task".to_string(),
+                team_id: "team".to_string(),
+                title: "task".to_string(),
+                objective: "objective".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                depends_on: Vec::new(),
+                status: AgenticTaskStatus::Published,
+                claimant: None,
+                claim_generation: 0,
+                claim_execution_id: None,
+                claimed_at_ms: None,
+                lease_expires_at_ms: None,
+                claim_renewal_streak: 0,
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &TaskAttemptDispatchInput {
+                task_ref: "task".to_string(),
+                execution_id: "agentic-graph:agent".to_string(),
+                agent_ref: "agent-1".to_string(),
+                membership_id: "membership-1".to_string(),
+                mode: AgentAttemptMode::Execute,
+                generation: 0,
+            },
+            1_000,
+        );
+        let task = &projection.tasks["task"];
+        let live_attempt = task
+            .active_attempts
+            .get("agentic-graph:agent")
+            .expect("the dispatched attempt");
+        let admitted = |agent: &str| {
+            ExecutionCommitService::task_claim_verdict(
+                "task",
+                &task.status,
+                &task.team_id,
+                &task.team_id,
+                task.claimant.as_deref(),
+                agent,
+                task.claim_execution_id.as_deref(),
+                task.claim_generation,
+                task.lease_expires_at_ms,
+                false,
+                false,
+                Some(attempt(
+                    live_attempt.execution_id.as_str(),
+                    live_attempt.agent_id.as_str(),
+                    live_attempt.membership_id.as_str(),
+                    live_attempt.mode,
+                    live_attempt.generation,
+                )),
+                live_attempt.membership_id.as_str(),
+                "agentic-graph:agent",
+                1_000,
+                None,
+            )
+        };
+        assert!(
+            admitted("agent-1").is_ok(),
+            "the dispatched executor is admitted by the dispatch fence alone: {:?}",
+            admitted("agent-1")
+        );
+        assert!(
+            admitted("agent-2")
+                .as_ref()
+                .err()
+                .map(String::as_str)
+                .is_some_and(|reason| reason.starts_with("claim_owner_mismatch")),
+            "another Agent on the same Task is still refused: {:?}",
+            admitted("agent-2")
+        );
     }
 
 }

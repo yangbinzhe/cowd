@@ -4110,8 +4110,19 @@ impl AgentActionService {
                 schema_version: 1,
             });
         }
-        let claim_lease_ms = matches!(envelope.action, AgentAction::TaskClaim(_))
-            .then(super::work_market::claim_lease_ms);
+        // A lease is a duration, not a fact of the moment: recording it with
+        // the action keeps the rebuilt projection's fence on the duration that
+        // was in force when the action was applied.  An Execute dispatch writes
+        // the same fence as a claim, so it records the same duration.
+        let claim_lease_ms = match &envelope.action {
+            AgentAction::TaskClaim(_) => Some(super::work_market::claim_lease_ms()),
+            AgentAction::TaskAttemptDispatch(input)
+                if input.mode == harness_contract::agent_action::AgentAttemptMode::Execute =>
+            {
+                Some(super::work_market::claim_lease_ms())
+            }
+            _ => None,
+        };
         let mut action_payload = json!({
             "envelope": envelope,
             "entity_ref": entity_ref,
@@ -6116,12 +6127,26 @@ fn apply_projection_events(
             .get("entity_ref")
             .and_then(serde_json::Value::as_str);
         projection.apply(&envelope, entity_ref, event.sequence, event.created_at_ms);
-        if let AgentAction::TaskClaim(input) = &envelope.action {
-            if let Some(lease_ms) = recorded_claim_lease_ms(&event.payload)? {
-                if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
-                    task.lease_expires_at_ms = Some(event.created_at_ms.saturating_add(lease_ms));
+        match &envelope.action {
+            AgentAction::TaskClaim(input) => {
+                if let Some(lease_ms) = recorded_claim_lease_ms(&event.payload)? {
+                    if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+                        task.lease_expires_at_ms =
+                            Some(event.created_at_ms.saturating_add(lease_ms));
+                    }
                 }
             }
+            AgentAction::TaskAttemptDispatch(input)
+                if input.mode == harness_contract::agent_action::AgentAttemptMode::Execute =>
+            {
+                if let Some(lease_ms) = recorded_claim_lease_ms(&event.payload)? {
+                    if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+                        task.lease_expires_at_ms =
+                            Some(event.created_at_ms.saturating_add(lease_ms));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())

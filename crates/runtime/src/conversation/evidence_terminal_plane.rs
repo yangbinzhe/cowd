@@ -92,6 +92,9 @@ mod raw_origin_tests {
 
     #[tokio::test]
     async fn raw_writer_cache_checks_actual_bytes_scope_and_staged_access() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_workspace, runtime) = runtime().await;
         let (_, access) = runtime
             .record_tool_raw_evidence(
@@ -274,6 +277,9 @@ mod raw_origin_tests {
     #[tokio::test]
     async fn prepared_raw_writer_checks_original_invocation_and_never_seals_recovery_without_owner()
     {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_workspace, runtime) = runtime().await;
         runtime
             .prepare_governed_tool_result_with_invocation(

@@ -1269,6 +1269,9 @@ impl ApiClient for R1InputBoundaryClient {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn r1_event_replay_host_branch_sources_are_exact() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     use crate::execution_core::graph::executors::{ScopedNodeBackend, SynthesizeBackend};
     for mode in ["block", "continue", "clean", "override", "disposition"] {
         let services = r1_observation_services();
@@ -1924,6 +1927,9 @@ impl ApiClient for R1NarratorFenceClient {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn r1_event_replay_host_after_narration_fence_does_not_emit_before_fence_observation() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     use crate::execution_core::graph::executors::SynthesizeBackend;
     let services = r1_observation_services();
     let session = Session::new();
@@ -2013,6 +2019,9 @@ async fn r1_event_replay_host_after_narration_fence_does_not_emit_before_fence_o
 
 #[tokio::test(flavor = "multi_thread")]
 async fn r1_event_replay_host_upstream_non_sources_do_not_emit() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     use crate::execution_core::graph::executors::ScopedNodeBackend;
     for mode in ["nonterminal", "missing_result", "unsupported_kind"] {
         let services = r1_observation_services();
@@ -2814,6 +2823,9 @@ impl ApiClient for R612InterleavedGoalClient {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn r612_model_producer_rechecks_goal_and_uses_one_observation_cut() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     use crate::execution_core::graph::executors::ScopedNodeBackend;
     for changed_goal in [false, true] {
         let services = r1_observation_services();

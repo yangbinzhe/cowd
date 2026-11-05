@@ -64,6 +64,9 @@ mod r1_root_scope_v2_original_owner {
 
     #[tokio::test]
     async fn root_nonowns_scope_v2_uses_original_toolbatch_owner_for_read_write() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(
             workspace.path().join("input.txt"),
@@ -432,6 +435,9 @@ mod r1_root_scope_v2_original_owner {
 
 #[tokio::test]
 async fn delegated_leaf_does_not_double_acquire_the_single_tool_slot() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     use crate::execution_core::graph::{
         ExecutionResourceKind, ExecutionResourceManager, ResourceQuota, ScopeLockManager,
     };

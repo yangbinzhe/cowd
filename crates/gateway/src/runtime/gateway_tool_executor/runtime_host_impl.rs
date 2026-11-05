@@ -412,7 +412,15 @@ impl GatewayToolExecutor {
                 request.input.clone()
             };
             if request.compiled_invocation.as_ref().is_some_and(|invocation| {
-                invocation.effect.uses_network && !invocation.effect.spawns_process
+                // The property predicate is a necessary condition, not the
+                // routing decision: the joined path implements only the tools
+                // `joined_local_network_tool` names, and the executor enforces
+                // the same set. Reading one function on both sides is what
+                // stops a network read tool from being routed into a path that
+                // cannot run it.
+                invocation.effect.uses_network
+                    && !invocation.effect.spawns_process
+                    && tools::host::joined_local_network_tool(&request.tool_name)
             }) {
                 async {
                     let input = harness_contract::step::parse_strict_json(&effective_input)

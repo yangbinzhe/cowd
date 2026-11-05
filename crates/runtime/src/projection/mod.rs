@@ -758,6 +758,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_projection_395_race_returns_complete_cut_without_replaying_full_history() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         for detail_scope in [ProjectionDetailScope::Full, ProjectionDetailScope::Summary] {
             let (services, backend, graph_id) = r1_history_fixture();
             let body = "public projection body ".repeat(30_000);
@@ -846,6 +849,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_projection_395_real_oversize_still_rejects_without_checkpoint() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let (services, backend, graph_id) = r1_history_fixture();
         for sequence in 0..2 {
             services.event_store().append(crate::RuntimeEventInput {
@@ -1689,6 +1695,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_bounded_history_projection_request_does_not_accumulate_all_pages() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let (services, backend, graph_id) = r1_history_fixture();
         let original_plan = services.graph_state_store().load(&graph_id).unwrap();
         for sequence in 0..1000 {
@@ -1738,6 +1747,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_703_long_history_full_hot_and_durable_reload_preserve_axes_and_bounds() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let (services, backend, graph_id) = r1_history_fixture();
         let query = context(&services);
         let mut latest = snapshot(&services, &graph_id, &query).await.unwrap();
@@ -1775,6 +1787,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_bounded_history_projection_cursor_scope_and_oversize_are_honest() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let (services, backend, graph_id) = r1_history_fixture();
         let query = context(&services);
         let initial = snapshot(&services, &graph_id, &query).await.unwrap();

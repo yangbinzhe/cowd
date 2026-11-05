@@ -2474,6 +2474,9 @@ mod tests {
 
     #[test]
     fn r1_bounded_history_graph_canonical_checkpoint_and_tail_fail_closed() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let (store, plane) = fixture.cold();
         let recovered = store.load_snapshot(&fixture.expected.id).unwrap();
@@ -2527,6 +2530,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_covered_body_is_not_resolved_but_history_still_rejects() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let old = &fixture.checkpoints[0];
         let latest = fixture.checkpoints.last().unwrap();
@@ -2574,6 +2580,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_latest_real_blob_missing_length_and_digest_fail_closed() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let old = &fixture.checkpoints[0];
         let latest = fixture.checkpoints.last().unwrap();
@@ -2603,6 +2612,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_latest_schema_kind_ref_and_identity_negative_matrix() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let latest = fixture.checkpoints.last().unwrap();
         let mut cases = Vec::new();
@@ -2740,6 +2752,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_tail_first_middle_last_and_missing_checkpoint_fail_closed() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let checkpoint = fixture.checkpoints.last().unwrap().sequence;
         for sequence in [checkpoint + 1, checkpoint + 3, fixture.expected.revision] {
@@ -2819,6 +2834,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_frozen_head_paging_and_budget_boundaries_are_honest() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let head = fixture.expected.revision;
         fixture.backend.reads.lock().unwrap().clear();
@@ -2928,6 +2946,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_graph_canonical_binding_conflict_uses_real_history_consumer() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let latest = fixture.checkpoints.last().unwrap();
         let (node_id, binding) = &fixture.bindings[0];
@@ -2998,6 +3019,9 @@ mod tests {
     #[tokio::test]
     async fn r1_graph_canonical_history_bindings_and_unreceipted_effect_are_not_replaced_by_snapshot(
     ) {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         use harness_contract::projection::TerminalEffectSettlement;
         let fixture = CanonicalGraphFixture::new();
         for (node_id, binding) in &fixture.bindings {
@@ -3157,6 +3181,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_graph_canonical_start_checkpoint_binding_and_covered_history_body_are_distinct() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let mut fixture = CanonicalGraphFixture::new();
         let started = fixture.add_started_checkpoint_and_successor();
         for (node_id, binding) in &fixture.bindings {
@@ -3253,6 +3280,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_checkpoint_required_binding_fields_are_not_invented() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let latest = fixture.checkpoints.last().unwrap();
         let (node_id, binding) = &fixture.bindings[0];
@@ -3288,6 +3318,9 @@ mod tests {
 
     #[tokio::test]
     async fn own843_graph_source_view_requires_its_own_fence_and_real_fault_reads() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let source = fixture.backend.source_mutation_fence().unwrap();
         let inner = fixture.backend.inner.source_mutation_fence().unwrap();
@@ -3361,6 +3394,9 @@ mod tests {
 
     #[tokio::test]
     async fn own843_previously_folded_original_metadata_change_is_rejected_on_resume() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let services = fixture.services();
         let first = crate::execution_projection::snapshot(
@@ -3406,6 +3442,9 @@ mod tests {
 
     #[tokio::test]
     async fn own843_foreign_prefix_owner_cannot_supply_current_history() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let original = CanonicalGraphFixture::new();
         let original_services = original.services();
         let first = crate::execution_projection::snapshot(

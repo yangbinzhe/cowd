@@ -972,79 +972,124 @@ mod pre_effect_admission_555 {
 
     #[tokio::test]
     async fn real_host_555_absolute_workspace_root_closes_original_batch_and_releases_successor() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::AbsoluteRoot).await;
     }
 
     #[tokio::test]
     async fn real_host_685_secret_authorization_gap_closes_original_without_dispatch() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::AuthorizationGap).await;
     }
 
     #[tokio::test]
     async fn real_host_685_mixed_secret_gap_and_real_receipt_release_successor() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::MixedAuthorizationGap).await;
     }
 
     #[tokio::test]
     async fn real_host_555_relative_workspace_root_retains_existing_admission_and_receipt() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::RelativeRoot).await;
     }
 
     #[tokio::test]
     async fn root_goal_refusal_closes_original_host_binding_without_a_tool_body_or_provider() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::RootGoalClosed).await;
     }
 
     #[tokio::test]
     async fn real_host_555_pre_effect_scope_rejection_has_original_no_dispatch_not_physical_timeout(
     ) {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::OutsideRoot).await;
     }
 
     #[tokio::test]
     async fn real_host_555_native_body_failure_is_receipted_not_no_dispatch() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::BodyFailure).await;
     }
 
     #[tokio::test]
     async fn real_host_733_body_failure_and_unexecuted_write_close_original_successor() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::BodyFailureBlockedWrite).await;
     }
 
     #[tokio::test]
     async fn real_host_733_scope_refusal_and_unexecuted_write_close_original_successor() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::ScopeRefusalBlockedWrite).await;
     }
 
     #[tokio::test]
     async fn real_host_733_transitive_unexecuted_writes_never_enter_host() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::BodyFailureBlockedChain).await;
     }
 
     #[tokio::test]
     async fn real_host_733_native_typed_pre_effect_refusal_blocks_write_without_dispatch() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain733(Case555::NativePreflightRefusal, true).await;
     }
 
     #[tokio::test]
     async fn real_host_555_mixed_original_receipt_and_refusal_close_only_their_exact_calls() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::Mixed).await;
     }
 
     #[tokio::test]
     async fn real_host_580_missing_session_journal_rejects_raw_publication_after_real_read_receipt()
     {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::MissingSessionJournal).await;
     }
 
     #[tokio::test]
     async fn real_host_580_native_preflight_typed_refusal_closes_original_legacy_batch_without_effect(
     ) {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         original_host_chain555(Case555::NativePreflightRefusal).await;
     }
 
     #[test]
     fn real_host_555_workspace_root_mapping_is_generic_and_does_not_admit_escape() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = PublicationFixture::new();
         let root = std::fs::canonicalize(&fixture.root).unwrap();
         let resolver =
@@ -1187,6 +1232,9 @@ fn original_model_closed518(
 
 #[tokio::test]
 async fn real_host_507_existing_goal_authority_is_pinned_without_redeclaring_completion() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     for interleaved_progress in [false, true] {
         let fixture = PublicationFixture::new();
         let original_goal = fixture
@@ -1301,6 +1349,9 @@ async fn real_host_507_existing_goal_authority_is_pinned_without_redeclaring_com
 
 #[tokio::test]
 async fn real_host_471_independent_goal_source_cas_rejects_stale_terminal_without_writes() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     for (independent_terminal, use_captured_sources) in
         [(true, false), (true, true), (false, false), (false, true)]
     {
@@ -1469,6 +1520,9 @@ async fn real_host_471_independent_goal_source_cas_rejects_stale_terminal_withou
 
 #[tokio::test]
 async fn real_host_471_foreign_pending_terminal_pin_cannot_be_promoted() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let fixture = PublicationFixture::new();
     let (host, _store, _ingress) = claimed_ingress_host(&fixture, false).await;
     let outcome = host.synthesize(&fixture.ticket).await.unwrap();
@@ -1486,6 +1540,9 @@ async fn real_host_471_foreign_pending_terminal_pin_cannot_be_promoted() {
 
 #[tokio::test]
 async fn real_host_471_reserved_publication_tampering_fails_atomically_before_writes() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     for mutation in [
         "actor",
         "session",
@@ -1706,6 +1763,9 @@ async fn claimed_ingress_host_with_prompt(
 
 #[tokio::test]
 async fn real_host_471_stale_ingress_generation_does_not_publish_or_forge_claim() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let fixture = PublicationFixture::new();
     let (host, _store, ingress) = claimed_ingress_host(&fixture, true).await;
     let before = messages(&host).await;
@@ -2173,6 +2233,9 @@ fn rb_machine_json_preserves_explicit_field_language_requirements() {
 
 #[tokio::test]
 async fn rb_actual_api_request_recovery_visibility_and_once() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     #[derive(Clone)]
     struct Capture(Arc<std::sync::Mutex<Vec<crate::ApiRequest>>>);
     impl ApiClient for Capture {
@@ -2240,6 +2303,9 @@ async fn rb_actual_api_request_recovery_visibility_and_once() {
 
 #[tokio::test]
 async fn rb_real_host_rejects_invalid_strict_terminal_before_goal_commit() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let candidate = "```json\n{}\n```";
     let fixture = PublicationFixture::with_original_candidate(candidate);
     let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
@@ -2270,6 +2336,9 @@ async fn rb_real_host_rejects_invalid_strict_terminal_before_goal_commit() {
 
 #[tokio::test]
 async fn rb_human_answer_does_not_require_json() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let fixture = PublicationFixture::with_original_candidate(ORIGINAL_ANSWER);
     let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
     let outcome = host.synthesize(&fixture.ticket).await.unwrap();
@@ -2282,6 +2351,9 @@ async fn rb_human_answer_does_not_require_json() {
 
 #[tokio::test]
 async fn rb_goal_bound_candidate_cannot_be_replaced() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let fixture = PublicationFixture::with_original_candidate(r#"{"path":"original"}"#);
     let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
     {
@@ -2298,6 +2370,9 @@ async fn rb_goal_bound_candidate_cannot_be_replaced() {
 
 #[tokio::test]
 async fn real_host_471_hot_repeated_and_concurrent_after_commit_append_once() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let fixture = PublicationFixture::new();
     let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
     let outcome = host.synthesize(&fixture.ticket).await.unwrap();
@@ -2326,6 +2401,9 @@ async fn real_host_471_hot_repeated_and_concurrent_after_commit_append_once() {
 
 #[tokio::test]
 async fn real_host_471_stale_graph_commit_cannot_publish_or_acknowledge() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let fixture = PublicationFixture::new();
     let host = fixture.host(fixture.services.clone(), fixture.session.clone(), true);
     let outcome = host.synthesize(&fixture.ticket).await.unwrap();
@@ -2366,6 +2444,9 @@ async fn real_host_471_stale_graph_commit_cannot_publish_or_acknowledge() {
 
 #[tokio::test]
 async fn real_host_471_unsatisfied_goal_proof_cannot_be_promoted_by_terminal_text() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let fixture = PublicationFixture::new();
     let blocked_goal_id = format!("471-unsatisfied-{}", uuid::Uuid::new_v4());
     let goal: GoalContract = serde_json::from_value(serde_json::json!({
@@ -2408,6 +2489,9 @@ async fn real_host_471_unsatisfied_goal_proof_cannot_be_promoted_by_terminal_tex
 
 #[tokio::test]
 async fn synthesize_471_terminal_shape_completion_and_usage_are_not_inferred() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_FIXTURE_ROOT") {
+        return;
+    }
     let fixture = PublicationFixture::new();
     let message =
         synthesize_message_value(&ConversationMessage::assistant(vec![ContentBlock::Text {

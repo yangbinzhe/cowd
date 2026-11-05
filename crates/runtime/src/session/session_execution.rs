@@ -1304,6 +1304,9 @@ mod tests {
 
     #[tokio::test]
     async fn ingress_is_durable_and_exactly_once_across_restart_claims() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (store, _services, router) = fixture().await;
         let request = SessionRuntimeOutboxRequest {
             input_id: "i1".to_string(),
@@ -1407,6 +1410,9 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_prevents_second_worker_reclaim_during_long_execution() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (store, services, _router) = fixture().await;
         let request = SessionRuntimeOutboxRequest {
             input_id: "long-i1".into(),
@@ -1546,6 +1552,9 @@ mod tests {
 
     #[tokio::test]
     async fn execution_fence_uses_immutable_claim_epoch_across_revision_changes() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (store, _services, router) = fixture().await;
         let request = SessionRuntimeOutboxRequest {
             input_id: "fence-i1".into(),
@@ -1620,6 +1629,9 @@ mod tests {
 
     #[tokio::test]
     async fn ack_failure_reclaim_reuses_committed_execution_without_repeating_side_effect() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         struct CommittedReceiptExecutor {
             store: Arc<UnifiedSessionStore>,
             executions: AtomicUsize,
@@ -1744,6 +1756,9 @@ mod tests {
     #[tokio::test]
     async fn session_dispatch_routes_into_the_real_target_session_stream_without_fabricating_a_result(
     ) {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (store, services, router) = fixture().await;
         let now = chrono::Utc::now().to_rfc3339();
         store
@@ -1961,6 +1976,9 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_result_uses_the_completed_target_graph_result_and_usage() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (store, services, router) = fixture().await;
         let now = chrono::Utc::now().to_rfc3339();
         store

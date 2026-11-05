@@ -3828,6 +3828,9 @@ mod tests {
 
     #[tokio::test]
     async fn initial_goal_binding_survives_runtime_reconstruction_without_reinterpreting_input() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         use harness_contract::turn::{SessionInputUserSource, SESSION_INPUT_USER_SOURCE_KEY};
         let workspace = tempfile::tempdir().unwrap();
         let events = Arc::new(RuntimeEventStore::for_test());
@@ -5265,6 +5268,9 @@ mod tests {
 
     #[test]
     fn r1_event_replay_current_schema_recovers_and_rejects_legacy() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let root = std::path::PathBuf::from(
             std::env::var_os("COWD_R1_06_FIXTURE_ROOT")
                 .expect("explicit private plan fixture root"),

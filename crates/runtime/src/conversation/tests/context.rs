@@ -504,11 +504,17 @@ impl ApiClient for PromptRecordingApi {
 
 #[tokio::test]
 async fn first_model_step_activates_skill_persists_bridge_and_injects_asset() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     verify_first_model_skill_activation(None).await;
 }
 
 #[tokio::test]
 async fn missing_or_wrong_version_second_skill_never_leaks_partial_prompt_or_tool_exposure() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     for failure in ["missing", "version"] {
         verify_first_model_skill_activation(Some(failure)).await;
     }
@@ -1769,6 +1775,9 @@ async fn successful_session_tools_are_rehydrated_on_the_next_user_turn() {
 
 #[tokio::test]
 async fn dynamic_tool_exposure_defers_schema_until_discovery_activation() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
     let request_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
     let api = DynamicExposureApi {
@@ -2140,6 +2149,9 @@ fn stable_prefix_metrics_track_wire_identity_and_provider_native_cache() {
 
 #[tokio::test]
 async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let artifact_root = tempfile::tempdir().unwrap();
     let store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
@@ -2313,6 +2325,9 @@ async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
 
 #[tokio::test]
 async fn governed_tool_result_never_publishes_durable_access_after_raw_store_failure() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let runtime = ConversationRuntime::new(
         Session::new(),
         MockApi,
@@ -2345,6 +2360,9 @@ async fn governed_tool_result_never_publishes_durable_access_after_raw_store_fai
 
 #[tokio::test]
 async fn context_turn_report_is_durable_before_runtime_exposes_it() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
     let session_id = session.session_id.clone();
@@ -2396,6 +2414,9 @@ async fn context_turn_report_is_durable_before_runtime_exposes_it() {
 
 #[tokio::test]
 async fn large_context_envelope_is_canonical_and_artifact_backed() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
     let session_id = session.session_id.clone();
@@ -2492,6 +2513,9 @@ async fn large_context_envelope_is_canonical_and_artifact_backed() {
 
 #[tokio::test]
 async fn context_turn_report_write_failure_does_not_expose_a_successful_report() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let runtime = ConversationRuntime::new(
         Session::new(),
@@ -2518,6 +2542,9 @@ async fn context_turn_report_write_failure_does_not_expose_a_successful_report()
 
 #[tokio::test]
 async fn compaction_event_failure_is_terminal_and_does_not_claim_durable_recovery() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let runtime = ConversationRuntime::new(
         Session::new(),

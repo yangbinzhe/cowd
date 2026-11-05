@@ -20,7 +20,11 @@ mod roster;
 pub(crate) mod supervision;
 mod topic;
 pub(crate) mod topic_delivery;
-mod work_market;
+// Crate-visible so the admission authority's own test can build the claim
+// fence with the production writer instead of a copy of it: a negative
+// control that asserts against a hand-written claim proves nothing about
+// the fence the dispatch actually writes.
+pub(crate) mod work_market;
 
 pub(crate) use action_service::{
     validate_receipt_index_record, AgenticTopicObservationAck, AgenticWaitDisposition,

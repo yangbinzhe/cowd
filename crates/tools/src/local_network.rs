@@ -6,6 +6,22 @@ use sha2::{Digest, Sha256};
 
 const MAX_LOCAL_NETWORK_OPERATIONS: usize = 400;
 
+/// Whether the joined local-network path implements this tool.
+///
+/// The joined path mints one `LocalNetworkFact` for a whole call, so it is only
+/// correct for the tools it actually implements. The router and the executor
+/// both read this one function, so a tool can never be routed into a path that
+/// does not implement it: before it existed the router decided on the effect
+/// property alone (`uses_network && !spawns_process`) while the executor decided
+/// on the tool name, so every network read tool other than `web_fetch` was
+/// routed here and could only fail.
+///
+/// `uses_network && !spawns_process` stays a necessary condition on top of
+/// this; it is not a substitute for it.
+pub fn joined_local_network_tool(tool: &str) -> bool {
+    matches!(tool, "web_fetch" | "tool_orchestrate")
+}
+
 #[derive(Debug, Default)]
 pub(super) struct LocalNetworkTrace {
     operations: Vec<LocalNetworkOperation>,
@@ -23,7 +39,7 @@ impl ToolHostLease {
         };
         let effect = self.describe_effect(tool, input);
         if effect.spawns_process
-            || (effect.uses_network && !matches!(tool, "web_fetch" | "tool_orchestrate"))
+            || (effect.uses_network && !joined_local_network_tool(tool))
         {
             trace
                 .lock()
@@ -119,8 +135,18 @@ impl ToolHostLease {
         let effect_key = harness_contract::step::canonical_digest(
             "step-effect-identity", &serde_json::json!([session_id, origin.origin_step_id, origin.call_id]),
         ).map_err(|error| failure(&error.to_string()))?;
-        if !matches!(canonical.as_str(), "web_fetch" | "tool_orchestrate")
-            || !effect.uses_network
+        // The tool name is checked on its own so an unimplemented tool is named
+        // as such instead of being reported as a binding mismatch. Everything
+        // below is the identity proof for a call this path does implement.
+        // Both the name the router saw and the name this path canonicalized to
+        // must be in the implemented set. The router's value is checked here as
+        // well so a canonicalization that renames the tool cannot make the two
+        // sides disagree about what is accepted: this side stays the stricter
+        // one, and a mismatch fails closed with the named reason.
+        if !joined_local_network_tool(tool_id) || !joined_local_network_tool(&canonical) {
+            return Err(failure("local network joined path does not implement this tool"));
+        }
+        if !effect.uses_network
             || effect.spawns_process
             || input_digest.strip_prefix("sha256:") != Some(binding.input_sha256.as_str())
             || descriptor_digest.strip_prefix("sha256:") != Some(binding.descriptor_sha256.as_str())

@@ -8333,6 +8333,9 @@ pub(crate) mod requested_cancellation_source_tests {
     #[tokio::test]
     async fn production_requested_source_confirms_historical_authorization_but_rejects_revoked_physical_claim(
     ) {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, control, receipt, ingress, store) =
             live_requested_fixture_with_store(root.path()).await;
@@ -8392,6 +8395,9 @@ pub(crate) mod requested_cancellation_source_tests {
 
     #[tokio::test]
     async fn revoke_before_authorization_commits_no_authorization_and_signals_no_control() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, control, receipt, ingress, store) =
             live_requested_fixture_with_store(root.path()).await;
@@ -8439,6 +8445,9 @@ pub(crate) mod requested_cancellation_source_tests {
 
     #[tokio::test]
     async fn authorization_commit_before_revoke_delays_notification_to_only_original_control() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, control, receipt, ingress, store) =
             live_requested_fixture_with_store(root.path()).await;
@@ -8659,6 +8668,9 @@ pub(crate) mod requested_cancellation_source_tests {
 
     #[tokio::test]
     async fn replay_preserves_original_source_and_foreign_id_is_rejected() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, control, receipt, _) = live_requested_fixture(root.path()).await;
         let original = authorized_fixture_source(&services, &control, &receipt).await;
@@ -8704,6 +8716,9 @@ pub(crate) mod requested_cancellation_source_tests {
 
     #[tokio::test]
     async fn operational_first_never_becomes_requested() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, control, receipt, _) = live_requested_fixture(root.path()).await;
         control.signal_operational();
@@ -8723,6 +8738,9 @@ pub(crate) mod requested_cancellation_source_tests {
 
     #[tokio::test]
     async fn released_original_control_rejects_source_reverification() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, control, receipt, _) = live_requested_fixture(root.path()).await;
         let source = {
@@ -8765,6 +8783,9 @@ pub(crate) mod requested_cancellation_source_tests {
 
     #[tokio::test]
     async fn replacement_control_and_unbound_control_reject_original_authorization() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, original, receipt, ingress) = live_requested_fixture(root.path()).await;
         let source = authorized_fixture_source(&services, &original, &receipt).await;
@@ -9029,6 +9050,9 @@ mod requested_cancellation_unknown_recovery_tests {
 
     #[tokio::test]
     async fn generic_write_error_and_real_none_remain_requested_in_same_tick_reconcile() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, control, receipt, store, _journal) =
             fault_fixture(root.path(), JournalFault::BeforeAppend).await;
@@ -9090,6 +9114,9 @@ mod requested_cancellation_unknown_recovery_tests {
 
     #[tokio::test]
     async fn injected_owner_result_loss_confirms_one_row_and_protected_final_replay() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (services, control, receipt, store, _journal) =
             fault_fixture(root.path(), JournalFault::LostResult).await;
@@ -9208,6 +9235,9 @@ mod requested_cancellation_unknown_recovery_tests {
 
     #[tokio::test]
     async fn queued_original_write_real_none_is_unknown_until_owned_task_commits() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let queued = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());

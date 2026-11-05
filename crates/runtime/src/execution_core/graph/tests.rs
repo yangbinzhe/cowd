@@ -2529,6 +2529,9 @@ fn malformed_session_terminal_cannot_commit_a_graph_without_an_outbox_row() {
 
 #[test]
 fn non_agentic_terminal_cannot_borrow_another_graphs_session() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
     let mut graph = test_graph("terminal Session belongs to Graph lineage");
@@ -3647,6 +3650,9 @@ fn r1_ref_fixture() -> (
 
 #[test]
 fn r1_event_replay_ref_write_retains_source_cas() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, artifacts, commits, graph) = r1_ref_fixture();
     let goals = crate::execution_core::GoalStore::new(events.clone());
     let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
@@ -3717,6 +3723,9 @@ fn r1_event_replay_ref_write_retains_source_cas() {
 
 #[test]
 fn r1_event_replay_current_retry_is_idempotent_and_rejects_legacy_transactions() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, _artifacts, commits, graph) = r1_ref_fixture();
     let first = commits
         .transition_node(&graph, "a", ExecutionNodeStatus::Ready, None, Vec::new())
@@ -3764,6 +3773,9 @@ fn r1_event_replay_current_retry_is_idempotent_and_rejects_legacy_transactions()
 
 #[test]
 fn r1_content_gc_committed_ref_survives_crash_before_pin_promotion() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, artifacts, commits, graph) = r1_ref_fixture();
     let event = events.latest_for_stream(&graph.id).unwrap().unwrap();
     let reference: harness_contract::context::ArtifactRef =
@@ -3802,6 +3814,9 @@ fn r1_content_gc_committed_ref_survives_crash_before_pin_promotion() {
 
 #[test]
 fn r1_content_gc_prepared_failure_reconciles_real_source_cas() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, artifacts, commits, graph) = r1_ref_fixture();
     let goals = crate::execution_core::GoalStore::new(events.clone());
     let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
@@ -3918,6 +3933,9 @@ fn r1_content_gc_prepared_failure_reconciles_real_source_cas() {
 
 #[test]
 fn r1_content_gc_all_submission_facades_revalidate_retired_slots() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, artifacts, _commits, graph) = r1_ref_fixture();
     let goals = crate::execution_core::GoalStore::new(events.clone());
     let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({

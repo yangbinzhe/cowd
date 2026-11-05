@@ -125,6 +125,71 @@ mod fixture_cache_tests {
 
 }
 
+/// Test hygiene: turn an absent private environment into a clean skip.
+///
+/// The isolated PostgreSQL instance (`COWD_TEST_POSTGRES_URL`) and the private
+/// fixture roots (`COWD_R1_06_FIXTURE_ROOT`, `COWD_TEST_FIXTURE_ROOT`) are
+/// optional environments. A test that needs one of them cannot run when it is
+/// absent, but that is an absent environment and not a product verdict, so it
+/// must not be reported as a failure.
+///
+/// The caller returns early when this returns `true`. The gate is inert when
+/// the environment *is* present, so any product judgement inside the same test
+/// is still exercised and still fails when it is wrong.
+#[track_caller]
+pub(crate) fn skip_if_env_absent(var: &str) -> bool {
+    if std::env::var_os(var).is_some() {
+        return false;
+    }
+    eprintln!("COWD_TEST_SKIPPED: {var} is absent; this test needs a private environment");
+    record_absent_environment_skip(var);
+    true
+}
+
+/// Serialize the skip log so parallel tests cannot interleave half-written
+/// lines. One process, one log, one writer at a time.
+fn skip_log_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Record one absent-environment skip so a run can prove how many tests
+/// skipped and for which variable. The record is written only when the runner
+/// asks for it through `COWD_TEST_SKIP_LOG`; otherwise the marker stays on
+/// stderr only.
+///
+/// The whole record is assembled into one string and written with a single
+/// `write_all` under a process-level lock: a formatted write issues several
+/// writes, and under parallel tests those pieces interleave into torn lines.
+#[track_caller]
+fn record_absent_environment_skip(var: &str) {
+    let Ok(path) = std::env::var("COWD_TEST_SKIP_LOG") else {
+        return;
+    };
+    use std::io::Write;
+    let thread = std::thread::current();
+    let test = match thread.name() {
+        Some(name) => name.to_string(),
+        None => {
+            let caller = std::panic::Location::caller();
+            format!("{}:{}", caller.file(), caller.line())
+        }
+    };
+    let line = format!("{test}\t{var}\n");
+    let guard = match skip_log_lock().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+    drop(guard);
+}
+
 /// Build a complete Session contract over an isolated PostgreSQL schema.
 /// Test runners remove `cowdrt_*` schemas after the process exits.
 pub(crate) fn session_store() -> UnifiedSessionStore {

@@ -201,7 +201,7 @@ impl AgenticProgramProjection {
                 super::work_market::apply_task_withdraw(self, envelope, input)
             }
             AgentAction::TaskAttemptDispatch(input) => {
-                super::work_market::apply_task_attempt_dispatch(self, input)
+                super::work_market::apply_task_attempt_dispatch(self, input, applied_at_ms)
             }
             AgentAction::TaskAttemptFail(input) => {
                 super::work_market::apply_task_attempt_fail(self, input)

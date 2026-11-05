@@ -466,6 +466,9 @@ fn r304_diagnostic_request_fixture(
 
 #[tokio::test]
 async fn begin_epoch_recovers_packed_and_outcome_after_restart() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     #[derive(Clone)]
     struct NoopApi;
 
@@ -671,6 +674,9 @@ fn provider_retry_fence_activates_for_prior_or_same_attempt_effect_receipt() {
 }
 #[tokio::test]
 async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let session_store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
     let session_id = session.session_id.clone();
@@ -2504,6 +2510,9 @@ async fn stale_session_execution_fence(
 
 #[tokio::test]
 async fn stale_session_fence_blocks_provider_before_transport_side_effect() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     #[derive(Clone)]
     struct CountingApi(Arc<AtomicUsize>);
     impl ApiClient for CountingApi {
@@ -2542,6 +2551,9 @@ async fn stale_session_fence_blocks_provider_before_transport_side_effect() {
 
 #[tokio::test]
 async fn stale_session_fence_blocks_tool_before_executor_side_effect() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
     let fence = stale_session_execution_fence("fence-tool", "request-tool").await;
@@ -3291,6 +3303,9 @@ async fn a_second_provider_overflow_exits_after_one_calibrated_recompile() {
 
 #[tokio::test]
 async fn selected_navigation_checks_durable_source_before_injecting_any_summary() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let session_id = "source-bound-navigation";
     store
@@ -3566,6 +3581,9 @@ fn semantic_checkpoint_id_is_stable_and_boundary_specific() {
 
 #[tokio::test]
 async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_turns() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let tmp = tempfile::tempdir().expect("temp memory root");
     let manager = Arc::new(
         CognitiveContextManager::new_ephemeral(memory::config::MemoryConfig {
@@ -4568,6 +4586,9 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
 
 #[tokio::test]
 async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let executions = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&executions);
     let session = Session::new();
@@ -5932,6 +5953,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn nested_read_real_host_wire_emits_only_actual_children() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let fixture = NativeFixture::new(Some("alpha\nbeta\n"), "none").await;
         fs::write(fixture._workspace.path().join("other.txt"), "gamma\ndelta\n").unwrap();
         let program = serde_json::json!({"steps":[{"id":"reads","op":"batch","calls":[
@@ -6081,6 +6105,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn r1_read_delivery_native_complete_and_preview_keep_original_identity() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let large = (0..12_000)
             .map(|index| format!("source row {index:05}: exact retained native body\n"))
             .collect::<String>();
@@ -6140,6 +6167,9 @@ mod r1_native_real_wire {
     /// result looks like it never read it.
     #[tokio::test]
     async fn r1_observed_input_survives_a_refused_output_frame() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let fixture = NativeFixture::new(Some("original source\n"), "none").await;
         fixture.server.reject_output.store(true, Ordering::SeqCst);
         let (mut fixture, call) = fixture.run_root_host(false).await;
@@ -6190,6 +6220,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn r1_read_delivery_native_failed_wire_or_confirmation_cannot_promote() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         for (recipient, fault) in ["none", "task_graph"].into_iter().flat_map(|recipient| {
             [
                 "packed",
@@ -6339,6 +6372,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn r1_read_delivery_root_none_and_task_graph_use_original_owner() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let large = (0..12_000)
             .map(|index| format!("root row {index:05}: original unabridged body\n"))
             .collect::<String>();
@@ -6440,6 +6476,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn r1_read_delivery_root_foreign_owner_step_or_ticket_cannot_promote() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         for recipient in ["none", "task_graph"] {
             for foreign in [
                 "owner_event",
@@ -6575,6 +6614,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn own836_native_writer_rejects_foreign_original_node_and_input() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let fixture = NativeFixture::new(Some("actual native source\n"), "task_graph").await;
         let (fixture, call) = fixture.run_root_host(false).await;
         let _scope = fixture

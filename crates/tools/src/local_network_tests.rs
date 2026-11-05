@@ -235,3 +235,68 @@ async fn own823n_distinct_step_effect_and_signed_call_namespaces_are_independent
         lease.execute_joined_local_network(&optional, "web_fetch", &input.to_string(), binding, "801-session", &origin()).await.unwrap();
     }
 }
+
+/// The joined path's acceptance set, in one place. Two tools are implemented and
+/// the rest are not; the router and the executor both read this, so a tool can
+/// never be routed into a path that cannot run it.
+#[test]
+fn the_joined_path_implements_exactly_two_tools() {
+    for tool in ["web_fetch", "tool_orchestrate"] {
+        assert!(joined_local_network_tool(tool), "{tool}");
+    }
+    for tool in ["web_search", "remote_trigger", "read_file", "bash", "execute_code", ""] {
+        assert!(!joined_local_network_tool(tool), "{tool}");
+    }
+}
+
+/// The property predicate is a necessary condition, never the routing decision:
+/// a network read tool that the joined path does not implement must not be
+/// accepted by the property alone.
+#[test]
+fn the_property_predicate_is_not_the_routing_decision() {
+    for tool in ["web_search", "remote_trigger"] {
+        let effect = ToolHost::builtin("r1-localnet-router", std::env::temp_dir())
+            .pin_snapshot()
+            .describe_effect(tool, &serde_json::json!({"query": "r1"}));
+        assert!(effect.uses_network, "{tool} claims a network effect");
+        assert!(!effect.spawns_process, "{tool} spawns no process");
+        assert!(
+            !joined_local_network_tool(tool),
+            "{tool} satisfies the property but the joined path does not implement it"
+        );
+    }
+}
+
+/// Normalization happens before the routing decision: the gateway resolves the
+/// canonical tool name first and routes on that, so a separator or case variant
+/// of a joined tool still lands in the joined path and a variant of a
+/// non-joined tool still does not. Without this, a future joined caller that
+/// skips normalization would silently drift from the executor's acceptance set.
+#[test]
+fn a_spelling_variant_normalizes_before_the_routing_decision() {
+    let lease = ToolHost::builtin("r1-localnet-variant", std::env::temp_dir()).pin_snapshot();
+    let snapshot = lease.snapshot();
+    for (requested, expected, joined) in [
+        ("web_fetch", "web_fetch", true),
+        ("web-fetch", "web_fetch", true),
+        ("WEB-FETCH", "web_fetch", true),
+        ("WebFetch", "web_fetch", true),
+        ("tool_orchestrate", "tool_orchestrate", true),
+        ("tool-orchestrate", "tool_orchestrate", true),
+        ("web_search", "web_search", false),
+        ("web-search", "web_search", false),
+        ("websearch", "web_search", false),
+        ("tool-search", "tool_search", false),
+    ] {
+        let canonical = snapshot
+            .catalog
+            .canonical_name(requested)
+            .unwrap_or_else(|| panic!("{requested} must resolve"));
+        assert_eq!(canonical, expected, "{requested}");
+        assert_eq!(
+            joined_local_network_tool(&canonical),
+            joined,
+            "{requested} resolves to {canonical}, whose joined membership must match"
+        );
+    }
+}

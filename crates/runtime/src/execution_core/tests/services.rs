@@ -667,6 +667,9 @@ async fn generalized_episode_set_executable_baseline() {
 
 #[tokio::test]
 async fn paired_skill_executes_native_writes_and_reads_in_distinct_runtime_leases() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     episode_set_pair(true).await;
 }
 
@@ -2413,6 +2416,9 @@ fn explicit_toml_import_is_runtime_owned_and_never_enters_runnable_catalog() {
 
 #[test]
 fn builder_rejects_partial_session_port_sets() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let store = Arc::new(crate::test_support::session_store());
     let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store);
@@ -2428,6 +2434,9 @@ fn builder_rejects_partial_session_port_sets() {
 
 #[tokio::test]
 async fn session_integrated_runtime_holds_all_autonomous_producers_until_recovery_release() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("producer-gate");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -2554,6 +2563,9 @@ async fn session_integrated_runtime_holds_all_autonomous_producers_until_recover
 
 #[test]
 fn workspace_builders_isolate_provider_tool_host_and_session_router() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let left_provider = Arc::new(crate::ProviderRegistry::empty());
     let right_provider = Arc::new(crate::ProviderRegistry::empty());
@@ -2622,6 +2634,9 @@ fn workspace_builders_isolate_provider_tool_host_and_session_router() {
 
 #[tokio::test]
 async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let timestamp = chrono::Utc::now().to_rfc3339();
     store
@@ -3265,6 +3280,9 @@ async fn startup_recovery_rejects_missing_lineage_before_any_durable_mutation() 
 
 #[tokio::test]
 async fn startup_recovery_does_not_resolve_handoff_for_an_excluded_session() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     let cowd_home = temp.path().join("home");

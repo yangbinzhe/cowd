@@ -364,6 +364,10 @@ impl std::fmt::Debug for ToolHostLease {
 #[path = "local_network.rs"]
 mod local_network;
 
+/// Re-exported so the gateway router and the joined executor read the same
+/// acceptance set instead of each deriving its own.
+pub use local_network::joined_local_network_tool;
+
 /// Why one child effect of an orchestrated program could not be resolved.
 ///
 /// `InvalidInput` means the child's own input violates its contract: the call
