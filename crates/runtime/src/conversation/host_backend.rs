@@ -8,6 +8,19 @@ use crate::execution_core::goal::{
     GoalWriteDisposition, PreparedUserGoalApplication,
 };
 
+/// The call identity a governed grant carries for one batch member.
+///
+/// `ToolPolicy::authorize` copies this value into the lease's idempotency key,
+/// and the durable local-network binding compares both against this call's own
+/// `tool_use_id` (`local_network.rs:58-59`), so the bare call id is the
+/// contract. A composite spelling once reached the grant from here and made
+/// every network effect on this path unclosable; nothing in the tree
+/// decomposes this value, and the attempt is already carried by the ticket and
+/// by the effect's own key.
+fn original_call_request_id(call_id: &str) -> String {
+    call_id.to_string()
+}
+
 impl<C: ApiClient + Send + Sync + 'static, T: ToolExecutor> TurnModelStepBackend<C, T> {
     async fn resume_user_input_application(
         &self,
@@ -9091,7 +9104,7 @@ where
                             );
                             continue;
                         }
-                        let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
+                        let request_id = original_call_request_id(&call.id);
                         let mut bound_request = governed_compilation.as_ref().ok()
                             .and_then(|compilation| compilation.plan.as_ref())
                             .and_then(|plan| plan.tasks.iter().find(|task| task.tool_call_id == call.id).map(|task| (plan, task)))
@@ -12809,5 +12822,31 @@ mod original_program_visibility_tests {
         let outcome = store.append_transaction(request);
         assert!(matches!(outcome, Err(crate::RuntimeEventStoreError::StaleRevision { .. })),
             "a Program write after the declared head must fail the node transaction closed");
+    }
+}
+
+#[cfg(test)]
+mod original_call_request_id_tests {
+    use super::original_call_request_id;
+
+    /// The producer side of the grant call-identity contract. The Host must
+    /// spell the call identity as the bare call id, because the durable
+    /// local-network binding compares the grant and its lease against this
+    /// call's own `tool_use_id`. A composite spelling reaches the grant and
+    /// makes every network effect on this path unclosable.
+    #[test]
+    fn the_host_spells_the_call_identity_as_the_bare_call_id() {
+        assert_eq!(original_call_request_id("chatcmpl-tool-1"), "chatcmpl-tool-1");
+    }
+
+    /// The regression guard: the composite that once reached the grant must not
+    /// come back, in any of the shapes this tree uses elsewhere.
+    #[test]
+    fn no_composite_spelling_reaches_the_grant() {
+        for call in ["chatcmpl-tool-1", "call-2", "801-call"] {
+            let spelled = original_call_request_id(call);
+            assert_eq!(spelled, call, "{call}");
+            assert!(!spelled.contains(':'), "{spelled}");
+        }
     }
 }

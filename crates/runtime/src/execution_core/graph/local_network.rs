@@ -337,9 +337,43 @@ impl ExecutionCommitService {
         outcome: &crate::RuntimeToolExecutionOutcome,
         effect: &ToolEffectDescriptor,
     ) -> bool {
+        Self::local_network_refusal_reason(outcome, effect).is_none()
+    }
+
+    /// Why the local-network closure predicate refused this outcome. `None`
+    /// means the predicate accepts it. The verdict is unchanged; this only
+    /// names the dimension, because one generic wording sent investigations
+    /// toward process reaping even when the effect was a network call that
+    /// never produced an observation.
+    pub(crate) fn local_network_refusal_reason(
+        outcome: &crate::RuntimeToolExecutionOutcome,
+        effect: &ToolEffectDescriptor,
+    ) -> Option<&'static str> {
         let observed = facts(outcome);
         if observed.is_empty() {
-            return !effect.spawns_process && !effect.uses_network;
+            // No network fact at all. The predicate accepts an effect that
+            // claims neither a process nor a network dimension; anything that
+            // does claim one is refused, and the name says which dimension.
+            //
+            // A *failed* outcome with no fact is a third condition, and it is
+            // not the same as a completed one: the call reports that it did
+            // not finish. It still stays refused, because a receipt that
+            // carries no operations list cannot prove that nothing was sent
+            // before the failure. Only evidence proves that, and the evidence
+            // is a fact whose operations are all pre-send refusals, which the
+            // per-operation branch below already accepts. Naming the case is
+            // what lets the next run tell the two apart.
+            if !effect.spawns_process && !effect.uses_network {
+                return None;
+            }
+            if effect.uses_network {
+                return Some(if matches!(outcome.status, crate::RuntimeToolExecutionStatus::Failed) {
+                    "network_effect_failed_without_observation"
+                } else {
+                    "network_effect_without_observation"
+                });
+            }
+            return Some("process_effect_without_observation");
         }
         if effect.spawns_process
             || !effect.uses_network
@@ -351,27 +385,46 @@ impl ExecutionCommitService {
                 )
             })
         {
-            return false;
+            if effect.spawns_process {
+                return Some("process_effect_with_network_observation");
+            }
+            if !effect.uses_network {
+                return Some("network_observation_on_non_network_effect");
+            }
+            if observed.len() != 1 {
+                return Some("network_observation_count_invalid");
+            }
+            return Some("process_and_network_facts_mixed");
         }
         let fact = observed[0];
-        fact.version == 1
-            && fact.host_joined
-            && fact.coverage_complete
-            && !fact.operations.is_empty()
-            && fact.operations.len() <= 400
-            && fact
+        if fact.version != 1 {
+            return Some("network_observation_version_invalid");
+        }
+        if !fact.host_joined {
+            return Some("network_observation_host_not_joined");
+        }
+        if !fact.coverage_complete {
+            return Some("network_observation_incomplete");
+        }
+        if fact.operations.is_empty() {
+            return Some("network_observation_without_operations");
+        }
+        if fact.operations.len() > 400 {
+            return Some("network_observation_over_budget");
+        }
+        fact
                 .operations
                 .iter()
                 .enumerate()
-                .all(|(position, operation)| {
-                    operation.ordinal as usize == position + 1
-                        && operation.input_sha256.len() == 64
-                        && operation
+                .find_map(|(position, operation)| {
+                    let operation_invalid = operation.ordinal as usize != position + 1
+                        || operation.input_sha256.len() != 64
+                        || !operation
                             .input_sha256
                             .bytes()
                             .all(|byte| byte.is_ascii_hexdigit())
-                        && !operation.endpoint.trim().is_empty()
-                        && match &operation.terminal {
+                        || operation.endpoint.trim().is_empty()
+                        || !match &operation.terminal {
                             LocalNetworkTerminal::BodyDone {
                                 status,
                                 body_sha256,
@@ -386,7 +439,8 @@ impl ExecutionCommitService {
                                 "network_policy_before_send" | "network_url_policy_before_send"
                             ),
                             LocalNetworkTerminal::Unknown { .. } => false,
-                        }
+                        };
+                    operation_invalid.then_some("network_observation_operation_invalid")
                 })
     }
 

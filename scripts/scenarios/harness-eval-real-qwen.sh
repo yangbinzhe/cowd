@@ -541,6 +541,23 @@ try:
     path=pathlib.Path(root)/'u5-final-acceptance.v1.json'
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     with os.fdopen(fd,'w') as out: json.dump(result,out);out.flush();os.fsync(out.fileno())
+    # The harness exited before the outer cleanup could be observed, so its own
+    # report says false and stays false. The observation this run actually made
+    # is recorded here instead, next to the harness report, and it exists only
+    # because the receipt above was produced and every check in this finalizer
+    # passed. A missing source is never an observation.
+    receipt,receipt_sha=read(path,65536,0o600)
+    need(receipt==result and receipt['status']=='passed','final receipt did not survive its own write')
+    observation=dict(schema_version=1,outer_cleanup_observed=True,
+        v1_receipt_sha256=receipt_sha,harness_report_sha256=report_sha,
+        inner_receipt_sha256=inner_sha,cleanup_result_sha256=cleanup_sha,
+        shutdown_validation_sha256=v1_sha,shutdown_receipt_sha256=v1['receipt_sha256'],
+        host_sha256=host_sha,scope=result['scope'],run_id=result['run_id'],owner=owner,
+        unreaped_zombies=cleanup.get('unreaped_zombies'),
+        remaining_owned=cleanup['remaining_owned'],launcher_exit_status=0)
+    observed=report_path.parent/'u5-outer-observation.v1.json'
+    fd=os.open(observed,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'w') as out: json.dump(observation,out,sort_keys=True);out.flush();os.fsync(out.fileno())
 except Exception as error:
     print('U5 final receipt rejected: '+str(error),file=sys.stderr);raise SystemExit(1)
 PYFINAL

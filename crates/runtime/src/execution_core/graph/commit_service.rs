@@ -11630,52 +11630,28 @@ impl ExecutionCommitService {
             .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
     }
 
-    /// Which ring a member whose physical closure did not hold belongs to.
-    ///
-    /// A member whose closure was decided on the local-network evidence path
-    /// is named on that path, so the next reader does not spend the
-    /// investigation looking for an unreaped process. The routing is the same
-    /// one `lease_recovery_process_closed` makes, so choosing the name cannot
-    /// change the judgement.
-    fn physical_closure_ring(
-        outcome: &crate::RuntimeToolExecutionOutcome,
-        effect: &ToolEffectDescriptor,
-        counts: &str,
-    ) -> (&'static str, String) {
-        use harness_contract::context::EvidenceTargetIdentity;
-        let on_network_path = outcome
-            .observed_evidence
-            .iter()
-            .any(|observed| matches!(observed.target, EvidenceTargetIdentity::LocalNetwork { .. }))
-            || outcome
-                .observed_evidence
-                .iter()
-                .all(|observed| !matches!(observed.target, EvidenceTargetIdentity::ToolExecution { .. }));
-        if on_network_path {
-            (
-                "network_effect_without_observation",
-                format!(
-                    "network_effect_without_observation uses_network={} observed_evidence={} outcome_status={:?}{}",
-                    effect.uses_network,
-                    outcome.observed_evidence.len(),
-                    outcome.status,
-                    counts
-                ),
-            )
-        } else {
-            ("process_not_closed", format!("process_not_closed {counts}"))
-        }
-    }
-
     fn lease_recovery_process_closed(
         outcome: &crate::RuntimeToolExecutionOutcome,
         effect: &ToolEffectDescriptor,
     ) -> bool {
+        Self::closure_refusal_reason(outcome, effect).is_none()
+    }
+
+    /// Which dimension of the physical-closure predicate refused this outcome.
+    /// `None` means the predicate accepts it. Diagnostics only: the verdict,
+    /// the fail-closed behavior and every permission are untouched, and this
+    /// reads exactly the facts the predicate reads. The predicate decides;
+    /// this only says which dimension decided it, so a run stops reporting
+    /// process reaping for a network call that never produced an observation.
+    fn closure_refusal_reason(
+        outcome: &crate::RuntimeToolExecutionOutcome,
+        effect: &ToolEffectDescriptor,
+    ) -> Option<&'static str> {
         use harness_contract::context::{EvidenceTargetIdentity, ToolExecutionTerminal};
         if outcome.observed_evidence.iter().any(|observed| matches!(
             observed.target, EvidenceTargetIdentity::LocalNetwork { .. }
         )) {
-            return Self::local_network_closed(outcome, effect);
+            return Self::local_network_refusal_reason(outcome, effect);
         }
         let facts = outcome
             .observed_evidence
@@ -11686,32 +11662,40 @@ impl ExecutionCommitService {
             })
             .collect::<Vec<_>>();
         if facts.is_empty() {
-            return Self::local_network_closed(outcome, effect);
+            return Self::local_network_refusal_reason(outcome, effect);
         }
-        facts.len() == 1
-            && match &facts[0].terminal {
-                ToolExecutionTerminal::NotStarted { reason_code } => !reason_code.is_empty(),
-                ToolExecutionTerminal::Settled {
-                    exit_code,
-                    signal,
-                    closure,
-                    ..
-                } => {
-                    // Physical closure is *quiescence*: the process tree this
-                    // node owns was reaped and nothing of it is still alive.
-                    // It is not a security posture. The hardening, network
-                    // isolation and status-channel flags stay in the evidence
-                    // for audit, but they are enforced where the evidence is
-                    // produced (an unhardened process never reaches a
-                    // `Settled` terminal in the first place), so requiring
-                    // them here would only forbid honest host-shell work
-                    // from ever closing.
-                    exit_code.is_some() != signal.is_some()
-                        && closure.all_children_reaped
-                        && closure.init_reaped
-                }
-                _ => false,
+        if facts.len() != 1 {
+            return Some("process_fact_count_invalid");
+        }
+        match &facts[0].terminal {
+            ToolExecutionTerminal::NotStarted { reason_code } => {
+                // A named not-started reason is a closed outcome: the process
+                // never launched and the durable fact says why. Only an
+                // unnamed one is unprovable. This is the same direction the
+                // predicate always had - the reason code being present is what
+                // makes it closable, not what makes it refusable.
+                reason_code.is_empty().then_some("process_not_started_without_reason")
             }
+            ToolExecutionTerminal::Settled { exit_code, signal, closure, .. } => {
+                // Physical closure is *quiescence*: the process tree this
+                // node owns was reaped and nothing of it is still alive.
+                // It is not a security posture. The hardening, network
+                // isolation and status-channel flags stay in the evidence
+                // for audit, but they are enforced where the evidence is
+                // produced (an unhardened process never reaches a
+                // `Settled` terminal in the first place), so requiring
+                // them here would only forbid honest host-shell work
+                // from ever closing.
+                if exit_code.is_some() == signal.is_some() {
+                    return Some("process_exit_signal_ambiguous");
+                }
+                if !closure.all_children_reaped || !closure.init_reaped {
+                    return Some("process_group_not_quiesced");
+                }
+                None
+            }
+            _ => Some("process_terminal_unknown"),
+        }
     }
 
     /// Why the fact's physical sources could not be derived, when the reason
@@ -12752,11 +12736,8 @@ impl ExecutionCommitService {
         let mut calls = BTreeMap::new();
         let mut primary_sources = BTreeMap::new();
         // The counts the next run needs to read the branch off the error
-        // text: how many calls the node planned, how many of them had already
-        // passed every leaf check when this one failed, and how many calls the
-        // no-dispatch fact covers. The middle number is NOT the number of
-        // receipts in the effect-index stream: a call is only counted once it
-        // has passed all of them, so it is named for what it measures.
+        // text: how many calls the node planned, how many receipts the
+        // owner wrote, and how many calls the no-dispatch fact covers.
         let planned_count = crate::step_snapshot::decode_persisted_tool_batch_value(&spec.payload_ref)
             .ok()
             .and_then(|payload| payload["calls"].as_array().map(|planned| planned.len()));
@@ -12930,11 +12911,16 @@ impl ExecutionCommitService {
                     primary_sources.insert(primary_stream, primary_head);
                 }
                 if !Self::lease_recovery_process_closed(&outcome, &effect) {
-                    let (ring, reason) =
-                        Self::physical_closure_ring(&outcome, &effect, &leaf_counts(receipts.len(), index_receipts));
+                    // Name the dimension the predicate refused. The verdict is
+                    // unchanged: this still returns None and still fails the
+                    // node closed. Only the wording stops blaming process
+                    // reaping for a network call that never produced an
+                    // observation.
+                    let ring = Self::closure_refusal_reason(&outcome, &effect)
+                        .unwrap_or("process_not_closed");
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason={ring}")); }
-                    *unprovable = Some((ring, reason));
+                    *unprovable = Some((ring, format!("{ring} {}", leaf_counts(receipts.len(), index_receipts))));
                     return Ok(None);
                 }
                 if !receipts.insert(key.to_string()) {
@@ -12957,7 +12943,7 @@ impl ExecutionCommitService {
         }
         #[cfg(any(test, feature = "test-fixtures"))]
         if trace_leaf {
-            crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_index graph={:?} node={:?} attempt={} stream={:?} head={} intents={} passed_before_failure={} calls={} no_dispatch={} retired={} bound={} delegated={}",
+            crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_index graph={:?} node={:?} attempt={} stream={:?} head={} intents={} receipts={} calls={} no_dispatch={} retired={} bound={} delegated={}",
                 graph.id.chars().take(64).collect::<String>(), node.chars().take(64).collect::<String>(), binding.attempt, stream.chars().take(64).collect::<String>(), head, intents.len(), receipts.len(), calls.len(), no_dispatch.map_or(0, |fact| fact.calls.len()), retired, bound.is_some(), delegated.is_some()));
             if bound.is_none() {
                 if let Ok(payload) = crate::step_snapshot::decode_persisted_tool_batch_value(&spec.payload_ref) {
@@ -12990,9 +12976,16 @@ impl ExecutionCommitService {
             }
         }
         if !intents.is_subset(&receipts) {
+            // An intent is written at the dispatch point and its terminal
+            // receipt at completion, in two different transactions, so
+            // "dispatched, still running" is exactly this shape. The receipt
+            // is a durable fact that lands later, so the closure keeps waiting
+            // inside its existing budget. Judging it unprovable here is the
+            // transient-as-permanent defect the ring classification names as
+            // the top regression risk, and it is the same treatment
+            // `bound_call_receipt_or_no_dispatch` just needed.
             #[cfg(any(test, feature = "test-fixtures"))]
             if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=intent_without_terminal_receipt")); }
-            *unprovable = Some(("intent_without_terminal_receipt", format!("intent_without_terminal_receipt {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
             return Ok(None);
         }
         if let Some(fact) = no_dispatch {
@@ -13041,9 +13034,17 @@ impl ExecutionCommitService {
                         && *input == expected
                         && key == &request.idempotency_key
                 }) {
+                    // The bound call has no terminal receipt and no no-dispatch
+                    // fact yet. That is the owner still working, not a
+                    // contradiction: with no receipt event in the index stream
+                    // there is nothing that says the effect was admitted and
+                    // then lost, so the closure keeps waiting inside its
+                    // existing budget. The permanent contradictions on this
+                    // path are the ones that need a fact to contradict - a
+                    // receipt the no-dispatch fact denies, or a receipt for a
+                    // call the node never planned - and those stay hard.
                     #[cfg(any(test, feature = "test-fixtures"))]
-                    if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=bound_call_receipt_or_no_dispatch")); }
-                    *unprovable = Some(("bound_call_receipt_or_no_dispatch", format!("bound_call_receipt_or_no_dispatch {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
+                    if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=bound_call_receipt_or_no_dispatch {}", leaf_counts(receipts.len(), index_receipts))); }
                     return Ok(None);
                 }
             } else {
@@ -13102,11 +13103,11 @@ impl ExecutionCommitService {
                     }
                     let Some((name, actual, _, origin, certified)) = calls.get(id) else {
                         // The planned call has no receipt at all: the member
-                        // has no terminal fact of its own. A different
-                        // condition from a receipt that exists but does not
-                        // match the planned call, so it carries its own ring
-                        // name. Both branches still return None and still
-                        // fail the node closed.
+                        // has no terminal fact of its own.
+                        // A different condition from a receipt that exists but
+                        // does not match the planned call, so it carries its
+                        // own ring name. Both branches still return None and
+                        // still fail the node closed.
                         #[cfg(any(test, feature = "test-fixtures"))]
                         if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_call_receipt_missing missing={id} {}", leaf_counts(receipts.len(), index_receipts))); }
                         *unprovable = Some(("planned_call_receipt_missing", format!("receipt missing for planned call {id} {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
@@ -13775,9 +13776,25 @@ impl ExecutionCommitService {
                 &mut leaf_unprovable,
             )?
             else {
-                // Every leaf source failure is decided by durable facts that
-                // are written before the node commits, so waiting cannot change
-                // it. Name the ring instead of spending the closure budget.
+                // What reaches this branch is only the part of the leaf check
+                // that a committed durable fact already decides, so waiting
+                // cannot change it: a receipt that exists and contradicts the
+                // plan (`planned_receipt_identity_mismatch`), an index receipt
+                // whose primary is missing although both are written in one
+                // transaction (`primary_receipt_missing`), a receipt for a call
+                // the node never planned (`foreign_call_receipt`), or a planned
+                // payload that cannot be read at all (`planned_calls_absent`,
+                // `planned_call_id_missing`, `planned_call_input_missing`,
+                // `planned_call_seen_twice`).
+                //
+                // The shapes that waiting *can* change are answered earlier as
+                // Pending and never arrive here: a dispatched call whose
+                // terminal receipt has not landed yet, and a bound call with no
+                // receipt event at all. Both are "the owner is still working",
+                // not a contradiction, and both stay bounded by the closure
+                // budget. Naming a ring here therefore means a durable fact is
+                // already committed and contradicts the node, which is why the
+                // budget is not spent on it.
                 if let Some((ring, reason)) = leaf_unprovable {
                     // The trace helper is test-gated in production builds, so the
                     // named ring always travels in the error text itself.
@@ -15578,6 +15595,109 @@ mod recovery_physical_450_tests {
     }
 }
 
+/// F3: the closure predicate names the dimension it refused. A network effect
+/// whose outcome carries no observation is a network fact gap, not a process
+/// reaping gap, and the run's error text has to say so.
+#[cfg(test)]
+mod closure_refusal_reason_tests {
+    use super::*;
+
+    fn network_effect() -> ToolEffectDescriptor {
+        let effect = tools::ToolHost::builtin("r1-890-network", std::env::temp_dir())
+            .pin_snapshot()
+            .describe_effect("web_search", &json!({"query": "r1-890"}));
+        assert!(effect.uses_network && !effect.spawns_process);
+        effect
+    }
+
+    fn plain_effect() -> ToolEffectDescriptor {
+        let effect = tools::ToolHost::builtin("r1-890-plain", std::env::temp_dir())
+            .pin_snapshot()
+            .describe_effect("read_file", &json!({"path": "a.txt"}));
+        assert!(!effect.uses_network && !effect.spawns_process);
+        effect
+    }
+
+    /// An outcome with no physical fact at all: exactly what a call that
+    /// failed before it produced anything leaves behind.
+    fn outcome_without_evidence() -> crate::RuntimeToolExecutionOutcome {
+        crate::RuntimeToolExecutionOutcome {
+            tool_use_id: "r1-890-network-call".to_string(),
+            tool_name: "web_search".to_string(),
+            status: crate::RuntimeToolExecutionStatus::Failed,
+            category: crate::ToolSafetyCategory::ReadOnly,
+            output: None,
+            error: Some("local network original grant/Step/attempt mismatch".to_string()),
+            evidence_ref: "tool-effect:r1-890-network-call".to_string(),
+            observed_evidence: Vec::new(),
+            pending_agent_batch: None,
+        }
+    }
+
+    /// A network call that failed and left no observation is named as its own
+    /// condition, not lumped with a completed call that claims an effect it
+    /// cannot show. It stays refused: a receipt with no operations list cannot
+    /// prove that nothing was sent before the failure.
+    #[test]
+    fn a_failed_network_call_without_an_observation_is_named_apart() {
+        let effect = network_effect();
+        let outcome = outcome_without_evidence();
+        assert_eq!(
+            ExecutionCommitService::closure_refusal_reason(&outcome, &effect),
+            Some("network_effect_failed_without_observation")
+        );
+        assert!(!ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect));
+        // The same shape reported as executed is a different condition.
+        let mut executed = outcome.clone();
+        executed.status = crate::RuntimeToolExecutionStatus::Executed;
+        assert_eq!(
+            ExecutionCommitService::closure_refusal_reason(&executed, &effect),
+            Some("network_effect_without_observation")
+        );
+    }
+
+    /// The verdict stays refused, and the reason names the network dimension
+    /// instead of blaming process reaping.
+    #[test]
+    fn a_network_call_without_an_observation_is_named_as_a_network_gap() {
+        let effect = network_effect();
+        // Executed, not failed: this is the call that claims an effect it
+        // cannot show. The failed shape is named apart, below.
+        let mut outcome = outcome_without_evidence();
+        outcome.status = crate::RuntimeToolExecutionStatus::Executed;
+        assert!(
+            !ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect),
+            "the verdict must stay refused"
+        );
+        assert_eq!(
+            ExecutionCommitService::closure_refusal_reason(&outcome, &effect),
+            Some("network_effect_without_observation")
+        );
+        // One source of truth: the local-network rule owns the name, and the
+        // boolean predicate is derived from the very same function.
+        assert_eq!(
+            ExecutionCommitService::local_network_refusal_reason(&outcome, &effect),
+            Some("network_effect_without_observation")
+        );
+        assert!(!ExecutionCommitService::local_network_closed(&outcome, &effect));
+    }
+
+    /// The negative control: an effect that claims no physical dimension is
+    /// not turned into a refusal by the new naming.
+    #[test]
+    fn an_effect_without_a_physical_dimension_still_closes_without_facts() {
+        let effect = plain_effect();
+        let mut outcome = outcome_without_evidence();
+        outcome.tool_name = "read_file".to_string();
+        assert!(
+            ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect),
+            "a plain read with no physical fact must still close"
+        );
+        assert_eq!(ExecutionCommitService::closure_refusal_reason(&outcome, &effect), None);
+    }
+
+}
+
 /// F2: a host-shell process effect closes physical closure on quiescence
 /// alone, and stays open when the quiescence fact is missing.
 #[cfg(test)]
@@ -15872,6 +15992,50 @@ mod host_process_quiescence_tests {
         closure.namespace_inode = 7;
         assert!(crate::host_process_closure::validate_host_process_fact(&foreign).is_err());
     }
+
+    /// A named not-started reason is a *closed* outcome: the process never
+    /// launched and the durable fact says why. Only an unnamed one is
+    /// unprovable. This direction is exactly what a refactor of the closure
+    /// predicate can invert without noticing, so it is pinned in both
+    /// directions.
+    #[test]
+    fn r1_890_a_named_not_started_reason_closes_and_an_unnamed_one_does_not() {
+        let effect = bash_effect();
+        for (case, reason_code, closes) in [
+            ("named", "process_never_launched", true),
+            ("unnamed", "", false),
+        ] {
+            let mut outcome = host_outcome(json!({
+                "exitCode": 0, "signal": null, "initReaped": true, "allChildrenReaped": true,
+            }));
+            let EvidenceTargetIdentity::ToolExecution { execution } =
+                &mut outcome.observed_evidence[0].target
+            else {
+                panic!("host process evidence missing")
+            };
+            execution.terminal = ToolExecutionTerminal::NotStarted {
+                reason_code: reason_code.to_string(),
+            };
+            assert_eq!(
+                ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect),
+                closes,
+                "{case}"
+            );
+            if closes {
+                assert_eq!(
+                    ExecutionCommitService::closure_refusal_reason(&outcome, &effect),
+                    None,
+                    "{case}"
+                );
+            } else {
+                assert_eq!(
+                    ExecutionCommitService::closure_refusal_reason(&outcome, &effect),
+                    Some("process_not_started_without_reason"),
+                    "{case}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -16125,11 +16289,50 @@ mod physical_closure_ring_tests {
         (events, commits, graph, spec, binding)
     }
 
-    /// A dispatched call whose terminal receipt has not landed yet is still
-    /// in flight. The closure names the missing ring and never claims the
-    /// node; it does not read the missing terminal as a contradiction.
+    /// A batch whose planned calls the node never dispatched. The index stream
+    /// is the authority on dispatch: its intent event is written in the same
+    /// transaction as the effect's own first intent, and it carries the call
+    /// identity in its `tool_invocation` reference.
+    fn never_dispatched_batch(
+        name: &str,
+        calls: Vec<serde_json::Value>,
+    ) -> (
+        Arc<RuntimeEventStore>,
+        ExecutionCommitService,
+        ExecutionGraph,
+        ExecutionNodeSpec,
+        ExecutionNodeBinding,
+    ) {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(events.clone());
+        let graph = ExecutionGraph::new(name.to_string());
+        let payload = crate::step_snapshot::encode_persisted_tool_batch(&json!({
+            "session_id": format!("{name}-session"), "step_snapshots":{}, "calls": calls
+        }))
+        .expect("persisted batch");
+        let spec = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", payload);
+        let binding = ExecutionNodeBinding {
+            executor_kind: "tool_batch".into(),
+            ticket_idempotency_key: spec.idempotency_key.clone(),
+            attempt: 3,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        (events, commits, graph, spec, binding)
+    }
+
+    fn planned_call(id: &str) -> serde_json::Value {
+        json!({"id": id, "name": "state_inspect", "input": "{}", "origin": null})
+    }
+
+    /// A dispatched call whose terminal receipt has not landed yet is still in
+    /// flight: the intent is written at admission and the receipt at
+    /// completion, in two transactions. The node stays open and the closure
+    /// keeps waiting, so there is no ring to name; what must hold is that the
+    /// missing terminal is not read as a contradiction that closes the node.
     #[test]
-    fn an_intent_without_a_terminal_receipt_is_named_and_never_closed() {
+    fn an_intent_without_a_terminal_receipt_keeps_the_node_open_and_is_pending() {
         let (events, commits, graph, spec, binding) = root_batch("ring original intent");
         let key = "ring-original-intent";
         let stream = format!(
@@ -16159,10 +16362,14 @@ mod physical_closure_ring_tests {
             sources.is_none(),
             "an in-flight call must not close the node"
         );
-        assert_eq!(
-            unprovable.map(|ring| ring.0),
-            Some("intent_without_terminal_receipt"),
-            "the missing terminal receipt is named"
+        // The in-flight call is transient, not a permanent refusal: the intent
+        // is written at dispatch and the receipt at completion, in two
+        // transactions. The node stays open and the closure keeps waiting, so
+        // there is no ring to name. What must still hold is that the node does
+        // not close, which is the assertion above.
+        assert!(
+            unprovable.is_none(),
+            "an in-flight call is pending, not unprovable: {unprovable:?}"
         );
     }
 
@@ -16199,112 +16406,142 @@ mod physical_closure_ring_tests {
             sources.is_none(),
             "a member without its effect receipt must not close the node"
         );
-        let (ring, reason) = unprovable.expect("the missing effect receipt is named");
-        assert_eq!(ring, "primary_receipt_missing");
-        // Both counts are reported: the node wrote this many receipts into its
-        // index stream, and this many of them had cleared every leaf check.
-        assert!(
-            reason.contains("index_receipts_seen=1"),
-            "the index-stream receipt count must be reported: {reason}"
-        );
-        assert!(
-            reason.contains("passed_before_failure=0"),
-            "the passing count must be reported and must not be the index count: {reason}"
+        assert_eq!(
+            unprovable.map(|ring| ring.0),
+            Some("primary_receipt_missing"),
+            "the missing effect receipt is named"
         );
     }
 
-    /// A member whose closure was decided on the local-network evidence path
-    /// is named on that path, so the next reader does not spend the
-    /// investigation looking for an unreaped process. The judgement is the
-    /// same either way; only the name and the facts in the reason differ.
+    /// The other side of the same rule: a call the node *did* dispatch, which
+    /// the index stream proves by its intent, still has to produce its receipt.
+    /// The node stays open until the receipt lands, and the closure keeps
+    /// waiting inside its budget instead of naming a ring: this is the control
+    /// that keeps "the owner is still working" from being read as a
+    /// contradiction that closes the node.
     #[test]
-    fn a_member_closed_by_the_local_network_evidence_is_named_on_that_path() {
-        use crate::host_process_closure::{build_host_process_fact, read_host_process_report};
-        let counts = "planned=1 passed_before_failure=0 no_dispatch=0";
-        let request = crate::RuntimeToolExecutionRequest {
-            compiled_invocation: None,
-            step_binding: None,
-            governed_plan_id: "plan".to_string(),
-            governed_plan_revision: 1,
-            observation_wave_sequence: 1,
-            idempotency_key: "ring-network-call".to_string(),
-            tool_use_id: "ring-network-call".to_string(),
-            tool_name: "bash".to_string(),
-            input: json!({"command": "printf ring"}).to_string(),
-            category: crate::ToolSafetyCategory::Destructive,
-            authorization: None,
-            session_id: Some("ring-network-session".to_string()),
-            sandbox_posture: harness_contract::policy::SandboxPosture::HostFullAccess,
-            policy_revision: 1,
-            authorized_scopes: Vec::new(),
-            memory_context: None,
-            reality_context: None,
-            model_lease: None,
-            parent_execution: None,
-            parent_execution_attempt: None,
-            execution_decision: None,
-            evaluation_isolated: false,
-            managed_invocation: None,
-            tool_progress: crate::ToolProgressSink::default(),
-        };
-        let effect = tools::ToolHost::builtin("ring-network", std::env::temp_dir())
-            .pin_snapshot()
-            .describe_effect("bash", &json!({"command": "printf ring"}));
-        let outcome = |observed_evidence: Vec<harness_contract::context::ObservedEvidence>| {
-            crate::RuntimeToolExecutionOutcome {
-                tool_use_id: request.tool_use_id.clone(),
-                tool_name: request.tool_name.clone(),
-                status: crate::RuntimeToolExecutionStatus::Executed,
-                category: request.category,
-                output: None,
-                error: None,
-                evidence_ref: String::new(),
-                observed_evidence,
-                pending_agent_batch: None,
-            }
-        };
-
-        // No observation at all: the effect asked for network evidence and
-        // none was produced, so the closure sits on the network path.
-        let (ring, reason) =
-            ExecutionCommitService::physical_closure_ring(&outcome(Vec::new()), &effect, counts);
-        assert_eq!(ring, "network_effect_without_observation");
-        assert!(reason.contains("observed_evidence=0"), "{reason}");
-        assert!(reason.contains("outcome_status="), "{reason}");
-        assert!(reason.contains("passed_before_failure=0"), "{reason}");
-
-        // A process observation decides the closure on the process path, so
-        // that member keeps its own name instead of being folded into the
-        // network one.
-        let report = read_host_process_report(Some(
-            &json!({"stdout": "ring", "stderr": "", "returnTruncated": false}).to_string(),
-        ));
-        let mut admission = crate::host_process_closure::test_admission(&request);
-        admission.source_bundle = harness_contract::context::ArtifactRef::durable(
-            "artifact://ring-source",
-            format!("sha256:{}", "a".repeat(64)),
-            12,
-            "application/json",
-            "session:ring-network-session",
+    fn a_dispatched_call_without_its_receipt_keeps_the_node_open() {
+        let (events, commits, graph, spec, binding) =
+            never_dispatched_batch("ring dispatched no receipt", vec![planned_call("ran")]);
+        let stream = format!(
+            "execution-agent-receipts:{}:{}:{}",
+            graph.id, spec.id, binding.attempt
         );
-        let fact = build_host_process_fact(
-            &request,
-            &effect,
-            &report,
-            harness_contract::context::ArtifactRef::durable(
-                "artifact://ring-body",
-                format!("sha256:{}", "b".repeat(64)),
-                12,
-                "application/json",
-                "session:ring-network-session",
-            ),
-            admission,
-        )
-        .expect("host process fact");
-        let evidence = vec![crate::host_process_closure::host_process_observation(&request, fact)];
-        let (ring, reason) =
-            ExecutionCommitService::physical_closure_ring(&outcome(evidence), &effect, counts);
-        assert_eq!(ring, "process_not_closed", "{reason}");
-        assert!(reason.starts_with("process_not_closed"), "{reason}");
+        let key = "ring-dispatched-no-receipt";
+        let revision = events.stream_revision(&stream).expect("index head");
+        events
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("ring-test:{key}:intent"),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream.clone(),
+                    expected_revision: revision,
+                }],
+                events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream,
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: "execution.agent_tool.intent".into(),
+                        status: Some("inflight".into()),
+                        actor: Some("governed_tool".into()),
+                        // The dispatch proof the closure reads: the call
+                        // identity in the intent's own reference.
+                        refs: vec![RuntimeEventRef {
+                            kind: "tool_invocation".into(),
+                            id: "ran".into(),
+                        }],
+                        payload: json!({"idempotency_key": key, "tool_name": "state_inspect", "sequence": 1}),
+                    },
+                    idempotency_key: Some(format!("agent-tool-intent:{key}")),
+                    schema_version: 1,
+                }],
+            })
+            .expect("index intent");
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "a dispatched call without its receipt must not close the node"
+        );
+        // The receipt is a durable fact that lands later, so this is pending
+        // rather than a permanent refusal. The assertion above is the control
+        // that matters: the never-dispatched rule must not turn "the owner is
+        // still working" into a closed node.
+        assert!(
+            unprovable.is_none(),
+            "a dispatched call still in flight is pending, not unprovable: {unprovable:?}"
+        );
+    }
+
+    /// A retired node keeps its own exemption for a call it never ran.
+    #[test]
+    fn a_retired_node_is_not_held_open_by_an_unrun_call() {
+        let (_events, commits, graph, spec, binding) =
+            never_dispatched_batch("ring retired unrun", vec![planned_call("never-ran")]);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, true, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(sources.is_some(), "a retired node is not held by an unrun call");
+        assert!(unprovable.is_none(), "{unprovable:?}");
+    }
+
+    /// The negative control for the pending rule: an in-flight member of a node
+    /// that is *not* retired still keeps it open, and it is pending rather than
+    /// a permanent refusal.
+    #[test]
+    fn an_in_flight_member_of_a_live_node_keeps_it_open() {
+        let (events, commits, graph, spec, binding) =
+            never_dispatched_batch("ring dispatched no receipt", vec![planned_call("ran")]);
+        let stream = format!(
+            "execution-agent-receipts:{}:{}:{}",
+            graph.id, spec.id, binding.attempt
+        );
+        let key = "ring-dispatched-no-receipt";
+        let revision = events.stream_revision(&stream).expect("index head");
+        events
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("ring-test:{key}:intent"),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream.clone(),
+                    expected_revision: revision,
+                }],
+                events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream,
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: "execution.agent_tool.intent".into(),
+                        status: Some("inflight".into()),
+                        actor: Some("governed_tool".into()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "tool_invocation".into(),
+                            id: "ran".into(),
+                        }],
+                        payload: json!({"idempotency_key": key, "tool_name": "state_inspect", "sequence": 1}),
+                    },
+                    idempotency_key: Some(format!("agent-tool-intent:{key}")),
+                    schema_version: 1,
+                }],
+            })
+            .expect("index intent");
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "an in-flight member keeps a live node open"
+        );
+        assert!(
+            unprovable.is_none(),
+            "an in-flight member is pending, not unprovable: {unprovable:?}"
+        );
     }
 }
