@@ -428,6 +428,16 @@ impl ProcessMemberCustody {
         Ok(())
     }
 
+    /// The named admission refusal this node's owner recorded for one call,
+    /// read back through the observation this child was bound to. It is the
+    /// parent's own reason, so a delegated action that was never admitted can
+    /// report which conjunct refused it instead of a generic wording.
+    pub(crate) fn parent_refusal_reason(&self, call_id: &str) -> Option<String> {
+        let binding = self.binding.lock().ok()?;
+        let (_, observation) = binding.as_ref()?;
+        observation.upgrade()?.refusal_reason(call_id)
+    }
+
     pub(crate) fn verified_units(
         &self, ticket: &crate::execution_core::NodeExecutionTicket,
         child: &crate::execution_core::graph::executors::OriginalAgentChildCall,

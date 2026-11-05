@@ -11630,6 +11630,43 @@ impl ExecutionCommitService {
             .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
     }
 
+    /// Which ring a member whose physical closure did not hold belongs to.
+    ///
+    /// A member whose closure was decided on the local-network evidence path
+    /// is named on that path, so the next reader does not spend the
+    /// investigation looking for an unreaped process. The routing is the same
+    /// one `lease_recovery_process_closed` makes, so choosing the name cannot
+    /// change the judgement.
+    fn physical_closure_ring(
+        outcome: &crate::RuntimeToolExecutionOutcome,
+        effect: &ToolEffectDescriptor,
+        counts: &str,
+    ) -> (&'static str, String) {
+        use harness_contract::context::EvidenceTargetIdentity;
+        let on_network_path = outcome
+            .observed_evidence
+            .iter()
+            .any(|observed| matches!(observed.target, EvidenceTargetIdentity::LocalNetwork { .. }))
+            || outcome
+                .observed_evidence
+                .iter()
+                .all(|observed| !matches!(observed.target, EvidenceTargetIdentity::ToolExecution { .. }));
+        if on_network_path {
+            (
+                "network_effect_without_observation",
+                format!(
+                    "network_effect_without_observation uses_network={} observed_evidence={} outcome_status={:?}{}",
+                    effect.uses_network,
+                    outcome.observed_evidence.len(),
+                    outcome.status,
+                    counts
+                ),
+            )
+        } else {
+            ("process_not_closed", format!("process_not_closed {counts}"))
+        }
+    }
+
     fn lease_recovery_process_closed(
         outcome: &crate::RuntimeToolExecutionOutcome,
         effect: &ToolEffectDescriptor,
@@ -12707,19 +12744,28 @@ impl ExecutionCommitService {
         let mut after = 0;
         let mut intents = BTreeSet::new();
         let mut receipts = BTreeSet::new();
+        // Receipt events the node's own index stream actually holds, counted
+        // as they are read. The passing set below only grows after a receipt
+        // clears every leaf check, so the two numbers answer different
+        // questions and both belong in the error text.
+        let mut index_receipts = 0usize;
         let mut calls = BTreeMap::new();
         let mut primary_sources = BTreeMap::new();
         // The counts the next run needs to read the branch off the error
-        // text: how many calls the node planned, how many receipts the
-        // owner wrote, and how many calls the no-dispatch fact covers.
+        // text: how many calls the node planned, how many of them had already
+        // passed every leaf check when this one failed, and how many calls the
+        // no-dispatch fact covers. The middle number is NOT the number of
+        // receipts in the effect-index stream: a call is only counted once it
+        // has passed all of them, so it is named for what it measures.
         let planned_count = crate::step_snapshot::decode_persisted_tool_batch_value(&spec.payload_ref)
             .ok()
             .and_then(|payload| payload["calls"].as_array().map(|planned| planned.len()));
-        let leaf_counts = |receipts: usize| {
+        let leaf_counts = |passed: usize, index_receipts: usize| {
             format!(
-                "planned={} receipts={} no_dispatch={}",
+                "planned={} passed_before_failure={} index_receipts_seen={} no_dispatch={}",
                 planned_count.map_or_else(|| "?".to_string(), |count| count.to_string()),
-                receipts,
+                passed,
+                index_receipts,
                 no_dispatch.map_or(0, |fact| fact.calls.len())
             )
         };
@@ -12774,6 +12820,10 @@ impl ExecutionCommitService {
                 {
                     return Err(invalid("lease recovery effect terminal key mismatch"));
                 }
+                // Counted before any leaf check runs, so the error text can
+                // say "the node wrote this many receipts" even when the very
+                // first one fails and nothing was accepted yet.
+                index_receipts += 1;
                 // A call refused before dispatch has no effect at all, so it
                 // has no primary receipt either: the no-dispatch fact is its
                 // proof. Require the primary only for calls the fact does not
@@ -12793,7 +12843,7 @@ impl ExecutionCommitService {
                 let Some(primary) = primary else {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=primary_receipt_missing")); }
-                    *unprovable = Some(("primary_receipt_missing", format!("primary_receipt_missing {}", leaf_counts(receipts.len()))));
+                    *unprovable = Some(("primary_receipt_missing", format!("primary_receipt_missing {}", leaf_counts(receipts.len(), index_receipts))));
                     return Ok(None);
                 };
                 let read = primary.kind == "execution.read.receipt";
@@ -12864,7 +12914,7 @@ impl ExecutionCommitService {
                     .map_err(|error| invalid(&error.to_string()))?
                     .is_none()
                     {
-                        *unprovable = Some(("read_terminal_missing", format!("read_terminal_missing {}", leaf_counts(receipts.len()))));
+                        *unprovable = Some(("read_terminal_missing", format!("read_terminal_missing {}", leaf_counts(receipts.len(), index_receipts))));
                         return Ok(None);
                     }
                 } else {
@@ -12880,9 +12930,11 @@ impl ExecutionCommitService {
                     primary_sources.insert(primary_stream, primary_head);
                 }
                 if !Self::lease_recovery_process_closed(&outcome, &effect) {
+                    let (ring, reason) =
+                        Self::physical_closure_ring(&outcome, &effect, &leaf_counts(receipts.len(), index_receipts));
                     #[cfg(any(test, feature = "test-fixtures"))]
-                    if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=process_not_closed")); }
-                    *unprovable = Some(("process_not_closed", format!("process_not_closed {}", leaf_counts(receipts.len()))));
+                    if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason={ring}")); }
+                    *unprovable = Some((ring, reason));
                     return Ok(None);
                 }
                 if !receipts.insert(key.to_string()) {
@@ -12905,7 +12957,7 @@ impl ExecutionCommitService {
         }
         #[cfg(any(test, feature = "test-fixtures"))]
         if trace_leaf {
-            crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_index graph={:?} node={:?} attempt={} stream={:?} head={} intents={} receipts={} calls={} no_dispatch={} retired={} bound={} delegated={}",
+            crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_index graph={:?} node={:?} attempt={} stream={:?} head={} intents={} passed_before_failure={} calls={} no_dispatch={} retired={} bound={} delegated={}",
                 graph.id.chars().take(64).collect::<String>(), node.chars().take(64).collect::<String>(), binding.attempt, stream.chars().take(64).collect::<String>(), head, intents.len(), receipts.len(), calls.len(), no_dispatch.map_or(0, |fact| fact.calls.len()), retired, bound.is_some(), delegated.is_some()));
             if bound.is_none() {
                 if let Ok(payload) = crate::step_snapshot::decode_persisted_tool_batch_value(&spec.payload_ref) {
@@ -12940,7 +12992,7 @@ impl ExecutionCommitService {
         if !intents.is_subset(&receipts) {
             #[cfg(any(test, feature = "test-fixtures"))]
             if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=intent_without_terminal_receipt")); }
-            *unprovable = Some(("intent_without_terminal_receipt", format!("intent_without_terminal_receipt {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+            *unprovable = Some(("intent_without_terminal_receipt", format!("intent_without_terminal_receipt {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
             return Ok(None);
         }
         if let Some(fact) = no_dispatch {
@@ -12963,7 +13015,7 @@ impl ExecutionCommitService {
                 }
                 #[cfg(any(test, feature = "test-fixtures"))]
                 if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=no_dispatch_sources")); }
-                *unprovable = Some(("no_dispatch_sources", format!("no_dispatch_sources {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                *unprovable = Some(("no_dispatch_sources", format!("no_dispatch_sources {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                 return Ok(None);
             }
             if fact
@@ -12991,7 +13043,7 @@ impl ExecutionCommitService {
                 }) {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=bound_call_receipt_or_no_dispatch")); }
-                    *unprovable = Some(("bound_call_receipt_or_no_dispatch", format!("bound_call_receipt_or_no_dispatch {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                    *unprovable = Some(("bound_call_receipt_or_no_dispatch", format!("bound_call_receipt_or_no_dispatch {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                     return Ok(None);
                 }
             } else {
@@ -13000,7 +13052,7 @@ impl ExecutionCommitService {
                 let Some(planned) = payload["calls"].as_array() else {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_calls_absent")); }
-                    *unprovable = Some(("planned_calls_absent", format!("planned_calls_absent {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                    *unprovable = Some(("planned_calls_absent", format!("planned_calls_absent {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                     return Ok(None);
                 };
                 // The node's own committed result is the authority on which
@@ -13014,7 +13066,7 @@ impl ExecutionCommitService {
                 // so the next run reads the branch off the error text.
                 if calls.len() + no_dispatch.map_or(0, |fact| fact.calls.len()) != planned.len() {
                     #[cfg(any(test, feature = "test-fixtures"))]
-                    if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_planned_gap {}", leaf_counts(receipts.len()))); }
+                    if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_planned_gap {}", leaf_counts(receipts.len(), index_receipts))); }
                 }
                 if calls.keys().any(|id| {
                     !planned
@@ -13023,17 +13075,17 @@ impl ExecutionCommitService {
                 }) {
                     #[cfg(any(test, feature = "test-fixtures"))]
                     if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=foreign_call_receipt")); }
-                    *unprovable = Some(("foreign_call_receipt", format!("foreign_call_receipt {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                    *unprovable = Some(("foreign_call_receipt", format!("foreign_call_receipt {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                     return Ok(None);
                 }
                 let mut seen = BTreeSet::new();
                 for call in planned {
                     let Some(id) = call["id"].as_str() else {
-                        *unprovable = Some(("planned_call_id_missing", format!("planned_call_id_missing {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                        *unprovable = Some(("planned_call_id_missing", format!("planned_call_id_missing {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
                     };
                     let Some(input) = call["input"].as_str() else {
-                        *unprovable = Some(("planned_call_input_missing", format!("planned_call_input_missing {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                        *unprovable = Some(("planned_call_input_missing", format!("planned_call_input_missing {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
                     };
                     if no_dispatch
@@ -13045,15 +13097,19 @@ impl ExecutionCommitService {
                         continue;
                     }
                     if !seen.insert(id) {
-                        *unprovable = Some(("planned_call_seen_twice", format!("planned_call_seen_twice {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                        *unprovable = Some(("planned_call_seen_twice", format!("planned_call_seen_twice {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
                     }
                     let Some((name, actual, _, origin, certified)) = calls.get(id) else {
                         // The planned call has no receipt at all: the member
-                        // has no terminal fact of its own.
+                        // has no terminal fact of its own. A different
+                        // condition from a receipt that exists but does not
+                        // match the planned call, so it carries its own ring
+                        // name. Both branches still return None and still
+                        // fail the node closed.
                         #[cfg(any(test, feature = "test-fixtures"))]
-                        if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_receipt_identity_mismatch missing={id} {}", leaf_counts(receipts.len()))); }
-                        *unprovable = Some(("planned_receipt_identity_mismatch", format!("receipt missing for planned call {id} {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                        if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_call_receipt_missing missing={id} {}", leaf_counts(receipts.len(), index_receipts))); }
+                        *unprovable = Some(("planned_call_receipt_missing", format!("receipt missing for planned call {id} {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
                     };
                     match Self::planned_call_identity(
@@ -13072,8 +13128,8 @@ impl ExecutionCommitService {
                         PlannedCallIdentity::Matches => {}
                         PlannedCallIdentity::Foreign(reason) => {
                             #[cfg(any(test, feature = "test-fixtures"))]
-                            if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_receipt_identity_mismatch {reason} {}", leaf_counts(receipts.len()))); }
-                            *unprovable = Some(("planned_receipt_identity_mismatch", format!("{reason} {}{}", leaf_counts(receipts.len()), Self::leaf_shape_note(&derived_shapes))));
+                            if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_receipt_identity_mismatch {reason} {}", leaf_counts(receipts.len(), index_receipts))); }
+                            *unprovable = Some(("planned_receipt_identity_mismatch", format!("{reason} {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                             return Ok(None);
                         }
                     }
@@ -16143,10 +16199,112 @@ mod physical_closure_ring_tests {
             sources.is_none(),
             "a member without its effect receipt must not close the node"
         );
-        assert_eq!(
-            unprovable.map(|ring| ring.0),
-            Some("primary_receipt_missing"),
-            "the missing effect receipt is named"
+        let (ring, reason) = unprovable.expect("the missing effect receipt is named");
+        assert_eq!(ring, "primary_receipt_missing");
+        // Both counts are reported: the node wrote this many receipts into its
+        // index stream, and this many of them had cleared every leaf check.
+        assert!(
+            reason.contains("index_receipts_seen=1"),
+            "the index-stream receipt count must be reported: {reason}"
         );
+        assert!(
+            reason.contains("passed_before_failure=0"),
+            "the passing count must be reported and must not be the index count: {reason}"
+        );
+    }
+
+    /// A member whose closure was decided on the local-network evidence path
+    /// is named on that path, so the next reader does not spend the
+    /// investigation looking for an unreaped process. The judgement is the
+    /// same either way; only the name and the facts in the reason differ.
+    #[test]
+    fn a_member_closed_by_the_local_network_evidence_is_named_on_that_path() {
+        use crate::host_process_closure::{build_host_process_fact, read_host_process_report};
+        let counts = "planned=1 passed_before_failure=0 no_dispatch=0";
+        let request = crate::RuntimeToolExecutionRequest {
+            compiled_invocation: None,
+            step_binding: None,
+            governed_plan_id: "plan".to_string(),
+            governed_plan_revision: 1,
+            observation_wave_sequence: 1,
+            idempotency_key: "ring-network-call".to_string(),
+            tool_use_id: "ring-network-call".to_string(),
+            tool_name: "bash".to_string(),
+            input: json!({"command": "printf ring"}).to_string(),
+            category: crate::ToolSafetyCategory::Destructive,
+            authorization: None,
+            session_id: Some("ring-network-session".to_string()),
+            sandbox_posture: harness_contract::policy::SandboxPosture::HostFullAccess,
+            policy_revision: 1,
+            authorized_scopes: Vec::new(),
+            memory_context: None,
+            reality_context: None,
+            model_lease: None,
+            parent_execution: None,
+            parent_execution_attempt: None,
+            execution_decision: None,
+            evaluation_isolated: false,
+            managed_invocation: None,
+            tool_progress: crate::ToolProgressSink::default(),
+        };
+        let effect = tools::ToolHost::builtin("ring-network", std::env::temp_dir())
+            .pin_snapshot()
+            .describe_effect("bash", &json!({"command": "printf ring"}));
+        let outcome = |observed_evidence: Vec<harness_contract::context::ObservedEvidence>| {
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: request.category,
+                output: None,
+                error: None,
+                evidence_ref: String::new(),
+                observed_evidence,
+                pending_agent_batch: None,
+            }
+        };
+
+        // No observation at all: the effect asked for network evidence and
+        // none was produced, so the closure sits on the network path.
+        let (ring, reason) =
+            ExecutionCommitService::physical_closure_ring(&outcome(Vec::new()), &effect, counts);
+        assert_eq!(ring, "network_effect_without_observation");
+        assert!(reason.contains("observed_evidence=0"), "{reason}");
+        assert!(reason.contains("outcome_status="), "{reason}");
+        assert!(reason.contains("passed_before_failure=0"), "{reason}");
+
+        // A process observation decides the closure on the process path, so
+        // that member keeps its own name instead of being folded into the
+        // network one.
+        let report = read_host_process_report(Some(
+            &json!({"stdout": "ring", "stderr": "", "returnTruncated": false}).to_string(),
+        ));
+        let mut admission = crate::host_process_closure::test_admission(&request);
+        admission.source_bundle = harness_contract::context::ArtifactRef::durable(
+            "artifact://ring-source",
+            format!("sha256:{}", "a".repeat(64)),
+            12,
+            "application/json",
+            "session:ring-network-session",
+        );
+        let fact = build_host_process_fact(
+            &request,
+            &effect,
+            &report,
+            harness_contract::context::ArtifactRef::durable(
+                "artifact://ring-body",
+                format!("sha256:{}", "b".repeat(64)),
+                12,
+                "application/json",
+                "session:ring-network-session",
+            ),
+            admission,
+        )
+        .expect("host process fact");
+        let evidence = vec![crate::host_process_closure::host_process_observation(&request, fact)];
+        let (ring, reason) =
+            ExecutionCommitService::physical_closure_ring(&outcome(evidence), &effect, counts);
+        assert_eq!(ring, "process_not_closed", "{reason}");
+        assert!(reason.starts_with("process_not_closed"), "{reason}");
     }
 }

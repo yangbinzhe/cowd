@@ -955,7 +955,22 @@ impl ScopedRuntimeToolExecutor {
             if original.tool_progress.original_fresh_effect()
                 .map_err(ToolError::unknown)?.is_none()
             {
-                return Err(ToolError::unknown("original Ticket effect admission missing"));
+                // The parent refused this delegated action before it was
+                // admitted. Name the missing admission, carry the facts that
+                // identify the refused member, and read the parent's own
+                // named refusal back from the observation this child was bound
+                // to, so the run's error text says which conjunct refused it.
+                let parent_reason = crate::agent_in_process_worker::current_process_member_custody(&original)
+                    .ok()
+                    .flatten()
+                    .and_then(|custody| custody.parent_refusal_reason(&original.tool_use_id));
+                return Err(ToolError::unknown(original_effect_admission_missing_reason(
+                    &original.tool_use_id,
+                    &original.idempotency_key,
+                    tool_name,
+                    self.attempt,
+                    parent_reason.as_deref(),
+                )));
             }
             let original_input = serde_json::from_str::<serde_json::Value>(&original.input)
                 .map_err(|error| ToolError::unknown(format!("original delegated input invalid: {error}")))?;
@@ -1467,5 +1482,69 @@ impl ScopedRuntimeToolExecutor {
                 outcome.error.unwrap_or_else(|| "tool outcome unknown".into()),
             )),
         }
+    }
+}
+
+/// The error text for a delegated action whose original effect was never
+/// admitted: the missing admission is named and the refused member is
+/// identified. It reports facts, not an interpretation.
+pub(crate) fn original_effect_admission_missing_reason(
+    tool_use_id: &str,
+    effect_key: &str,
+    tool_name: &str,
+    attempt: u32,
+    parent_reason: Option<&str>,
+) -> String {
+    let mut reason = format!(
+        "original_effect_admission_missing tool_use_id={tool_use_id} effect_key={effect_key} tool_name={tool_name} attempt={attempt}"
+    );
+    // The parent's own named refusal, carried verbatim. It is the admission
+    // owner's wording, so this line never invents a reason of its own.
+    if let Some(parent_reason) = parent_reason {
+        reason.push_str(" parent_refusal=");
+        reason.push_str(parent_reason);
+    }
+    reason
+}
+
+#[cfg(test)]
+mod original_effect_admission_tests {
+    use super::original_effect_admission_missing_reason;
+
+    /// The refusal must name the missing admission and identify the member.
+    #[test]
+    fn the_missing_admission_is_named_and_the_member_identified() {
+        let reason = original_effect_admission_missing_reason(
+            "chatcmpl-tool-1",
+            "sha256:key",
+            "task_publish",
+            3,
+            None,
+        );
+        assert!(reason.starts_with("original_effect_admission_missing"), "{reason}");
+        assert!(reason.contains("tool_use_id=chatcmpl-tool-1"), "{reason}");
+        assert!(reason.contains("effect_key=sha256:key"), "{reason}");
+        assert!(reason.contains("tool_name=task_publish"), "{reason}");
+        assert!(reason.contains("attempt=3"), "{reason}");
+    }
+
+    /// When the node's owner recorded a named refusal for this call, it is
+    /// carried verbatim: the run's error text then names the conjunct instead
+    /// of only saying the admission is missing.
+    #[test]
+    fn the_parent_named_refusal_is_carried_verbatim() {
+        let reason = original_effect_admission_missing_reason(
+            "chatcmpl-tool-1",
+            "sha256:key",
+            "task_publish",
+            3,
+            Some("tool_effect_authority: claim_status_mismatch task_ref=task:3e7f"),
+        );
+        assert!(reason.contains("attempt=3"), "{reason}");
+        assert!(
+            reason.contains("parent_refusal=tool_effect_authority: claim_status_mismatch task_ref=task:3e7f"),
+            "{reason}"
+        );
+        assert!(!reason.contains("parent_refusal=tool_effect_authority: claim_status_mismatch task_ref=task:3e7f parent_refusal"), "{reason}");
     }
 }

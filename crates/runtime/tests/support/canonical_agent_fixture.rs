@@ -73,6 +73,7 @@ impl RuntimeExecutionHost for CanonicalReadHost {
             error: None,
             evidence_ref: format!("runtime-tool:{}", request.tool_use_id),
             observed_evidence: vec![observed],
+            pending_agent_batch: None,
         }
     }
 

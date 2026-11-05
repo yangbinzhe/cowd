@@ -736,8 +736,12 @@ impl GatewayToolExecutor {
                         let carrier = runtime::PendingAgentBatch::with_cause(
                             prefix, error.pending_agent_batch().cloned(),
                         );
+                        // Keep the member's own error in the outer message:
+                        // the generic wording alone hides the only
+                        // actionable fact the run can report.
                         return Err(ToolError::unknown_with_agent_batch(
-                            "original batch has committed or unresolved members", carrier,
+                            &batch_member_error_message(&error.to_string()),
+                            carrier,
                         ));
                     }
                     return Err(error);
@@ -2294,5 +2298,72 @@ mod unified_read_tests {
     fn the_read_guard_matches_the_exposed_tool_name() {
         assert!(is_unified_read_tool("read_ref"));
         assert!(!is_unified_read_tool("read"));
+    }
+}
+
+/// The outer message of a failed batch member: the generic wording plus the
+/// member's own error, so a run reports the cause instead of the wrapper.
+/// The member's error text is carried verbatim; nothing here interprets it.
+pub(crate) fn batch_member_error_message(detail: &str) -> String {
+    format!("original batch has committed or unresolved members: {detail}")
+}
+
+#[cfg(test)]
+mod batch_member_error_tests {
+    use super::batch_member_error_message;
+
+    /// The outer message must carry the member's own error: a run that only
+    /// reports the wrapper hides the cause of the refusal.
+    #[test]
+    fn the_outer_message_carries_the_member_error() {
+        let message = batch_member_error_message(
+            "original_effect_admission_missing tool_use_id=call-1 effect_key=key-1",
+        );
+        assert!(
+            message.contains("original batch has committed or unresolved members"),
+            "{message}"
+        );
+        assert!(
+            message.contains("original_effect_admission_missing")
+                && message.contains("tool_use_id=call-1"),
+            "the member's own error must survive: {message}"
+        );
+    }
+
+    /// A member error with no typed failure renders as its bare message, and
+    /// the outer wrapper must still carry it. This is the shape the admission
+    /// refusals take today.
+    #[test]
+    fn a_member_error_without_a_failure_keeps_its_message() {
+        let member = runtime::ToolError::unknown(
+            "original_effect_admission_missing tool_use_id=call-1 effect_key=key-1 attempt=2",
+        );
+        let message = batch_member_error_message(&member.to_string());
+        assert!(message.contains("original_effect_admission_missing"), "{message}");
+        assert!(message.contains("tool_use_id=call-1"), "{message}");
+        assert!(message.contains("attempt=2"), "{message}");
+    }
+
+    /// A member error carrying a typed failure renders through `Display` as
+    /// the failure document, not as the bare message. The member's own text
+    /// still has to survive the wrapper, otherwise a change to `Display`
+    /// would silently drop the only actionable fact the run can report.
+    #[test]
+    fn a_member_error_with_a_failure_keeps_its_message() {
+        let member = runtime::ToolError::from_failure(
+            harness_contract::tool::ToolExecutionFailure::input_contract(
+                "task_publish",
+                "original_effect_admission_missing tool_use_id=call-2 effect_key=key-2",
+                None,
+                Vec::new(),
+            ),
+        );
+        let message = batch_member_error_message(&member.to_string());
+        assert!(message.contains("original batch has committed or unresolved members"), "{message}");
+        assert!(
+            message.contains("original_effect_admission_missing")
+                && message.contains("tool_use_id=call-2"),
+            "the member's own error must survive the failure document: {message}"
+        );
     }
 }

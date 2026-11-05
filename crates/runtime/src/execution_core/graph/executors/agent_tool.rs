@@ -528,6 +528,20 @@ impl NoDispatchObservation {
         }
     }
 
+    /// The named reason this node's admission recorded for one call, when the
+    /// call was refused before dispatch. Reading it back is the only way a
+    /// downstream consumer can report *which* admission conjunct refused the
+    /// call instead of a generic "admission missing".
+    pub(crate) fn refusal_reason(&self, call_id: &str) -> Option<String> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .refused
+            .iter()
+            .find(|call| call.call_id == call_id)
+            .map(|call| call.reason.clone())
+            .filter(|reason| !reason.is_empty())
+    }
+
     /// Retain the original owner's durable call decision for graph closure.
     /// The graph commit re-reads and fences the decision before publishing.
     pub(crate) fn refuse_committed(

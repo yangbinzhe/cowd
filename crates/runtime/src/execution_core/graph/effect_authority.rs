@@ -159,6 +159,8 @@ impl ExecutionCommitService {
         if effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
             || effect.uses_network
             || effect.spawns_process
+            || effect.mutates_packages
+            || effect.mutates_system
             || effect.scopes.is_empty()
             || effect
                 .scopes
@@ -245,7 +247,98 @@ impl ExecutionCommitService {
     /// equality. Each conjunct is named so the error text says which one was
     /// false.
     #[allow(clippy::too_many_arguments)]
+    /// What the model can do next for each named conjunct. This is text
+    /// only: it never changes the verdict, and it names no internal
+    /// mechanism — the model is told what to do, not how the runtime
+    /// decides.
+    fn claim_next_step(reason: &str) -> Option<&'static str> {
+        let name = reason.split_whitespace().next()?;
+        Some(match name {
+            "claim_status_mismatch" => {
+                "this Task has no valid claim yet: claim it with task_claim first"
+            }
+            "claim_not_yet_durable_in_same_batch" => {
+                "the claim for this Task is in the same batch and must be accepted first: call task_claim and wait for it before acting on the Task"
+            }
+            "claim_team_mismatch" => "this Task belongs to another team: do not act on it",
+            "claim_owner_mismatch" => "another member owns this Task's claim: do not act on it",
+            "claim_execution_graph_mismatch" => {
+                "this Task's claim belongs to another run: claim it again in this run"
+            }
+            "claim_generation_mismatch" => {
+                "this Task was claimed by an earlier attempt of yours: claim it again for this attempt"
+            }
+            "claim_lease_expired" => "this Task's claim expired: claim it again",
+            "claim_cancelled" => "this Task's claim was cancelled: do not act on it",
+            "claim_pending_retirement" => "this Task is being retired: do not act on it",
+            "active_attempt_missing" => {
+                "this Task has no running attempt in this run: claim it first"
+            }
+            "active_attempt_owner_mismatch" => {
+                "another member is running this Task: do not act on it"
+            }
+            "active_attempt_membership_mismatch" => {
+                "this Task is being run by another membership: do not act on it"
+            }
+            "active_attempt_mode_mismatch" => {
+                "this Task is being reviewed, not executed: do not act on it"
+            }
+            "active_attempt_execution_mismatch" => {
+                "this Task's attempt belongs to another run: claim it again in this run"
+            }
+            _ => return None,
+        })
+    }
+
+    /// Append the next step the model can take. The verdict itself is
+    /// unchanged; only the reason text grows.
+    fn with_next_step(reason: String) -> String {
+        match Self::claim_next_step(&reason) {
+            Some(step) => format!("{reason}; next: {step}"),
+            None => reason,
+        }
+    }
+
     fn task_claim_verdict(
+        task_ref: &str,
+        status: &AgenticTaskStatus,
+        task_team_id: &str,
+        scope_team_id: &str,
+        claimant: Option<&str>,
+        scope_agent_id: &str,
+        claim_execution_id: Option<&str>,
+        claim_generation: u64,
+        lease_expires_at_ms: Option<u64>,
+        cancel_requested_by: bool,
+        pending_retirement: bool,
+        attempt: Option<(&str, &str, &str, AgentAttemptMode, u64)>,
+        scope_membership_id: &str,
+        effect_graph_id: &str,
+        now_ms: u64,
+        same_batch_claim: Option<&str>,
+    ) -> Result<(), String> {
+        Self::task_claim_verdict_inner(
+            task_ref,
+            status,
+            task_team_id,
+            scope_team_id,
+            claimant,
+            scope_agent_id,
+            claim_execution_id,
+            claim_generation,
+            lease_expires_at_ms,
+            cancel_requested_by,
+            pending_retirement,
+            attempt,
+            scope_membership_id,
+            effect_graph_id,
+            now_ms,
+            same_batch_claim,
+        )
+        .map_err(Self::with_next_step)
+    }
+
+    fn task_claim_verdict_inner(
         task_ref: &str,
         status: &AgenticTaskStatus,
         task_team_id: &str,
@@ -1955,4 +2048,96 @@ mod task_claim_verdict_tests {
         .expect_err("an effective call without a claim must be refused");
         assert!(reason.starts_with("claim_status_mismatch"), "{reason}");
     }
+
+    /// Every named conjunct must tell the model what it can do next, and the
+    /// hint must stay free of internal mechanism.
+    #[test]
+    fn every_claim_conjunct_tells_the_model_what_to_do_next() {
+        for (name, expected) in [
+            ("claim_status_mismatch", "task_claim"),
+            ("claim_not_yet_durable_in_same_batch", "task_claim"),
+            ("claim_team_mismatch", "do not act on it"),
+            ("claim_owner_mismatch", "do not act on it"),
+            ("claim_execution_graph_mismatch", "claim it again"),
+            ("claim_generation_mismatch", "claim it again"),
+            ("claim_lease_expired", "claim it again"),
+            ("claim_cancelled", "do not act on it"),
+            ("claim_pending_retirement", "do not act on it"),
+            ("active_attempt_missing", "claim it first"),
+            ("active_attempt_owner_mismatch", "do not act on it"),
+            ("active_attempt_membership_mismatch", "do not act on it"),
+            ("active_attempt_mode_mismatch", "do not act on it"),
+            ("active_attempt_execution_mismatch", "claim it again"),
+        ] {
+            let step = ExecutionCommitService::claim_next_step(&format!("{name} task_ref=task:1"))
+                .unwrap_or_else(|| panic!("{name} has no next step"));
+            assert!(step.contains(expected), "{name}: {step}");
+            for internal in ["projection", "generation", "membership_id", "epoch", "lease_expires"] {
+                assert!(
+                    !step.contains(internal),
+                    "{name} leaks an internal detail: {step}"
+                );
+            }
+        }
+        // A reason that is not a claim conjunct carries no hint.
+        assert!(
+            ExecutionCommitService::claim_next_step("some_other_reason task_ref=task:1").is_none()
+        );
+    }
+
+    /// A read effect that mutates packages or the system is not a pure read
+    /// and must not take the read-only exemption.
+    #[test]
+    fn a_read_effect_that_mutates_packages_or_system_is_not_exempt() {
+        for mutate in ["packages", "system"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = tools::ToolHost::builtin("effect-authority-mutate-test", workspace.path());
+            let input = serde_json::json!({"path":"crates/runtime/src/lib.rs"});
+            let mut effect = host.pin_snapshot().describe_effect("read_file", &input);
+            assert_eq!(effect.effect_kind, harness_contract::tool::ToolEffectKind::Read);
+            if mutate == "packages" {
+                effect.mutates_packages = true;
+            } else {
+                effect.mutates_system = true;
+            }
+            let invocation = harness_contract::tool::GovernedToolInvocation {
+                origin: None,
+                contract_version: crate::governed_tool_plan::GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
+                invocation_id: "call-read".into(),
+                intent: harness_contract::tool::ToolIntent {
+                    invocation_id: "call-read".into(),
+                    tool_name: "read_file".into(),
+                    normalized_input: input.clone(),
+                },
+                resource_demand: harness_contract::tool::ResourceDemand {
+                    tool_slots: 1,
+                    process_slots: 0,
+                    network_slots: 0,
+                    cpu_weight: 1,
+                    memory_bytes: 0,
+                    scopes: vec![],
+                },
+                effect,
+                explicit_dependencies: vec![],
+                compiled_dependencies: vec![],
+                catalog_revision: 1,
+                descriptor_set_hash: "sha256:test-descriptor-set".into(),
+                idempotency_key: "call-read".into(),
+            };
+            let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+                &crate::tool_dispatch::ToolRequest {
+                    tool_use_id: "call-read".into(),
+                    tool_name: "read_file".into(),
+                    input: input.to_string(),
+                    depends_on: vec![],
+                },
+            );
+            request.compiled_invocation = Some(invocation);
+            assert!(
+                !ExecutionCommitService::is_read_only_effect(&request),
+                "a read that mutates {mutate} never takes the read-only exemption"
+            );
+        }
+    }
+
 }
