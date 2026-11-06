@@ -3475,6 +3475,21 @@ pub trait ToolExecutor: Send + Sync + 'static {
         None
     }
 
+    /// Rewrite one turn call's input onto the byte basis this executor will
+    /// actually execute on, before the governed plan describes the call's
+    /// effect. The default keeps the model's raw bytes: an executor that
+    /// executes the raw input keeps the plan, the authorization and the
+    /// closure identity on that same basis. An executor that rewrites the
+    /// input (the member path normalizes workspace-internal absolute resource
+    /// paths) must return the same bytes here, so the effect description, the
+    /// authorization descriptor, the planned payload and the closure identity
+    /// all name what executes. Err means the input cannot be normalized
+    /// deterministically; the caller refuses the call rather than admitting an
+    /// effect on an unreadable input.
+    fn normalize_turn_tool_input(&self, _tool_name: &str, input: &str) -> Result<String, ToolError> {
+        Ok(input.to_string())
+    }
+
     fn prepare_step_catalog(
         &self,
         _ceiling: harness_contract::tool::ToolPermissionMode,

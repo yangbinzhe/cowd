@@ -13402,7 +13402,7 @@ impl ExecutionCommitService {
                         PlannedCallIdentity::Foreign(reason) => {
                             #[cfg(any(test, feature = "test-fixtures"))]
                             if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=planned_receipt_identity_mismatch {reason} {}", leaf_counts(receipts.len(), index_receipts))); }
-                            *unprovable = Some(("planned_receipt_identity_mismatch", format!("{reason} {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
+                            *unprovable = Some(("planned_receipt_identity_mismatch", format!("planned_call={id} planned_tool={} {reason} {}{}", call["name"].as_str().unwrap_or("?"), leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                             return Ok(None);
                         }
                     }
@@ -14098,6 +14098,15 @@ impl ExecutionCommitService {
     /// tool name and the input digest describe *what the owner executed*:
     /// the runtime derives both for sanctioned calls, so a difference there
     /// is reported and never silently dropped.
+    /// Compare one planned call with the receipt its owner committed.
+    ///
+    /// Both sides sit on the turn-normalized byte basis: the planned input is
+    /// the normalized turn call (the turn entry normalizes before the governed
+    /// plan describes the effect), and the receipt's `input_sha256` is
+    /// committed on that same normalized basis. The raw-digest branch below is
+    /// therefore a normalized-basis comparison - never raw against normalized -
+    /// and the certified-canonical branch is the owner's own expectation of
+    /// those same bytes. A genuine input difference still fails closed here.
     fn planned_call_identity(
         planned_name: Option<&str>,
         planned_input: &str,
@@ -16389,6 +16398,115 @@ mod no_dispatch_ordering_tests {
         // receipt: a genuinely missing member stays missing.
         assert!(ExecutionCommitService::primary_receipt_required(Some(&fact), "key-other"));
         assert!(ExecutionCommitService::primary_receipt_required(None, "key-covered"));
+    }
+}
+
+#[cfg(test)]
+mod a7_patch_a_tests {
+    use super::ExecutionCommitService;
+    use super::PlannedCallIdentity;
+    use crate::conversation::ToolExecutor as _;
+
+    fn digest(input: &str) -> String {
+        format!("sha256:{:x}", sha2::Sha256::digest(input.as_bytes()))
+    }
+
+    use sha2::Digest as _;
+
+    /// The real #5 pair (report n8-v010021-team-projection-20261106-a, call
+    /// chatcmpl-tool-a7295955a2458928): the model's raw composite
+    /// `tool_orchestrate` input and the path-normalized bytes the member
+    /// executor actually ran and committed.
+    const RAW_ORCHESTRATE_INPUT: &str = r#"{"steps":[{"id":"glob_rest","input":{"cursor":"{\"version\":2,\"root\":\"/media/yi/Datas/workspace/.cowd-worktrees/n8-eval-n8-v010021-team-projection-20261106-a/crates/runtime\",\"query_hash\":\"bcc6a1af57c77a30767e33d16088daeb9a004e79ba1b07886ee1941ee51db41f\",\"after\":\"/media/yi/Datas/workspace/.cowd-worktrees/n8-eval-n8-v010021-team-projection-20261106-a/crates/runtime/src/context/ledger/mod.rs\",\"file_hash\":null,\"row\":0,\"omissions\":[\"ignore_rules_unavailable\"]}","ignore_patterns":[],"include_ignored":false,"path":"/media/yi/Datas/workspace/.cowd-worktrees/n8-eval-n8-v010021-team-projection-20261106-a/crates","pattern":"runtime/**/*.rs"},"op":"call","tool":"glob_search"},{"id":"read_lib","input":{"complete":true,"path":"crates/runtime/src/lib.rs"},"op":"call","tool":"read_file"},{"id":"read_agentic_mod","input":{"complete":true,"path":"crates/runtime/src/agentic/mod.rs"},"op":"call","tool":"read_file"},{"id":"read_cargo","input":{"complete":true,"path":"crates/runtime/Cargo.toml"},"op":"call","tool":"read_file"}]}"#;
+    const NORMALIZED_ORCHESTRATE_INPUT: &str = r#"{"steps":[{"id":"glob_rest","input":{"cursor":"{\"version\":2,\"root\":\"/media/yi/Datas/workspace/.cowd-worktrees/n8-eval-n8-v010021-team-projection-20261106-a/crates/runtime\",\"query_hash\":\"bcc6a1af57c77a30767e33d16088daeb9a004e79ba1b07886ee1941ee51db41f\",\"after\":\"/media/yi/Datas/workspace/.cowd-worktrees/n8-eval-n8-v010021-team-projection-20261106-a/crates/runtime/src/context/ledger/mod.rs\",\"file_hash\":null,\"row\":0,\"omissions\":[\"ignore_rules_unavailable\"]}","ignore_patterns":[],"include_ignored":false,"path":"crates","pattern":"runtime/**/*.rs"},"op":"call","tool":"glob_search"},{"id":"read_lib","input":{"complete":true,"path":"crates/runtime/src/lib.rs"},"op":"call","tool":"read_file"},{"id":"read_agentic_mod","input":{"complete":true,"path":"crates/runtime/src/agentic/mod.rs"},"op":"call","tool":"read_file"},{"id":"read_cargo","input":{"complete":true,"path":"crates/runtime/Cargo.toml"},"op":"call","tool":"read_file"}]}"#;
+
+    /// Patch A regression: the turn entry normalizes the call's input before
+    /// the governed plan describes its effect, so the planned call the closure
+    /// compares is the normalized one and the receipt committed on that same
+    /// basis answers it. The pre-patch shape (the raw plan against that
+    /// receipt) still fails closed - the fix moves the basis, it does not
+    /// loosen the identity comparison.
+    #[test]
+    fn a_turn_normalized_plan_matches_its_receipt_and_the_raw_plan_still_fails_closed() {
+        assert_eq!(
+            digest(RAW_ORCHESTRATE_INPUT),
+            "sha256:5e1aa13c284e15e2a1f61915fe7da3647584f34909d43afe0d235b8c9a2f86d3"
+        );
+        assert_eq!(
+            digest(NORMALIZED_ORCHESTRATE_INPUT),
+            "sha256:74faf3bafb95dc728a43bfb42daa79557a9394dbbf6273a656833c322e09a58a"
+        );
+        let origin = serde_json::json!({"origin_step_id": "step-a7", "call_id": "call-a7"});
+        let receipt_digest = serde_json::json!(digest(NORMALIZED_ORCHESTRATE_INPUT));
+        // The normalized plan (what the turn entry now persists) answers the receipt.
+        match ExecutionCommitService::planned_call_identity(
+            Some("tool_orchestrate"),
+            NORMALIZED_ORCHESTRATE_INPUT,
+            Some(&origin),
+            "tool_orchestrate",
+            &receipt_digest,
+            &origin,
+            None,
+        ) {
+            PlannedCallIdentity::Matches => {}
+            other => panic!("the normalized plan must match its receipt: {other:?}"),
+        }
+        // The raw plan (the pre-patch shape) still fails closed against it.
+        match ExecutionCommitService::planned_call_identity(
+            Some("tool_orchestrate"),
+            RAW_ORCHESTRATE_INPUT,
+            Some(&origin),
+            "tool_orchestrate",
+            &receipt_digest,
+            &origin,
+            None,
+        ) {
+            PlannedCallIdentity::Foreign(reason) => {
+                assert!(reason.contains("input differs"), "the refusal must name the input difference: {reason}");
+            }
+            other => panic!("the raw plan must still fail closed: {other:?}"),
+        }
+    }
+
+    /// Negative control 1: a receipt that answers different bytes is still
+    /// refused on the normalized basis - the basis change grants nothing.
+    #[test]
+    fn a_genuinely_different_receipt_still_fails_closed_on_the_normalized_basis() {
+        let origin = serde_json::json!({"origin_step_id": "step-a7", "call_id": "call-a7"});
+        let mut different = serde_json::from_str::<serde_json::Value>(NORMALIZED_ORCHESTRATE_INPUT)
+            .expect("normalized input parses");
+        different["steps"][0]["input"]["path"] = serde_json::json!("crates/gateway");
+        let different_input = serde_json::to_string(&different).expect("serializes");
+        assert_ne!(digest(&different_input), digest(NORMALIZED_ORCHESTRATE_INPUT));
+        match ExecutionCommitService::planned_call_identity(
+            Some("tool_orchestrate"),
+            NORMALIZED_ORCHESTRATE_INPUT,
+            Some(&origin),
+            "tool_orchestrate",
+            &serde_json::json!(digest(&different_input)),
+            &origin,
+            None,
+        ) {
+            PlannedCallIdentity::Foreign(reason) => {
+                assert!(reason.contains("input differs"), "the refusal must name the input difference: {reason}");
+            }
+            other => panic!("a receipt for different bytes must be refused: {other:?}"),
+        }
+    }
+
+    /// Root regression: an executor that executes the model's raw bytes (the
+    /// root path) keeps them - the trait default rewrites nothing, so the
+    /// root turn's plan, authorization and closure stay on the raw basis.
+    #[test]
+    fn a_root_executor_keeps_the_models_raw_input_bytes() {
+        let executor = crate::conversation::StaticToolExecutor::new();
+        let input = r#"{"path":"/media/absolute/workspace/path"}"#;
+        assert_eq!(
+            executor
+                .normalize_turn_tool_input("read_file", input)
+                .expect("the root executor never refuses on normalization"),
+            input
+        );
     }
 }
 

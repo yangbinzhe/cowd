@@ -7756,3 +7756,31 @@ fn process_human_grant_cannot_exceed_packet_or_service_mode() {
             PermissionMode::DangerFullAccess), allowed);
     }
 }
+
+/// A7 Patch A, C-a: a turn call whose input cannot be normalized
+/// deterministically is an error, never a silent fallback to raw bytes. The
+/// tool_plane turn entry routes that error into `refused_before_dispatch`, so
+/// the call never enters `requests`/`pending`, is never dispatched and commits
+/// no receipt - the fail-closed shape the repetition guard's refusal path
+/// already uses. A well-formed input normalizes and stays representable.
+#[tokio::test]
+async fn a7_patch_a_normalization_unavailable_refuses_before_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let executor = concurrency_test_executor(
+        root.path(),
+        Arc::new(ConcurrencyTrackingRuntimeExecutionHost::new()),
+        Arc::new(ScopeLockManager::new()),
+    );
+    let error = executor
+        .normalize_turn_tool_input("read_file", "{not json")
+        .expect_err("an unnormalizable input must be an error, not a raw fallback");
+    assert!(
+        error.to_string().contains("invalid scoped tool input"),
+        "the refusal must name the unreadable input: {error}"
+    );
+    let input = r#"{"path":"crates/runtime/src/lib.rs"}"#;
+    let normalized = executor
+        .normalize_turn_tool_input("read_file", input)
+        .expect("a well-formed input normalizes");
+    assert_eq!(normalized, input, "an in-workspace relative input is unchanged");
+}

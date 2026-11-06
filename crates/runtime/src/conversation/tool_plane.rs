@@ -2277,16 +2277,42 @@ where
         // does, and record each refusal the same way it already records itself.
         let mut refused_ids = std::collections::BTreeSet::new();
         let mut refusal_messages = Vec::new();
+        // The member executor executes a path-normalized input, so the turn's
+        // calls are normalized onto that same byte basis here - before the
+        // governed plan describes each call's effect - keeping the plan, the
+        // authorization, the planned payload and the closure identity on the
+        // bytes that will actually execute (the path_scope security
+        // invariant). The root executor keeps the model's raw bytes. A call
+        // whose input cannot be normalized deterministically is refused here,
+        // exactly like the repetition breaker below, so no effect is admitted
+        // on an unreadable input.
+        let mut normalized_inputs = std::collections::BTreeMap::new();
+        for call in calls {
+            match self.tool_executor.normalize_turn_tool_input(&call.name, &call.input) {
+                Ok(input) => {
+                    normalized_inputs.insert(call.id.clone(), input);
+                }
+                Err(error) => {
+                    refused_ids.insert(call.id.clone());
+                    refused_before_dispatch.push((
+                        call.id.clone(),
+                        format!("turn input normalization refused for `{}`: {error}", call.name),
+                    ));
+                }
+            }
+        }
         for call in calls {
             if replays.contains_key(&call.id) || original_replays.contains_key(&call.id) {
                 continue;
             }
             let Some(refusal) =
-                self.blocked_repeated_call(&call.name, &call.id, &call.input, iteration)
+                self.blocked_repeated_call(&call.name, &call.id,
+                    normalized_inputs.get(&call.id).unwrap_or(&call.input), iteration)
             else {
                 continue;
             };
-            self.note_refusal_ignored(&call.name, &call.input);
+            self.note_refusal_ignored(&call.name,
+                normalized_inputs.get(&call.id).unwrap_or(&call.input));
             refused_before_dispatch.push((
                 call.id.clone(),
                 "repetition breaker refused before compilation".into(),
@@ -2327,7 +2353,10 @@ where
             .map(|call| ToolRequest {
                 tool_use_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                input: call.input.clone(),
+                input: normalized_inputs
+                    .get(&call.id)
+                    .cloned()
+                    .unwrap_or_else(|| call.input.clone()),
                 depends_on: call.depends_on.clone(),
             })
             .collect::<Vec<_>>();
@@ -2335,7 +2364,11 @@ where
         let pending = calls
             .iter()
             .filter(|call| !refused_ids.contains(&call.id))
-            .map(|call| (call.id.clone(), call.name.clone(), call.input.clone()))
+            .map(|call| (call.id.clone(), call.name.clone(),
+                normalized_inputs
+                    .get(&call.id)
+                    .cloned()
+                    .unwrap_or_else(|| call.input.clone())))
             .collect::<Vec<_>>();
         let original_executor: Arc<dyn crate::ToolExecutor> = self.tool_executor.clone();
         let plan_pin = original_executor.pin_step_catalog().map(Arc::new);

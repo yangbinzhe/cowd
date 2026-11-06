@@ -680,6 +680,20 @@ impl ScopedRuntimeToolExecutor {
 
 #[async_trait::async_trait]
 impl ToolExecutor for ScopedRuntimeToolExecutor {
+    /// The member executor executes a path-normalized input, so the turn's
+    /// calls are normalized here with this executor's own existing
+    /// normalization and its own workspace root - the same function and the
+    /// same root the execution side uses, never a second rule set.
+    fn normalize_turn_tool_input(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        normalize_delegated_resource_paths(
+            tool_name,
+            input,
+            &self.workspace_root,
+            &self.path_identity_resolver,
+            self.resource_scopes.as_deref(),
+        )
+    }
+
     fn bind_bounded_process_request(&self, request: &mut crate::RuntimeToolExecutionRequest)
         -> Result<(), ToolError> {
         self.bind_original_bounded_request(request)
