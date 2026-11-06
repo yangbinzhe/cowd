@@ -6163,25 +6163,54 @@ impl ExecutionCommitService {
         request: &crate::RuntimeToolExecutionRequest,
         effect: &ToolEffectDescriptor,
     ) -> Result<crate::RuntimeToolExecutionOutcome, ExecutionCommitError> {
+        self.completed_original_delegated_action_family(request, effect, false)
+    }
+
+    /// The Read family settles a read receipt instead of an effect receipt.
+    /// Its delegated child writes the same durable pair under the read keys,
+    /// so a member Read action is consumed exactly like a mutation action:
+    /// the parent never appends a second receipt for the same effect key.
+    pub(crate) fn completed_original_delegated_read_action(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+    ) -> Result<crate::RuntimeToolExecutionOutcome, ExecutionCommitError> {
+        self.completed_original_delegated_action_family(request, effect, true)
+    }
+
+    fn completed_original_delegated_action_family(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        read: bool,
+    ) -> Result<crate::RuntimeToolExecutionOutcome, ExecutionCommitError> {
         let invalid = |reason: &str| ExecutionCommitError::InvalidCommand(reason.into());
         let stream = format!("execution-effect:{}", request.idempotency_key);
         let index_stream = delegated_agent_receipt_stream_id(request)
             .ok_or_else(|| invalid("original delegated receipt owner missing"))?;
         let primary = self.event_store.event_by_idempotency_key(
-            &stream, &format!("{}:receipt", request.idempotency_key))?
+            &stream,
+            &format!(
+                "{}:{}",
+                request.idempotency_key,
+                if read { "read-receipt" } else { "receipt" }
+            ),
+        )?
             .ok_or_else(|| invalid("original delegated primary receipt missing"))?;
         let index = self.event_store.event_by_idempotency_key(
             &index_stream, &delegated_agent_receipt_key(request))?
             .ok_or_else(|| invalid("original delegated index receipt missing"))?;
         validate_mutation_tool_fingerprint(request, effect, &primary.payload, "receipt")?;
-        self.validate_terminal_scope(request, effect, &primary, false)?;
+        self.validate_terminal_scope(request, effect, &primary, read)?;
         let txn = self.event_store.original_transaction_receipt(&primary.transaction_id)?
             .ok_or_else(|| invalid("original delegated receipt transaction missing"))?;
         let outcome: crate::RuntimeToolExecutionOutcome = serde_json::from_value(primary.payload["outcome"].clone())?;
         if primary.scope != RuntimeEventScope::ExecutionNode
             || index.scope != RuntimeEventScope::ExecutionNode
-            || primary.kind != "execution.effect.receipt" || primary.schema_version != 1
+            || primary.kind != if read { "execution.read.receipt" } else { "execution.effect.receipt" }
+            || primary.schema_version != 1
             || index.kind != "execution.agent_tool.receipt"
+            || (read && index.payload["effect_kind"] != "read")
             || primary.actor.as_deref() != Some("governed_tool")
             || index.actor.as_deref() != Some("governed_tool")
             || primary.status.as_deref() != Some("completed")

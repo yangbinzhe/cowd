@@ -800,6 +800,45 @@ impl OriginalGovernedHook {
     }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+impl OriginalGovernedHook {
+    /// Build the same-call hook an admission installs, for tests that drive a
+    /// delegated agent-tool node without the full governed ToolBatch planner.
+    /// The pinned owner is inert: only the plan/session/parent identity this
+    /// hook records is read on the bound (Step-carrying) path.
+    pub(crate) fn installed_for_test(
+        ticket: crate::execution_core::NodeExecutionTicket,
+        step: Option<crate::step_snapshot::StepCallBinding>,
+        plan_id: String,
+        plan_revision: u64,
+        session_id: String,
+        parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+        attempt: Option<u32>,
+        model_input: serde_json::Value,
+        effective_input: serde_json::Value,
+        invocation: harness_contract::tool::GovernedToolInvocation,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            ticket,
+            step,
+            pinned: std::sync::Arc::new(crate::governed_tool_plan::OriginalPinnedInvocation::new(
+                invocation.clone(),
+                None,
+                std::sync::Arc::new(crate::conversation::StaticToolExecutor::new()),
+            )),
+            authorization: std::sync::OnceLock::new(),
+            plan_id,
+            plan_revision,
+            session_id,
+            parent,
+            attempt,
+            model_input,
+            effective_input,
+            invocation,
+        })
+    }
+}
+
 struct TicketToolAdmission {
     resource: Option<crate::ToolExecutionAdmission>,
     prepared: Option<PreparedGovernedToolCall>,
@@ -3471,8 +3510,16 @@ where
             let output = execution.as_ref().map_err(|error| error.clone().with_unresolved_context(
                 "original child receipt remains unsettled", None,
             ))?;
-            let receipt = commit.completed_original_delegated_action(request, descriptor)
-                .map_err(|error| ToolError::unknown(error.to_string()))?;
+            // A Read-family action's child settles a read receipt, never an
+            // effect receipt; consuming the right durable pair is what keeps
+            // the member's Read action terminal instead of unknown.
+            let receipt = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                commit.completed_original_delegated_read_action(request, descriptor)
+                    .map_err(|error| ToolError::unknown(error.to_string()))?
+            } else {
+                commit.completed_original_delegated_action(request, descriptor)
+                    .map_err(|error| ToolError::unknown(error.to_string()))?
+            };
             if receipt.status != crate::RuntimeToolExecutionStatus::Executed
                 || receipt.output.as_deref() != Some(output.model_text())
             {

@@ -2017,10 +2017,25 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
                     if request.tool_progress.original_governed_hook().map_err(|error| NodeExecutorError::Uncertain {
                         node_id: ticket.node_id.clone(), reason: error,
                     })?.is_some() {
-                        return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(),
-                            reason: "original governed effect owner missing".into() });
-                    }
-                    false
+                        // The owner slot answers the admission question for the
+                        // effect families that install one. The Read family never
+                        // installs a first-effect owner (see after_commit), so an
+                        // empty slot is not a lost effect: the durable admission
+                        // fact answers the same question in every family, under
+                        // the same exact keys. A fact that cannot be read is
+                        // never an admission, so a call the parent never admitted
+                        // stays uncertain instead of being dispatched.
+                        if !services.commit_service()
+                            .original_effect_admitted(false, request)
+                            .map_err(|error| NodeExecutorError::Uncertain {
+                                node_id: ticket.node_id.clone(), reason: error.to_string(),
+                            })?
+                        {
+                            return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(),
+                                reason: "original governed effect owner missing".into() });
+                        }
+                        true
+                    } else { false }
                 }
             }
         } else { false };
@@ -3567,5 +3582,693 @@ pub(crate) mod carrier_437_tests {
                 }
             }
         }
+    }
+}
+
+
+/// A7: the member agent's first model step issues `state_inspect` next to
+/// `workspace_snapshot`. `state_inspect` is an agent action of the Read family,
+/// so it reaches the agent-tool node through the turn's governed ToolBatch plan
+/// (tool-dag plan id, governed hook installed) while the Read family never
+/// installs a first-effect owner. Before the fix that shape was reported as
+/// `original governed effect owner missing` (Uncertain), the node blocked, and
+/// the member turn never reached a terminal or a durable receipt.
+#[cfg(test)]
+pub(crate) mod a7_member_read_action_tests {
+    use super::*;
+
+    const SESSION: &str = "a7-session";
+    const TURN: &str = "a7-turn";
+    const GRAPH: &str = "a7-member-graph";
+    const NODE: &str = "a7-member-node";
+    const RUN: &str = "a7-member-run";
+    const AGENT: &str = "a7-member-agent";
+    const TASK: &str = "task:a7-member-task";
+    const PLAN: &str = "tool-dag-a7-member-read";
+
+    /// A member AgentTask that stays running: the turn's tool batch and the
+    /// Read family's admission both fence on the parent node being live, and a
+    /// unit fixture has no provider to finish the turn with.
+    struct PendingAgentTask;
+
+    impl crate::execution_core::graph::executors::AgentTaskBackendResolver for PendingAgentTask {
+        fn resolve(
+            &self,
+            _packet: &harness_contract::agent::AgentTaskPacket,
+        ) -> Option<
+            Arc<dyn crate::execution_core::graph::executors::AgentTaskBackend>,
+        > {
+            Some(Arc::new(Self))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::execution_core::graph::executors::AgentTaskBackend for PendingAgentTask {
+        async fn execute(
+            &self,
+            _: harness_contract::agent::AgentTaskPacket,
+        ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
+            std::future::pending().await
+        }
+        async fn cancel(
+            &self,
+            _: &harness_contract::agent::AgentTaskPacket,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn cancellation_finalized(&self, _: &harness_contract::agent::AgentTaskPacket) {}
+    }
+
+    /// Minimal execution host over a builtin ToolHost: it serves the pinned
+    /// catalog and the effect descriptors the member Read action needs, and
+    /// fails closed for everything else.
+    struct A7Host(tools::ToolHost);
+
+    #[async_trait::async_trait]
+    impl crate::RuntimeExecutionHost for A7Host {
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            Some(self.0.pin_snapshot())
+        }
+        fn delegated_tool_definitions(&self, names: &[String]) -> Vec<crate::ProviderToolDefinition> {
+            let requested = names.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+            self.0
+                .pin_snapshot()
+                .snapshot()
+                .catalog
+                .definitions(Some(&requested))
+                .into_iter()
+                .map(|definition| crate::ProviderToolDefinition {
+                    name: definition.name,
+                    description: definition.description,
+                    input_schema: definition.input_schema,
+                })
+                .collect()
+        }
+        fn delegated_tool_effect_descriptor(
+            &self,
+            name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            let lease = self.0.pin_snapshot();
+            lease.snapshot().catalog.canonical_name(name)?;
+            Some(lease.describe_effect(name, input))
+        }
+        async fn execute_runtime_tool(
+            &self,
+            request: &RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            crate::RuntimeToolExecutionOutcome {
+                pending_agent_batch: None,
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::BlockedPermission,
+                category: request.category,
+                output: None,
+                error: Some("a7 host cannot execute this tool".into()),
+                evidence_ref: String::new(),
+                observed_evidence: Vec::new(),
+            }
+        }
+    }
+
+    struct A7Fixture {
+        services: Arc<RuntimeServices>,
+        packet: harness_contract::agent::AgentTaskPacket,
+        _workspace: tempfile::TempDir,
+    }
+
+    fn a7_packet() -> harness_contract::agent::AgentTaskPacket {
+        let mut packet = harness_contract::agent::AgentTaskPacket {
+            assignment: crate::test_support::agent_assignment(
+                None,
+                AGENT,
+                RUN,
+                TASK,
+                SESSION,
+                "a7-mission",
+                Some("team:a7-member-team"),
+                GRAPH,
+                NODE,
+            ),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: "inspect the task".into(),
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            cohort_prompt_package: None,
+            acceptance: Vec::new(),
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            agentic_binding: None,
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: vec!["state_inspect".into()],
+            allowed_skills: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            policy_revision: 1,
+            model_lease: "a7-model".into(),
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                "a7-budget",
+                AGENT,
+                AGENT,
+                1,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "a7-key".into(),
+        }
+        ;
+        packet
+    }
+
+    /// Compile the packet's Runtime binding the way the production admission
+    /// does: the Read family's effect authority fences on it.
+    fn a7_bound_packet(
+        services: &RuntimeServices,
+        mut packet: harness_contract::agent::AgentTaskPacket,
+    ) -> harness_contract::agent::AgentTaskPacket {
+        let definition_id = harness_contract::agent::AgentDefinitionId::new(
+            harness_contract::agent::DefinitionScope::Builtin,
+            "cowd/execute",
+        )
+        .unwrap();
+        let mut request = crate::AgentBindingRequest::new(
+            definition_id,
+            harness_contract::agent::RevisionSelector::LatestApprovedStable,
+            packet.agent_id(),
+            packet.session_id(),
+            packet.task_id(),
+        );
+        request.team_id = packet.team_id().map(str::to_string);
+        request.granted_capabilities = vec![harness_contract::agent::AgentCapability::Read];
+        request.allowed_tool_contract_refs = packet.allowed_tools.clone();
+        packet.binding = Some(
+            crate::AgentBindingCompiler::new(std::sync::Arc::clone(
+                services.definition_registry(),
+            ))
+            .compile(request)
+            .unwrap()
+            .snapshot,
+        );
+        packet
+    }
+
+    async fn a7_fixture() -> A7Fixture {
+        let workspace = tempfile::tempdir().unwrap();
+        let actions = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+            .iter()
+            .map(|name| tools::RuntimeToolDefinition {
+                name: name.to_string(),
+                description: Some("a7 coordination adapter".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+                required_permission: harness_contract::policy::PermissionMode::ReadOnly,
+                effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+                    resolver_id: "runtime.agent_action".into(),
+                    resolver_version: 2,
+                },
+            })
+            .collect();
+        let catalog = tools::ToolCatalog::builtin().with_runtime_tools(actions).unwrap();
+        let host = Arc::new(A7Host(tools::ToolHost::new(
+            "a7-host",
+            workspace.path(),
+            tools::ToolHostSnapshot::new(
+                Arc::new(catalog),
+                Arc::new(tools::lsp_client::LspRegistry::default()),
+                None,
+            ),
+        )));
+        // The host and the services must share one workspace root: the member
+        // Read action's effect scope is admitted against the pinned workspace,
+        // and a second root would read as a different workspace.
+        let services = RuntimeServices::builder(
+            workspace.path().join("home"),
+            workspace.path(),
+        )
+        .runtime_event_store(Arc::new(
+            crate::runtime_event_store::RuntimeEventStore::for_test(),
+        ))
+        .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(
+            workspace.path().join("test-artifacts"),
+        )))
+        .task_aggregate_service(Arc::new(crate::TaskAggregateService::for_test()))
+        .background_work(crate::BackgroundWorkConfig {
+            evolution: false,
+            growth: false,
+        })
+        .tool_execution_host(host)
+        .build()
+        .unwrap();
+        let packet = a7_bound_packet(&services, a7_packet());
+        let mut graph = ExecutionGraph::new("a7 member fixture");
+        graph.id = GRAPH.into();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: SESSION.into(),
+            turn_id: TURN.into(),
+            root_task_id: TASK.into(),
+            task_id: TASK.into(),
+            generation: 1,
+        });
+        let mut node = ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::AgentTask,
+            "agent_task",
+            serde_json::to_string(&packet).unwrap(),
+        );
+        node.id = NODE.into();
+        graph.nodes.push(node);
+        services
+            .agent_task_executor()
+            .install_resolver(Arc::new(PendingAgentTask));
+        services.commit_service().register_graph(graph).unwrap();
+        let driver = Arc::clone(&services);
+        tokio::spawn(async move {
+            let _ = driver.execution_supervisor().drive_registered(GRAPH).await;
+        });
+        for _ in 0..250 {
+            let driven = services.graph_state_store().load(GRAPH).unwrap();
+            if driven.node_statuses.get(NODE) == Some(&ExecutionNodeStatus::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        services.publish_session_execution_policy(
+            SESSION,
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        A7Fixture {
+            services,
+            packet,
+            _workspace: workspace,
+        }
+    }
+
+    fn member_state_inspect_request(fixture: &A7Fixture) -> RuntimeToolExecutionRequest {
+        let services = &fixture.services;
+        let packet = &fixture.packet;
+        let host = services.tool_execution_host().expect("fixture ToolHost");
+        let lease = host.pin_step_catalog().expect("pinned catalog");
+        let session_policy = services
+            .session_execution_policy(SESSION)
+            .expect("fixture Session policy");
+        let identity = harness_contract::step::StepIdentity {
+            step_id: "step-a7-member-read".into(),
+            session_id: SESSION.into(),
+            turn_id: TURN.into(),
+            execution_id: Some(RUN.into()),
+            actor_ref: Some(format!("agent:{AGENT}")),
+            run_ref: Some(RUN.into()),
+            attempt: Some(1),
+            epoch: None,
+            goal_ref: None,
+            program_ref: None,
+            task_ref: Some(TASK.into()),
+            build_ref: "a7-build".into(),
+        };
+        let definitions = lease
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .filter(|definition| definition.name == "state_inspect")
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(definitions.len(), 1, "state_inspect must be registered");
+        let step = Arc::new(
+            crate::step_snapshot::BoundStep::bind(
+                identity,
+                lease.clone(),
+                &definitions,
+                &serde_json::json!({"profile": "original"}),
+                &serde_json::json!({"request": "original"}),
+                std::collections::BTreeMap::from([(
+                    "policy".into(),
+                    session_policy.revision.to_string(),
+                )]),
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_add(3_600_000),
+            )
+            .expect("bound Step"),
+        );
+        let binding = crate::step_snapshot::StepCallBinding::provider(step, "call-a7-member-read");
+        let input = serde_json::json!({"scope_ref": TASK});
+        let input_text = serde_json::to_string(&input).expect("input serializes");
+        let invocation = binding
+            .prepare_invocation(Some(lease.clone()), "state_inspect", &input)
+            .expect("compiled invocation");
+        let policy = crate::PermissionPolicy::new(session_policy.permission_mode);
+        let assessment = crate::AuthorizationNegotiator::new().assess_effective(
+            &policy,
+            &crate::AuthorizationRequest {
+                principal_id: format!("agent:{AGENT}"),
+                capability: "state_inspect".into(),
+                input: input_text.clone(),
+                idempotency_key: binding.effect_idempotency_key(),
+                effect: invocation.effect.clone(),
+                parent_ceiling: packet.permission_ceiling,
+                parent_lease_id: None,
+                policy_revision: session_policy.revision,
+                recovery_scope: RUN.into(),
+                context: crate::PermissionContext::default(),
+                safe_alternatives: Vec::new(),
+            },
+        );
+        let authorization = crate::ToolPolicy
+            .authorize(
+                &assessment.effective,
+                &assessment.assessment,
+                binding.origin.call_id.clone(),
+                assessment.assessment.lease.clone().expect("assessed lease"),
+                30,
+            )
+            .expect("authorization")
+            .authorization;
+        let mut request = RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: binding.origin.call_id.clone(),
+                tool_name: "state_inspect".into(),
+                input: input_text,
+                depends_on: vec![],
+            },
+        );
+        request.idempotency_key = binding.effect_idempotency_key();
+        request.compiled_invocation = Some(invocation.clone());
+        request.step_binding = Some(binding.clone());
+        // The member's first model step reaches the agent-tool node through the
+        // turn's governed ToolBatch plan, so the plan id is the tool-dag id and
+        // the governed hook the admission installed attests it.
+        request.governed_plan_id = PLAN.into();
+        request.governed_plan_revision = 1;
+        request.observation_wave_sequence = 1;
+        request.category = crate::ToolSafetyCategory::from_effect(&invocation.effect);
+        request.authorization = Some(authorization);
+        request.session_id = Some(SESSION.into());
+        request.sandbox_posture = session_policy.sandbox_posture;
+        request.policy_revision = session_policy.revision;
+        request.authorized_scopes = vec![format!("session:{SESSION}")];
+        request.model_lease = Some(packet.model_lease.clone());
+        request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: GRAPH.into(),
+            node_id: NODE.into(),
+        });
+        request.parent_execution_attempt = Some(1);
+        request.tool_progress
+            .install_original_governed_hook(
+                crate::conversation::tool_plane::OriginalGovernedHook::installed_for_test(
+                    NodeExecutionTicket {
+                        graph_id: GRAPH.into(),
+                        node_id: NODE.into(),
+                        executor_kind: "tool_batch".into(),
+                        service_class: Default::default(),
+                        attempt: 1,
+                        idempotency_key: format!("{NODE}:attempt"),
+                        payload_ref: String::new(),
+                    },
+                    Some(binding),
+                    PLAN.into(),
+                    1,
+                    SESSION.into(),
+                    request.parent_execution.clone(),
+                    Some(1),
+                    input.clone(),
+                    input,
+                    invocation,
+                ),
+            )
+            .expect("governed hook installs once");
+        request
+    }
+
+    /// What the turn's own admission writes before it dispatches the child:
+    /// the Read family's `execution.read.intent` on the call's effect stream.
+    fn admit_member_read_intent(services: &RuntimeServices, request: &RuntimeToolExecutionRequest) {
+        let host = services.tool_execution_host().expect("fixture ToolHost");
+        let input: serde_json::Value = serde_json::from_str(&request.input).expect("input parses");
+        let descriptor = host
+            .delegated_tool_effect_descriptor(&request.tool_name, &input)
+            .expect("state_inspect descriptor");
+        let scope = crate::bound_tool_batch::admitted_effect_scope(
+            request,
+            &descriptor,
+            host.pin_step_catalog(),
+            services.path_identity_resolver(),
+        )
+        .expect("admitted scope");
+        services
+            .commit_service()
+            .begin_bound_tool_effect(request, &descriptor, &scope)
+            .expect("the Read family admits through its read intent");
+    }
+
+    fn receipt_pair(
+        services: &RuntimeServices,
+        request: &RuntimeToolExecutionRequest,
+    ) -> Vec<crate::DurableRuntimeEvent> {
+        let parent = request.parent_execution.as_ref().expect("parent");
+        let store = services.event_store();
+        [
+            (
+                format!("execution-effect:{}", request.idempotency_key),
+                format!("{}:read-receipt", request.idempotency_key),
+            ),
+            (
+                format!("execution-agent-receipts:{}:{}:1", parent.execution_id, parent.node_id),
+                format!("agent-tool-receipt:{}", request.idempotency_key),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(stream, key)| store.event_by_idempotency_key(&stream, &key).unwrap())
+        .collect()
+    }
+
+    fn admission_intent_present(
+        services: &RuntimeServices,
+        request: &RuntimeToolExecutionRequest,
+    ) -> bool {
+        services
+            .commit_service()
+            .original_effect_admitted(false, request)
+            .expect("admission fact reads")
+    }
+
+    /// Register the agent-tool child graph exactly as the original dispatcher
+    /// does and retain its child carrier, then drive it through the runner.
+    async fn drive_member_read_action(
+        fixture: &A7Fixture,
+        request: &RuntimeToolExecutionRequest,
+    ) -> harness_contract::execution_graph::ExecutionNodeStatus {
+        let services = &fixture.services;
+        let payload = encode_bound_agent_tool(AGENT, RUN, request.clone()).expect("bound payload");
+        let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let graph_id = format!("agent-tool-batch:{digest}");
+        let node_id = format!("agent-tool:{digest}");
+        let parent = request.parent_execution.clone().expect("parent");
+        let parent_graph = services
+            .graph_state_store()
+            .load(&parent.execution_id)
+            .expect("member graph");
+        let mut graph = ExecutionGraph::new("a7 agent tool batch");
+        graph.id = graph_id.clone();
+        graph.parent_execution = Some(parent.clone());
+        graph.lineage = parent_graph.lineage.clone();
+        graph.service_class = parent_graph.service_class;
+        let mut node = ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            payload.clone(),
+        );
+        node.id = node_id.clone();
+        node.idempotency_key = node_id.clone();
+        graph.nodes.push(node);
+        services.commit_service().register_graph(graph).unwrap();
+        // The pending carrier must outlive the runner's binding step: its
+        // Drop retires the pending entry once the bound observation took it.
+        let _pending = services
+            .tool_batch_executor()
+            .retain_original_agent_child(
+                &graph_id,
+                &node_id,
+                &payload,
+                Arc::new(request.clone()),
+                NodeExecutionTicket {
+                    graph_id: parent.execution_id.clone(),
+                    node_id: parent.node_id.clone(),
+                    executor_kind: "tool_batch".into(),
+                    service_class: Default::default(),
+                    attempt: 1,
+                    idempotency_key: format!("{}:attempt", parent.node_id),
+                    payload_ref: String::new(),
+                },
+                fixture.packet.clone(),
+                Arc::clone(services.event_store()),
+                None,
+                None,
+                None,
+            )
+            .expect("child carrier");
+        services
+            .execution_supervisor()
+            .drive_registered(&graph_id)
+            .await
+            .expect("agent tool batch drives");
+        drop(_pending);
+        services
+            .execution_supervisor()
+            .wait_for_terminal(&graph_id)
+            .await
+            .expect("agent tool batch terminalizes");
+        services
+            .graph_state_store()
+            .load(&graph_id)
+            .expect("driven graph")
+            .node_statuses[&node_id]
+    }
+
+    #[tokio::test]
+    async fn member_state_inspect_read_action_reaches_a_terminal_with_its_durable_read_receipt() {
+        let fixture = a7_fixture().await;
+        let request = member_state_inspect_request(&fixture);
+        admit_member_read_intent(&fixture.services, &request);
+        assert!(admission_intent_present(&fixture.services, &request));
+        let status = drive_member_read_action(&fixture, &request).await;
+        assert_eq!(
+            status,
+            harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+            "the admitted member Read action runs its node to a terminal"
+        );
+        let pair = receipt_pair(&fixture.services, &request);
+        assert_eq!(pair.len(), 2, "the child committed its durable read receipt pair");
+        assert_eq!(pair[0].kind, "execution.read.receipt");
+        assert_eq!(pair[1].kind, "execution.agent_tool.receipt");
+        assert_eq!(pair[1].payload["effect_kind"], "read");
+        assert_eq!(pair[0].transaction_id, pair[1].transaction_id);
+        assert_eq!(pair[0].payload["outcome"], pair[1].payload["outcome"]);
+        let receipted = &pair[0].payload["outcome"];
+        assert_eq!(
+            receipted["status"], "blocked_permission",
+            "a unit fixture has no live agentic Program, so the action submission \
+             itself names the stage it reached instead of ending Unknown"
+        );
+        assert!(
+            receipted["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("agent_actor")),
+            "the named reason proves execution passed the fixed admission check, \
+             re-validated the read intent and reached the action submission"
+        );
+        assert!(
+            fixture
+                .services
+                .event_store()
+                .event_by_idempotency_key(
+                    &format!("execution-effect:{}", request.idempotency_key),
+                    &format!("{}:receipt", request.idempotency_key)
+                )
+                .unwrap()
+                .is_none(),
+            "the Read family never writes a mutation effect receipt"
+        );
+        assert!(fixture
+            .services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn member_read_action_without_durable_admission_is_not_dispatched() {
+        let fixture = a7_fixture().await;
+        let request = member_state_inspect_request(&fixture);
+        assert!(!admission_intent_present(&fixture.services, &request));
+        let payload = encode_bound_agent_tool(AGENT, RUN, request.clone()).expect("bound payload");
+        let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let graph_id = format!("agent-tool-batch:{digest}");
+        let node_id = format!("agent-tool:{digest}");
+        let parent = request.parent_execution.clone().expect("parent");
+        // The pending carrier must outlive the binding step: its Drop retires
+        // the pending entry once the bound observation took it.
+        let _pending = fixture
+            .services
+            .tool_batch_executor()
+            .retain_original_agent_child(
+                &graph_id,
+                &node_id,
+                &payload,
+                Arc::new(request.clone()),
+                // The refusal this test asserts fires before any parent-ticket
+                // use, so the carrier's parent ticket only has to name the same
+                // physical owner coordinates the request carries.
+                NodeExecutionTicket {
+                    graph_id: parent.execution_id.clone(),
+                    node_id: parent.node_id.clone(),
+                    executor_kind: "tool_batch".into(),
+                    service_class: Default::default(),
+                    attempt: 1,
+                    idempotency_key: format!("{}:attempt", parent.node_id),
+                    payload_ref: String::new(),
+                },
+                fixture.packet.clone(),
+                Arc::clone(fixture.services.event_store()),
+                None,
+                None,
+                None,
+            )
+            .expect("child carrier");
+        let ticket = NodeExecutionTicket {
+            graph_id,
+            node_id,
+            executor_kind: "tool_batch".into(),
+            service_class: Default::default(),
+            attempt: 1,
+            idempotency_key: format!("agent-tool:{digest}"),
+            payload_ref: payload,
+        };
+        fixture
+            .services
+            .tool_batch_executor()
+            .observe_binding(&ticket)
+            .expect("physical binding");
+        drop(_pending);
+        let backend = AgentToolBatchBackend {
+            services: Arc::downgrade(&fixture.services),
+            bound: decode_bound_agent_tool(&ticket.payload_ref).expect("bound decode"),
+            stop: Default::default(),
+        };
+        let error = backend
+            .execute(&ticket)
+            .await
+            .expect_err("a member Read action without its admission fact is not dispatched");
+        match error {
+            NodeExecutorError::Uncertain { reason, .. } => {
+                assert_eq!(reason, "original governed effect owner missing");
+            }
+            other => panic!("unexpected executor error: {other:?}"),
+        }
+        assert!(
+            receipt_pair(&fixture.services, &request).is_empty(),
+            "no durable receipt may exist for an unadmitted member Read action"
+        );
+        assert!(fixture
+            .services
+            .execution_supervisor()
+            .shutdown()
+            .await
+            .errors
+            .is_empty());
     }
 }
