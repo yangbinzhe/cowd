@@ -405,7 +405,7 @@ pub(crate) struct OriginalHostPreparedMember {
     owner: Arc<SharedPolicyOwner>,
     store: Arc<crate::RuntimeEventStore>,
     reservation: Arc<crate::runtime_event_store::OriginalMemberReservation>,
-    fresh_effect: Arc<crate::execution_core::graph::OriginalFreshEffectOwner>,
+    fresh_effect: Option<Arc<crate::execution_core::graph::OriginalFreshEffectOwner>>,
     ticket: crate::execution_core::graph::NodeExecutionTicket,
     original: Arc<crate::RuntimeToolExecutionRequest>,
     step: crate::step_snapshot::StepCallBinding,
@@ -424,7 +424,12 @@ impl OriginalHostPreparedMember {
     pub(crate) fn ticket(&self) -> &crate::execution_core::graph::NodeExecutionTicket { &self.ticket }
     pub(crate) fn reservation(&self) -> &Arc<crate::runtime_event_store::OriginalMemberReservation> { &self.reservation }
     fn reservation_is_current(&self) -> bool {
-        self.fresh_effect.matches_original(&self.store, &self.original)
+        // The effect owner answers the identity question for the families
+        // that install one. An absent owner is not a mismatch: the Read
+        // family installs no owner, and the durable preparation fence
+        // carries the identity of the original call from its own durable
+        // admission intent instead.
+        self.fresh_effect.as_ref().is_none_or(|owner| owner.matches_original(&self.store, &self.original))
             && u64::try_from(self.prepared.index).is_ok_and(|index| self.reservation.matches_original(
                 &self.store, &self.prepared.outer_key, index, &self.ticket))
     }
@@ -629,6 +634,20 @@ impl OriginalHostPreparedMember {
         let prepared = coordinator.queue().prepare_member_approval(&grant.grant_id, &matched_context, risk, &binding)?;
         self.prepare_authority(Some(prepared))
     }
+}
+
+/// Whether the effect owner, when it is present, still names this call.
+///
+/// An absent owner is not a mismatch: the Read family installs no owner at
+/// all, and the durable preparation fence carries the identity of the
+/// original call from its own durable admission intent instead. An owner
+/// that is present must name this exact call, or the member is refused.
+pub(crate) fn original_host_effect_owner_matches(
+    owner: Option<&Arc<crate::execution_core::graph::OriginalFreshEffectOwner>>,
+    store: &Arc<crate::runtime_event_store::RuntimeEventStore>,
+    original: &crate::RuntimeToolExecutionRequest,
+) -> bool {
+    owner.is_none_or(|owner| owner.matches_original(store, original))
 }
 
 impl SharedPolicyOwner {
@@ -1069,12 +1088,16 @@ impl SharedPolicyOwner {
             .ok_or_else(|| {
                 RuntimeError::new("original Host member store unavailable")
             })?;
+        // The effect owner answers the identity question for the families
+        // that install one. An absent owner is not a refusal: the Read
+        // family installs no owner, and the durable preparation fence
+        // carries the identity of the original call from its own durable
+        // admission intent instead. An owner that is present must still
+        // match this exact original call.
         let fresh_effect = original.tool_progress.original_fresh_effect().map_err(|error| {
             RuntimeError::new(error)
-        })?.ok_or_else(|| {
-            RuntimeError::new("original Host fresh effect owner unavailable")
         })?;
-        if !fresh_effect.matches_original(store, &original) {
+        if !original_host_effect_owner_matches(fresh_effect.as_ref(), store, &original) {
             return Err(RuntimeError::new("original Host fresh effect owner mismatch"));
         }
         let validation_store = Arc::clone(store);
@@ -1136,7 +1159,7 @@ impl SharedPolicyOwner {
         candidate.fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(|error| {
             RuntimeError::new(error)
         })?;
-        if !fresh_effect.matches_original(store, &original)
+        if !original_host_effect_owner_matches(fresh_effect.as_ref(), store, &original)
             || !reservation.matches_original(store, &original.idempotency_key, member_index, &ticket)
             || self.policy_revision() != original.policy_revision || candidate.claim.session_id() != self.session_id() {
             return Err(RuntimeError::new("original Host member owner changed during preparation"));
@@ -3341,5 +3364,133 @@ mod original_permission_context_tests {
         // session that carries an operator override.
         assert_ne!(original_permission_context_json(&overridden),
             original_permission_context_json(&default));
+    }
+}
+
+/// The Host member producer used to require the effect owner slot and
+/// refused a Read-family member for a missing owner. These assertions read
+/// the owner the same way the producer does: an absent owner is not a
+/// refusal, and an owner that names another call still is.
+#[cfg(test)]
+mod original_host_owner_tests {
+    use super::*;
+
+    /// The original call's own request, with the invocation its effect
+    /// owner names.
+    fn owner_request(
+        tool_name: &str,
+        effect_key: &str,
+        workspace: &std::path::Path,
+    ) -> crate::RuntimeToolExecutionRequest {
+        let invocation = tools::ToolHost::builtin("host-owner", workspace)
+            .pin_snapshot()
+            .prepare_governed_invocation("host-call", tool_name, &serde_json::json!({}), &[]);
+        let effect = invocation.effect.clone();
+        crate::RuntimeToolExecutionRequest {
+            compiled_invocation: Some(invocation),
+            step_binding: None,
+            governed_plan_id: "plan".into(),
+            governed_plan_revision: 1,
+            observation_wave_sequence: 1,
+            idempotency_key: effect_key.into(),
+            tool_use_id: "host-call".into(),
+            tool_name: tool_name.into(),
+            input: "{}".into(),
+            category: crate::ToolSafetyCategory::from_effect(&effect),
+            authorization: None,
+            session_id: Some("session".into()),
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
+            authorized_scopes: vec![],
+            memory_context: None,
+            reality_context: None,
+            model_lease: None,
+            parent_execution: None,
+            parent_execution_attempt: None,
+            execution_decision: None,
+            evaluation_isolated: true,
+            managed_invocation: None,
+            tool_progress: crate::ToolProgressSink::default(),
+        }
+    }
+
+    /// The effect owner this call's own first effect produced, recovered
+    /// from the durable facts it was built from.
+    fn effect_owner(
+        events: &Arc<crate::runtime_event_store::RuntimeEventStore>,
+        request: &Arc<crate::RuntimeToolExecutionRequest>,
+    ) -> Arc<crate::execution_core::graph::OriginalFreshEffectOwner> {
+        let effect_key = request.idempotency_key.clone();
+        let stream_id = format!("execution-effect:{effect_key}");
+        let key = format!("{effect_key}:intent");
+        let transaction = crate::runtime_event_store::AppendTransactionRequest {
+            transaction_id: key.clone(),
+            expected_streams: vec![crate::runtime_event_store::ExpectedStreamRevision {
+                stream_id: stream_id.clone(),
+                expected_revision: 0,
+            }],
+            events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                event: crate::runtime_event_store::RuntimeEventInput {
+                    stream_id: stream_id.clone(),
+                    scope: crate::runtime_event_store::RuntimeEventScope::ExecutionNode,
+                    kind: "execution.effect.intent".into(),
+                    status: Some("inflight".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![crate::runtime_event_store::RuntimeEventRef {
+                        kind: "tool_invocation".into(),
+                        id: "host-call".into(),
+                    }],
+                    payload: serde_json::json!({
+                        "idempotency_key": effect_key,
+                        "tool_use_id": "host-call",
+                        "tool_name": request.tool_name,
+                    }),
+                },
+                idempotency_key: Some(key.clone()),
+                schema_version: 1,
+            }],
+        };
+        events.append_transaction(transaction.clone()).expect("intent");
+        events
+            .retain_original_first_effect(Arc::new(transaction), Arc::clone(request))
+            .expect("retain");
+        crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(events))
+            .recover_original_first_effect_owner(&key)
+            .expect("owner")
+            .expect("owner present")
+    }
+
+    /// The positive control: a Read-family member has no effect owner at
+    /// all, and the Host producer does not refuse it for that any more. The
+    /// durable admission fact is what admits it.
+    #[test]
+    fn the_host_owner_check_does_not_require_an_effect_owner() {
+        let events = Arc::new(crate::runtime_event_store::RuntimeEventStore::for_test());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let request = owner_request("edit", "host-read", workspace.path());
+        assert!(
+            original_host_effect_owner_matches(None, &events, &request),
+            "an absent effect owner is not a refusal on the Host path"
+        );
+    }
+
+    /// The negative control: an owner that names another call is still
+    /// refused. The relaxation is about the absent owner only.
+    #[test]
+    fn the_host_owner_check_refuses_an_owner_that_names_another_call() {
+        let events = Arc::new(crate::runtime_event_store::RuntimeEventStore::for_test());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let request = Arc::new(owner_request("edit", "host-mine", workspace.path()));
+        let other = Arc::new(owner_request("edit", "host-other", workspace.path()));
+        let owner = effect_owner(&events, &other);
+        assert!(
+            !original_host_effect_owner_matches(Some(&owner), &events, &request),
+            "an owner of another call is refused"
+        );
+        let owner = effect_owner(&events, &request);
+        assert!(
+            original_host_effect_owner_matches(Some(&owner), &events, &request),
+            "an owner of this very call is accepted"
+        );
     }
 }

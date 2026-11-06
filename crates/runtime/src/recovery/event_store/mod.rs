@@ -139,9 +139,40 @@ pub(crate) struct OriginalMemberEffectFence {
     request: Arc<AppendTransactionRequest>,
     receipt: StdMutex<Option<AppendTransactionReceipt>>,
     hook_entered: std::sync::atomic::AtomicBool,
-    original: std::sync::Weak<crate::RuntimeToolExecutionRequest>,
+    /// The original call this fence observes.
+    ///
+    /// The fence holds this request itself. A weak handle would answer the
+    /// settlement's identity question only while some other holder kept the
+    /// request alive, and the Read family installs no effect owner to hold
+    /// it: the fence would then never be able to name the call it belongs
+    /// to, and a member the runtime did admit would be refused at the
+    /// settlement instead of at the admission. Holding the request here
+    /// keeps the observation alive for as long as the fence is retained.
+    original: Arc<crate::RuntimeToolExecutionRequest>,
     claim: Arc<crate::execution_core::services::OriginalSessionClaim>,
     terminal: StdMutex<Option<(Arc<AppendTransactionRequest>, AppendTransactionReceipt)>>,
+}
+
+/// The fence must own the original call, not merely observe it weakly.
+///
+/// The settlement asks the fence whether it still belongs to that call. A
+/// weak handle answers only while some other holder keeps the call alive,
+/// and the Read family installs no effect owner to hold it: the fence would
+/// then be unable to name a call the runtime did admit, and that member
+/// would be refused at the settlement instead of at the admission. This
+/// assertion is the field's own type: it only compiles while the fence
+/// keeps the call itself.
+#[cfg(test)]
+mod original_member_fence_tests {
+    use super::*;
+
+    #[test]
+    fn the_member_fence_keeps_the_original_call_on_its_own_handle() {
+        fn own_handle(fence: &OriginalMemberEffectFence) -> &Arc<crate::RuntimeToolExecutionRequest> {
+            &fence.original
+        }
+        let _keeps_its_own_handle = own_handle;
+    }
 }
 
 pub(crate) enum OriginalStoppedMember {
@@ -231,8 +262,9 @@ impl OriginalMemberNoncommit {
             }
     }
     pub(crate) fn matches_request(&self, original: &crate::RuntimeToolExecutionRequest) -> bool {
-        self.fence.original.upgrade().is_some_and(|source| source.as_ref() == original
-            && source.tool_progress.same_original_channels(&original.tool_progress))
+        let source = &self.fence.original;
+        source.as_ref() == original
+            && source.tool_progress.same_original_channels(&original.tool_progress)
     }
     pub(crate) fn identity_fact(&self) -> RuntimeEventStoreResult<serde_json::Value> {
         match self.checked_request() {
@@ -1104,16 +1136,16 @@ impl RuntimeEventStore {
     /// member hook. An uncertain append remains attached to the reservation.
     pub(crate) fn acquire_original_member_preparation_fence(
         self: &Arc<Self>, reservation: &OriginalMemberReservation,
-        original: &crate::RuntimeToolExecutionRequest,
+        original: &Arc<crate::RuntimeToolExecutionRequest>,
         ticket: &crate::execution_core::graph::NodeExecutionTicket, index: usize,
-        first_effect: &crate::execution_core::graph::OriginalFreshEffectOwner,
+        first_effect: Option<&crate::execution_core::graph::OriginalFreshEffectOwner>,
         claim: Arc<crate::execution_core::services::OriginalSessionClaim>,
     ) -> RuntimeEventStoreResult<Arc<OriginalMemberEffectFence>> {
         use harness_contract::execution_graph::ExecutionNodeStatus;
         let index = u64::try_from(index).map_err(|_| RuntimeEventStoreError::InvalidTransaction("member index overflow".into()))?;
         if original.session_id.as_deref() != Some(claim.session_id())
             || original.step_binding.as_ref().is_none_or(|step| step.snapshot.identity.turn_id != claim.turn_id())
-            || !first_effect.matches_original(self, original) {
+            || first_effect.is_some_and(|owner| !owner.matches_original(self, original)) {
             return Err(RuntimeEventStoreError::InvalidTransaction("original first effect owner unavailable".into()));
         }
         if !reservation.matches_original(self, &original.idempotency_key, index, ticket) {
@@ -1139,8 +1171,11 @@ impl RuntimeEventStore {
                 .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
             let invocation = original.compiled_invocation.as_ref().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original effect missing".into()))?;
             let read = invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read;
-            let intent_key = format!("{}:{}", original.idempotency_key, if read { "read-intent" } else { "intent" });
-            let intent = self.event_by_idempotency_key(&stream, &intent_key)?
+            // The admission intent is read by the one reading of that fact:
+            // the same two exact keys and the same kind whitelist the
+            // closure and the admission gates read.
+            let intent = crate::execution_core::graph::read_effect_admission_intent(self, &original.idempotency_key)
+                .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?
                 .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original effect intent missing".into()))?;
             let receipt = self.original_transaction_receipt(&intent.transaction_id)?
                 .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original effect intent receipt unavailable".into()))?;
@@ -1182,7 +1217,7 @@ impl RuntimeEventStore {
             };
             let fence = Arc::new(OriginalMemberEffectFence { owner: Arc::downgrade(self), nonce: Arc::clone(&reservation.nonce),
                 outer: original.idempotency_key.clone(), index, ticket: ticket.clone(), request: Arc::new(transaction), receipt: StdMutex::new(None),
-                hook_entered: std::sync::atomic::AtomicBool::new(false), original: Arc::downgrade(first_effect.original_request()),
+                hook_entered: std::sync::atomic::AtomicBool::new(false), original: Arc::clone(original),
                 claim, terminal: StdMutex::new(None) });
             {
                 let mut owners = self.retained_checked_members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -1307,6 +1307,95 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
         self.append_inner(request, Some(terminal))
     }
+
+    /// Settle an original member that never committed.
+    ///
+    /// The process-local backend answers the same question the durable
+    /// backend answers: the member's terminal fact is written on the
+    /// call's own effect stream, and every field of that fact is checked
+    /// against the preparation it settles before it is written. A member
+    /// with a checked request needs the backend's checked-source owner,
+    /// which this backend does not have, so it fails closed there.
+    fn settle_original_member(
+        &self,
+        checked: Option<&CheckedAppendRequest>,
+        member: OriginalMemberDecisionInput,
+        claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<OriginalMemberDecision> {
+        let invalid =
+            || RuntimeEventStoreError::InvalidTransaction("original member settlement identity unavailable".into());
+        if checked.is_some() {
+            return Err(invalid());
+        }
+        let [preparation] = member.preparation.events.as_slice() else { return Err(invalid()); };
+        let payload = &preparation.event.payload;
+        let outer = payload["outer_key"].as_str().filter(|value| !value.is_empty()).ok_or_else(invalid)?;
+        let index = payload["member_index"].as_u64().ok_or_else(invalid)?;
+        let stream = format!("execution-effect:{outer}");
+        let preparation_key = format!("agentic-member-preparation:{index}");
+        let terminal_key = format!("agentic-member:{index}");
+        let preparation_hash = super::domain::request_hash(&member.preparation)
+            .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+        // The preparation this settlement settles must be the durable fact
+        // that was written, with the receipt that wrote it.
+        let stored = self
+            .event_by_idempotency_key(&stream, &preparation_key)
+            .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?
+            .ok_or_else(invalid)?;
+        if stored.transaction_id != member.preparation.transaction_id
+            || stored.commit_cursor != member.preparation_receipt.commit_cursor
+            || member.preparation_receipt.transaction_id != member.preparation.transaction_id
+            || member.preparation_receipt.request_hash != preparation_hash
+            || member.preparation_receipt.commit_cursor == 0
+            || member.preparation_receipt.event_ids.len() != 1
+            || member.preparation_receipt.event_ids.first() != Some(&stored.event_id)
+        {
+            return Err(invalid());
+        }
+        // The claim must be the turn the preparation names.
+        if payload["session_id"].as_str() != Some(claim.session_id)
+            || payload["turn_id"].as_str() != Some(claim.turn_id)
+        {
+            return Err(invalid());
+        }
+        // The terminal fact continues the preparation's own, on the same
+        // stream and under the same call.
+        let terminal = &member.terminal_event;
+        if member.terminal_transaction_id != format!("member-preparation-noncommit:{preparation_hash}")
+            || terminal.event.stream_id != stream
+            || terminal.event.scope != RuntimeEventScope::ExecutionNode
+            || terminal.event.kind != "execution.effect.member_noncommit"
+            || terminal.event.status.as_deref() != Some("not_committed")
+            || terminal.event.actor.as_deref() != Some("execution_commit_service")
+            || terminal.event.refs != preparation.event.refs
+            || terminal.schema_version != 1
+            || terminal.idempotency_key.as_deref() != Some(terminal_key.as_str())
+        {
+            return Err(invalid());
+        }
+        let revision = self.stream_revision(&stream)?;
+        let mut terminal_event = terminal.clone();
+        {
+            let terminal_payload = terminal_event
+                .event
+                .payload
+                .as_object_mut()
+                .ok_or_else(invalid)?;
+            terminal_payload.insert("noncommit_reason".into(), serde_json::json!("abandoned"));
+            terminal_payload.insert("noncommit_error_kind".into(), serde_json::json!("original_owner_stopped"));
+        }
+        let transaction = AppendTransactionRequest {
+            transaction_id: member.terminal_transaction_id.clone(),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: stream.clone(),
+                expected_revision: revision,
+            }],
+            events: vec![terminal_event],
+        };
+        let receipt = self.append_transaction(transaction.clone())?;
+        Ok(OriginalMemberDecision::ConfirmedNoncommit { receipt, transaction })
+    }
+
     fn consume_verified_decision_lease(
         &self,
         lease_id: &str,

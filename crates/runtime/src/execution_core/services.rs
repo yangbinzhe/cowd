@@ -1713,6 +1713,15 @@ impl std::fmt::Debug for OriginalSessionClaim {
     }
 }
 impl OriginalSessionClaim {
+    /// The claim of one original Session turn, for an isolated fixture.
+    ///
+    /// A claim is otherwise installed by the ingress that owns the turn. A
+    /// fixture that drives the original member flow needs the same claim
+    /// shape, and it must not rebuild the turn's own lineage.
+    #[cfg(test)]
+    pub(crate) fn for_isolated_turn(ingress: crate::TurnIngressRef) -> Arc<OriginalSessionClaim> {
+        Arc::new(OriginalSessionClaim { ingress })
+    }
     pub(crate) fn session_id(&self) -> &str { &self.ingress.session_id }
     pub(crate) fn message_id(&self) -> &str { &self.ingress.message_id }
     pub(crate) fn turn_id(&self) -> &str { &self.ingress.turn_id }

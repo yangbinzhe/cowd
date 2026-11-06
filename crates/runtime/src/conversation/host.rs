@@ -6866,7 +6866,7 @@ impl OriginalBatchPolicyOwner {
     async fn prepare_original_host_capability(
         &self, original: &crate::RuntimeToolExecutionRequest, index: usize,
         reservation: Arc<crate::runtime_event_store::OriginalMemberReservation>,
-        fresh_effect: &Arc<crate::execution_core::graph::OriginalFreshEffectOwner>,
+        fresh_effect: Option<&Arc<crate::execution_core::graph::OriginalFreshEffectOwner>>,
     ) -> Result<crate::step_snapshot::OriginalPreparedMemberCapability, OriginalHostPreparationFailure> {
         let before_fence = |reason: String| OriginalHostPreparationFailure {
             reason: OriginalHostPreparationFailureReason::Preparation(reason), effect_fence: None,
@@ -6879,8 +6879,23 @@ impl OriginalBatchPolicyOwner {
         // it must atomically retain the durable fence in the same reservation
         // before returning, including its own Unknown outcome, and provide
         // exclusive rights before the first hook or approval can run.
+        // The durable fence observes the original call through the request
+        // the effect owner holds for it. The Read family installs no owner,
+        // so the request of this very call is the observation's source
+        // there: it is the same request the owner would have held, with the
+        // same same-call channels.
+        //
+        // The fence keeps this request itself. A temporary handle would let
+        // the fence's own observation die with this call frame, and the
+        // settlement would then be unable to name the call it belongs to:
+        // a member the runtime did admit would be refused there instead of
+        // at the admission.
+        let original_request = match fresh_effect {
+            Some(owner) => Arc::clone(owner.original_request()),
+            None => Arc::new(original.clone()),
+        };
         let effect_fence = self.event_store.acquire_original_member_preparation_fence(
-            &reservation, original, &self.ticket, index, fresh_effect,
+            &reservation, &original_request, &self.ticket, index, fresh_effect.map(|owner| owner.as_ref()),
             self.owner.original_member_claim().map_err(before_fence)?,
         ).map_err(|error| {
             OriginalHostPreparationFailure {
@@ -7134,6 +7149,41 @@ impl OriginalBatchPolicyOwner {
     }
 }
 
+/// Whether the original Host call's member may be prepared.
+///
+/// The owner slot answers for the effect families that install one. When
+/// the slot is empty the durable admission fact answers the same question:
+/// the original call's own effect stream holds its admission intent, read
+/// by the one reading of that fact. A fact that cannot be read is never an
+/// admission, so the member stays unknown.
+///
+/// The refusal is the admission owner's own named refusal, built by the one
+/// wording function, so the run says which member was refused and why: the
+/// original call holds no readable durable admission fact. This path never
+/// invents a reason of its own, and it names the same fact the other gates
+/// read.
+pub(crate) fn original_host_member_admission(
+    owner: Option<Arc<crate::execution_core::graph::OriginalFreshEffectOwner>>,
+    store: &crate::runtime_event_store::RuntimeEventStore,
+    original: &crate::RuntimeToolExecutionRequest,
+    attempt: u32,
+) -> Result<(), String> {
+    if crate::agent_in_process_worker::original_member_admitted(owner, store, &original.idempotency_key) {
+        return Ok(());
+    }
+    let parent_reason = crate::agent_in_process_worker::current_process_member_custody(original)
+        .ok()
+        .flatten()
+        .and_then(|custody| custody.parent_refusal_reason(&original.tool_use_id));
+    Err(crate::agent_in_process_worker::original_effect_admission_missing_reason(
+        &original.tool_use_id,
+        &original.idempotency_key,
+        &original.tool_name,
+        attempt,
+        parent_reason.as_deref(),
+    ))
+}
+
 #[async_trait]
 impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
     async fn prepare_member_pregrant(&self, original: &crate::RuntimeToolExecutionRequest, index: usize)
@@ -7184,16 +7234,16 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
         // It must have been produced by the successful initial intent append,
         // never by an idempotent retry. The effect owner verifies the complete
         // ticket/request/store binding while acquiring the durable fence.
+        //
+        // An empty slot is not yet a refusal: the Read family installs no
+        // owner, so the slot is empty for a call the runtime did admit. The
+        // durable admission fact answers the same question in every family,
+        // read by the one reading of that fact, which is the fact the
+        // closure and the other two admission gates read. A fact that
+        // cannot be read is never an admission, so a refusal stays a
+        // refusal and its text is unchanged.
         let fresh_effect = match original.tool_progress.original_fresh_effect() {
-            Ok(Some(owner)) => owner,
-            Ok(None) => {
-                let stop = crate::tool_host::OriginalBatchMemberStop::publish(coordinate,
-                    crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeUnknown(
-                        "original fresh effect owner unavailable".into()));
-                return AgentBatchMemberPregrant::Unknown { failure: BatchMemberUnknown {
-                    index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
-                }, stop: Some(stop) };
-            }
+            Ok(owner) => owner,
             Err(reason) => {
                 let stop = crate::tool_host::OriginalBatchMemberStop::publish(coordinate,
                     crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeUnknown(reason.clone()));
@@ -7202,6 +7252,15 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
                 }, stop: Some(stop) };
             }
         };
+        if let Err(reason) = original_host_member_admission(
+            fresh_effect.clone(), &self.event_store, original, self.ticket.attempt,
+        ) {
+            let stop = crate::tool_host::OriginalBatchMemberStop::publish(coordinate,
+                crate::tool_host::OriginalBatchMemberStopReason::BeforeOutcomeUnknown(reason.into()));
+            return AgentBatchMemberPregrant::Unknown { failure: BatchMemberUnknown {
+                index, reason: BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
+            }, stop: Some(stop) };
+        }
         // Reserve the original owner's retained slot before running the
         // member hook. This is only process-local custody; the producer below
         // also requires original effect/backend exclusive proof before hook.
@@ -7226,7 +7285,7 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalBatchPolicyOwner {
                 }, stop: Some(stop) };
             }
         };
-        match self.prepare_original_host_capability(original, index, Arc::clone(&reservation), &fresh_effect).await {
+        match self.prepare_original_host_capability(original, index, Arc::clone(&reservation), fresh_effect.as_ref()).await {
             Ok(candidate) => {
                 AgentBatchMemberPregrant::Candidate(candidate)
             },
@@ -8876,4 +8935,165 @@ async fn attach_conversation_graph(
             .map_err(|error| RuntimeError::new(error.to_string()))?
     };
     Ok((attached, recovering))
+}
+
+/// The Host member pre-grant used to read an empty owner slot as a refusal,
+/// and the Read family installs no owner at all: its members were refused
+/// before they were admitted. These assertions read the durable admission
+/// fact instead, in the same shape the closure and the other two gates read
+/// it, and they keep the refusal wording this path always published.
+#[cfg(test)]
+mod original_host_admission_tests {
+    use super::*;
+
+    /// The original call the Host gate reads: its own request, under the
+    /// effect key its durable admission fact is written.
+    fn gate_request(effect_key: &str) -> crate::RuntimeToolExecutionRequest {
+        let tool_name = harness_contract::agent_action::STATE_INSPECT_TOOL_ID;
+        crate::RuntimeToolExecutionRequest {
+            idempotency_key: effect_key.to_string(),
+            tool_use_id: "host-call".into(),
+            tool_name: tool_name.into(),
+            input: "{}".into(),
+            session_id: Some("host-session".into()),
+            ..crate::RuntimeToolExecutionRequest::from_tool_request(
+                &crate::tool_dispatch::ToolRequest {
+                    tool_use_id: "host-call".into(),
+                    tool_name: tool_name.into(),
+                    input: "{}".into(),
+                    depends_on: vec![],
+                },
+            )
+        }
+    }
+
+    /// The call's own durable admission fact on its effect stream.
+    fn append_admission(
+        events: &crate::runtime_event_store::RuntimeEventStore,
+        effect_key: &str,
+        kind: &str,
+        suffix: &str,
+    ) {
+        let stream_id = format!("execution-effect:{effect_key}");
+        let idempotency_key = format!("{effect_key}:{suffix}");
+        let revision = events.stream_revision(&stream_id).expect("effect head");
+        events
+            .append_transaction(crate::runtime_event_store::AppendTransactionRequest {
+                transaction_id: idempotency_key.clone(),
+                expected_streams: vec![crate::runtime_event_store::ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: revision,
+                }],
+                events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: crate::runtime_event_store::RuntimeEventInput {
+                        stream_id: stream_id.clone(),
+                        scope: crate::runtime_event_store::RuntimeEventScope::ExecutionNode,
+                        kind: kind.to_string(),
+                        status: Some("inflight".into()),
+                        actor: Some("governed_tool".into()),
+                        refs: vec![crate::runtime_event_store::RuntimeEventRef {
+                            kind: "tool_invocation".into(),
+                            id: "host-call".into(),
+                        }],
+                        payload: serde_json::json!({
+                            "idempotency_key": effect_key,
+                            "tool_use_id": "host-call",
+                        }),
+                    },
+                    idempotency_key: Some(idempotency_key),
+                    schema_version: 1,
+                }],
+            })
+            .expect("admission");
+    }
+
+    /// The Host gate admits a Read-family member whose admission is a
+    /// durable fact: that family installs no owner, and the empty slot used
+    /// to read as a refusal.
+    #[test]
+    fn the_host_gate_admits_a_read_family_member_with_a_durable_admission() {
+        let events = crate::runtime_event_store::RuntimeEventStore::for_test();
+        append_admission(&events, "host-read", "execution.read.intent", "read-intent");
+        assert_eq!(
+            original_host_member_admission(None, &events, &gate_request("host-read"), 1),
+            Ok(()),
+            "a read admission admits the Host member"
+        );
+    }
+
+    /// The Read-family admission the production writer publishes is the fact
+    /// the Host gate reads. The fact is written by the production writer
+    /// itself, not by a copy of it: the writer publishes the effect, the
+    /// replay contract, the input digest and the resolved scope of the very
+    /// call, and the gate reads exactly that.
+    #[test]
+    fn the_host_gate_admits_a_read_member_admitted_by_the_production_writer() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = tools::ToolHost::builtin("host-read-writer", workspace.path());
+        let request = crate::bound_tool_batch::scope_admission_tests::bound_request(
+            &host, "read_file", serde_json::json!({"path": "a"}),
+        );
+        let effect = request.compiled_invocation.as_ref().expect("invocation").effect.clone();
+        let events = Arc::new(crate::runtime_event_store::RuntimeEventStore::for_test());
+        let service = crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(&events));
+        service.begin_tool_effect(&request, &effect).expect("read admission");
+        assert_eq!(
+            original_host_member_admission(None, &events, &request, 1),
+            Ok(()),
+            "the Host gate admits a member whose read admission the production writer published"
+        );
+    }
+
+    /// The negative control: an original without a durable admission fact
+    /// is still refused by the Host gate.
+    #[test]
+    fn the_host_gate_refuses_a_member_without_a_durable_admission() {
+        let events = crate::runtime_event_store::RuntimeEventStore::for_test();
+        assert_eq!(
+            original_host_member_admission(None, &events, &gate_request("host-absent"), 1).is_err(),
+            true,
+            "an absent admission refuses the Host member"
+        );
+    }
+
+    /// An admission that cannot be read is not an admission: the Host gate
+    /// keeps refusing instead of excusing the member. The fact is not
+    /// downgraded to "no admission"; it stays unreadable and refused.
+    #[test]
+    fn the_host_gate_refuses_a_member_with_an_unreadable_admission() {
+        let events = crate::runtime_event_store::RuntimeEventStore::for_test();
+        append_admission(
+            &events,
+            "host-foreign",
+            "execution.effect.member_noncommit",
+            "intent",
+        );
+        assert_eq!(
+            original_host_member_admission(None, &events, &gate_request("host-foreign"), 1).is_err(),
+            true,
+            "an unreadable admission refuses the Host member"
+        );
+    }
+
+    /// The refusal keeps the wording this path publishes: the same named
+    /// refusal the other admission gates publish, naming the missing durable
+    /// admission fact and the member it refused.
+    #[test]
+    fn the_host_gate_keeps_its_own_refusal_wording() {
+        let events = crate::runtime_event_store::RuntimeEventStore::for_test();
+        let request = gate_request("host-wording");
+        let reason = original_host_member_admission(None, &events, &request, 3)
+            .expect_err("an absent admission refuses the Host member");
+        assert!(
+            reason.starts_with("original_effect_admission_missing"),
+            "the refusal keeps its name: {reason}"
+        );
+        assert!(reason.contains("tool_use_id=host-call"), "{reason}");
+        assert!(reason.contains("effect_key=host-wording"), "{reason}");
+        assert!(reason.contains("attempt=3"), "{reason}");
+        assert!(
+            reason.contains("durable_admission_fact=absent_or_unreadable"),
+            "the refusal names the durable admission fact: {reason}"
+        );
+    }
 }

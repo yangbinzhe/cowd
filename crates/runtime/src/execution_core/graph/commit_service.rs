@@ -3315,6 +3315,118 @@ pub(crate) enum PhysicalClosureProof {
 }
 
 
+/// The admission intent one call's effect stream holds, under the two exact
+/// keys the admission writers use.
+///
+/// This is the one place those keys are written down. The closure that
+/// proves a node's physical closure, the gate that admits a delegated
+/// action, the gate that prepares an original's member and the member
+/// preparation fence all ask this fact the same question, so they must not
+/// each write their own answer.
+pub(crate) fn read_effect_admission_intent(
+    store: &crate::runtime_event_store::RuntimeEventStore,
+    effect_key: &str,
+) -> Result<Option<crate::DurableRuntimeEvent>, ExecutionCommitError> {
+    let stream_id = format!("execution-effect:{effect_key}");
+    for suffix in ["intent", "read-intent"] {
+        let event = store
+            .event_by_idempotency_key(&stream_id, &format!("{effect_key}:{suffix}"))
+            .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+        if event.is_some() {
+            return Ok(event);
+        }
+    }
+    Ok(None)
+}
+
+/// The admission of one call, read from its own effect stream.
+///
+/// Two exact keys are enough. A retry implies the base intent, and the
+/// only other writer of an effect stream is a member's noncommit, which
+/// carries a different key: reading "the stream is not empty" would read
+/// that member's noncommit as an admission of a call that never ran. The
+/// kind whitelist is the depth under the exact key, and the call the
+/// admission names is what tells an admission apart from a fact this
+/// reading cannot interpret.
+pub(crate) fn read_effect_admission(
+    store: &crate::runtime_event_store::RuntimeEventStore,
+    effect_key: &str,
+) -> Result<EffectAdmission, ExecutionCommitError> {
+    let intent = read_effect_admission_intent(store, effect_key)?;
+    let Some(intent) = intent.as_ref() else {
+        // No admission on this stream. The stream may still hold the
+        // terminal receipt of an effect whose admission cannot be read:
+        // "no admission" then does not mean "no effect", and a call whose
+        // effect exists must not be excused as one that never ran.
+        let stream_id = format!("execution-effect:{effect_key}");
+        for suffix in ["receipt", "read-receipt"] {
+            let receipt = store
+                .event_by_idempotency_key(&stream_id, &format!("{effect_key}:{suffix}"))
+                .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+            if receipt.is_some() {
+                return Ok(EffectAdmission::Unreadable);
+            }
+        }
+        return Ok(EffectAdmission::NotAdmitted);
+    };
+    if !matches!(
+        intent.kind.as_str(),
+        "execution.effect.intent"
+            | "execution.effect.retry_admitted"
+            | "execution.read.intent"
+    ) || ExecutionCommitService::admitted_call_id(intent).is_none()
+    {
+        // The admission cannot be read, so it cannot be held against any
+        // call: nothing may be skipped or admitted on its account.
+        return Ok(EffectAdmission::Unreadable);
+    }
+    Ok(EffectAdmission::Admitted)
+}
+
+/// What a call's own effect stream says about its admission.
+///
+/// This is the single reading of that fact: the closure that proves a
+/// node's physical closure and the gate that admits a delegated action
+/// both read it here, so the two can never answer differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffectAdmission {
+    /// The stream holds the call's admission intent: the owner admitted it.
+    Admitted,
+    /// The stream holds no admission intent at all: the call was never
+    /// admitted and has no admitted effect to close.
+    NotAdmitted,
+    /// The stream holds an admission this reading cannot interpret: the
+    /// call cannot be told apart from it, so nothing may be skipped or
+    /// admitted on its account.
+    Unreadable,
+}
+
+/// The calls one batch owner admitted, read from its own effect streams.
+///
+/// A planned call the owner never admitted has no admitted effect, so the
+/// closure must not hold the node open for it: there is nothing to close.
+/// The admission intent is the owner's own fact and it names the call it
+/// admitted, so the reading comes from it instead of being re-derived here.
+#[derive(Debug, Default)]
+struct AdmittedCalls {
+    /// The calls an admission intent named.
+    admitted: BTreeSet<String>,
+    /// The owner wrote an admission that names no call, so no call can be
+    /// told apart from it.
+    unnameable: bool,
+}
+
+impl AdmittedCalls {
+    /// Whether a planned call may be skipped for want of an admitted effect.
+    ///
+    /// When the owner wrote an admission that names no call, nothing can be
+    /// told apart, so no call is skipped: an admission that cannot be read
+    /// is not evidence that a call never ran.
+    fn may_skip(&self, call_id: &str) -> bool {
+        !self.unnameable && !self.admitted.contains(call_id)
+    }
+}
+
 /// What the owner's receipt says about the planned call it answers.
 #[derive(Debug)]
 enum PlannedCallIdentity {
@@ -5689,6 +5801,12 @@ impl ExecutionCommitService {
                             "resolved_effect_scope": scope,
                             "replay": receipt_replay_contract(request)?,
                             "process_class": effect.spawns_process,
+                            // The input this admission covers, under the same
+                            // name and the same digest the mutation family
+                            // writes: the member preparation fence reads it
+                            // for both families, and a read admission that
+                            // left it out could never be checked.
+                            "input_sha256": format!("sha256:{:x}", Sha256::digest(request.input.as_bytes())),
                         }),
                     },
                     idempotency_key: Some(key),
@@ -12495,6 +12613,107 @@ impl ExecutionCommitService {
         Ok(Some(fact))
     }
 
+    /// The call one admission intent names.
+    ///
+    /// Both admission families carry the same `tool_invocation` reference, and
+    /// a composite call's family cannot be told from its name, so the call is
+    /// read from the reference alone: the closure never has to know whether
+    /// the admitted call was a read or a write.
+    fn admitted_call_id(intent: &crate::DurableRuntimeEvent) -> Option<String> {
+        intent
+            .refs
+            .iter()
+            .find(|reference| reference.kind == "tool_invocation")
+            .map(|reference| reference.id.clone())
+    }
+
+    /// The effect key of every planned call, read from the batch's own typed
+    /// calls.
+    ///
+    /// The key is the call's own binding identity, so the same reading holds
+    /// for a delegated owner and for a plan this runtime never delegated: no
+    /// second association has to be carried to the closure. A plan that
+    /// cannot be read yields no key at all, and a call without a key cannot
+    /// be told apart from its admissions.
+    fn planned_effect_keys(spec: &ExecutionNodeSpec) -> BTreeMap<String, String> {
+        let Ok((calls, _)) = crate::host::decode_tool_batch(&spec.payload_ref) else {
+            return BTreeMap::new();
+        };
+        calls
+            .into_iter()
+            .filter_map(|call| {
+                let key = call.binding.as_ref()?.effect_idempotency_key();
+                Some((call.id, key))
+            })
+            .collect()
+    }
+
+    /// The admission of one call, read from its own effect stream.
+    ///
+    /// Two exact keys are enough. A retry implies the base intent, and the
+    /// only other writer of an effect stream is a member's noncommit, which
+    /// carries a different key: reading "the stream is not empty" would read
+    /// that member's noncommit as an admission of a call that never ran. The
+    /// kind whitelist is the depth under the exact key, and the call the
+    /// admission names is what tells an admission apart from a fact this
+    /// reading cannot interpret.
+    ///
+    /// A stream that holds a terminal receipt but no admission is not a call
+    /// that never ran: it holds the effect of a call whose admission cannot
+    /// be read, and it is reported as unreadable so that nothing is skipped
+    /// on its account.
+    pub(crate) fn effect_admission(
+        &self,
+        effect_key: &str,
+    ) -> Result<EffectAdmission, ExecutionCommitError> {
+        read_effect_admission(&self.event_store, effect_key)
+    }
+
+    /// Whether the delegated action may proceed on the original call's
+    /// admission.
+    ///
+    /// The owner slot answers the question for the effect families that
+    /// install one. When the slot is empty the durable admission fact
+    /// answers it instead: the same effect-stream intent the closure reads,
+    /// under the same exact keys and the same kind whitelist. A fact that
+    /// cannot be read is never an admission, so a refusal stays a refusal.
+    pub(crate) fn original_effect_admitted(
+        &self,
+        owner_present: bool,
+        original: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<bool, ExecutionCommitError> {
+        if owner_present {
+            return Ok(true);
+        }
+        Ok(matches!(
+            self.effect_admission(&original.idempotency_key)?,
+            EffectAdmission::Admitted
+        ))
+    }
+
+    /// The calls the owner admitted, read from the effect streams' admission
+    /// intents.
+    fn admitted_calls(
+        &self,
+        keys: &BTreeMap<String, String>,
+    ) -> Result<AdmittedCalls, ExecutionCommitError> {
+        let mut admitted = AdmittedCalls::default();
+        for (call_id, key) in keys {
+            match self.effect_admission(key)? {
+                // The owner never admitted this call: its effect stream holds
+                // no admission, so there is no admitted effect to close.
+                EffectAdmission::NotAdmitted => {}
+                EffectAdmission::Admitted => {
+                    admitted.admitted.insert(call_id.clone());
+                }
+                EffectAdmission::Unreadable => {
+                    admitted.unnameable = true;
+                }
+            }
+        }
+        Ok(admitted)
+    }
+
     fn delegated_host_leaf_owner(
         &self,
         graph: &ExecutionGraph,
@@ -13079,6 +13298,15 @@ impl ExecutionCommitService {
                     *unprovable = Some(("foreign_call_receipt", format!("foreign_call_receipt {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                     return Ok(None);
                 }
+                // The admission facts of this batch's own planned calls. A
+                // planned call the owner never admitted has no admitted
+                // effect, so there is nothing to close and no ring to name;
+                // a call it did admit keeps its receipt requirement and its
+                // identity check below. The reading is per call and per
+                // effect stream, so it holds the same way for a delegated
+                // owner and for a plan this runtime never delegated.
+                let effect_keys = Self::planned_effect_keys(spec);
+                let admitted = self.admitted_calls(&effect_keys)?;
                 let mut seen = BTreeSet::new();
                 for call in planned {
                     let Some(id) = call["id"].as_str() else {
@@ -13100,6 +13328,21 @@ impl ExecutionCommitService {
                     if !seen.insert(id) {
                         *unprovable = Some(("planned_call_seen_twice", format!("planned_call_seen_twice {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
+                    }
+                    // A planned call the owner never admitted has no
+                    // admitted effect, so there is nothing to close and no
+                    // ring to name: skipping it is not a refusal, it is the
+                    // absence of one. A call whose key cannot be read is not
+                    // skipped: an admission that cannot be read is not
+                    // evidence that the call never ran. A call that owns a
+                    // receipt is not skipped either: its receipt is a fact
+                    // about the planned call, and the identity check below
+                    // is what holds it.
+                    if effect_keys.contains_key(id)
+                        && !calls.contains_key(id)
+                        && admitted.may_skip(id)
+                    {
+                        continue;
                     }
                     let Some((name, actual, _, origin, certified)) = calls.get(id) else {
                         // The planned call has no receipt at all: the member
@@ -16542,6 +16785,942 @@ mod physical_closure_ring_tests {
         assert!(
             unprovable.is_none(),
             "an in-flight member is pending, not unprovable: {unprovable:?}"
+        );
+    }
+
+    /// A planned call with the binding the owner derived its effect key
+    /// from: the batch carries the call's own origin and step snapshot, so
+    /// the closure reads the key from the batch itself.
+    struct RingCall {
+        binding: crate::step_snapshot::StepCallBinding,
+        request: crate::RuntimeToolExecutionRequest,
+        tool_name: String,
+        planned_input: String,
+    }
+
+    /// The fixture's own call: a real bound step and a real invocation, so
+    /// the call carries the same identity the owner would have used. The
+    /// planned input is separate from the executed one: a receipt that
+    /// answers a different input is a different fact.
+    fn ring_call(
+        host: &tools::ToolHost,
+        session_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        executed_input: &serde_json::Value,
+        planned_input: &str,
+    ) -> RingCall {
+        let lease = host.pin_snapshot();
+        let advertised = lease
+            .snapshot()
+            .catalog
+            .definitions(None)
+            .into_iter()
+            .filter(|definition| definition.name == tool_name)
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(advertised.len(), 1, "the fixture tool is advertised");
+        let identity = serde_json::from_value(json!({
+            "step_id": format!("ring-step:{call_id}"),
+            "session_id": session_id,
+            "turn_id": "ring-turn",
+            "execution_id": "ring-graph",
+            "actor_ref": "ring-fixture",
+            "attempt": 1,
+            "epoch": "1",
+            "build_ref": "ring-fixture",
+        }))
+        .unwrap();
+        let step = Arc::new(
+            crate::step_snapshot::BoundStep::bind(
+                identity,
+                lease,
+                &advertised,
+                &json!({}),
+                &json!({}),
+                BTreeMap::new(),
+                // The persisted batch is read back under the strict JSON
+                // contract, so the step's own numbers stay inside the
+                // interoperable range.
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let binding = crate::step_snapshot::StepCallBinding::provider(step, call_id);
+        let invocation = binding
+            .prepare_invocation(Some(host.pin_snapshot()), tool_name, executed_input)
+            .unwrap();
+        let mut request =
+            crate::RuntimeToolExecutionRequest::from_tool_request(&crate::tool_dispatch::ToolRequest {
+                tool_use_id: call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                input: serde_json::to_string(executed_input).unwrap(),
+                depends_on: Vec::new(),
+            });
+        request.idempotency_key = binding.effect_idempotency_key();
+        request.session_id = Some(session_id.to_string());
+        request.policy_revision = 1;
+        request.observation_wave_sequence = 1;
+        request.governed_plan_id = "ring-plan".into();
+        request.governed_plan_revision = 1;
+        request.compiled_invocation = Some(invocation);
+        request.step_binding = Some(binding.clone());
+        RingCall {
+            binding,
+            request,
+            tool_name: tool_name.to_string(),
+            planned_input: planned_input.to_string(),
+        }
+    }
+
+    /// The persisted batch of the given planned calls. Each call carries its
+    /// own origin and step snapshot, so the closure reads every call's
+    /// effect key from the batch the node planned.
+    fn ring_payload(session_id: &str, calls: &[&RingCall]) -> String {
+        let mut snapshots = serde_json::Map::new();
+        let mut planned = Vec::new();
+        for call in calls {
+            snapshots.insert(
+                call.binding.origin.origin_step_id.clone(),
+                serde_json::to_value(&*call.binding.snapshot).unwrap(),
+            );
+            planned.push(json!({
+                "id": call.binding.origin.call_id,
+                "name": call.tool_name,
+                "input": call.planned_input,
+                "depends_on": [],
+                "origin": call.binding.origin,
+            }));
+        }
+        crate::step_snapshot::encode_persisted_tool_batch(&json!({
+            "session_id": session_id,
+            "step_snapshots": snapshots,
+            "calls": planned,
+        }))
+        .expect("persisted batch")
+    }
+
+    /// A root ToolBatch whose planned calls carry their own bindings.
+    fn ring_batch(
+        name: &str,
+        payload: &str,
+    ) -> (
+        Arc<RuntimeEventStore>,
+        ExecutionCommitService,
+        ExecutionGraph,
+        ExecutionNodeSpec,
+        ExecutionNodeBinding,
+    ) {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(events.clone());
+        let graph = ExecutionGraph::new(name.to_string());
+        let spec = ExecutionNodeSpec::new(
+            ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            payload.to_string(),
+        );
+        let binding = ExecutionNodeBinding {
+            executor_kind: "tool_batch".into(),
+            ticket_idempotency_key: spec.idempotency_key.clone(),
+            attempt: 3,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        (events, commits, graph, spec, binding)
+    }
+
+    /// The owner's own admission of a Read: the read intent on the call's
+    /// effect stream. It is written under the exact key the closure reads,
+    /// and it names the call it admitted.
+    fn append_read_intent(
+        events: &RuntimeEventStore,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+    ) {
+        let key = request.idempotency_key.clone();
+        let stream_id = format!("execution-effect:{key}");
+        let idempotency_key = format!("{key}:read-intent");
+        let revision = events.stream_revision(&stream_id).expect("effect head");
+        events
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: idempotency_key.clone(),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: revision,
+                }],
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream_id.clone(),
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: "execution.read.intent".into(),
+                        status: Some("inflight".into()),
+                        actor: Some("governed_tool".into()),
+                        refs: commit_pipeline::tool_effect_refs(request),
+                        payload: json!({
+                            "idempotency_key": key,
+                            "tool_use_id": request.tool_use_id,
+                            "tool_name": request.tool_name,
+                            "effect": effect,
+                            "resolved_effect_scope": serde_json::Value::Null,
+                            "replay": receipt_replay_contract(request).expect("replay contract"),
+                            "process_class": false,
+                        }),
+                    },
+                    idempotency_key: Some(idempotency_key),
+                    schema_version: 1,
+                }],
+            })
+            .expect("read intent");
+    }
+
+    /// The owner's terminal outcome for an executed call.
+    fn ring_outcome(
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> crate::RuntimeToolExecutionOutcome {
+        crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: crate::ToolSafetyCategory::ReadOnly,
+            output: None,
+            error: None,
+            evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+            observed_evidence: Vec::new(),
+            pending_agent_batch: None,
+        }
+    }
+
+    /// The index stream of the node: the closure reads the owner's receipts
+    /// from it.
+    fn ring_index_stream(
+        graph: &ExecutionGraph,
+        spec: &ExecutionNodeSpec,
+        binding: &ExecutionNodeBinding,
+    ) -> String {
+        format!(
+            "execution-agent-receipts:{}:{}:{}",
+            graph.id, spec.id, binding.attempt
+        )
+    }
+
+    /// E1: a Read receipt that does not answer the planned call is refused.
+    /// The owner admitted the call and wrote a terminal receipt for it, but
+    /// the receipt answers a different input, so the identity check must
+    /// refuse the node instead of closing it. The admission alone may not
+    /// skip the call: that is the hole the retracted block 4 opened.
+    #[test]
+    fn a_read_receipt_that_does_not_match_the_planned_call_is_refused() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("ring-read-mismatch", workspace.path());
+        let session = "ring-session";
+        let mut call = ring_call(
+            &host,
+            session,
+            "ring-read-mismatch",
+            "read_file",
+            &json!({"path": "executed.txt"}),
+            "{\"path\":\"planned.txt\"}",
+        );
+        let effect = call.request.compiled_invocation.as_ref().unwrap().effect.clone();
+        let payload = ring_payload(session, std::slice::from_ref(&&call));
+        let (events, commits, graph, spec, binding) =
+            ring_batch("ring read mismatch", &payload);
+        call.request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: graph.id.clone(),
+                node_id: spec.id.clone(),
+            });
+        call.request.parent_execution_attempt = Some(binding.attempt);
+        append_read_intent(&events, &call.request, &effect);
+        commits
+            .commit_readonly_tool_receipts(&[(
+                call.request.clone(),
+                ring_outcome(&call.request),
+            )])
+            .expect("read receipt");
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "a receipt that does not answer the planned call must not close the node"
+        );
+        assert_eq!(
+            unprovable.as_ref().map(|ring| ring.0),
+            Some("planned_receipt_identity_mismatch"),
+            "the mismatching receipt is named: {unprovable:?}"
+        );
+    }
+
+    /// E1 and E2, negative side: the same node with a receipt that does
+    /// answer the planned call closes. The refusal above is caused by the
+    /// mismatch and by nothing else.
+    #[test]
+    fn a_read_receipt_that_matches_the_planned_call_closes_the_node() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("ring-read-match", workspace.path());
+        let session = "ring-session";
+        let mut call = ring_call(
+            &host,
+            session,
+            "ring-read-match",
+            "read_file",
+            &json!({"path": "planned.txt"}),
+            "{\"path\":\"planned.txt\"}",
+        );
+        let effect = call.request.compiled_invocation.as_ref().unwrap().effect.clone();
+        let payload = ring_payload(session, std::slice::from_ref(&&call));
+        let (events, commits, graph, spec, binding) = ring_batch("ring read match", &payload);
+        call.request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: graph.id.clone(),
+                node_id: spec.id.clone(),
+            });
+        call.request.parent_execution_attempt = Some(binding.attempt);
+        append_read_intent(&events, &call.request, &effect);
+        commits
+            .commit_readonly_tool_receipts(&[(
+                call.request.clone(),
+                ring_outcome(&call.request),
+            )])
+            .expect("read receipt");
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(sources.is_some(), "an answered planned call closes the node");
+        assert!(unprovable.is_none(), "{unprovable:?}");
+    }
+
+    /// E2: an admitted Read that is still in flight is held closed. The
+    /// read family never writes an index intent, so the index stream stays
+    /// empty and the closure's own index rule cannot cover the call: the
+    /// planned loop is the only thing that can hold it, and it must fail
+    /// closed rather than skip it.
+    #[test]
+    fn an_admitted_read_without_a_terminal_receipt_is_held_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("ring-read-inflight", workspace.path());
+        let session = "ring-session";
+        let call = ring_call(
+            &host,
+            session,
+            "ring-read-inflight",
+            "read_file",
+            &json!({"path": "planned.txt"}),
+            "{\"path\":\"planned.txt\"}",
+        );
+        let effect = call.request.compiled_invocation.as_ref().unwrap().effect.clone();
+        let payload = ring_payload(session, std::slice::from_ref(&&call));
+        let (events, commits, graph, spec, binding) =
+            ring_batch("ring read in flight", &payload);
+        append_read_intent(&events, &call.request, &effect);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "an in-flight admitted call must not close the node"
+        );
+        assert_eq!(
+            unprovable.as_ref().map(|ring| ring.0),
+            Some("planned_call_receipt_missing"),
+            "the in-flight call is held closed: {unprovable:?}"
+        );
+        assert_eq!(
+            events
+                .stream_revision(&ring_index_stream(&graph, &spec, &binding))
+                .expect("index head"),
+            0,
+            "the read family writes no index intent, so the two mechanisms cannot cover for each other"
+        );
+    }
+
+    /// E3: a planned call the owner never admitted is skipped. It has no
+    /// admitted effect, so there is nothing to close and no ring to name.
+    /// The node closes on the facts it really has.
+    #[test]
+    fn a_planned_call_that_was_never_admitted_is_not_held_open() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("ring-never-admitted", workspace.path());
+        let session = "ring-session";
+        let call = ring_call(
+            &host,
+            session,
+            "ring-never-admitted",
+            "read_file",
+            &json!({"path": "planned.txt"}),
+            "{\"path\":\"planned.txt\"}",
+        );
+        let payload = ring_payload(session, std::slice::from_ref(&&call));
+        let (_events, commits, graph, spec, binding) =
+            ring_batch("ring never admitted", &payload);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_some(),
+            "a call the owner never admitted does not hold the node open"
+        );
+        assert!(
+            unprovable.is_none(),
+            "a skipped call names no ring: {unprovable:?}"
+        );
+    }
+
+    /// E3, negative side, in the same node as the skipped call: the call
+    /// the owner did admit is not skipped, so the node is held by it alone.
+    /// The ring names that call and never the one that was never admitted,
+    /// which is what tells the two apart.
+    #[test]
+    fn the_admitted_call_in_a_pair_is_held_while_the_never_admitted_one_is_skipped() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("ring-pair", workspace.path());
+        let session = "ring-session";
+        let never = ring_call(
+            &host,
+            session,
+            "ring-never",
+            "read_file",
+            &json!({"path": "never.txt"}),
+            "{\"path\":\"never.txt\"}",
+        );
+        let mut admitted = ring_call(
+            &host,
+            session,
+            "ring-admitted",
+            "read_file",
+            &json!({"path": "admitted.txt"}),
+            "{\"path\":\"admitted.txt\"}",
+        );
+        let effect = admitted
+            .request
+            .compiled_invocation
+            .as_ref()
+            .unwrap()
+            .effect
+            .clone();
+        let payload = ring_payload(session, &[&never, &admitted]);
+        let (events, commits, graph, spec, binding) = ring_batch("ring pair", &payload);
+        admitted.request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: graph.id.clone(),
+                node_id: spec.id.clone(),
+            });
+        admitted.request.parent_execution_attempt = Some(binding.attempt);
+        append_read_intent(&events, &admitted.request, &effect);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(sources.is_none(), "the admitted call holds the node open");
+        assert_eq!(
+            unprovable.as_ref().map(|ring| ring.0),
+            Some("planned_call_receipt_missing"),
+            "the admitted call is the one that is held: {unprovable:?}"
+        );
+        let reason = unprovable
+            .as_ref()
+            .map(|ring| ring.1.clone())
+            .unwrap_or_default();
+        assert!(
+            reason.contains("ring-admitted"),
+            "the ring names the admitted call: {reason}"
+        );
+        assert!(
+            !reason.contains("ring-never"),
+            "the never admitted call names no ring: {reason}"
+        );
+    }
+}
+
+/// The admission discriminator's own states, kept apart from the closure
+/// that reads them.
+///
+/// The closure's behaviour is proved in `physical_closure_ring_tests`; here
+/// the judgment itself is pinned: the two admission families are read the
+/// same way, the three states stay three, and an admission that cannot be
+/// read forbids every skip.
+#[cfg(test)]
+mod p3_admission_discriminator_tests {
+    use super::*;
+
+    /// One admission event, written the way the owner writes it: the exact
+    /// key under the effect stream of the call's own key.
+    fn append_admission(
+        events: &RuntimeEventStore,
+        key: &str,
+        suffix: &str,
+        kind: &str,
+        call_id: Option<&str>,
+    ) {
+        let stream_id = format!("execution-effect:{key}");
+        let revision = events.stream_revision(&stream_id).expect("effect head");
+        events
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("p3-test:{key}:{suffix}"),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: revision,
+                }],
+                events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream_id.clone(),
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: kind.to_string(),
+                        status: Some("inflight".into()),
+                        actor: Some("governed_tool".into()),
+                        refs: call_id
+                            .map(|id| {
+                                vec![RuntimeEventRef {
+                                    kind: "tool_invocation".into(),
+                                    id: id.to_string(),
+                                }]
+                            })
+                            .unwrap_or_default(),
+                        payload: json!({"idempotency_key": key}),
+                    },
+                    idempotency_key: Some(format!("{key}:{suffix}")),
+                    schema_version: 1,
+                }],
+            })
+            .expect("admission");
+    }
+
+    /// A store and the service that reads it.
+    fn reader() -> (Arc<RuntimeEventStore>, ExecutionCommitService) {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(events.clone());
+        (events, commits)
+    }
+
+    /// The two admission families name their call the same way. A composite
+    /// call's family cannot be told from its name, so the closure reads the
+    /// call from the reference and never asks which family it belongs to.
+    #[test]
+    fn an_admission_names_its_call_in_either_family() {
+        for (kind, suffix) in [
+            ("execution.read.intent", "read-intent"),
+            ("execution.effect.intent", "intent"),
+        ] {
+            let (events, _) = reader();
+            append_admission(&events, "family-key", suffix, kind, Some("call-1"));
+            let intent = events
+                .event_by_idempotency_key(
+                    &format!("execution-effect:family-key"),
+                    &format!("family-key:{suffix}"),
+                )
+                .expect("admission read")
+                .expect("admission");
+            assert_eq!(
+                ExecutionCommitService::admitted_call_id(&intent),
+                Some("call-1".to_string()),
+                "{kind} names its call"
+            );
+        }
+    }
+
+    /// The family-independence of the judgment itself: a read admission and
+    /// a write admission are both "the owner admitted this call". The
+    /// closure never asks which family a call belongs to, because a
+    /// composite call's family cannot be told from its name.
+    #[test]
+    fn both_admission_families_are_judged_the_same_way() {
+        let (read_events, read) = reader();
+        append_admission(
+            &read_events,
+            "read-key",
+            "read-intent",
+            "execution.read.intent",
+            Some("call-1"),
+        );
+        assert_eq!(
+            read.effect_admission("read-key").expect("read admission"),
+            EffectAdmission::Admitted,
+            "a read admission is an admission"
+        );
+
+        let (write_events, write) = reader();
+        append_admission(
+            &write_events,
+            "write-key",
+            "intent",
+            "execution.effect.intent",
+            Some("call-1"),
+        );
+        assert_eq!(
+            write.effect_admission("write-key").expect("write admission"),
+            EffectAdmission::Admitted,
+            "a write admission is an admission"
+        );
+    }
+
+    /// The three states stay three: an admitted call is never skipped, a
+    /// call the owner never admitted has no effect to close, and that skip
+    /// names no ring - it is not a refusal, it is the absence of one.
+    #[test]
+    fn only_a_call_the_owner_never_admitted_may_be_skipped() {
+        let admitted = AdmittedCalls {
+            admitted: BTreeSet::from(["call-1".to_string()]),
+            unnameable: false,
+        };
+        assert!(
+            !admitted.may_skip("call-1"),
+            "an admitted call is never skipped: its receipt is still required"
+        );
+        assert!(
+            admitted.may_skip("call-2"),
+            "a call the owner never admitted has no effect to close"
+        );
+    }
+
+    /// An admission that names no call cannot be read, so it cannot be held
+    /// against any planned call: nothing may be skipped on its account.
+    #[test]
+    fn an_admission_that_names_no_call_forbids_skipping_any_call() {
+        let unreadable = AdmittedCalls {
+            admitted: BTreeSet::new(),
+            unnameable: true,
+        };
+        assert!(!unreadable.may_skip("call-1"));
+        assert!(!unreadable.may_skip("call-2"));
+    }
+
+    /// An effect whose admission cannot be read is not a call that never
+    /// ran. The stream holds a terminal receipt, so the call had an effect;
+    /// "no admission" must not be read as "no effect", or the closure would
+    /// skip a call that has to be closed.
+    #[test]
+    fn an_effect_without_a_readable_admission_is_never_a_never_dispatched_call() {
+        let (events, commits) = reader();
+        append_admission(
+            &events,
+            "orphan-key",
+            "read-receipt",
+            "execution.read.receipt",
+            Some("call-1"),
+        );
+        assert_eq!(
+            commits
+                .effect_admission("orphan-key")
+                .expect("orphan admission"),
+            EffectAdmission::Unreadable,
+            "a receipt without a readable admission is not a never dispatched call"
+        );
+    }
+
+    /// The kinds the discriminator accepts are the kinds the production
+    /// admission writers write, and the one production writer whose event
+    /// lands on the owner's effect stream under a key of its own keeps that
+    /// key.
+    ///
+    /// The invariant "a call that was never dispatched has no effect to
+    /// close" rests on the effect stream holding nothing else. A member's
+    /// noncommit lands on the owner's effect stream, so if it were written
+    /// under an admission key the discriminator would read it as an
+    /// admission and excuse a call that ran. This is the write-point
+    /// conservation the whitelist depends on.
+    #[test]
+    fn the_admission_whitelist_matches_the_production_writers() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let commit = std::fs::read_to_string(
+            root.join("src/execution_core/graph/commit_service.rs"),
+        )
+        .expect("commit service source");
+        let recovery = std::fs::read_to_string(root.join("src/recovery/event_store/mod.rs"))
+            .expect("event store source");
+
+        for kind in [
+            "execution.read.intent",
+            "execution.effect.intent",
+            "execution.effect.retry_admitted",
+        ] {
+            assert!(
+                commit.contains(&format!("\"{kind}\"")),
+                "{kind} is written by the production admission writers"
+            );
+        }
+        for key in [":read-intent", ":intent"] {
+            assert!(
+                commit.contains(key),
+                "the admission writers use the exact key {key} the discriminator reads"
+            );
+        }
+        assert!(
+            recovery.contains("execution.effect.member_noncommit"),
+            "the member noncommit is written to the owner's effect stream"
+        );
+        assert!(
+            recovery.contains("agentic-member:{}"),
+            "the member noncommit keeps a key of its own, never an admission key"
+        );
+    }
+
+    /// An admission under the exact key whose kind is not one of the
+    /// admission kinds cannot be interpreted, so it cannot be held against
+    /// any call and nothing may be skipped on its account.
+    #[test]
+    fn an_admission_of_an_unknown_kind_cannot_be_read() {
+        let (events, commits) = reader();
+        append_admission(
+            &events,
+            "foreign-key",
+            "intent",
+            "execution.effect.member_noncommit",
+            Some("call-1"),
+        );
+        assert_eq!(
+            commits
+                .effect_admission("foreign-key")
+                .expect("foreign admission"),
+            EffectAdmission::Unreadable,
+            "an admission of an unknown kind cannot be read"
+        );
+    }
+}
+
+
+/// The admission gate of a delegated action reads the same durable fact the
+/// closure reads: the call's own effect stream, under the exact intent
+/// keys. The two readers cannot answer differently because they are one
+/// reader.
+#[cfg(test)]
+mod original_effect_admission_tests {
+    use super::*;
+
+    /// The call's own durable admission fact.
+    fn append_admission(
+        events: &RuntimeEventStore,
+        effect_key: &str,
+        kind: &str,
+        suffix: &str,
+    ) {
+        let stream_id = format!("execution-effect:{effect_key}");
+        let idempotency_key = format!("{effect_key}:{suffix}");
+        let revision = events.stream_revision(&stream_id).expect("effect head");
+        events
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: idempotency_key.clone(),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: revision,
+                }],
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream_id.clone(),
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: kind.to_string(),
+                        status: Some("inflight".into()),
+                        actor: Some("governed_tool".into()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "tool_invocation".into(),
+                            id: "gate-call".into(),
+                        }],
+                        payload: json!({
+                            "idempotency_key": effect_key,
+                            "tool_use_id": "gate-call",
+                        }),
+                    },
+                    idempotency_key: Some(idempotency_key),
+                    schema_version: 1,
+                }],
+            })
+            .expect("admission");
+    }
+
+    /// The original call's own request: a delegated action carries it
+    /// unchanged, so the gate reads this exact call's admission.
+    fn original_request(effect_key: &str) -> crate::RuntimeToolExecutionRequest {
+        crate::RuntimeToolExecutionRequest {
+            idempotency_key: effect_key.to_string(),
+            tool_use_id: "gate-call".to_string(),
+            tool_name: harness_contract::agent_action::STATE_INSPECT_TOOL_ID.to_string(),
+            input: "{}".to_string(),
+            ..crate::RuntimeToolExecutionRequest::from_tool_request(
+                &crate::tool_dispatch::ToolRequest {
+                    tool_use_id: "gate-call".into(),
+                    tool_name: harness_contract::agent_action::STATE_INSPECT_TOOL_ID.into(),
+                    input: "{}".into(),
+                    depends_on: vec![],
+                },
+            )
+        }
+    }
+
+    /// The Read family: the call's own read intent is its admission, and
+    /// the action is admitted even though that family installs no owner.
+    #[test]
+    fn a_read_intent_admits_the_original_call() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        append_admission(&events, "gate-read", "execution.read.intent", "read-intent");
+        let service = ExecutionCommitService::new(events.clone());
+        let original = original_request("gate-read");
+        assert!(
+            service
+                .original_effect_admitted(false, &original)
+                .expect("read admission"),
+            "a read admission is an admission"
+        );
+    }
+
+    /// The other family reads the same way: the shape of the judgment does
+    /// not change with the family.
+    #[test]
+    fn an_effect_intent_admits_the_original_call() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        append_admission(&events, "gate-write", "execution.effect.intent", "intent");
+        let service = ExecutionCommitService::new(events.clone());
+        let original = original_request("gate-write");
+        assert!(
+            service
+                .original_effect_admitted(false, &original)
+                .expect("effect admission"),
+            "a write admission is an admission"
+        );
+    }
+
+    /// A call whose effect stream holds no admission was never admitted:
+    /// the action stays refused, and the refusal keeps its name.
+    #[test]
+    fn an_unadmitted_call_is_never_admitted() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let service = ExecutionCommitService::new(events.clone());
+        let original = original_request("gate-absent");
+        assert!(
+            !service
+                .original_effect_admitted(false, &original)
+                .expect("absent admission"),
+            "an absent admission is not an admission"
+        );
+    }
+
+    /// An admission the reading cannot interpret is never an admission:
+    /// nothing may be admitted on its account.
+    #[test]
+    fn an_unreadable_admission_is_never_an_admission() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        append_admission(
+            &events,
+            "gate-foreign",
+            "execution.effect.member_noncommit",
+            "intent",
+        );
+        let service = ExecutionCommitService::new(events.clone());
+        let original = original_request("gate-foreign");
+        assert!(
+            !service
+                .original_effect_admitted(false, &original)
+                .expect("foreign admission"),
+            "an admission of an unknown kind is not an admission"
+        );
+    }
+
+    /// The owner slot answers alone for the families that install one, so
+    /// their behaviour is unchanged: the durable fact is not even read.
+    #[test]
+    fn the_owner_slot_answers_alone_for_the_families_that_install_one() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let service = ExecutionCommitService::new(events.clone());
+        let original = original_request("gate-owned");
+        assert!(
+            service
+                .original_effect_admitted(true, &original)
+                .expect("owner admission"),
+            "the owner slot is the family's own answer"
+        );
+    }
+
+    /// The one reading of the durable admission fact: the same two exact
+    /// keys and the same kind whitelist, whatever asks.
+    #[test]
+    fn the_shared_reader_judges_the_admission_the_same_way() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        append_admission(&events, "shared-read", "execution.read.intent", "read-intent");
+        append_admission(&events, "shared-write", "execution.effect.intent", "intent");
+        append_admission(
+            &events,
+            "shared-foreign",
+            "execution.effect.member_noncommit",
+            "intent",
+        );
+        assert_eq!(
+            read_effect_admission(&events, "shared-read").expect("read admission"),
+            EffectAdmission::Admitted,
+            "a read admission is an admission"
+        );
+        assert_eq!(
+            read_effect_admission(&events, "shared-write").expect("write admission"),
+            EffectAdmission::Admitted,
+            "a write admission is an admission"
+        );
+        assert_eq!(
+            read_effect_admission(&events, "shared-foreign").expect("foreign admission"),
+            EffectAdmission::Unreadable,
+            "an admission of an unknown kind cannot be read"
+        );
+        assert_eq!(
+            read_effect_admission(&events, "shared-absent").expect("absent admission"),
+            EffectAdmission::NotAdmitted,
+            "an absent admission is not an admission"
+        );
+    }
+
+    /// The read admission carries the input digest the member preparation
+    /// fence reads for both families: a read admission that left it out
+    /// could never be checked.
+    #[test]
+    fn the_read_admission_carries_the_input_digest_the_fence_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("gate-read-intent", workspace.path());
+        let request = crate::bound_tool_batch::scope_admission_tests::bound_request(
+            &host,
+            "read_file",
+            json!({"path": "a"}),
+        );
+        let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+        assert_eq!(effect.effect_kind, ToolEffectKind::Read);
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let service = ExecutionCommitService::new(events.clone());
+        assert!(matches!(
+            service
+                .begin_tool_effect(&request, &effect)
+                .expect("read admission"),
+            ToolEffectState::NotRequired
+        ));
+        let intent = events
+            .event_by_idempotency_key(
+                &format!("execution-effect:{}", request.idempotency_key),
+                &format!("{}:read-intent", request.idempotency_key),
+            )
+            .expect("intent read")
+            .expect("read intent");
+        assert_eq!(
+            intent.payload["input_sha256"],
+            json!(format!(
+                "sha256:{:x}",
+                Sha256::digest(request.input.as_bytes())
+            )),
+            "the read admission carries the input the fence reads"
         );
     }
 }

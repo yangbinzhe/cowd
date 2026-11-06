@@ -30,6 +30,7 @@ pub mod resources;
 pub(crate) const PHYSICAL_CLOSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(crate) use commit_service::{execution_lineage_stream_id, process_closure_document, receipt_replay_contract, TerminalScopeReader};
+pub(crate) use commit_service::{read_effect_admission, read_effect_admission_intent, EffectAdmission};
 pub use commit_service::{
     CallRefusalOwner, CommittedCallRefusal, DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
     ExecutionEffectState, ProcessClosurePublicationAuthority, ToolEffectState,

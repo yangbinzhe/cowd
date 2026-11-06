@@ -619,6 +619,44 @@ impl OriginalProcessBatchPolicyOwner {
     }
 }
 
+/// Whether the original call's member may be prepared.
+///
+/// The owner slot answers for the effect families that install one. When
+/// the slot is empty the durable admission fact answers the same question:
+/// the original call's own effect stream holds its admission intent, read
+/// by the one reading of that fact. A fact that cannot be read is not an
+/// admission, so the member stays unknown.
+/// The named refusal the admission gates publish for a call whose durable
+/// admission fact is missing.
+///
+/// The wording lives in one place, so the Host gate and the delegated gate
+/// cannot answer the same refusal differently.
+pub(crate) fn original_effect_admission_missing_reason(
+    tool_use_id: &str,
+    effect_key: &str,
+    tool_name: &str,
+    attempt: u32,
+    parent_reason: Option<&str>,
+) -> String {
+    tool_scope::original_effect_admission_missing_reason(
+        tool_use_id, effect_key, tool_name, attempt, parent_reason,
+    )
+}
+
+pub(crate) fn original_member_admitted(
+    owner: Option<Arc<crate::execution_core::graph::OriginalFreshEffectOwner>>,
+    store: &crate::runtime_event_store::RuntimeEventStore,
+    effect_key: &str,
+) -> bool {
+    if owner.is_some() {
+        return true;
+    }
+    matches!(
+        crate::execution_core::graph::read_effect_admission(store, effect_key),
+        Ok(crate::execution_core::graph::EffectAdmission::Admitted)
+    )
+}
+
 #[async_trait::async_trait]
 impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner {
     async fn prepare_member_pregrant(&self, original: &crate::RuntimeToolExecutionRequest, index: usize)
@@ -728,11 +766,20 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
         };
         // Only the effect owner produced by this original call can authorize
         // the durable preparation fence; an absent owner is never Fresh.
+        // When the owner is absent the durable admission fact answers the
+        // same question: the original call's own effect stream holds its
+        // admission intent, read by the one reading of that fact. A fact
+        // that cannot be read is not an admission, so the member stays
+        // unknown.
         let fresh_effect = match original.tool_progress.original_fresh_effect() {
-            Ok(Some(owner)) => owner,
-            _ => return unknown(BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
+            Ok(owner) => owner,
+            Err(_) => return unknown(BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
                 "original fresh effect owner unavailable".into()),
         };
+        if !original_member_admitted(fresh_effect.clone(), &self.process.store, &original.idempotency_key) {
+            return unknown(BatchMemberUnknownReason::OriginalTransactionFactsUnavailable,
+                "original fresh effect owner unavailable".into());
+        }
         let Some(slot) = self.scope.upgrade().and_then(|scope| scope.call_slot.upgrade()) else {
             let reason = "original Process call slot unavailable".to_string();
             return unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason);
@@ -750,8 +797,16 @@ impl crate::tool_host::AgentBatchPolicyOwner for OriginalProcessBatchPolicyOwner
         let reservation = member.original_reservation().expect("reservation was installed by this member owner");
         // A retains the original append request and token before attempting the
         // effect marker. Any failure here can be an unknown append outcome.
+        let Some(original_request) = self
+            .scope
+            .upgrade()
+            .and_then(|scope| scope.original_request.get().cloned())
+        else {
+            let reason = "original Process call request unavailable".to_string();
+            return unknown(BatchMemberUnknownReason::Preparation(reason.clone()), reason);
+        };
         let fence = match self.process.store.acquire_original_member_preparation_fence(
-            reservation, original, self.process.ticket(), index, &fresh_effect, Arc::clone(self.process.claim()),
+            reservation, &original_request, self.process.ticket(), index, fresh_effect.as_deref(), Arc::clone(self.process.claim()),
         ) {
             Ok(fence) => fence,
             Err(error) => {
@@ -3174,5 +3229,91 @@ mod process_request_scope_tests {
         first.completed.notify_waiters();
         assert_eq!(same.replay().await.unwrap(), "late real result");
         assert!(!scope.accepting, "late completion cannot reopen admission");
+    }
+}
+
+#[cfg(test)]
+mod original_member_admission_tests {
+    use super::*;
+
+    /// The original call's own admission fact on its effect stream.
+    fn append_admission(
+        events: &crate::runtime_event_store::RuntimeEventStore,
+        effect_key: &str,
+        kind: &str,
+        suffix: &str,
+    ) {
+        let stream_id = format!("execution-effect:{effect_key}");
+        let idempotency_key = format!("{effect_key}:{suffix}");
+        let revision = events.stream_revision(&stream_id).expect("effect head");
+        events
+            .append_transaction(crate::runtime_event_store::AppendTransactionRequest {
+                transaction_id: idempotency_key.clone(),
+                expected_streams: vec![crate::runtime_event_store::ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: revision,
+                }],
+                events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: crate::runtime_event_store::RuntimeEventInput {
+                        stream_id: stream_id.clone(),
+                        scope: crate::runtime_event_store::RuntimeEventScope::ExecutionNode,
+                        kind: kind.to_string(),
+                        status: Some("inflight".into()),
+                        actor: Some("governed_tool".into()),
+                        refs: vec![crate::runtime_event_store::RuntimeEventRef {
+                            kind: "tool_invocation".into(),
+                            id: "member-call".into(),
+                        }],
+                        payload: serde_json::json!({
+                            "idempotency_key": effect_key,
+                            "tool_use_id": "member-call",
+                        }),
+                    },
+                    idempotency_key: Some(idempotency_key),
+                    schema_version: 1,
+                }],
+            })
+            .expect("admission");
+    }
+
+    /// The second gate admits a Read-family original whose admission is a
+    /// durable fact: that family installs no owner, and the empty slot used
+    /// to read as a refusal.
+    #[test]
+    fn the_second_gate_admits_a_read_family_original_with_a_durable_admission() {
+        let events = Arc::new(crate::runtime_event_store::RuntimeEventStore::for_test());
+        append_admission(&events, "member-read", "execution.read.intent", "read-intent");
+        assert!(
+            original_member_admitted(None, &events, "member-read"),
+            "a read admission admits the member"
+        );
+    }
+
+    /// The negative control: an original without a durable admission fact
+    /// is still refused by the second gate.
+    #[test]
+    fn the_second_gate_refuses_an_original_without_a_durable_admission() {
+        let events = Arc::new(crate::runtime_event_store::RuntimeEventStore::for_test());
+        assert!(
+            !original_member_admitted(None, &events, "member-absent"),
+            "an absent admission refuses the member"
+        );
+    }
+
+    /// An admission that cannot be read is not an admission: the second
+    /// gate keeps refusing.
+    #[test]
+    fn the_second_gate_refuses_an_unreadable_admission() {
+        let events = Arc::new(crate::runtime_event_store::RuntimeEventStore::for_test());
+        append_admission(
+            &events,
+            "member-foreign",
+            "execution.effect.member_noncommit",
+            "intent",
+        );
+        assert!(
+            !original_member_admitted(None, &events, "member-foreign"),
+            "an unreadable admission refuses the member"
+        );
     }
 }
