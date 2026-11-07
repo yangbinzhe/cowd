@@ -551,3 +551,64 @@ fn own823n_historical_issuer_allows_mutable_32_use_snapshot_but_not_signature_or
         assert!(crate::authorization_negotiator::validate_historical_authorization_issuer(&changed, &original_grant, original.commit_cursor).is_err(), "issuer {fault}");
     }
 }
+
+/// U: the failure path's pre-send subset is provable, and every other shape
+/// still refuses.
+///
+/// The reader is unchanged by U: it already reads the observed evidence first
+/// and then judges the per-operation facts. U only makes the failure path
+/// produce those facts, so this pins what a failure can and cannot prove.
+#[test]
+fn u_pre_send_subset_is_provable_and_every_other_shape_still_refuses() {
+    let (original, effect) = fixture();
+    let outcome: RuntimeToolExecutionOutcome =
+        serde_json::from_value(original.payload["outcome"].clone()).unwrap();
+    // U-P1: every operation is a pre-send refusal, so "nothing was sent" is
+    // provable and the ring does not appear.
+    let mut proven = outcome.clone();
+    let EvidenceTargetIdentity::LocalNetwork { operation } =
+        &mut proven.observed_evidence[0].target
+    else {
+        unreachable!()
+    };
+    operation.operations[0].terminal = LocalNetworkTerminal::NotStarted {
+        reason_code: "network_policy_before_send".into(),
+    };
+    assert!(
+        ExecutionCommitService::local_network_refusal_reason(&proven, &effect).is_none(),
+        "a pre-send refusal proves that nothing was sent"
+    );
+    // U-N1: no fact at all keeps the original ring.
+    let mut missing = outcome.clone();
+    missing.observed_evidence.clear();
+    assert_eq!(
+        ExecutionCommitService::local_network_refusal_reason(&missing, &effect),
+        Some("network_effect_without_observation")
+    );
+    // U-N1b: an operation whose terminal is unknown is not a proof.
+    let mut unknown = outcome.clone();
+    let EvidenceTargetIdentity::LocalNetwork { operation } =
+        &mut unknown.observed_evidence[0].target
+    else {
+        unreachable!()
+    };
+    operation.operations[0].terminal = LocalNetworkTerminal::Unknown {
+        reason_code: "timeout".into(),
+    };
+    assert_eq!(
+        ExecutionCommitService::local_network_refusal_reason(&unknown, &effect),
+        Some("network_observation_operation_invalid")
+    );
+    // U-N2: an incomplete coverage cannot prove anything either.
+    let mut incomplete = outcome.clone();
+    let EvidenceTargetIdentity::LocalNetwork { operation } =
+        &mut incomplete.observed_evidence[0].target
+    else {
+        unreachable!()
+    };
+    operation.coverage_complete = false;
+    assert_eq!(
+        ExecutionCommitService::local_network_refusal_reason(&incomplete, &effect),
+        Some("network_observation_incomplete")
+    );
+}

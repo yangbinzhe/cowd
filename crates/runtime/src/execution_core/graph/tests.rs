@@ -9778,3 +9778,236 @@ async fn r1_534_builtin_completed_entered_callback_cleanup_cannot_reset_original
     assert!(observation.witness().is_none());
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
+
+/// The original terminal custody belongs to the original Session terminal.
+///
+/// A delegated leaf publishes its own terminal and never owns the original
+/// Session terminal, so a published terminal completion alone must not demand
+/// that custody. The original Session terminal keeps demanding it.
+#[test]
+fn a8_original_terminal_custody_is_required_only_for_the_original_session_terminal() {
+    let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
+        status: ExecutionNodeStatus::Completed,
+        result_ref: Some("a8-delegated-terminal".to_string()),
+        wait_class: None,
+        summary: Some("delegated leaf terminal".to_string()),
+        evidence_refs: Vec::new(),
+        failure: None,
+        usage: Default::default(),
+        finished_at_ms: 1,
+    });
+    // A delegated leaf terminal: no original Session terminal was requested.
+    assert!(!super::runner::requests_original_session_terminal(&outcome));
+    outcome
+        .domain_events
+        .push(crate::runtime_event_store::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: "session-terminal:request-a8".to_string(),
+                scope: crate::RuntimeEventScope::SessionInput,
+                kind: "runtime.session.terminal_requested".to_string(),
+                status: Some("pending_delivery".to_string()),
+                actor: Some("SynthesizeNodeExecutor".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({}),
+            },
+            idempotency_key: Some("a8-session-terminal".to_string()),
+            schema_version: 1,
+        });
+    // The original Session terminal keeps its custody requirement, and the
+    // custody error keeps its original wording.
+    assert!(super::runner::requests_original_session_terminal(&outcome));
+    let error = super::runner::missing_original_terminal_custody(&outcome)
+        .expect("the original Session terminal keeps its custody requirement");
+    assert_eq!(
+        error.to_string(),
+        "runtime execution driver failed: original terminal handoff is unconfirmed"
+    );
+    // A delegated leaf terminal never carries that custody.
+    let mut leaf = NodeExecutionOutcome::new(ExecutionNodeResult {
+        status: ExecutionNodeStatus::Completed,
+        result_ref: Some("a8-delegated-terminal".to_string()),
+        wait_class: None,
+        summary: Some("delegated leaf terminal".to_string()),
+        evidence_refs: Vec::new(),
+        failure: None,
+        usage: Default::default(),
+        finished_at_ms: 1,
+    });
+    leaf.domain_events.push(crate::runtime_event_store::RuntimeTransactionEventInput {
+        event: crate::RuntimeEventInput {
+            stream_id: "execution-node:leaf".to_string(),
+            scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "execution.node.result".to_string(),
+            status: Some("completed".to_string()),
+            actor: Some("synthesize".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({}),
+        },
+        idempotency_key: Some("a8-leaf-node".to_string()),
+        schema_version: 1,
+    });
+    assert!(super::runner::missing_original_terminal_custody(&leaf).is_none());
+}
+
+/// A delegated leaf publishes its own terminal.
+///
+/// The leaf terminal carries a terminal completion and never carries the
+/// original Session terminal, because only a root Session ingress asks for
+/// that one. The runner must not read a leaf terminal as a lost original
+/// terminal handover, while the original Session terminal keeps demanding its
+/// custody.
+struct A8LeafTerminalBackend {
+    commits: ExecutionCommitService,
+    session_id: String,
+    turn_id: String,
+    original_session_terminal: bool,
+}
+
+struct A8LeafTerminalResolver {
+    graph_id: String,
+    backend: Arc<A8LeafTerminalBackend>,
+}
+
+impl super::executors::SynthesizeBackendResolver for A8LeafTerminalResolver {
+    fn resolve(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Option<Arc<dyn super::executors::SynthesizeBackend>> {
+        (ticket.graph_id == self.graph_id)
+            .then(|| Arc::clone(&self.backend) as Arc<dyn super::executors::SynthesizeBackend>)
+    }
+}
+
+#[async_trait]
+impl super::executors::SynthesizeBackend for A8LeafTerminalBackend {
+    async fn synthesize(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, String> {
+        use sha2::{Digest, Sha256};
+        let text = "a8 delegated leaf terminal";
+        let messages = vec![serde_json::json!({
+            "role":"assistant","blocks":[{"Text":{"text":text}}],"usage":null
+        })];
+        let publication = self
+            .commits
+            .prepare_synthesize_transcript(
+                ticket,
+                &self.session_id,
+                &self.turn_id,
+                0,
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                messages,
+                Some(harness_contract::goal::GoalCompletion::Partial),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some(format!(
+                "turn-result:{}:{:x}",
+                ticket.graph_id,
+                Sha256::digest(text.as_bytes())
+            )),
+            wait_class: None,
+            summary: Some("delegated leaf terminal".to_string()),
+            evidence_refs: Vec::new(),
+            failure: None,
+            usage: Default::default(),
+            finished_at_ms: 1,
+        });
+        if self.original_session_terminal {
+            outcome
+                .domain_events
+                .push(crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: format!("session-terminal:{}", self.turn_id),
+                        scope: crate::RuntimeEventScope::SessionInput,
+                        kind: "runtime.session.terminal_requested".to_string(),
+                        status: Some("pending_delivery".to_string()),
+                        actor: Some("SynthesizeNodeExecutor".to_string()),
+                        refs: Vec::new(),
+                        payload: serde_json::json!({}),
+                    },
+                    idempotency_key: Some("a8-session-terminal".to_string()),
+                    schema_version: 1,
+                });
+        }
+        ExecutionCommitService::attach_host_transcript(&mut outcome, publication)
+            .map_err(|error| error.to_string())?;
+        Ok(outcome)
+    }
+
+    async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a8_delegated_leaf_terminal_is_not_a_lost_original_session_terminal() {
+    for original_session_terminal in [false, true] {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let root = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(root.path().join("blobs")));
+        event_store.bind_artifact_store(artifacts.clone()).unwrap();
+        let commits = ExecutionCommitService::new(Arc::clone(&event_store)).with_artifact_store(artifacts);
+        let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+        let registry = Arc::new(NodeExecutorRegistry::new());
+        let synthesize = Arc::new(super::executors::SynthesizeNodeExecutor::new());
+        registry
+            .register(Arc::clone(&synthesize) as Arc<dyn NodeExecutor>)
+            .unwrap();
+        let mut graph = test_graph("a8 delegated leaf terminal");
+        let mut spec = node("leaf-terminal");
+        spec.kind = ExecutionNodeKind::Synthesize;
+        spec.executor_kind = "synthesize".into();
+        graph.nodes.push(spec);
+        let graph_id = graph.id.clone();
+        let lineage = graph.lineage.clone().unwrap();
+        synthesize.install_resolver(Arc::new(A8LeafTerminalResolver {
+            graph_id: graph_id.clone(),
+            backend: Arc::new(A8LeafTerminalBackend {
+                commits: commits.clone(),
+                session_id: lineage.session_id.clone(),
+                turn_id: lineage.turn_id.clone(),
+                original_session_terminal,
+            }),
+        }));
+        let runner = test_runner(registry, state.clone(), commits);
+        let _ = runner.start(graph).await;
+        let committed = state.load(&graph_id).expect("graph state");
+        let status = committed
+            .node_statuses
+            .get("leaf-terminal")
+            .copied()
+            .unwrap_or(ExecutionNodeStatus::Planned);
+        if original_session_terminal {
+            // The original Session terminal keeps demanding its custody: this
+            // shape never completes as a plain leaf terminal.
+            assert_ne!(
+                status,
+                ExecutionNodeStatus::Completed,
+                "the original Session terminal custody must still be required"
+            );
+            // The refused terminal leaves no durable completed receipt of its
+            // own: it either carries its failure or it was never committed.
+            let recorded = committed.node_results.get("leaf-terminal");
+            assert!(
+                recorded
+                    .map(|result| {
+                        result.failure.as_ref().is_some_and(|failure| !failure.message.is_empty())
+                    })
+                    .unwrap_or(true),
+                "the refused original Session terminal must not carry a durable completed receipt"
+            );
+        } else {
+            // The delegated leaf's own terminal is not a lost original Session
+            // terminal handover.
+            assert_eq!(status, ExecutionNodeStatus::Completed);
+            assert!(committed.node_results["leaf-terminal"]
+                .failure
+                .as_ref()
+                .is_none());
+        }
+    }
+}

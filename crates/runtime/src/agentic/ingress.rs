@@ -108,7 +108,31 @@ fn is_review_content_refusal(error: &str) -> bool {
 }
 
 fn is_review_source_changed_retry(error: &str) -> bool {
-    is_review_precondition_refusal(error) || is_review_content_refusal(error)
+    is_review_precondition_refusal(error)
+        || is_review_content_refusal(error)
+        || is_review_source_drift(error)
+}
+
+/// A refusal whose cause is a source head that moved while the review was
+/// reading it.
+///
+/// Every string below is authored by Runtime's own read fences
+/// (`review_evidence/results.rs`, `review_evidence/policy.rs`,
+/// `review_evidence/current_review.rs`), never by a provider or a model, and
+/// each of them still refuses. The class only decides the bounded retry
+/// budget and how the attempt settles: a drifting source that matched no
+/// classifier used to clear the streak on every rejection, so
+/// `failed_review_attempts` never incremented and the bounded review-attempt
+/// terminal was never reached.
+fn is_review_source_drift(error: &str) -> bool {
+    error.contains("result metadata source changed during resolution")
+        || error.contains("result metadata source moved backwards during resolution")
+        || error.contains("proof source changed during validation")
+        || error.contains("proof source changed while paging")
+        || error.contains("proof source changed at final page boundary")
+        || error.contains("completed review witness source changed during authentication")
+        || error.contains("current Session head moved backwards while reading original material")
+        || error.contains("original Session material cut or current head differs")
 }
 
 fn is_review_program_advanced(error: &str) -> bool {
@@ -1246,8 +1270,33 @@ mod tests {
         assert!(is_review_source_changed_retry(
             "review policy source changed; retry against current strategy and tool plans"
         ));
+        // A source head that moved while the review was reading it still
+        // refuses; it now reaches the bounded settlement instead of clearing
+        // the streak on every rejection.
+        for error in [
+            "result metadata source changed during resolution; rebuild the review; source=session:one expected=1 actual=2 phase=result_source_pin",
+            "result metadata source moved backwards during resolution; rebuild the review; source=session:one expected=2 actual=1 phase=result_source_pin",
+            "proof source changed during validation",
+            "proof source changed during validation; retry current inputs; source=goal:x expected=1 actual=2 phase=final_source_fence; advanced=1 head=2 []",
+            "proof source changed while paging; retry current inputs",
+            "proof source changed at final page boundary; retry current inputs",
+            "completed review witness source changed during authentication",
+            "current Session head moved backwards while reading original material",
+            "original Session material cut or current head differs",
+        ] {
+            assert!(is_review_source_drift(error), "{error}");
+            assert!(is_review_source_changed_retry(error), "{error}");
+        }
         // Unrelated rejections must not be treated as the wedged retry class.
         assert!(!is_review_source_changed_retry("review Task not found"));
+        for error in [
+            "review Task not found",
+            "Artifact catalog source changed; start a fresh discovery",
+            "result publication does not match its original physical packet/claim",
+            "review physical attempt is stale",
+        ] {
+            assert!(!is_review_source_drift(error), "{error}");
+        }
         assert!(!is_review_source_changed_retry(
             "Artifact catalog source changed; start a fresh discovery"
         ));

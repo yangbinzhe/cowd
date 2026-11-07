@@ -1371,6 +1371,33 @@ pub enum ToolHostError {
     McpUnavailable,
     #[error("tool execution failed: {0}")]
     Execution(String),
+    /// A joined local network call failed after the host took it.
+    ///
+    /// The fact carries the per-operation facts the host observed. It is
+    /// evidence, never authority: the call still fails, and the facts never
+    /// turn a failure into a success. The wording is the original failure
+    /// reason, so the failure reads exactly as it did before.
+    #[error("{reason}")]
+    LocalNetworkFailed {
+        reason: String,
+        fact: harness_contract::context::LocalNetworkFact,
+    },
+}
+
+impl ToolHostError {
+    /// The local network fact a failed joined call produced, when the failure
+    /// carries one.
+    ///
+    /// A caller that reports observations reads the fact here and puts it in
+    /// the same observed-evidence slot a successful call uses. A failure with
+    /// no fact stays a failure with no observation.
+    #[must_use]
+    pub fn local_network_fact(&self) -> Option<harness_contract::context::LocalNetworkFact> {
+        match self {
+            Self::LocalNetworkFailed { fact, .. } => Some(fact.clone()),
+            _ => None,
+        }
+    }
 }
 
 fn validate_schema_value(

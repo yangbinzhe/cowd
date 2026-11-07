@@ -228,6 +228,27 @@ pub enum ExecutionRunnerError {
     Driver(String),
 }
 
+/// The original terminal custody belongs to the original Session terminal.
+///
+/// Only a root Session ingress asks for that terminal, so only that request
+/// can leave the original terminal without a live owner. A delegated leaf
+/// publishes its own terminal and never owns the original Session terminal,
+/// so a published terminal completion alone must not demand that custody.
+pub(super) fn requests_original_session_terminal(outcome: &NodeExecutionOutcome) -> bool {
+    outcome.domain_events.iter()
+        .any(|event| event.event.kind == "runtime.session.terminal_requested")
+}
+
+/// The custody error of a committed Synthesize outcome whose original Session
+/// terminal has no live owner. A delegated leaf terminal never asks for that
+/// custody, so it never carries this error.
+pub(super) fn missing_original_terminal_custody(
+    outcome: &NodeExecutionOutcome,
+) -> Option<ExecutionRunnerError> {
+    requests_original_session_terminal(outcome)
+        .then(|| ExecutionRunnerError::Driver("original terminal handoff is unconfirmed".into()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionRunReport {
     pub graph_id: String,
@@ -1782,28 +1803,46 @@ impl ExecutionGraphRunner {
             &match &result { Ok(()) => "result=ok physical_sources=confirmed".into(),
                 Err(error) => format!("result=error physical_sources=unconfirmed kind={} original_detail=private", build16_runner_error_kind(error)) });
         let result = if result.is_ok() && disposition == CallbackDisposition::Commit && ticket.executor_kind == "synthesize" {
-            let original_owner = {
+            let original_handoff = {
                 let active = self.active.lock().await;
                 active.get(&(graph_id.to_string(), ticket.node_id.clone()))
                     .filter(|owner| owner.ticket == *ticket && owner.binding == binding)
                     .and_then(|owner| owner.cancel_outcome.state.lock().ok().and_then(|handoff| {
                         if !handoff.finished { return None; }
-                        handoff.outcome.as_ref().and_then(|outcome| outcome.original_terminal_owner.as_ref().map(|owner| Arc::clone(&owner.0)))
+                        handoff.outcome.clone()
                     }))
             };
-            if let Some(owner) = original_owner {
-                let ticket = ticket.clone();
-                tokio::task::spawn_blocking(move || owner.release_after_original_physical_close(&ticket)).await
-                    .map_err(|error| ExecutionRunnerError::Driver(format!("original terminal release task failed: {error}")))?
-                    .map_err(ExecutionRunnerError::Driver)
-            } else {
-                // A non-terminal Synthesize replan has no terminal owner and
-                // keeps its original callback behavior. For a terminal result,
-                // missing the live handoff is Unknown and must retain custody.
-                let document = self.commit_service.committed_host_transcript(ticket)?;
-                if document.terminal_completion.is_some() {
-                    Err(ExecutionRunnerError::Driver("original terminal handoff is unconfirmed".into()))
-                } else { result }
+            match original_handoff {
+                Some(outcome) => {
+                    match outcome.original_terminal_owner.as_ref() {
+                        Some(owner) => {
+                            let owner = Arc::clone(&owner.0);
+                            let ticket = ticket.clone();
+                            tokio::task::spawn_blocking(move || owner.release_after_original_physical_close(&ticket)).await
+                                .map_err(|error| ExecutionRunnerError::Driver(format!("original terminal release task failed: {error}")))?
+                                .map_err(ExecutionRunnerError::Driver)
+                        }
+                        // The original Session terminal was requested but no
+                        // live owner carries it: Unknown, and the custody of
+                        // the original terminal must be retained.
+                        None => match missing_original_terminal_custody(&outcome) {
+                            Some(error) => Err(error),
+                            // A delegated leaf publishes its own terminal and
+                            // never owns the original Session terminal. It has
+                            // no original terminal custody to retain.
+                            None => result,
+                        },
+                    }
+                }
+                None => {
+                    // The live handoff is gone. Without it the original
+                    // terminal custody cannot be read, so the original
+                    // fail-closed check still applies.
+                    let document = self.commit_service.committed_host_transcript(ticket)?;
+                    if document.terminal_completion.is_some() {
+                        Err(ExecutionRunnerError::Driver("original terminal handoff is unconfirmed".into()))
+                    } else { result }
+                }
             }
         } else { result };
         if let Some(active) = self

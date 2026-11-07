@@ -6708,7 +6708,12 @@ impl OriginalBatchPolicyOwner {
             .and_then(|value| usize::try_from(value).ok()).ok_or_else(unavailable)?;
         let action = transaction.events.get(action_index).ok_or_else(unavailable)?;
         let outer_hook = host.original_outer_hook_publication_facts().map_err(|_| unavailable())?;
-        if action.event.payload.pointer("/member_admission/outer_hook") != Some(&outer_hook)
+        // The member admission facts are read back from the same-source batch
+        // payload the action event keeps.
+        let action_payload = crate::step_snapshot::rebuild_member_admission_payload(&action.event.payload)
+            .map_err(|_| unavailable())?;
+        let action_payload: &serde_json::Value = &action_payload;
+        if action_payload.pointer("/member_admission/outer_hook") != Some(&outer_hook)
             || receipt.event_ids.get(action_index).is_none_or(String::is_empty)
             || !receipt.stream_revisions.iter().any(|source| source.stream_id == action.event.stream_id
                 && source.expected_revision < source.committed_revision)
@@ -7004,6 +7009,10 @@ impl OriginalBatchPolicyOwner {
     ) -> Result<OriginalMemberReplayWitness, String> {
         let binding = original.step_binding.as_ref().ok_or("original Step missing")?;
         let facts = action.payload.get("member_admission").ok_or("original member facts missing")?;
+        // The member admission facts are read back from the same-source batch
+        // payload the action event keeps.
+        let facts = crate::step_snapshot::rebuild_member_admission_facts(facts)?;
+        let facts: &serde_json::Value = &facts;
         let prepared: OriginalMemberReplayPrepared = serde_json::from_value(
             facts.get("prepared").cloned().ok_or("original preparation missing")?,
         ).map_err(|error| error.to_string())?;

@@ -5123,3 +5123,348 @@ fn r453_timeline_byte_short_transaction_resumes_by_exact_position_and_rejects_si
             .starts_with("HistoryBudgetExceeded:")
     );
 }
+
+/// A Session query port that answers with one durable input claim.
+///
+/// The owner recovery under test reuses the claim and the control the
+/// original ingress installed, and asks the durable Session whether that
+/// claim is still the live one. This port answers exactly that question and
+/// nothing else.
+struct A8SessionQueryPort {
+    records: std::sync::Mutex<Vec<crate::RuntimeSessionInputRecord>>,
+}
+
+impl A8SessionQueryPort {
+    fn new(records: Vec<crate::RuntimeSessionInputRecord>) -> Arc<Self> {
+        Arc::new(Self { records: std::sync::Mutex::new(records) })
+    }
+
+    fn set(&self, records: Vec<crate::RuntimeSessionInputRecord>) {
+        *self.records.lock().unwrap() = records;
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::SessionRuntimeQueryPort for A8SessionQueryPort {
+    async fn cancellation_authorization_by_id(
+        &self,
+        _request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<Option<session::SessionDomainEvent>, session::SessionError> {
+        Ok(None)
+    }
+
+    fn history_reader(&self) -> Option<Arc<session::SessionHistoryReader>> {
+        None
+    }
+
+    async fn session_record(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<crate::RuntimeSessionRecord>, session::SessionError> {
+        Ok(None)
+    }
+
+    async fn runtime_input(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::RuntimeSessionInputRecord>, session::SessionError> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|record| record.request_id == request_id)
+            .cloned())
+    }
+
+    async fn runtime_input_by_input_id(
+        &self,
+        _input_id: &str,
+    ) -> Result<Option<crate::RuntimeSessionInputRecord>, session::SessionError> {
+        Ok(None)
+    }
+
+    async fn pending_session_input_applications(
+        &self,
+        _session_id: &str,
+        _session_generation: u64,
+        _after: Option<(usize, String)>,
+        _limit: usize,
+    ) -> Result<Vec<crate::RuntimeSessionInputRecord>, session::SessionError> {
+        Ok(Vec::new())
+    }
+
+    async fn input_admission(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<crate::RuntimeSessionInputAdmission>, session::SessionError> {
+        Ok(None)
+    }
+
+    async fn evidence_access(
+        &self,
+        _session_id: &str,
+        _evidence_id: &str,
+    ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, session::SessionError> {
+        Ok(None)
+    }
+}
+
+fn a8_original_ingress() -> crate::TurnIngressRef {
+    crate::TurnIngressRef {
+        request_id: "request-a8".into(),
+        turn_id: "turn-a8".into(),
+        message_id: "message-a8".into(),
+        session_id: "session-a8".into(),
+        primary_task_id: "task-a8".into(),
+        root_task_id: "task-a8".into(),
+        session_generation: 4,
+        input_sequence: 9,
+        claim_owner: "session-a8".into(),
+        claim_token: "claim-token-a8".into(),
+        claim_revision: 2,
+        handoff_id: None,
+    }
+}
+
+/// The durable input claim of the original root turn, still live.
+fn a8_live_input_record(ingress: &crate::TurnIngressRef) -> crate::RuntimeSessionInputRecord {
+    crate::RuntimeSessionInputRecord {
+        input_id: "input-a8".into(),
+        request_id: ingress.request_id.clone(),
+        turn_id: ingress.turn_id.clone(),
+        message_id: ingress.message_id.clone(),
+        session_id: ingress.session_id.clone(),
+        sequence: ingress.input_sequence as usize,
+        session_generation: ingress.session_generation,
+        decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+        target_turn_id: Some(ingress.turn_id.clone()),
+        classification_json: None,
+        task_route_hint: None,
+        status: crate::RuntimeSessionInputStatus::Running,
+        runtime_commit_cursor: None,
+        attempts: 1,
+        next_attempt_at_ms: 0,
+        claim_owner: Some(ingress.claim_owner.clone()),
+        claim_token: Some(ingress.claim_token.clone()),
+        claim_fence_epoch: Some(ingress.claim_revision),
+        claim_expires_at_ms: Some(crate::tool_invocation::now_ms() + 600_000),
+        failure_class: None,
+        last_error: None,
+        revision: ingress.claim_revision,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        terminal_at_ms: None,
+        runtime_options_json: None,
+        application_receipt: None,
+    }
+}
+
+/// The root graph ends and its bus lease is retired, but the original Session
+/// turn still owes its members an owner. The owner is recovered from the same
+/// claim and the same original turn control, never from a new one.
+#[tokio::test]
+async fn a8_original_session_owner_survives_the_root_bus_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let ingress = a8_original_ingress();
+    let execution_id = crate::session_ingress_graph_id(
+        &ingress.session_id,
+        &ingress.request_id,
+        &ingress.turn_id,
+    );
+    let control = services
+        .create_turn_cancellation_control(&execution_id, &ingress)
+        .expect("original turn control");
+    services.live_execution_store.record_queued(
+        &ingress.session_id,
+        execution_id.clone(),
+        ingress.turn_id.clone(),
+    );
+    let lease = services
+        .bind_active_execution_bus(execution_id.clone(), crate::CowdEventBus::new())
+        .expect("root execution bus");
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let fence = crate::SessionExecutionFence::from_claim(
+        Arc::clone(&port) as Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress.request_id.clone(),
+        ingress.session_id.clone(),
+        ingress.session_generation,
+        ingress.input_sequence as usize,
+        ingress.claim_owner.clone(),
+        ingress.claim_token.clone(),
+    )
+    .expect("durable execution fence");
+    let claim = lease
+        .install_session_fence(
+            &ingress,
+            fence,
+            Arc::clone(&control),
+            crate::SessionInputStream::new(ingress.session_id.clone()),
+            Arc::new(crate::conversation::OriginalTurnInputControl::default()),
+            crate::permissions::PermissionPolicy::new(crate::permissions::PermissionMode::ReadOnly),
+        )
+        .expect("original Session fence");
+    // The root graph ends: its active execution bus lease is retired.
+    drop(lease);
+
+    let recovered = services
+        .recovered_original_conclusion_owner(&ingress.session_id, &ingress.turn_id, &execution_id)
+        .await
+        .expect("the original Session owner is recovered from the original fence");
+    // The recovered owner carries the very claim the ingress installed, so its
+    // claim token is not lost and its commit_wins identity is unchanged.
+    assert!(Arc::ptr_eq(&recovered.claim, &claim));
+    assert_eq!(recovered.claim.session_id(), ingress.session_id);
+    assert_eq!(recovered.claim.turn_id(), ingress.turn_id);
+
+    // Another root execution never inherits that owner.
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            "session-ingress-graph:00000000000000000000000000000000"
+        )
+        .await
+        .is_none());
+    // Another turn of that Session never inherits it either.
+    assert!(services
+        .recovered_original_conclusion_owner(&ingress.session_id, "turn-other", &execution_id)
+        .await
+        .is_none());
+    // A Session without an original fence has no owner to recover.
+    assert!(services
+        .recovered_original_conclusion_owner("session-other", &ingress.turn_id, &execution_id)
+        .await
+        .is_none());
+
+    // A finished original turn keeps no recoverable owner: the Session no
+    // longer holds that turn's live claim.
+    port.set(vec![crate::RuntimeSessionInputRecord {
+        status: crate::RuntimeSessionInputStatus::Completed,
+        claim_expires_at_ms: None,
+        ..a8_live_input_record(&ingress)
+    }]);
+    assert!(services
+        .recovered_original_conclusion_owner(&ingress.session_id, &ingress.turn_id, &execution_id)
+        .await
+        .is_none());
+
+    // The original turn's own cancellation still refuses the recovery.
+    port.set(vec![a8_live_input_record(&ingress)]);
+    control.signal_operational();
+    assert!(services
+        .recovered_original_conclusion_owner(&ingress.session_id, &ingress.turn_id, &execution_id)
+        .await
+        .is_none());
+}
+
+/// Install one original Session fence on a fresh root execution bus.
+fn a8_install_session_fence(
+    services: &RuntimeServices,
+    port: &Arc<A8SessionQueryPort>,
+    ingress: &crate::TurnIngressRef,
+) -> Arc<crate::execution_core::services::OriginalSessionClaim> {
+    let execution_id = crate::session_ingress_graph_id(
+        &ingress.session_id,
+        &ingress.request_id,
+        &ingress.turn_id,
+    );
+    let control = services
+        .create_turn_cancellation_control(&execution_id, ingress)
+        .expect("original turn control");
+    services.live_execution_store.record_queued(
+        &ingress.session_id,
+        execution_id.clone(),
+        ingress.turn_id.clone(),
+    );
+    let lease = services
+        .bind_active_execution_bus(execution_id.clone(), crate::CowdEventBus::new())
+        .expect("root execution bus");
+    let fence = crate::SessionExecutionFence::from_claim(
+        Arc::clone(port) as Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress.request_id.clone(),
+        ingress.session_id.clone(),
+        ingress.session_generation,
+        ingress.input_sequence as usize,
+        ingress.claim_owner.clone(),
+        ingress.claim_token.clone(),
+    )
+    .expect("durable execution fence");
+    let claim = lease
+        .install_session_fence(
+            ingress,
+            fence,
+            Arc::clone(&control),
+            crate::SessionInputStream::new(ingress.session_id.clone()),
+            Arc::new(crate::conversation::OriginalTurnInputControl::default()),
+            crate::permissions::PermissionPolicy::new(crate::permissions::PermissionMode::ReadOnly),
+        )
+        .expect("original Session fence");
+    // The root graph ends: its active execution bus lease is retired.
+    drop(lease);
+    claim
+}
+
+/// The retained original Session owner is released by identity.
+///
+/// The next turn for the same Session replaces the retained entry. A release
+/// that belongs to the previous turn must not remove the new turn's owner.
+#[tokio::test]
+async fn a8_retained_owner_release_is_identity_qualified() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let first = a8_original_ingress();
+    let second = crate::TurnIngressRef {
+        request_id: "request-b8".into(),
+        turn_id: "turn-b8".into(),
+        message_id: "message-b8".into(),
+        session_generation: 5,
+        input_sequence: 10,
+        claim_token: "claim-token-b8".into(),
+        claim_revision: 3,
+        ..first.clone()
+    };
+    let port = A8SessionQueryPort::new(vec![
+        a8_live_input_record(&first),
+        a8_live_input_record(&second),
+    ]);
+    let first_claim = a8_install_session_fence(&services, &port, &first);
+    let second_claim = a8_install_session_fence(&services, &port, &second);
+    let second_execution_id = crate::session_ingress_graph_id(
+        &second.session_id,
+        &second.request_id,
+        &second.turn_id,
+    );
+
+    // The previous turn releases its owner. The retained entry now belongs to
+    // the new turn, so that owner must survive.
+    services.release_original_session_owner(&first.session_id, &first_claim);
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &second.session_id,
+            &second.turn_id,
+            &second_execution_id
+        )
+        .await
+        .is_some());
+
+    // The new turn releases its own owner, and that owner is gone.
+    services.release_original_session_owner(&second.session_id, &second_claim);
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &second.session_id,
+            &second.turn_id,
+            &second_execution_id
+        )
+        .await
+        .is_none());
+}

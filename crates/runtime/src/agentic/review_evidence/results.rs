@@ -1885,7 +1885,17 @@ pub(super) fn pin_result_source_with_reader(
         .stream_revision(source)
         .map_err(|error| error.to_string())?;
     if let Some(previous) = cuts.insert(source.to_string(), revision) {
-        if previous != revision {
+        // A head that moved backwards is a truncated or replaced stream, and
+        // growth on any source this review judges is the object under review
+        // moving. Only growth on a shared aggregate stream is another actor
+        // appending while this review reads, which leaves the pinned window
+        // unchanged.
+        if revision < previous {
+            return Err(format!(
+                "result metadata source moved backwards during resolution; rebuild the review; source={source} expected={previous} actual={revision} phase=result_source_pin"
+            ));
+        }
+        if revision != previous && !super::repin_accepts_moved_head(source, previous, revision) {
             return Err(format!(
                 "result metadata source changed during resolution; rebuild the review; source={source} expected={previous} actual={revision} phase=result_source_pin"
             ));
@@ -1927,7 +1937,7 @@ pub(super) fn result_source_events_at_session_cut(
     historical_cut: u64, authenticated_head: u64,
 ) -> Result<Vec<DurableRuntimeEvent>, String> {
     if !source.starts_with("session:") || historical_cut > authenticated_head
-        || pin_result_source(store, source, cuts)? != authenticated_head {
+        || pin_result_source(store, source, cuts)? < authenticated_head {
         return Err("original Session material cut or current head differs".into());
     }
     let mut after = 0;
@@ -1943,8 +1953,11 @@ pub(super) fn result_source_events_at_session_cut(
             events.push(event);
         }
     }
-    if pin_result_source(store, source, cuts)? != authenticated_head {
-        return Err("current Session head changed while reading original material".into());
+    // The authenticated head is a cut point that must still exist. Another
+    // actor appending to the Session while this review reads leaves it valid;
+    // a head below it means the cut was truncated away.
+    if pin_result_source(store, source, cuts)? < authenticated_head {
+        return Err("current Session head moved backwards while reading original material".into());
     }
     Ok(events)
 }
@@ -2061,6 +2074,48 @@ fn authenticate_callback_parent_chain(
         }
         execution = parent.execution_id;
     }
+}
+
+/// The original input of the read a receipt belongs to, when the Session
+/// stream still carries the governed plan of that read.
+///
+/// The plan task is the only durable carrier of that input, and the receipt's
+/// own `replay.payload_digest` is the canonical digest of it - the same
+/// binding `original_tool_primary_and_index` uses when it authenticates a
+/// primary receipt against its plan. The task is therefore selected by
+/// digest, never guessed: a receipt whose plan task is absent, ambiguous or
+/// unreadable yields no input rather than an assumed one.
+pub(super) fn original_read_input<'events>(
+    session_events: &'events [crate::DurableRuntimeEvent],
+    primary: &crate::DurableRuntimeEvent,
+) -> Option<&'events serde_json::Value> {
+    let digest = primary.payload["replay"]["payload_digest"].as_str()?;
+    let call_id = primary.payload["tool_use_id"].as_str()?;
+    let tool_name = primary.payload["tool_name"].as_str()?;
+    let mut selected = None;
+    for plan in session_events
+        .iter()
+        .filter(|plan| plan.kind == "tool.execution_plan.created")
+    {
+        for task in plan.payload["tasks"].as_array().into_iter().flatten() {
+            if task["tool_call_id"] != call_id || task["tool_name"] != tool_name {
+                continue;
+            }
+            let Ok(candidate) =
+                harness_contract::step::canonical_digest("tool-effect-payload", &task["normalized_input"])
+            else {
+                continue;
+            };
+            if candidate != digest {
+                continue;
+            }
+            if selected.is_some() {
+                return None;
+            }
+            selected = Some(&task["normalized_input"]);
+        }
+    }
+    selected
 }
 
 pub(super) fn result_tool_plan<'events>(
@@ -3011,6 +3066,36 @@ fn publication_sources(
     Ok((programs, publications))
 }
 
+/// The business claim generation is one ahead of the dispatch generation of
+/// the attempt that holds the claim - the same named equation as
+/// `work_market::claim_generation_matches_its_attempt` and the Execute branch
+/// of the actor admission. The dispatch action is the only writer of that
+/// generation and it is durable in the program stream; `packet.attempt` is
+/// the physical attempt of the producer graph, a different namespace, so
+/// comparing the two directly refused every re-dispatched Task's artifact.
+/// A call whose dispatch record cannot be found is refused: the alignment
+/// fact is missing, never assumed.
+fn claim_generation_matches_its_dispatch(
+    publications: &[crate::DurableRuntimeEvent],
+    execution: &str,
+    generation: u64,
+) -> bool {
+    use harness_contract::agent_action::{AgentAction, AgentActionEnvelope};
+    publications.iter().any(|event| {
+        if event.kind != "agentic.action_applied" {
+            return false;
+        }
+        let Ok(envelope) = serde_json::from_value::<AgentActionEnvelope>(
+            event.payload["envelope"].clone(),
+        ) else {
+            return false;
+        };
+        matches!(&envelope.action, AgentAction::TaskAttemptDispatch(input)
+            if input.execution_id == execution
+                && u64::from(input.generation).checked_add(1) == Some(generation))
+    })
+}
+
 fn original_artifact_publication(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -3101,6 +3186,9 @@ fn original_artifact_publication(
             .agentic_binding
             .as_ref()
             .ok_or("result producer packet has no Program binding")?;
+        // The artifact's own claim execution: the dispatch that produced it is
+        // the durable writer of the generation this judgment aligns against.
+        let claim_execution = artifact.claim_execution_id.as_deref().unwrap_or_default();
         if scope.program_id != owner.program_id
             || Some(scope.agent_id.as_str()) != owner.agent_id.as_deref()
             || owner.actor_id != scope.agent_id
@@ -3112,7 +3200,9 @@ fn original_artifact_publication(
                 })
             || artifact
                 .claim_generation
-                .is_some_and(|generation| generation != u64::from(packet.attempt))
+                .is_some_and(|generation| {
+                    !claim_generation_matches_its_dispatch(publications, claim_execution, generation)
+                })
         {
             return Err(
                 "result publication does not match its original physical packet/claim".into(),
@@ -5077,6 +5167,341 @@ mod tests {
         }
     }
 
+
+    /// The #17 re-dispatch shape, judged on the durable dispatch record.
+    ///
+    /// A re-dispatched Task keeps publishing its artifact under the execution
+    /// that produced it: the business claim generation is one ahead of the
+    /// dispatch generation that authorized the claim, while the producer
+    /// packet's physical attempt stays 1. Judging those two namespaces
+    /// against each other refused every such artifact, so the alignment is
+    /// read from the dispatch action - the only writer of that generation,
+    /// durable in the same Program stream this judgment already holds. A
+    /// claim whose dispatch record cannot be found is refused, and a refused
+    /// judgment writes nothing durable.
+    #[test]
+    fn a1_claim_generation_aligns_with_the_dispatch_that_produced_the_artifact() {
+        use harness_contract::agent::{AgenticExecutionBinding, AgenticExecutionFocus};
+        use harness_contract::agent::{
+            AgentBindingSnapshot, AgentCapability, AgentDataLease, AgentDefinitionId,
+            AgentDefinitionRevisionRef, AgentExecutorPolicy, AgentInstanceRef, AgentModelPolicy,
+            CognitiveReadScope, CognitiveWriteMode,
+        };
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionEnvelope, AgentActorKind, AgentAttemptMode,
+            ArtifactCommitInput, OriginalAgentExecution, TaskAttemptDispatchInput,
+        };
+        use harness_contract::context::ChildExecutionBudgetReservation;
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+        };
+
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let program_id = "a1-program";
+        let session = "a1-session";
+        let turn = "a1-turn";
+        let graph_id = "a1-graph";
+        let node_id = "a1-node";
+        let run_id = "run:a1-graph";
+        let worker = "a1-worker";
+        let task_ref = "task:a1";
+        let artifact_ref = "artifact:a1-result";
+        let content_ref = "artifact://a1-content";
+        let program_stream = format!("agentic-program:{program_id}");
+        let readers = || super::super::ResultContentReaders {
+            artifacts: None,
+            history: None,
+            process_inputs: None,
+        };
+        let content = ArtifactRef::durable(
+            content_ref,
+            "sha256:a1",
+            3,
+            "text/plain",
+            format!("session:{session}"),
+        );
+
+        // The physical producer: one AgentTask node of one registered graph,
+        // bound to the Program that published the artifact. Its attempt stays
+        // 1 across every re-dispatch of the Task.
+        let mut packet = AgentTaskPacket {
+            assignment: crate::test_support::agent_assignment(
+                None,
+                worker,
+                run_id,
+                task_ref,
+                session,
+                "mission:a1",
+                Some("team:a1"),
+                graph_id,
+                node_id,
+            ),
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: "Read the original content".into(),
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            acceptance: Vec::new(),
+            cohort_prompt_package: None,
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            policy_revision: 1,
+            model_lease: "fixture".into(),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "a1-budget",
+                worker,
+                task_ref,
+                1024,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "a1-packet".into(),
+            agentic_binding: None,
+        };
+        packet.agentic_binding = Some(AgenticExecutionBinding {
+            program_id: program_id.into(),
+            agent_id: worker.into(),
+            membership_id: "membership:a1".into(),
+            team_id: "team:a1".into(),
+            task_team_id: "team:a1".into(),
+            source_spec_revision: 1,
+            task_purpose: None,
+            focus: AgenticExecutionFocus::TaskExecute {
+                task_ref: task_ref.into(),
+            },
+        });
+        // The packet carries the binding Runtime compiled for it: the producer
+        // judgment refuses an unbound packet, and the digest is the one
+        // Runtime recomputes from the snapshot itself.
+        let mut binding = AgentBindingSnapshot {
+            binding_id: format!("binding:{worker}"),
+            definition_ref: AgentDefinitionRevisionRef {
+                definition_id: AgentDefinitionId::new(
+                    harness_contract::agent::DefinitionScope::Builtin,
+                    "cowd/test-agent",
+                )
+                .unwrap(),
+                revision: 1,
+            },
+            definition_digest: "a".repeat(64),
+            instructions: "# A1\n\nRead the original content.\n".to_string(),
+            instance: AgentInstanceRef {
+                instance_id: format!("instance:{worker}"),
+                role_slot_id: None,
+            },
+            executor: AgentExecutorPolicy::CowdNative,
+            model_policy: AgentModelPolicy {
+                profile: "test".into(),
+                allowed_models: vec!["fast".into()],
+                fallback_allowed: true,
+            },
+            effective_capabilities: vec![AgentCapability::Read],
+            skill_refs: Vec::new(),
+            skill_tool_pins: None,
+            skill_tool_refs: None,
+            tool_contract_refs: Vec::new(),
+            data_lease: AgentDataLease {
+                session_id: session.into(),
+                task_id: task_ref.into(),
+                team_id: Some("team:a1".into()),
+                read_scopes: vec![CognitiveReadScope::Session],
+                write_mode: CognitiveWriteMode::None,
+                fact_boundaries: Vec::new(),
+                fact_refs: Vec::new(),
+                matrix_snapshot_refs: Vec::new(),
+            },
+            release: None,
+            evaluation: None,
+            display: None,
+            binding_digest: String::new(),
+        };
+        binding.binding_digest = crate::agent::binding::recompute_binding_digest(&binding)
+            .expect("the fixture binding digest recomputes");
+        packet.binding = Some(binding);
+        let mut graph = ExecutionGraph::new("A1 producer graph");
+        graph.id = graph_id.into();
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: session.into(),
+            turn_id: turn.into(),
+            root_task_id: task_ref.into(),
+            task_id: task_ref.into(),
+            generation: 1,
+        });
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent_task",
+            serde_json::to_string(&packet).unwrap(),
+        );
+        node.id = node_id.into();
+        graph.nodes.push(node);
+        crate::ExecutionCommitService::new(std::sync::Arc::clone(&store))
+            .register_graph(graph)
+            .unwrap();
+
+        let worker_actor = AgentActorBinding {
+            original_execution: Some(OriginalAgentExecution {
+                graph_id: graph_id.into(),
+                node_id: node_id.into(),
+                attempt: 1,
+            }),
+            objective_id: "a1-objective".into(),
+            program_id: program_id.into(),
+            session_id: session.into(),
+            turn_id: turn.into(),
+            root_execution_id: Some("a1-root".into()),
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: "A1 fixture".into(),
+            model_lease: "fixture".into(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: Vec::new(),
+            actor_id: worker.into(),
+            kind: AgentActorKind::Agent,
+            execution_id: Some(graph_id.into()),
+            team_id: Some("team:a1".into()),
+            agent_id: Some(worker.into()),
+        };
+        let append_action = |action_id: &str,
+                            actor: &AgentActorBinding,
+                            action: AgentAction,
+                            entity_ref: Option<&str>| {
+            let mut payload = serde_json::Map::new();
+            payload.insert(
+                "envelope".into(),
+                serde_json::to_value(&AgentActionEnvelope {
+                    action_id: action_id.into(),
+                    actor: actor.clone(),
+                    expected_revision: None,
+                    action,
+                })
+                .unwrap(),
+            );
+            if let Some(entity_ref) = entity_ref {
+                payload.insert("entity_ref".into(), entity_ref.into());
+            }
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: program_stream.clone(),
+                    scope: crate::RuntimeEventScope::Program,
+                    kind: "agentic.action_applied".into(),
+                    status: Some("applied".into()),
+                    actor: Some(actor.actor_id.clone()),
+                    refs: Vec::new(),
+                    payload: serde_json::Value::Object(payload),
+                })
+                .unwrap()
+        };
+        append_action(
+            "a1-commit",
+            &worker_actor,
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: content_ref.into(),
+                kind: "report".into(),
+                title: "A1 result".into(),
+                relates_to: Vec::new(),
+            }),
+            Some(artifact_ref),
+        );
+        let mut supervisor = worker_actor.clone();
+        supervisor.actor_id = "runtime.program-supervisor".into();
+        supervisor.kind = AgentActorKind::Supervisor;
+        supervisor.execution_id = Some(graph_id.into());
+        supervisor.agent_id = None;
+        supervisor.team_id = None;
+        supervisor.original_execution = None;
+        append_action(
+            "a1-dispatch",
+            &supervisor,
+            AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                task_ref: task_ref.into(),
+                execution_id: graph_id.into(),
+                agent_ref: worker.into(),
+                membership_id: "membership:a1".into(),
+                mode: AgentAttemptMode::Execute,
+                generation: 1,
+            }),
+            None,
+        );
+
+        let revision = store.stream_revision(&program_stream).unwrap();
+        let mut program = AgenticProgramProjection::empty(program_id, "a1-objective");
+        program.session_id = session.into();
+        program.turn_id = turn.into();
+        program.root_execution_id = Some("a1-root".into());
+        program.revision = revision;
+        program.artifacts.insert(
+            artifact_ref.into(),
+            crate::agentic::program::AgenticArtifactProjection {
+                artifact_ref: artifact_ref.into(),
+                content_ref: content_ref.into(),
+                kind: "report".into(),
+                title: "A1 result".into(),
+                relates_to: Vec::new(),
+                committed_by: worker.into(),
+                claim_execution_id: Some(graph_id.into()),
+                claim_generation: Some(2),
+            },
+        );
+
+        // Positive: the claim generation is one ahead of the dispatch
+        // generation that authorized it, under a producer packet whose
+        // physical attempt is 1.
+        let resolved =
+            resolve_result_metadata(&store, &program, artifact_ref, &content, None, readers())
+                .expect("the re-dispatched Task's artifact must pass on the dispatch equation");
+        assert_eq!(resolved.producers.len(), 1);
+        assert_eq!(resolved.producers[0].actor, worker);
+        assert_eq!(resolved.producers[0].execution, format!("agent-run:{run_id}"));
+
+        // Negative: a generation the dispatch did not authorize is refused.
+        // Generation 1 is the value the retired raw comparison accepted, so
+        // this also proves the judgment did not simply stop checking.
+        for generation in [1_u64, 3] {
+            let mut wrong = program.clone();
+            wrong
+                .artifacts
+                .get_mut(artifact_ref)
+                .unwrap()
+                .claim_generation = Some(generation);
+            assert_eq!(
+                resolve_result_metadata(&store, &wrong, artifact_ref, &content, None, readers())
+                    .err()
+                    .expect("a claim generation the dispatch did not authorize must be rejected"),
+                "result publication does not match its original physical packet/claim",
+                "claim generation {generation} must be rejected"
+            );
+        }
+
+        // Negative: an execution the Program stream holds no dispatch record
+        // for is refused fail-closed...
+        let mut foreign = program.clone();
+        foreign
+            .artifacts
+            .get_mut(artifact_ref)
+            .unwrap()
+            .claim_execution_id = Some("a1-foreign-graph".into());
+        assert_eq!(
+            resolve_result_metadata(&store, &foreign, artifact_ref, &content, None, readers())
+                .err()
+                .expect("a claim execution with no dispatch record must be rejected"),
+            "result publication does not match its original physical packet/claim"
+        );
+        // ...and the refusal leaves the Program stream exactly as it was: no
+        // receipt, no settlement, nothing durable.
+        assert_eq!(
+            store.stream_revision(&program_stream).unwrap(),
+            revision,
+            "a refused publication must not write a receipt"
+        );
+    }
 
     #[tokio::test]
     async fn r1_proof_effect_metadata_independently_recovers_original_result_producers() {

@@ -1652,6 +1652,30 @@ fn packet_identity_matches(
     }
 }
 
+/// The two shared aggregate streams a review reads while other actors keep
+/// appending to them: the reviewed Session stream, and the physical lineage
+/// stream of the reviewed graph. Both are append-only and every event in them
+/// is located by sequence, so an append that lands while this review reads
+/// does not change the material it already pinned. The prefixes are the ones
+/// the product already classifies by (`results.rs` Session cuts,
+/// `execution_core/graph/commit_pipeline.rs` lineage stream ids); no new
+/// classification dimension is introduced.
+fn source_grows_during_review(source: &str) -> bool {
+    source.starts_with("session:") || source.starts_with("execution-lineage:")
+}
+
+/// Whether re-pinning a source inside one review resolution may accept a head
+/// that moved.
+///
+/// Only growth on a shared aggregate stream is admissible. A head that moved
+/// backwards means the stream was truncated or replaced, so the material the
+/// review already read may no longer be there; growth on any other source
+/// means the object under review itself moved. Both still refuse - this
+/// decides nothing about content, identity or authority.
+pub(crate) fn repin_accepts_moved_head(source: &str, previous: u64, revision: u64) -> bool {
+    revision > previous && source_grows_during_review(source)
+}
+
 /// Why a TaskReview-scoped physical attempt cannot validate this review.
 ///
 /// Returns the specific reason, or `Ok(())` when every condition holds. The

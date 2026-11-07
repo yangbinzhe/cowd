@@ -300,3 +300,45 @@ fn a_spelling_variant_normalizes_before_the_routing_decision() {
         );
     }
 }
+
+/// U: a failed joined call carries the per-operation facts it produced.
+///
+/// Before this, a failure carried no fact at all, so a reader could not tell
+/// "nothing was sent" from "we cannot prove it". The facts are copied out of
+/// the trace exactly as the host recorded them: no operation is invented,
+/// dropped or rewritten, and the call still fails.
+#[tokio::test]
+async fn u_failed_joined_call_carries_the_operations_it_produced() {
+    let _guard = crate::test_process_environment_lock().lock().unwrap();
+    let _environment = NetworkEnv(std::env::var_os("COWD_ALLOW_PRIVATE_NETWORK"));
+    std::env::set_var("COWD_ALLOW_PRIVATE_NETWORK", "1");
+    // The response declares more bytes than it sends, so the joined call
+    // fails after the request was taken.
+    let (endpoint, worker) = server("ok", 20, std::time::Duration::ZERO);
+    let input = serde_json::json!({"url":endpoint,"prompt":"read"});
+    let (lease, authorization, binding) = fixture(&input);
+    let error = lease
+        .execute_joined_local_network(
+            &authorization,
+            "web_fetch",
+            &input.to_string(),
+            binding,
+            "801-session",
+            &origin(),
+        )
+        .await
+        .expect_err("the broken response fails");
+    let fact = error
+        .local_network_fact()
+        .expect("the failure carries the facts it produced");
+    assert!(fact.host_joined);
+    assert!(fact.coverage_complete);
+    assert_eq!(fact.operations.len(), 1);
+    // The operation is reported as it was recorded: the request was taken and
+    // the outcome is unknown. Nothing is rewritten into "not sent".
+    assert!(matches!(
+        fact.operations[0].terminal,
+        LocalNetworkTerminal::Unknown { .. }
+    ));
+    worker.join().unwrap();
+}

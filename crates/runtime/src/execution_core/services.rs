@@ -1684,6 +1684,11 @@ pub struct RuntimeServices {
     session_journal_port: OnceLock<Arc<dyn crate::SessionRuntimeJournalPort>>,
     session_application_port: OnceLock<Arc<dyn crate::SessionRuntimeApplicationPort>>,
     active_execution_buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
+    /// The original Session owner parts per Session, retained after the root
+    /// execution bus lease is retired. This index holds the very claim and
+    /// control that `install_session_fence` took from the original ingress;
+    /// it is not a second authority source and it never mints an owner.
+    original_session_owners: Arc<Mutex<BTreeMap<String, OriginalSessionOwnerParts>>>,
     session_execution_policy_controls:
         Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
     session_execution_policy_admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
@@ -1725,6 +1730,12 @@ impl OriginalSessionClaim {
     pub(crate) fn session_id(&self) -> &str { &self.ingress.session_id }
     pub(crate) fn message_id(&self) -> &str { &self.ingress.message_id }
     pub(crate) fn turn_id(&self) -> &str { &self.ingress.turn_id }
+    pub(crate) fn request_id(&self) -> &str { &self.ingress.request_id }
+    /// The identity of one original Session claim: the Session, the turn and
+    /// the ingress request that carried it.
+    pub(crate) fn identity(&self) -> (&str, &str, &str) {
+        (&self.ingress.session_id, &self.ingress.turn_id, &self.ingress.request_id)
+    }
     pub(crate) fn fence(&self) -> Result<session::SessionTerminalExecutionFence, String> {
         Ok(session::SessionTerminalExecutionFence {
             request_id: self.ingress.request_id.clone(),
@@ -1769,6 +1780,24 @@ impl ActiveSessionFence {
     }
 }
 
+/// The original Session owner handles that one root ingress installed.
+///
+/// These are the very handles the original ingress took: the same durable
+/// claim (with its claim token) and the same original turn control. Keeping
+/// them reachable after the root execution bus lease is retired lets a member
+/// that outlives the root graph recover the equivalent owner instead of
+/// losing it. Nothing here is minted: a missing or cancelled original turn
+/// simply has no owner to recover.
+#[derive(Clone)]
+struct OriginalSessionOwnerParts {
+    fence: crate::SessionExecutionFence,
+    root_control: Arc<TurnCancellationControl>,
+    claim: Arc<OriginalSessionClaim>,
+    input: crate::SessionInputStream,
+    requested: Arc<crate::conversation::OriginalTurnInputControl>,
+    policy: crate::permissions::PermissionPolicy,
+}
+
 /// Original active turn owners used by a Program conclusion. These handles
 /// are taken from the active ingress registry, never reconstructed from a
 /// Program projection. The commit control is registered with both original
@@ -1786,6 +1815,10 @@ pub(crate) struct OriginalTerminalCommitOwner {
     store: std::sync::Weak<RuntimeEventStore>,
     policy_controls: Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
     admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
+    /// The retained original Session owner parts. The original turn is over
+    /// once its terminal custody is released, so that release also closes the
+    /// recovery window for this Session.
+    session_owners: std::sync::Weak<Mutex<BTreeMap<String, OriginalSessionOwnerParts>>>,
     owner: OriginalConclusionOwner,
     ticket: crate::execution_core::graph::NodeExecutionTicket,
     terminal: Mutex<OriginalTerminalClosureState>,
@@ -1864,6 +1897,21 @@ impl OriginalTerminalCommitOwner {
         }
         terminal.event = None;
         terminal.released = true;
+        drop(terminal);
+        // The original turn has closed its Session terminal: the recovery
+        // window for that Session ends with it.
+        if let Some(session_owners) = self.session_owners.upgrade() {
+            let mut owners = session_owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = self.owner.claim.session_id();
+            if owners
+                .get(session_id)
+                .is_some_and(|parts| parts.claim.identity() == self.owner.claim.identity())
+            {
+                owners.remove(session_id);
+            }
+        }
         Ok(())
     }
 
@@ -1950,6 +1998,10 @@ pub(crate) struct ActiveExecutionBusLease {
     generation: u64,
     bus: crate::CowdEventBus,
     buses: Arc<Mutex<BTreeMap<String, ActiveExecutionBus>>>,
+    /// Session-scoped index of the original Session owner parts this Runtime
+    /// installed. It keeps the original claim reachable after the root bus
+    /// lease is retired, without keeping the root bus itself alive.
+    session_owners: Arc<Mutex<BTreeMap<String, OriginalSessionOwnerParts>>>,
 }
 
 impl ActiveExecutionBusLease {
@@ -1980,9 +2032,29 @@ impl ActiveExecutionBusLease {
         let claim = Arc::new(OriginalSessionClaim { ingress: ingress.clone() });
         claim.fence()?;
         active.session_fence = Some(ActiveSessionFence {
-            session_id: ingress.session_id.clone(), turn_id: ingress.turn_id.clone(), fence, root_control,
-            claim: Arc::clone(&claim), input, control_requested, original_policy, original_policy_owner: None,
+            session_id: ingress.session_id.clone(), turn_id: ingress.turn_id.clone(), fence: fence.clone(),
+            root_control: Arc::clone(&root_control),
+            claim: Arc::clone(&claim), input: input.clone(), control_requested: Arc::clone(&control_requested),
+            original_policy: original_policy.clone(), original_policy_owner: None,
         });
+        // The root bus lease is retired when the root graph ends, but the
+        // original Session turn may still owe its members an owner. Keep the
+        // very handles this ingress installed reachable by Session, so the
+        // owner can be recovered instead of being minted again.
+        self.session_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                ingress.session_id.clone(),
+                OriginalSessionOwnerParts {
+                    fence: fence.clone(),
+                    root_control: Arc::clone(&root_control),
+                    claim: Arc::clone(&claim),
+                    input: input.clone(),
+                    requested: Arc::clone(&control_requested),
+                    policy: original_policy.clone(),
+                },
+            );
         Ok(claim)
     }
 
@@ -2689,6 +2761,7 @@ impl RuntimeServices {
             session_journal_port: OnceLock::new(),
             session_application_port: OnceLock::new(),
             active_execution_buses: Arc::new(Mutex::new(BTreeMap::new())),
+            original_session_owners: Arc::new(Mutex::new(BTreeMap::new())),
             session_execution_policy_controls,
             session_execution_policy_admission_blocks,
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
@@ -4103,6 +4176,7 @@ impl RuntimeServices {
             generation,
             bus,
             buses: Arc::clone(&self.active_execution_buses),
+            session_owners: Arc::clone(&self.original_session_owners),
         })
     }
 
@@ -4211,6 +4285,7 @@ impl RuntimeServices {
             store: Arc::downgrade(&self.event_store),
             policy_controls: Arc::clone(&self.session_execution_policy_controls),
             admission_blocks: Arc::clone(&self.session_execution_policy_admission_blocks),
+            session_owners: Arc::downgrade(&self.original_session_owners),
             owner, ticket: ticket.clone(), terminal: Mutex::new(OriginalTerminalClosureState::default()),
         }))
     }
@@ -4280,6 +4355,94 @@ impl RuntimeServices {
         let control = root_control.token().member_commit_control();
         requested.register(&control);
         Some(OriginalConclusionOwner { claim, input, control, policy: active.original_policy.clone() })
+    }
+
+    /// Recover the equivalent original Session owner after the root graph has
+    /// ended and its active bus lease has been retired.
+    ///
+    /// The recovered owner is the one the original ingress installed: the same
+    /// durable claim (with its claim token) and the same original turn
+    /// control. Nothing is minted here, so the recovered owner keeps its
+    /// commit_wins participation and its cancellation participation. The
+    /// original turn's own cancellation still decides: a cancelled Session
+    /// turn never regains a delegated owner.
+    pub(crate) async fn recovered_original_conclusion_owner(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        root_execution_id: &str,
+    ) -> Option<OriginalConclusionOwner> {
+        let parts = self
+            .original_session_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()?;
+        let OriginalSessionOwnerParts { fence, root_control, claim, input, requested, policy } = parts;
+        if claim.session_id() != session_id || claim.turn_id() != turn_id {
+            return None;
+        }
+        // The Program's root execution must be the very root ingress that
+        // installed this fence. A recovered owner never widens the lineage.
+        let fence_root_execution_id = crate::session_ingress_graph_id(
+            claim.session_id(),
+            claim.request_id(),
+            claim.turn_id(),
+        );
+        if root_execution_id != fence_root_execution_id {
+            return None;
+        }
+        // The original turn's own cancellation still decides: a cancelled
+        // Session turn never regains a delegated owner, and that turn is over.
+        if root_control.is_cancelled() {
+            self.release_original_session_owner(session_id, &claim);
+            return None;
+        }
+        // The original Session must still hold this turn's live claim. That
+        // durable fact is what says the original turn is still active: the
+        // Session keeps its root claim Running until the terminal ACK, and a
+        // finished, cancelled or superseded turn no longer owns it. An
+        // unreadable fact is not permission to write.
+        if fence
+            .verify(crate::SessionExecutionFencePhase::ToolCommit)
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        let control = root_control.token().member_commit_control();
+        requested.register(&control);
+        Some(OriginalConclusionOwner {
+            claim,
+            input,
+            control,
+            policy,
+        })
+    }
+
+    /// Drop the retained original Session owner parts for one Session.
+    ///
+    /// The recovery window ends with the original turn: a finished turn keeps
+    /// no owner that a later member could recover.
+    ///
+    /// The removal is identity qualified. The next turn for the same Session
+    /// replaces the retained entry, and a release that belongs to the
+    /// previous turn must not remove the new turn's owner.
+    pub(crate) fn release_original_session_owner(
+        &self,
+        session_id: &str,
+        claim: &OriginalSessionClaim,
+    ) {
+        let mut owners = self
+            .original_session_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if owners
+            .get(session_id)
+            .is_some_and(|parts| parts.claim.identity() == claim.identity())
+        {
+            owners.remove(session_id);
+        }
     }
 
     pub(crate) fn with_conclusion_policy<T>(

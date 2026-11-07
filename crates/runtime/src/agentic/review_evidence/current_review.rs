@@ -775,15 +775,19 @@ pub(crate) fn authenticate_original_member_lease_transition(
     let key = index.payload["program_event_key"].as_str().ok_or("member lease original action key missing")?;
     let action = store.event_by_idempotency_key(program, key).map_err(|e| e.to_string())?
         .ok_or("member lease original action missing")?;
+    // The member admission facts are read back from the same-source batch
+    // payload the action event keeps.
+    let action_payload = crate::step_snapshot::rebuild_member_admission_payload(&action.payload)?;
+    let action_payload: &serde_json::Value = &action_payload;
     if action.scope != crate::RuntimeEventScope::Program || action.schema_version != 1
         || !matches!(action.kind.as_str(), "agentic.action_applied" | "agentic.action_rejected")
         || action.transaction_id != receipt.transaction_id || action.commit_cursor != receipt.commit_cursor
         || receipt.event_ids.get(action.transaction_index as usize) != Some(&action.event_id)
         || index.payload["program_event_index"].as_u64() != Some(u64::from(action.transaction_index))
         || index.payload["program_event_kind"].as_str() != Some(action.kind.as_str())
-        || action.payload["envelope"]["action_id"] != format!("{outer}:{ordinal}")
-        || action.payload["member_admission"]["prepared"]["identity"] != identity
-        || action.payload["member_admission"]["ticket"] != index.payload["ticket"] {
+        || action_payload["envelope"]["action_id"] != format!("{outer}:{ordinal}")
+        || action_payload["member_admission"]["prepared"]["identity"] != identity
+        || action_payload["member_admission"]["ticket"] != index.payload["ticket"] {
         return Err("member lease original Program action differs".into());
     }
     Ok(AuthenticatedMemberLeaseTransition { transaction: receipt, action, index, transition: transition.clone() })
@@ -995,10 +999,17 @@ pub(crate) fn authenticate_completed_process_review(
         || observation.duplicate || observation.error.is_some() {
         return Err("completed review original observation differs".into());
     }
-    for (source, head) in &fences {
-        if store.stream_revision(source).map_err(|error| error.to_string())? != *head {
+    for (source, head) in &mut fences {
+        let current = store.stream_revision(source).map_err(|error| error.to_string())?;
+        if current < *head
+            || (current != *head && !super::repin_accepts_moved_head(source.as_str(), *head, current))
+        {
             return Err("completed review witness source changed during authentication".into());
         }
+        // The witness fence records the head this authentication observed, so
+        // the commit that follows fences a shared aggregate stream as it
+        // stands rather than as it stood when the review started reading.
+        *head = current;
     }
     Ok(Some(CompletedProcessReviewWitness { request: request.clone(), action, intent, receipt,
         child_ticket: witness.child_ticket, parent_ticket: witness.parent_ticket, packet: packet.clone(), source_fences: fences }))
@@ -1445,6 +1456,10 @@ pub(crate) fn authenticate_original_root_member_review(
     _proof_cuts: &std::collections::BTreeMap<String, u64>,
 ) -> Result<AuthenticatedHistoricalPolicyCall, String> {
     let facts = action.payload.get("member_admission").ok_or("Root member original admission missing")?;
+    // The member admission facts are read back from the same-source batch
+    // payload the action event keeps.
+    let facts = crate::step_snapshot::rebuild_member_admission_facts(facts)?;
+    let facts: &serde_json::Value = &facts;
     let hook = &facts["original_hook"];
     let request: crate::RuntimeToolExecutionRequest = serde_json::from_value(hook["outer_request"].clone())
         .map_err(|_| "Root member original outer request malformed")?;
@@ -1738,7 +1753,8 @@ fn original_checked_member_authority_events(
     action: &crate::DurableRuntimeEvent,
     request: &crate::RuntimeToolExecutionRequest,
 ) -> Result<OriginalCheckedMemberAuthority, String> {
-    let facts = &action.payload["member_admission"];
+    let facts = crate::step_snapshot::rebuild_member_admission_facts(&action.payload["member_admission"])?;
+    let facts: &serde_json::Value = &facts;
     let prepared = &facts["prepared"];
     let outer = prepared["outer_key"].as_str().filter(|value| !value.is_empty())
         .ok_or("member original outer key missing")?;
@@ -1872,7 +1888,8 @@ pub(crate) fn authenticate_original_process_review_assessment(
     let step = request.step_binding.as_ref().ok_or("review assessment Step missing")?;
     if request.tool_name == "agent_action_batch" {
         let authority = original_checked_member_authority_events(store, &completed.action, request)?;
-        let facts = &completed.action.payload["member_admission"];
+        let facts = crate::step_snapshot::rebuild_member_admission_facts(&completed.action.payload["member_admission"])?;
+        let facts: &serde_json::Value = &facts;
         let prepared = &facts["prepared"];
         let hook = &facts["original_hook"];
         let member_auth: harness_contract::tool::ToolExecutionAuthorization = serde_json::from_value(facts["authorization"].clone())

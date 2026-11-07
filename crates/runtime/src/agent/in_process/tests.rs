@@ -2620,7 +2620,17 @@ impl RuntimeExecutionHost for DiscoveryTestHost {
                                     request.tool_name.clone(), request.observation_wave_sequence,
                                 ));
                                 output
-                            }).map_err(|error| error.to_string()),
+                            }).map_err(|error| {
+                                // A failed joined call carries the facts it
+                                // produced; they travel through the same
+                                // observed evidence slot.
+                                if let Some(fact) = error.local_network_fact() {
+                                    typed_observations.push(fact.into_observation(
+                                        request.tool_name.clone(), request.observation_wave_sequence,
+                                    ));
+                                }
+                                error.to_string()
+                            }),
                             _ => Err("local network original Session/Step missing".into()),
                         }
                     } else {

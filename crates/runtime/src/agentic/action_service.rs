@@ -4132,7 +4132,14 @@ impl AgentActionService {
             action_payload["original_single_call"] = facts.clone();
         }
         if let Some(facts) = member.and_then(|context| context.member_call_facts.as_ref()) {
-            action_payload["member_admission"] = facts.clone();
+            // The action event keeps one copy of the persisted batch payload
+            // and one copy of the Step snapshot it carries; every other copy
+            // points at them. The facts a reader rebuilds are byte identical.
+            let mut facts = facts.clone();
+            crate::step_snapshot::dedupe_member_admission_facts(&mut facts).map_err(|error| {
+                AgentActionServiceError::Corrupt(error)
+            })?;
+            action_payload["member_admission"] = facts;
         }
         if let Some(lease_ms) = claim_lease_ms {
             action_payload["claim_lease_ms"] = json!(lease_ms);
@@ -4806,7 +4813,13 @@ impl AgentActionService {
             rejection_payload["original_single_call"] = facts.clone();
         }
         if let Some(facts) = member.and_then(|context| context.member_call_facts.as_ref()) {
-            rejection_payload["member_admission"] = facts.clone();
+            // The rejection event carries the same same-source facts as the
+            // applied one: one batch payload copy, one Step snapshot copy.
+            let mut facts = facts.clone();
+            crate::step_snapshot::dedupe_member_admission_facts(&mut facts).map_err(|error| {
+                AgentActionServiceError::Corrupt(error)
+            })?;
+            rejection_payload["member_admission"] = facts;
         }
         let event = RuntimeTransactionEventInput {
             event: RuntimeEventInput {

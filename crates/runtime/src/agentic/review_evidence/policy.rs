@@ -807,11 +807,15 @@ fn pinned_stream_events_with_cut(
     let revision = store
         .stream_revision(source)
         .map_err(|error| error.to_string())?;
-    if sources
-        .insert(source.into(), revision)
-        .is_some_and(|previous| previous != revision)
-    {
-        return Err("proof source changed during validation".into());
+    if let Some(previous) = sources.insert(source.into(), revision) {
+        // Growth on a shared aggregate stream is another actor appending while
+        // this proof reads; anything else that moved - including a head that
+        // went backwards - is still a change of the source under proof.
+        if revision < previous
+            || (revision != previous && !super::repin_accepts_moved_head(source, previous, revision))
+        {
+            return Err("proof source changed during validation".into());
+        }
     }
     let mut events = Vec::new();
     let mut through = match authenticated_tail {
@@ -828,10 +832,9 @@ fn pinned_stream_events_with_cut(
             }
             break;
         }
-        if store
-            .stream_revision(source)
-            .map_err(|error| error.to_string())?
-            != revision
+        let current = store.stream_revision(source).map_err(|error| error.to_string())?;
+        if current < revision
+            || (current != revision && !super::repin_accepts_moved_head(source, revision, current))
         {
             return Err("proof source changed while paging; retry current inputs".into());
         }
@@ -927,10 +930,9 @@ fn pinned_stream_events_with_cut(
     if matches!(projection, PinnedEventProjection::ReceiptIndexEffects) && through != 0 {
         return Err("receipt-index structural history is incomplete".into());
     }
-    if store
-        .stream_revision(source)
-        .map_err(|error| error.to_string())?
-        != revision
+    let current = store.stream_revision(source).map_err(|error| error.to_string())?;
+    if current < revision
+        || (current != revision && !super::repin_accepts_moved_head(source, revision, current))
     {
         return Err("proof source changed at final page boundary; retry current inputs".into());
     }
@@ -3128,6 +3130,7 @@ fn collect_actual_acquisition(
     program: &AgenticProgramProjection,
     primary: &crate::DurableRuntimeEvent,
     index: &crate::DurableRuntimeEvent,
+    original_input: Option<&serde_json::Value>,
     session_events: &[crate::DurableRuntimeEvent],
     boundary: &super::results::ResultInputBoundary,
     readers: super::ResultContentReaders<'_>,
@@ -3172,7 +3175,7 @@ fn collect_actual_acquisition(
     }
     let seal_value = &primary.payload[READ_ACQUISITION_FIELD];
     if seal_value.is_null() {
-        if !immutable_receipt_without_workspace_extent(primary, &descriptor)? {
+        if !immutable_receipt_without_workspace_extent(primary, &descriptor, original_input)? {
             return Err("proof_actual_input_extent_unsupported: actual read lacks an original physical extent".into());
         }
         let output = primary.payload["outcome"]["output"]
@@ -4329,6 +4332,7 @@ pub(super) fn actual_input_snapshot_for_phase(
                     program,
                     &primary,
                     &event,
+                    super::results::original_read_input(&session_events, &primary),
                     &session_events,
                     boundary,
                     readers,
@@ -4415,6 +4419,7 @@ pub(super) fn actual_input_snapshot_for_phase(
                     program,
                     &primary,
                     &index,
+                    Some(&task["normalized_input"]),
                     &session_events,
                     boundary,
                     readers,
@@ -4738,21 +4743,61 @@ pub(super) fn authenticate_settled_effect(
     Ok(descriptor)
 }
 
+/// Whether the original input of a read addresses the workspace.
+///
+/// The governed read that produced a receipt names what it read, and the
+/// product already classifies model-facing references
+/// (`harness_contract::refs::Address`): `file://` and `dir://` address the
+/// workspace, while `tool://`, `artifact://`, `fact://` and the other record
+/// schemes address durable records that carry no workspace extent. A legacy
+/// bare identifier is resolved by the directory and may name a workspace
+/// path, so it stays on the workspace side. `Ok(None)` means the input names
+/// no reference at all - the read was not a reference read.
+fn original_read_target(input: &serde_json::Value) -> Result<Option<bool>, String> {
+    use harness_contract::refs::Address;
+    let Some(reference) = input.get("reference").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    let address = Address::parse(reference)
+        .map_err(|error| format!("original read reference is not parseable: {error}"))?;
+    Ok(Some(matches!(
+        address,
+        Address::File(_) | Address::Dir(_) | Address::Bare(_)
+    )))
+}
+
 fn immutable_receipt_without_workspace_extent(
     primary: &crate::DurableRuntimeEvent,
     descriptor: &ToolEffectDescriptor,
+    original_input: Option<&serde_json::Value>,
 ) -> Result<bool, String> {
     if !primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null()
         || descriptor.effect_kind != ToolEffectKind::Read
-        || descriptor
-            .scopes
-            .iter()
-            .any(|scope| scope.resource == harness_contract::policy::PermissionResource::File)
         || descriptor.uses_network
         || descriptor.spawns_process
         || descriptor.mutates_packages
         || descriptor.mutates_system
     {
+        return Ok(false);
+    }
+    // What the read actually hit, not what the tool declared: a read whose
+    // original input names a workspace path always needs an acquisition
+    // seal, while a read that named a durable record carries no workspace
+    // extent even though the unified read facade declares a File capability.
+    // When the original input cannot be resolved the declared capability face
+    // still decides, and that fallback is the stricter legacy judgment.
+    let declared_workspace_face = descriptor
+        .scopes
+        .iter()
+        .any(|scope| scope.resource == harness_contract::policy::PermissionResource::File);
+    let read_a_workspace_path = match original_input {
+        Some(input) => match original_read_target(input)? {
+            Some(target) => target,
+            None => declared_workspace_face,
+        },
+        None => declared_workspace_face,
+    };
+    if read_a_workspace_path {
         return Ok(false);
     }
     if primary.payload["outcome"]["status"] != "executed"
@@ -4783,7 +4828,11 @@ pub(super) fn original_material_scope(
             .ok_or("physical material lacks its original governed plan")?;
         let primary = super::results::original_tool_primary(store, event, task, sources)?;
         let descriptor = super::results::receipt_effect_descriptor(&primary)?;
-        if immutable_receipt_without_workspace_extent(&primary, &descriptor)? {
+        if immutable_receipt_without_workspace_extent(
+            &primary,
+            &descriptor,
+            Some(&task["normalized_input"]),
+        )? {
             return Ok(None);
         }
         if !primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
@@ -4831,7 +4880,10 @@ pub(super) fn original_material_scope(
         return Err("physical material primary/index disagree".into());
     }
     let descriptor = super::results::receipt_effect_descriptor(&primary)?;
-    if immutable_receipt_without_workspace_extent(&primary, &descriptor)? {
+    // This branch reaches the primary through the agent receipt stream and
+    // holds no plan task, so the original input cannot be resolved here: the
+    // declared capability face decides, which is the stricter judgment.
+    if immutable_receipt_without_workspace_extent(&primary, &descriptor, None)? {
         return Ok(None);
     }
     if primary.payload["resolved_effect_scope"].is_null() {
@@ -7786,7 +7838,11 @@ mod tests {
     #[test]
     fn pinned_stream_rejects_final_page_boundary_race_then_reads_stable_cut() {
         let store = RuntimeEventStore::for_test();
-        let source = "session:actual-final-page-race";
+        // A source the review itself judges: growth on it is the object under
+        // proof moving, so the fence stays an equality fence. The reviewed
+        // Session stream is a shared aggregate stream and is covered by
+        // `pinned_stream_accepts_shared_aggregate_growth_while_paging`.
+        let source = "agentic-program:actual-final-page-race";
         let append = |store: &RuntimeEventStore| {
             store.append(crate::RuntimeEventInput {
                 stream_id: source.into(), scope: crate::RuntimeEventScope::Session,
@@ -7812,7 +7868,9 @@ mod tests {
     #[test]
     fn pinned_stream_rejects_real_paging_race_then_reads_stable_cut() {
         let store = RuntimeEventStore::for_test();
-        let source = "session:actual-paging-race";
+        // See `pinned_stream_rejects_final_page_boundary_race_then_reads_stable_cut`:
+        // a judged source keeps the equality fence.
+        let source = "agentic-program:actual-paging-race";
         let append = |store: &RuntimeEventStore| {
             store.append(crate::RuntimeEventInput {
                 stream_id: source.into(), scope: crate::RuntimeEventScope::Session,
@@ -7831,6 +7889,389 @@ mod tests {
         pinned_stream_events(&store, source, &mut stable_sources, 0, PinnedEventProjection::Effects)
             .expect("a fresh read after the source stops advancing must succeed");
         assert_eq!(stable_sources[source], 2);
+    }
+
+    /// A reader whose head is scripted, so a re-pin can observe a source that
+    /// grew or moved backwards without a concurrent writer.
+    struct ScriptedHead {
+        heads: std::collections::VecDeque<u64>,
+    }
+    impl super::super::read_source::ReadAuthSource for ScriptedHead {
+        fn stream_revision(&mut self, _: &str) -> Result<u64, String> {
+            Ok(self.heads.pop_front().expect("scripted head"))
+        }
+        fn event_by_idempotency_key(&mut self, _: &str, _: &str)
+            -> Result<Option<crate::DurableRuntimeEvent>, String> {
+            Ok(None)
+        }
+        fn list_stream_after(&mut self, _: &str, _: u64, _: u64, _: usize, _: usize)
+            -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+            Ok(Vec::new())
+        }
+        fn transaction_stream_revision_exact(&mut self, _: &str, _: &str)
+            -> Result<Option<crate::CommittedStreamRevision>, String> {
+            Ok(None)
+        }
+        fn resolve_graph_record(&mut self, _: &crate::DurableRuntimeEvent)
+            -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    /// The re-pin judgment itself. Growth on a shared aggregate stream is
+    /// admissible; a head that moved backwards never is; and a source this
+    /// review judges keeps its equality fence.
+    #[test]
+    fn repin_admits_only_shared_aggregate_growth() {
+        let pin = |reader: &mut ScriptedHead,
+                   source: &str,
+                   cuts: &mut std::collections::BTreeMap<String, u64>| {
+            super::super::results::pin_result_source_with_reader(reader, source, cuts)
+        };
+        let mut session_cuts = std::collections::BTreeMap::new();
+        let mut grown_session = ScriptedHead { heads: [5_u64, 7].into() };
+        assert_eq!(pin(&mut grown_session, "session:one", &mut session_cuts).unwrap(), 5);
+        assert_eq!(pin(&mut grown_session, "session:one", &mut session_cuts).unwrap(), 7);
+        assert_eq!(session_cuts["session:one"], 7);
+
+        let mut lineage_cuts = std::collections::BTreeMap::new();
+        let mut grown_lineage = ScriptedHead { heads: [5_u64, 7].into() };
+        assert_eq!(pin(&mut grown_lineage, "execution-lineage:one", &mut lineage_cuts).unwrap(), 5);
+        assert_eq!(pin(&mut grown_lineage, "execution-lineage:one", &mut lineage_cuts).unwrap(), 7);
+        assert_eq!(lineage_cuts["execution-lineage:one"], 7);
+
+        let mut judged_cuts = std::collections::BTreeMap::new();
+        let mut grown_judged = ScriptedHead { heads: [5_u64, 7].into() };
+        pin(&mut grown_judged, "agentic-program:one", &mut judged_cuts).unwrap();
+        assert_eq!(
+            pin(&mut grown_judged, "agentic-program:one", &mut judged_cuts).unwrap_err(),
+            "result metadata source changed during resolution; rebuild the review; \
+             source=agentic-program:one expected=5 actual=7 phase=result_source_pin"
+        );
+
+        let mut backwards_cuts = std::collections::BTreeMap::new();
+        let mut backwards = ScriptedHead { heads: [5_u64, 3].into() };
+        pin(&mut backwards, "session:one", &mut backwards_cuts).unwrap();
+        let error = pin(&mut backwards, "session:one", &mut backwards_cuts).unwrap_err();
+        assert!(error.contains("phase=result_source_pin"), "{error}");
+        assert!(error.contains("moved backwards"), "{error}");
+        assert!(error.contains("expected=5 actual=3"), "{error}");
+    }
+
+    /// G: the original input a read is judged by is taken from the governed
+    /// plan task the receipt already authenticates, never from a copy.
+    ///
+    /// The receipt carries the canonical digest of that task's normalized
+    /// input, so the task is selected by digest: a receipt whose digest does
+    /// not match selects nothing, and two indistinguishable candidates select
+    /// nothing rather than one of them.
+    #[test]
+    fn g_original_read_input_is_selected_by_the_receipts_own_digest() {
+        let store = RuntimeEventStore::for_test();
+        let plan = |tasks: Vec<serde_json::Value>| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:g-original-input".into(),
+                    scope: crate::RuntimeEventScope::Tool,
+                    kind: "tool.execution_plan.created".into(),
+                    status: Some("planned".into()),
+                    actor: Some("conversation_runtime".into()),
+                    refs: vec![],
+                    payload: serde_json::json!({"plan_id": "g-plan", "tasks": tasks}),
+                })
+                .unwrap()
+        };
+        let task = |call_id: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "tool_call_id": call_id,
+                "tool_name": "read_ref",
+                "normalized_input": input,
+            })
+        };
+        let receipt = |call_id: &str, digest: &str| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "execution-effect:g-original-input".into(),
+                    scope: crate::RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.receipt".into(),
+                    status: Some("completed".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload: serde_json::json!({
+                        "tool_use_id": call_id,
+                        "tool_name": "read_ref",
+                        "replay": {"payload_digest": digest},
+                    }),
+                })
+                .unwrap()
+        };
+        let input = serde_json::json!({"reference": "tool://tool-raw-abc"});
+        let digest = harness_contract::step::canonical_digest("tool-effect-payload", &input).unwrap();
+        let other_digest =
+            harness_contract::step::canonical_digest("tool-effect-payload", &serde_json::json!({"reference": "tool://tool-raw-other"}))
+                .unwrap();
+
+        // The receipt's own digest selects its plan task.
+        let selected = plan(vec![task("g-call", input.clone())]);
+        let primary = receipt("g-call", &digest);
+        assert_eq!(
+            super::super::results::original_read_input(&[selected.clone()], &primary),
+            Some(&input),
+            "the plan task whose digest the receipt carries is the original input"
+        );
+
+        // A receipt that carries another digest selects nothing, so the
+        // judgment falls back to the stricter declared capability face.
+        let foreign = receipt("g-call", &other_digest);
+        assert!(
+            super::super::results::original_read_input(&[selected.clone()], &foreign).is_none(),
+            "a receipt whose digest does not match selects no plan task"
+        );
+
+        // Two indistinguishable candidates select nothing rather than one.
+        let first = plan(vec![task("g-call", input.clone())]);
+        let second = plan(vec![task("g-call", input.clone())]);
+        assert!(
+            super::super::results::original_read_input(&[first, second], &primary).is_none(),
+            "two indistinguishable plan tasks select nothing"
+        );
+
+        // Two candidates that differ are separated by the receipt's digest:
+        // the authenticated one is the original input, not a guess.
+        let first = plan(vec![task("g-call", input.clone())]);
+        let second = plan(vec![task("g-call", serde_json::json!({"reference": "tool://tool-raw-other"}))]);
+        assert_eq!(
+            super::super::results::original_read_input(&[first, second], &primary),
+            Some(&input),
+            "the receipt's digest separates two candidates that differ"
+        );
+    }
+
+    /// G: the read's own original input decides whether that read carries a
+    /// workspace extent, not the capability face the tool declares.
+    ///
+    /// The unified read facade declares a File capability whatever it reads,
+    /// so the declared face refused every durable record a reviewer must
+    /// read. A read whose original input names a workspace path still needs
+    /// an acquisition seal; a read that named a durable record has no
+    /// workspace extent at all.
+    #[test]
+    fn g_read_target_decides_whether_a_read_has_a_workspace_extent() {
+        let store = RuntimeEventStore::for_test();
+        let receipt = |payload: serde_json::Value| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:g-read-target".into(),
+                    scope: crate::RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.receipt".into(),
+                    status: Some("completed".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload,
+                })
+                .unwrap()
+        };
+        let descriptor = |scopes: Vec<harness_contract::policy::PermissionScope>| ToolEffectDescriptor {
+            tool_id: "read_ref".into(),
+            descriptor_hash: "g-read-ref-descriptor".into(),
+            effect_kind: ToolEffectKind::Read,
+            idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+            scopes,
+            required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        };
+        let file_face = vec![harness_contract::policy::PermissionScope {
+            resource: harness_contract::policy::PermissionResource::File,
+            operation: harness_contract::policy::PermissionOperation::Read,
+            target: Some(".".into()),
+        }];
+        let body = serde_json::json!({
+            "outcome": {"status": "executed", "output": "original body"},
+            "outcome_truncated": false,
+        });
+        let record = serde_json::json!({"reference": "tool://tool-raw-abc"});
+        let workspace_file = serde_json::json!({"reference": "file://workspace/report.txt"});
+        let workspace_dir = serde_json::json!({"reference": "dir://workspace"});
+        let bare = serde_json::json!({"reference": "legacy-identifier"});
+        let unknown = serde_json::json!({"reference": "nope://unknown-scheme"});
+
+        // A durable record read through the unified facade: the declared File
+        // capability is not what the read hit, and it has no workspace extent.
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                Some(&record),
+            )
+            .unwrap(),
+            "a read that named a durable record has no workspace extent"
+        );
+        // A workspace path is still a workspace read and still needs the seal.
+        for (target, input) in [
+            ("file://workspace/report.txt", &workspace_file),
+            ("dir://workspace", &workspace_dir),
+        ] {
+            assert!(
+                !super::immutable_receipt_without_workspace_extent(
+                    &receipt(body.clone()),
+                    &descriptor(file_face.clone()),
+                    Some(input),
+                )
+                .unwrap(),
+                "{target} is a workspace read and has no immutable extent"
+            );
+        }
+        // A legacy bare identifier is resolved by the directory and may name
+        // a workspace path, so it stays on the workspace side.
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                Some(&bare),
+            )
+            .unwrap(),
+            "a bare identifier may name a workspace path"
+        );
+        // Without a resolved original input the declared face still decides:
+        // the fallback is the stricter legacy judgment, never a relaxation.
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                None,
+            )
+            .unwrap(),
+            "an unresolved original input keeps the declared capability judgment"
+        );
+        // A tool that declares no File capability keeps its legacy judgment.
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(Vec::new()),
+                Some(&record),
+            )
+            .unwrap(),
+            "a record read by a non-File tool is still an immutable receipt"
+        );
+        // A reference that cannot be parsed fails explicitly; it never falls
+        // back to treating the read as an immutable receipt.
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                Some(&unknown),
+            )
+            .is_err(),
+            "an unparseable original reference must fail explicitly"
+        );
+        // The body and the seal rules are untouched by the target judgment.
+        assert_eq!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(serde_json::json!({
+                    "outcome": {"status": "executed", "output": "original body"},
+                    "outcome_truncated": true,
+                })),
+                &descriptor(file_face.clone()),
+                Some(&record),
+            )
+            .unwrap_err(),
+            "actual immutable receipt lacks its complete original acquired body"
+        );
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt(serde_json::json!({
+                    "outcome": {"status": "executed", "output": "original body"},
+                    "read_acquisition_v1": {"seal": "present"},
+                })),
+                &descriptor(file_face.clone()),
+                Some(&record),
+            )
+            .unwrap(),
+            "a sealed read is judged by its acquisition, not as an immutable receipt"
+        );
+    }
+
+    /// A shared aggregate stream growing while the proof pages is another
+    /// actor appending, not the material under proof changing: the pinned
+    /// window is read unchanged and the read succeeds.
+    #[test]
+    fn pinned_stream_accepts_shared_aggregate_growth_while_paging() {
+        let store = RuntimeEventStore::for_test();
+        for source in [
+            "session:shared-aggregate-growth",
+            "execution-lineage:shared-aggregate-growth",
+        ] {
+            let append = |store: &RuntimeEventStore| {
+                store
+                    .append(crate::RuntimeEventInput {
+                        stream_id: source.into(),
+                        scope: crate::RuntimeEventScope::Session,
+                        kind: "test.source-advance".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: serde_json::json!({}),
+                    })
+                    .unwrap();
+            };
+            append(&store);
+            store.inject_read_fault_once(
+                source.into(),
+                "stream_revision",
+                2,
+                move |store| append(store),
+            );
+            let mut sources = std::collections::BTreeMap::new();
+            pinned_stream_events(&store, source, &mut sources, 0, PinnedEventProjection::Effects)
+                .expect("concurrent appends to a shared aggregate stream must not read as a source change");
+            assert_eq!(sources[source], 1, "the proof keeps the head it was assembled against");
+        }
+    }
+
+    /// The Session cut read keeps the authenticated head as a cut point, not
+    /// as the head the stream must still be at: an append that lands while the
+    /// original material is read leaves the cut valid and the window unchanged.
+    #[test]
+    fn session_cut_read_accepts_an_append_that_lands_while_reading() {
+        let store = RuntimeEventStore::for_test();
+        let source = "session:cut-growth";
+        let append = |store: &RuntimeEventStore| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: source.into(),
+                    scope: crate::RuntimeEventScope::Session,
+                    kind: "test.source-advance".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        };
+        append(&store);
+        append(&store);
+        store.inject_read_fault_once(
+            source.into(),
+            "list_stream_after",
+            1,
+            move |store| append(store),
+        );
+        let mut cuts = std::collections::BTreeMap::new();
+        let events = super::super::results::result_source_events_at_session_cut(
+            &store,
+            source,
+            &mut cuts,
+            2,
+            2,
+        )
+        .expect("a concurrent append must not invalidate the authenticated Session cut");
+        assert_eq!(events.len(), 2, "the read window stops at the historical cut");
+        assert_eq!(cuts[source], 3, "the cut records the head the read ended at");
     }
 
     #[test]
@@ -7886,7 +8327,11 @@ mod tests {
     #[test]
     fn pinned_delivery_empty_source_keeps_its_original_cut() {
         let store = RuntimeEventStore::for_test();
-        let source = "session:empty-projection";
+        // A source the review itself judges: a cut that no longer matches its
+        // head is refused. The reviewed Session stream is a shared aggregate
+        // stream, where an append that lands between two reads is admissible
+        // (`pinned_stream_accepts_shared_aggregate_growth_while_paging`).
+        let source = "agentic-program:empty-projection";
         let mut sources = std::collections::BTreeMap::new();
         assert!(pinned_stream_events(
             &store,

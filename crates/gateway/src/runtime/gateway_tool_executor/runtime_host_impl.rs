@@ -428,11 +428,27 @@ impl GatewayToolExecutor {
                     self.reject_orchestrated_tools_outside_allow_list(&request.tool_name, &input)?;
                     let binding = runtime::ExecutionCommitService::local_network_binding(request)
                         .map_err(|error| ToolError::new(error.to_string()))?;
-                    let (output, fact) = step_lease.execute_joined_local_network(
+                    let joined = step_lease.execute_joined_local_network(
                         authorization, &request.tool_name, &effective_input, binding,
                         request.session_id.as_deref().ok_or_else(|| ToolError::new("local network Session missing"))?,
                         &request.step_binding.as_ref().ok_or_else(|| ToolError::new("local network Step missing"))?.origin,
-                    ).await.map_err(|error| ToolError::new(error.to_string()))?;
+                    ).await;
+                    let (output, fact) = match joined {
+                        Ok(joined) => joined,
+                        Err(error) => {
+                            // A failed joined call carries the per-operation
+                            // facts it produced. They travel through the same
+                            // observed evidence slot a successful call uses, so
+                            // a reader can tell "nothing was sent" from "we
+                            // cannot prove it". The call still fails.
+                            if let Some(fact) = error.local_network_fact() {
+                                typed_observations.push(fact.into_observation(
+                                    request.tool_name.clone(), request.observation_wave_sequence,
+                                ));
+                            }
+                            return Err(ToolError::new(error.to_string()));
+                        }
+                    };
                     typed_observations.push(fact.into_observation(
                         request.tool_name.clone(), request.observation_wave_sequence,
                     ));
@@ -542,7 +558,10 @@ impl GatewayToolExecutor {
                     output: None,
                     error: Some(error.to_string()),
                     evidence_ref,
-                    observed_evidence: Vec::new(),
+                    // A failed call keeps the observations it really made. The
+                    // reader decides what they prove; an empty list stays an
+                    // empty list.
+                    observed_evidence: typed_observations,
                 }
             }
         }

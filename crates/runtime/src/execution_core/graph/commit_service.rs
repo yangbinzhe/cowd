@@ -12928,6 +12928,89 @@ impl ExecutionCommitService {
         )
     }
 
+    /// The durable terminal refusal of a call that was admitted and then
+    /// refused during execution, read from the call's own effect stream.
+    ///
+    /// The original owner records a member's terminal refusal as one
+    /// checked transaction: the program's action event
+    /// (`agentic.completion_rejected`, status `rejected`) and the member's
+    /// index twin on the call's own effect stream
+    /// (`agentic.batch_member.index`, key `agentic-member:{index}`). The
+    /// twin names the program event it belongs to, so the pair is
+    /// authenticated as the one transaction that wrote both. A call whose
+    /// refusal is not durably recorded this way has no terminal fact of
+    /// its own: the answer is `None` and the caller keeps waiting, which
+    /// is the judgement an in-flight call has always had.
+    fn original_call_refusal_head(
+        &self,
+        key: &str,
+    ) -> Result<Option<u64>, ExecutionCommitError> {
+        let stream = format!("execution-effect:{key}");
+        let head = self.event_store.stream_revision(&stream)?;
+        if head == 0 {
+            return Ok(None);
+        }
+        let mut after = 0;
+        while after < head {
+            let page = self
+                .event_store
+                .list_stream_after(&stream, after, head, 100, 1024 * 1024)
+                .map_err(ExecutionCommitError::InvalidCommand)?;
+            if page.is_empty() {
+                return Err(ExecutionCommitError::InvalidCommand(
+                    "lease recovery effect-index gap".into(),
+                ));
+            }
+            for event in page {
+                after = event.sequence;
+                if event.kind != "agentic.batch_member.index"
+                    || event.scope != RuntimeEventScope::ExecutionNode
+                    || event.actor.as_deref() != Some("runtime.agentic_action")
+                    || event.status.as_deref() != Some("committed")
+                    || event.schema_version != 1
+                    || event.payload["outer_key"] != key
+                    || event.payload["program_event_kind"] != "agentic.completion_rejected"
+                {
+                    continue;
+                }
+                let Some(program_stream) = event.payload["program_stream"].as_str() else {
+                    continue;
+                };
+                let Some(program_key) = event.payload["program_event_key"].as_str() else {
+                    continue;
+                };
+                let Some(program) = self
+                    .event_store
+                    .event_by_idempotency_key(program_stream, program_key)?
+                else {
+                    continue;
+                };
+                if program.kind != "agentic.completion_rejected"
+                    || program.scope != RuntimeEventScope::Program
+                    || program.status.as_deref() != Some("rejected")
+                    || program.schema_version != 1
+                    || program.transaction_id != event.transaction_id
+                    || program.commit_cursor != event.commit_cursor
+                {
+                    continue;
+                }
+                let Some(receipt) = self
+                    .event_store
+                    .original_transaction_receipt(&event.transaction_id)?
+                else {
+                    continue;
+                };
+                if !receipt.event_ids.contains(&event.event_id)
+                    || !receipt.event_ids.contains(&program.event_id)
+                {
+                    continue;
+                }
+                return Ok(Some(head));
+            }
+        }
+        Ok(None)
+    }
+
     fn lease_recovery_leaf_sources_with_fact(
         &self,
         graph: &ExecutionGraph,
@@ -13223,7 +13306,26 @@ impl ExecutionCommitService {
                 }
             }
         }
-        if !intents.is_subset(&receipts) {
+        // A call admitted and then refused during execution leaves its
+        // admission intent without a terminal receipt: the refusal is a
+        // durable fact of the original owner's action event, not a receipt
+        // that lands later. Consume that fact as the call's terminal
+        // result. The call settles as terminally refused - it is never
+        // counted as executed and never gains a receipt - and its own
+        // effect stream joins the proof's sources at the head this proof
+        // read, so a later write to it still fails the proof closed. A
+        // call without the fact is still the owner working, which is the
+        // judgement the branch below keeps.
+        let mut refused = BTreeSet::new();
+        for key in intents.difference(&receipts) {
+            if let Some(head) = self.original_call_refusal_head(key)? {
+                refused.insert(key.clone());
+                primary_sources.insert(format!("execution-effect:{key}"), head);
+                #[cfg(any(test, feature = "test-fixtures"))]
+                if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_refused call={} head={}", key.chars().take(96).collect::<String>(), head)); }
+            }
+        }
+        if !intents.iter().all(|key| receipts.contains(key) || refused.contains(key)) {
             // An intent is written at the dispatch point and its terminal
             // receipt at completion, in two different transactions, so
             // "dispatched, still running" is exactly this shape. The receipt
@@ -13281,7 +13383,7 @@ impl ExecutionCommitService {
                     *name == request.tool_name
                         && *input == expected
                         && key == &request.idempotency_key
-                }) {
+                }) && !refused.contains(request.idempotency_key.as_str()) {
                     // The bound call has no terminal receipt and no no-dispatch
                     // fact yet. That is the owner still working, not a
                     // contradiction: with no receipt event in the index stream
@@ -13348,6 +13450,18 @@ impl ExecutionCommitService {
                     };
                     if no_dispatch
                         .is_some_and(|fact| fact.calls.iter().any(|call| call.call_id == id))
+                    {
+                        continue;
+                    }
+                    // A call the owner admitted and then refused during
+                    // execution is closed by its durable refusal fact, the
+                    // same way a call refused before dispatch is closed by
+                    // the no-dispatch fact: it has no terminal receipt
+                    // because it has no executed effect, not because the
+                    // member is still working.
+                    if effect_keys
+                        .get(id)
+                        .is_some_and(|key| refused.contains(key.as_str()))
                     {
                         continue;
                     }
@@ -14969,11 +15083,29 @@ impl ExecutionCommitService {
                         ExpectedStreamRevision { stream_id: program_stream_id.clone(), expected_revision: program.revision },
                         ExpectedStreamRevision { stream_id: format!("goal:{}", goal.goal.id), expected_revision: goal.stream_revision },
                     ] {
-                        if expected_domain_revisions.get(&source.stream_id).is_some_and(|revision| *revision != source.expected_revision)
-                            || domain_events.iter().any(|event| event.event.stream_id == source.stream_id) {
+                        // A partial delivery reports unresolved work against a
+                        // fresh projection: the causal read set pinned the
+                        // Program and Goal heads when the Synthesize decision
+                        // was made, and members legitimately advanced both
+                        // streams afterwards, so a read-set revision that no
+                        // longer matches is not a refusal. What stays hard is
+                        // a same-transaction write to either stream, which
+                        // would collide with this very transaction.
+                        if domain_events.iter().any(|event| event.event.stream_id == source.stream_id) {
                             return Err(invalid("partial Objective source revision changed or collides with B writes"));
                         }
-                        if seen.insert(source.stream_id.clone()) { expected_streams.push(source); }
+                        // Fence both streams at the head this transaction
+                        // read, never at the stale read-set revision: the
+                        // read set pushed these streams earlier, so a plain
+                        // insert would leave the compare-and-set fence on the
+                        // revision the decision read and turn the absorbed
+                        // advance into a StaleRevision instead. Overwriting
+                        // the entry moves the fence to the head read here,
+                        // where a later write or a truncation still fails it.
+                        match expected_streams.iter_mut().find(|entry| entry.stream_id == source.stream_id) {
+                            Some(entry) => { *entry = source; }
+                            None => { seen.insert(source.stream_id.clone()); expected_streams.push(source); }
+                        }
                     }
                     let metadata = serde_json::json!({
                         "record_type":"objective_unresolved_v1", "status":"uncertain",
@@ -17868,6 +18000,833 @@ mod original_effect_admission_tests {
                 Sha256::digest(request.input.as_bytes())
             )),
             "the read admission carries the input the fence reads"
+        );
+    }
+}
+
+/// S1.1 (#4, read_ref delegation): a member refused during execution leaves
+/// its admission intent without a terminal receipt, because the refusal is
+/// a durable fact of the original owner's action event rather than a
+/// receipt. The closure consumes that fact as the call's terminal result:
+/// the call settles as terminally refused, never counted as executed, and
+/// its own effect stream is fenced at the head the proof read. The same
+/// test is red before the patch (an intent without a terminal receipt keeps
+/// the node open, which is the #4 failure) and green after it.
+#[cfg(test)]
+mod failure_shape_tests {
+    use super::*;
+    use crate::runtime_event_store::RuntimeTransactionEventInput;
+
+    /// The node's own index stream, written the way the effect owner writes
+    /// it: the dispatch intent at admission, the terminal receipt at
+    /// completion, in two transactions.
+    fn append_index_event(
+        events: &RuntimeEventStore,
+        stream_id: &str,
+        key: &str,
+        kind: &str,
+        idempotency_key: String,
+    ) {
+        let revision = events.stream_revision(stream_id).expect("index head");
+        let transaction = AppendTransactionRequest {
+            transaction_id: format!("shape-test:{key}:{kind}"),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: stream_id.to_string(),
+                expected_revision: revision,
+            }],
+            events: vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: stream_id.to_string(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: kind.to_string(),
+                    status: Some("inflight".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload: json!({"idempotency_key": key, "tool_name": "read_ref", "sequence": 1}),
+                },
+                idempotency_key: Some(idempotency_key),
+                schema_version: 1,
+            }],
+        };
+        events.append_transaction(transaction).expect("index event");
+    }
+
+    /// A ToolBatch node and the service that proves its physical closure.
+    fn node(
+        name: &str,
+    ) -> (
+        Arc<RuntimeEventStore>,
+        ExecutionCommitService,
+        ExecutionGraph,
+        ExecutionNodeSpec,
+        ExecutionNodeBinding,
+    ) {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(events.clone());
+        let graph = ExecutionGraph::new(name.to_string());
+        let payload = crate::step_snapshot::encode_persisted_tool_batch(&json!({
+            "session_id": format!("{name}-session"), "step_snapshots":{}, "calls":[]
+        }))
+        .expect("persisted batch");
+        let spec = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", payload);
+        let binding = ExecutionNodeBinding {
+            executor_kind: "tool_batch".into(),
+            ticket_idempotency_key: spec.idempotency_key.clone(),
+            attempt: 3,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        (events, commits, graph, spec, binding)
+    }
+
+    fn index_stream(
+        graph: &ExecutionGraph,
+        spec: &ExecutionNodeSpec,
+        binding: &ExecutionNodeBinding,
+    ) -> String {
+        format!(
+            "execution-agent-receipts:{}:{}:{}",
+            graph.id, spec.id, binding.attempt
+        )
+    }
+
+    /// The original owner's durable record of one member call: the read
+    /// admission on the call's own effect stream, then the terminal refusal
+    /// as the one checked transaction the action owner writes it in - the
+    /// program's rejection event and the member's index twin on that same
+    /// effect stream. `same_transaction = false` writes the twin in a
+    /// transaction of its own, which is the shape the closure must not
+    /// consume. `program_twin = false` drops the program event entirely.
+    fn append_refusal(
+        events: &RuntimeEventStore,
+        key: &str,
+        program_id: &str,
+        same_transaction: bool,
+        program_twin: bool,
+    ) {
+        let effect_stream = format!("execution-effect:{key}");
+        let program_stream = format!("agentic-program:{program_id}");
+        let program_key = format!("completion-rejected:{key}");
+        let marker_key = "agentic-member:0".to_string();
+        let admission = RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: effect_stream.clone(),
+                scope: RuntimeEventScope::ExecutionNode,
+                kind: "execution.read.intent".into(),
+                status: Some("inflight".into()),
+                actor: Some("governed_tool".into()),
+                refs: vec![],
+                payload: json!({"idempotency_key": key, "tool_use_id": "shape-call"}),
+            },
+            idempotency_key: Some(format!("{key}:read-intent")),
+            schema_version: 1,
+        };
+        let effect_revision = events.stream_revision(&effect_stream).expect("effect head");
+        events
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("shape-test:{key}:read-intent"),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: effect_stream.clone(),
+                    expected_revision: effect_revision,
+                }],
+                events: vec![admission],
+            })
+            .expect("read admission");
+        let marker = RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: effect_stream.clone(),
+                scope: RuntimeEventScope::ExecutionNode,
+                kind: "agentic.batch_member.index".into(),
+                status: Some("committed".into()),
+                actor: Some("runtime.agentic_action".into()),
+                refs: vec![],
+                payload: json!({
+                    "outer_key": key, "member_index": 0,
+                    "program_stream": program_stream,
+                    "program_event_kind": "agentic.completion_rejected",
+                    "program_event_key": program_key,
+                    "program_event_index": 0,
+                }),
+            },
+            idempotency_key: Some(marker_key),
+            schema_version: 1,
+        };
+        let program = RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: program_stream.clone(),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.completion_rejected".into(),
+                status: Some("rejected".into()),
+                actor: Some("runtime.agentic_action".into()),
+                refs: vec![],
+                payload: json!({
+                    "program_id": program_id,
+                    "code": "objective_not_verifiable",
+                    "gap": "the completion admission refused this member call",
+                }),
+            },
+            idempotency_key: Some(program_key),
+            schema_version: 1,
+        };
+        let effect_revision = events.stream_revision(&effect_stream).expect("effect head");
+        let program_revision = events.stream_revision(&program_stream).expect("program head");
+        if same_transaction {
+            let written = if program_twin {
+                vec![marker, program]
+            } else {
+                vec![marker]
+            };
+            events
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: format!("shape-test:{key}:member-index"),
+                    expected_streams: written
+                        .iter()
+                        .map(|event| ExpectedStreamRevision {
+                            stream_id: event.event.stream_id.clone(),
+                            expected_revision: events
+                                .stream_revision(&event.event.stream_id)
+                                .expect("fence head"),
+                        })
+                        .collect(),
+                    events: written,
+                })
+                .expect("member index twin");
+        } else {
+            events
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: format!("shape-test:{key}:member-index"),
+                    expected_streams: vec![ExpectedStreamRevision {
+                        stream_id: effect_stream.clone(),
+                        expected_revision: effect_revision,
+                    }],
+                    events: vec![marker],
+                })
+                .expect("member index twin");
+            if program_twin {
+                events
+                    .append_transaction(AppendTransactionRequest {
+                        transaction_id: format!("shape-test:{key}:program-rejection"),
+                        expected_streams: vec![ExpectedStreamRevision {
+                            stream_id: program_stream.clone(),
+                            expected_revision: program_revision,
+                        }],
+                        events: vec![program],
+                    })
+                    .expect("program rejection");
+            }
+        }
+    }
+
+    /// C-P1 (red before the patch, green after): a read_ref delegation whose
+    /// member was refused during execution closes on the owner's durable
+    /// refusal fact. The call's terminal is the refusal - it is never
+    /// counted as executed - and its own effect stream is fenced at the
+    /// head this proof read.
+    #[test]
+    fn closure0_read_ref_delegation_refused_call_settles_on_its_durable_refusal() {
+        let (events, commits, graph, spec, binding) = node("shape refused settled");
+        let key = "shape-refused-key";
+        append_index_event(
+            &events,
+            &index_stream(&graph, &spec, &binding),
+            key,
+            "execution.agent_tool.intent",
+            format!("agent-tool-intent:{key}"),
+        );
+        append_refusal(&events, key, "shape-program", true, true);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                false,
+                None,
+                &mut unprovable,
+            )
+            .expect("leaf sources");
+        let sources = sources.expect("a durably refused call closes the node");
+        assert!(
+            unprovable.is_none(),
+            "a durable refusal is a terminal, not a ring: {unprovable:?}"
+        );
+        let effect_stream = format!("execution-effect:{key}");
+        assert!(
+            sources.iter().any(|source| source.stream_id == effect_stream
+                && source.expected_revision
+                    == events.stream_revision(&effect_stream).expect("effect head")),
+            "the refused call's own effect stream is fenced: {sources:?}"
+        );
+        // The proof consumes the refusal fact and writes nothing: a call
+        // that never executed never gains a receipt.
+        assert!(
+            events
+                .event_by_idempotency_key(&effect_stream, &format!("{key}:read-receipt"))
+                .expect("receipt read")
+                .is_none(),
+            "a refused call is never receipted as executed"
+        );
+        assert!(
+            events
+                .event_by_idempotency_key(
+                    &index_stream(&graph, &spec, &binding),
+                    &format!("agent-tool-receipt:{key}")
+                )
+                .expect("index read")
+                .is_none(),
+            "a refused call is never receipted on the owner index either"
+        );
+    }
+
+    /// C-N1/C-N3: a call with no durable refusal fact keeps the judgement it
+    /// has always had. The owner may still be working, so the node stays
+    /// open and no ring is named.
+    #[test]
+    fn closure0_read_ref_delegation_call_without_a_refusal_fact_stays_pending() {
+        let (events, commits, graph, spec, binding) = node("shape refused absent");
+        let key = "shape-absent-key";
+        append_index_event(
+            &events,
+            &index_stream(&graph, &spec, &binding),
+            key,
+            "execution.agent_tool.intent",
+            format!("agent-tool-intent:{key}"),
+        );
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                false,
+                None,
+                &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "a call without a durable refusal is still the owner working"
+        );
+        assert!(
+            unprovable.is_none(),
+            "an in-flight call is pending, not unprovable: {unprovable:?}"
+        );
+    }
+
+    /// C-N2: a refusal whose two events are not the one checked transaction
+    /// is not a terminal fact. The closure keeps waiting instead of closing
+    /// on half a fact, and names no ring.
+    #[test]
+    fn closure0_read_ref_delegation_refusal_outside_one_transaction_is_not_consumed() {
+        let (events, commits, graph, spec, binding) = node("shape refused split");
+        let key = "shape-split-key";
+        append_index_event(
+            &events,
+            &index_stream(&graph, &spec, &binding),
+            key,
+            "execution.agent_tool.intent",
+            format!("agent-tool-intent:{key}"),
+        );
+        append_refusal(&events, key, "shape-program", false, true);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                false,
+                None,
+                &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "a refusal split across two transactions is not one checked fact"
+        );
+        assert!(
+            unprovable.is_none(),
+            "an unauthenticated refusal is pending, not a ring: {unprovable:?}"
+        );
+    }
+
+    /// C-N2 (the other half): a member index twin whose program rejection
+    /// never landed is half a fact. The closure keeps waiting.
+    #[test]
+    fn closure0_read_ref_delegation_refusal_without_its_program_twin_is_not_consumed() {
+        let (events, commits, graph, spec, binding) = node("shape refused half");
+        let key = "shape-half-key";
+        append_index_event(
+            &events,
+            &index_stream(&graph, &spec, &binding),
+            key,
+            "execution.agent_tool.intent",
+            format!("agent-tool-intent:{key}"),
+        );
+        append_refusal(&events, key, "shape-program", true, false);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                false,
+                None,
+                &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "a member twin without its program rejection is not a terminal"
+        );
+        assert!(
+            unprovable.is_none(),
+            "half a refusal is pending, not a ring: {unprovable:?}"
+        );
+    }
+
+    /// The refusal fact names its call: a twin written for another call's
+    /// effect stream closes nothing here.
+    #[test]
+    fn closure0_read_ref_delegation_foreign_refusal_names_another_call() {
+        let (events, commits, graph, spec, binding) = node("shape refused foreign");
+        let key = "shape-foreign-key";
+        append_index_event(
+            &events,
+            &index_stream(&graph, &spec, &binding),
+            key,
+            "execution.agent_tool.intent",
+            format!("agent-tool-intent:{key}"),
+        );
+        append_refusal(&events, "shape-other-key", "shape-program", true, true);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                false,
+                None,
+                &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_none(),
+            "another call's refusal closes nothing for this call"
+        );
+    }
+}
+
+/// S1.5-adjacent (#8, synthesize:failed): the partial Objective path used to
+/// compare the node's causal read set with the current Program and Goal heads
+/// and refuse the terminal when members had advanced either stream after the
+/// Synthesize decision. The partial delivery reports unresolved work against
+/// a fresh projection, so the read-set revision is absorbed: the fence moves
+/// to the head this transaction read, a same-transaction write to either
+/// stream is still refused, and the output stays `objective_unresolved_v1` /
+/// `uncertain`. The positive test is red before the patch (the stale read set
+/// was a refusal) and green after it.
+#[cfg(test)]
+mod partial_objective_source_tests {
+    use super::*;
+
+    /// A graph whose single node is the Synthesize owner of the Session
+    /// terminal, started so its binding and start ticket exist.
+    fn started_synthesize_graph(
+        name: &str,
+    ) -> (
+        Arc<RuntimeEventStore>,
+        ExecutionCommitService,
+        ExecutionGraph,
+        ExecutionNodeSpec,
+        String,
+        Arc<crate::ArtifactStore>,
+    ) {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        // The checked terminal path requires the Session to be admitted on the
+        // backend, the same registration the ingress and the supervisor make.
+        events
+            .ensure_session_recovery_admitted("test-session")
+            .expect("session admitted");
+        let commits = ExecutionCommitService::new(events.clone());
+        let mut graph = ExecutionGraph::new(name.to_string());
+        let graph_id = graph.id.clone();
+        let task_id = format!("test-task:{graph_id}");
+        let graph = graph.with_lineage(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "test-session".to_string(),
+            turn_id: format!("test-turn:{graph_id}"),
+            root_task_id: task_id.clone(),
+            task_id,
+            generation: 1,
+        });
+        let spec = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Synthesize,
+            "synthesize",
+            "{}".to_string(),
+        );
+        let mut graph = graph;
+        graph.nodes.push(spec.clone());
+        let graph = commits.register_graph(graph).expect("register").graph;
+        let graph = commits
+            .transition_node(
+                &graph,
+                &spec.id,
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("ready synthesize")
+            .graph;
+        let binding = ExecutionNodeBinding {
+            executor_kind: "synthesize".into(),
+            ticket_idempotency_key: spec.idempotency_key.clone(),
+            attempt: 1,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        let graph = commits
+            .bind_and_start_node(&graph, &spec.id, binding)
+            .expect("start synthesize")
+            .graph;
+        let artifacts = Arc::new(
+            crate::ArtifactStore::for_test(
+                &std::env::temp_dir().join(format!("a9-partial-{}", uuid::Uuid::new_v4())),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        );
+        let commits = commits.with_artifact_store(Arc::clone(&artifacts));
+        (events, commits, graph, spec, graph_id, artifacts)
+    }
+
+    /// The root Program of this graph's Session and Turn, opened and then
+    /// advanced once more, the way a member keeps writing it after the
+    /// Synthesize decision pinned the read set.
+    fn advance_program(
+        events: &Arc<RuntimeEventStore>,
+        graph: &ExecutionGraph,
+        node_id: &str,
+    ) -> (String, u64) {
+        use harness_contract::agent_action::{AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, MessagePublishInput};
+        let lineage = graph.lineage.as_ref().expect("lineage");
+        let objective_id =
+            harness_contract::agent_action::root_objective_id(&lineage.session_id, &lineage.turn_id);
+        let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+        let actions = crate::AgentActionService::new(Arc::clone(events))
+            .with_graph_store(crate::ExecutionGraphStateStore::new(Arc::clone(events)));
+        for summary in ["program opened", "member advanced the program"] {
+            let observation = actions.apply(&AgentActionEnvelope {
+                action_id: format!("p-source:{summary}"),
+                actor: AgentActorBinding {
+                    original_execution: Some(harness_contract::agent_action::OriginalAgentExecution {
+                        graph_id: graph.id.clone(),
+                        node_id: node_id.to_string(),
+                        attempt: 1,
+                    }),
+                    objective_id: objective_id.clone(),
+                    program_id: program_id.clone(),
+                    session_id: lineage.session_id.clone(),
+                    turn_id: lineage.turn_id.clone(),
+                    root_execution_id: Some(graph.id.clone()),
+                    required_team_count: 0,
+                    exact_team_count: None,
+                    objective_summary: "partial objective source".into(),
+                    model_lease: "test".into(),
+                    permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                    resource_scopes: vec![],
+                    actor_id: format!("root:{}", lineage.session_id),
+                    kind: AgentActorKind::Root,
+                    execution_id: None,
+                    team_id: None,
+                    agent_id: None,
+                },
+                expected_revision: None,
+                action: AgentAction::MessagePublish(MessagePublishInput {
+                    topic_ref: format!("topic:{program_id}"),
+                    summary: Some(summary.into()),
+                    content_ref: None,
+                    refs: vec![],
+                    recipients: vec![],
+                    intent: None,
+                    issue_dispositions: vec![],
+                }),
+            });
+            assert!(observation.is_ok(), "program action applied: {observation:?}");
+        }
+        let head = events
+            .stream_revision(&format!("agentic-program:{program_id}"))
+            .expect("program head");
+        (program_id, head)
+    }
+
+    /// The Session's Goal, bound to the Program this terminal reports on.
+    /// `completion` is the goal's own completion state.
+    fn bind_goal(
+        events: &Arc<RuntimeEventStore>,
+        graph: &ExecutionGraph,
+        program_id: &str,
+        completion: &str,
+    ) -> String {
+        let lineage = graph.lineage.as_ref().expect("lineage");
+        let objective_id =
+            harness_contract::agent_action::root_objective_id(&lineage.session_id, &lineage.turn_id);
+        // The goal id carries the `goal:` prefix: the store prefixes the
+        // stream itself, and the partial path looks this goal up under
+        // `goal:{graph.id}`.
+        let goal_id = format!("goal:{}", graph.id);
+        let goal: harness_contract::goal::GoalContract = serde_json::from_value(json!({
+            "id": goal_id,
+            "session_id": lineage.session_id,
+            "objective": "partial objective source",
+            "criteria": [{"id":"checked","statement":"verified","status":"open"}],
+            "phase": "execution",
+            "scope": "internal",
+            "spec_revision": 1,
+            "spec_digest": "partial",
+            "completion": completion,
+            "revision": 1,
+            "user_sequence": 1,
+            "execution_binding": {
+                "objective_id": objective_id,
+                "agentic_program_id": program_id,
+                "session_id": lineage.session_id,
+                "turn_id": lineage.turn_id,
+                "root_execution_id": graph.id,
+            },
+        }))
+        .expect("goal contract");
+        crate::execution_core::GoalStore::new(Arc::clone(events))
+            .create(goal)
+            .expect("goal created");
+        goal_id
+    }
+
+    /// The durable terminal artifact a partial delivery authenticates, and
+    /// the terminal event that carries its reference.
+    fn terminal_event(
+        events: &Arc<RuntimeEventStore>,
+        artifacts: &Arc<crate::ArtifactStore>,
+        graph: &ExecutionGraph,
+        spec: &ExecutionNodeSpec,
+    ) -> RuntimeTransactionEventInput {
+        let lineage = graph.lineage.as_ref().expect("lineage");
+        let terminal_id = format!("terminal:{}", graph.id);
+        let origin = crate::PreparedArtifactOrigin::TerminalBody {
+            terminal_id: terminal_id.clone(),
+            session_id: lineage.session_id.clone(),
+            execution_id: graph.id.clone(),
+            turn_id: lineage.turn_id.clone(),
+            event_stream: format!("session-terminal:{}", graph.id),
+            event_key: spec.idempotency_key.clone(),
+        };
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": crate::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
+            "goal_completion": "partial",
+            "text": "the objective is unresolved",
+        }))
+        .expect("terminal body");
+        let reference = artifacts
+            .write_pre_pinned_with_media_blocking(
+                &format!("session:{}", lineage.session_id),
+                &terminal_id,
+                "application/vnd.cowd.session-terminal+json",
+                &bytes,
+                &origin,
+            )
+            .expect("terminal artifact");
+        events.bind_artifact_store(Arc::clone(artifacts)).expect("bind artifacts");
+        let payload_ref = crate::encode_session_terminal_artifact_ref(&reference).expect("artifact ref");
+        RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: format!("session-terminal:{}", graph.id),
+                scope: RuntimeEventScope::SessionInput,
+                kind: "runtime.session.terminal_requested".into(),
+                status: Some("pending_delivery".into()),
+                actor: Some("SynthesizeNodeExecutor".into()),
+                refs: vec![],
+                payload: json!({
+                    "terminal_id": terminal_id,
+                    "message_id": format!("assistant:{}", graph.id),
+                    "session_id": lineage.session_id,
+                    "execution_id": graph.id,
+                    "turn_id": lineage.turn_id,
+                    "request_id": format!("request:{}", graph.id),
+                    "session_generation": 1,
+                    "input_sequence": 1,
+                    "input_claim_owner": "claim:owner",
+                    "input_claim_token": "claim:token",
+                    "input_claim_revision": 1,
+                    "controlled_recovery_claim_fingerprints": [],
+                    "payload_ref": payload_ref,
+                }),
+            },
+            idempotency_key: Some(spec.idempotency_key.clone()),
+            schema_version: 1,
+        }
+    }
+
+    /// The graph the runner hands the commit: the transition already applied
+    /// (the Synthesize node Completed) and the revision the commit will write.
+    /// The partial path's `owned_synthesis` check reads the passed graph, so a
+    /// graph that still shows the node Running is not the runner's shape.
+    fn runner_next_graph(graph: &ExecutionGraph, node_id: &str) -> ExecutionGraph {
+        let mut next = graph.clone();
+        next.revision = graph.revision + 1;
+        next.node_statuses
+            .insert(node_id.to_string(), ExecutionNodeStatus::Completed);
+        next
+    }
+
+    fn completed_result(id: &str) -> ExecutionNodeResult {
+        ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some(format!("result:{id}")),
+            wait_class: None,
+            summary: Some(format!("result {id}")),
+            evidence_refs: Vec::new(),
+            failure: None,
+            usage: Default::default(),
+            finished_at_ms: 1,
+        }
+    }
+
+    /// P-P1 (red before the patch, green after): a partial delivery whose
+    /// causal read set pinned the Program head before the members advanced it
+    /// commits. Both source streams are fenced at the head this transaction
+    /// read - never at the stale read-set revision - and the terminal record
+    /// stays `objective_unresolved_v1` / `uncertain`.
+    #[test]
+    fn partial_objective_source_absorbs_the_read_set_advance_and_fences_the_current_head() {
+        let (events, commits, graph, spec, _graph_id, artifacts) =
+            started_synthesize_graph("partial source absorbed");
+        let (program_id, program_head) = advance_program(&events, &graph, &spec.id);
+        let goal_id = bind_goal(&events, &graph, &program_id, "open");
+        let terminal = terminal_event(&events, &artifacts, &graph, &spec);
+        // The read set the Synthesize decision pinned: the Program head
+        // before the member advanced it.
+        let stale_read_set = BTreeMap::from([(format!("agentic-program:{program_id}"), 1u64)]);
+        let prepared = commits
+            .prepare_graph_append(
+                &runner_next_graph(&graph, &spec.id),
+                graph.revision,
+                format!("{}:wave:{}:terminal:{}", graph.id, graph.revision + 1, uuid::Uuid::new_v4()),
+                ExecutionGraphEvent::NodesTransitioned {
+                    node_ids: vec![spec.id.clone()],
+                    delta: ExecutionGraphDelta::between(&graph, &runner_next_graph(&graph, &spec.id)),
+                },
+                vec![terminal.clone()],
+                &stale_read_set,
+            )
+            .expect("a partial delivery absorbs the read-set advance");
+        assert!(
+            prepared
+                .expected_streams
+                .iter()
+                .any(|source| source.stream_id == format!("agentic-program:{program_id}")
+                    && source.expected_revision == program_head),
+            "the Program stream is fenced at the head this transaction read: {:?}",
+            prepared.expected_streams
+        );
+        assert!(
+            prepared
+                .expected_streams
+                .iter()
+                .any(|source| source.stream_id == format!("goal:{goal_id}")
+                    && source.expected_revision > 0),
+            "the Goal stream is fenced at its own head: {:?}",
+            prepared.expected_streams
+        );
+        let metadata = prepared
+            .authored_metadata
+            .as_ref()
+            .expect("a partial delivery authors its unresolved record");
+        assert_eq!(metadata["record_type"], json!("objective_unresolved_v1"));
+        assert_eq!(metadata["status"], json!("uncertain"));
+        assert_eq!(metadata["program_stream_revision"], json!(program_head));
+        // The append itself runs on the checked-terminal backend, which the
+        // in-memory test store does not carry: the fence and the authored
+        // record above are this patch's witness, and the store's own
+        // compare-and-set keeps rejecting a write after the projection read.
+        let _ = &events;
+    }
+
+    /// P-N1: a same-transaction write to either source stream is still
+    /// refused, with the wording this path has always published.
+    #[test]
+    fn partial_objective_source_still_refuses_a_same_transaction_write() {
+        let (events, commits, graph, spec, _graph_id, artifacts) =
+            started_synthesize_graph("partial source collision");
+        let (program_id, _program_head) = advance_program(&events, &graph, &spec.id);
+        let goal_id = bind_goal(&events, &graph, &program_id, "open");
+        let terminal = terminal_event(&events, &artifacts, &graph, &spec);
+        let next = runner_next_graph(&graph, &spec.id);
+        let collision = RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: format!("agentic-program:{program_id}"),
+                scope: RuntimeEventScope::Program,
+                kind: "agentic.action_applied".into(),
+                status: Some("applied".into()),
+                actor: Some("root".into()),
+                refs: vec![],
+                payload: json!({"collision": true}),
+            },
+            idempotency_key: Some("partial-source-collision".into()),
+            schema_version: 1,
+        };
+        let stale_read_set = BTreeMap::from([(format!("agentic-program:{program_id}"), 1u64)]);
+        let refused = commits
+            .prepare_graph_append(
+                &next,
+                graph.revision,
+                format!("{}:wave:{}:terminal-collision", graph.id, graph.revision + 1),
+                ExecutionGraphEvent::NodesTransitioned {
+                    node_ids: vec![spec.id.clone()],
+                    delta: ExecutionGraphDelta::between(&graph, &next),
+                },
+                vec![terminal, collision],
+                &stale_read_set,
+            )
+            .err()
+            .expect("a same-transaction write to a source stream is still refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("partial Objective source revision changed or collides with B writes"),
+            "the refusal keeps its wording: {refused}"
+        );
+    }
+
+    /// P-N4: the partial path's own preconditions are untouched - a Goal that
+    /// is not Open is still refused.
+    #[test]
+    fn partial_objective_source_still_refuses_a_closed_goal() {
+        let (events, commits, graph, spec, _graph_id, artifacts) =
+            started_synthesize_graph("partial source closed goal");
+        let (program_id, _program_head) = advance_program(&events, &graph, &spec.id);
+        bind_goal(&events, &graph, &program_id, "satisfied");
+        let terminal = terminal_event(&events, &artifacts, &graph, &spec);
+        let stale_read_set = BTreeMap::from([(format!("agentic-program:{program_id}"), 1u64)]);
+        let refused = commits
+            .prepare_transition_node(
+                &graph,
+                &spec.id,
+                ExecutionNodeStatus::Completed,
+                Some(completed_result(&spec.id)),
+                vec![terminal],
+                &stale_read_set,
+                None,
+            )
+            .err()
+            .expect("a closed Goal is still refused");
+        assert!(
+            refused.to_string().contains("no committed Objective verdict"),
+            "the precondition refusal keeps its wording: {refused}"
         );
     }
 }

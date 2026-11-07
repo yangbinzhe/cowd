@@ -660,6 +660,211 @@ fn decode_persisted_batch_value(
     Ok(value)
 }
 
+/// A redundant copy of the persisted batch payload inside one action payload
+/// is replaced by a pointer to the single copy that event keeps.
+const BATCH_PAYLOAD_REF_POINTER: &str = "__cowd_batch_payload_ref__";
+/// A redundant copy of the Step snapshot that persisted batch payload carries
+/// is replaced by a pointer to the snapshot the batch keeps.
+const BATCH_STEP_SNAPSHOT_POINTER: &str = "__cowd_batch_step_snapshot__";
+
+/// The Session the original member facts were admitted in.
+fn member_facts_session_id(facts: &serde_json::Value) -> Option<&str> {
+    facts.pointer("/outer_hook/session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|session| !session.is_empty())
+}
+
+/// The persisted batch payload this member facts keep: the ticket's own
+/// `payload_ref`. It is the one copy the event still carries inline.
+fn member_facts_payload_ref(facts: &serde_json::Value) -> Option<&str> {
+    facts.pointer("/ticket/payload_ref")
+        .and_then(serde_json::Value::as_str)
+        .filter(|payload| !payload.is_empty())
+}
+
+/// Does this facts value hold a pointer to the batch payload or to its Step
+/// snapshot? The old inline shape holds neither and is returned unchanged.
+fn holds_batch_pointer(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
+            (key == BATCH_PAYLOAD_REF_POINTER || key == BATCH_STEP_SNAPSHOT_POINTER)
+                || holds_batch_pointer(child)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(holds_batch_pointer),
+        _ => false,
+    }
+}
+
+/// Replace every copy of the persisted batch payload, and of the Step snapshot
+/// it carries, that is byte-equal to the copy this event keeps.
+///
+/// Only an equal copy is replaced, so the same-source rebuild is byte
+/// identical to the shape this used to inline.
+fn replace_redundant_copies(
+    value: &mut serde_json::Value,
+    path: &[String],
+    payload_ref: &str,
+    snapshots: &serde_json::Map<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let Some(child) = map.get_mut(&key) else { continue };
+                let mut child_path = path.to_vec();
+                child_path.push(key.clone());
+                let keeps_the_copy = path.len() == 1 && path.first().map(String::as_str) == Some("ticket");
+                if key == "payload_ref"
+                    && !keeps_the_copy
+                    && child.as_str() == Some(payload_ref)
+                {
+                    *child = serde_json::json!({ BATCH_PAYLOAD_REF_POINTER: "ticket.payload_ref" });
+                    continue;
+                }
+                if key == "snapshot" {
+                    let mut carried: Option<String> = None;
+                    for (step_id, snapshot) in snapshots.iter() {
+                        if snapshot == &*child {
+                            carried = Some(step_id.clone());
+                            break;
+                        }
+                    }
+                    if let Some(step_id) = carried {
+                        *child = serde_json::json!({ BATCH_STEP_SNAPSHOT_POINTER: step_id });
+                        continue;
+                    }
+                }
+                replace_redundant_copies(child, &child_path, payload_ref, snapshots);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                replace_redundant_copies(item, path, payload_ref, snapshots);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Restore every pointer to the copy the event keeps.
+fn restore_batch_pointers(
+    value: &mut serde_json::Value,
+    payload_ref: &str,
+    snapshots: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    // A pointer is the whole object: the marker names the copy this event
+    // keeps, and the rebuild replaces the pointer with that copy.
+    if let Some(map) = value.as_object() {
+        if map.len() == 1 {
+            if let Some(target) = map.get(BATCH_PAYLOAD_REF_POINTER) {
+                if target.as_str() != Some("ticket.payload_ref") {
+                    return Err("original member facts missing: unknown batch payload pointer".into());
+                }
+                *value = serde_json::Value::String(payload_ref.to_string());
+                return Ok(());
+            }
+            if let Some(step_id) = map.get(BATCH_STEP_SNAPSHOT_POINTER) {
+                let step_id = step_id
+                    .as_str()
+                    .ok_or("original member facts missing: batch Step pointer unreadable")?;
+                let snapshot = snapshots
+                    .get(step_id)
+                    .ok_or("original member facts missing: batch Step pointer unresolved")?;
+                *value = snapshot.clone();
+                return Ok(());
+            }
+        }
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (_, child) in map.iter_mut() {
+                restore_batch_pointers(child, payload_ref, snapshots)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                restore_batch_pointers(item, payload_ref, snapshots)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Replace the redundant copies of the persisted batch payload, and of the
+/// Step snapshot it carries, inside one member facts value.
+///
+/// The event keeps one copy of the batch payload (the ticket's own
+/// `payload_ref`) and one copy of the Step snapshot (inside that batch). Every
+/// other copy points at them, so the event no longer grows with the member's
+/// batch payload. Nothing else changes: only an equal copy is replaced, so
+/// the same-source rebuild is byte identical to the inline shape.
+pub(crate) fn dedupe_member_admission_facts(
+    facts: &mut serde_json::Value,
+) -> Result<(), String> {
+    let Some(payload_ref) = member_facts_payload_ref(facts).map(str::to_string) else { return Ok(()); };
+    let batch = decode_persisted_tool_batch_value(&payload_ref)
+        .map_err(|error| format!("original member facts missing: {error}"))?;
+    let empty = serde_json::Map::new();
+    let snapshots = batch
+        .get("step_snapshots")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(&empty);
+    replace_redundant_copies(facts, &[], &payload_ref, snapshots);
+    Ok(())
+}
+
+/// Rebuild the original member facts from the same-source batch payload.
+///
+/// The old inline shape is returned unchanged. The new pointer shape is
+/// rebuilt from the batch payload the event keeps, so every reader sees the
+/// byte identical facts it always saw. A pointer that cannot be resolved is
+/// an explicit failure: a missing fact is never read as "no fact".
+pub(crate) fn rebuild_member_admission_facts(
+    facts: &serde_json::Value,
+) -> Result<std::borrow::Cow<'_, serde_json::Value>, String> {
+    if !holds_batch_pointer(facts) {
+        return Ok(std::borrow::Cow::Borrowed(facts));
+    }
+    let payload_ref = member_facts_payload_ref(facts)
+        .ok_or("original member facts missing: batch payload pointer unresolved")?;
+    let batch = decode_persisted_tool_batch_value(payload_ref)
+        .map_err(|error| format!("original member facts missing: {error}"))?;
+    let session_id = member_facts_session_id(facts)
+        .ok_or("original member facts missing: Session binding unavailable")?;
+    if batch.get("session_id").and_then(serde_json::Value::as_str) != Some(session_id) {
+        return Err("original member facts missing: batch payload Session differs".into());
+    }
+    let empty = serde_json::Map::new();
+    let snapshots = batch
+        .get("step_snapshots")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(&empty);
+    let mut rebuilt = facts.clone();
+    restore_batch_pointers(&mut rebuilt, payload_ref, snapshots)?;
+    Ok(std::borrow::Cow::Owned(rebuilt))
+}
+
+/// Rebuild the member admission facts inside one action payload.
+///
+/// The old inline shape is returned unchanged; the new pointer shape is
+/// rebuilt from the batch payload the action event keeps, so every reader
+/// sees the byte identical facts it always saw.
+pub(crate) fn rebuild_member_admission_payload(
+    payload: &serde_json::Value,
+) -> Result<std::borrow::Cow<'_, serde_json::Value>, String> {
+    let Some(facts) = payload.get("member_admission") else {
+        return Ok(std::borrow::Cow::Borrowed(payload));
+    };
+    if !holds_batch_pointer(facts) {
+        return Ok(std::borrow::Cow::Borrowed(payload));
+    }
+    let rebuilt = rebuild_member_admission_facts(facts)?;
+    let mut payload = payload.clone();
+    payload["member_admission"] = rebuilt.into_owned();
+    Ok(std::borrow::Cow::Owned(payload))
+}
+
 #[cfg(test)]
 mod persisted_payload_413_tests {
     use super::*;
@@ -1481,4 +1686,299 @@ impl OriginalMemberCommitCapability {
         })
     }
 
+}
+
+#[cfg(test)]
+mod member_facts_dedup_tests {
+    use super::*;
+
+    /// The Step snapshot the persisted batch payload carries.
+    fn a8_step_snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "identity": {"attempt": 1, "parent": "original", "generation": 3, "step_id": "step-413"},
+            "tools": [{"permissions": {"allow_write": false}, "purpose": "business",
+                "schema": "complete schema ".repeat(1200)}],
+            "catalog_digest": "catalog-413",
+            "related_revisions": {"goal": "7"},
+        })
+    }
+
+    /// The persisted batch payload one member ticket names.
+    fn a8_batch(session_id: &str) -> String {
+        encode_persisted_tool_batch(&serde_json::json!({
+            "session_id": session_id,
+            "step_snapshots": {"step-413": a8_step_snapshot()},
+            "calls": [{"origin": {"origin_step_id": "step-413"}, "id": "call-413",
+                "name": "state_inspect", "input": "{}", "depends_on": []}],
+            "continue_with_tool_batch": false,
+        }))
+        .expect("tool batch")
+    }
+
+    /// The persisted batch payload of a batch with `members` members.
+    fn a8_batch_with_members(session_id: &str, members: usize) -> String {
+        let calls: Vec<serde_json::Value> = (0..members)
+            .map(|index| serde_json::json!({
+                "origin": {"origin_step_id": "step-413"},
+                "id": format!("call-413-{index}"),
+                "name": "state_inspect",
+                "input": "member input ".repeat(256),
+                "depends_on": [],
+            }))
+            .collect();
+        encode_persisted_tool_batch(&serde_json::json!({
+            "session_id": session_id,
+            "step_snapshots": {"step-413": a8_step_snapshot()},
+            "calls": calls,
+            "continue_with_tool_batch": false,
+        }))
+        .expect("tool batch")
+    }
+
+    /// The original member facts in their inline shape.
+    fn a8_member_facts(session_id: &str) -> (serde_json::Value, serde_json::Value) {
+        a8_member_facts_for_batch(session_id, a8_batch(session_id))
+    }
+
+    /// The original member facts for one member of a named batch.
+    fn a8_member_facts_for_batch(
+        session_id: &str,
+        batch: String,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let snapshot = a8_step_snapshot();
+        let facts = serde_json::json!({
+            "prepared": {"outer_key": "outer-413", "index": 0, "tool": "state_inspect",
+                "input": {}, "effect": {"kind": "read"}, "identity": "member-413"},
+            "authorization": {"tool_id": "state_inspect", "request_id": "member-413"},
+            "ticket": {"graph_id": "graph-413", "node_id": "node-413", "executor_kind": "tool_batch",
+                "service_class": "foreground", "attempt": 1, "idempotency_key": "ticket-413",
+                "payload_ref": batch},
+            "original_events": [],
+            "original_hook": {"owner": "host",
+                "original_prepared": {"identity": "member-413"},
+                "effective_prepared": {"identity": "member-413"},
+                "hook_effective_input": "{}",
+                "permission_context": {"override_decision": null},
+                "outer_request": {"tool_name": "agent_action_batch",
+                    "step_binding": {"snapshot": snapshot, "origin": {"call_id": "call-413"}}},
+                "step": {"snapshot": snapshot, "origin": {"call_id": "call-413"}}},
+            "outer_hook": {"ticket": {"graph_id": "graph-413", "node_id": "node-413",
+                    "executor_kind": "tool_batch", "service_class": "foreground", "attempt": 1,
+                    "idempotency_key": "ticket-413", "payload_ref": batch},
+                "step": {"snapshot": snapshot, "origin": {"call_id": "call-413"}},
+                "plan_id": "plan-413", "plan_revision": 1, "session_id": session_id,
+                "parent": {"execution_id": "graph-413", "node_id": "node-413"}, "attempt": 1,
+                "model_input": {}, "effective_input": {}, "invocation": {"intent": {"name": "state_inspect"}}},
+        });
+        (facts, snapshot)
+    }
+
+    /// The same-source rebuild gives a reader the byte identical facts, and the
+    /// event no longer carries a second copy of the batch payload.
+    #[test]
+    fn member_admission_facts_dedupe_and_rebuild_are_byte_identical() {
+        let (facts, _) = a8_member_facts("session-413");
+        let inline = facts.clone();
+        let mut deduped = facts.clone();
+        dedupe_member_admission_facts(&mut deduped).expect("dedupe");
+        assert!(
+            serde_json::to_string(&deduped).unwrap().len()
+                < serde_json::to_string(&inline).unwrap().len(),
+            "the deduped facts must be smaller than the inline ones"
+        );
+        // The kept copy is still inline; every other copy points at it.
+        assert!(deduped["ticket"]["payload_ref"].is_string());
+        assert!(deduped["outer_hook"]["ticket"]["payload_ref"].is_object());
+        assert!(deduped["original_hook"]["step"]["snapshot"].is_object());
+        // The rebuild is byte identical to the inline shape.
+        let rebuilt = rebuild_member_admission_facts(&deduped).expect("rebuild");
+        assert_eq!(*rebuilt, inline);
+        // The old inline shape reads back unchanged.
+        let unchanged = rebuild_member_admission_facts(&inline).expect("rebuild inline");
+        assert_eq!(*unchanged, inline);
+    }
+
+    /// A pointer that cannot be resolved is an explicit failure: a missing
+    /// fact is never read as "no fact".
+    #[test]
+    fn member_admission_facts_rebuild_refuses_a_broken_pointer() {
+        let (facts, _) = a8_member_facts("session-413");
+        let mut deduped = facts.clone();
+        dedupe_member_admission_facts(&mut deduped).expect("dedupe");
+
+        // A pointer to a Step the batch does not carry is refused.
+        let mut unknown_step = deduped.clone();
+        unknown_step["original_hook"]["step"]["snapshot"] =
+            serde_json::json!({ BATCH_STEP_SNAPSHOT_POINTER: "step-unknown" });
+        let error = rebuild_member_admission_facts(&unknown_step).expect_err("unknown Step pointer");
+        assert!(error.contains("original member facts missing"), "{error}");
+
+        // A pointer to another Session's batch payload is refused.
+        let (foreign, _) = a8_member_facts("session-other");
+        let mut foreign_batch = deduped.clone();
+        foreign_batch["ticket"]["payload_ref"] = foreign["ticket"]["payload_ref"].clone();
+        let error = rebuild_member_admission_facts(&foreign_batch).expect_err("foreign Session");
+        assert!(error.contains("original member facts missing"), "{error}");
+
+        // A batch payload whose bytes do not match its digest is refused.
+        let mut broken = deduped.clone();
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(broken["ticket"]["payload_ref"].as_str().unwrap()).unwrap();
+        envelope["sha256"] = serde_json::Value::String("sha256:0000".into());
+        broken["ticket"]["payload_ref"] = serde_json::Value::String(envelope.to_string());
+        let error = rebuild_member_admission_facts(&broken).expect_err("broken digest");
+        assert!(error.contains("original member facts missing"), "{error}");
+    }
+
+    /// The action event one member of a batch writes, in the production
+    /// payload shape.
+    fn a8_action_event_payload(session_id: &str, members: usize) -> serde_json::Value {
+        let (facts, _) = a8_member_facts_for_batch(
+            session_id,
+            a8_batch_with_members(session_id, members),
+        );
+        let mut facts = facts;
+        dedupe_member_admission_facts(&mut facts).expect("dedupe");
+        serde_json::json!({
+            "envelope": {"action_id": "outer-413:0"},
+            "entity_ref": "entity-413",
+            "member_admission": facts,
+        })
+    }
+
+    /// The core benefit of the same-source payload: one member's action event
+    /// does not grow with the batch it belongs to.
+    ///
+    /// The batch payload the ticket names carries every member's call, so a
+    /// bigger batch makes that one copy bigger. What must not happen is the
+    /// event carrying a second copy of that payload, or a copy of the Step
+    /// snapshot it carries: the event stays inside one fixed budget, and
+    /// doubling the batch does not double it.
+    #[test]
+    fn agentic_action_event_size_is_almost_independent_of_the_batch_member_count() {
+        let small = a8_action_event_payload("session-413", 4);
+        let large = a8_action_event_payload("session-413", 8);
+        let small_bytes = serde_json::to_vec(&small).expect("encode").len();
+        let large_bytes = serde_json::to_vec(&large).expect("encode").len();
+        // Doubling the batch does not double the event: the increment is far
+        // below the linear growth of one member's facts per member.
+        assert!(
+            large_bytes < small_bytes + small_bytes / 4,
+            "the action event must not grow with the batch member count: {small_bytes} -> {large_bytes}"
+        );
+        // The event stays inside one fixed budget whatever the batch holds.
+        assert!(
+            large_bytes < 64 * 1024,
+            "one action event must stay inside the fixed budget: {large_bytes}"
+        );
+        // The bound is discriminating: the inline shape this patch replaced
+        // carries the batch payload and its Step snapshot again, and is more
+        // than double the deduped event.
+        let (inline, _) = a8_member_facts_for_batch(
+            "session-413",
+            a8_batch_with_members("session-413", 8),
+        );
+        let inline_bytes = serde_json::to_vec(&serde_json::json!({
+            "envelope": {"action_id": "outer-413:0"},
+            "entity_ref": "entity-413",
+            "member_admission": inline,
+        }))
+        .expect("encode")
+        .len();
+        assert!(
+            inline_bytes > large_bytes * 2,
+            "the inline shape must stay over twice the deduped event, or the bound proves nothing: {inline_bytes} vs {large_bytes}"
+        );
+    }
+
+    /// A single event that is still over the page budget is not silently
+    /// dropped, truncated or rewritten: the writer keeps every byte, and the
+    /// reader's explicit failure (the durable page budget) is untouched.
+    #[tokio::test]
+    async fn an_oversized_action_event_is_written_without_silent_truncation() {
+        let store = crate::RuntimeEventStore::for_test();
+        let (facts, _) = a8_member_facts("session-413");
+        let mut facts = facts;
+        dedupe_member_admission_facts(&mut facts).expect("dedupe");
+        let mut payload = serde_json::json!({
+            "envelope": {"action_id": "outer-413:0"},
+            "member_admission": facts,
+        });
+        payload["oversized"] = serde_json::Value::String("x".repeat(1024 * 1024 + 64));
+        let stream_id = "agentic-program:program-oversized";
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: "tx-oversized".into(),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: stream_id.into(),
+                expected_revision: 0,
+            }],
+            events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: stream_id.into(),
+                    scope: crate::RuntimeEventScope::Program,
+                    kind: "agentic.action_applied".into(),
+                    status: Some("applied".into()),
+                    actor: Some("agent".into()),
+                    refs: Vec::new(),
+                    payload: payload.clone(),
+                },
+                idempotency_key: Some("action-oversized".into()),
+                schema_version: 1,
+            }],
+        })
+        .expect("append oversized action event");
+        let stored = store
+            .event_by_idempotency_key(stream_id, "action-oversized")
+            .expect("read oversized action event")
+            .expect("oversized action event present");
+        // Every byte is kept: the writer neither drops nor rewrites the event.
+        assert_eq!(stored.payload, payload);
+    }
+
+    /// The producer writes the deduped action event and the reader reads the
+    /// byte identical facts back from the real durable event.
+    #[tokio::test]
+    async fn member_admission_action_event_reads_back_byte_identical_after_dedupe() {
+        let store = crate::RuntimeEventStore::for_test();
+        let (facts, _) = a8_member_facts("session-413");
+        let inline = facts.clone();
+        let mut deduped = facts.clone();
+        dedupe_member_admission_facts(&mut deduped).expect("dedupe");
+        let payload = serde_json::json!({
+            "envelope": {"action_id": "outer-413:0"},
+            "member_admission": deduped,
+        });
+        let stream_id = "agentic-program:program-413";
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: "tx-413".into(),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: stream_id.into(),
+                expected_revision: 0,
+            }],
+            events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: stream_id.into(),
+                    scope: crate::RuntimeEventScope::Program,
+                    kind: "agentic.action_applied".into(),
+                    status: Some("applied".into()),
+                    actor: Some("agent".into()),
+                    refs: Vec::new(),
+                    payload: payload.clone(),
+                },
+                idempotency_key: Some("action-413".into()),
+                schema_version: 1,
+            }],
+        })
+        .expect("append action event");
+        let stored = store
+            .event_by_idempotency_key(stream_id, "action-413")
+            .expect("read action event")
+            .expect("action event present");
+        // The durable event carries the deduped payload, and the reader
+        // rebuilds the byte identical facts from it.
+        assert!(stored.payload["member_admission"]["outer_hook"]["ticket"]["payload_ref"].is_object());
+        let rebuilt = rebuild_member_admission_payload(&stored.payload).expect("rebuild payload");
+        let rebuilt: &serde_json::Value = &rebuilt;
+        assert_eq!(rebuilt["member_admission"], inline);
+    }
 }

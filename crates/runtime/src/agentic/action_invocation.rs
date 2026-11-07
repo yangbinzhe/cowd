@@ -576,10 +576,30 @@ where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Outpu
         || original_ticket.attempt != attempt {
         return Err("original delegated AgentTask start ticket mismatch".into());
     }
-    let delegated_session_owner = services.agent_action_service().project_snapshot(&actor.program_id).ok()
+    let delegated_program = services.agent_action_service().project_snapshot(&actor.program_id).ok()
         .filter(|program| program.session_id == actor.session_id && program.turn_id == actor.turn_id
-            && program.root_execution_id == actor.root_execution_id)
-        .and_then(|program| services.original_conclusion_owner(&program))
+            && program.root_execution_id == actor.root_execution_id);
+    // The original Session owner is normally the live root ingress. Once the
+    // root graph has ended, that bus lease is gone, and the equivalent owner
+    // is recovered from the original Session fence the ingress installed: the
+    // same durable claim and the same original turn control, never a new one.
+    let delegated_owner = match delegated_program.as_ref() {
+        Some(program) => match services.original_conclusion_owner(program) {
+            Some(owner) => Some(owner),
+            None => match program.root_execution_id.as_deref() {
+                Some(root_execution_id) => services
+                    .recovered_original_conclusion_owner(
+                        &program.session_id,
+                        &program.turn_id,
+                        root_execution_id,
+                    )
+                    .await,
+                None => None,
+            },
+        },
+        None => None,
+    };
+    let delegated_session_owner = delegated_owner
         .filter(|owner| owner.claim.session_id() == actor.session_id && owner.claim.turn_id() == actor.turn_id)
         .map(|owner| DelegatedOriginalSessionOwner { owner, event_store: Arc::clone(services.event_store()), ticket: original_ticket.clone(), packet: packet.clone(), original_input: input.clone(), provider_capture: provider_capture.cloned() });
     if matches!(&binding.origin.source, harness_contract::step::CallSource::Process { .. }) {

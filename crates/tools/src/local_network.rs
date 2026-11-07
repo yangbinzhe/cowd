@@ -168,11 +168,49 @@ impl ToolHostLease {
         let trace = Arc::new(std::sync::Mutex::new(LocalNetworkTrace::default()));
         let mut lease = self.for_authorized_read_cache(authorization)?;
         lease.local_network_trace = Some(Arc::clone(&trace));
-        let output = tokio::task::spawn_blocking(move || lease.dispatch_sync(&canonical, &value))
-            .await
-            .map_err(|error| failure(&format!("local network host join failed: {error}")))??;
+        let dispatch = tokio::task::spawn_blocking(move || lease.dispatch_sync(&canonical, &value)).await;
+        let output = match dispatch {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                // The joined call failed after the host took it. The
+                // per-operation facts it produced travel with the failure, so
+                // a reader can tell "nothing was sent" from "we cannot prove
+                // it". The facts are copied out of the trace: the lease's own
+                // copy may still be alive on this path.
+                let fact = seal_failure_trace(binding.clone(), trace)?;
+                return Err(ToolHostError::LocalNetworkFailed {
+                    reason: error.to_string(),
+                    fact,
+                });
+            }
+            Err(error) => {
+                return Err(failure(&format!("local network host join failed: {error}")));
+            }
+        };
         Ok((output, seal_trace(binding, trace)?))
     }
+}
+
+/// Seal the trace of a failed joined call.
+///
+/// The lease's own copy of the trace may still be alive on the failure path,
+/// so the facts are copied out of the trace instead of consuming it. Every
+/// operation is reported exactly as the host recorded it: no operation is
+/// invented, dropped or rewritten.
+fn seal_failure_trace(
+    binding: ToolExecutionBinding,
+    trace: Arc<std::sync::Mutex<LocalNetworkTrace>>,
+) -> Result<LocalNetworkFact, ToolHostError> {
+    let trace = trace
+        .lock()
+        .map_err(|_| ToolHostError::Execution("local network trace poisoned".into()))?;
+    Ok(LocalNetworkFact {
+        version: 1,
+        binding,
+        host_joined: true,
+        coverage_complete: !trace.unsupported,
+        operations: trace.operations.clone(),
+    })
 }
 
 fn seal_trace(

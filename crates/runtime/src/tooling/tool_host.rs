@@ -527,6 +527,10 @@ impl AuthenticatedBatchMember {
             .and_then(|value| usize::try_from(value).ok()).ok_or("original member action position invalid")?;
         let action = transaction.events.get(action_index).ok_or("original member action absent")?;
         let facts = action.event.payload.get("member_admission").ok_or("original member facts absent")?;
+        // The member admission facts are read back from the same-source batch
+        // payload the action event keeps.
+        let facts = crate::step_snapshot::rebuild_member_admission_facts(facts)?;
+        let facts: &serde_json::Value = &facts;
         let outer = facts.pointer("/prepared/outer_key").and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty()).ok_or("original member outer missing")?;
         let identity = facts.pointer("/prepared/identity").and_then(serde_json::Value::as_str)
