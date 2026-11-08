@@ -45,6 +45,81 @@ struct OriginalActionCommit<'a> {
     committed_capture: Option<&'a std::cell::RefCell<Option<CommittedActionAppend>>>,
 }
 
+/// A call that was admitted and then refused while it ran.
+///
+/// The call's own effect key is the identity the refusal is written under:
+/// the consumer looks the fact up by the admitted call's own key, so a
+/// refusal written under any other key would never be read.
+pub struct RefusedCall<'a> {
+    /// The refused call's own effect key.
+    pub effect_key: &'a str,
+    /// The refused call's own tool use identity.
+    pub tool_use_id: &'a str,
+    pub tool_name: &'a str,
+    /// Why the call was refused, in the caller's own words.
+    pub reason: &'a str,
+}
+
+/// What became of a refused call's durable fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalOutcome {
+    /// The refusal is now a durable fact.
+    Recorded,
+    /// The call carried no admission intent, so no fact was written: there
+    /// is no half-written rejection for a consumer to read as one.
+    NotAdmitted,
+}
+
+/// The effect-stream twin of one durable rejection fact.
+///
+/// The twin is written on the rejected call's own effect stream, so a
+/// consumer finds the fact by the call's own key. The member shape and the
+/// refused-call shape differ only here: the key the twin is written under,
+/// and the member coordinates it carries.
+struct RejectionTwin {
+    /// The call's own effect key.
+    outer_key: String,
+    /// The twin's own idempotency key inside that stream.
+    idempotency_key: String,
+    /// The member ordinal this twin stands for, when the fact is a member's.
+    member_index: Option<usize>,
+    member_identity: Option<String>,
+    ticket: serde_json::Value,
+}
+
+/// The identity one durable rejection fact is written under.
+///
+/// The program's rejection event and its effect-stream twin are one fact:
+/// the program event names the rejected call, and the twin names the program
+/// event it belongs to, so the pair is authenticated as the one transaction
+/// that wrote both.
+struct RejectionIdentity<'a> {
+    program_id: &'a str,
+    session_id: &'a str,
+    program_revision: u64,
+    /// The program event's actor, and the objective it references.
+    actor_id: &'a str,
+    objective_id: &'a str,
+    /// The idempotency basis of the program event: the rejected call's id.
+    action_id: &'a str,
+    code: &'a str,
+    gap: &'a str,
+    /// The program event's own payload.
+    payload: serde_json::Value,
+    /// What a re-entry read-back compares, field by field.
+    replay: RejectionReplay<'a>,
+    /// The effect-stream twin, when this fact names the call's own effect.
+    twin: Option<RejectionTwin>,
+}
+
+/// What a re-entry read-back compares, field by field.
+enum RejectionReplay<'a> {
+    /// An Agent action's rejection: its envelope, and the fields beside it.
+    AgentAction { envelope: &'a AgentActionEnvelope },
+    /// A refused call's own coordinates.
+    RefusedCall { effect_key: &'a str },
+}
+
 /// Created only from this store owner's successful checked append. A public
 /// deserialized receipt cannot construct this capability.
 /// Original checked commits and verified unknown-outcome reads share the same
@@ -2842,13 +2917,47 @@ impl AgentActionService {
     /// This index is appended in the same original transaction as the Program
     /// event; it grants no authority and its reader must authenticate both
     /// events and their shared transaction receipt.
-    fn original_member_index_event(
-        envelope: &AgentActionEnvelope,
-        context: Option<&OriginalActionCommit<'_>>,
-        program_event_index: usize,
+    /// The effect-stream twin of one rejection fact.
+    ///
+    /// The member shape and the refused-call shape are the same fact: the
+    /// kind, scope, actor, status, schema and payload fields are identical,
+    /// so one consumer reads one shape. Only the key the twin is written
+    /// under, and the member coordinates it carries, differ.
+    fn rejection_index_event(
+        program_id: &str,
+        twin: &RejectionTwin,
+        program_event_index: u32,
         program_event_kind: &str,
         program_event_key: &str,
-    ) -> Result<Option<RuntimeTransactionEventInput>, AgentActionServiceError> {
+    ) -> RuntimeTransactionEventInput {
+        RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: format!("execution-effect:{}", twin.outer_key),
+                scope: RuntimeEventScope::ExecutionNode,
+                kind: "agentic.batch_member.index".into(),
+                status: Some("committed".into()),
+                actor: Some("runtime.agentic_action".into()),
+                refs: vec![RuntimeEventRef { kind: "agentic_program".into(), id: program_id.to_string() }],
+                payload: json!({
+                    "outer_key": twin.outer_key, "member_index": twin.member_index,
+                    "member_identity": twin.member_identity, "ticket": twin.ticket,
+                    "program_stream": program_stream(program_id),
+                    "program_event_kind": program_event_kind, "program_event_key": program_event_key,
+                    "program_event_index": program_event_index,
+                }),
+            },
+            idempotency_key: Some(twin.idempotency_key.clone()),
+            schema_version: 1,
+        }
+    }
+
+    /// The member's own effect-stream twin, when this fact is a member's.
+    ///
+    /// The twin is written on the member batch's outer effect stream, and
+    /// the outer source must be one this owner already holds locked.
+    fn original_member_twin(
+        context: Option<&OriginalActionCommit<'_>>,
+    ) -> Result<Option<RejectionTwin>, AgentActionServiceError> {
         let Some(facts) = context.and_then(|owner| owner.member_call_facts.as_ref()) else { return Ok(None); };
         let owner = context.ok_or_else(|| AgentActionServiceError::Corrupt("member owner missing".into()))?;
         let prepared: crate::step_snapshot::PreparedAgentBatchMember = serde_json::from_value(
@@ -2865,29 +2974,59 @@ impl AgentActionService {
         if !owner.sources.iter().any(|source| source.stream_id == stream_id) {
             return Err(AgentActionServiceError::Corrupt("member original outer effect source is not locked".into()));
         }
+        Ok(Some(RejectionTwin {
+            outer_key: prepared.outer_key.clone(),
+            idempotency_key: format!("agentic-member:{}", prepared.index),
+            member_index: Some(prepared.index),
+            member_identity: Some(prepared.identity.clone()),
+            ticket: facts["ticket"].clone(),
+        }))
+    }
+
+    /// The effect-stream twin for a single call's own rejection.
+    ///
+    /// A single Agent action is refused under its own effect key, so its
+    /// twin belongs on that call's own stream. The twin exists only when
+    /// the call carries its own admission intent: a fact nobody can read
+    /// is not written.
+    fn single_call_rejection_twin(
+        &self,
+        member: Option<&OriginalActionCommit<'_>>,
+        action_id: &str,
+    ) -> Result<Option<RejectionTwin>, AgentActionServiceError> {
+        let Some(context) = member else { return Ok(None); };
+        let Some(facts) = context.single_call_facts.as_ref() else { return Ok(None); };
+        if self.authenticate_call_admission(action_id, None, None)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(RejectionTwin {
+            outer_key: action_id.to_string(),
+            idempotency_key: format!("agentic-single:{}", action_id),
+            member_index: None,
+            member_identity: None,
+            ticket: facts["ticket"].clone(),
+        }))
+    }
+
+    fn original_member_index_event(
+        envelope: &AgentActionEnvelope,
+        context: Option<&OriginalActionCommit<'_>>,
+        program_event_index: usize,
+        program_event_kind: &str,
+        program_event_key: &str,
+    ) -> Result<Option<RuntimeTransactionEventInput>, AgentActionServiceError> {
+        let Some(twin) = Self::original_member_twin(context)? else { return Ok(None); };
         let program_event_index = u32::try_from(program_event_index)
             .map_err(|_| {
                 AgentActionServiceError::Corrupt("member program event index overflow".into())
             })?;
-        Ok(Some(RuntimeTransactionEventInput {
-            event: RuntimeEventInput {
-                stream_id,
-                scope: RuntimeEventScope::ExecutionNode,
-                kind: "agentic.batch_member.index".into(),
-                status: Some("committed".into()),
-                actor: Some("runtime.agentic_action".into()),
-                refs: vec![RuntimeEventRef { kind: "agentic_program".into(), id: envelope.actor.program_id.clone() }],
-                payload: json!({
-                    "outer_key": prepared.outer_key, "member_index": prepared.index,
-                    "member_identity": prepared.identity, "ticket": facts["ticket"],
-                    "program_stream": program_stream(&envelope.actor.program_id),
-                    "program_event_kind": program_event_kind, "program_event_key": program_event_key,
-                    "program_event_index": program_event_index,
-                }),
-            },
-            idempotency_key: Some(format!("agentic-member:{}", prepared.index)),
-            schema_version: 1,
-        }))
+        Ok(Some(Self::rejection_index_event(
+            &envelope.actor.program_id,
+            &twin,
+            program_event_index,
+            program_event_kind,
+            program_event_key,
+        )))
     }
 
     fn append_original_action_transaction(
@@ -4775,31 +4914,6 @@ impl AgentActionService {
         physical_source: Option<&ExpectedStreamRevision>,
         member: Option<&OriginalActionCommit<'_>>,
     ) -> Result<(), AgentActionServiceError> {
-        if self
-            .store
-            .is_session_recovery_excluded(&projection.session_id)
-        {
-            return Err(AgentActionServiceError::EventStore(
-                "completion rejection journal excluded".into(),
-            ));
-        }
-        let stream_id = program_stream(&projection.program_id);
-        if let Some(existing) = self.store.event_by_idempotency_key(
-            &stream_id, &format!("completion-rejected:{}", envelope.action_id),
-        )? {
-            if !self.completion_rejection_replay_is_fenced(&existing, envelope)?
-                || existing.payload["program_id"] != projection.program_id
-                || existing.payload["code"] != code
-                || existing.payload["objective_id"] != envelope.actor.objective_id
-                || existing.payload["action"] != serde_json::to_value(&envelope.action)?
-                || serde_json::from_value::<AgentActionEnvelope>(existing.payload["envelope"].clone())? != *envelope
-                || existing.payload["gap"] != gap
-                || existing.actor.as_deref() != Some(envelope.actor.actor_id.as_str())
-            {
-                return Err(AgentActionServiceError::Corrupt("completion rejection replay conflicts with original event".into()));
-            }
-            return Ok(());
-        }
         let mut rejection_payload = json!({
             "program_id": projection.program_id,
             "request_action_id": envelope.action_id,
@@ -4821,20 +4935,72 @@ impl AgentActionService {
             })?;
             rejection_payload["member_admission"] = facts;
         }
+        let identity = RejectionIdentity {
+            program_id: &projection.program_id,
+            session_id: &projection.session_id,
+            program_revision: projection.revision,
+            actor_id: &envelope.actor.actor_id,
+            objective_id: &envelope.actor.objective_id,
+            action_id: &envelope.action_id,
+            code,
+            gap,
+            payload: rejection_payload,
+            replay: RejectionReplay::AgentAction { envelope },
+            twin: match Self::original_member_twin(member)? {
+                Some(twin) => Some(twin),
+                None => self.single_call_rejection_twin(member, &envelope.action_id)?,
+            },
+        };
+        self.record_rejection_fact(&identity, physical_source, member)
+    }
+
+    /// Write one durable rejection fact.
+    ///
+    /// The program event and its effect-stream twin are written in one
+    /// transaction: the twin names the program event it belongs to, and the
+    /// pair is authenticated as the one transaction that wrote both. A fact
+    /// that is already there is read back field by field - the same
+    /// rejection is not written twice, and a different one under the same
+    /// key is a corruption.
+    fn record_rejection_fact(
+        &self,
+        identity: &RejectionIdentity<'_>,
+        physical_source: Option<&ExpectedStreamRevision>,
+        member: Option<&OriginalActionCommit<'_>>,
+    ) -> Result<(), AgentActionServiceError> {
+        if self
+            .store
+            .is_session_recovery_excluded(identity.session_id)
+        {
+            return Err(AgentActionServiceError::EventStore(
+                "completion rejection journal excluded".into(),
+            ));
+        }
+        let stream_id = program_stream(identity.program_id);
+        let program_event_key = format!("completion-rejected:{}", identity.action_id);
+        if let Some(existing) = self
+            .store
+            .event_by_idempotency_key(&stream_id, &program_event_key)?
+        {
+            if !self.rejection_replay_is_fenced(&existing, identity)? {
+                return Err(AgentActionServiceError::Corrupt("completion rejection replay conflicts with original event".into()));
+            }
+            return Ok(());
+        }
         let event = RuntimeTransactionEventInput {
             event: RuntimeEventInput {
-                stream_id,
+                stream_id: stream_id.clone(),
                 scope: RuntimeEventScope::Program,
                 kind: COMPLETION_REJECTED_EVENT_KIND.to_string(),
                 status: Some("rejected".to_string()),
-                actor: Some(envelope.actor.actor_id.clone()),
+                actor: Some(identity.actor_id.to_string()),
                 refs: vec![RuntimeEventRef {
                     kind: "objective".to_string(),
-                    id: envelope.actor.objective_id.clone(),
+                    id: identity.objective_id.to_string(),
                 }],
-                payload: rejection_payload,
+                payload: identity.payload.clone(),
             },
-            idempotency_key: Some(format!("completion-rejected:{}", envelope.action_id)),
+            idempotency_key: Some(program_event_key.clone()),
             schema_version: 1,
         };
         // Same two corrections as the discipline-conflict marker: append while
@@ -4844,8 +5010,8 @@ impl AgentActionService {
         // count it exists to feed never saw a single one, behind a `let _ =` that
         // swallowed the error for the life of the feature.
         let mut expected_streams = vec![ExpectedStreamRevision {
-            stream_id: program_stream(&projection.program_id),
-            expected_revision: projection.revision,
+            stream_id,
+            expected_revision: identity.program_revision,
         }];
         if let Some(source) = physical_source {
             if let Some(existing) = expected_streams.iter().find(|entry| entry.stream_id == source.stream_id) {
@@ -4857,16 +5023,167 @@ impl AgentActionService {
             }
         }
         let mut events = vec![event];
-        if let Some(index) = Self::original_member_index_event(
-            envelope, member, 0, COMPLETION_REJECTED_EVENT_KIND,
-            &format!("completion-rejected:{}", envelope.action_id),
-        )? { events.push(index); }
+        if let Some(twin) = &identity.twin {
+            let twin_stream = format!("execution-effect:{}", twin.outer_key);
+            if !expected_streams.iter().any(|entry| entry.stream_id == twin_stream) {
+                let revision = self.store.stream_revision(&twin_stream)?;
+                expected_streams.push(ExpectedStreamRevision {
+                    stream_id: twin_stream,
+                    expected_revision: revision,
+                });
+            }
+            events.push(Self::rejection_index_event(
+                identity.program_id,
+                twin,
+                0,
+                COMPLETION_REJECTED_EVENT_KIND,
+                &program_event_key,
+            ));
+        }
         self.append_original_action_transaction(AppendTransactionRequest {
-            transaction_id: format!("completion-rejected:{}:{}", projection.program_id, envelope.action_id),
+            transaction_id: format!("completion-rejected:{}:{}", identity.program_id, identity.action_id),
             expected_streams,
             events,
         }, member)?;
         Ok(())
+    }
+
+    /// Authenticate the admission intent of one call, by the call's own key.
+    ///
+    /// A refusal is only durable when the call it refuses was admitted. The
+    /// consumer reads refusals by the admitted call's own key, so a refusal
+    /// of a call that carries no admission intent would be a fact nobody
+    /// reads, and would claim a decision that was never taken.
+    fn authenticate_call_admission(
+        &self,
+        effect_key: &str,
+        tool_use_id: Option<&str>,
+        tool_name: Option<&str>,
+    ) -> Result<Option<crate::DurableRuntimeEvent>, AgentActionServiceError> {
+        // The admission of a call is read by the runtime's single reader: the
+        // same question the closure and the delegated-action gate ask, so
+        // this writer can never answer differently from them. An admission
+        // the reader cannot interpret is no admission here - nothing is
+        // written on the account of a fact this side cannot read.
+        let admission =
+            crate::execution_core::graph::read_effect_admission(&self.store, effect_key)
+                .map_err(|error| AgentActionServiceError::EventStore(error.to_string()))?;
+        if admission != crate::execution_core::graph::EffectAdmission::Admitted {
+            return Ok(None);
+        }
+        let Some(intent) =
+            crate::execution_core::graph::read_effect_admission_intent(&self.store, effect_key)
+                .map_err(|error| AgentActionServiceError::EventStore(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        // On top of that reading, this side keeps one narrower check of its
+        // own: the admission must name this call's own tool use and tool.
+        if intent.payload["idempotency_key"] != effect_key
+            || tool_use_id.is_some_and(|value| intent.payload["tool_use_id"] != value)
+            || tool_name.is_some_and(|value| intent.payload["tool_name"] != value)
+        {
+            return Ok(None);
+        }
+        Ok(Some(intent))
+    }
+
+    /// Record the durable terminal refusal of a call that was admitted and
+    /// then refused while it ran.
+    ///
+    /// The fact is the program's rejection event and its effect-stream twin,
+    /// written as one transaction under the refused call's own effect key.
+    /// A call without its own admission intent gets no fact at all: the
+    /// consumer would never read it, and writing one would claim a refusal
+    /// the runtime never decided.
+    pub fn record_refused_admitted_call(
+        &self,
+        projection: &AgenticProgramProjection,
+        call: &RefusedCall<'_>,
+    ) -> Result<RefusalOutcome, AgentActionServiceError> {
+        let Some(intent) =
+            self.authenticate_call_admission(call.effect_key, Some(call.tool_use_id), Some(call.tool_name))?
+        else {
+            return Ok(RefusalOutcome::NotAdmitted);
+        };
+        let code = "call_refused_after_admission";
+        let identity = RejectionIdentity {
+            program_id: &projection.program_id,
+            session_id: &projection.session_id,
+            program_revision: projection.revision,
+            actor_id: "runtime.agentic_action",
+            objective_id: &projection.objective_id,
+            action_id: call.effect_key,
+            code,
+            gap: call.reason,
+            payload: json!({
+                "program_id": projection.program_id,
+                "request_action_id": call.effect_key,
+                "code": code,
+                "objective_id": projection.objective_id,
+                "action": call.tool_name,
+                "envelope": serde_json::Value::Null,
+                "gap": call.reason,
+                "refused_call": {
+                    "effect_key": call.effect_key,
+                    "tool_use_id": call.tool_use_id,
+                    "tool_name": call.tool_name,
+                    "admission": {
+                        "stream_id": intent.stream_id,
+                        "event_id": intent.event_id,
+                        "kind": intent.kind,
+                        "commit_cursor": intent.commit_cursor,
+                    },
+                },
+            }),
+            replay: RejectionReplay::RefusedCall { effect_key: call.effect_key },
+            twin: Some(RejectionTwin {
+                outer_key: call.effect_key.to_string(),
+                idempotency_key: format!("agentic-single:{}", call.effect_key),
+                member_index: None,
+                member_identity: None,
+                ticket: serde_json::Value::Null,
+            }),
+        };
+        self.record_rejection_fact(&identity, None, None)?;
+        Ok(RefusalOutcome::Recorded)
+    }
+
+    /// The fence a rejection fact's re-entry read-back must satisfy.
+    ///
+    /// Each shape compares the fields that identify it: an Agent action's
+    /// rejection is fenced by its envelope, a refused call's by the call's
+    /// own coordinates. A fact that cannot prove its own identity is not a
+    /// replay of this rejection.
+    fn rejection_replay_is_fenced(
+        &self,
+        event: &crate::DurableRuntimeEvent,
+        identity: &RejectionIdentity<'_>,
+    ) -> Result<bool, AgentActionServiceError> {
+        match identity.replay {
+            RejectionReplay::AgentAction { envelope } => {
+                Ok(self.completion_rejection_replay_is_fenced(event, envelope)?
+                    && event.payload["program_id"] == identity.program_id
+                    && event.payload["code"] == identity.code
+                    && event.payload["objective_id"] == identity.objective_id
+                    && event.payload["action"] == serde_json::to_value(&envelope.action)?
+                    && serde_json::from_value::<AgentActionEnvelope>(event.payload["envelope"].clone())? == *envelope
+                    && event.payload["gap"] == identity.gap
+                    && event.actor.as_deref() == Some(identity.actor_id))
+            }
+            RejectionReplay::RefusedCall { effect_key } => {
+                Ok(event.stream_id == program_stream(identity.program_id)
+                    && event.kind == COMPLETION_REJECTED_EVENT_KIND
+                    && event.scope == RuntimeEventScope::Program
+                    && event.schema_version == 1
+                    && event.status.as_deref() == Some("rejected")
+                    && event.actor.as_deref() == Some(identity.actor_id)
+                    && event.idempotency_key.as_deref()
+                        == Some(format!("completion-rejected:{}", identity.action_id).as_str())
+                    && event.payload["request_action_id"] == effect_key
+                    && event.payload["code"] == identity.code)
+            }
+        }
     }
 
     /// Borrow the original in-process call custody, if the current request

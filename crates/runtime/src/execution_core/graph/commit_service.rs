@@ -3091,6 +3091,12 @@ pub enum ExecutionCommitError {
     AlreadyAppliedSame { graph_id: String },
     #[error("domain event attempted to mutate canonical graph stream `{0}`")]
     GraphStreamCollision(String),
+    /// The physical closure proof read stream heads and re-read them after
+    /// the leaf checks: a source moved under the proof. The owner is still
+    /// writing, so the lease recovery keeps re-proving inside the existing
+    /// physical-closure budget instead of failing the node closed.
+    #[error("physical closure sources moved under the proof: {stream_id}")]
+    PhysicalClosureSourceMoved { stream_id: String },
     #[error("domain event for stream `{0}` has no stable idempotency key")]
     MissingDomainIdempotency(String),
     #[error("graph executor cannot emit protected domain scope `{0}`")]
@@ -3099,6 +3105,33 @@ pub enum ExecutionCommitError {
     BlockingTask(String),
     #[error("execution graph replan is invalid: {0}")]
     InvalidReplan(String),
+}
+
+impl ExecutionCommitError {
+    /// Whether this commit error is the owner still working, so the lease
+    /// recovery keeps re-proving inside the physical-closure budget: a
+    /// source that moved under the proof, or a transaction that raced a
+    /// concurrent writer. The match is closed on purpose: a cause added
+    /// later fails to compile here until it is classified deliberately,
+    /// and nothing is retried by default.
+    pub(crate) fn keeps_the_closure_waiting(&self) -> bool {
+        match self {
+            Self::PhysicalClosureSourceMoved { .. } => true,
+            Self::EventStore(RuntimeEventStoreError::StaleRevision { .. }) => true,
+            Self::EventStore(_) => false,
+            Self::Transition(_) => false,
+            Self::Serialization(_) => false,
+            Self::StaleRevision { .. } => false,
+            Self::InvalidCommand(_) => false,
+            Self::EffectAdmissionUnknown { .. } => false,
+            Self::AlreadyAppliedSame { .. } => false,
+            Self::GraphStreamCollision(_) => false,
+            Self::MissingDomainIdempotency(_) => false,
+            Self::ProtectedDomainScope(_) => false,
+            Self::BlockingTask(_) => false,
+            Self::InvalidReplan(_) => false,
+        }
+    }
 }
 
 struct TerminalCheckedSources { digest: String }
@@ -3310,8 +3343,80 @@ fn merge_outcome_source_revisions(
 /// a ring that can never hold for this node, so waiting cannot help.
 pub(crate) enum PhysicalClosureProof {
     Proven(Vec<ExpectedStreamRevision>),
-    Pending,
+    Pending(PhysicalClosurePending),
     Unprovable { ring: &'static str, reason: String },
+}
+
+/// Why one physical closure proof is still waiting. The set is closed on
+/// purpose: a wait added later is classified here, never absorbed by a
+/// catch-all.
+pub(crate) enum PhysicalClosurePending {
+    /// A source moved between the proof's first read and its re-read. The
+    /// owner is still writing, so the closure re-proves on a fresh view
+    /// inside the physical-closure budget; the stream that moved travels
+    /// with the verdict so the commit can name it.
+    SourceMoved { stream_id: String },
+    /// The leaf proof has no terminal fact for the node yet: a dispatched
+    /// call whose terminal receipt has not landed, a bound call with no
+    /// receipt event, or a no-dispatch fact whose effect stream is not
+    /// empty yet. The owner is still working, and at the recovery boundary
+    /// this keeps the judgement it has always had.
+    LeafIncomplete,
+    /// The agent run's lifecycle stream moved under its read, or its exit
+    /// is not durable yet. It keeps the judgement it has always had at the
+    /// recovery boundary.
+    AgentRunUnsettled,
+}
+
+impl PhysicalClosurePending {
+    /// Whether this wait re-proves inside the physical-closure budget. A
+    /// source that moved is read again on a fresh view; the other waits
+    /// name causes the recovery cannot shorten by waiting, so they stay
+    /// fatal there. The match is closed: a wait added later is classified
+    /// here deliberately.
+    pub(crate) fn re_proves_inside_the_closure_budget(&self) -> bool {
+        match self {
+            Self::SourceMoved { .. } => true,
+            Self::LeafIncomplete => false,
+            Self::AgentRunUnsettled => false,
+        }
+    }
+}
+
+/// Map one physical closure proof onto the normal-release closure's fenced
+/// sources, or the commit error that names why it has none.
+///
+/// A proof that is still waiting because a source moved under it is reported
+/// as a typed retryable error: the owner is still writing, and the lease
+/// recovery keeps re-proving inside the physical-closure budget. A proof
+/// waiting for any other reason, and a proof that names a ring which can
+/// never hold, stay an invalid command.
+fn normal_release_closure_sources(
+    proof: PhysicalClosureProof,
+) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
+    match proof {
+        PhysicalClosureProof::Proven(sources) => Ok(sources),
+        PhysicalClosureProof::Pending(pending) => match pending {
+            // The stream that moved crosses the boundary as a typed
+            // retryable error, never as this message: the message is
+            // shared with the other waiting causes, and the recovery
+            // classifies the wait by type.
+            PhysicalClosurePending::SourceMoved { stream_id } => {
+                Err(ExecutionCommitError::PhysicalClosureSourceMoved { stream_id })
+            }
+            PhysicalClosurePending::LeafIncomplete
+            | PhysicalClosurePending::AgentRunUnsettled => Err(
+                ExecutionCommitError::InvalidCommand(
+                    "normal binding physical closure is not positively proven".into(),
+                ),
+            ),
+        },
+        PhysicalClosureProof::Unprovable { ring, reason } => Err(
+            ExecutionCommitError::InvalidCommand(format!(
+                "normal binding physical closure is not positively proven: {ring}: {reason}"
+            )),
+        ),
+    }
 }
 
 
@@ -12489,9 +12594,15 @@ impl ExecutionCommitService {
         }
         match self.binding_physical_sources_with_witness(graph, node, binding, witness)? {
             PhysicalClosureProof::Proven(sources) => Ok(Some(sources)),
-            PhysicalClosureProof::Pending => Err(ExecutionCommitError::InvalidCommand(
-                "NoDispatch current physical sources are incomplete".into(),
-            )),
+            // A source that moved under this proof is the same wait it has
+            // always been here: the NoDispatch readers do not re-prove, so
+            // the typed retryable error belongs to the lease closure's
+            // commit, not to this consumer.
+            PhysicalClosureProof::Pending(_) => {
+                Err(ExecutionCommitError::InvalidCommand(
+                    "NoDispatch current physical sources are incomplete".into(),
+                ))
+            }
             PhysicalClosureProof::Unprovable { ring, reason } => {
                 Err(ExecutionCommitError::InvalidCommand(format!(
                     "NoDispatch current physical sources are incomplete: {ring}: {reason}"
@@ -14102,7 +14213,9 @@ impl ExecutionCommitService {
                     // source change, so the closure is unsettled and reads
                     // again on the fresh view; it is not a fact that can never
                     // hold.
-                    return Ok(PhysicalClosureProof::Pending);
+                    return Ok(PhysicalClosureProof::Pending(
+                        PhysicalClosurePending::AgentRunUnsettled,
+                    ));
                 }
                 Err(error) => return Err(ExecutionCommitError::InvalidCommand(error)),
             };
@@ -14110,7 +14223,9 @@ impl ExecutionCommitService {
             else {
                 // The agent run's exit is durable and notifies on commit, so
                 // this ring is still pending rather than permanently unprovable.
-                return Ok(PhysicalClosureProof::Pending);
+                return Ok(PhysicalClosureProof::Pending(
+                    PhysicalClosurePending::AgentRunUnsettled,
+                ));
             };
             sources.extend(exit_sources);
         }
@@ -14190,15 +14305,27 @@ impl ExecutionCommitService {
                     ));
                     return Ok(PhysicalClosureProof::Unprovable { ring, reason });
                 }
-                return Ok(PhysicalClosureProof::Pending);
+                // The leaf proof has no terminal fact yet: the owner is
+                // still working. At the recovery boundary this keeps the
+                // judgement it has always had.
+                return Ok(PhysicalClosureProof::Pending(
+                    PhysicalClosurePending::LeafIncomplete,
+                ));
             };
             leaf
         };
         sources.extend(leaf);
         for source in &sources {
             if self.event_store.stream_revision(&source.stream_id)? != source.expected_revision {
-                // A source moved under the proof: read it again.
-                return Ok(PhysicalClosureProof::Pending);
+                // A source moved under the proof: read it again. The owner
+                // is still writing, so this is a retryable wait inside the
+                // closure budget, never a ring; the stream that moved
+                // travels with the verdict so the commit can name it.
+                return Ok(PhysicalClosureProof::Pending(
+                    PhysicalClosurePending::SourceMoved {
+                        stream_id: source.stream_id.clone(),
+                    },
+                ));
             }
         }
         Ok(PhysicalClosureProof::Proven(sources))
@@ -14530,7 +14657,14 @@ impl ExecutionCommitService {
         }
         for source in &sources {
             if self.event_store.stream_revision(&source.stream_id)? != source.expected_revision {
-                return Ok(None);
+                // The same wait the commit step reports: a source moved
+                // under this longer proof window. It crosses as the typed
+                // retryable error so the recovery re-proves instead of
+                // naming an unproven quiescence; the other reasons this
+                // function has no quiescence keep returning `None`.
+                return Err(ExecutionCommitError::PhysicalClosureSourceMoved {
+                    stream_id: source.stream_id.clone(),
+                });
             }
         }
         Ok(Some(BindingRecoveryQuiescence {
@@ -14578,22 +14712,13 @@ impl ExecutionCommitService {
         let mut closure = released.closure().clone();
         let mut release_sources = released.sources().to_vec();
         if closure.source == "normal_release" {
-            let physical_sources = match self.binding_physical_sources_with_witness(
+            let proof = self.binding_physical_sources_with_witness(
                 graph,
                 &closure.node_id,
                 &closure.binding,
                 witness,
-            )? {
-                PhysicalClosureProof::Proven(sources) => sources,
-                PhysicalClosureProof::Pending => {
-                    return Err(invalid("normal binding physical closure is not positively proven"));
-                }
-                PhysicalClosureProof::Unprovable { ring, reason } => {
-                    return Err(invalid(&format!(
-                        "normal binding physical closure is not positively proven: {ring}: {reason}"
-                    )));
-                }
-            };
+            )?;
+            let physical_sources = normal_release_closure_sources(proof)?;
             release_sources.extend(physical_sources);
         }
         let (ticket, _) = ExecutionGraphStateStore::new(self.event_store.clone())
@@ -18418,6 +18543,590 @@ mod failure_shape_tests {
         assert!(
             sources.is_none(),
             "another call's refusal closes nothing for this call"
+        );
+    }
+
+    // ---- C-c: a source that moves under the proof is a retryable wait ----
+
+    use crate::execution_core::graph::events::ExecutionBindingLeaseClosure;
+    use crate::execution_core::graph::recovery::{ExecutionGraphRecovery, ExecutionRecoveryError};
+    use crate::execution_core::graph::registry::{
+        NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor,
+        NodeExecutorError, NodeExecutorRegistry,
+    };
+    use crate::execution_core::graph::resources::{
+        ExecutionResourceKind, ExecutionResourceManager, ResourceQuota, ScopeLockManager,
+        ScopeLockMode, ScopeLockRequest, ScopedResource, WorktreeLeaseManager,
+    };
+
+    /// A minimal executor registered under the ToolBatch kind so the lease
+    /// recovery can authenticate a ToolBatch node's binding. The node has
+    /// already completed when the recovery runs, so `start` and
+    /// `poll_or_await` are never reached on this path.
+    struct SourceMovedToolBatchExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for SourceMovedToolBatchExecutor {
+        fn kind(&self) -> &str {
+            "tool_batch"
+        }
+
+        fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+            Ok(())
+        }
+
+        async fn start(
+            &self,
+            context: NodeExecutionContext,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            Ok(NodeExecutionTicket {
+                graph_id: context.graph.id.clone(),
+                node_id: context.node.id.clone(),
+                executor_kind: self.kind().to_string(),
+                service_class: context.graph.service_class,
+                attempt: context.attempt,
+                idempotency_key: format!("{}:{}", context.node.idempotency_key, context.attempt),
+                payload_ref: context.node.payload_ref.clone(),
+            })
+        }
+
+        async fn poll_or_await(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            Err(NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "the source-moved fixture never polls a completed node".into(),
+            })
+        }
+    }
+
+    /// The C-c race fixture: one ToolBatch node whose single planned member
+    /// was durably refused during execution, so the closure proves the
+    /// refusal and fences the call's own effect stream at the head the
+    /// proof read.
+    struct SourceMovedRaceFixture {
+        _root: std::path::PathBuf,
+        events: Arc<RuntimeEventStore>,
+        state: ExecutionGraphStateStore,
+        commits: ExecutionCommitService,
+        scopes: Arc<ScopeLockManager>,
+        worktrees: Arc<WorktreeLeaseManager>,
+        resources: Arc<ExecutionResourceManager>,
+        registry: Arc<NodeExecutorRegistry>,
+    }
+
+    impl SourceMovedRaceFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("a10-source-moved-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).expect("race fixture root");
+            let events = Arc::new(RuntimeEventStore::for_test());
+            let state = ExecutionGraphStateStore::new(events.clone());
+            let commits = ExecutionCommitService::new(events.clone());
+            let scopes = Arc::new(
+                ScopeLockManager::persistent(root.join("scopes")).expect("scope manager"),
+            );
+            let worktrees = Arc::new(
+                WorktreeLeaseManager::open(root.join("worktrees.json")).expect("worktree leases"),
+            );
+            let resources = Arc::new(ExecutionResourceManager::new([(
+                ExecutionResourceKind::Tool,
+                ResourceQuota::new(1, 2, 2).unwrap(),
+            )]));
+            let registry = Arc::new(NodeExecutorRegistry::new());
+            registry
+                .register(Arc::new(SourceMovedToolBatchExecutor))
+                .expect("tool batch executor");
+            Self {
+                _root: root,
+                events,
+                state,
+                commits,
+                scopes,
+                worktrees,
+                resources,
+                registry,
+            }
+        }
+
+        /// Register the graph and complete its one ToolBatch node, then seed
+        /// the member call's durable refusal: the admission intent on the
+        /// owner index stream, and the refusal marker with its program twin
+        /// in one checked transaction on the call's own effect stream.
+        /// `prefix_events` benign events are written ahead of the marker so
+        /// the proof's read of that stream has a real window to be raced
+        /// in. The scope lease, the resource lease and the owner fence are
+        /// acquired for the start and released again, the way a restart
+        /// finds the binding.
+        async fn terminal_refused_toolbatch(
+            &self,
+            name: &str,
+            key: &str,
+            prefix_events: usize,
+        ) -> (ExecutionGraph, ExecutionNodeBinding, String) {
+            let payload = crate::step_snapshot::encode_persisted_tool_batch(&json!({
+                "session_id": format!("{name}-session"), "step_snapshots": {}, "calls": []
+            }))
+            .expect("persisted batch");
+            let spec = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", payload);
+            let graph = ExecutionGraph::new(name.to_string());
+            let graph_id = graph.id.clone();
+            let task_id = format!("test-task:{graph_id}");
+            let mut graph = graph.with_lineage(
+                harness_contract::execution_graph::ExecutionGraphLineage {
+                    session_id: "test-session".to_string(),
+                    turn_id: format!("test-turn:{graph_id}"),
+                    root_task_id: task_id.clone(),
+                    task_id,
+                    generation: 1,
+                },
+            );
+            graph.nodes.push(spec.clone());
+            let graph = self.commits.register_graph(graph).expect("register").graph;
+            let graph = self
+                .commits
+                .transition_node(&graph, &spec.id, ExecutionNodeStatus::Ready, None, Vec::new())
+                .expect("ready")
+                .graph;
+            let scope = self
+                .scopes
+                .try_acquire([ScopeLockRequest {
+                    scope: ScopedResource::Resource {
+                        namespace: "a10-race".into(),
+                        key: "reader".into(),
+                    },
+                    mode: ScopeLockMode::Read,
+                }])
+                .unwrap()
+                .unwrap();
+            let resource = self
+                .resources
+                .acquire(ExecutionResourceKind::Tool, None)
+                .await
+                .expect("resource");
+            let binding = ExecutionNodeBinding {
+                executor_kind: "tool_batch".into(),
+                ticket_idempotency_key: spec.idempotency_key.clone(),
+                // The first attempt of a fresh node: the start ticket the
+                // owner fence validates must name it.
+                attempt: 1,
+                resource_lease_refs: vec![resource.projection_reference()],
+                scope_lease_ref: Some(scope.projection_reference()),
+                worktree_lease_ref: None,
+            };
+            let ticket = NodeExecutionTicket {
+                graph_id: graph.id.clone(),
+                node_id: spec.id.clone(),
+                executor_kind: binding.executor_kind.clone(),
+                service_class: graph.service_class,
+                attempt: binding.attempt,
+                idempotency_key: binding.ticket_idempotency_key.clone(),
+                payload_ref: spec.payload_ref.clone(),
+            };
+            let fence_key = ExecutionBindingLeaseClosure::fence_key(&graph, &spec.id, &binding);
+            let fence = self
+                .scopes
+                .acquire_binding_owner(&fence_key, || {
+                    self.commits
+                        .validate_unadmitted_binding_start(&graph, &spec, &ticket)
+                        .map_err(|error| error.to_string())
+                })
+                .expect("owner fence");
+            let graph = self
+                .commits
+                .bind_and_start_node(&graph, &spec.id, binding.clone())
+                .expect("start")
+                .graph;
+            let graph = self
+                .commits
+                .transition_node(
+                    &graph,
+                    &spec.id,
+                    ExecutionNodeStatus::Completed,
+                    Some(harness_contract::execution_graph::ExecutionNodeResult {
+                        status: ExecutionNodeStatus::Completed,
+                        result_ref: Some(format!("result:{name}")),
+                        wait_class: None,
+                        summary: Some(format!("result {name}")),
+                        evidence_refs: Vec::new(),
+                        failure: None,
+                        usage: Default::default(),
+                        finished_at_ms: 1,
+                    }),
+                    Vec::new(),
+                )
+                .expect("complete")
+                .graph;
+            // Benign events ahead of the marker widen the proof's read of
+            // the call's own effect stream; the marker scan skips them.
+            let effect_stream = format!("execution-effect:{key}");
+            for index in 0..prefix_events {
+                let revision = self.events.stream_revision(&effect_stream).expect("head");
+                self.events
+                    .append_transaction(AppendTransactionRequest {
+                        transaction_id: format!("{name}-prefix:{index}"),
+                        expected_streams: vec![ExpectedStreamRevision {
+                            stream_id: effect_stream.clone(),
+                            expected_revision: revision,
+                        }],
+                        events: vec![RuntimeTransactionEventInput {
+                            event: RuntimeEventInput {
+                                stream_id: effect_stream.clone(),
+                                scope: RuntimeEventScope::ExecutionNode,
+                                kind: "execution.read.intent".into(),
+                                status: Some("inflight".into()),
+                                actor: Some("governed_tool".into()),
+                                refs: vec![],
+                                payload: json!({"idempotency_key": key}),
+                            },
+                            idempotency_key: Some(format!("{name}-prefix:{index}")),
+                            schema_version: 1,
+                        }],
+                    })
+                    .expect("prefix event");
+            }
+            // The owner's durable record of the member's terminal refusal,
+            // seeded the way the action owner writes it.
+            append_index_event(
+                &self.events,
+                &index_stream(&graph, &spec, &binding),
+                key,
+                "execution.agent_tool.intent",
+                format!("agent-tool-intent:{key}"),
+            );
+            append_refusal(&self.events, key, &format!("{name}-program"), true, true);
+            // A restart finds the binding without its leases or its owner.
+            scope.try_release().expect("scope release");
+            drop(resource);
+            drop(fence);
+            (graph, binding, spec.id)
+        }
+
+        /// The call's own effect stream, the one source a bound node's
+        /// closure fences beside the owner index stream.
+        fn effect_stream(&self, key: &str) -> String {
+            format!("execution-effect:{key}")
+        }
+    }
+
+    /// A concurrent writer that keeps appending to one stream until it is
+    /// stopped, from a blocking thread so it keeps writing through the
+    /// proof's synchronous reads. Each write is a complete transaction of
+    /// its own; the shape of the event does not matter to the fence, only
+    /// that the head moves under the proof.
+    fn spawn_stream_writer(
+        events: &Arc<RuntimeEventStore>,
+        stream_id: &str,
+        name: &str,
+        cap: u64,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<u64>,
+    ) {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_events = Arc::clone(events);
+        let writer_stream = stream_id.to_string();
+        let writer_name = name.to_string();
+        let writer_stop = Arc::clone(&stop);
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut written = 0u64;
+            while !writer_stop.load(std::sync::atomic::Ordering::SeqCst) && written < cap {
+                let revision = match writer_events.stream_revision(&writer_stream) {
+                    Ok(revision) => revision,
+                    Err(_) => break,
+                };
+                let written_event = writer_events.append_transaction(AppendTransactionRequest {
+                    transaction_id: format!("{writer_name}-race:{written}"),
+                    expected_streams: vec![ExpectedStreamRevision {
+                        stream_id: writer_stream.clone(),
+                        expected_revision: revision,
+                    }],
+                    events: vec![RuntimeTransactionEventInput {
+                        event: RuntimeEventInput {
+                            stream_id: writer_stream.clone(),
+                            scope: RuntimeEventScope::ExecutionNode,
+                            kind: "execution.read.intent".into(),
+                            status: Some("inflight".into()),
+                            actor: Some("governed_tool".into()),
+                            refs: vec![],
+                            payload: json!({"idempotency_key": writer_name}),
+                        },
+                        idempotency_key: Some(format!("{writer_name}-race:{written}")),
+                        schema_version: 1,
+                    }],
+                });
+                if written_event.is_ok() {
+                    written += 1;
+                }
+            }
+            written
+        });
+        (stop, handle)
+    }
+
+    /// The deterministic core of C-c: one physical closure proof maps onto
+    /// exactly one commit outcome. A source that moved under the proof is
+    /// the typed retryable error the lease recovery re-proves on; a proof
+    /// waiting for any other reason, and a proof that names a ring which
+    /// can never hold, stay an invalid command.
+    #[test]
+    fn closure0_source_moved_proof_maps_to_the_typed_retryable_commit_error() {
+        let sources = vec![ExpectedStreamRevision {
+            stream_id: "execution-effect:shape-moved".into(),
+            expected_revision: 2,
+        }];
+        assert_eq!(
+            normal_release_closure_sources(PhysicalClosureProof::Proven(sources.clone()))
+                .expect("a proven closure keeps its fenced sources"),
+            sources
+        );
+        let waiting = normal_release_closure_sources(PhysicalClosureProof::Pending(
+            PhysicalClosurePending::LeafIncomplete,
+        ))
+            .expect_err("a waiting proof is not a closure");
+        assert!(
+            matches!(&waiting, ExecutionCommitError::InvalidCommand(reason)
+                if reason == "normal binding physical closure is not positively proven"),
+            "a proof waiting for any other reason keeps the judgement it always had: {waiting}"
+        );
+        let moved = normal_release_closure_sources(PhysicalClosureProof::Pending(
+            PhysicalClosurePending::SourceMoved {
+                stream_id: "execution-effect:shape-moved".into(),
+            },
+        ))
+        .expect_err("a moved source is reported, never absorbed");
+        assert!(
+            matches!(&moved, ExecutionCommitError::PhysicalClosureSourceMoved { stream_id }
+                if stream_id == "execution-effect:shape-moved"),
+            "the stream that moved travels with the verdict: {moved}"
+        );
+        // Every waiting reason is classified by type, and only the one
+        // that re-proves crosses the boundary as the retryable error.
+        for waiting in [
+            PhysicalClosurePending::LeafIncomplete,
+            PhysicalClosurePending::AgentRunUnsettled,
+        ] {
+            let error = normal_release_closure_sources(PhysicalClosureProof::Pending(waiting))
+                .expect_err("a waiting proof is not a closure");
+            assert!(
+                !error.keeps_the_closure_waiting(),
+                "a wait the recovery cannot shorten stays fatal: {error}"
+            );
+        }
+        assert!(
+            moved.keeps_the_closure_waiting(),
+            "the moved-source error is the retryable classification: {moved}"
+        );
+        let ringed = normal_release_closure_sources(PhysicalClosureProof::Unprovable {
+            ring: "shape_ring",
+            reason: "shape reason".into(),
+        })
+        .expect_err("a ring is not a closure");
+        assert!(
+            matches!(&ringed, ExecutionCommitError::InvalidCommand(reason)
+                if reason == "normal binding physical closure is not positively proven: shape_ring: shape reason"),
+            "a ring keeps its wording: {ringed}"
+        );
+    }
+
+    /// C-c P1 (red before the patch, green after): a concurrent writer
+    /// keeps appending to the fenced source while the closure proof is
+    /// reading it. The first attempt observes the move and waits; once the
+    /// writes stop, a re-proof inside the physical-closure budget closes
+    /// the node. Before the patch the first move failed the node closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closure0_source_moved_under_the_proof_waits_and_closes() {
+        let fixture = SourceMovedRaceFixture::new();
+        let (graph, binding, node_id) = fixture
+            .terminal_refused_toolbatch("shape source moved", "shape-moved-key", 1_000)
+            .await;
+        let effect_stream = fixture.effect_stream("shape-moved-key");
+        let (stop, writer) = spawn_stream_writer(&fixture.events, &effect_stream, "shape-moved", 20_000);
+        // Let the writer get inside the proof's window before the recovery
+        // starts, so the first attempt really does race it.
+        let settled_head = fixture.events.stream_revision(&effect_stream).expect("head");
+        while fixture.events.stream_revision(&effect_stream).expect("head") == settled_head {
+            tokio::task::yield_now().await;
+        }
+        let stopper = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let recovery = ExecutionGraphRecovery::new(&fixture.state, &fixture.commits, &fixture.registry);
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            recovery.recover_with_leases(
+                &graph.id,
+                &fixture.scopes,
+                &fixture.worktrees,
+                "a10-race",
+            ),
+        )
+        .await
+        .expect("the recovery stays inside the physical-closure budget")
+        .expect("a source that moved under the proof waits for the owner, it does not fail the node closed");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        stopper.await.unwrap();
+        let written = writer.await.unwrap();
+        assert!(written > 0, "the concurrent writer really wrote: {written}");
+        let position = fixture
+            .state
+            .binding_start_position(&recovered, &node_id, &binding)
+            .expect("position")
+            .expect("binding start");
+        assert!(
+            fixture
+                .state
+                .binding_lease_closure(&recovered, &node_id, &binding, position)
+                .expect("closure read"),
+            "the closure is durably committed after the writes stop"
+        );
+    }
+
+    /// C-c N1: a second settlement for this call is durably written across
+    /// its own streams. The closure must never absorb it: the re-proof
+    /// reads the fresh view and still fails closed on the contradiction.
+    /// The settlement is seeded before the recovery so the control is
+    /// deterministic; a mid-window write of the same shape is covered by
+    /// the P1 race plus this re-proof judgement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closure0_second_settlement_for_the_call_is_never_absorbed() {
+        let fixture = SourceMovedRaceFixture::new();
+        let (graph, binding, node_id) = fixture
+            .terminal_refused_toolbatch("shape second settlement", "shape-second-key", 0)
+            .await;
+        let effect_stream = fixture.effect_stream("shape-second-key");
+        let index_stream = format!(
+            "execution-agent-receipts:{}:{}:{}",
+            graph.id, node_id, binding.attempt
+        );
+        let effect_revision = fixture.events.stream_revision(&effect_stream).expect("head");
+        let index_revision = fixture.events.stream_revision(&index_stream).expect("head");
+        // A settlement is written as one transaction: the primary receipt
+        // on the call's own effect stream and its owner index twin. This
+        // one names an owner that is not this node.
+        let outcome = json!({"status": "executed", "tool_use_id": "shape-second-call", "tool_name": "read_ref"});
+        fixture
+            .events
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: "shape-second-settlement".into(),
+                expected_streams: vec![
+                    ExpectedStreamRevision {
+                        stream_id: effect_stream.clone(),
+                        expected_revision: effect_revision,
+                    },
+                    ExpectedStreamRevision {
+                        stream_id: index_stream.clone(),
+                        expected_revision: index_revision,
+                    },
+                ],
+                events: vec![
+                    RuntimeTransactionEventInput {
+                        event: RuntimeEventInput {
+                            stream_id: effect_stream.clone(),
+                            scope: RuntimeEventScope::ExecutionNode,
+                            kind: "execution.read.receipt".into(),
+                            status: Some("completed".into()),
+                            actor: Some("governed_tool".into()),
+                            refs: vec![],
+                            payload: json!({
+                                "idempotency_key": "shape-second-key",
+                                "tool_name": "read_ref",
+                                "input_sha256": "sha256:shape-second-input",
+                                "outcome": outcome,
+                                "replay": {
+                                    "call_id": "shape-second-call",
+                                    "parent_execution": {
+                                        "execution_id": "shape-foreign-graph",
+                                        "node_id": "shape-foreign-node",
+                                    },
+                                },
+                            }),
+                        },
+                        idempotency_key: Some("shape-second-key:read-receipt".into()),
+                        schema_version: 1,
+                    },
+                    RuntimeTransactionEventInput {
+                        event: RuntimeEventInput {
+                            stream_id: index_stream.clone(),
+                            scope: RuntimeEventScope::ExecutionNode,
+                            kind: "execution.agent_tool.receipt".into(),
+                            status: Some("completed".into()),
+                            actor: Some("governed_tool".into()),
+                            refs: vec![],
+                            payload: json!({
+                                "idempotency_key": "shape-second-key",
+                                "sequence": 2,
+                                "outcome": outcome,
+                            }),
+                        },
+                        idempotency_key: Some("agent-tool-receipt:shape-second-key".into()),
+                        schema_version: 1,
+                    },
+                ],
+            })
+            .expect("second settlement");
+        let recovery = ExecutionGraphRecovery::new(&fixture.state, &fixture.commits, &fixture.registry);
+        let error = recovery
+            .recover_with_leases(
+                &graph.id,
+                &fixture.scopes,
+                &fixture.worktrees,
+                "a10-race",
+            )
+            .await
+            .expect_err("a second settlement this node cannot authenticate fails the closure closed");
+        let detail = error.to_string();
+        assert!(
+            detail.contains("owner mismatch"),
+            "the re-proof names the contradiction it refused to absorb: {detail}"
+        );
+    }
+
+    /// C-c N2: a source that never settles spends the physical-closure
+    /// budget and then fails closed with the typed error. The retry never
+    /// becomes an unbounded wait and never a silent pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closure0_source_that_never_settles_fails_after_the_budget() {
+        let fixture = SourceMovedRaceFixture::new();
+        let (graph, _binding, _node_id) = fixture
+            .terminal_refused_toolbatch("shape never settles", "shape-never-key", 1_000)
+            .await;
+        let effect_stream = fixture.effect_stream("shape-never-key");
+        let (stop, writer) = spawn_stream_writer(&fixture.events, &effect_stream, "shape-never", 200_000);
+        let settled_head = fixture.events.stream_revision(&effect_stream).expect("head");
+        while fixture.events.stream_revision(&effect_stream).expect("head") == settled_head {
+            tokio::task::yield_now().await;
+        }
+        let started = std::time::Instant::now();
+        let recovery = ExecutionGraphRecovery::new(&fixture.state, &fixture.commits, &fixture.registry);
+        let error = recovery
+            .recover_with_leases_until(
+                &graph.id,
+                &fixture.scopes,
+                &fixture.worktrees,
+                "a10-race",
+                std::time::Instant::now() + std::time::Duration::from_millis(400),
+            )
+            .await
+            .expect_err("a source that never settles fails closed");
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.await.unwrap();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "the physical-closure budget was spent before failing: {elapsed:?}"
+        );
+        assert!(elapsed <= std::time::Duration::from_secs(5), "the failure stays bounded: {elapsed:?}");
+        assert!(
+            matches!(
+                error,
+                ExecutionRecoveryError::Commit(ExecutionCommitError::PhysicalClosureSourceMoved { .. })
+            ),
+            "the budget-exhausted failure is the typed source-moved error: {error}"
         );
     }
 }

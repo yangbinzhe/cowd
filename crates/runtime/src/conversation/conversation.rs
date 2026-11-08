@@ -4189,6 +4189,9 @@ pub struct ToolError {
     unknown: bool,
     failure: Option<harness_contract::tool::ToolExecutionFailure>,
     pre_effect_refusal: Option<crate::execution_core::graph::PreEffectRefusal>,
+    /// The tool layer decided this refusal before the call could run, so
+    /// the call never executed and the runtime may settle it as refused.
+    refusal_before_effect: bool,
     original_bounded_acquisition_failure: Option<OriginalBoundedAcquisitionFailureHandle>,
     original_packet_scope_denial: Option<OriginalPacketScopeDenialHandle>,
     original_packet_scope_receipt: Option<OriginalPacketScopeReceiptHandle>,
@@ -4208,7 +4211,7 @@ impl ToolError {
             message: message.into(),
             unknown: false,
             failure: None,
-            pre_effect_refusal: None,
+            pre_effect_refusal: None, refusal_before_effect: false,
             original_bounded_acquisition_failure: None,
             original_packet_scope_denial: None,
             original_packet_scope_receipt: None,
@@ -4228,7 +4231,7 @@ impl ToolError {
             message: failure.message.clone(),
             unknown: failure.class == harness_contract::tool::ToolExecutionFailureClass::EffectUncertain,
             failure: Some(failure),
-            pre_effect_refusal: None,
+            pre_effect_refusal: None, refusal_before_effect: false,
             original_bounded_acquisition_failure: None,
             original_packet_scope_denial: None,
             original_packet_scope_receipt: None,
@@ -4275,7 +4278,7 @@ impl ToolError {
     /// The original effect may have committed and must remain unresolved.
     #[must_use]
     pub fn unknown(message: impl Into<String>) -> Self {
-        Self { message: message.into(), unknown: true, failure: None, pre_effect_refusal: None, original_bounded_acquisition_failure: None, original_packet_scope_denial: None, original_packet_scope_receipt: None, original_packet_scope_request: None, pending_agent_batch: None, secondary_failures: Vec::new(), original_child_drive: None, original_child_close: None, original_child_receipt: None, original_child_cancel: None }
+        Self { message: message.into(), unknown: true, failure: None, pre_effect_refusal: None, refusal_before_effect: false, original_bounded_acquisition_failure: None, original_packet_scope_denial: None, original_packet_scope_receipt: None, original_packet_scope_request: None, pending_agent_batch: None, secondary_failures: Vec::new(), original_child_drive: None, original_child_close: None, original_child_receipt: None, original_child_cancel: None }
     }
 
     /// Carry the original producer boundary; Runtime still authenticates and closes the outer effect.
@@ -4398,7 +4401,26 @@ impl ToolError {
     ) -> Self {
         let mut error = Self::new(message);
         error.pre_effect_refusal = Some(refusal);
+        error.refusal_before_effect = true;
         error
+    }
+
+    /// A refusal the tool layer decided before the call could run.
+    ///
+    /// The call never executed, so the runtime may settle it as refused
+    /// rather than leave it in flight. The refusal is reported, never
+    /// written: only the runtime's own writer records it.
+    #[must_use]
+    pub fn refused_before_effect(message: impl Into<String>) -> Self {
+        let mut error = Self::new(message);
+        error.refusal_before_effect = true;
+        error
+    }
+
+    /// Whether this error is a refusal decided before the call could run.
+    #[must_use]
+    pub fn is_refusal_before_effect(&self) -> bool {
+        self.refusal_before_effect
     }
 
     pub(crate) fn pre_effect_refusal_for(

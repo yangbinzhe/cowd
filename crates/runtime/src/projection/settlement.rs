@@ -333,6 +333,45 @@ mod all_binding_closure_tests {
         services.shutdown_execution().await;
         services.shutdown_maintenance().await;
     }
+
+    #[test]
+    fn a_moved_closure_source_keeps_its_retryable_class_through_the_scope_mapping() {
+        use crate::execution_core::graph::{ExecutionCommitError, ExecutionRunnerError};
+
+        let moved = ExecutionCommitError::PhysicalClosureSourceMoved {
+            stream_id: "execution-effect:shape-moved".into(),
+        };
+        let mapped = scope_read_error(moved);
+        assert!(
+            !matches!(&mapped, RuntimeServicesError::Invariant(_)),
+            "a source that moved under the proof is a wait, not an invariant violation: {mapped}"
+        );
+        assert!(
+            !matches!(
+                &mapped,
+                RuntimeServicesError::GraphRunner(ExecutionRunnerError::Commit(
+                    ExecutionCommitError::InvalidCommand(_)
+                ))
+            ),
+            "the wait is not flattened into an invalid command: {mapped}"
+        );
+        let kept = match &mapped {
+            RuntimeServicesError::GraphRunner(ExecutionRunnerError::Commit(kept)) => kept,
+            other => panic!("the moved source crosses with its type intact: {other}"),
+        };
+        assert!(
+            matches!(
+                kept,
+                ExecutionCommitError::PhysicalClosureSourceMoved { stream_id }
+                    if stream_id == "execution-effect:shape-moved"
+            ),
+            "the stream that moved travels with the verdict: {kept}"
+        );
+        assert!(
+            kept.keeps_the_closure_waiting(),
+            "the wait still classifies as retryable after the mapping: {kept}"
+        );
+    }
 }
 
 pub(super) fn local_reference(reference: &str) -> bool {
@@ -513,6 +552,15 @@ fn scope_read_error(
     match error {
         crate::execution_core::graph::ExecutionCommitError::EventStore(error) => {
             RuntimeServicesError::EventStore(error)
+        }
+        // A source that moved under the closure proof is the owner still
+        // writing: it is a wait, not an invariant violation. It crosses with
+        // its type and the stream that moved intact, so the layer above can
+        // still tell that it may be waited on.
+        error @ crate::execution_core::graph::ExecutionCommitError::PhysicalClosureSourceMoved { .. } => {
+            RuntimeServicesError::GraphRunner(
+                crate::execution_core::graph::ExecutionRunnerError::Commit(error),
+            )
         }
         error => RuntimeServicesError::Invariant(error.to_string()),
     }

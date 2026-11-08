@@ -1809,16 +1809,42 @@ pub(crate) struct OriginalConclusionOwner {
     policy: crate::permissions::PermissionPolicy,
 }
 
+/// One Program action by the member that made it, reduced to what the
+/// recovery predicate needs: whether it opens that member's attempt, closes
+/// it, or neither.
+struct MemberAttemptRecord {
+    execution_id: String,
+    /// Opens the member's attempt.
+    dispatch: bool,
+    /// Closes the member's attempt.
+    settles: bool,
+}
+
+/// The durable Program journal of one Session turn, told apart by state.
+enum SessionProgramJournal {
+    /// The journal exists but could not be read.
+    Unknown,
+    /// This Session turn has no Program journal.
+    NoProgram,
+    /// The journal of this turn.
+    Journal(Vec<crate::DurableRuntimeEvent>),
+}
+
 /// Original live Session owner carried by the Synthesize outcome. Keep only
 /// its original store and policy-owner handles, not the Runtime service graph.
 pub(crate) struct OriginalTerminalCommitOwner {
     store: std::sync::Weak<RuntimeEventStore>,
     policy_controls: Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
     admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
-    /// The retained original Session owner parts. The original turn is over
-    /// once its terminal custody is released, so that release also closes the
-    /// recovery window for this Session.
-    session_owners: std::sync::Weak<Mutex<BTreeMap<String, OriginalSessionOwnerParts>>>,
+    /// Close the recovery window for one Session turn, if the members of that
+    /// turn have all settled.
+    ///
+    /// The action is held as an opaque closure on purpose: this owner lives
+    /// inside the runner's own type graph, and naming the Runtime services
+    /// here would put the whole service graph into every proof about it. The
+    /// action asks the same per-member fact the recovery gate asks, and it
+    /// removes the retained owner under the same identity rule.
+    release_after_terminal: Arc<dyn Fn(&str, &OriginalSessionClaim) -> bool + Send + Sync>,
     owner: OriginalConclusionOwner,
     ticket: crate::execution_core::graph::NodeExecutionTicket,
     terminal: Mutex<OriginalTerminalClosureState>,
@@ -1899,19 +1925,12 @@ impl OriginalTerminalCommitOwner {
         terminal.released = true;
         drop(terminal);
         // The original turn has closed its Session terminal: the recovery
-        // window for that Session ends with it.
-        if let Some(session_owners) = self.session_owners.upgrade() {
-            let mut owners = session_owners
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let session_id = self.owner.claim.session_id();
-            if owners
-                .get(session_id)
-                .is_some_and(|parts| parts.claim.identity() == self.owner.claim.identity())
-            {
-                owners.remove(session_id);
-            }
-        }
+        // window for that Session ends with it. It does not end while a
+        // member of that turn is still unsettled. Such a member can still be
+        // owed an owner, and an owner removed under it could never be
+        // recovered again. This is the same fact the recovery gate asks, in
+        // the Session-wide form.
+        (self.release_after_terminal)(&self.owner.claim.session_id(), &self.owner.claim);
         Ok(())
     }
 
@@ -4285,7 +4304,14 @@ impl RuntimeServices {
             store: Arc::downgrade(&self.event_store),
             policy_controls: Arc::clone(&self.session_execution_policy_controls),
             admission_blocks: Arc::clone(&self.session_execution_policy_admission_blocks),
-            session_owners: Arc::downgrade(&self.original_session_owners),
+            release_after_terminal: Arc::new({
+                let services = Arc::downgrade(self);
+                move |session_id: &str, claim: &OriginalSessionClaim| -> bool {
+                    services.upgrade().is_some_and(|services| {
+                        services.release_original_session_owner_after_terminal(session_id, claim)
+                    })
+                }
+            }),
             owner, ticket: ticket.clone(), terminal: Mutex::new(OriginalTerminalClosureState::default()),
         }))
     }
@@ -4357,6 +4383,183 @@ impl RuntimeServices {
         Some(OriginalConclusionOwner { claim, input, control, policy: active.original_policy.clone() })
     }
 
+    /// The durable Program journal of one Session turn.
+    ///
+    /// One Session turn owns exactly one Program: the objective id is derived
+    /// from the Session and the turn, and the Program id from that objective.
+    ///
+    /// The three states are not the same fact, and the two callers below need
+    /// them told apart:
+    ///
+    /// * `Unknown` - the journal exists but could not be read. That is no
+    ///   fact at all, and it is never read as "nothing is running": the
+    ///   recovery refuses, and the release keeps the retained owner rather
+    ///   than removing an owner it cannot reason about.
+    /// * `NoProgram` - this Session turn has no Program journal. The turn
+    ///   registered no member work, so the recovery refuses and the release
+    ///   removes.
+    /// * `Journal` - the journal of this turn.
+    fn session_program_journal(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> SessionProgramJournal {
+        let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+        let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+        match self.event_store.list_stream(&format!("agentic-program:{program_id}")) {
+            Err(_) => SessionProgramJournal::Unknown,
+            Ok(events) if events.is_empty() => SessionProgramJournal::NoProgram,
+            Ok(events) => SessionProgramJournal::Journal(events),
+        }
+    }
+
+    /// One Program action by the member that made it, reduced to what the
+    /// recovery predicate needs.
+    ///
+    /// This is the single fold both predicates use, so the read side and the
+    /// write side can never disagree about one member: a dispatch opens that
+    /// member's attempt, a settlement closes it, and the last record wins.
+    fn member_attempt_records(
+        events: &[crate::DurableRuntimeEvent],
+    ) -> Vec<MemberAttemptRecord> {
+        let mut records = Vec::new();
+        for event in events {
+            if event.kind != "agentic.action_applied" {
+                continue;
+            }
+            let Some(envelope) = event
+                .payload
+                .get("envelope")
+                .and_then(|value| serde_json::from_value::<
+                    harness_contract::agent_action::AgentActionEnvelope,
+                >(value.clone())
+                .ok())
+            else {
+                continue;
+            };
+            let Some(execution_id) = envelope.actor.execution_id else {
+                continue;
+            };
+            let settles = Self::program_action_settles_attempt(&envelope.action);
+            let dispatch = matches!(
+                envelope.action,
+                harness_contract::agent_action::AgentAction::TaskAttemptDispatch(_)
+            );
+            if settles || dispatch {
+                records.push(MemberAttemptRecord { execution_id, settles, dispatch });
+            }
+        }
+        records
+    }
+
+    /// Whether one member's attempt is still unsettled: it was dispatched and
+    /// nothing has settled it since.
+    fn member_attempt_record_is_unsettled(
+        records: &[MemberAttemptRecord],
+        member_execution_id: &str,
+    ) -> bool {
+        let mut unsettled = false;
+        for record in records.iter().filter(|record| record.execution_id == member_execution_id) {
+            if record.settles {
+                unsettled = false;
+            }
+            if record.dispatch {
+                unsettled = true;
+            }
+        }
+        unsettled
+    }
+
+    /// Whether any member's attempt is still unsettled, by the same fold.
+    fn any_member_attempt_is_unsettled(records: &[MemberAttemptRecord]) -> bool {
+        let members: std::collections::BTreeSet<&str> =
+            records.iter().map(|record| record.execution_id.as_str()).collect();
+        members
+            .into_iter()
+            .any(|member| Self::member_attempt_record_is_unsettled(records, member))
+    }
+
+    /// Whether one Program action ends the attempt of the member that made it.
+    ///
+    /// These are the durable settlement records of a member attempt, named
+    /// one by one. A failed attempt, a delivered Task, a review decision, a
+    /// released claim and a declined opportunity each end the attempt that
+    /// produced them: the member has nothing left to delegate. The attempt
+    /// registration itself (`TaskAttemptDispatch`) is deliberately absent,
+    /// because it opens an attempt instead of closing one.
+    fn program_action_settles_attempt(action: &harness_contract::agent_action::AgentAction) -> bool {
+        use harness_contract::agent_action::AgentAction;
+        match action {
+            AgentAction::TaskAttemptFail(_)
+            | AgentAction::TaskSubmit(_)
+            | AgentAction::TaskReview(_)
+            | AgentAction::TaskRelease(_) => true,
+            AgentAction::MessagePublish(publish) => publish
+                .intent
+                .as_ref()
+                .is_some_and(|intent| intent.kind == harness_contract::agent_action::TaskIntentKind::Decline),
+            _ => false,
+        }
+    }
+
+    /// Per-member recovery liveness, read from the durable Program journal.
+    ///
+    /// The original Session's durable claim is a Session-wide fact: the
+    /// ingress execution acks that record to a terminal status and it ends
+    /// for every member at once, even while members are still running. The
+    /// Program journal keeps the per-member fact instead: one member's
+    /// attempt is registered by its dispatch and closed by its own
+    /// settlement, and no other member's record can close it.
+    ///
+    /// The fold of that journal (`AgenticTaskProjection.active_attempts`) is
+    /// not used here. It drops an attempt the moment the attempt fails, so
+    /// "absent from the fold" cannot distinguish a settled attempt from one
+    /// that is still running. The journal itself can, because it names the
+    /// settlement instead of inferring it from absence.
+    ///
+    /// Both absent states refuse: an unreadable journal is no fact, and a
+    /// turn with no Program registered no member work at all.
+    pub(crate) fn member_attempt_is_unsettled(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        member_execution_id: &str,
+    ) -> bool {
+        match self.session_program_journal(session_id, turn_id) {
+            SessionProgramJournal::Journal(events) => {
+                let records = Self::member_attempt_records(&events);
+                Self::member_attempt_record_is_unsettled(&records, member_execution_id)
+            }
+            SessionProgramJournal::Unknown | SessionProgramJournal::NoProgram => false,
+        }
+    }
+
+    /// The Session-wide counterpart of the per-member fact: some member of
+    /// this turn still has an attempt that has not settled.
+    ///
+    /// The recovery window may not close while it does. A member that is
+    /// still unsettled may still owe the Session an owner, and an owner that
+    /// was removed under it would be an owner that member can never recover.
+    ///
+    /// This reads the same journal through the same fold as the per-member
+    /// predicate above, so the write side can never keep an owner for a turn
+    /// whose members the read side already refuses - or the other way round.
+    /// An unreadable journal keeps the owner: removing it would be a decision
+    /// made on a fact nobody could read.
+    pub(crate) fn session_has_unsettled_attempts(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> bool {
+        match self.session_program_journal(session_id, turn_id) {
+            SessionProgramJournal::Journal(events) => {
+                Self::any_member_attempt_is_unsettled(&Self::member_attempt_records(&events))
+            }
+            SessionProgramJournal::Unknown => true,
+            SessionProgramJournal::NoProgram => false,
+        }
+    }
+
     /// Recover the equivalent original Session owner after the root graph has
     /// ended and its active bus lease has been retired.
     ///
@@ -4366,11 +4569,19 @@ impl RuntimeServices {
     /// commit_wins participation and its cancellation participation. The
     /// original turn's own cancellation still decides: a cancelled Session
     /// turn never regains a delegated owner.
+    ///
+    /// The recovery is granted per member. The original Session's live claim
+    /// stays a sufficient reason on its own, but it ends for every member at
+    /// once when the ingress execution reaches its terminal. The member's own
+    /// attempt is the per-member fact: while that attempt is still unsettled,
+    /// this member can still be owed an owner. A member whose attempt already
+    /// settled gets no owner, and an unreadable Program is no permission.
     pub(crate) async fn recovered_original_conclusion_owner(
         &self,
         session_id: &str,
         turn_id: &str,
         root_execution_id: &str,
+        member_execution_id: &str,
     ) -> Option<OriginalConclusionOwner> {
         let parts = self
             .original_session_owners
@@ -4398,17 +4609,36 @@ impl RuntimeServices {
             self.release_original_session_owner(session_id, &claim);
             return None;
         }
-        // The original Session must still hold this turn's live claim. That
-        // durable fact is what says the original turn is still active: the
-        // Session keeps its root claim Running until the terminal ACK, and a
-        // finished, cancelled or superseded turn no longer owns it. An
-        // unreadable fact is not permission to write.
-        if fence
+        // Named exception to the live Session claim, per member.
+        //
+        // The live claim says the original turn is still active: the Session
+        // keeps its root claim Running until the terminal ACK, and a
+        // finished, cancelled or superseded turn no longer owns it. That
+        // claim ends for every member at once, the moment the ingress
+        // execution reaches its terminal. A member whose own attempt is
+        // still unsettled is still running at that point and is still owed
+        // an owner, so the claim's end does not end the member's work.
+        //
+        // Every other gate below stays exactly as it was: the Program's root
+        // execution must be the very root ingress that installed this fence,
+        // a cancelled Session turn never regains a delegated owner, the
+        // claim must name this same Session and turn, and the recovered
+        // owner is the very claim, turn control and original policy the
+        // ingress installed - never a second one. A journal that cannot be
+        // read is no fact: this member is refused, exactly as it would be
+        // without any attempt at all.
+        let session_claim_is_live = fence
             .verify(crate::SessionExecutionFencePhase::ToolCommit)
             .await
-            .is_err()
-        {
-            return None;
+            .is_ok();
+        if !session_claim_is_live {
+            if !self.member_attempt_is_unsettled(session_id, turn_id, member_execution_id) {
+                // The read side and the write side ask the same fact in the
+                // same direction: nobody in this turn is unsettled any more,
+                // so the window this member asked about is over.
+                self.release_original_session_owner_after_terminal(session_id, &claim);
+                return None;
+            }
         }
         let control = root_control.token().member_commit_control();
         requested.register(&control);
@@ -4428,11 +4658,54 @@ impl RuntimeServices {
     /// The removal is identity qualified. The next turn for the same Session
     /// replaces the retained entry, and a release that belongs to the
     /// previous turn must not remove the new turn's owner.
+    ///
+    /// This is the cancellation path, and it does not wait for the turn's
+    /// members to settle. A cancelled Session turn is a terminal fact, not a
+    /// liveness question, and the recovery gate refuses a cancelled turn on
+    /// its own: the retained owner would authorize nothing.
     pub(crate) fn release_original_session_owner(
         &self,
         session_id: &str,
         claim: &OriginalSessionClaim,
     ) {
+        self.remove_retained_session_owner(session_id, claim);
+    }
+
+    /// Close the recovery window for one Session turn at its terminal close.
+    ///
+    /// The window ends with the original turn. It does not end while a member
+    /// of that turn is still unsettled: such a member can still be owed an
+    /// owner, and an owner removed under it could never be recovered again.
+    /// This is the same fact the recovery gate asks, in the Session-wide
+    /// form, so the read side and the write side can never disagree about a
+    /// member that is still running.
+    ///
+    /// The boundary is the attempt settlement, which is an event boundary:
+    /// nothing re-runs this release when the last member settles. The
+    /// retained owner can therefore outlive the turn. It authorizes nothing
+    /// on its own - it only ever hands out the owner the ingress installed,
+    /// to a member whose own attempt the journal still shows as unsettled -
+    /// and the next turn for the same Session replaces the entry.
+    ///
+    /// Returns whether the retained owner was removed.
+    pub(crate) fn release_original_session_owner_after_terminal(
+        &self,
+        session_id: &str,
+        claim: &OriginalSessionClaim,
+    ) -> bool {
+        if self.session_has_unsettled_attempts(session_id, claim.turn_id()) {
+            return false;
+        }
+        self.remove_retained_session_owner(session_id, claim)
+    }
+
+    /// Remove the retained original Session owner parts for one Session, if
+    /// the retained entry is still the one this claim identifies.
+    fn remove_retained_session_owner(
+        &self,
+        session_id: &str,
+        claim: &OriginalSessionClaim,
+    ) -> bool {
         let mut owners = self
             .original_session_owners
             .lock()
@@ -4442,6 +4715,9 @@ impl RuntimeServices {
             .is_some_and(|parts| parts.claim.identity() == claim.identity())
         {
             owners.remove(session_id);
+            true
+        } else {
+            false
         }
     }
 

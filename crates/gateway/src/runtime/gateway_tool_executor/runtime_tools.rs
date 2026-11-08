@@ -918,7 +918,7 @@ impl GatewayToolExecutor {
                 },
                 None => {
                     let capability = binding.action_invocation.ok_or_else(||
-                        ToolError::unknown("original single-call capability unavailable"))?;
+                        single_call_capability_refusal(tool_name))?;
                     services.submit_delegated_tool_action(capability, &envelope, tool_name, &original_action_input)
                         .await.map_err(|error| match error {
                             runtime::AgentActionServiceError::MemberUnknown(_) => ToolError::unknown(error.to_string()),
@@ -1492,7 +1492,11 @@ impl GatewayToolExecutor {
         // capability unavailable" Unknown blocked the whole node. Name what
         // is actually missing instead.
         if is_agent_action_tool(delegate) && binding.action_invocation.is_none() {
-            return Err(ToolError::new(format!(
+            // The call is refused before it runs: the delegated reader is an
+            // Agent action and this call carries no original action
+            // capability, so nothing was executed. The refusal is reported
+            // as such, and the runtime settles the call against it.
+            return Err(ToolError::refused_before_effect(format!(
                 "`read_ref` cannot serve the reference `{}` in this call: the delegated reader `{delegate}` is an Agent action and this call carries no original action capability; call `{delegate}` directly with the same target",
                 input.reference
             )));
@@ -2126,6 +2130,25 @@ impl GatewayToolExecutor {
 /// tool: a stale `read` here sends every read into the MCP catch-all, which
 /// rejects it with "invalid MCP tool name `read_ref`" - one live run lost a
 /// read this way (L5 trace, line 393).
+/// The refusal a single Agent-action call gets when it carries no original
+/// owner's action capability.
+///
+/// This is an authorization fact about the call, not a routing fact: the call
+/// may not act for the original owner, so the refusal names what is missing
+/// and what the caller can do about it - replay the action under the original
+/// owner, have that owner authorize it, or issue it on a non-delegated path.
+/// It deliberately does not reuse the `read_ref` delegation refusal's
+/// "call X directly" remedy, which belongs to a routing problem and would
+/// point at the wrong next step here. The error stays an Unknown: no
+/// capability is granted, nothing is dispatched and nothing is re-queued.
+pub(crate) fn single_call_capability_refusal(tool_name: &str) -> ToolError {
+    ToolError::unknown(format!(
+        "`{tool_name}` is an Agent action and this call carries no original owner's action \
+         capability: replay the action under the original owner, have that owner authorize it, \
+         or use a non-delegated path"
+    ))
+}
+
 fn is_unified_read_tool(tool_name: &str) -> bool {
     tool_name == "read_ref"
 }
@@ -2364,6 +2387,35 @@ mod batch_member_error_tests {
             message.contains("original_effect_admission_missing")
                 && message.contains("tool_use_id=call-2"),
             "the member's own error must survive the failure document: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod single_call_refusal_tests {
+    use super::single_call_capability_refusal;
+
+    /// The refusal must be diagnosable and its remedy must be the right one:
+    /// it names the Agent action, says the original owner's action capability
+    /// is missing, offers the next steps that actually apply to an
+    /// authorization fact, and does not borrow the routing remedy of the
+    /// `read_ref` delegation refusal.
+    #[test]
+    fn single_call_capability_refusal_names_what_is_missing_and_the_next_step() {
+        let refusal = single_call_capability_refusal("task_review").to_string();
+        assert!(refusal.contains("task_review"), "{refusal}");
+        assert!(
+            refusal.contains("original owner's action capability"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("replay the action under the original owner"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("non-delegated path"), "{refusal}");
+        assert!(
+            !refusal.contains("directly"),
+            "the routing remedy of the read_ref refusal must not be copied here: {refusal}"
         );
     }
 }

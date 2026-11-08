@@ -1893,6 +1893,80 @@ struct DelegatedActionOwnerHost<'a> {
     provider_capture: Option<&'a Arc<crate::conversation::tool_plane::OriginalSingleProducerCapture>>,
 }
 
+/// The durable refusal of a call that was refused before it ran.
+///
+/// The fact is written under the call's own effect key, so the batch
+/// closure can settle the call as refused instead of waiting for a receipt
+/// that will never come. Two premises decide whether a fact may exist at
+/// all: the call's own program binding, and that program's own projection.
+/// A call whose program cannot be named, or whose program cannot be read,
+/// gets no fact - the refusal still stands, and the closure still waits.
+pub(crate) fn settle_refused_call(
+    services: &RuntimeServices,
+    agent: &harness_contract::agent::AgentTaskPacket,
+    request: &RuntimeToolExecutionRequest,
+    outcome: &RuntimeToolExecutionOutcome,
+) -> bool {
+    if outcome.status != crate::RuntimeToolExecutionStatus::BlockedPermission {
+        return false;
+    }
+    let Some(program_id) = agent
+        .agentic_binding
+        .as_ref()
+        .map(|binding| binding.program_id.clone())
+    else {
+        return false;
+    };
+    let actions = services.agent_action_service();
+    let Ok(Some(projection)) = actions.project_if_exists(&program_id) else {
+        return false;
+    };
+    record_refused_call_fact(&actions, &projection, request, outcome)
+}
+
+/// The durable refusal of a call that was refused before it ran.
+///
+/// The fact is written under the call's own effect key, so the batch
+/// closure can settle the call as refused instead of waiting for a receipt
+/// that will never come. The writer decides whether the fact may exist at
+/// all: a call without its own admission intent gets none. A fact that
+/// cannot be written leaves the call exactly as it was - the refusal still
+/// stands, and the closure still waits.
+pub(crate) fn record_refused_call_fact(
+    actions: &crate::agentic::AgentActionService,
+    projection: &crate::agentic::AgenticProgramProjection,
+    request: &RuntimeToolExecutionRequest,
+    outcome: &RuntimeToolExecutionOutcome,
+) -> bool {
+    if outcome.status != crate::RuntimeToolExecutionStatus::BlockedPermission {
+        return false;
+    }
+    let refusal = crate::agentic::RefusedCall {
+        effect_key: &request.idempotency_key,
+        tool_use_id: &request.tool_use_id,
+        tool_name: &request.tool_name,
+        reason: outcome
+            .error
+            .as_deref()
+            .unwrap_or("the call was refused before it ran"),
+    };
+    match actions.record_refused_admitted_call(projection, &refusal) {
+        Ok(crate::agentic::RefusalOutcome::Recorded) => true,
+        // A call without its own admission intent gets no fact: there is
+        // nothing for a consumer to read, so nothing was settled.
+        Ok(crate::agentic::RefusalOutcome::NotAdmitted) => false,
+        Err(error) => {
+            tracing::warn!(
+                program_id = %projection.program_id,
+                effect_key = %request.idempotency_key,
+                %error,
+                "refused call left no durable rejection fact"
+            );
+            false
+        }
+    }
+}
+
 #[async_trait]
 impl crate::RuntimeExecutionHost for DelegatedActionOwnerHost<'_> {
     fn bounded_process_authority(&self, request: &RuntimeToolExecutionRequest) -> Result<crate::tool_host::BoundedProcessAuthority, ToolError> {
@@ -2346,6 +2420,10 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
         } else {
             outcome
         };
+        // T: a call that was refused before it ran leaves a durable fact
+        // under its own effect key, so the batch closure can settle it as
+        // refused instead of waiting for a receipt that will never come.
+        settle_refused_call(&services, &agent, request, &outcome);
         // Leaf effect/receipt has committed under its admission. The graph
         // outcome below is the delivery fence; callers only read it after commit.
         let mut result = agent_tool_outcome(&outcome).map_err(|error| fail(error.to_string()))?;
@@ -4135,6 +4213,161 @@ pub(crate) mod a7_member_read_action_tests {
             .load(&graph_id)
             .expect("driven graph")
             .node_statuses[&node_id]
+    }
+
+    /// T: a call that was refused before it ran leaves a durable refusal fact
+    /// under its own effect key, so the batch closure can settle it as
+    /// refused instead of waiting for a receipt that will never come.
+    ///
+    /// The fact is the program's rejection event and its effect-stream twin,
+    /// written as one transaction under the refused call's own key. Two
+    /// premises decide whether it may exist: the member's own program
+    /// binding, and that program's own projection.
+    #[tokio::test]
+    async fn t_refused_call_leaves_a_durable_fact_under_its_own_key() {
+        let fixture = a7_fixture().await;
+        let request = member_state_inspect_request(&fixture);
+        admit_member_read_intent(&fixture.services, &request);
+        let key = request.idempotency_key.clone();
+        let store = fixture.services.event_store();
+        // The member's own program, as the program lane records it.
+        let program_id = "t-program";
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: format!("agentic-program:{program_id}"),
+                scope: crate::RuntimeEventScope::Program,
+                kind: "agentic.program_opened".into(),
+                status: Some("open".into()),
+                actor: Some("t-root".into()),
+                refs: vec![],
+                payload: serde_json::json!({
+                    "objective_id": "t-objective",
+                    "session_id": SESSION,
+                    "turn_id": TURN,
+                }),
+            })
+            .expect("program opened");
+        let bound = |program: &str| harness_contract::agent::AgenticExecutionBinding {
+            program_id: program.into(),
+            agent_id: AGENT.into(),
+            membership_id: "membership:t".into(),
+            team_id: "team:t".into(),
+            task_team_id: "team:t".into(),
+            source_spec_revision: 1,
+            task_purpose: None,
+            focus: harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+                task_ref: TASK.into(),
+            },
+        };
+        let mut agent = fixture.packet.clone();
+        agent.agentic_binding = Some(bound(program_id));
+        let outcome = crate::RuntimeToolExecutionOutcome {
+            pending_agent_batch: None,
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::BlockedPermission,
+            category: request.category,
+            output: None,
+            error: Some(
+                "`read_ref` cannot serve the reference `task:t` in this call: the delegated reader \
+                 `state_inspect` is an Agent action and this call carries no original action \
+                 capability"
+                    .into(),
+            ),
+            evidence_ref: String::new(),
+            observed_evidence: Vec::new(),
+        };
+        assert!(
+            settle_refused_call(&fixture.services, &agent, &request, &outcome),
+            "the refused call leaves a durable fact"
+        );
+        let program_stream = format!("agentic-program:{program_id}");
+        let program_event = store
+            .event_by_idempotency_key(&program_stream, &format!("completion-rejected:{key}"))
+            .expect("program event lookup")
+            .expect("program rejection event");
+        assert_eq!(program_event.kind, "agentic.completion_rejected");
+        assert_eq!(program_event.scope, crate::RuntimeEventScope::Program);
+        assert_eq!(program_event.status.as_deref(), Some("rejected"));
+        let twin = store
+            .event_by_idempotency_key(
+                &format!("execution-effect:{key}"),
+                &format!("agentic-single:{key}"),
+            )
+            .expect("twin lookup")
+            .expect("effect stream twin");
+        assert_eq!(twin.kind, "agentic.batch_member.index");
+        assert_eq!(twin.scope, crate::RuntimeEventScope::ExecutionNode);
+        assert_eq!(twin.actor.as_deref(), Some("runtime.agentic_action"));
+        assert_eq!(twin.status.as_deref(), Some("committed"));
+        assert_eq!(twin.payload["outer_key"], key);
+        assert_eq!(twin.payload["program_event_kind"], "agentic.completion_rejected");
+        assert_eq!(twin.payload["program_stream"], program_stream);
+        assert_eq!(
+            twin.payload["program_event_key"],
+            format!("completion-rejected:{key}")
+        );
+        // One transaction wrote both, and the receipt names both: this is
+        // what the consumer authenticates before it settles the call.
+        assert_eq!(program_event.transaction_id, twin.transaction_id);
+        assert_eq!(program_event.commit_cursor, twin.commit_cursor);
+        let receipt = store
+            .original_transaction_receipt(&program_event.transaction_id)
+            .expect("transaction receipt")
+            .expect("one transaction receipt");
+        assert!(receipt.event_ids.contains(&program_event.event_id));
+        assert!(receipt.event_ids.contains(&twin.event_id));
+        // A call that was never admitted gets no fact at all.
+        let mut unadmitted = request.clone();
+        unadmitted.idempotency_key = "t-unadmitted-effect".into();
+        assert!(
+            !settle_refused_call(&fixture.services, &agent, &unadmitted, &outcome),
+            "a call without its own admission intent leaves no fact"
+        );
+        assert_eq!(
+            store
+                .stream_revision(&format!("execution-effect:{}", unadmitted.idempotency_key))
+                .expect("effect stream"),
+            0
+        );
+        assert!(
+            store
+                .event_by_idempotency_key(
+                    &program_stream,
+                    &format!("completion-rejected:{}", unadmitted.idempotency_key),
+                )
+                .expect("program event lookup")
+                .is_none(),
+            "an unadmitted call leaves no rejection fact behind"
+        );
+        // A call that ran and failed is not a refusal: it may have left
+        // effects, so it must not be settled as terminally refused.
+        let mut failed = outcome.clone();
+        failed.status = crate::RuntimeToolExecutionStatus::Failed;
+        let mut failed_request = request.clone();
+        failed_request.idempotency_key = "t-failed-effect".into();
+        assert!(
+            !settle_refused_call(&fixture.services, &agent, &failed_request, &failed),
+            "a failed call is not a refusal"
+        );
+        // Premise one: a member whose packet names no program gets no fact.
+        let mut unbound = agent.clone();
+        unbound.agentic_binding = None;
+        let mut unbound_request = request.clone();
+        unbound_request.idempotency_key = "t-unbound-effect".into();
+        assert!(
+            !settle_refused_call(&fixture.services, &unbound, &unbound_request, &outcome),
+            "a call whose program cannot be named leaves no fact"
+        );
+        // Premise two: a program that cannot be read leaves no fact.
+        let mut absent = agent.clone();
+        absent.agentic_binding = Some(bound("t-absent-program"));
+        let mut absent_request = request.clone();
+        absent_request.idempotency_key = "t-absent-effect".into();
+        assert!(
+            !settle_refused_call(&fixture.services, &absent, &absent_request, &outcome),
+            "a call whose program cannot be read leaves no fact"
+        );
     }
 
     #[tokio::test]

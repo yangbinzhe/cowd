@@ -583,6 +583,9 @@ where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Outpu
     // root graph has ended, that bus lease is gone, and the equivalent owner
     // is recovered from the original Session fence the ingress installed: the
     // same durable claim and the same original turn control, never a new one.
+    // The recovery is asked for this member: its own graph is the member the
+    // authenticated actor belongs to, and only that member's own unsettled
+    // attempt can keep the recovery window open for it.
     let delegated_owner = match delegated_program.as_ref() {
         Some(program) => match services.original_conclusion_owner(program) {
             Some(owner) => Some(owner),
@@ -592,6 +595,7 @@ where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Outpu
                         &program.session_id,
                         &program.turn_id,
                         root_execution_id,
+                        &parent.execution_id,
                     )
                     .await,
                 None => None,

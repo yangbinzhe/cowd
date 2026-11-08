@@ -30,7 +30,7 @@ pub(crate) use action_service::{
     validate_receipt_index_record, AgenticTopicObservationAck, AgenticWaitDisposition,
     TopicObservationKind,
 };
-pub use action_service::{AgentActionService, AgentActionServiceError, OriginalCommittedMember, OriginalMemberSubmission};
+pub use action_service::{AgentActionService, AgentActionServiceError, OriginalCommittedMember, OriginalMemberSubmission, RefusalOutcome, RefusedCall};
 pub(crate) use action_service::{OriginalCommittedConclusion, OriginalCommittedSingle, OriginalReplayedAction};
 pub(crate) use action_service::process_original_member_replay;
 pub(crate) use execution::start_agentic_claim_heartbeat;

@@ -4311,28 +4311,39 @@ pub(super) fn actual_input_snapshot_for_phase(
                     actual_read_source_fault(&mut original);
                     original
                 };
-                if !event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
+                let original_input = if !event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
                     super::results::authenticate_read_input(
                         store,
                         &event,
                         packet,
                         &mut actual.sources,
                     )?;
+                    // A sealed read is judged by its acquisition; its target
+                    // identity is not consulted, so no original input is
+                    // needed here.
+                    None
                 } else {
-                    authenticate_unsealed_delegated_input(
+                    // G-c: a delegated member's read carries its original
+                    // input in the authenticated child request, and that is
+                    // where the same target-identity predicate reads it from.
+                    // The program Session stream holds no governed plan task
+                    // for a member's read, so looking there attributed every
+                    // member read to the declared capability face - which is
+                    // what refused a read of a durable record.
+                    Some(authenticate_unsealed_delegated_input(
                         store,
                         &primary,
                         &event,
                         packet,
                         &mut actual,
-                    )?;
-                }
+                    )?)
+                };
                 collect_actual_acquisition(
                     store,
                     program,
                     &primary,
                     &event,
-                    super::results::original_read_input(&session_events, &primary),
+                    original_input.as_ref(),
                     &session_events,
                     boundary,
                     readers,
@@ -7958,92 +7969,670 @@ mod tests {
         assert!(error.contains("expected=5 actual=3"), "{error}");
     }
 
-    /// G: the original input a read is judged by is taken from the governed
-    /// plan task the receipt already authenticates, never from a copy.
+    /// G-c skeleton: the delegated member fixture, end to end at function
+    /// level. Asserts the member's read authenticates and carries the
+    /// original input the same target-identity predicate reads.
     ///
-    /// The receipt carries the canonical digest of that task's normalized
-    /// input, so the task is selected by digest: a receipt whose digest does
-    /// not match selects nothing, and two indistinguishable candidates select
-    /// nothing rather than one of them.
+    /// The fixture is the mechanical part: a content-addressed child graph
+    /// holding the bound request, its lineage registration, and the
+    /// primary/index receipt pair on the streams the member path reads.
     #[test]
-    fn g_original_read_input_is_selected_by_the_receipts_own_digest() {
-        let store = RuntimeEventStore::for_test();
-        let plan = |tasks: Vec<serde_json::Value>| {
-            store
-                .append(crate::RuntimeEventInput {
-                    stream_id: "session:g-original-input".into(),
-                    scope: crate::RuntimeEventScope::Tool,
-                    kind: "tool.execution_plan.created".into(),
-                    status: Some("planned".into()),
-                    actor: Some("conversation_runtime".into()),
-                    refs: vec![],
-                    payload: serde_json::json!({"plan_id": "g-plan", "tasks": tasks}),
-                })
-                .unwrap()
+    fn g_c_member_read_end_to_end() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let session = "gc-session";
+        let turn = "gc-turn";
+        let graph_id = "gc-graph";
+        let node_id = "gc-node";
+        let run_id = "run:gc-graph";
+        let worker = "gc-worker";
+        let principal = "gc-principal";
+        let call_id = "gc-call";
+        let step_id = "gc-step";
+
+        let mut packet = harness_contract::agent::AgentTaskPacket {
+            assignment: crate::test_support::agent_assignment(
+                None,
+                worker,
+                run_id,
+                "task:gc",
+                session,
+                "mission:gc",
+                Some("team:gc"),
+                graph_id,
+                node_id,
+            ),
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: "Read the durable record".into(),
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            acceptance: Vec::new(),
+            cohort_prompt_package: None,
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: vec!["read_ref".into()],
+            allowed_skills: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            policy_revision: 1,
+            model_lease: "fixture".into(),
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                "gc-budget",
+                worker,
+                "task:gc",
+                1024,
+                4_000_000_000_000,
+                1,
+            ),
+            deadline_at_ms: 4_000_000_000_000,
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "gc-packet".into(),
+            agentic_binding: None,
         };
-        let task = |call_id: &str, input: serde_json::Value| {
+        packet.agentic_binding = Some(harness_contract::agent::AgenticExecutionBinding {
+            program_id: "gc-program".into(),
+            agent_id: worker.into(),
+            membership_id: "membership:gc".into(),
+            team_id: "team:gc".into(),
+            task_team_id: "team:gc".into(),
+            source_spec_revision: 1,
+            task_purpose: None,
+            focus: harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+                task_ref: "task:gc".into(),
+            },
+        });
+
+        // The member's own read: a unified read of a durable record.
+        let input = serde_json::json!({"reference": "artifact://art-gc"});
+        let input_text = serde_json::to_string(&input).unwrap();
+        let step: crate::step_snapshot::StepCallBinding = serde_json::from_value(
             serde_json::json!({
-                "tool_call_id": call_id,
-                "tool_name": "read_ref",
-                "normalized_input": input,
-            })
+                "origin": {
+                    "origin_step_id": step_id,
+                    "call_id": call_id,
+                    "catalog_digest": "gc-catalog",
+                    "source": {"kind": "provider", "attempt_id": "gc-attempt"},
+                },
+                "snapshot": {
+                    "contract_version": 1,
+                    "identity": {
+                        "step_id": step_id,
+                        "session_id": session,
+                        // The packet's admitted turn, which the member path
+                        // binds the Step identity to.
+                        "turn_id": packet.assignment.execution_identity.turn_id().unwrap_or(turn),
+                        "execution_id": run_id,
+                        // The packet's admitted principal, not a name of our
+                        // own choosing: the member path binds the Step
+                        // identity to it.
+                        "actor_ref": packet.assignment.execution_identity.principal_id(),
+                        "run_ref": run_id,
+                        "attempt": 1,
+                        "goal_ref": null,
+                        "program_ref": null,
+                        "task_ref": null,
+                        "build_ref": "gc-fixture",
+                    },
+                    "provider_attempt": {
+                        "attempt_id": "gc-attempt",
+                        "origin_step_id": step_id,
+                        "model_profile_digest": "gc-profile",
+                        "request_digest": "gc-request",
+                    },
+                    "catalog_digest": "gc-catalog",
+                    "tools": [],
+                    "related_revisions": {},
+                    "context_refs": [],
+                    "expires_at_ms": 4_000_000_000_000i64,
+                },
+            }),
+        )
+        .unwrap();
+        let key = step.effect_idempotency_key();
+        let payload_digest =
+            harness_contract::step::canonical_digest("tool-effect-payload", &input).unwrap();
+        let input_sha256 = crate::context_evidence::read_sha256(input_text.as_bytes());
+
+        // The descriptor the unified read facade declares: a File capability
+        // face whatever the read actually named.
+        let effect = ToolEffectDescriptor {
+            tool_id: "read_ref".into(),
+            descriptor_hash: "gc-descriptor".into(),
+            effect_kind: ToolEffectKind::Read,
+            idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+            scopes: vec![harness_contract::policy::PermissionScope {
+                resource: harness_contract::policy::PermissionResource::File,
+                operation: harness_contract::policy::PermissionOperation::Read,
+                target: Some(".".into()),
+            }],
+            required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
         };
-        let receipt = |call_id: &str, digest: &str| {
+        let lease = harness_contract::policy::AuthorizationLease {
+            lease_id: "gc-lease".into(),
+            principal_id: principal.into(),
+            parent_lease_id: None,
+            capability: "read_ref".into(),
+            scopes: effect.scopes.clone(),
+            ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            issued_at_ms: 0,
+            expires_at_ms: 4_000_000_000_000,
+            max_uses: 1,
+            remaining_uses: 1,
+            idempotency_key: "gc-lease-key".into(),
+            policy_revision: 1,
+            effect_descriptor_hash: effect.descriptor_hash.clone(),
+            signature: "gc-signature".into(),
+            status: harness_contract::policy::AuthorizationLeaseStatus::Active,
+        };
+        let authorization = harness_contract::tool::ToolExecutionAuthorization {
+            request_id: "gc-request".into(),
+            tool_id: "read_ref".into(),
+            descriptor_hash: effect.descriptor_hash.clone(),
+            policy_revision: 1,
+            scope: effect.scopes[0].clone(),
+            authorization_lease: lease,
+            timeout_lease: "gc-timeout".into(),
+            idempotency_key: None,
+        };
+        let invocation = harness_contract::tool::GovernedToolInvocation {
+            origin: Some(step.origin.clone()),
+            contract_version: 1,
+            invocation_id: call_id.into(),
+            intent: harness_contract::tool::ToolIntent {
+                invocation_id: call_id.into(),
+                tool_name: "read_ref".into(),
+                normalized_input: input.clone(),
+            },
+            effect: effect.clone(),
+            resource_demand: Default::default(),
+            explicit_dependencies: Vec::new(),
+            compiled_dependencies: Vec::new(),
+            catalog_revision: 1,
+            descriptor_set_hash: "gc-descriptor-set".into(),
+            idempotency_key: key.clone(),
+        };
+        let request: crate::tool_host::RuntimeToolExecutionRequest =
+            serde_json::from_value(serde_json::json!({
+                "compiled_invocation": invocation,
+                "step_binding": step,
+                "governed_plan_id": "gc-plan",
+                "governed_plan_revision": 1,
+                "observation_wave_sequence": 1,
+                "idempotency_key": key,
+                "tool_use_id": call_id,
+                "tool_name": "read_ref",
+                "input": input_text,
+                "category": "read_only",
+                "authorization": authorization,
+                "session_id": session,
+                "sandbox_posture": "workspace_write_sandbox",
+                "policy_revision": 1,
+                "authorized_scopes": [],
+                "parent_execution": {
+                    "execution_id": graph_id,
+                    "node_id": node_id,
+                },
+                "parent_execution_attempt": packet.attempt,
+            }))
+            .unwrap();
+
+        // The parent graph the packet was admitted under: the real member
+        // path loads it before it reads the member's receipts.
+        let mut parent_graph = harness_contract::execution_graph::ExecutionGraph::new("gc parent");
+        parent_graph.id = graph_id.into();
+        parent_graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: session.into(),
+            turn_id: packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap_or(turn)
+                .to_string(),
+            root_task_id: "task:gc".into(),
+            task_id: "task:gc".into(),
+            generation: 1,
+        });
+        let mut parent_node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::AgentTask,
+            "agent_task",
+            serde_json::to_string(&packet).unwrap(),
+        );
+        parent_node.id = node_id.into();
+        parent_graph.nodes.push(parent_node);
+        crate::ExecutionCommitService::new(std::sync::Arc::clone(&store))
+            .register_graph(parent_graph)
+            .unwrap();
+
+        // The bound child graph, named by the digest of its own payload.
+        // The bound payload is the production persisted encoding, not raw
+        // JSON: the decoder reads exactly what the encoder wrote.
+        let bound_text = crate::execution_core::graph::executors::agent_tool::encode_bound_agent_tool(
+            worker,
+            run_id,
+            request,
+        )
+        .unwrap();
+        let bound_digest = format!("{:x}", {
+            use sha2::Digest;
+            sha2::Sha256::digest(bound_text.as_bytes())
+        });
+        let child_graph_id = format!("agent-tool-batch:{bound_digest}");
+        let child_node_id = format!("agent-tool:{bound_digest}");
+        let mut child = harness_contract::execution_graph::ExecutionGraph::new("gc child");
+        child.id = child_graph_id.clone();
+        child.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: graph_id.into(),
+            node_id: node_id.into(),
+        });
+        child.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: session.into(),
+            turn_id: packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap_or(turn)
+                .to_string(),
+            root_task_id: "task:gc".into(),
+            task_id: "task:gc".into(),
+            generation: 1,
+        });
+        let mut child_node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            bound_text.clone(),
+        );
+        child_node.id = child_node_id.clone();
+        child.nodes.push(child_node);
+        crate::ExecutionCommitService::new(std::sync::Arc::clone(&store))
+            .register_graph(child)
+            .unwrap();
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: format!("execution-lineage:{graph_id}"),
+                scope: crate::RuntimeEventScope::Relation,
+                kind: "execution.lineage.child_registered.v1".into(),
+                status: Some("registered".into()),
+                actor: Some("execution_commit_service".into()),
+                refs: vec![],
+                payload: serde_json::json!({
+                    "parent_execution_id": graph_id,
+                    "parent_node_id": node_id,
+                    "child_execution_id": child_graph_id,
+                    "child_objective": "gc child",
+                }),
+            })
+            .unwrap();
+
+        // The primary/index receipt pair on the streams the member path reads.
+        let outcome = serde_json::json!({
+            "status": "executed",
+            "tool_use_id": call_id,
+            "tool_name": "read_ref",
+            "output": "durable record body",
+        });
+        // The replay carries the compiled invocation with its normalized
+        // input withheld, exactly as the producer stores it.
+        let mut stored_invocation = invocation.clone();
+        stored_invocation.intent.normalized_input = serde_json::Value::Null;
+        let stored_invocation = serde_json::to_value(&stored_invocation).unwrap();
+        let replay = serde_json::json!({
+            "session_id": session,
+            "parent_execution": {"execution_id": graph_id, "node_id": node_id},
+            "origin": step.origin,
+            "call_id": call_id,
+            "invocation": stored_invocation,
+            "payload_digest": payload_digest,
+        });
+        let primary_payload = serde_json::json!({
+            "idempotency_key": key,
+            "tool_use_id": call_id,
+            "tool_name": "read_ref",
+            "input_sha256": input_sha256,
+            "outcome": outcome.clone(),
+            "replay": replay,
+        });
+        let index_payload = serde_json::json!({
+            "idempotency_key": key,
+            "effect_kind": "read",
+            "outcome": outcome,
+            "authorized_scopes": [],
+            "effect_scope": authorization.scope,
+            "sequence": 1,
+        });
+        let receipt = store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!("gc-receipt:{key}"),
+                expected_streams: vec![
+                    crate::ExpectedStreamRevision {
+                        stream_id: format!("execution-effect:{key}"),
+                        expected_revision: 0,
+                    },
+                    crate::ExpectedStreamRevision {
+                        stream_id: format!(
+                            "execution-agent-receipts:{graph_id}:{node_id}:{}",
+                            packet.attempt
+                        ),
+                        expected_revision: 0,
+                    },
+                ],
+                events: vec![
+                    crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: format!("execution-effect:{key}"),
+                            scope: crate::RuntimeEventScope::ExecutionNode,
+                            kind: "execution.read.receipt".into(),
+                            status: Some("completed".into()),
+                            actor: Some("governed_tool".into()),
+                            refs: vec![],
+                            payload: primary_payload,
+                        },
+                        idempotency_key: Some(format!("{key}:read-receipt")),
+                        schema_version: 1,
+                    },
+                    crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: format!(
+                                "execution-agent-receipts:{graph_id}:{node_id}:{}",
+                                packet.attempt
+                            ),
+                            scope: crate::RuntimeEventScope::ExecutionNode,
+                            kind: "execution.agent_tool.receipt".into(),
+                            status: Some("completed".into()),
+                            actor: Some("governed_tool".into()),
+                            refs: vec![],
+                            payload: index_payload,
+                        },
+                        idempotency_key: Some(format!("agent-tool-receipt:{key}")),
+                        schema_version: 1,
+                    },
+                ],
+            })
+            .unwrap();
+        let _ = receipt;
+        let events = store
+            .list_stream(&format!("execution-effect:{key}"))
+            .unwrap();
+        let primary = events
+            .iter()
+            .find(|event| event.kind == "execution.read.receipt")
+            .unwrap()
+            .clone();
+        let index = store
+            .list_stream(&format!(
+                "execution-agent-receipts:{graph_id}:{node_id}:{}",
+                packet.attempt
+            ))
+            .unwrap()
+            .iter()
+            .find(|event| event.kind == "execution.agent_tool.receipt")
+            .unwrap()
+            .clone();
+
+        // The member path authenticates the read's original input from the
+        // child request, and that input is what the shared predicate reads.
+        let mut actual = ActualInputSnapshot {
+            file_dependencies: Vec::new(),
+            immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
+            material_events: Vec::new(),
+            canonical_facts: Vec::new(),
+        };
+        let member_input = authenticate_unsealed_delegated_input(
+            &store,
+            &primary,
+            &index,
+            &packet,
+            &mut actual,
+        )
+        .expect("the member read authenticates its original input");
+        assert_eq!(member_input["reference"], "artifact://art-gc");
+
+        let body = serde_json::json!({
+            "outcome": {"status": "executed", "output": "original body"},
+            "outcome_truncated": false,
+        });
+        let receipt_of = |payload: &serde_json::Value| {
             store
                 .append(crate::RuntimeEventInput {
-                    stream_id: "execution-effect:g-original-input".into(),
+                    stream_id: "session:gc-sealed".into(),
                     scope: crate::RuntimeEventScope::ExecutionNode,
                     kind: "execution.read.receipt".into(),
                     status: Some("completed".into()),
                     actor: Some("governed_tool".into()),
                     refs: vec![],
-                    payload: serde_json::json!({
-                        "tool_use_id": call_id,
-                        "tool_name": "read_ref",
-                        "replay": {"payload_digest": digest},
-                    }),
+                    payload: payload.clone(),
                 })
                 .unwrap()
         };
-        let input = serde_json::json!({"reference": "tool://tool-raw-abc"});
-        let digest = harness_contract::step::canonical_digest("tool-effect-payload", &input).unwrap();
-        let other_digest =
-            harness_contract::step::canonical_digest("tool-effect-payload", &serde_json::json!({"reference": "tool://tool-raw-other"}))
-                .unwrap();
 
-        // The receipt's own digest selects its plan task.
-        let selected = plan(vec![task("g-call", input.clone())]);
-        let primary = receipt("g-call", &digest);
-        assert_eq!(
-            super::super::results::original_read_input(&[selected.clone()], &primary),
-            Some(&input),
-            "the plan task whose digest the receipt carries is the original input"
-        );
-
-        // A receipt that carries another digest selects nothing, so the
-        // judgment falls back to the stricter declared capability face.
-        let foreign = receipt("g-call", &other_digest);
+        // G-c-P1: the member's read of a durable record carries no workspace
+        // extent, so the actual-input acquisition settles with the immutable
+        // receipt fact instead of being refused.
+        //
+        // The settlement runs through the member path itself. The boundary
+        // names the consumer event that path authenticates, so the assertion
+        // witnesses the wiring that reads the member's original input - not
+        // the shared predicate alone.
+        let mut program = AgenticProgramProjection::empty("gc-program", "gc-objective");
+        program.session_id = session.into();
+        let consumer = store
+            .append(crate::RuntimeEventInput {
+                stream_id: format!("session:{session}"),
+                scope: crate::RuntimeEventScope::ExecutionNode,
+                kind: "execution.effect.intent".into(),
+                status: Some("completed".into()),
+                actor: Some("governed_tool".into()),
+                refs: vec![],
+                payload: serde_json::json!({
+                    "idempotency_key": key,
+                    "replay": {
+                        "origin": step.origin,
+                        "session_id": session,
+                        "call_id": call_id,
+                        "parent_execution": {"execution_id": graph_id, "node_id": node_id},
+                    },
+                }),
+            })
+            .unwrap();
+        let boundary = super::super::results::ResultInputBoundary {
+            producer: format!("agent-run:{run_id}"),
+            packet: Some(packet.clone()),
+            step: None,
+            cursor: consumer.commit_cursor,
+            call_key: key.clone(),
+            source: harness_contract::goal::ProofInputEvent {
+                stream_id: consumer.stream_id.clone(),
+                sequence: consumer.sequence,
+                event_id: consumer.event_id.clone(),
+                payload_digest: super::super::proof_value_digest(&consumer.payload),
+            },
+        };
+        let mut windows = std::collections::BTreeMap::new();
+        let settled = super::actual_input_snapshot_for_phase(
+            &store,
+            &program,
+            std::slice::from_ref(&boundary),
+            super::super::ResultContentReaders {
+                artifacts: None,
+                history: None,
+                process_inputs: None,
+            },
+            None,
+            false,
+            None,
+        )
+        .expect("a member read of a durable record has no workspace extent");
         assert!(
-            super::super::results::original_read_input(&[selected.clone()], &foreign).is_none(),
-            "a receipt whose digest does not match selects no plan task"
+            settled
+                .canonical_facts
+                .iter()
+                .any(|fact| fact["grade"] == "acquired_immutable_receipt"),
+            "the member read of a durable record settles as an immutable receipt: {:?}",
+            settled.canonical_facts
         );
 
-        // Two indistinguishable candidates select nothing rather than one.
-        let first = plan(vec![task("g-call", input.clone())]);
-        let second = plan(vec![task("g-call", input.clone())]);
-        assert!(
-            super::super::results::original_read_input(&[first, second], &primary).is_none(),
-            "two indistinguishable plan tasks select nothing"
-        );
-
-        // Two candidates that differ are separated by the receipt's digest:
-        // the authenticated one is the original input, not a guess.
-        let first = plan(vec![task("g-call", input.clone())]);
-        let second = plan(vec![task("g-call", serde_json::json!({"reference": "tool://tool-raw-other"}))]);
+        // G-c-N2: the same member read, judged as a workspace path, is still
+        // refused - the extension did not turn a workspace read into a record.
+        let mut refused = ActualInputSnapshot {
+            file_dependencies: Vec::new(),
+            immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
+            material_events: Vec::new(),
+            canonical_facts: Vec::new(),
+        };
         assert_eq!(
-            super::super::results::original_read_input(&[first, second], &primary),
-            Some(&input),
-            "the receipt's digest separates two candidates that differ"
+            collect_actual_acquisition(
+                &store,
+                &program,
+                &primary,
+                &index,
+                Some(&serde_json::json!({"reference": "file://workspace/report.txt"})),
+                &[],
+                &boundary,
+                super::super::ResultContentReaders {
+                    artifacts: None,
+                    history: None,
+                    process_inputs: None,
+                },
+                &mut refused,
+                &mut windows,
+            )
+            .unwrap_err(),
+            "proof_actual_input_extent_unsupported: actual read lacks an original physical extent"
+        );
+        assert!(
+            refused.canonical_facts.is_empty(),
+            "a refused member read settles nothing"
+        );
+
+        // G-c-N3: the red lines. A read that carries an acquisition seal is
+        // judged by that seal, never as an immutable receipt; and a read whose
+        // original input cannot be resolved keeps the stricter declared
+        // capability judgment rather than being waved through.
+        let sealed = serde_json::json!({
+            "outcome": {"status": "executed", "output": "original body"},
+            "outcome_truncated": false,
+            "read_acquisition_v1": {"seal": "present"},
+        });
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt_of(&sealed),
+                &effect,
+                Some(&member_input),
+            )
+            .unwrap(),
+            "a sealed read is judged by its acquisition, not as an immutable receipt"
+        );
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(&receipt_of(&body), &effect, None)
+                .unwrap(),
+            "an unresolved original input keeps the declared capability judgment"
+        );
+    }
+
+    /// G-c: a delegated member's read is judged by the original input its
+    /// authenticated child request carries, not by the capability face the
+    /// unified read facade declares.
+    ///
+    /// The member path reads that input from the child request it already
+    /// authenticated (the same canonical digest binding the receipt carries),
+    /// so a member reading a durable record has no workspace extent while a
+    /// member reading a workspace path still needs its acquisition seal.
+    #[test]
+    fn g_c_member_read_target_decides_whether_the_read_has_a_workspace_extent() {
+        let store = RuntimeEventStore::for_test();
+        let receipt = |payload: serde_json::Value| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:g-c-member-read".into(),
+                    scope: crate::RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.receipt".into(),
+                    status: Some("completed".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload,
+                })
+                .unwrap()
+        };
+        let descriptor = |scopes: Vec<harness_contract::policy::PermissionScope>| ToolEffectDescriptor {
+            tool_id: "read_ref".into(),
+            descriptor_hash: "g-c-read-ref-descriptor".into(),
+            effect_kind: ToolEffectKind::Read,
+            idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+            scopes,
+            required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        };
+        let file_face = vec![harness_contract::policy::PermissionScope {
+            resource: harness_contract::policy::PermissionResource::File,
+            operation: harness_contract::policy::PermissionOperation::Read,
+            target: Some(".".into()),
+        }];
+        let body = serde_json::json!({
+            "outcome": {"status": "executed", "output": "original body"},
+            "outcome_truncated": false,
+        });
+        // The member's authenticated child request input, the shape the member
+        // path now feeds to the same predicate the root path uses.
+        let member_input = |reference: &str| {
+            Some(serde_json::json!({"reference": reference}))
+        };
+
+        // A member reading a durable record: no workspace extent.
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                member_input("artifact://art_74d37ca7").as_ref(),
+            )
+            .unwrap(),
+            "a member read of a durable record has no workspace extent"
+        );
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                member_input("tool://tool-raw-chatcmpl-tool-a815fdd23125e201").as_ref(),
+            )
+            .unwrap(),
+            "a member read of a tool raw record has no workspace extent"
+        );
+        // A member reading a workspace path still needs its acquisition seal.
+        for target in ["file://workspace/report.txt", "dir://workspace"] {
+            assert!(
+                !super::immutable_receipt_without_workspace_extent(
+                    &receipt(body.clone()),
+                    &descriptor(file_face.clone()),
+                    member_input(target).as_ref(),
+                )
+                .unwrap(),
+                "{target} is a workspace read and keeps its seal requirement"
+            );
+        }
+        // A member read whose child request cannot be authenticated keeps the
+        // stricter declared capability judgment: Unknown is not turned into a
+        // pass.
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                None,
+            )
+            .unwrap(),
+            "an unauthenticated member read keeps the declared capability judgment"
         );
     }
 

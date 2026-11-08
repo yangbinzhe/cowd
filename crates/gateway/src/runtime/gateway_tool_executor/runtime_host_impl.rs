@@ -553,7 +553,12 @@ impl GatewayToolExecutor {
                 runtime::RuntimeToolExecutionOutcome { pending_agent_batch,
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
-                    status: if unknown { runtime::RuntimeToolExecutionStatus::Unknown } else { runtime::RuntimeToolExecutionStatus::Failed },
+                    // A refusal decided before the call could run never
+                    // executed: it is blocked, not failed, and the runtime
+                    // may settle it as refused.
+                    status: if unknown { runtime::RuntimeToolExecutionStatus::Unknown }
+                        else if error.is_refusal_before_effect() { runtime::RuntimeToolExecutionStatus::BlockedPermission }
+                        else { runtime::RuntimeToolExecutionStatus::Failed },
                     category: request.category,
                     output: None,
                     error: Some(error.to_string()),

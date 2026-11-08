@@ -2076,48 +2076,6 @@ fn authenticate_callback_parent_chain(
     }
 }
 
-/// The original input of the read a receipt belongs to, when the Session
-/// stream still carries the governed plan of that read.
-///
-/// The plan task is the only durable carrier of that input, and the receipt's
-/// own `replay.payload_digest` is the canonical digest of it - the same
-/// binding `original_tool_primary_and_index` uses when it authenticates a
-/// primary receipt against its plan. The task is therefore selected by
-/// digest, never guessed: a receipt whose plan task is absent, ambiguous or
-/// unreadable yields no input rather than an assumed one.
-pub(super) fn original_read_input<'events>(
-    session_events: &'events [crate::DurableRuntimeEvent],
-    primary: &crate::DurableRuntimeEvent,
-) -> Option<&'events serde_json::Value> {
-    let digest = primary.payload["replay"]["payload_digest"].as_str()?;
-    let call_id = primary.payload["tool_use_id"].as_str()?;
-    let tool_name = primary.payload["tool_name"].as_str()?;
-    let mut selected = None;
-    for plan in session_events
-        .iter()
-        .filter(|plan| plan.kind == "tool.execution_plan.created")
-    {
-        for task in plan.payload["tasks"].as_array().into_iter().flatten() {
-            if task["tool_call_id"] != call_id || task["tool_name"] != tool_name {
-                continue;
-            }
-            let Ok(candidate) =
-                harness_contract::step::canonical_digest("tool-effect-payload", &task["normalized_input"])
-            else {
-                continue;
-            };
-            if candidate != digest {
-                continue;
-            }
-            if selected.is_some() {
-                return None;
-            }
-            selected = Some(&task["normalized_input"]);
-        }
-    }
-    selected
-}
-
 pub(super) fn result_tool_plan<'events>(
     events: &'events [DurableRuntimeEvent],
     event: &DurableRuntimeEvent,

@@ -8,6 +8,159 @@ use harness_contract::goal::{AcceptanceCriterion, AcceptanceStatus, GoalCompleti
 
 use super::*;
 
+/// T: a call that was admitted and then refused while it ran leaves one
+/// durable fact, written under the call's own effect key.
+///
+/// The consumer reads the refusal by the admitted call's own key, so the
+/// program event and its effect-stream twin are one transaction under that
+/// key. A call that carries no admission intent gets no fact at all.
+#[test]
+fn t_refused_admitted_call_writes_one_consumable_rejection_fact() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
+    // The program this rejection is written under is the one the projection
+    // names; an empty program stream is revision 0.
+    let mut projection = AgenticProgramProjection::empty("t-program", "t-objective");
+    projection.session_id = "t-session".into();
+    let key = "t-refusal-effect";
+    let call = RefusedCall {
+        effect_key: key,
+        tool_use_id: "t-refusal-call",
+        tool_name: "read_ref",
+        reason: "the delegated reader is an Agent action and this call carries no original action capability",
+    };
+    // A call without its own admission intent gets no fact.
+    assert_eq!(
+        service
+            .record_refused_admitted_call(&projection, &call)
+            .expect("refusal outcome"),
+        RefusalOutcome::NotAdmitted
+    );
+    assert_eq!(
+        store
+            .stream_revision(&format!("execution-effect:{key}"))
+            .expect("effect stream"),
+        0
+    );
+    assert!(
+        store
+            .event_by_idempotency_key(
+                &format!("agentic-program:{}", projection.program_id),
+                &format!("completion-rejected:{key}"),
+            )
+            .expect("program event lookup")
+            .is_none(),
+        "an unadmitted call leaves no rejection fact behind"
+    );
+    // The admission intent the refusal is read against, written the way the
+    // Read family admits it: one transaction event under its own key.
+    store
+        .append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("{key}:read-intent"),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: format!("execution-effect:{key}"),
+                expected_revision: 0,
+            }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: format!("execution-effect:{key}"),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.intent".into(),
+                    status: Some("inflight".into()),
+                    actor: Some("governed_tool".into()),
+                    // The admission names the call it admitted, the way the
+                    // Read family admits it.
+                    refs: vec![crate::RuntimeEventRef {
+                        kind: "tool_invocation".into(),
+                        id: call.tool_use_id.into(),
+                    }],
+                    payload: json!({
+                        "idempotency_key": key,
+                        "tool_use_id": call.tool_use_id,
+                        "tool_name": call.tool_name,
+                    }),
+                },
+                idempotency_key: Some(format!("{key}:read-intent")),
+                schema_version: 1,
+            }],
+        })
+        .expect("admission intent");
+    assert!(
+        store
+            .event_by_idempotency_key(
+                &format!("execution-effect:{key}"),
+                &format!("{key}:read-intent"),
+            )
+            .expect("intent lookup")
+            .is_some(),
+        "the admission intent is on the call's own effect stream"
+    );
+    assert_eq!(
+        service
+            .record_refused_admitted_call(&projection, &call)
+            .expect("refusal outcome"),
+        RefusalOutcome::Recorded
+    );
+    // The program's rejection event.
+    let program_stream = format!("agentic-program:{}", projection.program_id);
+    let program_event = store
+        .event_by_idempotency_key(&program_stream, &format!("completion-rejected:{key}"))
+        .expect("program event lookup")
+        .expect("program rejection event");
+    assert_eq!(program_event.kind, "agentic.completion_rejected");
+    assert_eq!(program_event.scope, RuntimeEventScope::Program);
+    assert_eq!(program_event.status.as_deref(), Some("rejected"));
+    assert_eq!(
+        program_event.idempotency_key.as_deref(),
+        Some(format!("completion-rejected:{key}").as_str())
+    );
+    assert_eq!(program_event.payload["request_action_id"], key);
+    // Its effect-stream twin, on the refused call's own stream.
+    let twin = store
+        .event_by_idempotency_key(
+            &format!("execution-effect:{key}"),
+            &format!("agentic-single:{key}"),
+        )
+        .expect("twin lookup")
+        .expect("effect stream twin");
+    assert_eq!(twin.kind, "agentic.batch_member.index");
+    assert_eq!(twin.scope, RuntimeEventScope::ExecutionNode);
+    assert_eq!(twin.actor.as_deref(), Some("runtime.agentic_action"));
+    assert_eq!(twin.status.as_deref(), Some("committed"));
+    assert_eq!(twin.schema_version, 1);
+    assert_eq!(twin.payload["outer_key"], key);
+    assert_eq!(twin.payload["program_event_kind"], "agentic.completion_rejected");
+    assert_eq!(twin.payload["program_stream"], program_stream);
+    assert_eq!(
+        twin.payload["program_event_key"],
+        format!("completion-rejected:{key}")
+    );
+    // One transaction wrote both, and the receipt names both.
+    assert_eq!(program_event.transaction_id, twin.transaction_id);
+    assert_eq!(program_event.commit_cursor, twin.commit_cursor);
+    let receipt = store
+        .original_transaction_receipt(&program_event.transaction_id)
+        .expect("transaction receipt")
+        .expect("one transaction receipt");
+    assert!(receipt.event_ids.contains(&program_event.event_id));
+    assert!(receipt.event_ids.contains(&twin.event_id));
+    // The same refusal again is not a second fact.
+    assert_eq!(
+        service
+            .record_refused_admitted_call(&projection, &call)
+            .expect("refusal outcome"),
+        RefusalOutcome::Recorded
+    );
+    assert_eq!(
+        store
+            .list_stream(&format!("execution-effect:{key}"))
+            .expect("effect stream")
+            .len(),
+        2,
+        "the intent and its one refusal twin are the whole stream"
+    );
+}
+
 #[test]
 fn own832_retirement_execute_preserves_preclaim_and_claim_identity_fences() {
     let store = Arc::new(RuntimeEventStore::for_test());

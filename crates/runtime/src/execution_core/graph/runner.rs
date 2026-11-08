@@ -118,9 +118,10 @@ pub(crate) fn k05_completion_trace(ticket: &NodeExecutionTicket, stage: &'static
 }
 
 #[cfg(feature = "test-fixtures")]
-fn k05_completion_cas_error(ticket: &NodeExecutionTicket, error: &ExecutionCommitError) {
-    use sha2::{Digest, Sha256};
-    let (category, stream, expected, actual) = match error {
+fn k05_completion_cas_class(
+    error: &ExecutionCommitError,
+) -> (&'static str, Option<&str>, Option<u64>, Option<u64>) {
+    match error {
         ExecutionCommitError::EventStore(crate::runtime_event_store::RuntimeEventStoreError::StaleRevision { stream_id, expected, actual }) =>
             ("event_store_stale_revision", Some(stream_id.as_str()), Some(*expected), Some(*actual)),
         ExecutionCommitError::StaleRevision { graph_id, expected, actual } =>
@@ -132,11 +133,22 @@ fn k05_completion_cas_error(ticket: &NodeExecutionTicket, error: &ExecutionCommi
         ExecutionCommitError::InvalidCommand(_) => ("invalid_command", None, None, None),
         ExecutionCommitError::AlreadyAppliedSame { .. } => ("already_applied_same", None, None, None),
         ExecutionCommitError::GraphStreamCollision(_) => ("graph_stream_collision", None, None, None),
+        // The source moved under the proof: the owner is still writing, so the
+        // closure re-proves inside its budget. The same wait the recovery seam
+        // takes, named the same way.
+        ExecutionCommitError::PhysicalClosureSourceMoved { stream_id } =>
+            ("physical_closure_source_moved", Some(stream_id.as_str()), None, None),
         ExecutionCommitError::MissingDomainIdempotency(_) => ("missing_domain_idempotency", None, None, None),
         ExecutionCommitError::ProtectedDomainScope(_) => ("protected_domain_scope", None, None, None),
         ExecutionCommitError::BlockingTask(_) => ("blocking_task", None, None, None),
         ExecutionCommitError::InvalidReplan(_) => ("invalid_replan", None, None, None),
-    };
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn k05_completion_cas_error(ticket: &NodeExecutionTicket, error: &ExecutionCommitError) {
+    use sha2::{Digest, Sha256};
+    let (category, stream, expected, actual) = k05_completion_cas_class(error);
     let source_kind = stream.map(|id| {
         if id == ticket.graph_id.as_str() { "graph" }
         else if id.starts_with("execution-agent-receipts:") { "agent_receipts" }
@@ -1752,7 +1764,16 @@ impl ExecutionGraphRunner {
                                     "physical closure unprovable: {ring}: {reason}"
                                 )));
                             }
-                            super::commit_service::PhysicalClosureProof::Pending => {}
+                            // A source that moved under the proof is the
+                            // same wait here: this observation loop already
+                            // re-proves on the next commit inside the
+                            // physical-closure budget.
+                            // Every wait is the same wait here: this
+                            // observation loop already re-proves on the next
+                            // commit inside the physical-closure budget. The
+                            // asymmetry with the recovery is deliberate and
+                            // is registered as R-1 in the patch notes.
+                            super::commit_service::PhysicalClosureProof::Pending(_) => {}
                         }
                         changes.changed().await.map_err(|_| {
                             ExecutionRunnerError::Driver(
@@ -4487,6 +4508,64 @@ mod goal_revalidation_fence_tests {
         assert!(!accepts_goal_revalidation(&original, &candidate, &old, &changed_sources, "goal:one", 62, 63));
         changed_sources.insert("effect:one".into(), 8);
         assert!(!accepts_goal_revalidation(&original, &candidate, &old, &changed_sources, "goal:one", 62, 63));
+    }
+
+    // The completion classifier sits behind the test-fixtures feature, so
+    // the release build does not type-check it. The arm for the moved
+    // source is asserted here, where the feature is on: the error is
+    // classified by its type and keeps the stream that moved, instead of
+    // falling into a bucket that names neither.
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn the_moved_closure_source_is_classified_by_type_and_keeps_its_stream() {
+        let error = ExecutionCommitError::PhysicalClosureSourceMoved {
+            stream_id: "execution-effect:shape-moved".into(),
+        };
+        let (category, stream, expected, actual) = k05_completion_cas_class(&error);
+        assert_eq!(category, "physical_closure_source_moved");
+        assert_eq!(stream, Some("execution-effect:shape-moved"));
+        assert_eq!(expected, None);
+        assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn every_executor_error_that_carries_a_node_gives_the_node_back() {
+        // `DuplicateExecutor` carries no node: it names the executor kind
+        // that was registered twice. Every other variant carries the node
+        // it failed on, and the attribution must hand it back unchanged, so
+        // a failure stays attributable to its node.
+        for error in [
+            NodeExecutorError::Unavailable {
+                executor_kind: "executor".into(),
+                node_id: "node-a".into(),
+            },
+            NodeExecutorError::Invalid {
+                node_id: "node-a".into(),
+                reason: "refused".into(),
+            },
+            NodeExecutorError::Start {
+                node_id: "node-a".into(),
+                reason: "refused".into(),
+            },
+            NodeExecutorError::Poll {
+                node_id: "node-a".into(),
+                reason: "refused".into(),
+            },
+            NodeExecutorError::Cancel {
+                node_id: "node-a".into(),
+                reason: "refused".into(),
+            },
+            NodeExecutorError::Recover {
+                node_id: "node-a".into(),
+                reason: "refused".into(),
+            },
+            NodeExecutorError::Uncertain {
+                node_id: "node-a".into(),
+                reason: "refused".into(),
+            },
+        ] {
+            assert_eq!(executor_error_node_id(&error), "node-a", "{error}");
+        }
     }
 }
 
