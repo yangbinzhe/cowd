@@ -994,6 +994,11 @@ fn resolve_result_refs(program: &AgenticProgramProjection, result_refs: &[String
 pub(crate) struct IndependentReview {
     pub producers: Vec<String>,
     pub verification: ObjectiveReviewVerification,
+    /// The required writes this review settled as failed, in the closure
+    /// projection's entry shape. They travel BESIDE the proof: the proof's
+    /// digests must not change, and a failure that is not named anywhere
+    /// would be silence.
+    pub required_write_failures: Vec<serde_json::Value>,
 }
 
 struct ReadCoverage {
@@ -1012,6 +1017,20 @@ struct ReadCoverage {
 /// primer advertises as the one reader that does not count.
 fn counts_as_physical_read(tool_name: &str) -> bool {
     matches!(tool_name, "evidence_retrieve" | "read_ref")
+}
+
+/// Whether this read carries its own read-acquisition seal.
+///
+/// The seal is judged by its value, not by the presence of a key: the store
+/// writes the seal into the read's receipt payload, and a key whose value is
+/// json null carries no seal - that is the shape the truncated receipt of the
+/// live run has. The decoder is used exactly as the seal path uses it, so
+/// the seal's decoding and its authentication are unchanged by this fact;
+/// it only says whether the seal is there.
+fn read_carries_acquisition_seal(event_payload: &serde_json::Value) -> bool {
+    let seal = &event_payload[crate::context_evidence::READ_ACQUISITION_FIELD];
+    seal.is_object()
+        && crate::context_evidence::decode_read_acquisition(seal).is_ok()
 }
 
 /// Whether two references name the same object under either spelling.
@@ -1652,16 +1671,31 @@ fn packet_identity_matches(
     }
 }
 
-/// The two shared aggregate streams a review reads while other actors keep
-/// appending to them: the reviewed Session stream, and the physical lineage
-/// stream of the reviewed graph. Both are append-only and every event in them
-/// is located by sequence, so an append that lands while this review reads
-/// does not change the material it already pinned. The prefixes are the ones
-/// the product already classifies by (`results.rs` Session cuts,
-/// `execution_core/graph/commit_pipeline.rs` lineage stream ids); no new
-/// classification dimension is introduced.
+/// The shared aggregate streams a review reads while other actors keep
+/// appending to them: the reviewed Session stream, the physical lineage
+/// stream of the reviewed graph, and the execution graph streams themselves.
+///
+/// All are append-only and every event in them is located by sequence, so an
+/// append that lands while this review reads does not change the material it
+/// already pinned. The execution graph streams grow on their own while the
+/// review reads them - a sibling node migrating already advances the root
+/// graph and its child graphs - and that growth moves nothing inside the
+/// pinned window, because the window locates its material by sequence. The
+/// prefixes are the ones the product already classifies by (`results.rs`
+/// Session cuts, `execution_core/graph/commit_pipeline.rs` lineage stream ids,
+/// and the product's own execution graph id forms `agentic-graph:` and
+/// `session-ingress-graph:`); no new classification dimension is introduced.
 fn source_grows_during_review(source: &str) -> bool {
-    source.starts_with("session:") || source.starts_with("execution-lineage:")
+    // A5: normalize before the prefix test. A delegated read reaches this
+    // predicate in its run-id form (`run:agentic-graph:...`), because the
+    // reviewer pins the un-normalized ticket graph id, while the store looks
+    // that id up under the graph id alone. A rule that depends on every
+    // caller remembering the normalization is not a rule.
+    let source = crate::execution_core::graph::graph_id_for_lookup(source);
+    source.starts_with("session:")
+        || source.starts_with("execution-lineage:")
+        || source.starts_with("agentic-graph:")
+        || source.starts_with("session-ingress-graph:")
 }
 
 /// Whether re-pinning a source inside one review resolution may accept a head
@@ -3009,6 +3043,21 @@ impl RuntimeServices {
                         if let Some(output) = output.and_then(|output| {
                             serde_json::from_str::<serde_json::Value>(&output).ok()
                         }) {
+                            // G-d: the material judgment is about the material,
+                            // not about the scope. This read has an authenticated
+                            // material when it carries its own read-acquisition
+                            // seal, or when its material output resolved as
+                            // available and was authenticated against its
+                            // original source identity below. A seal is judged by
+                            // its value: a key whose value is json null carries
+                            // no seal. The seal's decoding and authentication are
+                            // unchanged, and the extent predicate further down is
+                            // unchanged.
+                            let read_carries_seal =
+                                read_carries_acquisition_seal(&event.payload);
+                            if read_carries_seal {
+                                immutable_material = true;
+                            }
                             if output["kind"] == "evidence_retrieve" && output["available"] == true
                             {
                                 if let Some(selector) = output["evidence_ref"].as_str() {
@@ -3218,8 +3267,12 @@ impl RuntimeServices {
                                     {
                                         return Err("immutable review material does not match its original source identity".into());
                                     }
-                                    immutable_material =
-                                        scope.as_ref().is_none_or(|scope| scope.targets.is_empty());
+                                    // The chain above authenticated this material
+                                    // against its original source identity: the
+                                    // original primary and its index were
+                                    // resolved and the content matched. The
+                                    // scope's targets are not a proxy for that.
+                                    immutable_material = true;
                                     for source in material
                                         .iter()
                                         .flat_map(|material| &material.result_sources)
@@ -3471,6 +3524,10 @@ impl RuntimeServices {
             readers,
             current_review.map(ReviewActionIdentity::Live),
         )?;
+        // The one place the entries are made: the review's own snapshot names
+        // every required write that ran and failed. The snapshot's own fields
+        // are moved into the proof below, so the entries are taken first.
+        let required_write_failures = coverage::required_write_failure_entries(&snapshot);
         verification.work_manifest_digest = snapshot.work_digest;
         verification.effect_manifest_digest = Some(snapshot.effects.digest);
         // The identity of the review control call this proof was built
@@ -3496,6 +3553,7 @@ impl RuntimeServices {
         Ok(IndependentReview {
             producers: producers.into_iter().collect(),
             verification,
+            required_write_failures,
         })
     }
 
@@ -3614,6 +3672,256 @@ mod tests {
         assert!(!refusal.contains("tool `"), "{refusal}");
         // And the way out is stated.
         assert!(refusal.contains("Publish a Task"), "{refusal}");
+    }
+
+    /// A reader that reports one revision per stream. The A2 assertions are
+    /// about the pin, so the reader only has to answer heads.
+    struct A2PinReader {
+        revisions: std::collections::BTreeMap<String, u64>,
+    }
+
+    impl super::read_source::ReadAuthSource for A2PinReader {
+        fn stream_revision(&mut self, stream: &str) -> Result<u64, String> {
+            Ok(self.revisions.get(stream).copied().unwrap_or_default())
+        }
+        fn event_by_idempotency_key(
+            &mut self,
+            _stream: &str,
+            _key: &str,
+        ) -> Result<Option<crate::DurableRuntimeEvent>, String> {
+            Ok(None)
+        }
+        fn list_stream_after(
+            &mut self,
+            _stream: &str,
+            _after: u64,
+            _through: u64,
+            _limit: usize,
+            _bytes: usize,
+        ) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+            Ok(Vec::new())
+        }
+        fn transaction_stream_revision_exact(
+            &mut self,
+            _transaction: &str,
+            _stream: &str,
+        ) -> Result<Option<crate::CommittedStreamRevision>, String> {
+            Ok(None)
+        }
+        fn resolve_graph_record(
+            &mut self,
+            _record: &crate::DurableRuntimeEvent,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    /// A2f-P1: an execution graph head that grew while the review was reading
+    /// is another actor advancing it, and the review goes on. The same pin
+    /// path refuses a head that moved backwards.
+    #[test]
+    fn a2f_a_growing_execution_graph_head_is_admissible_and_a_backwards_head_is_not() {
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert("agentic-graph:abc".to_string(), 4);
+        assert_eq!(
+            super::results::pin_result_source_with_reader(
+                &mut reader,
+                "agentic-graph:abc",
+                &mut cuts
+            )
+            .expect("the first pin"),
+            4
+        );
+        // The graph advanced while this review was reading it.
+        reader.revisions.insert("agentic-graph:abc".to_string(), 5);
+        assert_eq!(
+            super::results::pin_result_source_with_reader(
+                &mut reader,
+                "agentic-graph:abc",
+                &mut cuts
+            )
+            .expect("a growing execution graph head is admissible"),
+            5
+        );
+        // A head that moved backwards is a truncated or replaced stream.
+        reader.revisions.insert("agentic-graph:abc".to_string(), 4);
+        let error = super::results::pin_result_source_with_reader(
+            &mut reader,
+            "agentic-graph:abc",
+            &mut cuts,
+        )
+        .expect_err("a backwards head must still be refused");
+        assert!(
+            error.contains("result metadata source moved backwards during resolution"),
+            "{error}"
+        );
+    }
+
+    /// A2f-N2: a source that is not a shared aggregate stream still refuses a
+    /// moved head, with the original wording.
+    #[test]
+    fn a2f_a_non_tolerated_source_head_that_moved_is_still_refused() {
+        for source in [
+            "agentic-program:abc",
+            "goal:abc",
+            "execution-effect:abc",
+            "execution-agent-receipts:abc:node",
+        ] {
+            let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+            let mut cuts = std::collections::BTreeMap::new();
+            reader.revisions.insert(source.to_string(), 4);
+            super::results::pin_result_source_with_reader(&mut reader, source, &mut cuts)
+                .expect("the first pin");
+            reader.revisions.insert(source.to_string(), 5);
+            let error = super::results::pin_result_source_with_reader(
+                &mut reader,
+                source,
+                &mut cuts,
+            )
+            .expect_err("a moved head on a non-tolerated source must be refused");
+            assert!(
+                error.contains("result metadata source changed during resolution"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    /// A2f-P2: the paging path reads the same predicate, so the graph streams
+    /// it pages are admissible there too. A delegated read reaches the
+    /// predicate in its run-id form, because the reviewer pins the
+    /// un-normalized ticket graph id while the store keys on the graph id.
+    #[test]
+    fn a2f_the_paging_path_reads_the_same_source_classes() {
+        for source in [
+            "agentic-graph:abc",
+            "run:agentic-graph:abc",
+            "session-ingress-graph:abc",
+            "run:session-ingress-graph:abc",
+            "session:abc",
+            "execution-lineage:abc",
+        ] {
+            assert!(
+                super::repin_accepts_moved_head(source, 4, 5),
+                "{source} is a shared aggregate stream"
+            );
+        }
+        // A head that did not grow is not a growth, and a source that is not a
+        // shared aggregate stream is the object under review moving.
+        assert!(!super::repin_accepts_moved_head("agentic-graph:abc", 5, 5));
+        assert!(!super::repin_accepts_moved_head("agentic-graph:abc", 5, 4));
+        for source in [
+            "agentic-program:abc",
+            "goal:abc",
+            "execution-effect:abc",
+            "execution-agent-receipts:abc:node",
+        ] {
+            assert!(
+                !super::repin_accepts_moved_head(source, 4, 5),
+                "{source} is not a shared aggregate stream"
+            );
+        }
+    }
+
+    /// G-d-N2: G-d does not widen which tools have to provide physical
+    /// material.
+    #[test]
+    fn g_d_the_physical_read_coverage_is_unchanged() {
+        assert!(counts_as_physical_read("read_ref"));
+        assert!(counts_as_physical_read("evidence_retrieve"));
+        assert!(!counts_as_physical_read("read"));
+        assert!(!counts_as_physical_read("read_file"));
+        assert!(!counts_as_physical_read("grep_search"));
+        assert!(!counts_as_physical_read("state_inspect"));
+    }
+
+    /// A read-acquisition seal, in the shape the product writes it.
+    fn a2_gd_seal() -> serde_json::Value {
+        let step: harness_contract::step::StepIdentity = serde_json::from_value(
+            serde_json::json!({
+                "step_id": "read-step",
+                "session_id": "read-session",
+                "turn_id": "read-turn",
+                "execution_id": "agentic-graph:read",
+                "actor_ref": "read-agent",
+                "run_ref": "read-run",
+                "attempt": 1,
+                "build_ref": "read-fixture",
+            }),
+        )
+        .expect("step identity");
+        let seal = crate::context_evidence::ReadAcquisitionSeal {
+            schema_version: 1,
+            primary_stream: "read-primary".into(),
+            primary_key: "read-key:read-receipt".into(),
+            index_stream: "execution-agent-receipts:agentic-graph:read:node:1".into(),
+            index_key: "agent-tool-receipt:read-key".into(),
+            session_id: "read-session".into(),
+            invocation_id: "read-call".into(),
+            tool_name: "read_file".into(),
+            graph_id: "agentic-graph:read".into(),
+            node_id: "node".into(),
+            attempt: 1,
+            step,
+            origin: serde_json::json!({
+                "origin_step_id": "read-step",
+                "call_id": "read-call",
+                "catalog_digest": "fixed",
+                "source": {"kind": "provider", "attempt_id": "read-attempt"},
+            }),
+            input_sha256: "read-input".into(),
+            body: crate::context_evidence::ReadBodySeal {
+                schema_version: 1,
+                source_ref: "workspace/read.txt".into(),
+                source_sha256: "sha256:read-source".into(),
+                source_bytes: 20,
+                output_sha256: "sha256:read-output".into(),
+                output_bytes: 4,
+                extent: crate::context_evidence::ReadExtent::FileLines {
+                    start_line: 2,
+                    line_count: 1,
+                    total_lines: 4,
+                    ends_with_newline: true,
+                    body_sha256: "sha256:read-output".into(),
+                    body_bytes: 4,
+                    source_omitted: true,
+                },
+            },
+        };
+        serde_json::to_value(seal).expect("seal value")
+    }
+
+    /// G-d-P1 and G-d-N1: a read carries a seal only when the seal's value is
+    /// one. The truncated receipt of the live run has the key with a json null
+    /// value, and that is no seal.
+    #[test]
+    fn g_d_a_read_carries_a_seal_only_when_its_value_is_one() {
+        let sealed = serde_json::json!({
+            "read_acquisition_v1": a2_gd_seal(),
+        });
+        assert!(read_carries_acquisition_seal(&sealed));
+        let null_value =
+            serde_json::json!({"read_acquisition_v1": serde_json::Value::Null});
+        assert!(!read_carries_acquisition_seal(&null_value));
+        let absent = serde_json::json!({"other": 1});
+        assert!(!read_carries_acquisition_seal(&absent));
+        let another_type = serde_json::json!({"read_acquisition_v1": "not a seal"});
+        assert!(!read_carries_acquisition_seal(&another_type));
+        let not_a_seal = serde_json::json!({"read_acquisition_v1": {"schema_version": 1}});
+        assert!(!read_carries_acquisition_seal(&not_a_seal));
+    }
+
+    /// G-d-N1: the auxiliary read refusal keeps its own wording. G-d widens
+    /// who has a material; it does not rewrite what a read without one says.
+    #[test]
+    fn g_d_the_auxiliary_read_refusal_text_is_unchanged() {
+        let source = include_str!("review_evidence.rs");
+        assert!(
+            source.contains(
+                "\"proof auxiliary read has no authenticated immutable or physical material\""
+            ),
+            "the auxiliary read refusal text must not change"
+        );
     }
 
     #[test]

@@ -2421,3 +2421,14 @@ fn network_domain_env_wins_over_config_file() {
     drop(block);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn provider_reasoning_effort_is_optional_and_rejects_unknown_values() {
+    let root = crate::json::JsonValue::parse(r#"{"providers":{"step":{"base_url":"https://example.invalid/v1","api_key":"test","models":["step-5-preview"],"reasoning_effort":"high"}}}"#).unwrap();
+    let configured = super::parse_optional_providers_config(&root).unwrap();
+    assert_eq!(configured.providers["step"].reasoning_effort.as_deref(), Some("high"));
+    let missing = crate::json::JsonValue::parse(r#"{"providers":{"step":{"base_url":"https://example.invalid/v1","api_key":"test","models":["step-5-preview"]}}}"#).unwrap();
+    assert_eq!(super::parse_optional_providers_config(&missing).unwrap().providers["step"].reasoning_effort, None);
+    let invalid = crate::json::JsonValue::parse(r#"{"providers":{"step":{"base_url":"https://example.invalid/v1","api_key":"test","models":["step-5-preview"],"reasoning_effort":"unknown"}}}"#).unwrap();
+    assert!(super::parse_optional_providers_config(&invalid).is_err());
+}

@@ -296,6 +296,16 @@ struct RetainedCheckedMember {
     conclusion_published: bool,
     terminal: Option<SessionTerminalInput>,
     terminal_owner: Option<Arc<crate::execution_core::services::OriginalTerminalCommitOwner>>,
+    terminal_authored_metadata: Option<serde_json::Value>,
+}
+
+/// Borrowed handles for the original terminal attempt; this is not a new owner.
+#[derive(Clone)]
+pub(crate) struct OriginalRetainedTerminal {
+    pub(crate) request: Arc<CheckedAppendRequest>,
+    pub(crate) terminal: SessionTerminalInput,
+    pub(crate) authored_metadata: Option<serde_json::Value>,
+    pub(crate) owner: Arc<crate::execution_core::services::OriginalTerminalCommitOwner>,
 }
 impl std::fmt::Debug for RetainedCheckedMember {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1501,6 +1511,7 @@ impl RuntimeEventStore {
             retained.insert(transaction_id.clone(), RetainedMemberEntry::Checked(RetainedCheckedMember {
                 request: Arc::clone(&submitted), control: Arc::clone(&control), authority: authority.clone(), effect_fence: retained_fence,
                 attempt_noncommit: None, member_terminal: None, conclusion_proof: conclusion_proof.clone(), conclusion_receipt: None, conclusion_published: false, terminal: None, terminal_owner: None,
+                terminal_authored_metadata: None,
             }));
         }
         let result = if let Some(fence) = effect_fence {
@@ -1926,6 +1937,7 @@ impl RuntimeEventStore {
         &self, request: Arc<CheckedAppendRequest>, terminal: SessionTerminalInput,
         control: Arc<crate::conversation::MemberCommitControl>,
         terminal_owner: Arc<crate::execution_core::services::OriginalTerminalCommitOwner>,
+        authored_metadata: Option<serde_json::Value>,
     ) -> RuntimeEventStoreResult<()> {
         let id = &request.transaction.transaction_id;
         let mut retained = self.retained_checked_members.lock().map_err(|_| RuntimeEventStoreError::Corrupt("terminal custody unavailable".into()))?;
@@ -1933,6 +1945,7 @@ impl RuntimeEventStore {
         retained.insert(id.clone(), RetainedMemberEntry::Checked(RetainedCheckedMember {
             request, control, authority: None, effect_fence: None, attempt_noncommit: None, member_terminal: None, conclusion_proof: None,
             conclusion_receipt: None, conclusion_published: false, terminal: Some(terminal), terminal_owner: Some(terminal_owner),
+            terminal_authored_metadata: authored_metadata,
         }));
         Ok(())
     }
@@ -1944,11 +1957,90 @@ impl RuntimeEventStore {
         let mut retained = self.retained_checked_members.lock().map_err(|_| RuntimeEventStoreError::Corrupt("terminal custody unavailable".into()))?;
         let Some(RetainedMemberEntry::Checked(owner)) = retained.get_mut(id) else { return Err(RuntimeEventStoreError::Corrupt("terminal custody disappeared".into())); };
         if !Arc::ptr_eq(&owner.request, request) || owner.terminal.is_none() || owner.terminal_owner.is_none() { return Err(RuntimeEventStoreError::Corrupt("terminal custody differs".into())); }
+        let terminal = owner.terminal.as_ref().ok_or_else(|| RuntimeEventStoreError::Corrupt("terminal custody differs".into()))?;
+        let program = terminal.turn_id.as_deref().map(|turn| {
+            let objective = harness_contract::agent_action::root_objective_id(&terminal.session_id, turn);
+            format!("agentic-program:{}", harness_contract::agent_action::program_id_for_objective(&objective))
+        });
         match result {
             Ok(Some(receipt)) => owner.conclusion_receipt = Some(receipt.clone()),
+            Err(RuntimeEventStoreError::CheckedAttemptRolledBack(cause))
+                if matches!(cause.as_ref(), RuntimeEventStoreError::SessionAttemptsUnsettled)
+                    || matches!(cause.as_ref(), RuntimeEventStoreError::StaleRevision { stream_id, .. }
+                        if program.as_deref() == Some(stream_id.as_str())) => {
+                owner.attempt_noncommit = Some(OriginalMemberAttemptNoncommit::RolledBack);
+            },
             Ok(None) | Err(RuntimeEventStoreError::CheckedAttemptRolledBack(_)) => { retained.remove(id); },
             Err(_) => {}, // Unknown retains the original request and control.
         }
+        Ok(())
+    }
+
+    pub(crate) fn original_terminal_after_confirmed_rollback(
+        &self,
+        original: &Arc<crate::execution_core::services::OriginalTerminalCommitOwner>,
+    ) -> RuntimeEventStoreResult<OriginalRetainedTerminal> {
+        let retained = self.retained_checked_members.lock()
+            .map_err(|_| RuntimeEventStoreError::Corrupt("terminal custody unavailable".into()))?;
+        let mut matches = retained.values().filter_map(|entry| match entry {
+            RetainedMemberEntry::Checked(entry) if entry.terminal_owner.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, original)) => Some(entry),
+            RetainedMemberEntry::Checked(_) | RetainedMemberEntry::Reserved { .. }
+                | RetainedMemberEntry::FreshEffect { .. } => None,
+        });
+        let Some(entry) = matches.next() else {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original rolled-back terminal custody unavailable".into()));
+        };
+        if matches.next().is_some() {
+            return Err(RuntimeEventStoreError::Corrupt("ambiguous original terminal custody".into()));
+        }
+        let owner = entry.terminal_owner.as_ref().ok_or_else(|| RuntimeEventStoreError::Corrupt("terminal owner missing".into()))?;
+        if !Arc::ptr_eq(owner, original)
+            || !matches!(entry.attempt_noncommit, Some(OriginalMemberAttemptNoncommit::RolledBack))
+            || !entry.control.original_noncommit_reconciled().map_err(RuntimeEventStoreError::InvalidTransaction)?
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original terminal rollback identity unavailable".into()));
+        }
+        Ok(OriginalRetainedTerminal {
+            request: Arc::clone(&entry.request),
+            terminal: entry.terminal.clone().ok_or_else(|| RuntimeEventStoreError::Corrupt("terminal input missing".into()))?,
+            authored_metadata: entry.terminal_authored_metadata.clone(),
+            owner: Arc::clone(owner),
+        })
+    }
+
+    pub(crate) fn retire_original_terminal_after_replan(
+        &self, retained: &OriginalRetainedTerminal, replan: &AppendTransactionReceipt, graph_id: &str,
+    ) -> RuntimeEventStoreResult<()> {
+        let old = retained.request.transaction.expected_streams.iter()
+            .find(|source| source.stream_id == graph_id)
+            .ok_or_else(|| RuntimeEventStoreError::Corrupt("original terminal graph source missing".into()))?;
+        let new = replan.stream_revisions.iter().find(|source| source.stream_id == graph_id)
+            .ok_or_else(|| RuntimeEventStoreError::Corrupt("original replan graph receipt missing".into()))?;
+        if new.expected_revision < old.expected_revision
+            || new.expected_revision.checked_add(1) != Some(new.committed_revision)
+            || replan.commit_cursor == 0 || replan.event_ids.is_empty()
+        { return Err(RuntimeEventStoreError::Corrupt("original terminal replan graph CAS differs".into())); }
+        let mut entries = self.retained_checked_members.lock()
+            .map_err(|_| RuntimeEventStoreError::Corrupt("terminal custody unavailable".into()))?;
+        let id = &retained.request.transaction.transaction_id;
+        let entry = match entries.get(id) {
+            Some(RetainedMemberEntry::Checked(entry)) => entry,
+            Some(RetainedMemberEntry::Reserved { .. }) | Some(RetainedMemberEntry::FreshEffect { .. }) =>
+                return Err(RuntimeEventStoreError::Corrupt("original terminal retirement owner changed".into())),
+            None => return if retained.owner.retired_replan_matches(replan).map_err(RuntimeEventStoreError::InvalidTransaction)? {
+                Ok(())
+            } else { Err(RuntimeEventStoreError::Corrupt("original terminal retirement is unconfirmed".into())) },
+        };
+        if !Arc::ptr_eq(&entry.request, &retained.request)
+            || entry.terminal_owner.as_ref().is_none_or(|owner| !Arc::ptr_eq(owner, &retained.owner))
+            || entry.terminal.as_ref() != Some(&retained.terminal)
+            || entry.terminal_authored_metadata != retained.authored_metadata
+            || entry.conclusion_receipt.is_some()
+            || !matches!(entry.attempt_noncommit, Some(OriginalMemberAttemptNoncommit::RolledBack))
+            || !entry.control.original_noncommit_reconciled().map_err(RuntimeEventStoreError::InvalidTransaction)?
+        { return Err(RuntimeEventStoreError::Corrupt("original terminal retirement identity differs".into())); }
+        retained.owner.record_retired_replan(replan).map_err(RuntimeEventStoreError::InvalidTransaction)?;
+        entries.remove(id);
         Ok(())
     }
 

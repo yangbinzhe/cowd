@@ -276,6 +276,9 @@ fn validate_provider_config(config: &ProvidersConfig) -> ProviderRegistryDiagnos
                 provider.name
             ));
         }
+        if provider.reasoning_effort.as_deref().is_some_and(|value| !model_protocol::provider_config::valid_reasoning_effort(value)) {
+            errors.push(format!("provider '{key}' has invalid reasoning_effort"));
+        }
         if provider.base_url.trim().is_empty() {
             errors.push(format!("provider '{key}' has an empty base_url"));
         }
@@ -332,6 +335,7 @@ mod tests {
             providers: HashMap::from([(
                 "test".to_string(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     base_url: "https://example.test/v1".to_string(),
                     api_key: "secret".to_string(),

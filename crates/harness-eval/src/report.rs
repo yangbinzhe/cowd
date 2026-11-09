@@ -209,6 +209,47 @@ impl HarnessEvalReportGate {
     }
 }
 
+/// The name prefix a required write's terminal failure carries in the closure
+/// projection's own entry shape.
+const REQUIRED_WRITE_FAILURE_NAME_PREFIX: &str = "required_write_terminally_failed:";
+
+/// The required writes that ran and failed, as the closure projection's own
+/// entries.
+///
+/// The projection carries these entries in the existing `{name, passed,
+/// evidence}` shape. The field that holds them belongs to the product, so the
+/// entries are recognised by their shape and by their name rather than by one
+/// field name: a rename on the product side must not silently hide a
+/// required write's failure from the gate. A projection that carries none is
+/// the ordinary case and yields nothing.
+fn required_write_failure_entries(projection: &Value) -> Vec<Value> {
+    let Some(object) = projection.as_object() else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for value in object.values() {
+        let Some(items) = value.as_array() else {
+            continue;
+        };
+        for item in items {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            let Some(name) = item.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !name.starts_with(REQUIRED_WRITE_FAILURE_NAME_PREFIX)
+                || !item.contains_key("passed")
+                || !item.contains_key("evidence")
+            {
+                continue;
+            }
+            entries.push(serde_json::Value::Object(item.clone()));
+        }
+    }
+    entries
+}
+
 /// Evaluate the canonical Agent-first closure projection.  This deliberately
 /// consumes only durable projection facts; a model's claimed status or a
 /// summary counter is never sufficient to pass the gate.
@@ -480,6 +521,25 @@ pub fn evaluate_agentic_program_closure(value: &Value) -> Value {
             "objective_verdict": verdict.is_some()
         }),
     );
+
+    // The required writes that ran and failed are named by the closure
+    // projection, in the projection's own entry shape. They are read here so
+    // the gate can see them: a projection that carries none adds no check and
+    // is not a failure, and a failure that is named is never counted as a
+    // satisfied requirement.
+    for entry in required_write_failure_entries(projection) {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let passed = entry
+            .get("passed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let evidence = entry.get("evidence").cloned().unwrap_or(Value::Null);
+        check(&name, passed, evidence);
+    }
 
     agentic_closure_result(
         projection,
@@ -2445,6 +2505,59 @@ fn live_gateway_total_tokens(live: &Value) -> u64 {
 mod gate_tests {
     use super::*;
     use serde_json::json;
+
+    /// The named failures of required writes reach the closure gate as checks:
+    /// one check per entry, the entry's own name and evidence, and a failed
+    /// entry is missing rather than satisfied. A projection that carries none
+    /// adds no check, and a second pass returns the first pass unchanged.
+    #[test]
+    fn the_closure_gate_reads_the_named_required_write_failures() {
+        let projection = json!({
+            "program_id": "program",
+            "required_write_failures": [{
+                "name": "required_write_terminally_failed:effect-1",
+                "passed": false,
+                "evidence": {
+                    "grade": "required_write_terminally_failed",
+                    "effect_key": "effect-1",
+                    "tool_use_id": "call-1",
+                    "receipt_cursor": 42
+                }
+            }],
+        });
+        let closure = super::evaluate_agentic_program_closure(&projection);
+        let checks = closure["checks"].as_array().expect("closure checks");
+        let named = checks
+            .iter()
+            .find(|check| check["name"] == "required_write_terminally_failed:effect-1")
+            .expect("the named failure is a check of its own");
+        assert_eq!(named["passed"], false);
+        assert_eq!(named["evidence"]["effect_key"], "effect-1");
+        assert_eq!(named["evidence"]["receipt_cursor"], 42);
+        assert!(closure["missing"]
+            .as_array()
+            .expect("closure missing")
+            .iter()
+            .any(|name| name == "required_write_terminally_failed:effect-1"));
+        // A projection with no named failure adds no check and is not a
+        // failure of its own.
+        let plain = super::evaluate_agentic_program_closure(&json!({"program_id": "program"}));
+        assert!(!plain["checks"]
+            .as_array()
+            .expect("closure checks")
+            .iter()
+            .any(|check| check["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("required_write_terminally_failed:")));
+        // The second pass returns the first pass's output unchanged: the
+        // already-evaluated closure has no projection to read.
+        assert_eq!(
+            super::evaluate_agentic_program_closure(&closure),
+            closure,
+            "the closure evaluation is idempotent"
+        );
+    }
 
     #[test]
     fn physical_execution_observation_uses_original_axes_not_business_outcome() {

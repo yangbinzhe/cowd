@@ -3457,6 +3457,7 @@ async fn native_coordination_wire(supplement: bool, fail_input_request: bool) {
                 providers: std::collections::HashMap::from([(
                     "test".into(),
                     model_protocol::provider_config::ProviderConfig {
+                        reasoning_effort: None,
                         name: "test".into(),
                         base_url: format!("http://{address}/v1"),
                         api_key: "local-test-only".into(),

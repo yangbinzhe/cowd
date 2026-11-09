@@ -30,6 +30,9 @@ pub enum NodeExecutorError {
     Recover { node_id: String, reason: String },
     #[error("executor effect for node `{node_id}` has uncertain completion: {reason}")]
     Uncertain { node_id: String, reason: String },
+    /// The original executor still owns call custody; no empty outcome exists.
+    #[error("original call custody for node `{node_id}` remains unknown: {reason}")]
+    OriginalCustodyUnknown { node_id: String, reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +109,24 @@ impl std::fmt::Debug for OriginalTerminalOwner {
 impl PartialEq for OriginalTerminalOwner { fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) } }
 impl Eq for OriginalTerminalOwner {}
 
+#[async_trait]
+pub(crate) trait OriginalSynthesizeReplan: Send + Sync {
+    async fn prepare(&self, ticket: &NodeExecutionTicket, original: &NodeExecutionOutcome)
+        -> Result<NodeExecutionOutcome, String>;
+    async fn committed(&self, ticket: &NodeExecutionTicket, original: &NodeExecutionOutcome)
+        -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub(crate) struct OriginalSynthesizeReplanHandle(pub(crate) Arc<dyn OriginalSynthesizeReplan>);
+impl std::fmt::Debug for OriginalSynthesizeReplanHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OriginalSynthesizeReplanHandle") }
+}
+impl PartialEq for OriginalSynthesizeReplanHandle {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalSynthesizeReplanHandle {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeExecutionOutcome {
     pub result: ExecutionNodeResult,
@@ -131,6 +152,8 @@ pub struct NodeExecutionOutcome {
     pub(crate) original_agent_child: Option<OriginalAgentChild>,
     #[serde(skip)]
     pub(crate) original_terminal_owner: Option<OriginalTerminalOwner>,
+    #[serde(skip)]
+    pub(crate) original_synthesize_replan: Option<OriginalSynthesizeReplanHandle>,
     #[serde(skip)]
     pub(crate) source_revisions: BTreeMap<String, u64>,
     #[serde(skip)]
@@ -178,6 +201,7 @@ impl NodeExecutionOutcome {
             original_replayed_actions: Vec::new(),
             original_agent_child: None,
             original_terminal_owner: None,
+            original_synthesize_replan: None,
             source_revisions: BTreeMap::new(),
             no_dispatch: None,
             replan: None,
@@ -208,6 +232,9 @@ pub trait NodeExecutor: Send + Sync {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError>;
+    /// Install/remove only the original in-process binding around graph admission.
+    fn prepare_original_binding(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> { Ok(()) }
+    fn rollback_original_binding(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> { Ok(()) }
     /// Revalidate a post-tool Goal observation using the original owner. This
     /// must never dispatch or replay the physical operation. Unknown remains
     /// unknown and leaves the original source fence in force.
@@ -261,6 +288,10 @@ pub trait NodeExecutor: Send + Sync {
     /// either committed or definitively failed. Implementations must not
     /// mutate durable graph state from this callback.
     fn cancellation_finalized(&self, _ticket: &NodeExecutionTicket) {}
+    /// Called only after the original graph binding and physical closure close.
+    fn original_binding_released(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
     /// Query an authenticated, already durable outcome of this exact attempt.
     /// Must not start work, invoke a Provider, or re-interpret business input.
     /// The recovery owner still commits through the original source fences and
@@ -268,6 +299,12 @@ pub trait NodeExecutor: Send + Sync {
     async fn recover_known_outcome(
         &self,
         _ticket: &NodeExecutionTicket,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        Ok(None)
+    }
+    /// Re-read only the original in-process owner's facts, never re-execute.
+    async fn reconcile_original_custody(
+        &self, _ticket: &NodeExecutionTicket,
     ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
         Ok(None)
     }

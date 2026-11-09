@@ -215,12 +215,20 @@ pub struct ProviderConfig {
     /// When absent, Cowd infers the protocol locally from provider name, base
     /// URL, and model names.
     pub protocol: Option<String>,
+    /// Optional default sent for this provider; absent preserves the existing behavior.
+    pub reasoning_effort: Option<String>,
     /// Provider-side multiple-tool proposal request. This never changes
     /// Runtime's independent local execution concurrency policy.
     pub parallel_tool_calls: ParallelToolCallsMode,
     /// Provider/model-specific gate for starting descriptor-proven read-only
     /// tools before the current response reaches its terminal frame.
     pub early_tool_start: EarlyToolStartMode,
+}
+
+/// Values accepted by the existing `--reasoning-effort` interface.
+#[must_use]
+pub fn valid_reasoning_effort(value: &str) -> bool {
+    matches!(value, "low" | "medium" | "high" | "max")
 }
 
 /// Named collection of provider configurations.
@@ -281,6 +289,7 @@ mod tests {
         protocol: Option<&str>,
     ) -> ProviderConfig {
         ProviderConfig {
+            reasoning_effort: None,
             name: name.to_string(),
             base_url: base_url.to_string(),
             api_key: "sk-test".to_string(),

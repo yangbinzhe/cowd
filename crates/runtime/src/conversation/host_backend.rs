@@ -2,6 +2,14 @@
 
 use super::*;
 
+// Construct result futures after the producer returns, outside its poll frame.
+#[inline(never)]
+fn construct_result_phase<F: std::future::Future>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
+
 use crate::execution_core::goal::{
     finish_user_goal_application, read_user_goal_application, user_application_clock,
     user_goal_application_committed, user_goal_application_committed_sources, GoalWriteCheckpoint,
@@ -1274,6 +1282,141 @@ where
         self.resume_user_input_application(ticket, true).await
     }
 
+    async fn reconcile_original_custody(
+        &self,
+        ticket: &NodeExecutionTicket,
+        workers: &[(String, crate::conversation::EarlyToolDispatchResult)],
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        if ticket != &self.ticket || self.stop.is_cancelled() { return Ok(None); }
+        let Some(error) = self.local_fence.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clone() else { return Ok(None) };
+        if !error.early_tool_failures().is_empty() { return Ok(None); }
+        let (mut early, originals, observed) = {
+            let state = self.state.lock().await;
+            (state.early_tool_receipts.clone(), state.pending_member_batches.clone(), state.tool_receipts_observed)
+        };
+        let recorded_early = early.clone();
+        for receipt in error.effect_receipts() {
+            if early.get(&receipt.call.id).is_some_and(|old| old != receipt) { return Ok(None); }
+            early.insert(receipt.call.id.clone(), receipt.clone());
+        }
+        let mut deferred_sources = BTreeMap::new();
+        let mut worker_ids = BTreeSet::new();
+        for (call_id, result) in workers {
+            if !worker_ids.insert(call_id.clone()) { return Ok(None); }
+            if let crate::conversation::EarlyToolDispatchResult::Deferred(deferred) = result {
+                if early.contains_key(call_id) { return Ok(None); }
+                let Some(sources) = original_early_deferral_sources(&self.services, ticket, call_id, deferred)
+                    .unwrap_or(None) else { return Ok(None) };
+                for (stream, head) in sources {
+                    if deferred_sources.insert(stream, head).is_some_and(|old| old != head) { return Ok(None); }
+                }
+                continue;
+            }
+            let crate::conversation::EarlyToolDispatchResult::Executed(original) = result else { return Ok(None) };
+            let Some(receipt) = early.get(call_id) else { return Ok(None) };
+            let (Some(expected), Some(actual)) = (&receipt.original_source, &original.original_source) else { return Ok(None) };
+            if original.call != receipt.call || original.outcome != receipt.outcome
+                || expected.ticket != actual.ticket || !Arc::ptr_eq(&expected.request, &actual.request) {
+                return Ok(None);
+            }
+        }
+        let early = early.into_values().collect::<Vec<_>>();
+        if !verify_original_early_read_set(&self.services, &ticket.graph_id, &early, &originals).unwrap_or(false) {
+            return Ok(None);
+        }
+        let settled = if !originals.is_empty() {
+            settle_original_host_carriers(&self.services, &self.state, &ticket.graph_id, &early)
+                .await.unwrap_or(false)
+        } else { true };
+        if !settled || self.stop.is_cancelled() { return Ok(None); }
+        {
+            let state = self.state.lock().await;
+            if !state.pending_member_batches.is_empty() || state.early_tool_receipts != recorded_early
+                || state.tool_receipts_observed != observed { return Ok(None); }
+        }
+        let Some(mut sources) = original_sibling_closure_cut(&self.services, ticket).unwrap_or(None) else {
+            return Ok(None);
+        };
+        for (stream, head) in deferred_sources {
+            if sources.insert(stream, head).is_some_and(|old| old != head) { return Ok(None); }
+        }
+        // Pin the current heads actually read for each original call. The
+        // closure cut pins the original graph and its physical sources.
+        for receipt in &early {
+            let Some(source) = receipt.original_source.as_ref() else { return Ok(None) };
+            let stream = format!("execution-effect:{}", source.request.idempotency_key);
+            let head = self.services.event_store().stream_revision(&stream)
+                .map_err(|error| NodeExecutorError::OriginalCustodyUnknown { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
+            if sources.insert(stream, head).is_some_and(|old| old != head) { return Ok(None); }
+        }
+        for ((node_id, attempt), calls) in &originals {
+            let index = format!("execution-agent-receipts:{}:{}:{}", ticket.graph_id, node_id, attempt);
+            let head = self.services.event_store().stream_revision(&index)
+                .map_err(|error| NodeExecutorError::OriginalCustodyUnknown { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
+            if sources.insert(index, head).is_some_and(|old| old != head) { return Ok(None); }
+            for (_, pending) in calls {
+                let Some((_, calls)) = pending.original_host_call_set() else { return Ok(None) };
+                for call in calls {
+                    let Some(binding) = call.binding.as_ref() else { return Ok(None) };
+                    let stream = format!("execution-effect:{}", binding.effect_idempotency_key());
+                    let head = self.services.event_store().stream_revision(&stream)
+                        .map_err(|error| NodeExecutorError::OriginalCustodyUnknown { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
+                    if sources.insert(stream, head).is_some_and(|old| old != head) { return Ok(None); }
+                }
+            }
+        }
+        if self.stop.is_cancelled() { return Ok(None); }
+        let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
+            status: ExecutionNodeStatus::Failed, result_ref: None, wait_class: None,
+            summary: None, evidence_refs: Vec::new(),
+            failure: Some(harness_contract::execution_graph::ExecutionFailure {
+                kind: "session_execution_fence".into(), message: error.to_string(),
+                retryable: false, evidence_refs: Vec::new(),
+            }),
+            usage: ExecutionUsage::default(), finished_at_ms: user_application_clock(),
+        });
+        outcome.source_revisions = sources;
+        Ok(Some(outcome))
+    }
+
+    async fn confirm_original_early_release(
+        &self,
+        ticket: &NodeExecutionTicket,
+        workers: &[(String, crate::conversation::EarlyToolDispatchResult)],
+    ) -> Result<bool, NodeExecutorError> {
+        if ticket != &self.ticket || self.stop.is_cancelled() { return Ok(false); }
+        if workers.is_empty() { return Ok(true); }
+        let mut receipts = self.state.lock().await.early_tool_receipts.clone();
+        if let Some(error) = self.local_fence.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        {
+            for receipt in error.effect_receipts() {
+                if receipts.get(&receipt.call.id).is_some_and(|old| old != receipt) { return Ok(false); }
+                receipts.insert(receipt.call.id.clone(), receipt.clone());
+            }
+        }
+        let mut checked = BTreeSet::new();
+        for (call_id, result) in workers {
+            if !checked.insert(call_id.clone()) { return Ok(false); }
+            if let crate::conversation::EarlyToolDispatchResult::Deferred(deferred) = result {
+                if receipts.contains_key(call_id)
+                    || original_early_deferral_sources(&self.services, ticket, call_id, deferred)
+                        .unwrap_or(None).is_none() { return Ok(false); }
+                continue;
+            }
+            let crate::conversation::EarlyToolDispatchResult::Executed(original) = result else { return Ok(false) };
+            let Some(receipt) = receipts.get(call_id) else { return Ok(false) };
+            let (Some(sealed), Some(source)) = (&receipt.original_source, &original.original_source) else { return Ok(false) };
+            if original.call != receipt.call || original.outcome != receipt.outcome
+                || source.ticket != sealed.ticket || !Arc::ptr_eq(&source.request, &sealed.request)
+                || !original_early_read_is_committed(&self.services, ticket, receipt).unwrap_or(false) {
+                return Ok(false);
+            }
+        }
+        Ok(!self.stop.is_cancelled())
+    }
+
     async fn execute(
         &self,
         ticket: &NodeExecutionTicket,
@@ -2383,7 +2526,7 @@ where
         drop(runtime);
         // Construct the remaining result phase only after the original model
         // scoped guards are dropped and transcript/input cleanup has run.
-        Box::pin(async {
+        construct_result_phase(|| async {
         if result.as_ref().ok().is_some_and(|step|step.input_interpretation.is_some()) {
             let step=result.map_err(|e|NodeExecutorError::Poll{node_id:ticket.node_id.clone(),reason:e.to_string()})?;
             let (user_graph_revision, user_program_cut) = user_source_cuts.ok_or_else(||
@@ -3989,11 +4132,15 @@ where
                     // early authorization commit into a fresh batch admission.
                     let mut state = self.state.lock().await;
                     for receipt in error.effect_receipts() {
-                        if state.early_tool_receipts.insert(receipt.call.id.clone(), receipt.clone()).is_none() {
+                        if !state.early_tool_receipts.contains_key(&receipt.call.id) {
+                            state.early_tool_receipts.insert(receipt.call.id.clone(), receipt.clone());
                             state.tool_receipts_observed = state.tool_receipts_observed.saturating_add(1);
                         }
                     }
-                    return Err(NodeExecutorError::Poll {
+                    drop(state);
+                    *self.local_fence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(error.clone());
+                    return Err(NodeExecutorError::OriginalCustodyUnknown {
                         node_id: ticket.node_id.clone(),
                         reason: error.to_string(),
                     });
@@ -4008,6 +4155,13 @@ where
                             failure: None, usage: ExecutionUsage::default(), finished_at_ms: user_application_clock(),
                         }));
                     }
+                }
+                if error.session_execution_fence_error().is_some() {
+                    *self.local_fence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(error.clone());
+                    return Err(NodeExecutorError::OriginalCustodyUnknown {
+                        node_id: ticket.node_id.clone(), reason: error.to_string(),
+                    });
                 }
                 // A provider failure is execution evidence, not an implicit
                 // graph terminal. Preserve it and let the same Goal policy
@@ -8357,6 +8511,482 @@ where
     }
 }
 
+/// Pin the exact graph cut and each sibling's original durable closure.
+/// A missing closure or a moved physical source remains unobserved.
+fn original_sibling_closure_cut(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+) -> Result<Option<BTreeMap<String, u64>>, String> {
+    let store = services.graph_state_store();
+    let events = services.event_store();
+    let current = store.load(&ticket.graph_id).map_err(|error| error.to_string())?;
+    let cut = store.load_graph_at_revision(&ticket.graph_id, current.revision)
+        .map_err(|error| error.to_string())?;
+    if cut != current || cut.node_statuses.get(&ticket.node_id) != Some(&ExecutionNodeStatus::Running)
+        || cut.recovery_cursor.node_attempts.get(&ticket.node_id) != Some(&ticket.attempt) {
+        return Ok(None);
+    }
+    let mut sources = BTreeMap::from([(cut.id.clone(), cut.revision)]);
+    let mut cursor = 0;
+    let mut original_found = false;
+    while cursor < cut.revision {
+        let (next, starts) = store.binding_starts_page(&cut.id, cursor, cut.revision)
+            .map_err(|error| error.to_string())?;
+        if next <= cursor || next > cut.revision { return Ok(None); }
+        cursor = next;
+        for (node, binding, start) in starts {
+            if node == ticket.node_id && binding.attempt == ticket.attempt {
+                if original_found { return Ok(None); }
+                let (original, _) = store.binding_start_ticket(&cut, &node, &binding)
+                    .map_err(|error| error.to_string())?;
+                if original != *ticket { return Ok(None); }
+                original_found = true;
+                continue;
+            }
+            let key = binding.lease_closure_key(&cut, &node);
+            let Some(record) = events.event_by_idempotency_key(&cut.id, &key)
+                .map_err(|error| error.to_string())? else { return Ok(None) };
+            if record.sequence > cut.revision || record.transaction_id != key
+                || (record.commit_cursor, record.transaction_index) <= (start.1, start.2) {
+                return Ok(None);
+            }
+            let resolved = events.resolve_read_record(record.clone()).map_err(|error| error.to_string())?;
+            if !binding.validate_lease_closure(&cut, &node, (start.1, start.2), &resolved)
+                .map_err(|error| error.to_string())?
+                || !store.binding_lease_closure(&cut, &node, &binding, start)
+                    .map_err(|error| error.to_string())? { return Ok(None); }
+            let Some(receipt) = events.original_transaction_receipt(&record.transaction_id)
+                .map_err(|error| error.to_string())? else { return Ok(None) };
+            if receipt.transaction_id != record.transaction_id || receipt.commit_cursor != record.commit_cursor
+                || receipt.event_ids.get(record.transaction_index as usize) != Some(&record.event_id)
+                || receipt.event_ids.iter().filter(|id| *id == &record.event_id).count() != 1 {
+                return Ok(None);
+            }
+            let mut graph_source = false;
+            for source in &receipt.stream_revisions {
+                if source.stream_id == cut.id {
+                    if graph_source || source.expected_revision.checked_add(1) != Some(record.sequence)
+                        || source.committed_revision != record.sequence { return Ok(None); }
+                    graph_source = true;
+                    continue;
+                }
+                if source.expected_revision != source.committed_revision { return Ok(None); }
+                let head = events.stream_revision(&source.stream_id).map_err(|error| error.to_string())?;
+                if head < source.committed_revision
+                    || sources.insert(source.stream_id.clone(), head).is_some_and(|old| old != head) {
+                    return Ok(None);
+                }
+            }
+            if !graph_source { return Ok(None); }
+        }
+    }
+    Ok(original_found.then_some(sources))
+}
+
+fn original_host_carrier_matches_ticket(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+    call_id: &str,
+    pending: &crate::PendingAgentBatch,
+) -> bool {
+    let Some((original_ticket, original_calls)) = pending.original_host_call_set() else {
+        return false;
+    };
+    if original_ticket != ticket || !crate::host::decode_tool_batch(&ticket.payload_ref).ok()
+        .is_some_and(|(calls, _)| calls == original_calls) {
+        return false;
+    }
+    match pending.value() {
+        crate::PendingAgentBatchValue::OriginalCall(carrier) => {
+            let request = carrier.original_request();
+            carrier.original_host_call_set().is_some_and(|(owner, calls)| owner == ticket && calls == original_calls)
+                && request.tool_use_id == call_id
+                && crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, request).is_ok()
+        },
+        crate::PendingAgentBatchValue::OriginalPacketScope(original) => original.matches(ticket, services.event_store(), call_id),
+        crate::PendingAgentBatchValue::OriginalBoundedAcquisition(original) => original.matches(ticket, services.event_store(), call_id),
+        crate::PendingAgentBatchValue::OriginalReplay(original) => original.replay.ticket() == ticket && original.replay.call_id() == call_id,
+        crate::PendingAgentBatchValue::WithCause { primary, .. } => {
+            let crate::PendingAgentBatchValue::OriginalCall(carrier) = primary.primary_value() else { return false };
+            let same_cause = if let Some(boundary) = pending.original_terminal_boundary_ref() {
+                pending.same_original_terminal_carrier(carrier.original_request(), boundary)
+            } else if let Some(publication) = pending.original_stop_publication() {
+                carrier.original_request().tool_progress.checked_original_stop_publications().ok()
+                    .is_some_and(|publications| publications.len() == 1 && Arc::ptr_eq(&publications[0], publication))
+                    && pending.same_original_stop_carrier(carrier.original_request(), publication)
+            } else { false };
+            carrier.original_host_call_set().is_some_and(|(owner, calls)| owner == ticket && calls == original_calls)
+                && carrier.original_request().tool_use_id == call_id
+                && same_cause
+                && crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, carrier.original_request()).is_ok()
+        },
+        _ => false,
+    }
+}
+
+fn original_pending_is_released(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+    observation: &Arc<crate::execution_core::graph::executors::agent_tool::NoDispatchObservation>,
+    call_id: &str,
+    pending: &crate::PendingAgentBatch,
+) -> Result<bool, String> {
+    if !original_host_carrier_matches_ticket(services, ticket, call_id, pending)
+        || !observation.ticket_matches(ticket) || observation.member_custody_is_unresolved() {
+        return Ok(false);
+    }
+    let commits = services.commit_service();
+    match pending.value() {
+        crate::PendingAgentBatchValue::OriginalCall(_) =>
+            original_host_carrier_is_released(services, ticket, observation, call_id, pending),
+        crate::PendingAgentBatchValue::OriginalPacketScope(original) => {
+            let proof = commits.original_agent_packet_scope_refusal(ticket, original.request(), original.fact())
+                .map_err(|error| error.to_string())?;
+            Ok(original.receipt().is_none_or(|receipt|
+                receipt.event_id() == proof.event_id() && receipt.transaction_id() == proof.transaction_id()))
+        },
+        crate::PendingAgentBatchValue::OriginalBoundedAcquisition(original) => {
+            let proof = commits.original_bounded_acquisition_failure(ticket, original.fact())
+                .map_err(|error| error.to_string())?;
+            Ok(original.receipt().is_none_or(|receipt|
+                receipt.event_id() == proof.event_id() && receipt.transaction_id() == proof.transaction_id()))
+        },
+        crate::PendingAgentBatchValue::OriginalReplay(original) => {
+            if original.complete_request.is_some() {
+                return original_complete_replay_is_committed(services, ticket, call_id, original);
+            }
+            commits.original_replayed_action_after_commit(ticket, &original.replay)
+                .map_err(|error| error.to_string())?;
+            let Some(physical) = original.physical_receipt.as_ref() else { return Ok(false) };
+            let Some(key) = physical.idempotency_key.as_deref() else { return Ok(false) };
+            let Some(event) = services.event_store().event_by_idempotency_key(&physical.stream_id, key)
+                .map_err(|error| error.to_string())? else { return Ok(false) };
+            let Some(receipt) = services.event_store().original_transaction_receipt(&event.transaction_id)
+                .map_err(|error| error.to_string())? else { return Ok(false) };
+            Ok(event.event_id == physical.event_id && event.transaction_id == physical.transaction_id
+                && event.commit_cursor == physical.commit_cursor && event.payload == physical.payload
+                && receipt.transaction_id == event.transaction_id && receipt.commit_cursor == event.commit_cursor
+                && receipt.event_ids.get(event.transaction_index as usize) == Some(&event.event_id))
+        },
+        crate::PendingAgentBatchValue::WithCause { primary, .. } => {
+            let _ = primary;
+            original_host_carrier_is_released(services, ticket, observation, call_id, pending)
+        },
+        _ => Ok(false),
+    }
+}
+
+/// Authenticate the complete replay against its original semantic and
+/// physical transactions; it is not the partial-replay node event.
+fn original_complete_replay_is_committed(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+    call_id: &str,
+    original: &crate::conversation::OriginalReplayedPartial,
+) -> Result<bool, String> {
+    let (Some(request), Some(physical), Some(observation)) = (
+        original.complete_request.as_ref(), original.physical_receipt.as_ref(), original.replay.observation(),
+    ) else { return Ok(false) };
+    if !original.replay.belongs_to(services.event_store()) || original.replay.ticket() != ticket
+        || original.replay.call_id() != call_id || request.tool_use_id != call_id
+        || crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, request).is_err()
+    { return Ok(false); }
+    let semantic = original.replay.program_event();
+    let original_receipt = original.replay.receipt();
+    let Some(semantic_key) = semantic.idempotency_key.as_deref() else { return Ok(false) };
+    let Some(actual_semantic) = services.event_store().event_by_idempotency_key(&semantic.stream_id, semantic_key)
+        .map_err(|error| error.to_string())? else { return Ok(false) };
+    let Some(semantic_receipt) = services.event_store().original_transaction_receipt(&semantic.transaction_id)
+        .map_err(|error| error.to_string())? else { return Ok(false) };
+    if actual_semantic != *semantic || semantic_receipt.transaction_id != original_receipt.transaction_id
+        || semantic_receipt.request_hash != original_receipt.request_hash
+        || semantic_receipt.commit_cursor != original_receipt.commit_cursor
+        || semantic_receipt.event_ids != original_receipt.event_ids
+        || semantic_receipt.stream_revisions != original_receipt.stream_revisions
+        || semantic_receipt.event_ids.get(semantic.transaction_index as usize) != Some(&semantic.event_id)
+        || observation.action_id.is_empty() { return Ok(false); }
+    let Some(effect) = request.compiled_invocation.as_ref().map(|invocation| &invocation.effect) else { return Ok(false) };
+    let Some(outcome) = services.commit_service().completed_tool_effect(request, effect)
+        .map_err(|error| error.to_string())? else { return Ok(false) };
+    let Some(physical_key) = physical.idempotency_key.as_deref() else { return Ok(false) };
+    let Some(actual_physical) = services.event_store().event_by_idempotency_key(&physical.stream_id, physical_key)
+        .map_err(|error| error.to_string())? else { return Ok(false) };
+    let Some(receipt) = services.event_store().original_transaction_receipt(&physical.transaction_id)
+        .map_err(|error| error.to_string())? else { return Ok(false) };
+    Ok(actual_physical == **physical && receipt.transaction_id == physical.transaction_id
+        && receipt.commit_cursor == physical.commit_cursor
+        && receipt.event_ids.get(physical.transaction_index as usize) == Some(&physical.event_id)
+        && serde_json::to_value(&outcome).map_err(|error| error.to_string())? == physical.payload["outcome"]
+        && (physical.commit_cursor, physical.transaction_index) > (semantic.commit_cursor, semantic.transaction_index))
+}
+
+/// Verify the original read and its transaction without reconstructing policy.
+fn original_read_is_committed(
+    services: &crate::RuntimeServices, ticket: &NodeExecutionTicket,
+    request: &crate::RuntimeToolExecutionRequest,
+) -> Result<bool, String> {
+    services.commit_service().original_read_is_committed(ticket, request)
+}
+
+/// Only the original joined worker can attest its pre-dispatch return.
+/// Previously acknowledged authorization writes remain separately durable.
+fn original_early_deferral_sources(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+    call_id: &str,
+    deferred: &crate::conversation::EarlyToolDeferral,
+) -> Result<Option<BTreeMap<String, u64>>, String> {
+    let Some(original) = deferred.original_undispatched.as_ref() else { return Ok(None) };
+    if original.ticket != *ticket || original.call_id != call_id || deferred.tool_call_id != call_id
+        || original.identity.tool_call_id.as_deref() != Some(call_id) {
+        return Ok(None);
+    }
+    let mut seen = BTreeSet::new();
+    let mut sources = BTreeMap::new();
+    for event in &original.authorization_events {
+        let Some(key) = event.idempotency_key.as_deref() else { return Ok(None) };
+        if !seen.insert((event.stream_id.clone(), key.to_string()))
+            || event.kind != "authorization.lease_transition"
+            || event.scope != crate::RuntimeEventScope::Tool || event.schema_version != 1
+            || event.actor.as_deref() != Some("conversation_runtime.early_tool")
+            || event.transaction_id != format!("authorization-transition:{key}")
+            || !event.stream_id.starts_with("authorization-lease:") {
+            return Ok(None);
+        }
+        let Some(actual) = services.event_store().event_by_idempotency_key(&event.stream_id, key)
+            .map_err(|error| error.to_string())? else { return Ok(None) };
+        let Some(receipt) = services.event_store().original_transaction_receipt(&event.transaction_id)
+            .map_err(|error| error.to_string())? else { return Ok(None) };
+        if actual != *event || receipt.transaction_id != event.transaction_id
+            || receipt.commit_cursor != event.commit_cursor
+            || receipt.event_ids.get(event.transaction_index as usize) != Some(&event.event_id)
+            || receipt.event_ids.iter().filter(|id| *id == &event.event_id).count() != 1
+            || !receipt.stream_revisions.iter().any(|source| source.stream_id == event.stream_id
+                && source.expected_revision < event.sequence && event.sequence <= source.committed_revision)
+        { return Ok(None); }
+        let head = services.event_store().stream_revision(&event.stream_id).map_err(|error| error.to_string())?;
+        if sources.insert(event.stream_id.clone(), head).is_some_and(|old| old != head) { return Ok(None); }
+    }
+    Ok(Some(sources))
+}
+
+fn original_early_read_is_committed(
+    services: &crate::RuntimeServices, ticket: &NodeExecutionTicket,
+    early: &crate::conversation::EarlyToolExecutionReceipt,
+) -> Result<bool, String> {
+    services.commit_service().original_early_read_is_committed(ticket, early)
+}
+
+/// Verify every early read and the complete original frame, without treating
+/// an InlineModel read as a ToolBatch observation.
+fn verify_original_early_read_set(
+    services: &crate::RuntimeServices,
+    owner_graph_id: &str,
+    early: &[crate::conversation::EarlyToolExecutionReceipt],
+    pending: &BTreeMap<(String, u32), Vec<(String, crate::PendingAgentBatch)>>,
+) -> Result<bool, String> {
+    if early.is_empty() { return Ok(true); }
+    let mut groups = BTreeMap::<(String, String, u32), Vec<crate::conversation::EarlyToolExecutionReceipt>>::new();
+    for item in early {
+        let Some(source) = item.original_source.as_ref() else { return Ok(false) };
+        if source.ticket.graph_id != owner_graph_id || source.ticket.executor_kind != "inline_model" || source.completed_calls.is_none() {
+            return Ok(false);
+        }
+        groups.entry((source.ticket.graph_id.clone(), source.ticket.node_id.clone(), source.ticket.attempt))
+            .or_default().push(item.clone());
+    }
+    for ((graph_id, node_id, attempt), items) in groups {
+        let mut unique = BTreeSet::new();
+        let expected = items[0].original_source.as_ref().and_then(|source| source.completed_calls.as_ref());
+        if expected.is_none() || items.iter().any(|item| {
+            !unique.insert(item.call.id.clone())
+                || item.original_source.as_ref().and_then(|source| source.completed_calls.as_ref()) != expected
+        }) { return Ok(false); }
+        let Some(expected) = expected else { return Ok(false) };
+        for calls in pending.values() {
+            for (call_id, original) in calls {
+                if original.original_host_call_set().is_some_and(|(_, calls)| calls == expected) {
+                    unique.insert(call_id.clone());
+                }
+            }
+        }
+        if expected.len() != unique.len() || expected.iter().any(|call| !unique.contains(&call.id)) {
+            return Ok(false);
+        }
+        for item in &items {
+            let Some(source) = item.original_source.as_ref() else { return Ok(false) };
+            if source.ticket.graph_id != graph_id || source.ticket.node_id != node_id
+                || source.ticket.attempt != attempt
+                || !original_early_read_is_committed(services, &source.ticket, item)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Re-read one original Host release from its node transaction and live proof.
+/// Missing or mismatched facts remain unknown and cannot authorize a retry.
+fn original_host_carrier_is_released(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+    observation: &Arc<crate::execution_core::graph::executors::agent_tool::NoDispatchObservation>,
+    call_id: &str,
+    pending: &crate::PendingAgentBatch,
+) -> Result<bool, String> {
+    let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.primary_value() else {
+        return Ok(false);
+    };
+    let request = carrier.original_request();
+    if !original_host_carrier_matches_ticket(services, ticket, call_id, pending) {
+        return Ok(false);
+    }
+    let commits = services.commit_service();
+    if request.tool_name != "agent_action_batch" {
+        if carrier.has_unsettled_host_members() || !carrier.outcomes().is_empty()
+            || pending.original_stop_publication().is_some()
+            || request.tool_progress.original_fresh_effect()?.is_some()
+        {
+            return Ok(false);
+        }
+        return original_read_is_committed(services, ticket, request);
+    }
+    let outers = commits.original_batch_outers_after_commit(ticket).map_err(|error| error.to_string())?;
+    if outers.iter().filter(|outer| *outer == &request.idempotency_key).count() != 1 {
+        return Ok(false);
+    }
+    let facts = commits.original_batch_members_after_commit(ticket, &request.idempotency_key)
+        .map_err(|error| error.to_string())?.into_iter()
+        .map(|fact| fact.payload().clone()).collect::<Vec<_>>();
+    let pending_fact = commits.original_batch_pending_after_commit(ticket, &request.idempotency_key)
+        .map_err(|error| error.to_string())?.map(|fact| fact.payload()["pending"].clone());
+    let proof = carrier.host_release_slot().lock()
+        .map_err(|_| "original Host release proof unavailable".to_string())?.clone();
+    let Some(proof) = proof else { return Ok(false) };
+    let publications = request.tool_progress.checked_original_stop_publications()?;
+    let same_publication = match &proof.publication {
+        None => publications.is_empty(),
+        Some(original) => publications.len() == 1 && Arc::ptr_eq(original, &publications[0]),
+    };
+    if proof.ticket != *ticket || !proof.owner.matches_original(services.event_store(), request)
+        || proof.facts != facts || proof.pending != pending_fact
+        || !same_publication
+        || !std::sync::Weak::ptr_eq(&proof.observation, &Arc::downgrade(observation))
+        || !observation.ticket_matches(ticket)
+        || carrier.has_unsettled_host_members()
+    {
+        return Ok(false);
+    }
+    let units = carrier.verified_host_settlements(ticket, services.event_store(), &facts, pending_fact.as_ref())?;
+    if units.len() != proof.members.len() || units.iter().zip(&proof.members).any(|(unit, original)| {
+        !std::sync::Weak::ptr_eq(original, &Arc::downgrade(unit)) || !unit.is_settled()
+    }) {
+        return Ok(false);
+    }
+    let stream = format!("execution-effect:{}", request.idempotency_key);
+    let key = format!("{}:receipt", request.idempotency_key);
+    let Some(event) = services.event_store().event_by_idempotency_key(&stream, &key)
+        .map_err(|error| error.to_string())? else { return Ok(false) };
+    let Some(receipt) = services.event_store().original_transaction_receipt(&event.transaction_id)
+        .map_err(|error| error.to_string())? else { return Ok(false) };
+    Ok(event.kind == "execution.effect.receipt"
+        && event.scope == crate::RuntimeEventScope::ExecutionNode
+        && event.actor.as_deref() == Some("governed_tool")
+        && event.status.as_deref() == Some("completed")
+        && event.schema_version == 1
+        && matches!(event.payload["outcome"]["status"].as_str(), Some("executed" | "failed" | "blocked_permission"))
+        && event.payload["replay"] == crate::execution_core::graph::receipt_replay_contract(request)
+            .map_err(|error| error.to_string())?
+        && event.transaction_id == proof.outer_receipt.transaction_id
+        && event.commit_cursor == proof.outer_receipt.commit_cursor
+        && receipt.transaction_id == proof.outer_receipt.transaction_id
+        && receipt.request_hash == proof.outer_receipt.request_hash
+        && receipt.commit_cursor == proof.outer_receipt.commit_cursor
+        && receipt.event_ids == proof.outer_receipt.event_ids
+        && receipt.stream_revisions == proof.outer_receipt.stream_revisions
+        && receipt.event_ids.get(event.transaction_index as usize) == Some(&event.event_id))
+}
+
+/// Ask the original active owner to settle, then verify every captured call.
+async fn settle_original_host_carriers(
+    services: &Arc<crate::RuntimeServices>,
+    state: &Arc<tokio::sync::Mutex<TurnGraphState>>,
+    graph_id: &str,
+    early: &[crate::conversation::EarlyToolExecutionReceipt],
+) -> Result<bool, String> {
+    let originals = state.lock().await.pending_member_batches.clone();
+    if originals.is_empty() {
+        return Ok(true);
+    }
+    for ((node_id, attempt), calls) in originals {
+        let mut unique = BTreeSet::new();
+        if calls.is_empty() || calls.iter().any(|(id, _)| id.is_empty()) {
+            return Ok(false);
+        }
+        for (id, _) in &calls { unique.insert(id.clone()); }
+        let verified = services.execution_supervisor().settle_retained_original_callback(
+            graph_id, &node_id, attempt,
+            |ticket| {
+                let mut captured_outers = BTreeSet::new();
+                let mut original_calls_by_id = BTreeMap::new();
+                for (id, pending) in &calls {
+                    if !original_host_carrier_matches_ticket(services, ticket, id, pending) { return Ok(false); }
+                    let Some((_, original_calls)) = pending.original_host_call_set() else { return Ok(false) };
+                    let original_ids = original_calls.iter().map(|call| call.id.clone()).collect::<BTreeSet<_>>();
+                    let mut covered = unique.clone();
+                    for receipt in early {
+                        let Some(source) = receipt.original_source.as_ref() else { return Ok(false) };
+                        if source.completed_calls.as_deref() == Some(original_calls) {
+                            if !covered.insert(receipt.call.id.clone()) { return Ok(false); }
+                        }
+                    }
+                    if original_ids.len() != original_calls.len() || original_ids != covered {
+                        return Ok(false);
+                    }
+                    if let crate::PendingAgentBatchValue::OriginalCall(carrier) = pending.primary_value() {
+                        if let Some(previous) = original_calls_by_id.insert(id, carrier.original_request()) {
+                            if previous != carrier.original_request()
+                                || !previous.tool_progress.same_original_channels(&carrier.original_request().tool_progress)
+                            { return Ok(false); }
+                            continue;
+                        }
+                        if carrier.original_request().tool_name != "agent_action_batch" { continue; }
+                        if !captured_outers.insert(carrier.original_request().idempotency_key.clone()) {
+                            return Ok(false);
+                        }
+                    } else if calls.iter().filter(|(other, _)| other == id).count() != 1 {
+                        return Ok(false);
+                    }
+                }
+                let durable = services.commit_service().original_batch_outers_after_commit(ticket)
+                    .map_err(|error| error.to_string())?;
+                Ok(durable.len() == captured_outers.len()
+                    && durable.iter().all(|outer| captured_outers.contains(outer)))
+            },
+            |ticket, observation| {
+                let Some(observation) = observation else { return Ok(false) };
+                for id in &unique {
+                    let mut released = false;
+                    for (_, pending) in calls.iter().filter(|(candidate, _)| candidate == id) {
+                        if original_pending_is_released(services, ticket, observation, id, pending)? {
+                            released = true;
+                            break;
+                        }
+                    }
+                    if !released {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+        ).await?;
+        if verified.is_none() || state.lock().await.pending_member_batches.contains_key(&(node_id, attempt)) {
+            return Ok(false);
+        }
+    }
+    Ok(state.lock().await.pending_member_batches.is_empty())
+}
+
 /// Retain the same live call carriers only for this turn. This map is not
 /// authority and cannot establish that the node transaction committed.
 pub(crate) async fn retain_original_member_batches(
@@ -8371,7 +9001,8 @@ pub(crate) async fn retain_original_member_batches(
     for (call_id, pending) in batches {
         // Arc equality here only avoids retaining the exact same live object
         // twice. It is never used for authorization or fact comparison.
-        if !retained.iter().any(|(old_call, old)| old_call == call_id && old == pending) {
+        if !retained.iter().any(|(old_call, old)| old_call == call_id && old == pending
+            && old.original_host_call_set() == pending.original_host_call_set()) {
             retained.push((call_id.clone(), pending.clone()));
         }
     }
@@ -8449,9 +9080,16 @@ fn attach_original_member_prefixes(
             .map_err(|error| error.to_string())?;
     }
     for (call_id, pending) in batches {
+        if matches!(pending.value(), crate::PendingAgentBatchValue::WithCause { .. })
+            && matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalReplay(_)
+                | crate::PendingAgentBatchValue::OriginalPacketScope(_)
+                | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) {
+            return Err("original call has an independent unresolved cause".into());
+        }
         if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) { continue; }
         if let crate::PendingAgentBatchValue::OriginalReplay(original) = pending.primary_value() {
             if original.replay.call_id() != call_id { return Err("original replay call differs".into()); }
+            if original.complete_request.is_some() { continue; }
             services.commit_service().attach_original_replayed_action(outcome, Arc::clone(&original.replay))
                 .map_err(|error| error.to_string())?;
             continue;
@@ -8662,7 +9300,8 @@ pub(crate) fn pregrant_original_action_receipt(
             let partial = ConversationMessage::tool_result(&call.id, &call.name,
                 "original action committed; observation and physical outcome unavailable", true);
             let carrier = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalReplay(
-                crate::conversation::OriginalReplayedPartial { replay: Arc::clone(&original_action), physical_receipt: None }));
+                crate::conversation::OriginalReplayedPartial { replay: Arc::clone(&original_action), physical_receipt: None, complete_request: None }))
+                .with_original_host_call_set(ticket, &call.id);
             return Ok(OriginalActionReceiptState::CommittedPartial(partial, carrier));
         }
         None => return Err(unknown("original semantic transaction exists but Host outcome receipt is unobserved".into())),
@@ -8729,11 +9368,13 @@ pub(crate) fn pregrant_original_action_receipt(
         let partial = ConversationMessage::tool_result(&call.id, &call.name,
             "original action committed; semantic observation unavailable", true);
         let carrier = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalReplay(
-            crate::conversation::OriginalReplayedPartial { replay: original_action, physical_receipt: Some(Arc::new(event)) }));
+            crate::conversation::OriginalReplayedPartial { replay: original_action, physical_receipt: Some(Arc::new(event)), complete_request: None }))
+            .with_original_host_call_set(ticket, &call.id);
         return Ok(OriginalActionReceiptState::CommittedPartial(partial, carrier));
     }
     Ok(OriginalActionReceiptState::Complete(HostOriginalReplay { call: call.clone(),
-        outcome: crate::bound_tool_batch::retained_replay_outcome(outcome), original_action }))
+        outcome: crate::bound_tool_batch::retained_replay_outcome(outcome), original_action,
+        original_request: Arc::new(request.clone()), physical_receipt: Arc::new(event) }))
 }
 
 #[async_trait]
@@ -8931,7 +9572,16 @@ where
                     || (!directory_read && !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str())) { continue; }
                 if directory_read { precompleted.remove(&call.id); }
                 match pregrant_original_action_receipt(issuer, services.as_ref(), ticket, call) {
-                    Ok(OriginalActionReceiptState::Complete(receipt)) => { original_replays.insert(call.id.clone(), receipt); }
+                    Ok(OriginalActionReceiptState::Complete(receipt)) => {
+                        let retained = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalReplay(
+                            crate::conversation::OriginalReplayedPartial {
+                                replay: Arc::clone(&receipt.original_action),
+                                physical_receipt: Some(Arc::clone(&receipt.physical_receipt)),
+                                complete_request: Some(Arc::clone(&receipt.original_request)),
+                            })).with_original_host_call_set(ticket, &call.id);
+                        retain_original_member_batches(&self.state, ticket, &[(call.id.clone(), retained)]).await?;
+                        original_replays.insert(call.id.clone(), receipt);
+                    }
                     Ok(OriginalActionReceiptState::Unobserved) => {},
                     Ok(OriginalActionReceiptState::CommittedPartial(partial, original)) => {
                         let messages = calls.iter().filter_map(|item| {
@@ -9281,6 +9931,18 @@ where
                 )
             };
             if !precompleted.is_empty() {
+                let original = services.tool_batch_executor().binding_observation(ticket)
+                    .ok_or_else(|| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "early read original batch custody unavailable".into() })?;
+                for receipt in precompleted.values() {
+                    let source = receipt.original_source.as_ref().ok_or_else(|| NodeExecutorError::Uncertain {
+                        node_id: ticket.node_id.clone(), reason: "early read original source unavailable".into() })?;
+                    if !original_early_read_is_committed(services.as_ref(), &source.ticket, receipt)
+                        .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })? {
+                        return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "early read original source unconfirmed".into() });
+                    }
+                    original.hold_original_early_read(ticket, receipt.clone())
+                        .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })?;
+                }
                 let runtime = self.runtime.lock().await;
                 let state = self.state.lock().await;
                 if state.has_evaluation_scope() {
@@ -11455,6 +12117,11 @@ where
         let mut settled_packet_scope = Vec::new();
         let mut packet_scope_unresolved = false;
         for (call_id, pending) in &retained_replays {
+            if matches!(pending.value(), crate::PendingAgentBatchValue::WithCause { .. })
+                && matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalPacketScope(_)
+                    | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) {
+                return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original call has an independent unresolved cause".into() });
+            }
             let crate::PendingAgentBatchValue::OriginalPacketScope(original) = pending.primary_value() else { continue };
             if !original.matches(ticket, services.event_store(), call_id) {
                 return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original packet scope custody mismatch".into() });
@@ -11490,9 +12157,22 @@ where
             return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(),
                 reason: "original packet scope transaction remains unresolved".into() });
         }
+        let mut settled_complete_replays = Vec::new();
         for (call_id, pending) in &retained_replays {
+            if matches!(pending.value(), crate::PendingAgentBatchValue::WithCause { .. })
+                && matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalReplay(_)) {
+                return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original replay has an independent unresolved cause".into() });
+            }
             if let crate::PendingAgentBatchValue::OriginalReplay(original) = pending.primary_value() {
                 if original.replay.call_id() != call_id { return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "original replay call differs".into() }); }
+                if original.complete_request.is_some() {
+                    if !original_complete_replay_is_committed(&services, ticket, call_id, original)
+                        .map_err(|reason| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason })? {
+                        return Err(NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: "complete original replay remains unresolved".into() });
+                    }
+                    settled_complete_replays.push(pending.clone());
+                    continue;
+                }
                 services.commit_service().original_replayed_action_after_commit(ticket, &original.replay)
                     .map_err(|error| NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: error.to_string() })?;
             }
@@ -11735,7 +12415,9 @@ where
         state.pending_transcript.remove(&ticket.node_id);
         if let Some(retained) = state.pending_member_batches.get_mut(&(ticket.node_id.clone(), ticket.attempt)) {
             retained.retain(|(call_id, pending)| {
-                if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) {
+                if settled_complete_replays.iter().any(|settled| settled == pending) {
+                    false
+                } else if matches!(pending.primary_value(), crate::PendingAgentBatchValue::OriginalPacketScope(_) | crate::PendingAgentBatchValue::OriginalBoundedAcquisition(_)) {
                     !settled_packet_scope.iter().any(|(settled, _)| settled == pending)
                 } else { !settled_calls.contains(call_id) }
             });
@@ -12251,6 +12933,14 @@ mod closed_host_continuity_475_tests {
                 )
                 .unwrap()
                 .graph;
+            let cut = original_sibling_closure_cut(&services, &ticket)
+                .expect("original graph cut is readable")
+                .expect("the only started binding is the original model ticket");
+            assert_eq!(cut.get(&running.id), Some(&running.revision));
+            let mut foreign = ticket.clone();
+            foreign.idempotency_key.push_str(":foreign");
+            assert!(original_sibling_closure_cut(&services, &foreign)
+                .map_or(true, |cut| cut.is_none()), "a drifted ticket cannot authenticate the cut");
             let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
                 status: ExecutionNodeStatus::Completed,
                 result_ref: Some("475-model-result".into()),
@@ -12284,6 +12974,7 @@ mod closed_host_continuity_475_tests {
             let hot = TurnModelStepBackend {
                 ticket: ticket.clone(),
                 stop: crate::CancellationToken::new(),
+                local_fence: Mutex::new(None),
                 runtime: runtime.clone(),
                 state: state.clone(),
                 services: services.clone(),

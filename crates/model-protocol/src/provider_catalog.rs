@@ -403,6 +403,7 @@ mod tests {
         providers.insert(
             "openai".to_string(),
             ProviderConfig {
+                reasoning_effort: None,
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key: "sk-test".to_string(),
                 models: vec!["gpt-5-mini".to_string()],
@@ -415,6 +416,7 @@ mod tests {
         providers.insert(
             "deepseek".to_string(),
             ProviderConfig {
+                reasoning_effort: None,
                 base_url: "https://api.deepseek.com/v1".to_string(),
                 api_key: String::new(),
                 models: vec!["deepseek-v4-flash".to_string()],

@@ -2,7 +2,7 @@
 #[cfg(test)]
 use crate::agentic::execution::reviewed_goal_fixture::diagnostic_1120 as obs1120;
 use crate::agentic::program::AgenticProgramProjection;
-use crate::{ExpectedStreamRevision, RuntimeEventStore};
+use crate::{ExpectedStreamRevision, RuntimeEventScope, RuntimeEventStore};
 use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
 use harness_contract::goal::GoalContract;
 use harness_contract::tool::{ToolEffectDescriptor, ToolEffectKind};
@@ -31,6 +31,12 @@ pub(crate) struct ProofInputSnapshot {
     /// It is a CANDIDATE that every entry re-binds against the durable
     /// evidence; a snapshot without one exempts nothing.
     pub current_review_effect_key: Option<String>,
+    /// The required writes this review settled as terminally failed.
+    ///
+    /// Each one names the call that ran and failed. A settled pending write
+    /// is never a satisfied requirement, and never an effect that did not
+    /// happen: the conclusion carries these by name.
+    pub terminal_failures: Vec<serde_json::Value>,
     pub(super) dependency_frame: ConclusionMaterialDependencies,
     pub(super) pre_authenticated_session_source: Option<ExpectedStreamRevision>,
 }
@@ -617,7 +623,7 @@ fn with_authenticated_applied_review<T>(
     let envelope: harness_contract::agent_action::AgentActionEnvelope =
         serde_json::from_value(original.payload["envelope"].clone())
             .map_err(|_| "original applied review envelope missing")?;
-    if original.scope != crate::RuntimeEventScope::Program
+    if original.scope != RuntimeEventScope::Program
         || original.schema_version != 1
         || envelope.actor.program_id != program.program_id
         || envelope.actor.objective_id != program.objective_id
@@ -995,7 +1001,7 @@ pub(crate) fn verify_nested_read(
 ) -> Result<Option<VerifiedNestedRead>, String> {
     use crate::context_evidence::{ReadDeliveryRecipient, ReadDeliveryTransport, ReadExtent};
     if event.kind != "context.nested_read_model_observed" || event.schema_version != 1
-        || event.scope != crate::RuntimeEventScope::Session || event.actor.as_deref() != Some("conversation_runtime")
+        || event.scope != RuntimeEventScope::Session || event.actor.as_deref() != Some("conversation_runtime")
         || event.status.as_deref() != Some("confirmed") || event.payload["schema_version"] != 1 { return Ok(None); }
     let payload = &event.payload;
     let material = nested_parent_material(payload)?;
@@ -1449,7 +1455,7 @@ pub(crate) fn read_delivery_snapshot_for_scope(
             PROCESS_DELIVERY_KIND => ("runtime.process_jsonl", "sent"),
             _ => continue,
         };
-        if event.scope != crate::RuntimeEventScope::Session
+        if event.scope != RuntimeEventScope::Session
             || event.schema_version != 1
             || event.actor.as_deref() != Some(expected.0)
             || event.status.as_deref() != Some(expected.1)
@@ -1506,7 +1512,7 @@ pub(crate) fn read_delivery_snapshot_for_scope(
             || receipt.kind != "execution.agent_tool.receipt"
             || primary.actor.as_deref() != Some("governed_tool")
             || receipt.actor != primary.actor
-            || primary.scope != crate::RuntimeEventScope::ExecutionNode
+            || primary.scope != RuntimeEventScope::ExecutionNode
             || receipt.scope != primary.scope
             || primary.transaction_id != receipt.transaction_id
             || primary.commit_cursor != receipt.commit_cursor
@@ -2118,7 +2124,7 @@ pub(crate) fn root_file_acquisition(
             }
             if plan.sequence >= owner.sequence
                 || plan.actor.as_deref() != Some("conversation_runtime")
-                || plan.scope != crate::RuntimeEventScope::Tool
+                || plan.scope != RuntimeEventScope::Tool
                 || plan.status.as_deref() != Some("planned")
                 || !plan.refs.iter().any(|reference| {
                     reference.kind == "execution" && reference.id == binding.root_execution_id
@@ -2202,7 +2208,7 @@ pub(crate) fn root_file_acquisition(
         || index.kind != "execution.agent_tool.receipt"
         || primary.actor.as_deref() != Some("governed_tool")
         || index.actor != primary.actor
-        || primary.scope != crate::RuntimeEventScope::ExecutionNode
+        || primary.scope != RuntimeEventScope::ExecutionNode
         || index.scope != primary.scope
         || primary.status.as_deref() != Some("completed")
         || index.status.as_deref() != Some("completed")
@@ -2487,7 +2493,7 @@ fn r1_581_actual_read_phase_keeps_discovery_exact_and_revalidates_existing_cuts(
         store
             .append(crate::RuntimeEventInput {
                 stream_id: source.into(),
-                scope: crate::RuntimeEventScope::Session,
+                scope: RuntimeEventScope::Session,
                 kind: "runtime.phase581.metadata".into(),
                 status: None,
                 actor: Some("phase581_test_not_business_authority".into()),
@@ -2671,7 +2677,7 @@ impl ActualImmutableInput {
         if primary.kind != "execution.read.receipt"
             || primary.schema_version != 1
             || primary.actor.as_deref() != Some("governed_tool")
-            || primary.scope != crate::RuntimeEventScope::ExecutionNode
+            || primary.scope != RuntimeEventScope::ExecutionNode
             || primary.status.as_deref() != Some("completed")
             || index.kind != "execution.agent_tool.receipt"
             || index.schema_version != 2
@@ -3144,7 +3150,7 @@ fn collect_actual_acquisition(
         || crate::ExecutionCommitService::receipt_observation_sequence(&index).is_none()
         || primary.actor.as_deref() != Some("governed_tool")
         || primary.actor != index.actor
-        || primary.scope != crate::RuntimeEventScope::ExecutionNode
+        || primary.scope != RuntimeEventScope::ExecutionNode
         || primary.scope != index.scope
         || index.kind != "execution.agent_tool.receipt"
         || primary.transaction_id != index.transaction_id
@@ -4063,7 +4069,7 @@ fn other_required_review_is_native(
         AgentAction, AgentActionEnvelope, ObjectiveReviewDecision,
     };
     if event.stream_id != format!("agentic-program:{}", program.program_id)
-        || event.scope != crate::RuntimeEventScope::Program
+        || event.scope != RuntimeEventScope::Program
         || event.schema_version != 1
         || event.kind != "agentic.action_applied"
         || event.status.as_deref() != Some("applied")
@@ -4947,6 +4953,272 @@ pub(crate) fn proof_input_snapshot_for_action(
     proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, current_review, None)
 }
 
+/// What one receipt's outcome says about the required write it settles.
+///
+/// The set is closed: the two statuses the existing settled rule owns, the
+/// one this review settles as a terminal failure, and nothing else. A status
+/// outside the set is named, never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutcomeClass {
+    /// The write succeeded, or was blocked before it ran.
+    Succeeded,
+    /// The write ran and failed.
+    Failed,
+    /// There is no receipt yet: the write is still in flight.
+    InFlight,
+}
+
+fn terminal_outcome_class(status: Option<&str>) -> Result<OutcomeClass, String> {
+    match status {
+        Some("executed" | "blocked_permission") => Ok(OutcomeClass::Succeeded),
+        Some("failed") => Ok(OutcomeClass::Failed),
+        Some(status) => Err(format!("outcome status {status} is not one this review can read")),
+        None => Ok(OutcomeClass::InFlight),
+    }
+}
+
+/// Whether one call carries the durable fact of its own refusal.
+///
+/// The twin is written by the writer that refused the call, on that call's
+/// own effect stream, in one transaction with the program event it names.
+/// It is read the way the consumer reads it: the twin names the program
+/// event, the two share one transaction and one commit cursor, and the
+/// receipt names both.
+///
+/// A single call's twin is addressed by the call's own effect key. A batch
+/// member's twin lives on the batch's outer effect stream and is addressed
+/// by that outer key, because the member's own key names no member index
+/// there.
+fn refused_call_is_settled(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    key: &str,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<TerminalFactRead, String> {
+    let mut candidates = vec![(key.to_string(), format!("agentic-single:{key}"))];
+    if let Some((outer, index)) = member_outer_and_index(key) {
+        candidates.push((outer, format!("agentic-member:{index}")));
+    }
+    for (stream_key, idempotency_key) in candidates {
+        let stream = format!("execution-effect:{}", stream_key);
+        super::results::pin_result_source(store, &stream, sources)
+            .map_err(|error| format!("refusal twin source read failed: {error}"))?;
+        // A read that fails is not a miss: it is named, and the caller keeps
+        // the call pending. Only a stream that holds no twin is a miss.
+        let Some(twin) = store
+            .event_by_idempotency_key(&stream, &idempotency_key)
+            .map_err(|error| format!("refusal twin read failed: {error}"))?
+        else {
+            continue;
+        };
+        if twin.kind != "agentic.batch_member.index"
+            || twin.scope != RuntimeEventScope::ExecutionNode
+            || twin.actor.as_deref() != Some("runtime.agentic_action")
+            || twin.status.as_deref() != Some("committed")
+            || twin.schema_version != 1
+            || twin.payload["outer_key"] != stream_key
+            || twin.payload["program_event_kind"] != "agentic.completion_rejected"
+        {
+            return Ok(TerminalFactRead::Unprovable(format!(
+                "refusal twin on {stream} does not have the refusal shape"
+            )));
+        }
+        // A member's twin is read through its batch's outer key, so the
+        // member it stands for has to be checked here: the member ordinal in
+        // this intent's own key, and the member identity the twin names.
+        if let Some((_, index)) = member_outer_and_index(key) {
+            // The member index is read, not guessed: a value this review
+            // cannot read is named, and never read as "another member".
+            let member_index = match twin.payload["member_index"].as_u64() {
+                Some(value) => value.to_string(),
+                None => {
+                    return Ok(TerminalFactRead::Unprovable(format!(
+                        "refusal twin on {stream} names no member index"
+                    )));
+                }
+            };
+            if member_index != index
+                || twin.payload["member_identity"]
+                    .as_str()
+                    .filter(|identity| !identity.is_empty())
+                    .is_none()
+            {
+                return Ok(TerminalFactRead::Unprovable(format!(
+                    "refusal twin on {stream} stands for another member than this intent"
+                )));
+            }
+        }
+        let Some(program_stream) = twin.payload["program_stream"].as_str() else {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin names no program event stream".into(),
+            ));
+        };
+        let Some(program_key) = twin.payload["program_event_key"].as_str() else {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin names no program event key".into(),
+            ));
+        };
+        let Some(program) = store
+            .event_by_idempotency_key(program_stream, program_key)
+            .map_err(|error| format!("refusal program event read failed: {error}"))?
+        else {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin names a program event that is not there".into(),
+            ));
+        };
+        if program.kind != "agentic.completion_rejected"
+            || program.scope != RuntimeEventScope::Program
+            || program.status.as_deref() != Some("rejected")
+            || program.schema_version != 1
+            || program.transaction_id != twin.transaction_id
+            || program.commit_cursor != twin.commit_cursor
+        {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin and its program event are not one transaction".into(),
+            ));
+        }
+        let Some(receipt) = store
+            .original_transaction_receipt(&twin.transaction_id)
+            .map_err(|error| format!("refusal transaction receipt read failed: {error}"))?
+        else {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin has no transaction receipt".into(),
+            ));
+        };
+        if !receipt.event_ids.contains(&twin.event_id)
+            || !receipt.event_ids.contains(&program.event_id)
+        {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal transaction receipt does not name both events".into(),
+            ));
+        }
+        return Ok(TerminalFactRead::Found {
+            cursor: twin.commit_cursor,
+        });
+    }
+    Ok(TerminalFactRead::NotFound)
+}
+
+/// What one candidate family says about a call's terminal fact.
+///
+/// `NotFound` is "this family holds nothing here"; `Unprovable` is "this
+/// family holds something that cannot be read as the fact". The two are
+/// never the same: only `Found` may settle a call, and `Unprovable` keeps
+/// the call pending under a named reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalFactRead {
+    NotFound,
+    Unprovable(String),
+    Found { cursor: u64 },
+}
+
+/// A batch member's own key names its batch's outer key and its member
+/// index: `{outer}:{index}`. The index is the trailing number, so the
+/// outer key is everything before the last colon.
+fn member_outer_and_index(key: &str) -> Option<(String, String)> {
+    let (outer, index) = key.rsplit_once(':')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((outer.to_string(), index.to_string()))
+}
+
+/// How one required write's own durable facts answer whether it is settled.
+///
+/// Two families can answer it, and they answer different questions: a
+/// refusal twin says the call was refused before it took effect, a terminal
+/// receipt says the call ran and failed. When both are present for the same
+/// call, the facts contradict each other, and the contradiction is named -
+/// neither fact is used to settle the call, and neither is silently
+/// preferred.
+///
+/// This is the decision the review makes for one required write, lifted out
+/// of the collection so that it can be read - and witnessed - on its own.
+enum RequiredWriteSettlement {
+    /// The call was refused before it took effect: its refusal twin is the
+    /// terminal fact, and the review settles the call on it.
+    Refused { cursor: u64 },
+    /// The call ran and failed. The named failure carries it: never a
+    /// satisfied requirement, and never an effect that did not happen.
+    Failed { failure: serde_json::Value },
+    /// The call is still pending: nothing terminal settles it.
+    Pending,
+    /// The refusal fact cannot be read as this call's fact.
+    UnreadableRefusal { reason: String },
+    /// The two terminal facts contradict each other for the same call.
+    Contradiction {
+        refusal_cursor: Option<u64>,
+        receipt_cursor: Option<u64>,
+    },
+    /// A terminal failure has no receipt to name.
+    MissingReceipt,
+}
+
+/// Decide one required write's fate from its own durable facts.
+///
+/// The decision set is exactly the one the review has always made: a
+/// terminal receipt settles a call that ran, a refusal twin settles a call
+/// that was refused before it took effect, a call that ran and failed is
+/// carried as its own named failure, and a call with no terminal fact stays
+/// pending. Nothing here widens what settles a write: a call whose refusal
+/// fact cannot be read stays pending under a name, and a refusal fact and a
+/// terminal receipt for the same call contradict each other.
+fn required_write_settlement(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    identity: &str,
+    intent_payload: &serde_json::Value,
+    receipt: Option<(&serde_json::Value, u64)>,
+    terminally_failed: bool,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<RequiredWriteSettlement, String> {
+    let refusal_cursor = match refused_call_is_settled(store, identity, sources)? {
+        TerminalFactRead::Found { cursor } => Some(cursor),
+        // Nothing here: this family does not speak for the call. The call
+        // stays pending, as it was.
+        TerminalFactRead::NotFound => None,
+        // Something here that cannot be read as the fact: the call stays
+        // pending under a named reason, and it is never treated as if it
+        // needed no handling.
+        TerminalFactRead::Unprovable(reason) => {
+            return Ok(RequiredWriteSettlement::UnreadableRefusal { reason });
+        }
+    };
+    if refusal_cursor.is_some() && terminally_failed {
+        return Ok(RequiredWriteSettlement::Contradiction {
+            refusal_cursor,
+            receipt_cursor: receipt.map(|(_, cursor)| cursor),
+        });
+    }
+    if terminally_failed {
+        // The conclusion is this required write's own named failure: it ran
+        // and it failed. It is recorded as such - never as a satisfied
+        // requirement, and never as an effect that did not happen.
+        let Some((receipt_payload, receipt_cursor)) = receipt else {
+            return Ok(RequiredWriteSettlement::MissingReceipt);
+        };
+        return Ok(RequiredWriteSettlement::Failed {
+            failure: serde_json::json!({
+                "grade": "required_write_terminally_failed",
+                "effect_key": identity,
+                "tool_use_id": intent_payload["tool_use_id"],
+                "tool_name": intent_payload["tool_name"],
+                "failure_class": "terminal_failure",
+                "error": receipt_payload["outcome"]["error"],
+                "receipt_cursor": receipt_cursor,
+            }),
+        });
+    }
+    // E-s: a call that was admitted and then refused leaves a durable twin
+    // on its own effect stream, written in one transaction with the program
+    // event that names it. That twin is the call's terminal fact, so the
+    // review settles the call as refused instead of waiting for a receipt
+    // that will never come. Only the call that carries its own twin is
+    // settled: no other admitted write is.
+    if let Some(cursor) = refusal_cursor {
+        return Ok(RequiredWriteSettlement::Refused { cursor });
+    }
+    Ok(RequiredWriteSettlement::Pending)
+}
+
 fn proof_input_snapshot_for_phase(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -4957,6 +5229,11 @@ fn proof_input_snapshot_for_phase(
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
     pre_tail: Option<&HistoricalSessionCut>,
 ) -> Result<ProofInputSnapshot, String> {
+    // The named failures this review settles: each required write that ran
+    // and failed, with the facts that name it. They are carried to the
+    // review's conclusion; they are never a satisfied requirement and never
+    // an effect that did not happen.
+    let mut terminal_failures: Vec<serde_json::Value> = Vec::new();
     let inputs = proof.input_set.as_ref().ok_or("missing v2 proof inputs")?;
     if inputs.version != 2 {
         return Err("unsupported ProofInputSet version".into());
@@ -6465,6 +6742,37 @@ fn proof_input_snapshot_for_phase(
                     Some("executed" | "blocked_permission")
                 )
             });
+            // The status table is one closed set, and the same outcome status
+            // is never answered differently in two places: `executed` and
+            // `blocked_permission` belong to the existing settled rule,
+            // `failed` belongs to this arm, and any other status is named
+            // rather than guessed.
+            let terminally_failed = match terminal_outcome_class(
+                receipts
+                    .get(identity)
+                    .and_then(|receipt| receipt.payload["outcome"]["status"].as_str()),
+            ) {
+                Ok(class) => match class {
+                    // The existing settled rule owns these two.
+                    OutcomeClass::Succeeded => false,
+                    // A call that ran and failed is terminal too: the
+                    // authenticator above has proved that this receipt
+                    // settles this very intent. Such a write is not
+                    // satisfied - it failed - but it is no longer pending,
+                    // so the review must not wait for a receipt that will
+                    // never come.
+                    OutcomeClass::Failed => settled_descriptor.is_some(),
+                    // No receipt at all: the call is still in flight.
+                    OutcomeClass::InFlight => false,
+                },
+                // A receipt whose status this review cannot read is not a
+                // miss and not a failure: it stays pending under a name.
+                Err(reason) => {
+                    return Err(format!(
+                        "effect_review_pending: required write outcome status is not one this review can read; source={source} identity={identity} reason={reason}",
+                    ));
+                }
+            };
             // The exemption is the reviewer's OWN admitted call: the intent
             // has to be the one Runtime admitted for THIS graph, node and
             // attempt. The receipt index stream names all three, so an intent
@@ -6498,12 +6806,65 @@ fn proof_input_snapshot_for_phase(
                     continue;
                 }
                 ReviewWriteOutcome::Blocked => {
-                    return Err(format!(
-                        "effect_review_pending: unknown required or possibly intersecting delegated write; source={source} identity={identity} tool={} required={required} disjoint={disjoint} receipt_present={} current_review={:?}",
-                        intent.payload["tool_name"].as_str().unwrap_or("unknown"),
-                        receipts.contains_key(identity),
-                        current_review_effect_key,
-                    ));
+                    // Two terminal facts can answer this call, and they answer
+                    // different questions: a refusal twin says the call was
+                    // refused before it took effect, a terminal receipt says
+                    // the call ran and failed. The decision is the one the
+                    // review has always made, read here from the call's own
+                    // durable facts.
+                    let receipt = receipts.get(identity);
+                    let settlement = required_write_settlement(
+                        store,
+                        identity,
+                        &intent.payload,
+                        receipt.map(|receipt| (&receipt.payload, receipt.commit_cursor)),
+                        terminally_failed,
+                        &mut sources,
+                    )?;
+                    match settlement {
+                        RequiredWriteSettlement::Refused { .. } => {
+                            // The call carries its own refusal twin: it was
+                            // refused before it took effect, so it is settled.
+                            continue;
+                        }
+                        RequiredWriteSettlement::Failed { failure } => {
+                            // The named failure: this required write ran and
+                            // it failed. It is carried, never counted as
+                            // satisfied and never as an effect that did not
+                            // happen.
+                            terminal_failures.push(failure);
+                            continue;
+                        }
+                        RequiredWriteSettlement::UnreadableRefusal { reason } => {
+                            return Err(format!(
+                                "effect_review_pending: required write refusal fact is not readable; source={source} identity={identity} reason={reason}",
+                            ));
+                        }
+                        RequiredWriteSettlement::Contradiction {
+                            refusal_cursor,
+                            receipt_cursor,
+                        } => {
+                            return Err(format!(
+                                "effect_review_pending: refused and terminally failed facts contradict for the same call; effect_key={identity} intent_transaction={} refusal_cursor={:?} receipt_cursor={:?}",
+                                intent.transaction_id,
+                                refusal_cursor,
+                                receipt_cursor,
+                            ));
+                        }
+                        RequiredWriteSettlement::MissingReceipt => {
+                            return Err(format!(
+                                "effect_review_pending: required write failure has no receipt to name; source={source} identity={identity}",
+                            ));
+                        }
+                        RequiredWriteSettlement::Pending => {
+                            return Err(format!(
+                                "effect_review_pending: unknown required or possibly intersecting delegated write; source={source} identity={identity} tool={} required={required} disjoint={disjoint} receipt_present={} current_review={:?}",
+                                intent.payload["tool_name"].as_str().unwrap_or("unknown"),
+                                receipts.contains_key(identity),
+                                current_review_effect_key,
+                            ));
+                        }
+                    }
                 }
                 ReviewWriteOutcome::Settled => {}
             }
@@ -6855,6 +7216,7 @@ fn proof_input_snapshot_for_phase(
         },
         sources,
         current_review_effect_key,
+        terminal_failures,
         dependency_frame,
         pre_authenticated_session_source: pre_tail.map(|tail| tail.source.clone()),
     })
@@ -6869,7 +7231,7 @@ fn authenticated_delegated_plan_settled(
 ) -> Result<Option<std::collections::BTreeMap<String, serde_json::Value>>, String> {
     if plan.actor.as_deref() != Some("conversation_runtime")
         || plan.schema_version != 1
-        || plan.scope != crate::RuntimeEventScope::Tool
+        || plan.scope != RuntimeEventScope::Tool
         || plan.status.as_deref() != Some("planned")
         || plan.stream_id != format!("session:{}", packet.session_id())
     {
@@ -6904,7 +7266,7 @@ fn authenticated_delegated_plan_settled(
                 .map_err(|_| "delegated callback plan lacks its original Step")?;
         if terminal.actor.as_deref() != Some("conversation_runtime")
             || terminal.schema_version != 1
-            || terminal.scope != crate::RuntimeEventScope::Tool
+            || terminal.scope != RuntimeEventScope::Tool
             || terminal.status.as_deref() != Some("completed")
             || terminal.stream_id != plan.stream_id
             || terminal.commit_cursor < plan.commit_cursor
@@ -7527,7 +7889,7 @@ mod tests {
         let store = RuntimeEventStore::for_test();
         let plan = |tool_name: &str, effect_kind: &str| crate::RuntimeEventInput {
             stream_id: "session:review-control-plan".into(),
-            scope: crate::RuntimeEventScope::Session,
+            scope: RuntimeEventScope::Session,
             kind: "tool.execution_plan.created".into(),
             status: Some("planned".into()),
             actor: Some("conversation_runtime".into()),
@@ -7663,7 +8025,7 @@ mod tests {
             event_id: "plan-event".into(),
             stream_id: "session:delegated".into(),
             sequence: 4,
-            scope: crate::RuntimeEventScope::Tool,
+            scope: RuntimeEventScope::Tool,
             kind: "tool.execution_plan.created".into(),
             status: Some("planned".into()),
             actor: Some("conversation_runtime".into()),
@@ -7856,7 +8218,7 @@ mod tests {
         let source = "agentic-program:actual-final-page-race";
         let append = |store: &RuntimeEventStore| {
             store.append(crate::RuntimeEventInput {
-                stream_id: source.into(), scope: crate::RuntimeEventScope::Session,
+                stream_id: source.into(), scope: RuntimeEventScope::Session,
                 kind: "test.source-advance".into(), status: None, actor: None,
                 refs: vec![], payload: serde_json::json!({}),
             }).unwrap();
@@ -7884,7 +8246,7 @@ mod tests {
         let source = "agentic-program:actual-paging-race";
         let append = |store: &RuntimeEventStore| {
             store.append(crate::RuntimeEventInput {
-                stream_id: source.into(), scope: crate::RuntimeEventScope::Session,
+                stream_id: source.into(), scope: RuntimeEventScope::Session,
                 kind: "test.source-advance".into(), status: None, actor: None,
                 refs: vec![], payload: serde_json::json!({}),
             }).unwrap();
@@ -8257,7 +8619,7 @@ mod tests {
         store
             .append(crate::RuntimeEventInput {
                 stream_id: format!("execution-lineage:{graph_id}"),
-                scope: crate::RuntimeEventScope::Relation,
+                scope: RuntimeEventScope::Relation,
                 kind: "execution.lineage.child_registered.v1".into(),
                 status: Some("registered".into()),
                 actor: Some("execution_commit_service".into()),
@@ -8327,7 +8689,7 @@ mod tests {
                     crate::RuntimeTransactionEventInput {
                         event: crate::RuntimeEventInput {
                             stream_id: format!("execution-effect:{key}"),
-                            scope: crate::RuntimeEventScope::ExecutionNode,
+                            scope: RuntimeEventScope::ExecutionNode,
                             kind: "execution.read.receipt".into(),
                             status: Some("completed".into()),
                             actor: Some("governed_tool".into()),
@@ -8343,7 +8705,7 @@ mod tests {
                                 "execution-agent-receipts:{graph_id}:{node_id}:{}",
                                 packet.attempt
                             ),
-                            scope: crate::RuntimeEventScope::ExecutionNode,
+                            scope: RuntimeEventScope::ExecutionNode,
                             kind: "execution.agent_tool.receipt".into(),
                             status: Some("completed".into()),
                             actor: Some("governed_tool".into()),
@@ -8403,7 +8765,7 @@ mod tests {
             store
                 .append(crate::RuntimeEventInput {
                     stream_id: "session:gc-sealed".into(),
-                    scope: crate::RuntimeEventScope::ExecutionNode,
+                    scope: RuntimeEventScope::ExecutionNode,
                     kind: "execution.read.receipt".into(),
                     status: Some("completed".into()),
                     actor: Some("governed_tool".into()),
@@ -8426,7 +8788,7 @@ mod tests {
         let consumer = store
             .append(crate::RuntimeEventInput {
                 stream_id: format!("session:{session}"),
-                scope: crate::RuntimeEventScope::ExecutionNode,
+                scope: RuntimeEventScope::ExecutionNode,
                 kind: "execution.effect.intent".into(),
                 status: Some("completed".into()),
                 actor: Some("governed_tool".into()),
@@ -8538,6 +8900,413 @@ mod tests {
         );
     }
 
+    /// E-s: the refusal twin is addressed by the call's own effect key, and
+    /// a batch member's twin by the batch's outer key, because the member's
+    /// own key names no member index on that stream.
+    ///
+    /// The twin settles the call only when it names the program event it
+    /// belongs to and the two share one transaction and one receipt.
+    /// The outcome status set is closed: the two statuses the existing
+    /// settled rule owns, the one this review settles as a terminal failure,
+    /// and nothing else. A status outside the set is named, never guessed.
+    #[test]
+    fn f24_the_outcome_status_table_is_a_closed_set() {
+        assert!(matches!(
+            super::terminal_outcome_class(Some("executed")),
+            Ok(super::OutcomeClass::Succeeded)
+        ));
+        assert!(matches!(
+            super::terminal_outcome_class(Some("blocked_permission")),
+            Ok(super::OutcomeClass::Succeeded)
+        ));
+        assert!(matches!(
+            super::terminal_outcome_class(Some("failed")),
+            Ok(super::OutcomeClass::Failed)
+        ));
+        assert!(matches!(
+            super::terminal_outcome_class(None),
+            Ok(super::OutcomeClass::InFlight)
+        ));
+        // Anything outside the set is named, not guessed.
+        let unknown = super::terminal_outcome_class(Some("partial")).unwrap_err();
+        assert!(unknown.contains("partial"), "{unknown}");
+    }
+
+    /// The refusal twin is addressed by the call's own effect key, and a
+    /// batch member's twin by the batch's outer key, because the member's
+    /// own key names no member index on that stream.
+    ///
+    /// A member's twin must also stand for this intent's own member: read
+    /// through the outer key, another member's twin is not this call's fact.
+    #[test]
+    fn f24_the_refusal_twin_is_addressed_by_effect_key_and_by_outer_key() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let write = |store: &std::sync::Arc<RuntimeEventStore>,
+                     stream_key: &str,
+                     outer_key: &str,
+                     idem: &str,
+                     member_index: serde_json::Value,
+                     member_identity: serde_json::Value| {
+            let program_stream = "agentic-program:f24-program";
+            store
+                .append_transaction(crate::AppendTransactionRequest {
+                    transaction_id: format!("f24-refusal:{idem}"),
+                    // The writer declares the current revision of every
+                    // stream it writes, the way the rejection writer does;
+                    // the store refuses a transaction that does not.
+                    expected_streams: vec![
+                        crate::ExpectedStreamRevision {
+                            stream_id: "agentic-program:f24-program".to_string(),
+                            expected_revision: store
+                                .stream_revision("agentic-program:f24-program")
+                                .expect("program stream revision"),
+                        },
+                        crate::ExpectedStreamRevision {
+                            stream_id: format!("execution-effect:{stream_key}"),
+                            expected_revision: store
+                                .stream_revision(&format!("execution-effect:{stream_key}"))
+                                .expect("effect stream revision"),
+                        },
+                    ],
+                    events: vec![
+                        crate::RuntimeTransactionEventInput {
+                            event: crate::RuntimeEventInput {
+                                stream_id: program_stream.to_string(),
+                                scope: RuntimeEventScope::Program,
+                                kind: "agentic.completion_rejected".into(),
+                                status: Some("rejected".into()),
+                                actor: Some("runtime.agentic_action".into()),
+                                refs: vec![],
+                                payload: serde_json::json!({
+                                    "program_id": "f24-program",
+                                    "request_action_id": stream_key,
+                                    "code": "call_refused_after_admission",
+                                }),
+                            },
+                            // One refusal fact, one program event key.
+                            idempotency_key: Some(format!("completion-rejected:{idem}")),
+                            schema_version: 1,
+                        },
+                        crate::RuntimeTransactionEventInput {
+                            event: crate::RuntimeEventInput {
+                                stream_id: format!("execution-effect:{stream_key}"),
+                                scope: RuntimeEventScope::ExecutionNode,
+                                kind: "agentic.batch_member.index".into(),
+                                status: Some("committed".into()),
+                                actor: Some("runtime.agentic_action".into()),
+                                refs: vec![],
+                                payload: serde_json::json!({
+                                    "outer_key": outer_key,
+                                    "member_index": member_index,
+                                    "member_identity": member_identity,
+                                    "ticket": serde_json::Value::Null,
+                                    "program_stream": program_stream,
+                                    "program_event_kind": "agentic.completion_rejected",
+                                    "program_event_key": format!("completion-rejected:{idem}"),
+                                    "program_event_index": 0,
+                                }),
+                            },
+                            idempotency_key: Some(idem.to_string()),
+                            schema_version: 1,
+                        },
+                    ],
+                })
+                .expect("the refusal fact");
+        };
+        // A single call's twin: addressed by the call's own effect key.
+        let key = "f24-effect-key";
+        write(
+            &store,
+            key,
+            key,
+            &format!("agentic-single:{key}"),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        assert!(
+            matches!(
+                super::refused_call_is_settled(&store, key, &mut std::collections::BTreeMap::new())
+                    .expect("settled"),
+                super::TerminalFactRead::Found { .. }
+            ),
+            "a single call's twin settles it by its own effect key"
+        );
+        // A call with no twin of its own is a miss, not a failure.
+        assert!(
+            matches!(
+                super::refused_call_is_settled(
+                    &store,
+                    "f24-effect-key-absent",
+                    &mut std::collections::BTreeMap::new(),
+                )
+                .expect("miss"),
+                super::TerminalFactRead::NotFound
+            ),
+            "a call without a twin of its own is a miss"
+        );
+        // A batch member's twin: addressed by the batch's outer key.
+        let outer = "f24-outer-key";
+        let member = format!("{outer}:7");
+        write(
+            &store,
+            outer,
+            outer,
+            "agentic-member:7",
+            serde_json::json!(7),
+            serde_json::json!("f24-member-identity"),
+        );
+        // A twin that sits under another member's index but names this
+        // member's ordinal is not this intent's fact either.
+        write(
+            &store,
+            outer,
+            outer,
+            "agentic-member:8",
+            serde_json::json!(7),
+            serde_json::json!("f24-member-identity"),
+        );
+        assert!(
+            store
+                .event_by_idempotency_key(
+                    &format!("execution-effect:{member}"),
+                    "agentic-member:7",
+                )
+                .expect("member stream lookup")
+                .is_none(),
+            "the member's own key names no member index on the outer stream"
+        );
+        assert!(
+            matches!(
+                super::refused_call_is_settled(&store, &member, &mut std::collections::BTreeMap::new())
+                    .expect("settled"),
+                super::TerminalFactRead::Found { .. }
+            ),
+            "a batch member's twin settles it by the batch's outer key"
+        );
+        // A member with no twin of its own is a miss.
+        let other = format!("{outer}:9");
+        assert!(
+            matches!(
+                super::refused_call_is_settled(&store, &other, &mut std::collections::BTreeMap::new())
+                    .expect("read"),
+                super::TerminalFactRead::NotFound
+            ),
+            "a member with no twin of its own is a miss"
+        );
+        // A twin that names another member is not this intent's fact.
+        let other = format!("{outer}:8");
+        assert!(
+            matches!(
+                super::refused_call_is_settled(&store, &other, &mut std::collections::BTreeMap::new())
+                    .expect("read"),
+                super::TerminalFactRead::Unprovable(_)
+            ),
+            "another member's twin is not this intent's fact"
+        );
+    }
+
+    /// Write one refusal fact: the program event that names the refusal and
+    /// the twin on the call's own effect stream, in one transaction, the way
+    /// the rejection writer writes them.
+    fn f24_write_refusal_twin(
+        store: &std::sync::Arc<RuntimeEventStore>,
+        key: &str,
+        twin_idem: &str,
+        outer_key: &str,
+        member_index: serde_json::Value,
+        member_identity: serde_json::Value,
+    ) {
+        let program_stream = "agentic-program:f24-consume";
+        store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!("f24-consume-refusal:{twin_idem}"),
+                expected_streams: vec![
+                    crate::ExpectedStreamRevision {
+                        stream_id: program_stream.to_string(),
+                        expected_revision: store
+                            .stream_revision(program_stream)
+                            .expect("program stream revision"),
+                    },
+                    crate::ExpectedStreamRevision {
+                        stream_id: format!("execution-effect:{key}"),
+                        expected_revision: store
+                            .stream_revision(&format!("execution-effect:{key}"))
+                            .expect("effect stream revision"),
+                    },
+                ],
+                events: vec![
+                    crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: program_stream.to_string(),
+                            scope: RuntimeEventScope::Program,
+                            kind: "agentic.completion_rejected".into(),
+                            status: Some("rejected".into()),
+                            actor: Some("runtime.agentic_action".into()),
+                            refs: vec![],
+                            payload: serde_json::json!({
+                                "program_id": "f24-consume",
+                                "request_action_id": key,
+                                "code": "call_refused_after_admission",
+                            }),
+                        },
+                        idempotency_key: Some(format!("completion-rejected:{twin_idem}")),
+                        schema_version: 1,
+                    },
+                    crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: format!("execution-effect:{key}"),
+                            scope: RuntimeEventScope::ExecutionNode,
+                            kind: "agentic.batch_member.index".into(),
+                            status: Some("committed".into()),
+                            actor: Some("runtime.agentic_action".into()),
+                            refs: vec![],
+                            payload: serde_json::json!({
+                                "outer_key": outer_key,
+                                "member_index": member_index,
+                                "member_identity": member_identity,
+                                "ticket": serde_json::Value::Null,
+                                "program_stream": program_stream,
+                                "program_event_kind": "agentic.completion_rejected",
+                                "program_event_key": format!("completion-rejected:{twin_idem}"),
+                                "program_event_index": 0,
+                            }),
+                        },
+                        idempotency_key: Some(twin_idem.to_string()),
+                        schema_version: 1,
+                    },
+                ],
+            })
+            .expect("the refusal fact");
+    }
+
+    /// E-s: a required write that was admitted and then refused is settled by
+    /// its own refusal twin, so the review stops waiting for a receipt that
+    /// will never come.
+    #[test]
+    fn f24_a_refused_required_write_is_settled_by_its_own_twin() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let key = "f24-consume-effect-key";
+        f24_write_refusal_twin(
+            &store,
+            key,
+            &format!("agentic-single:{key}"),
+            key,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        let intent_payload = serde_json::json!({
+            "tool_use_id": "f24-consume-call",
+            "tool_name": "task_review",
+        });
+        let settlement = super::required_write_settlement(
+            &store,
+            key,
+            &intent_payload,
+            None,
+            false,
+            &mut std::collections::BTreeMap::new(),
+        )
+        .expect("the settlement decision");
+        assert!(
+            matches!(settlement, super::RequiredWriteSettlement::Refused { .. }),
+            "a required write that carries its own refusal twin is settled by it"
+        );
+    }
+
+    /// A required write with no refusal twin of its own stays pending: the
+    /// refusal family does not speak for it.
+    #[test]
+    fn f24_a_required_write_without_a_twin_stays_pending() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let intent_payload = serde_json::json!({
+            "tool_use_id": "f24-absent-call",
+            "tool_name": "task_review",
+        });
+        let settlement = super::required_write_settlement(
+            &store,
+            "f24-absent-effect-key",
+            &intent_payload,
+            None,
+            false,
+            &mut std::collections::BTreeMap::new(),
+        )
+        .expect("the settlement decision");
+        assert!(
+            matches!(settlement, super::RequiredWriteSettlement::Pending),
+            "a required write with no terminal fact of its own stays pending"
+        );
+    }
+
+    /// A required write that ran and failed is carried as its own named
+    /// failure - never as a satisfied requirement - and the name is plain
+    /// readable.
+    #[test]
+    fn f24_a_terminally_failed_required_write_carries_its_named_failure() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let intent_payload = serde_json::json!({
+            "tool_use_id": "f24-failed-call",
+            "tool_name": "task_review",
+        });
+        let receipt_payload = serde_json::json!({
+            "outcome": {
+                "status": "failed",
+                "error": "Runtime did not execute 'task_review': the objective requirement was not met",
+            },
+        });
+        let settlement = super::required_write_settlement(
+            &store,
+            "f24-failed-effect-key",
+            &intent_payload,
+            Some((&receipt_payload, 4242u64)),
+            true,
+            &mut std::collections::BTreeMap::new(),
+        )
+        .expect("the settlement decision");
+        let failure = match settlement {
+            super::RequiredWriteSettlement::Failed { failure } => failure,
+            _ => panic!("a required write that ran and failed carries its named failure"),
+        };
+        assert_eq!(failure["grade"], "required_write_terminally_failed");
+        assert_eq!(failure["effect_key"], "f24-failed-effect-key");
+        assert_eq!(failure["tool_use_id"], "f24-failed-call");
+        assert_eq!(failure["tool_name"], "task_review");
+        assert_eq!(failure["failure_class"], "terminal_failure");
+        assert_eq!(failure["receipt_cursor"], 4242);
+        // The name is plain readable: the error text appears as it was.
+        let plain = failure["error"].as_str().unwrap_or_default().to_string();
+        assert!(
+            plain.contains("the objective requirement was not met"),
+            "the named failure carries the error text"
+        );
+    }
+
+    /// A node effect is not a call's terminal fact: it carries no outcome.
+    #[test]
+    fn f24_a_node_effect_is_not_a_settlement_fact() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: "execution-node-effect:abc123:1".into(),
+                scope: RuntimeEventScope::ExecutionNode,
+                kind: "execution.node_effect".into(),
+                status: Some("committed".into()),
+                actor: Some("runtime.model_step".into()),
+                refs: vec![],
+                payload: serde_json::json!({"replan": "retry", "result": "none"}),
+            })
+            .expect("node effect");
+        assert!(
+            store
+                .event_by_idempotency_key(
+                    "execution-node-effect:abc123:1",
+                    "agentic-single:node-effect-key",
+                )
+                .expect("node effect lookup")
+                .is_none(),
+            "a node effect carries no outcome and is no settlement fact"
+        );
+    }
+
     /// G-c: a delegated member's read is judged by the original input its
     /// authenticated child request carries, not by the capability face the
     /// unified read facade declares.
@@ -8553,7 +9322,7 @@ mod tests {
             store
                 .append(crate::RuntimeEventInput {
                     stream_id: "session:g-c-member-read".into(),
-                    scope: crate::RuntimeEventScope::ExecutionNode,
+                    scope: RuntimeEventScope::ExecutionNode,
                     kind: "execution.read.receipt".into(),
                     status: Some("completed".into()),
                     actor: Some("governed_tool".into()),
@@ -8651,7 +9420,7 @@ mod tests {
             store
                 .append(crate::RuntimeEventInput {
                     stream_id: "session:g-read-target".into(),
-                    scope: crate::RuntimeEventScope::ExecutionNode,
+                    scope: RuntimeEventScope::ExecutionNode,
                     kind: "execution.read.receipt".into(),
                     status: Some("completed".into()),
                     actor: Some("governed_tool".into()),
@@ -8799,7 +9568,7 @@ mod tests {
                 store
                     .append(crate::RuntimeEventInput {
                         stream_id: source.into(),
-                        scope: crate::RuntimeEventScope::Session,
+                        scope: RuntimeEventScope::Session,
                         kind: "test.source-advance".into(),
                         status: None,
                         actor: None,
@@ -8833,7 +9602,7 @@ mod tests {
             store
                 .append(crate::RuntimeEventInput {
                     stream_id: source.into(),
-                    scope: crate::RuntimeEventScope::Session,
+                    scope: RuntimeEventScope::Session,
                     kind: "test.source-advance".into(),
                     status: None,
                     actor: None,
@@ -8877,7 +9646,7 @@ mod tests {
             let event = store
                 .append(crate::RuntimeEventInput {
                     stream_id: source.into(),
-                    scope: crate::RuntimeEventScope::Session,
+                    scope: RuntimeEventScope::Session,
                     kind: kind.into(),
                     status: None,
                     actor: Some("projection_unit_fixture_not_delivery_authority".into()),
@@ -8935,7 +9704,7 @@ mod tests {
         store
             .append(crate::RuntimeEventInput {
                 stream_id: source.into(),
-                scope: crate::RuntimeEventScope::Session,
+                scope: RuntimeEventScope::Session,
                 kind: "projection_fixture.unrelated_note".into(),
                 status: None,
                 actor: Some("projection_unit_fixture".into()),
@@ -9291,7 +10060,7 @@ mod tests {
         let mut primary = store
             .append(crate::RuntimeEventInput {
                 stream_id: "execution-effect:immutable".into(),
-                scope: crate::RuntimeEventScope::ExecutionNode,
+                scope: RuntimeEventScope::ExecutionNode,
                 kind: "execution.read.receipt".into(),
                 status: Some("completed".into()),
                 actor: Some("governed_tool".into()),
@@ -9679,7 +10448,7 @@ mod own872_plan_owner_tests {
         let store = crate::RuntimeEventStore::for_test();
         let mut plan = store.append(crate::RuntimeEventInput {
             stream_id: "session:own872".into(),
-            scope: crate::RuntimeEventScope::Tool,
+            scope: RuntimeEventScope::Tool,
             kind: "tool.execution_plan.created".into(),
             status: Some("planned".into()),
             actor: Some("conversation_runtime".into()),

@@ -18,6 +18,7 @@ fn host() -> StandardRuntimeHost<NoTools> {
         providers: std::collections::HashMap::from([(
             "own834".into(),
             crate::config::ProviderConfig {
+                reasoning_effort: None,
                 name: "own834".into(),
                 base_url: "http://127.0.0.1:9/v1".into(),
                 api_key: "test".into(),

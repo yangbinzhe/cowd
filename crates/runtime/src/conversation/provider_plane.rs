@@ -3,6 +3,14 @@
 use super::frame_refusal::{refusal_event_refs, wholly_refused_frame_reason, FrameRefusal};
 use super::*;
 
+// Construct result futures after the producer returns, outside its poll frame.
+#[inline(never)]
+fn construct_result_phase<F: std::future::Future>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalProviderAnswer {
     pub text: String,
@@ -1781,8 +1789,19 @@ where
             "provider_admission_queue_ms",
             queue_wait,
         );
-        self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ProviderRequest)
-            .await?;
+        // The ProviderRequest phase retains a typed decision from the
+        // original Session claim; a released claim is not authority.
+        let member_execution_id = self
+            .execution_identity
+            .as_ref()
+            .and_then(|identity| identity.graph_id())
+            .unwrap_or_default()
+            .to_string();
+        self.verify_session_execution_fence_for_attempt(
+            crate::SessionExecutionFencePhase::ProviderRequest,
+            &member_execution_id,
+        )
+        .await?;
         Ok((lease, queue_wait))
     }
 
@@ -2676,7 +2695,7 @@ where
             .await;
             // Construct the result phase only after the original stream and
             // producer/consumer finish have returned in this same task.
-            let completed = Box::pin(async {
+            let completed = construct_result_phase(|| async {
             let resource_result_class = stream_run.resource_result_class;
             let observed_usage = stream_run
                 .collected
@@ -2693,7 +2712,7 @@ where
                 first_event_at,
                 first_text_at,
                 stop_reason,
-                early_tool_receipts,
+                mut early_tool_receipts,
                 early_tool_deferrals,
                 early_tool_failures,
                 response_completed_at_ms,
@@ -2893,6 +2912,18 @@ where
             self.remember_original_root_calls(&calls)?;
             self.remember_native_tool_calls(&calls)?;
             let transcript_calls = calls.clone();
+            for receipt in &mut early_tool_receipts {
+                let Some(source) = receipt.original_source.as_mut() else { continue };
+                let mut matching = transcript_calls.iter().filter(|call| call.id == receipt.call.id);
+                if matching.next() == Some(&receipt.call) && matching.next().is_none()
+                    && source.request.tool_use_id == receipt.call.id
+                    && source.request.tool_name == receipt.call.name
+                    && source.request.step_binding == receipt.call.binding
+                    && source.request.input == receipt.call.input
+                {
+                    source.completed_calls = Some(transcript_calls.clone());
+                }
+            }
             // One shape for "the model asked for something that did not run",
             // shared with the whole-frame branches so a refusal is answered and
             // recorded the same way whichever branch found it.

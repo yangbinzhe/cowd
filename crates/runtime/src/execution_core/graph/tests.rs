@@ -5579,6 +5579,7 @@ async fn r1_423b_builtin_inline_model_crash_before_lease_commit_recovers_real_wo
         &spec.id,
         &binding,
     );
+    executor.prepare_original_binding(&ticket).unwrap();
     let graph = fixture
         .commits
         .bind_and_start_nodes(
@@ -5806,6 +5807,7 @@ pub(super) async fn running_inline_attempt_450(
     };
     let scopes = manual_scope_locks_475(&graph.id);
     let _owner = acquire_fixture_owner_475(&scopes, &commits, &graph, "durable", &binding);
+    executor.prepare_original_binding(&ticket).unwrap();
     let graph = commits
         .bind_and_start_nodes(
             &graph,
@@ -6925,6 +6927,7 @@ async fn r1_450_original_wait_after_ready_is_reconciled_not_borrowed_for_new_att
     };
     let scopes = manual_scope_locks_475(&ready.id);
     let owner = acquire_fixture_owner_475(&scopes, &commits, &ready, "durable", &binding);
+    executor.prepare_original_binding(&ticket).unwrap();
     let running = commits
         .bind_and_start_nodes(
             &ready,
@@ -8545,6 +8548,7 @@ async fn r1_475_orphan_admission_same_inode_cas_retry_response_loss_polls_once()
     assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
     let losses = Arc::new(AtomicUsize::new(0));
     commits.inject_binding_start_response_loss_for_test(&fresh.id, losses.clone());
+    executor.prepare_original_binding(&ticket).unwrap();
     let running = commits
         .bind_and_start_nodes(
             &fresh,
@@ -8632,6 +8636,7 @@ async fn r1_475_wait_result_then_ready_or_paused_cancel_keeps_original_receipt()
         };
         let scopes = manual_scope_locks_475(&ready.id);
         let owner = acquire_fixture_owner_475(&scopes, &commits, &ready, "durable", &binding);
+        executor.prepare_original_binding(&ticket).unwrap();
         let running = commits
             .bind_and_start_nodes(
                 &ready,
@@ -9202,6 +9207,7 @@ async fn running_source_wave_498() -> (
         owners.push(acquire_fixture_owner_475(
             &scopes, &commits, &graph, &spec.id, &binding,
         ));
+        executor.prepare_original_binding(&ticket).unwrap();
         bindings.insert(spec.id.clone(), binding);
         tickets.push(ticket);
         executors.push(executor);

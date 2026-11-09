@@ -903,6 +903,7 @@ if [[ -n "$MAX_CONCURRENCY" ]]; then
 fi
   PROVIDER_BASE_URL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" base_url)"
   PROVIDER_PROTOCOL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" protocol)"
+  PROVIDER_REASONING_EFFORT="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" reasoning_effort)"
   PROVIDER_CREDENTIAL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" api_key)"
   [[ -n "$PROVIDER_BASE_URL" && -n "$PROVIDER_CREDENTIAL" ]] || {
     echo "provider ${PROVIDER_ID} must declare base_url and api_key in ${SOURCE_CONFIG_FILE}" >&2
@@ -949,6 +950,10 @@ if [[ -n "$PROVIDER_PROTOCOL" ]]; then
   cat >>"$CONFIG_HOME/config.yaml" <<EOF
     protocol: "$PROVIDER_PROTOCOL"
 EOF
+fi
+if [[ -n "$PROVIDER_REASONING_EFFORT" ]]; then
+  case "$PROVIDER_REASONING_EFFORT" in low|medium|high|max) ;; *) echo "invalid provider reasoning effort" >&2; return 1;; esac
+  printf '    reasoning_effort: "%s"\n' "$PROVIDER_REASONING_EFFORT" >>"$CONFIG_HOME/config.yaml"
 fi
 cat >>"$CONFIG_HOME/config.yaml" <<EOF
     models:

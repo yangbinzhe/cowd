@@ -250,8 +250,6 @@ pub mod projection;
 pub mod provider_outcome_selector;
 #[path = "provider/prefix_attribution.rs"]
 pub mod provider_prefix_attribution;
-#[path = "provider/physical_send_owner.rs"]
-pub mod physical_send_owner;
 #[path = "provider/provider_registry.rs"]
 pub mod provider_registry;
 #[path = "provider/provider_resources.rs"]
@@ -470,6 +468,10 @@ pub use execution_core::{
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use harness_contract::agent::AgentLifecycleEvent;
+#[doc(hidden)]
+pub use harness_contract::agent_action::{
+    program_id_for_objective, root_objective_id, MemberAttemptFold, MemberAttemptObservation,
+};
 pub use harness_contract::context::{ArtifactRef, ArtifactWriteDescriptor};
 pub use harness_contract::outcome::RuntimeBuildIdentity;
 pub use hooks::{

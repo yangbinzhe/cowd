@@ -3535,6 +3535,7 @@ fn create_runtime_entry_runs_plugin_lifecycle_init_and_shutdown() {
         providers: std::collections::HashMap::from([(
             "test".to_string(),
             ProviderConfig {
+                reasoning_effort: None,
                 name: "test".to_string(),
                 base_url: "http://127.0.0.1:9/v1".to_string(),
                 api_key: "test".to_string(),

@@ -254,6 +254,7 @@ fn fallback_provider_from_env(model: &str) -> Option<ProviderConfig> {
     let api_key = std::env::var("OPENAI_API_KEY").ok()?;
     let base_url = std::env::var("OPENAI_BASE_URL").ok()?;
     Some(ProviderConfig {
+        reasoning_effort: None,
         base_url,
         api_key,
         models: vec![model.to_string()],
@@ -309,6 +310,7 @@ fn provider_from_cowd_config(model: &str) -> Option<ProviderConfig> {
             .and_then(serde_yaml::Value::as_str)
             .map(ToString::to_string);
         return Some(ProviderConfig {
+            reasoning_effort: None,
             base_url,
             api_key,
             models,

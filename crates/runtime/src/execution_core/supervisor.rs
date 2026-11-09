@@ -354,6 +354,24 @@ pub struct RuntimeExecutionSupervisor {
 }
 
 impl RuntimeExecutionSupervisor {
+    pub(crate) async fn settle_retained_original_callback<B, F>(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        attempt: u32,
+        verify_original: B,
+        verify_calls: F,
+    ) -> Result<Option<crate::execution_core::graph::NodeExecutionTicket>, String>
+    where
+        B: FnOnce(&crate::execution_core::graph::NodeExecutionTicket) -> Result<bool, String> + Send,
+        F: FnOnce(
+            &crate::execution_core::graph::NodeExecutionTicket,
+            Option<&Arc<crate::execution_core::graph::executors::agent_tool::NoDispatchObservation>>,
+        ) -> Result<bool, String> + Send,
+    {
+        self.runner.settle_retained_original_callback(graph_id, node_id, attempt, verify_original, verify_calls)
+            .await.map_err(|error| error.to_string())
+    }
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn observe_verdict_resolution_for_test(
         &self,
@@ -933,9 +951,10 @@ impl RuntimeExecutionSupervisor {
         graph: ExecutionGraph,
         actor: Option<harness_contract::agent_action::AgentActorBinding>,
         source_goal_cut: Option<crate::ExpectedStreamRevision>,
+        original_owner: Option<Arc<crate::execution_core::services::OriginalGraphRegistrationOwner>>,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
         self.runner
-            .register_continuation(graph, actor, source_goal_cut)
+            .register_continuation(graph, actor, source_goal_cut, original_owner)
             .await
     }
 
@@ -1753,8 +1772,9 @@ async fn run_completion_pump(
         let snapshot = match runner.pump_snapshot(graph_id, &in_flight).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                active_nodes.abort_all();
-                while active_nodes.join_next().await.is_some() {}
+                if let Err(drain) = abort_pump_nodes(&runner, graph_id, &in_flight, &mut active_nodes).await {
+                    return DriverOutcome::Failed(format!("{error}; original drain unconfirmed: {drain}"));
+                }
                 return DriverOutcome::Failed(error.to_string());
             }
         };
@@ -1779,8 +1799,9 @@ async fn run_completion_pump(
                 Vec::new()
             }
             Err(error) => {
-                active_nodes.abort_all();
-                while active_nodes.join_next().await.is_some() {}
+                if let Err(drain) = abort_pump_nodes(&runner, graph_id, &in_flight, &mut active_nodes).await {
+                    return DriverOutcome::Failed(format!("{error}; original drain unconfirmed: {drain}"));
+                }
                 return DriverOutcome::Failed(error.to_string());
             }
         };
@@ -1853,8 +1874,9 @@ async fn run_completion_pump(
 
         tokio::select! {
             _ = cancellation.cancelled() => {
-                active_nodes.abort_all();
-                while active_nodes.join_next().await.is_some() {}
+                if let Err(error) = abort_pump_nodes(&runner, graph_id, &in_flight, &mut active_nodes).await {
+                    return DriverOutcome::Failed(format!("original cancellation drain unconfirmed: {error}"));
+                }
                 return DriverOutcome::Aborted(
                     "execution cancelled while graph pump was running".to_string(),
                 );
@@ -1885,17 +1907,20 @@ async fn run_completion_pump(
                                     in_flight.remove(&node_id);
                                 }
                                 Ok((node_id, Err(error))) => {
-                                    in_flight.remove(&node_id);
                                     if matches!(error, ExecutionRunnerError::ResourceDeferred { .. }) {
+                                        in_flight.remove(&node_id);
                                         resource_deferred = true;
                                     } else if !matches!(
                                         error,
                                         ExecutionRunnerError::NodeMissing(_)
                                             | ExecutionRunnerError::CommandSuperseded { .. }
                                     ) {
-                                        active_nodes.abort_all();
-                                        while active_nodes.join_next().await.is_some() {}
+                                        if let Err(drain) = abort_pump_nodes(&runner, graph_id, &in_flight, &mut active_nodes).await {
+                                            return DriverOutcome::Failed(format!("{error}; original drain unconfirmed: {drain}"));
+                                        }
                                         return DriverOutcome::Failed(error.to_string());
+                                    } else {
+                                        in_flight.remove(&node_id);
                                     }
                                 }
                                 Err(error) => {
@@ -1912,8 +1937,8 @@ async fn run_completion_pump(
                         }
                     }
                     Ok((node_id, Err(error))) => {
-                        in_flight.remove(&node_id);
                         if matches!(error, ExecutionRunnerError::ResourceDeferred { .. }) {
+                            in_flight.remove(&node_id);
                             // Keep the graph driver alive across soft resource
                             // pressure. `wait_for_change` is notification-led
                             // with a bounded fallback, so a release cannot
@@ -1933,10 +1958,12 @@ async fn run_completion_pump(
                             ExecutionRunnerError::NodeMissing(_)
                                 | ExecutionRunnerError::CommandSuperseded { .. }
                         ) {
+                            in_flight.remove(&node_id);
                             continue;
                         }
-                        active_nodes.abort_all();
-                        while active_nodes.join_next().await.is_some() {}
+                        if let Err(drain) = abort_pump_nodes(&runner, graph_id, &in_flight, &mut active_nodes).await {
+                            return DriverOutcome::Failed(format!("{error}; original drain unconfirmed: {drain}"));
+                        }
                         return DriverOutcome::Failed(error.to_string());
                     }
                     Err(error) => {
@@ -1950,6 +1977,22 @@ async fn run_completion_pump(
             }
         }
     }
+}
+
+async fn abort_pump_nodes(
+    runner: &ExecutionGraphRunner,
+    graph_id: &str,
+    in_flight: &BTreeSet<String>,
+    active_nodes: &mut JoinSet<(String, Result<(), ExecutionRunnerError>)>,
+) -> Result<(), ExecutionRunnerError> {
+    let (owners, missing) = runner.capture_pump_cancellation_owners(graph_id, in_flight).await;
+    active_nodes.abort_all();
+    while active_nodes.join_next().await.is_some() {}
+    runner.drain_pump_cancellation_owners(graph_id, owners).await?;
+    if missing {
+        return Err(ExecutionRunnerError::Driver("original cancellation owner missing for in-flight node".into()));
+    }
+    Ok(())
 }
 
 fn spawn_owned_work(
@@ -2402,6 +2445,7 @@ mod completion_pump_tests {
             idempotency_key: "original-drain-122".into(),
             payload_ref: "{}".into(),
         };
+        crate::execution_core::NodeExecutor::prepare_original_binding(executor.as_ref(), &ticket).unwrap();
         let (release, ready) = tokio::sync::oneshot::channel();
         let mut leaf = Box::pin(executor.execute_physical_tool(
             &ticket,

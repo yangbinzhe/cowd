@@ -809,7 +809,11 @@ fn authenticate_closed_node_review_member(
     let graphs = crate::ExecutionGraphStateStore::new(store.clone());
     let graph = graphs.load(&ticket.graph_id).map_err(|e| e.to_string())?;
     let graph_revision = super::results::pin_result_source(store, &ticket.graph_id, sources)?;
-    if graph.revision != graph_revision { return Err("member node graph changed during authentication".into()); }
+    // A graph that grew since the pin is another actor advancing it; only a
+    // graph strictly older than the pin means the material under this member
+    // moved. Everything below - the binding, the original ticket, the start
+    // position, the lease closure and its transaction receipt - is unchanged.
+    if graph.revision < graph_revision { return Err("member node graph changed during authentication".into()); }
     let binding = graphs.current_binding(&graph, &ticket.node_id, ticket.attempt).map_err(|e| e.to_string())?;
     let (original, _) = graphs.binding_start_ticket(&graph, &ticket.node_id, &binding).map_err(|e| e.to_string())?;
     if original != *ticket { return Err("member node original ticket differs".into()); }

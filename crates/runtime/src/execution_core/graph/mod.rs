@@ -48,6 +48,7 @@ pub use registry::{
     ExecutionGraphReplan, NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket,
     NodeExecutor, NodeExecutorError, NodeExecutorRegistry,
 };
+pub(crate) use registry::{OriginalSynthesizeReplan, OriginalSynthesizeReplanHandle};
 pub use resources::{
     ExecutionAdmissionPolicy, ExecutionResourceKind, ExecutionResourceLease,
     ExecutionResourceManager, ExecutionResourceSnapshot, ExecutionServiceClass,

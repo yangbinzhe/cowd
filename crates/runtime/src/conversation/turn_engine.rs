@@ -1887,6 +1887,22 @@ where
         self.session_execution_fence = Some(fence);
     }
 
+    /// Verify the original Session claim and retain the typed local refusal.
+    pub(crate) async fn verify_session_execution_fence_for_attempt(
+        &self,
+        phase: crate::SessionExecutionFencePhase,
+        member_execution_id: &str,
+    ) -> Result<(), RuntimeError> {
+        match self.session_execution_fence.as_ref() {
+            Some(fence) => fence
+                .verify_attempt(phase, member_execution_id)
+                .await
+                .map(|_| ())
+                .map_err(RuntimeError::from_session_execution_fence),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn verify_session_execution_fence(
         &self,
         phase: crate::SessionExecutionFencePhase,

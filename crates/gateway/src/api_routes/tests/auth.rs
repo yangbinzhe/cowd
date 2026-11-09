@@ -252,6 +252,7 @@ fn test_provider_registry() -> Arc<runtime::ProviderRegistry> {
             providers: HashMap::from([(
                 "test".to_string(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     // Tests never submit this provider.  A closed loopback
                     // endpoint keeps accidental future calls deterministic.

@@ -1112,6 +1112,7 @@ pub mod test_support {
                     providers: HashMap::from([(
                         "test".to_string(),
                         ProviderConfig {
+                            reasoning_effort: None,
                             name: "test".to_string(),
                             // The black-box harness validates model ownership
                             // but never submits requests to this closed endpoint.

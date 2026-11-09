@@ -30,6 +30,7 @@ pub(crate) struct OriginalEffectReleaseProof {
 #[derive(Clone)]
 pub struct OriginalMemberCallCarrier {
     original_request: std::sync::Arc<RuntimeToolExecutionRequest>,
+    original_host_call_set: Option<(crate::execution_core::NodeExecutionTicket, Vec<crate::conversation::ModelToolCall>)>,
     outcomes: Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)>,
     stop_publications: Vec<std::sync::Arc<OriginalStopPublication>>,
     host_members: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<usize, (std::sync::Arc<crate::conversation::OriginalHostPreparedMember>, std::sync::Arc<OriginalMemberSettlement>)>>>,
@@ -39,7 +40,33 @@ impl OriginalMemberCallCarrier {
     pub(crate) fn from_original_request(original_request: std::sync::Arc<RuntimeToolExecutionRequest>) -> Self {
         let outcomes = original_request.tool_progress.original_members();
         let stop_publications = original_request.tool_progress.original_stop_publications();
-        Self { original_request, outcomes, stop_publications, host_members: Default::default(), host_release: Default::default() }
+        Self { original_request, original_host_call_set: None, outcomes, stop_publications, host_members: Default::default(), host_release: Default::default() }
+    }
+    /// Capture the original complete node call set before this request is dispatched.
+    pub(crate) fn with_original_host_call_set(
+        mut self,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        calls: &[crate::conversation::ModelToolCall],
+    ) -> Result<Self, String> {
+        if ticket.executor_kind != "tool_batch" {
+            return Err("original Host call set requires its ToolBatch ticket".into());
+        }
+        let (original, _) = crate::host::decode_tool_batch(&ticket.payload_ref)
+            .map_err(|error| error.to_string())?;
+        if original != calls
+            || calls.iter().filter(|call| call.id == self.original_request.tool_use_id
+                && call.name == self.original_request.tool_name
+                && call.binding == self.original_request.step_binding).count() != 1
+        {
+            return Err("original Host call set differs from the ticket".into());
+        }
+        self.original_host_call_set = Some((ticket.clone(), calls.to_vec()));
+        Ok(self)
+    }
+    pub(crate) fn original_host_call_set(
+        &self,
+    ) -> Option<(&crate::execution_core::NodeExecutionTicket, &[crate::conversation::ModelToolCall])> {
+        self.original_host_call_set.as_ref().map(|(ticket, calls)| (ticket, calls.as_slice()))
     }
     /// Retain the exact Host preparation under its original node carrier.
     pub(crate) fn retain_host_member(

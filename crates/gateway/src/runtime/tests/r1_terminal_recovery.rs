@@ -759,6 +759,7 @@ fn provider_registry(lanes: &[&LoopbackProvider]) -> Arc<runtime::ProviderRegist
             providers: std::collections::HashMap::from([(
                 lane.model.clone(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: lane.model.clone(),
                     base_url: lane.endpoint.clone(),
                     api_key: "loopback-only".into(),
@@ -4441,7 +4442,6 @@ impl RecoveryServices {
             notification_reader,
             candidate_graph,
             None,
-            false,
         )
         .await
     }
@@ -4454,15 +4454,7 @@ impl RecoveryServices {
         let mut config = runtime::ProviderResourceConfig::default();
         config.global = runtime::ProviderQuotaPolicy::new(1, 1, 1, 0);
         config.fallback = runtime::ProviderQuotaPolicy::new(1, 1, 1, 0);
-        Self::start_composed(root, topology, providers, None, None, Some(config), false).await
-    }
-
-    // Only the selected real-Session local loopback fixture opts into the
-    // explicit unauthenticated diagnostic transport.
-    async fn start_with_diagnostic_loopback(
-        root: &Path, topology: SelectedStorageTopology, providers: Arc<runtime::ProviderRegistry>,
-    ) -> Self {
-        Self::start_composed(root, topology, providers, None, None, None, true).await
+        Self::start_composed(root, topology, providers, None, None, Some(config)).await
     }
 
     async fn start_composed(
@@ -4472,7 +4464,6 @@ impl RecoveryServices {
         notification_reader: Option<Arc<runtime::RuntimeEventStore>>,
         candidate_graph: Option<String>,
         provider_config: Option<runtime::ProviderResourceConfig>,
-        diagnostic_loopback: bool,
     ) -> Self {
         use crate::services::session_service::{
             activation::SessionActivationCoordinator, presence::SessionPresenceLedger,
@@ -4524,13 +4515,7 @@ impl RecoveryServices {
             holds: physical_holds.clone(),
         });
         let config_home = root.join("home");
-        let mut builder = runtime::RuntimeServices::builder(&config_home, root.join("workspace"));
-        if diagnostic_loopback {
-            let cache = runtime::ProviderClientTemplateCache::diagnostic(
-                "isolated real-Session test using local loopback; unauthenticated",
-            ).expect("explicit loopback diagnostic reason");
-            builder = builder.provider_template_cache(Arc::new(cache));
-        }
+        let builder = runtime::RuntimeServices::builder(&config_home, root.join("workspace"));
         let services = builder
             .provider_resource_config(provider_config.unwrap_or_default())
             .provider_registry(providers.clone())
@@ -5361,7 +5346,7 @@ fn round437_original_six_team_batch_crosses_host_to_next_node_on_default_stack()
     let providers = provider_registry(&[&provider]);
     let topology = SelectedStorageTopology::compose_for_test(&root.join("home"), &root.join("workspace")).unwrap();
     eprintln!("round437 replay_root={} schema={:?}", root.display(), topology.preserve_failed_test_namespace());
-    let services = RecoveryServices::start_with_diagnostic_loopback(&root, topology, providers).await;
+    let services = RecoveryServices::start(&root, topology, providers).await;
     let session_id = format!("round437:{}", uuid::Uuid::new_v4());
     let mut request = EnsureSessionRequest::new(&session_id, Some("test-model".into()), SessionSource::Tui);
     request.owner_principal_id = Some("round437-local-replay".into());
@@ -5603,16 +5588,11 @@ async fn b_scope_refusal_and_independent_read_reach_original_gateway_provider() 
             }
         }
     }
-    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE",
-        "COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND"];
+    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE"];
     let _restore = Restore(keys.into_iter().map(|key| (key, std::env::var_os(key))).collect());
     std::env::set_var("COWD_EVAL_HARNESS", "1");
     std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
     std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
-    // This independent test process sends only to its own loopback listener;
-    // the diagnostic capability is not a production send authorization.
-    std::env::set_var("COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND", "local loopback fixture");
-    eprintln!("b_scope_script stage=diagnostic_send_configured endpoint=loopback");
     let root = fixture_root();
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -5621,7 +5601,7 @@ async fn b_scope_refusal_and_independent_read_reach_original_gateway_provider() 
     let mut provider = LoopbackProvider::start("root").await;
     let providers = provider_registry(&[&provider]);
     let topology = SelectedStorageTopology::compose_for_test(&root.path().join("home"), &workspace).unwrap();
-    let services = RecoveryServices::start_with_diagnostic_loopback(root.path(), topology, providers).await;
+    let services = RecoveryServices::start(root.path(), topology, providers).await;
     let runtime = services.runtime.runtime_services();
     let session = format!("b-scope-ingress:{}", uuid::Uuid::new_v4());
     let identity = std::sync::Mutex::new(None::<(String, String, String)>);
@@ -5716,16 +5696,11 @@ async fn original_host_orchestrated_search_novelty_and_unknown() {
             }
         }
     }
-    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE",
-        "COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND"];
+    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE"];
     let _restore = Restore(keys.into_iter().map(|key| (key, std::env::var_os(key))).collect());
     std::env::set_var("COWD_EVAL_HARNESS", "1");
     std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
     std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
-    // This independent test process sends only to its own loopback listener;
-    // the diagnostic capability is not a production send authorization.
-    std::env::set_var("COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND", "local loopback fixture");
-    eprintln!("b_scope_script stage=diagnostic_send_configured endpoint=loopback");
     let root = fixture_root();
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -5735,7 +5710,7 @@ async fn original_host_orchestrated_search_novelty_and_unknown() {
     let mut provider = LoopbackProvider::start("root").await;
     let providers = provider_registry(&[&provider]);
     let topology = SelectedStorageTopology::compose_for_test(&root.path().join("home"), &workspace).unwrap();
-    let services = RecoveryServices::start_with_diagnostic_loopback(root.path(), topology, providers).await;
+    let services = RecoveryServices::start(root.path(), topology, providers).await;
     let runtime = services.runtime.runtime_services();
     let session = format!("b-scope-ingress:{}", uuid::Uuid::new_v4());
     let identity = std::sync::Mutex::new(None::<(String, String, String)>);
@@ -5847,15 +5822,11 @@ async fn grep_samecall_original_ingress_receipt_wire_and_projection() {
             }
         }
     }
-    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE",
-        "COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND"];
+    let keys = ["COWD_EVAL_HARNESS", "COWD_EVAL_CORPUS_ID", "COWD_MODEL_TEMPERATURE"];
     let _restore = Restore(keys.into_iter().map(|key| (key, std::env::var_os(key))).collect());
     std::env::set_var("COWD_EVAL_HARNESS", "1");
     std::env::set_var("COWD_EVAL_CORPUS_ID", "live-scenarios-v1");
     std::env::set_var("COWD_MODEL_TEMPERATURE", "0");
-    // This independent test process sends only to its own loopback listener;
-    // the diagnostic capability is not a production send authorization.
-    std::env::set_var("COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND", "local loopback fixture");
     let root = fixture_root();
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -5869,7 +5840,7 @@ async fn grep_samecall_original_ingress_receipt_wire_and_projection() {
     let mut provider = LoopbackProvider::start("root").await;
     let providers = provider_registry(&[&provider]);
     let topology = SelectedStorageTopology::compose_for_test(&root.path().join("home"), &workspace).unwrap();
-    let services = RecoveryServices::start_with_diagnostic_loopback(root.path(), topology, providers).await;
+    let services = RecoveryServices::start(root.path(), topology, providers).await;
     let runtime = services.runtime.runtime_services();
     let session = format!("b-scope-ingress:{}", uuid::Uuid::new_v4());
     let identity = std::sync::Mutex::new(None::<(String, String, String)>);
@@ -6867,7 +6838,7 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
     let topology = SelectedStorageTopology::compose_for_test(
         &root.path().join("home"), &root.path().join("workspace"),
     ).unwrap();
-    let services = RecoveryServices::start_with_diagnostic_loopback(root.path(), topology, providers).await;
+    let services = RecoveryServices::start(root.path(), topology, providers).await;
     services.bounded_missing.store(missing.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
     let runtime = services.runtime.runtime_services();
     let session = format!("c-delegated-ingress:{}", uuid::Uuid::new_v4());

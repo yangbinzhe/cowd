@@ -636,14 +636,14 @@ where
                             Ok(fence) => match execution_bus_lease.as_ref()
                                 .map(|lease| runtime.original_turn_control().and_then(|control| {
                                     let (input, requested) = runtime.original_policy_input_context(&ingress.turn_id);
-                                    lease.install_session_fence(&ingress, fence.clone(), control, input, requested, runtime.permission_policy().clone())
+                                    lease.install_session_fence(&ingress, fence.clone().with_claim_fence_epoch(ingress.claim_revision), control, input, requested, runtime.permission_policy().clone())
                                 }))
                                 .transpose()
                             {
                                 Err(error) => Err((runtime, RuntimeError::new(error))),
                                 Ok(claim) => {
+                                    let fence = fence.with_claim_fence_epoch(ingress.claim_revision);
                                     runtime.set_original_session_claim(claim);
-                                    runtime.set_session_execution_fence(fence.clone());
                                     if let Some(lease) = execution_bus_lease.as_ref() {
                                         let owner = Arc::new(runtime.shared_policy_owner());
                                         if let Err(error) = lease.install_session_policy_owner(owner) {

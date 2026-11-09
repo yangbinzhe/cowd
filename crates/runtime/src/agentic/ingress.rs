@@ -276,7 +276,7 @@ impl RuntimeServices {
                 prepared.stream_id.clone(),
                 prepared.expected_stream_revision,
                 prepared.event.clone(),
-                None,
+                None, &[],
                 &[crate::runtime_event_store::ExpectedStreamRevision {
                     stream_id: binding.root_execution_id.clone(),
                     expected_revision: graph_revision,
@@ -756,6 +756,12 @@ impl RuntimeServices {
             capability.validate_envelope(envelope, tool, input).map_err(str::to_string)?;
         }
         let verification = review.as_ref().map(|review| &review.verification);
+        // The named failures of the required writes this review settled as
+        // failed. They travel beside the proof, never inside it.
+        let required_write_failures: &[serde_json::Value] = review
+            .as_ref()
+            .map(|review| review.required_write_failures.as_slice())
+            .unwrap_or(&[]);
         if let Some(member) = member_call {
             let goal = if matches!(envelope.action, AgentAction::ObjectiveUpdate(_) | AgentAction::ObjectiveReview(_)) {
                 let producers = review.as_ref().map_or(&[][..], |review| review.producers.as_slice());
@@ -813,7 +819,7 @@ impl RuntimeServices {
                             })?.authorization;
                         // New authority events are part of A's checked append;
                         // there are no prior consumed member events to invent.
-                        let applied = actions.apply_member_locked(envelope, goal, verification, sources, held, control,
+                        let applied = actions.apply_member_locked(envelope, goal, verification, required_write_failures, sources, held, control,
                             &claim, cursor, member.prepared(), &authorization, member.ticket(), &[], authority, member, reservation, effect_fence, outer_hook.as_ref())
                             .map_err(|error| {
                                 error
@@ -863,7 +869,7 @@ impl RuntimeServices {
             }
             if let Some(root) = root {
                 return root.with_single_checked(self, &streams, |original| {
-                    let result = actions.apply_single_locked(envelope, goal, verification, capability, tool, input, original);
+                    let result = actions.apply_single_locked(envelope, goal, verification, required_write_failures, capability, tool, input, original);
                     let result = result.and_then(|submission| {
                         let committed = submission.committed.is_some();
                         if let Some(handle) = submission.committed {
@@ -881,7 +887,7 @@ impl RuntimeServices {
             }
             return capability.with_original_delegated_checked(self, &streams, |delegated| {
                 let original = crate::conversation::tool_plane::OriginalSingleCheckedInputs::Delegated(delegated);
-                let result = actions.apply_single_locked(envelope, goal, verification, capability, tool, input, &original);
+                let result = actions.apply_single_locked(envelope, goal, verification, required_write_failures, capability, tool, input, &original);
                 let result = result.and_then(|submission| {
                     let committed = submission.committed.is_some();
                     if let Some(handle) = submission.committed {
@@ -916,14 +922,42 @@ impl RuntimeServices {
                     prepared.expected_stream_revision,
                     prepared.event,
                     verification,
+                    required_write_failures,
                 )
                 .map_err(|error| error.to_string())
         } else if let Some(verification) = verification {
             actions
-                .apply_verified_review(envelope, verification)
+                .apply_verified_review(envelope, verification, required_write_failures)
                 .map_err(|error| error.to_string())
         } else if internal_completion {
-            actions.apply_runtime_root_completion(envelope).map_err(|error| error.to_string())
+            let graph = envelope.actor.root_execution_id.as_deref().ok_or("original root completion graph unavailable")?;
+            match self.original_graph_registration_owner(graph, &envelope.actor)? {
+                Some(owner) => actions.apply_runtime_root_completion_owned(envelope, &owner),
+                None => actions.apply_runtime_root_completion(envelope),
+            }.map_err(|error| error.to_string())
+        } else if internal_supervisor && matches!(&envelope.action, AgentAction::TaskAttemptDispatch(_)) {
+            let program = actions.project(&envelope.actor.program_id).map_err(|error| error.to_string())?;
+            let owner = self.original_conclusion_owner(&program)
+                .ok_or("original Session supervisor dispatch owner unavailable")?;
+            self.with_conclusion_policy(&owner, |_| {
+                let turn = harness_contract::turn::TurnId::from_string(owner.claim.turn_id());
+                if owner.input.active_turn_id().as_ref() != Some(&turn) {
+                    return Err("original Session active turn changed".into());
+                }
+                let fence = owner.claim.fence()?;
+                let cursor = owner.input.highest_consumed_cursor(&turn);
+                if owner.input.active_turn_id().as_ref() != Some(&turn) {
+                    return Err("original Session active turn changed while reading cursor".into());
+                }
+                let consumed = match cursor {
+                    Some(cursor) if cursor.generation == fence.session_generation =>
+                        usize::try_from(cursor.sequence).map_err(|_| "original consumed input sequence overflow")?.max(fence.input_sequence),
+                    Some(_) => return Err("original consumed cursor generation mismatch".into()),
+                    None => fence.input_sequence,
+                };
+                actions.apply_runtime_supervisor_dispatch_owned(envelope, &owner, consumed)
+                    .map_err(|error| error.to_string())
+            })
         } else if internal_supervisor {
             actions.apply_runtime_supervisor(envelope).map_err(|error| error.to_string())
         } else {

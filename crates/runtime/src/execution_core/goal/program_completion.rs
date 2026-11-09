@@ -386,12 +386,18 @@ impl GoalStore {
                 cuts.push(ExpectedStreamRevision { stream_id: child.id, expected_revision: child_revision });
             }
         }
+        // A Task the dispatch side durably recorded as disconnected has no live
+        // work left: it failed, nobody is attempting it, its lease is gone and
+        // the root graph is terminal, so no agent will ever pick it up again.
+        // It therefore does not keep the Program waiting.
+        let disconnected = self.disconnected_task_refs(program)?;
         let unsettled = program.tasks.values().filter(|task| {
-            !task.active_attempts.is_empty()
-                || task.lease_expires_at_ms.is_some_and(|until| until > now)
-                || matches!(task.status, crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Claimed
-                    | crate::AgenticTaskStatus::Submitted | crate::AgenticTaskStatus::Rework
-                    | crate::AgenticTaskStatus::CancelRequested)
+            Self::task_blocks_the_program_cut(
+                task.status,
+                !task.active_attempts.is_empty(),
+                task.lease_expires_at_ms.is_some_and(|until| until > now),
+                disconnected.contains(&task.task_id),
+            )
         }).collect::<Vec<_>>();
         if unsettled.is_empty() { return Ok(Some(cuts)); }
         let stranded = crate::agentic::execution::dispatch::stranded_task_refs(program);
@@ -408,6 +414,110 @@ impl GoalStore {
             .count();
         if resumes < crate::execution_core::graph::executors::MAX_TASK_STRAND_RESUMES { return Ok(None); }
         Ok(Some(cuts))
+    }
+
+    /// Whether one Task still keeps the Program waiting for work.
+    ///
+    /// A Task with no active attempt, no live lease and a durable disconnect
+    /// record has no live work left: the dispatch side recorded that the root
+    /// graph was already terminal, so no agent will ever pick it up again and
+    /// nothing will replan it. Every other Task still waits - a live attempt,
+    /// a live lease and a Task the dispatcher never recorded a disconnect for
+    /// all keep the Program open.
+    fn task_blocks_the_program_cut(
+        status: crate::AgenticTaskStatus,
+        has_active_attempts: bool,
+        has_live_lease: bool,
+        disconnected: bool,
+    ) -> bool {
+        if disconnected
+            && matches!(status, crate::AgenticTaskStatus::Rework | crate::AgenticTaskStatus::Published)
+            && !has_active_attempts && !has_live_lease
+        {
+            return false;
+        }
+        has_active_attempts || has_live_lease || matches!(status,
+            crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Claimed
+                | crate::AgenticTaskStatus::Submitted | crate::AgenticTaskStatus::Rework
+                | crate::AgenticTaskStatus::CancelRequested)
+    }
+
+    /// Whether every Task still in the waiting bucket is durably disconnected:
+    /// it failed, has no active attempt and no live lease, and the dispatch
+    /// side recorded that the root graph was already terminal. An empty
+    /// waiting bucket is not a disconnected Program, and a Task the dispatcher
+    /// never recorded a disconnect for is not disconnected either - the
+    /// process-local dispatch starvation ledger is never consulted.
+    fn waiting_tasks_are_all_durably_disconnected(
+        waiting: &[(&str, crate::AgenticTaskStatus, bool, bool)],
+        disconnected: &[String],
+    ) -> bool {
+        if waiting.is_empty() { return false; }
+        waiting.iter().all(|(task_id, status, has_active_attempts, has_live_lease)| {
+            disconnected.iter().any(|recorded| recorded == task_id)
+                && matches!(status, crate::AgenticTaskStatus::Rework | crate::AgenticTaskStatus::Published)
+                && !has_active_attempts && !has_live_lease
+        })
+    }
+
+    /// The durable shape the loop-exit trigger reads: every Task still in the
+    /// waiting bucket is disconnected by a durable record. It reads no
+    /// process-local state, so the same Program reads the same way after a
+    /// restart.
+    pub(crate) fn program_tasks_all_durably_disconnected(
+        &self,
+        program: &AgenticProgramProjection,
+    ) -> Result<bool, String> {
+        let now = crate::tool_invocation::now_ms();
+        let disconnected = self.disconnected_task_refs(program)?;
+        let waiting = program.tasks.values()
+            .filter(|task| matches!(task.status,
+                crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Claimed
+                    | crate::AgenticTaskStatus::Submitted | crate::AgenticTaskStatus::Rework
+                    | crate::AgenticTaskStatus::CancelRequested))
+            .map(|task| (task.task_id.as_str(), task.status,
+                !task.active_attempts.is_empty(),
+                task.lease_expires_at_ms.is_some_and(|until| until > now)))
+            .collect::<Vec<_>>();
+        Ok(Self::waiting_tasks_are_all_durably_disconnected(&waiting, &disconnected))
+    }
+
+    /// Tasks the dispatch side durably recorded as disconnected: the dispatch
+    /// was attempted after the root graph had already become terminal, so no
+    /// agent can ever pick them up again and nothing will ever replan them.
+    ///
+    /// The record is a durable event on the program's dispatch stream
+    /// (`agentic.dispatch.declined`, written by
+    /// `AgentActionService::record_dispatch_decline`), not the process-local
+    /// dispatch starvation ledger: the ledger is process memory, and a
+    /// conclusion may not depend on it.
+    fn disconnected_task_refs(
+        &self,
+        program: &AgenticProgramProjection,
+    ) -> Result<Vec<String>, String> {
+        const DISPATCH_DECLINED_EVENT_KIND: &str = "agentic.dispatch.declined";
+        const ROOT_GRAPH_TERMINAL_REASON: &str = "root_graph_terminal";
+        let now = crate::tool_invocation::now_ms();
+        let candidates = program.tasks.values().filter(|task| {
+            matches!(task.status, crate::AgenticTaskStatus::Rework | crate::AgenticTaskStatus::Published)
+                && task.active_attempts.is_empty()
+                && !task.lease_expires_at_ms.is_some_and(|until| until > now)
+        }).collect::<Vec<_>>();
+        if candidates.is_empty() { return Ok(Vec::new()); }
+        let stream_id = format!("agentic-dispatch:{}", program.program_id);
+        let revision = self.event_store.stream_revision(&stream_id).map_err(|error| error.to_string())?;
+        if revision == 0 { return Ok(Vec::new()); }
+        let mut latest = std::collections::BTreeMap::<String, String>::new();
+        for event in self.read_conclusion_events(&stream_id, revision)? {
+            if event.kind != DISPATCH_DECLINED_EVENT_KIND { continue; }
+            let Some(task_ref) = event.payload.get("task_ref").and_then(|value| value.as_str()) else { continue; };
+            let Some(reason) = event.payload.get("reason").and_then(|value| value.as_str()) else { continue; };
+            latest.insert(task_ref.to_string(), reason.to_string());
+        }
+        Ok(candidates.into_iter()
+            .filter(|task| latest.get(&task.task_id).is_some_and(|reason| reason == ROOT_GRAPH_TERMINAL_REASON))
+            .map(|task| task.task_id.clone())
+            .collect())
     }
 
     /// Count the original rejection events after the last verified Goal gain.
@@ -1669,4 +1779,86 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn a9_disconnected_task_does_not_keep_the_program_waiting() {
+        // The dispatch side recorded that the root graph was already terminal:
+        // nobody will ever pick this Task up again, so it must not keep the
+        // Program waiting.
+        assert!(!GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Rework, false, false, true));
+        assert!(!GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Published, false, false, true));
+    }
+
+    #[test]
+    fn a9_task_without_a_disconnect_record_still_keeps_the_program_waiting() {
+        // No disconnect record: the Task may still be dispatched, so it waits.
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Rework, false, false, false));
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Published, false, false, false));
+    }
+
+    #[test]
+    fn a9_active_attempt_or_live_lease_still_keeps_the_program_waiting() {
+        // Fail closed: an attempt or a lease is live work, whatever the
+        // dispatch side recorded.
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Rework, true, false, true));
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Rework, false, true, true));
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Submitted, true, false, true));
+    }
+
+    #[test]
+    fn a9_task_outside_the_unsettled_bucket_never_waits() {
+        assert!(!GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Blocked, false, false, false));
+        assert!(!GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Accepted, false, false, false));
+    }
+
+
+    #[test]
+    fn a9_waiting_bucket_all_durably_disconnected_is_the_new_trigger_shape() {
+        // The only waiting Task failed, has no attempt and no live lease, and
+        // the dispatch side durably recorded the root graph as terminal.
+        assert!(GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, false, false)],
+            &["task:one".to_string()]));
+    }
+
+    #[test]
+    fn a9_a_stranded_task_without_a_disconnect_record_never_triggers_the_new_arm() {
+        // A Task the dispatcher only counted as starved has no durable
+        // disconnect record, so the new arm must not fire on it - and the
+        // process-local starvation ledger is never consulted.
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, false, false)],
+            &[]));
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, false, false)],
+            &["task:other".to_string()]));
+    }
+
+    #[test]
+    fn a9_a_waiting_task_with_an_attempt_or_a_lease_never_triggers_the_new_arm() {
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, true, false)],
+            &["task:one".to_string()]));
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, false, true)],
+            &["task:one".to_string()]));
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Submitted, false, false)],
+            &["task:one".to_string()]));
+    }
+
+    #[test]
+    fn a9_an_empty_waiting_bucket_never_triggers_the_new_arm() {
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(&[], &["task:one".to_string()]));
+    }
+
 }

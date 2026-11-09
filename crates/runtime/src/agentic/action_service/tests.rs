@@ -2045,6 +2045,234 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
     );
 }
 
+    #[test]
+    fn r_e_1_the_named_failure_reaches_the_durable_projection() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        // The physical binding the root action carries is checked against the
+        // graph store, so the service is wired to one and the graph it names
+        // is registered with a RUNNING node.
+        use crate::execution_core::graph::{
+            ExecutionCommitService, ExecutionGraphStateStore, ExecutionNodeBinding,
+            NodeExecutionTicket,
+        };
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+            ExecutionNodeStatus,
+        };
+        let graphs = ExecutionGraphStateStore::new(Arc::clone(&store));
+        let service = AgentActionService::new(Arc::clone(&store)).with_graph_store(graphs);
+        let mut graph = ExecutionGraph::new("Entries named failure")
+            .with_lineage(ExecutionGraphLineage {
+                session_id: "session-1".into(),
+                turn_id: "turn-1".into(),
+                root_task_id: "task:entries".into(),
+                task_id: "task:entries".into(),
+                generation: 1,
+            });
+        graph.nodes.push(ExecutionNodeSpec {
+            id: "entries-node".into(),
+            kind: ExecutionNodeKind::InlineModel,
+            payload_ref: "payload:entries".into(),
+            executor_kind: "entries-test".into(),
+            idempotency_key: "entries:attempt".into(),
+            lease_ref: None,
+            acceptance: Default::default(),
+            retry_policy: Default::default(),
+            resource_scopes: Vec::new(),
+            work: None,
+        });
+        let commits = ExecutionCommitService::new(Arc::clone(&store));
+        let graph = commits.register_graph(graph).unwrap().graph;
+        // Planned -> Ready -> Running is the official sequence: a node that is
+        // bound and started without being admitted first is an illegal
+        // transition.
+        let graph = commits
+            .transition_node(
+                &graph,
+                "entries-node",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+            .graph;
+        let binding = ExecutionNodeBinding {
+            executor_kind: "entries-test".to_string(),
+            ticket_idempotency_key: "entries:attempt".to_string(),
+            attempt: 1,
+            resource_lease_refs: Vec::new(),
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        let graph = commits
+            .bind_and_start_nodes(
+                &graph,
+                std::collections::BTreeMap::from([(
+                    "entries-node".to_string(),
+                    binding.clone(),
+                )]),
+                vec![NodeExecutionTicket {
+                    graph_id: graph.id.clone(),
+                    node_id: "entries-node".into(),
+                    executor_kind: "entries-test".into(),
+                    service_class: graph.service_class,
+                    attempt: 1,
+                    idempotency_key: "entries:attempt".to_string(),
+                    payload_ref: "payload:entries".into(),
+                }],
+            )
+            .unwrap()
+            .graph;
+        ExecutionGraphStateStore::new(Arc::clone(&store))
+            .binding_start_ticket(&graph, "entries-node", &binding)
+            .unwrap();
+        let mut team_action = root(
+            "entries-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Entries Team".to_string(),
+                mission: "carry a named failure".to_string(),
+                objective: None,
+            }),
+        );
+        team_action.actor.original_execution = Some(
+            harness_contract::agent_action::OriginalAgentExecution {
+                graph_id: graph.id.clone(),
+                node_id: "entries-node".to_string(),
+                attempt: 1,
+            },
+        );
+        // A Root actor's physical execution is the graph it names.
+        team_action.actor.root_execution_id = Some(graph.id.clone());
+        // The Root actor's identity is derived from the graph's own lineage:
+        // objective, program and actor id all follow from the session and turn
+        // the graph was registered under.
+        let derived_objective =
+            harness_contract::agent_action::root_objective_id("session-1", "turn-1");
+        let derived_program =
+            harness_contract::agent_action::program_id_for_objective(&derived_objective);
+        team_action.actor.actor_id = "root:session-1".to_string();
+        team_action.actor.objective_id = derived_objective.clone();
+        team_action.actor.program_id = derived_program.clone();
+        let team = service
+            .apply(&team_action)
+            .expect("team")
+            .changed_refs[0]
+            .clone();
+        let named_failure = vec![serde_json::json!({
+            "name": "required_write_terminally_failed:f24-failed-effect-key",
+            "passed": false,
+            "evidence": {
+                "grade": "required_write_terminally_failed",
+                "effect_key": "f24-failed-effect-key",
+                "tool_use_id": "f24-failed-call",
+                "receipt_cursor": 4242,
+            },
+        })];
+        let mut invite = root(
+            "named-failure-invite",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "worker".to_string(),
+                mission: "named failure".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        );
+        invite.actor.original_execution = Some(
+            harness_contract::agent_action::OriginalAgentExecution {
+                graph_id: graph.id.clone(),
+                node_id: "entries-node".to_string(),
+                attempt: 1,
+            },
+        );
+        // A Root actor's physical execution is the graph it names.
+        invite.actor.root_execution_id = Some(graph.id.clone());
+        invite.actor.actor_id = "root:session-1".to_string();
+        invite.actor.objective_id = derived_objective.clone();
+        invite.actor.program_id = derived_program.clone();
+        service
+            .apply_locked(
+                &invite,
+                &super::program_stream(&derived_program),
+                None,
+                None,
+                &named_failure,
+                &[],
+                false,
+                false,
+                None,
+            )
+            .expect("the named failure");
+        let projection = service.project(&derived_program).expect("projection");
+        let encoded = serde_json::to_value(&projection).expect("the projection");
+        let entry = &encoded["required_write_failures"][0];
+        assert!(
+            entry["name"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("required_write_terminally_failed:"),
+            "the entry is named by its prefix"
+        );
+        assert_eq!(entry["passed"], false);
+        assert_eq!(entry["evidence"]["grade"], "required_write_terminally_failed");
+        assert_eq!(entry["evidence"]["effect_key"], "f24-failed-effect-key");
+        assert_eq!(entry["evidence"]["tool_use_id"], "f24-failed-call");
+        assert_eq!(entry["evidence"]["receipt_cursor"], 4242);
+        // Negative control: an apply that carries no named failure adds none.
+        let mut plain = root(
+            "no-named-failure-invite",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "worker".to_string(),
+                mission: "no named failure".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        );
+        plain.actor.original_execution = Some(
+            harness_contract::agent_action::OriginalAgentExecution {
+                graph_id: graph.id.clone(),
+                node_id: "entries-node".to_string(),
+                attempt: 1,
+            },
+        );
+        // A Root actor's physical execution is the graph it names.
+        plain.actor.root_execution_id = Some(graph.id.clone());
+        plain.actor.actor_id = "root:session-1".to_string();
+        plain.actor.objective_id = derived_objective.clone();
+        plain.actor.program_id = derived_program.clone();
+        service
+            .apply_locked(
+                &plain,
+                &super::program_stream(&derived_program),
+                None,
+                None,
+                &[],
+                &[],
+                false,
+                false,
+                None,
+            )
+            .expect("the plain invite");
+        let projection = service.project(&derived_program).expect("projection");
+        let encoded = serde_json::to_value(&projection).expect("the projection");
+        assert_eq!(
+            encoded["required_write_failures"]
+                .as_array()
+                .map(|entries| entries.len()),
+            Some(1),
+            "an apply without a named failure adds none"
+        );
+    }
+
 #[test]
 fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
     let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));

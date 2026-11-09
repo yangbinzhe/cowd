@@ -36,7 +36,6 @@ pub(crate) use commit_pipeline::execution_lineage_stream_id;
 pub(crate) use commit_pipeline::{receipt_lifecycle_anchor, receipt_replay_contract};
 use commit_pipeline::*;
 pub(super) use commit_pipeline::{graph_identity_refs, graph_status};
-#[cfg(test)]
 pub(crate) use tool_receipt_query::ToolReceiptQuery;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +44,7 @@ pub(super) enum CallbackDisposition {
     Commit,
     Abort,
 }
+
 
 impl CallbackDisposition {
     pub(super) fn from_result(node_id: &str, result: &ExecutionNodeResult) -> Self {
@@ -3143,6 +3143,11 @@ impl crate::runtime_event_store::CheckedSourceValidator for TerminalCheckedSourc
     }
 }
 
+pub(super) enum OriginalTerminalRollbackDecision {
+    Committed(crate::CheckedAppendReceipt),
+    RolledBack(crate::runtime_event_store::OriginalRetainedTerminal),
+}
+
 #[derive(Clone)]
 struct PreparedGraphAppend {
     graph: ExecutionGraph,
@@ -3154,6 +3159,7 @@ struct PreparedGraphAppend {
     refreshable_lineage: BTreeSet<String>,
     process_input_frame: Option<Arc<crate::agentic::review_evidence::ProcessInputFrame>>,
     original_terminal_owner: Option<Arc<crate::execution_core::services::OriginalTerminalCommitOwner>>,
+    original_registration_owner: Option<Arc<crate::execution_core::services::OriginalGraphRegistrationOwner>>,
 }
 
 pub(crate) struct ExecutionTerminalCommit {
@@ -3169,6 +3175,7 @@ mod tests;
 pub struct ExecutionCommitReceipt {
     pub graph: ExecutionGraph,
     pub transaction: AppendTransactionReceipt,
+    pub(crate) original_replan_request: Option<Arc<crate::CheckedAppendRequest>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3391,6 +3398,21 @@ impl PhysicalClosurePending {
 /// recovery keeps re-proving inside the physical-closure budget. A proof
 /// waiting for any other reason, and a proof that names a ring which can
 /// never hold, stay an invalid command.
+/// The sibling branch applies to every outer that is not the host's own
+/// call. The host's own outer keeps its own path, and the host's own outer
+/// with a terminal member already found is the arm's own refusal; a sibling
+/// outer is settled by the sibling branch whatever the manifest's iteration
+/// order is, so a settleable sibling is consumed either way. The terminal
+/// member the host's own outer may have left behind deliberately does not
+/// gate the sibling.
+fn original_batch_sibling_may_settle(
+    outer: &str,
+    host_outer: &str,
+    _terminal_member_found: bool,
+) -> bool {
+    outer != host_outer
+}
+
 fn normal_release_closure_sources(
     proof: PhysicalClosureProof,
 ) -> Result<Vec<ExpectedStreamRevision>, ExecutionCommitError> {
@@ -7856,6 +7878,19 @@ impl ExecutionCommitService {
             member_facts.extend(outer_facts);
             if let Some(pending) = self.original_batch_pending_after_commit(ticket, &outer)? {
                 if outer != request.idempotency_key || terminal_member.is_some() {
+                    // A sibling outer's member was decided once, by the
+                    // owner, in the owner's own terminal transaction: the
+                    // pending names the member's own transaction. Consuming
+                    // that same source is what settles the outer — the
+                    // settlement never decides it a second time, writes
+                    // nothing, and never waits for it.
+                    if original_batch_sibling_may_settle(
+                        &outer, &request.idempotency_key, terminal_member.is_some())
+                        && self.original_batch_sibling_member_settled(
+                            &outer, pending.payload(), pending.event.commit_cursor)?
+                    {
+                        continue;
+                    }
                     return Err(invalid("original batch member outcome remains unresolved"));
                 }
                 let publications = request.tool_progress.checked_original_stop_publications()
@@ -8610,9 +8645,19 @@ impl ExecutionCommitService {
 
     pub(crate) fn register_graph_with_continuation(
         &self,
+        graph: ExecutionGraph,
+        continuation_actor: Option<harness_contract::agent_action::AgentActorBinding>,
+        source_goal_cut: Option<ExpectedStreamRevision>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        self.register_graph_with_continuation_owned(graph, continuation_actor, source_goal_cut, None)
+    }
+
+    fn register_graph_with_continuation_owned(
+        &self,
         mut graph: ExecutionGraph,
         continuation_actor: Option<harness_contract::agent_action::AgentActorBinding>,
         source_goal_cut: Option<ExpectedStreamRevision>,
+        original_owner: Option<Arc<crate::execution_core::services::OriginalGraphRegistrationOwner>>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         graph.revision = 1;
         graph.node_statuses.clear();
@@ -8748,7 +8793,7 @@ impl ExecutionCommitService {
                 }
                 expected_revisions.insert(source.id, source.revision);
             }
-            match self.append_graph_event_with_expected_domain_revisions(
+            let mut prepared = self.prepare_graph_append(
                 &graph,
                 0,
                 transaction_id.clone(),
@@ -8757,7 +8802,9 @@ impl ExecutionCommitService {
                 },
                 domain_events.clone(),
                 &expected_revisions,
-            ) {
+            )?;
+            prepared.original_registration_owner = original_owner.clone();
+            match self.commit_prepared_graph_append(prepared) {
                 Ok(receipt) => return Ok(receipt),
                 Err(error)
                     if is_lineage_registration_conflict(&error, lineage_stream.as_deref())
@@ -8833,10 +8880,11 @@ impl ExecutionCommitService {
         graph: ExecutionGraph,
         actor: Option<harness_contract::agent_action::AgentActorBinding>,
         source_goal_cut: Option<ExpectedStreamRevision>,
+        original_owner: Option<Arc<crate::execution_core::services::OriginalGraphRegistrationOwner>>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
-            service.register_graph_with_continuation(graph, actor, source_goal_cut)
+            service.register_graph_with_continuation_owned(graph, actor, source_goal_cut, original_owner)
         })
         .await
         .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
@@ -9649,6 +9697,97 @@ impl ExecutionCommitService {
             _ => return Err(ExecutionCommitError::InvalidCommand("node pending member state invalid".into())),
         }
         Ok(Some(CommittedNodeBatchMember { event }))
+    }
+
+    /// A sibling outer's member was decided once, by the owner, in the
+    /// owner's own terminal transaction: the pending names the member's own
+    /// transaction, and that transaction is the authority. This consumes the
+    /// same source and checks every claim against it — the settlement never
+    /// decides it a second time, writes nothing, and never waits for it.
+    ///
+    /// `Ok(true)` means the outer is accounted for. `Ok(false)` means the
+    /// owner has not decided a settleable outcome, and the refusal that
+    /// stands today stands unchanged. A claim that does not match the
+    /// member's own transaction is refused, never repaired.
+    fn original_batch_sibling_member_settled(
+        &self,
+        outer: &str,
+        pending: &serde_json::Value,
+        pending_commit_cursor: u64,
+    ) -> Result<bool, ExecutionCommitError> {
+        // Every outcome that is not the owner's decided and proven noncommit
+        // is refused by the caller's existing refusal: this helper adds no
+        // wording of its own, so the refusal family does not widen.
+        let Some(pending) = pending.get("pending").and_then(serde_json::Value::as_object) else {
+            return Ok(false);
+        };
+        // Only the owner's decided noncommit is settleable. A stop conflict
+        // aggregates several unsettled members of the same outer, so one
+        // member's terminal can never stand for it; the transient states
+        // are the owner's decision that is not durable yet. Neither is
+        // settleable, and neither changes the refusal that stands today.
+        match pending.get("state").and_then(serde_json::Value::as_str) {
+            Some("confirmed_noncommit") => {}
+            Some("stop_conflict")
+            | Some("before_outcome_unknown")
+            | Some("before_outcome_error")
+            | Some("before_outcome_store_unknown")
+            | Some("committed_observation_unavailable")
+            | Some("unknown_no_receipt")
+            | Some("committed_unbound")
+            | Some("unbound_stop") => return Ok(false),
+            _other => return Ok(false),
+        }
+        let Some(index) = pending.get("index").and_then(serde_json::Value::as_u64) else {
+            return Ok(false);
+        };
+        // The member's own transaction: the effect stream of that outer, at
+        // the member's own key. The owner wrote it before its own terminal,
+        // so the pending's terminal cursor is already past it and the
+        // member is either there or the claim names no transaction at all.
+        let stream = format!("execution-effect:{outer}");
+        let key = format!("agentic-member:{index}");
+        let Some(event) = self.event_store.event_by_idempotency_key(&stream, &key)? else {
+            return Ok(false);
+        };
+        if event.kind != "execution.effect.member_noncommit"
+            || event.scope != RuntimeEventScope::ExecutionNode
+            || event.status.as_deref() != Some("not_committed")
+            || event.actor.as_deref() != Some("execution_commit_service")
+            || event.schema_version != 1
+            || event.idempotency_key.as_deref() != Some(key.as_str())
+            || event.payload["outer_key"].as_str() != Some(outer)
+            || event.payload["member_index"].as_u64() != Some(index)
+            || event.commit_cursor > pending_commit_cursor
+        {
+            return Ok(false);
+        }
+        // The pending is checked against the member's own transaction and is
+        // never trusted on its own: same claims, same source, one decision.
+        if pending.get("terminal_transaction_id").and_then(serde_json::Value::as_str)
+            != Some(event.transaction_id.as_str())
+            || pending.get("terminal_commit_cursor").and_then(serde_json::Value::as_u64)
+                != Some(event.commit_cursor)
+            || pending.get("noncommit_reason") != Some(&event.payload["noncommit_reason"])
+            || pending.get("noncommit_error_kind") != Some(&event.payload["noncommit_error_kind"])
+        {
+            return Ok(false);
+        }
+        // The decision identity is rebuilt from the member's own payload and
+        // compared verbatim: the pending may not name another decision.
+        let identity = match event.payload["decision_identity"].as_str() {
+            Some("preparation") => serde_json::json!({"kind": "preparation",
+                "transaction_id": event.payload["preparation_transaction_id"],
+                "request_hash": event.payload["preparation_request_hash"]}),
+            _ if event.payload["checked_transaction_id"].is_string() => serde_json::json!({"kind": "checked",
+                "transaction_id": event.payload["checked_transaction_id"],
+                "request_hash": event.payload["checked_request_hash"]}),
+            _ => return Ok(false),
+        };
+        if pending.get("decision_identity") != Some(&identity) {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub(crate) fn attach_host_transcript(
@@ -13122,7 +13261,202 @@ impl ExecutionCommitService {
         Ok(None)
     }
 
+    /// Shared original read authentication used by Host and closure.
+    pub(crate) fn original_read_is_committed(
+        &self,
+        ticket: &super::registry::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<bool, String> {
+        let (Some(binding), Some(invocation), Some(parent), Some(session_id)) = (
+            request.step_binding.as_ref(), request.compiled_invocation.as_ref(),
+            request.parent_execution.as_ref(), request.session_id.as_deref(),
+        ) else { return Ok(false) };
+        if parent.execution_id != ticket.graph_id || parent.node_id != ticket.node_id
+            || request.parent_execution_attempt != Some(ticket.attempt)
+            || invocation.effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
+        {
+            return Ok(false);
+        }
+        let query = ToolReceiptQuery {
+            step_binding: binding, parent_execution: parent, session_id,
+            policy_revision: request.policy_revision, idempotency_key: &request.idempotency_key,
+            tool_use_id: &request.tool_use_id, tool_name: &request.tool_name, input: &request.input,
+        };
+        let Some(replay) = self.query_completed_agent_tool_effect(&query)
+            .map_err(|error| error.to_string())? else { return Ok(false) };
+        if replay.invocation.effect != invocation.effect
+            || replay.outcome.status == crate::RuntimeToolExecutionStatus::Unknown
+            || replay.outcome.pending_agent_batch.is_some()
+        {
+            return Ok(false);
+        }
+        let stream = format!("execution-effect:{}", request.idempotency_key);
+        let intent_key = format!("{}:read-intent", request.idempotency_key);
+        let Some(intent) = self.event_store.event_by_idempotency_key(&stream, &intent_key)
+            .map_err(|error| error.to_string())? else { return Ok(false) };
+        let Some(intent_receipt) = self.event_store.original_transaction_receipt(&intent.transaction_id)
+            .map_err(|error| error.to_string())? else { return Ok(false) };
+        let key = format!("{}:read-receipt", request.idempotency_key);
+        let Some(event) = self.event_store.event_by_idempotency_key(&stream, &key)
+            .map_err(|error| error.to_string())? else { return Ok(false) };
+        let Some(receipt) = self.event_store.original_transaction_receipt(&event.transaction_id)
+            .map_err(|error| error.to_string())? else { return Ok(false) };
+        let replay_contract = commit_pipeline::receipt_replay_contract(request)
+            .map_err(|error| error.to_string())?;
+        let index_stream = format!("execution-agent-receipts:{}:{}:{}", parent.execution_id, parent.node_id, ticket.attempt);
+        let Some(index) = self.event_store.event_by_idempotency_key(&index_stream,
+            &format!("agent-tool-receipt:{}", request.idempotency_key))
+            .map_err(|error| error.to_string())? else { return Ok(false) };
+        self.exact_delegated_receipt_sequence(request).map_err(|error| error.to_string())?;
+        Ok(index.kind == "execution.agent_tool.receipt" && index.scope == event.scope
+            && index.actor == event.actor && index.status.as_deref() == Some("completed")
+            && index.payload["effect_kind"] == "read"
+            && index.payload["idempotency_key"] == request.idempotency_key
+            && event.transaction_id == index.transaction_id && event.commit_cursor == index.commit_cursor
+            && event.transaction_index < index.transaction_index && event.refs == index.refs
+            && event.payload["outcome"] == index.payload["outcome"]
+            && receipt.event_ids.get(index.transaction_index as usize) == Some(&index.event_id)
+            && receipt.stream_revisions.iter().any(|revision| revision.stream_id == index_stream
+                && revision.expected_revision < index.sequence && index.sequence <= revision.committed_revision)
+            && intent.kind == "execution.read.intent"
+            && intent.scope == crate::RuntimeEventScope::ExecutionNode
+            && intent.actor.as_deref() == Some("governed_tool")
+            && intent.status.as_deref() == Some("inflight") && intent.schema_version == 1
+            && intent.payload["idempotency_key"] == request.idempotency_key
+            && intent.payload["tool_use_id"] == request.tool_use_id
+            && intent.payload["tool_name"] == request.tool_name
+            && intent.payload["effect"] == serde_json::to_value(&invocation.effect).map_err(|error| error.to_string())?
+            && intent.payload["replay"] == replay_contract
+            && intent_receipt.transaction_id == intent.transaction_id
+            && intent_receipt.commit_cursor == intent.commit_cursor
+            && intent_receipt.event_ids.get(intent.transaction_index as usize) == Some(&intent.event_id)
+            && intent_receipt.stream_revisions.iter().any(|revision| revision.stream_id == stream
+                && revision.expected_revision < intent.sequence && intent.sequence <= revision.committed_revision)
+            && intent.commit_cursor <= event.commit_cursor
+            && event.kind == "execution.read.receipt"
+            && event.scope == crate::RuntimeEventScope::ExecutionNode
+            && event.actor.as_deref() == Some("governed_tool")
+            && event.status.as_deref() == Some("completed") && event.schema_version == 1
+            && event.payload["replay"] == replay_contract
+            && receipt.transaction_id == event.transaction_id && receipt.commit_cursor == event.commit_cursor
+            && receipt.event_ids.get(event.transaction_index as usize) == Some(&event.event_id)
+            && receipt.stream_revisions.iter().any(|revision| revision.stream_id == stream
+                && revision.expected_revision < event.sequence && event.sequence <= revision.committed_revision))
+    }
+
+
+    pub(crate) fn original_early_read_is_committed(
+        &self,
+        ticket: &super::registry::NodeExecutionTicket,
+        early: &crate::conversation::EarlyToolExecutionReceipt,
+    ) -> Result<bool, String> {
+        let Some(source) = early.original_source.as_ref() else { return Ok(false) };
+        let Some(calls) = source.completed_calls.as_ref() else { return Ok(false) };
+        let mut seen = BTreeSet::new();
+        if source.ticket != *ticket || calls.is_empty()
+            || calls.iter().any(|call| call.id.is_empty() || !seen.insert(call.id.clone()))
+            || calls.iter().filter(|call| **call == early.call).count() != 1
+            || source.request.tool_use_id != early.call.id
+            || source.request.tool_name != early.call.name
+            || source.request.step_binding != early.call.binding
+            || source.request.input != early.call.input
+            || early.outcome.pending_agent_batch.is_some()
+            || !self.original_read_is_committed(ticket, &source.request)?
+        {
+            return Ok(false);
+        }
+        let stream = format!("execution-effect:{}", source.request.idempotency_key);
+        let key = format!("{}:read-receipt", source.request.idempotency_key);
+        let Some(event) = self.event_store.event_by_idempotency_key(&stream, &key)
+            .map_err(|error| error.to_string())? else { return Ok(false) };
+        Ok(event.payload["outcome"] == serde_json::to_value(&early.outcome).map_err(|error| error.to_string())?)
+    }
+
+
+    /// Prove the live joined carrier against its original model owner.
+    fn original_model_read_sources(
+        &self, graph: &ExecutionGraph, batch_node: &str, batch_binding: &ExecutionNodeBinding,
+        early: &crate::conversation::EarlyToolExecutionReceipt,
+    ) -> Result<Option<Vec<ExpectedStreamRevision>>, ExecutionCommitError> {
+        let Some(source) = early.original_source.as_ref() else { return Ok(None) };
+        let Some(step) = early.call.binding.as_ref() else { return Ok(None) };
+        let request = source.request.as_ref();
+        let Some(parent) = request.parent_execution.as_ref() else { return Ok(None) };
+        let Some(attempt) = request.parent_execution_attempt else { return Ok(None) };
+        let owner_node = parent.node_id.as_str();
+        if source.ticket.graph_id != graph.id || parent.execution_id != graph.id
+            || source.ticket.node_id != owner_node || source.ticket.attempt != attempt
+            || source.ticket.executor_kind != "inline_model" || owner_node == batch_node
+            || request.idempotency_key != step.effect_idempotency_key()
+            || graph.nodes.iter().find(|node| node.id == owner_node)
+                .is_none_or(|node| node.kind != ExecutionNodeKind::InlineModel || node.executor_kind != "inline_model") {
+            return Ok(None);
+        }
+        // Capture each head before reading its proof. The final closure CAS
+        // rejects any source moved after this read.
+        let primary_stream = format!("execution-effect:{}", request.idempotency_key);
+        let index_stream = format!("execution-agent-receipts:{}:{}:{}", graph.id, owner_node, attempt);
+        let node_stream = node_stream_id(&graph.id, owner_node);
+        let graph_head = self.event_store.stream_revision(&graph.id)?;
+        let node_head = self.event_store.stream_revision(&node_stream)?;
+        let primary_head = self.event_store.stream_revision(&primary_stream)?;
+        let index_head = self.event_store.stream_revision(&index_stream)?;
+        if graph_head != graph.revision { return Ok(None) }
+        let mut cursor = batch_node;
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(cursor.to_string()) { return Ok(None) }
+            let mut parents = graph.edges.iter().filter(|edge| edge.to == cursor && edge.kind.is_dependency());
+            let Some(edge) = parents.next() else { return Ok(None) };
+            if parents.next().is_some() { return Ok(None) }
+            if edge.from == owner_node { break }
+            if graph.nodes.iter().find(|node| node.id == edge.from)
+                .is_none_or(|node| node.kind != ExecutionNodeKind::ToolBatch || node.executor_kind != "tool_batch") {
+                return Ok(None);
+            }
+            cursor = edge.from.as_str();
+        }
+        let states = ExecutionGraphStateStore::new(self.event_store.clone());
+        let owner_binding = states.current_binding(graph, owner_node, attempt)
+            .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+        let (ticket, _) = states.binding_start_ticket(graph, owner_node, &owner_binding)
+            .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+        let owner_start = states.binding_start_position(graph, owner_node, &owner_binding)
+            .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+        let batch_start = states.binding_start_position(graph, batch_node, batch_binding)
+            .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+        let (Some(owner_start), Some(batch_start)) = (owner_start, batch_start) else { return Ok(None) };
+        if ticket != source.ticket { return Ok(None) }
+        validate_node_ticket_start(&self.event_store, &ticket, None)?;
+        if !self.original_early_read_is_committed(&ticket, early)
+            .map_err(ExecutionCommitError::InvalidCommand)? { return Ok(None) }
+        let Some(primary) = self.event_store.event_by_idempotency_key(&primary_stream,
+            &format!("{}:read-receipt", request.idempotency_key))? else { return Ok(None) };
+        let Some(index) = self.event_store.event_by_idempotency_key(&index_stream,
+            &format!("agent-tool-receipt:{}", request.idempotency_key))? else { return Ok(None) };
+        if primary.sequence > primary_head || index.sequence > index_head
+            || owner_start.1 >= primary.commit_cursor || primary.commit_cursor >= batch_start.1 {
+            return Ok(None);
+        }
+        Ok(Some(vec![
+            ExpectedStreamRevision { stream_id: primary_stream, expected_revision: primary_head },
+            ExpectedStreamRevision { stream_id: index_stream, expected_revision: index_head },
+            ExpectedStreamRevision { stream_id: graph.id.clone(), expected_revision: graph_head },
+            ExpectedStreamRevision { stream_id: node_stream, expected_revision: node_head },
+        ]))
+    }
+
     fn lease_recovery_leaf_sources_with_fact(
+        &self, graph: &ExecutionGraph, node: &str, binding: &ExecutionNodeBinding,
+        spec: &ExecutionNodeSpec, retired: bool,
+        no_dispatch: Option<&super::executors::agent_tool::NoDispatchFact>,
+        unprovable: &mut Option<(&'static str, String)>,
+    ) -> Result<Option<Vec<ExpectedStreamRevision>>, ExecutionCommitError> {
+        self.lease_recovery_leaf_sources_with_original_reads(
+            graph, node, binding, spec, retired, no_dispatch, &[], unprovable)
+    }
+
+    fn lease_recovery_leaf_sources_with_original_reads(
         &self,
         graph: &ExecutionGraph,
         node: &str,
@@ -13130,6 +13464,7 @@ impl ExecutionCommitService {
         spec: &ExecutionNodeSpec,
         retired: bool,
         no_dispatch: Option<&super::executors::agent_tool::NoDispatchFact>,
+        original_reads: &[crate::conversation::EarlyToolExecutionReceipt],
         unprovable: &mut Option<(&'static str, String)>,
     ) -> Result<Option<Vec<ExpectedStreamRevision>>, ExecutionCommitError> {
         let invalid = |reason: &str| ExecutionCommitError::InvalidCommand(reason.into());
@@ -13549,6 +13884,11 @@ impl ExecutionCommitService {
                 // owner and for a plan this runtime never delegated.
                 let effect_keys = Self::planned_effect_keys(spec);
                 let admitted = self.admitted_calls(&effect_keys)?;
+                let mut carrier_ids = BTreeSet::new();
+                if original_reads.iter().any(|receipt| !carrier_ids.insert(receipt.call.id.clone())
+                    || !planned.iter().any(|call| call["id"].as_str() == Some(receipt.call.id.as_str()))) {
+                    return Err(invalid("original early read is duplicated or outside batch"));
+                }
                 let mut seen = BTreeSet::new();
                 for call in planned {
                     let Some(id) = call["id"].as_str() else {
@@ -13559,6 +13899,29 @@ impl ExecutionCommitService {
                         *unprovable = Some(("planned_call_input_missing", format!("planned_call_input_missing {}{}", leaf_counts(receipts.len(), index_receipts), Self::leaf_shape_note(&derived_shapes))));
                         return Ok(None);
                     };
+                    // A joined early result has priority over all skip/retirement paths.
+                    // It is an executed original, never a batch no-dispatch fact.
+                    let matching = original_reads.iter().filter(|receipt| receipt.call.id == id).collect::<Vec<_>>();
+                    if !matching.is_empty() {
+                        if matching.len() != 1 || calls.contains_key(id)
+                            || no_dispatch.is_some_and(|fact| fact.calls.iter().any(|call| call.call_id == id))
+                            || effect_keys.get(id).is_some_and(|key| refused.contains(key)) {
+                            return Err(invalid("original early read conflicts with batch evidence"));
+                        }
+                        let (planned_calls, _) = crate::host::decode_tool_batch(&spec.payload_ref)?;
+                        if planned_calls.iter().filter(|planned| **planned == matching[0].call).count() != 1 {
+                            return Err(invalid("original early read differs from batch call"));
+                        }
+                        let Some(original) = self.original_model_read_sources(graph, node, binding, matching[0])? else {
+                            // Missing or moving source remains Unknown in the original custody.
+                            return Ok(None);
+                        };
+                        for source in original {
+                            merge_outcome_source_revisions(&mut primary_sources,
+                                &BTreeMap::from([(source.stream_id, source.expected_revision)]))?;
+                        }
+                        continue;
+                    }
                     if no_dispatch
                         .is_some_and(|fact| fact.calls.iter().any(|call| call.call_id == id))
                     {
@@ -14152,11 +14515,19 @@ impl ExecutionCommitService {
     }
 
     pub(super) fn binding_physical_sources_with_witness(
+        &self, graph: &ExecutionGraph, node: &str, binding: &ExecutionNodeBinding,
+        witness: Option<&super::executors::agent_tool::NoDispatchWitness>,
+    ) -> Result<PhysicalClosureProof, ExecutionCommitError> {
+        self.binding_physical_sources_with_original_reads(graph, node, binding, witness, &[])
+    }
+
+    pub(super) fn binding_physical_sources_with_original_reads(
         &self,
         graph: &ExecutionGraph,
         node: &str,
         binding: &ExecutionNodeBinding,
         witness: Option<&super::executors::agent_tool::NoDispatchWitness>,
+        original_reads: &[crate::conversation::EarlyToolExecutionReceipt],
     ) -> Result<PhysicalClosureProof, ExecutionCommitError> {
         let store = ExecutionGraphStateStore::new(self.event_store.clone());
         let (ticket, spec) = store
@@ -14182,6 +14553,10 @@ impl ExecutionCommitService {
         } else {
             self.canonical_no_dispatch_fact(graph, node, binding)?
         };
+        if !original_reads.is_empty() && (spec.kind != ExecutionNodeKind::ToolBatch
+            || super::executors::agent_tool::is_bound_agent_tool_graph(graph)) {
+            return Err(ExecutionCommitError::InvalidCommand("original early reads require their Host batch binding".into()));
+        }
         let mut sources = Vec::new();
         if let Some(fact) = &fact {
             let Some(current) = self.no_dispatch_physical_sources(fact)? else {
@@ -14242,6 +14617,9 @@ impl ExecutionCommitService {
             eprintln!("r622_toolbatch phase=physical_branch precommitted={} retired={} witness={} canonical_no_dispatch={}", precommitted, retired, witness.is_some(), fact.is_some());
         }
         let leaf = if precommitted {
+            if !original_reads.is_empty() {
+                return Err(ExecutionCommitError::InvalidCommand("precommitted batch cannot discard original early reads".into()));
+            }
             let transcript_nonempty = !self.committed_host_transcript(&ticket)?.messages.is_empty();
             let stream_id = format!(
                 "execution-agent-receipts:{}:{}:{}",
@@ -14267,13 +14645,14 @@ impl ExecutionCommitService {
                             == CallbackDisposition::Abort
                 });
             let mut leaf_unprovable = None;
-            let Some(leaf) = self.lease_recovery_leaf_sources_with_fact(
+            let Some(leaf) = self.lease_recovery_leaf_sources_with_original_reads(
                 graph,
                 node,
                 binding,
                 &spec,
                 partial,
                 fact.as_ref(),
+                original_reads,
                 &mut leaf_unprovable,
             )?
             else {
@@ -14700,10 +15079,18 @@ impl ExecutionCommitService {
     }
 
     pub(super) fn commit_binding_lease_closure_with_witness(
+        &self, graph: &ExecutionGraph, released: &super::resources::ReleasedBindingLeases<'_>,
+        witness: Option<&super::executors::agent_tool::NoDispatchWitness>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        self.commit_binding_lease_closure_with_original_reads(graph, released, witness, &[])
+    }
+
+    pub(super) fn commit_binding_lease_closure_with_original_reads(
         &self,
         graph: &ExecutionGraph,
         released: &super::resources::ReleasedBindingLeases<'_>,
         witness: Option<&super::executors::agent_tool::NoDispatchWitness>,
+        original_reads: &[crate::conversation::EarlyToolExecutionReceipt],
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let invalid = |reason: &str| ExecutionCommitError::InvalidCommand(reason.into());
         if !released.authentic_for(graph) {
@@ -14712,11 +15099,12 @@ impl ExecutionCommitService {
         let mut closure = released.closure().clone();
         let mut release_sources = released.sources().to_vec();
         if closure.source == "normal_release" {
-            let proof = self.binding_physical_sources_with_witness(
+            let proof = self.binding_physical_sources_with_original_reads(
                 graph,
                 &closure.node_id,
                 &closure.binding,
                 witness,
+                original_reads,
             )?;
             let physical_sources = normal_release_closure_sources(proof)?;
             release_sources.extend(physical_sources);
@@ -15474,6 +15862,7 @@ impl ExecutionCommitService {
             refreshable_lineage,
             process_input_frame,
             original_terminal_owner: None,
+            original_registration_owner: None,
         })
     }
 
@@ -15497,6 +15886,146 @@ impl ExecutionCommitService {
         self.commit_prepared_graph_append(prepared)
     }
 
+    fn append_original_registration(
+        &self,
+        transaction: AppendTransactionRequest,
+        owner: &crate::execution_core::services::OriginalGraphRegistrationOwner,
+    ) -> Result<crate::AppendTransactionReceipt, RuntimeEventStoreError> {
+        let streams = transaction.expected_streams.iter().map(|source| source.stream_id.clone()).collect::<Vec<_>>();
+        let digest = format!("original-registration:{}", transaction.transaction_id);
+        let validator = TerminalCheckedSources { digest: digest.clone() };
+        let request = crate::CheckedAppendRequest { transaction, frame_digest: digest, budget: crate::SourceCheckBudget::default() };
+        owner.with_current(|claim, control| {
+            Ok(self.event_store.with_authenticated_stream_locks(&streams, |locks| {
+                self.event_store.append_checked_transaction_cancellable_locked(
+                    request, &validator, control, claim, locks, None, None, None, None,
+                )
+            }))
+        }).map_err(RuntimeEventStoreError::InvalidTransaction)?
+            .and_then(|receipt| receipt.map(|receipt| receipt.into_parts().1.commit)
+                .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original registration cancelled before submission".into())))
+            .map_err(|error| match error {
+                RuntimeEventStoreError::CheckedAttemptRolledBack(cause)
+                    if matches!(cause.as_ref(), RuntimeEventStoreError::StaleRevision { .. }) => *cause,
+                other => other,
+            })
+    }
+
+    fn append_original_terminal_replan(
+        &self, transaction: AppendTransactionRequest,
+        owner: &crate::execution_core::services::OriginalTerminalCommitOwner,
+    ) -> Result<(crate::AppendTransactionReceipt, Arc<crate::CheckedAppendRequest>), RuntimeEventStoreError> {
+        if !owner.matches_replan_transaction(&transaction) {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original terminal replan identity differs".into()));
+        }
+        let streams = transaction.expected_streams.iter().map(|source| source.stream_id.clone()).collect::<Vec<_>>();
+        let digest = format!("original-terminal-replan:{}", transaction.transaction_id);
+        let validator = TerminalCheckedSources { digest: digest.clone() };
+        let mut request = crate::CheckedAppendRequest { transaction, frame_digest: digest, budget: crate::SourceCheckBudget::default() };
+        self.event_store.validate_content_publication(&mut request.transaction)?;
+        let original_request = Arc::new(request.clone());
+        owner.with_rollback_replacement(|claim, control| {
+            owner.retain_replacement_request(Arc::clone(&original_request), Arc::clone(&control))?;
+            let result = self.event_store.with_authenticated_stream_locks(&streams, |locks| {
+                self.event_store.append_checked_transaction_cancellable_locked(request, &validator, Arc::clone(&control), claim, locks, None, None, None, None)
+            });
+            if matches!(&result, Err(RuntimeEventStoreError::CheckedAttemptRolledBack(_))) {
+                owner.confirm_replacement_rollback(&original_request, &control)?;
+            }
+            Ok(result)
+        }).map_err(RuntimeEventStoreError::InvalidTransaction)?
+            .and_then(|receipt| receipt.map(|receipt| {
+                let (request, receipt, _) = receipt.into_parts();
+                (receipt.commit, request)
+            })
+                .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("original terminal replan cancelled before submission".into())))
+    }
+
+    pub(super) fn original_terminal_rollback_decision(
+        &self, outcome: &super::registry::NodeExecutionOutcome,
+    ) -> Result<OriginalTerminalRollbackDecision, ExecutionCommitError> {
+        let original = outcome.original_terminal_owner.as_ref()
+            .ok_or_else(|| ExecutionCommitError::InvalidCommand("original terminal outcome owner unavailable".into()))?;
+        let retained = self.event_store.original_terminal_after_confirmed_rollback(&original.0)?;
+        let sources = TerminalCheckedSources { digest: retained.request.frame_digest.clone() };
+        match self.event_store.original_checked_terminal_winner_with_metadata(
+            (*retained.request).clone(), &retained.terminal, retained.authored_metadata.as_ref(), &sources,
+        )? {
+            Some(winner) => Ok(OriginalTerminalRollbackDecision::Committed(winner)),
+            None => Ok(OriginalTerminalRollbackDecision::RolledBack(retained)),
+        }
+    }
+
+    pub(super) fn original_terminal_replan_winner(
+        &self, retained: &crate::runtime_event_store::OriginalRetainedTerminal,
+        ticket: &super::registry::NodeExecutionTicket, candidate: &super::registry::NodeExecutionOutcome,
+    ) -> Result<Option<(Arc<crate::CheckedAppendRequest>, AppendTransactionReceipt)>, ExecutionCommitError> {
+        let requests = retained.owner.replacement_requests_for_outcome(ticket, candidate)
+            .map_err(ExecutionCommitError::InvalidCommand)?;
+        let mut found: Option<(Arc<crate::CheckedAppendRequest>, AppendTransactionReceipt)> = None;
+        let mut unmatched_winner = false;
+        for request in requests {
+            let Some(receipt) = self.event_store.original_checked_transaction_receipt(&request.transaction.transaction_id)? else { continue; };
+            if receipt.commit.request_hash != request.identity_hash()? || receipt.validation.frame_digest != request.frame_digest {
+                unmatched_winner = true;
+                continue;
+            }
+            self.verify_original_terminal_replan(retained, &receipt.commit, &request, &ticket.graph_id)?;
+            if let Some((previous_request, previous_receipt)) = &found {
+                if previous_request.as_ref() != request.as_ref() || previous_receipt != &receipt.commit {
+                    return Err(ExecutionCommitError::InvalidCommand("original replan winner ambiguous".into()));
+                }
+            } else {
+                found = Some((request, receipt.commit));
+            }
+        }
+        if found.is_none() && unmatched_winner {
+            return Err(ExecutionCommitError::InvalidCommand("original replan transaction winner differs".into()));
+        }
+        Ok(found)
+    }
+
+    pub(super) fn retire_original_terminal_after_replan(
+        &self, retained: &crate::runtime_event_store::OriginalRetainedTerminal,
+        replan: &AppendTransactionReceipt, request: &Arc<crate::CheckedAppendRequest>, graph_id: &str,
+    ) -> Result<(), ExecutionCommitError> {
+        self.verify_original_terminal_replan(retained, replan, request, graph_id)?;
+        self.event_store.retire_original_terminal_after_replan(retained, replan, graph_id)?;
+        Ok(())
+    }
+
+    pub(super) fn verify_original_terminal_replan(
+        &self, retained: &crate::runtime_event_store::OriginalRetainedTerminal,
+        replan: &AppendTransactionReceipt, request: &Arc<crate::CheckedAppendRequest>, graph_id: &str,
+    ) -> Result<(), ExecutionCommitError> {
+        let checked = self.event_store.original_checked_transaction_receipt(&replan.transaction_id)?
+            .ok_or_else(|| ExecutionCommitError::InvalidCommand("original replan checked receipt unavailable".into()))?;
+        let mut expected = replan.clone();
+        expected.duplicate = checked.commit.duplicate;
+        if checked.commit != expected || request.transaction.transaction_id != replan.transaction_id
+            || request.identity_hash()? != replan.request_hash
+            || request.frame_digest != checked.validation.frame_digest
+            || checked.validation.frame_digest != format!("original-terminal-replan:{}", replan.transaction_id)
+            || !retained.owner.matches_replan_transaction(&request.transaction)
+        {
+            return Err(ExecutionCommitError::InvalidCommand("original replan checked receipt differs".into()));
+        }
+        let sources = TerminalCheckedSources { digest: retained.request.frame_digest.clone() };
+        if self.event_store.original_checked_terminal_winner_with_metadata(
+            (*retained.request).clone(), &retained.terminal, retained.authored_metadata.as_ref(), &sources,
+        )?.is_some() {
+            return Err(ExecutionCommitError::InvalidCommand("original terminal also has a winner".into()));
+        }
+        let old = retained.request.transaction.expected_streams.iter().find(|source| source.stream_id == graph_id)
+            .ok_or_else(|| ExecutionCommitError::InvalidCommand("original terminal graph source unavailable".into()))?;
+        let new = replan.stream_revisions.iter().find(|source| source.stream_id == graph_id)
+            .ok_or_else(|| ExecutionCommitError::InvalidCommand("original replan graph receipt unavailable".into()))?;
+        if new.expected_revision < old.expected_revision || new.expected_revision.checked_add(1) != Some(new.committed_revision) {
+            return Err(ExecutionCommitError::InvalidCommand("original replan graph CAS differs".into()));
+        }
+        Ok(())
+    }
+
     fn commit_prepared_graph_append(
         &self,
         prepared: PreparedGraphAppend,
@@ -15511,6 +16040,7 @@ impl ExecutionCommitService {
             refreshable_lineage: lineage_streams,
             process_input_frame: _process_input_frame,
             original_terminal_owner,
+            original_registration_owner,
         } = prepared;
         #[cfg(test)]
         if super::executors::agent_tool::is_bound_agent_tool_graph(&graph)
@@ -15528,6 +16058,7 @@ impl ExecutionCommitService {
         }
         const MAX_LINEAGE_RETRIES: usize = 8;
         let mut attempt = 0;
+        let mut original_replan_request = None;
         let transaction = loop {
             attempt += 1;
             let request = AppendTransactionRequest {
@@ -15590,7 +16121,14 @@ impl ExecutionCommitService {
                         },
                     }
                 },
-                None => self.event_store.append_transaction(request),
+                None => match (original_registration_owner.as_ref(), original_terminal_owner.as_ref()) {
+                    (Some(owner), None) => self.append_original_registration(request, owner),
+                    (None, Some(owner)) => self.append_original_terminal_replan(request, owner).map(|(receipt, request)| {
+                        original_replan_request = Some(request); receipt
+                    }),
+                    (None, None) => self.event_store.append_transaction(request),
+                    (Some(_), Some(_)) => Err(RuntimeEventStoreError::InvalidTransaction("conflicting original graph owners".into())),
+                },
             };
             #[cfg(test)]
             let result = if result.is_ok() {
@@ -15664,7 +16202,14 @@ impl ExecutionCommitService {
                                 },
                             }
                         },
-                        None => self.event_store.append_transaction(duplicate_request),
+                        None => match (original_registration_owner.as_ref(), original_terminal_owner.as_ref()) {
+                            (Some(owner), None) => self.append_original_registration(duplicate_request, owner),
+                            (None, Some(owner)) => self.append_original_terminal_replan(duplicate_request, owner).map(|(receipt, request)| {
+                                original_replan_request = Some(request); receipt
+                            }),
+                            (None, None) => self.event_store.append_transaction(duplicate_request),
+                            (Some(_), Some(_)) => Err(RuntimeEventStoreError::InvalidTransaction("conflicting original graph owners".into())),
+                        },
                     }
                 } else {
                     result
@@ -15727,6 +16272,7 @@ impl ExecutionCommitService {
         Ok(ExecutionCommitReceipt {
             graph: committed_graph,
             transaction,
+            original_replan_request,
         })
     }
 }
@@ -19128,6 +19674,149 @@ mod failure_shape_tests {
             ),
             "the budget-exhausted failure is the typed source-moved error: {error}"
         );
+    }
+
+    /// The sibling outer's member is settled from the member's own
+    /// transaction — the same source the owner decided from — with no write
+    /// and no wait. A claim that does not match that transaction is refused,
+    /// and the owner's unsettled states are not settled at all.
+    #[test]
+    fn rroot_sibling_member_settles_only_from_the_members_own_transaction() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(events.clone());
+        let outer = "sha256:sibling-outer";
+        let stream = format!("execution-effect:{outer}");
+        let preparation_hash = "prep-hash";
+        let transaction_id = format!("member-preparation-noncommit:{preparation_hash}");
+        // The member's own noncommit transaction, written by the member
+        // preparation path before the owner's terminal.
+        let head = events.stream_revision(&stream).expect("head");
+        let receipt = events
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: transaction_id.clone(),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream.clone(),
+                    expected_revision: head,
+                }],
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id: stream.clone(),
+                        scope: RuntimeEventScope::ExecutionNode,
+                        kind: "execution.effect.member_noncommit".into(),
+                        status: Some("not_committed".into()),
+                        actor: Some("execution_commit_service".into()),
+                        refs: Vec::new(),
+                        payload: json!({"ticket":"ticket","outer_key":outer,"member_index":0,
+                            "preparation_transaction_id":"prep-tx",
+                            "preparation_request_hash":preparation_hash,
+                            "decision_identity":"preparation",
+                            "noncommit_reason":"abandoned",
+                            "noncommit_error_kind":"original_owner_stopped"}),
+                    },
+                    idempotency_key: Some("agentic-member:0".into()),
+                    schema_version: 1,
+                }],
+            })
+            .expect("member noncommit");
+        // The owner's pending names the member's own transaction.
+        let pending = json!({"pending": {"index":0,"state":"confirmed_noncommit",
+            "decision_identity":{"kind":"preparation","transaction_id":"prep-tx",
+                "request_hash":preparation_hash},
+            "terminal_transaction_id":transaction_id,
+            "terminal_request_hash":receipt.request_hash,
+            "terminal_commit_cursor":receipt.commit_cursor,
+            "noncommit_reason":"abandoned",
+            "noncommit_error_kind":"original_owner_stopped"}});
+        let head_before = events.stream_revision(&stream).expect("head");
+        assert!(
+            commits
+                .original_batch_sibling_member_settled(&outer, &pending, receipt.commit_cursor)
+                .expect("the member's own transaction is read"),
+            "the owner's pending names the member's own transaction: the outer is settled"
+        );
+        // Zero writes: the settlement reads the member's own transaction.
+        assert_eq!(
+            events.stream_revision(&stream).expect("head"),
+            head_before,
+            "settling a sibling outer writes nothing"
+        );
+        // The owner's unsettled states are not settleable: a stop conflict
+        // aggregates several unsettled members of the same outer, so one
+        // member's terminal can never stand for it, and the transient
+        // states are a decision that is not durable yet.
+        for state in [
+            "stop_conflict",
+            "before_outcome_unknown",
+            "before_outcome_error",
+            "before_outcome_store_unknown",
+            "committed_observation_unavailable",
+            "unknown_no_receipt",
+        ] {
+            let unsettled = json!({"pending": {"index":0,"state":state}});
+            assert!(
+                !commits
+                    .original_batch_sibling_member_settled(&outer, &unsettled, receipt.commit_cursor)
+                    .expect("an unsettled owner is not a failure"),
+                "{state} is not settleable"
+            );
+        }
+        // A claim that does not match the member's own transaction is
+        // refused, never repaired: a transaction that does not exist, a
+        // decision identity that names another decision, and a reason that
+        // is not the member's own.
+        for forged in [
+            json!({"pending": {"index":0,"state":"confirmed_noncommit",
+                "decision_identity":{"kind":"preparation","transaction_id":"prep-tx",
+                    "request_hash":preparation_hash},
+                "terminal_transaction_id":"member-preparation-noncommit:other",
+                "terminal_request_hash":receipt.request_hash,
+                "terminal_commit_cursor":receipt.commit_cursor,
+                "noncommit_reason":"abandoned",
+                "noncommit_error_kind":"original_owner_stopped"}}),
+            json!({"pending": {"index":0,"state":"confirmed_noncommit",
+                "decision_identity":{"kind":"preparation","transaction_id":"prep-tx",
+                    "request_hash":"other-hash"},
+                "terminal_transaction_id":transaction_id,
+                "terminal_request_hash":receipt.request_hash,
+                "terminal_commit_cursor":receipt.commit_cursor,
+                "noncommit_reason":"abandoned",
+                "noncommit_error_kind":"original_owner_stopped"}}),
+            json!({"pending": {"index":0,"state":"confirmed_noncommit",
+                "decision_identity":{"kind":"preparation","transaction_id":"prep-tx",
+                    "request_hash":preparation_hash},
+                "terminal_transaction_id":transaction_id,
+                "terminal_request_hash":receipt.request_hash,
+                "terminal_commit_cursor":receipt.commit_cursor,
+                "noncommit_reason":"rolled_back",
+                "noncommit_error_kind":"original_owner_stopped"}}),
+        ] {
+            assert!(
+                !commits
+                    .original_batch_sibling_member_settled(&outer, &forged, receipt.commit_cursor)
+                    .expect("a forged claim is refused, not repaired"),
+                "a claim that does not match the member's own transaction is not settled"
+            );
+        }
+    }
+
+    /// The sibling's consumption does not depend on the manifest's outer
+    /// iteration order: a settleable sibling is settled whether or not the
+    /// host's own outer was iterated first and left a terminal member
+    /// behind. The host's own outer keeps its own path, and with a
+    /// terminal member already found it is the arm's own refusal.
+    #[test]
+    fn rroot_sibling_settlement_does_not_depend_on_the_outer_iteration_order() {
+        let host = "sha256:host-outer";
+        let sibling = "sha256:sibling-outer";
+        // The host's own outer is never settled by the sibling branch.
+        assert!(!original_batch_sibling_may_settle(host, host, false));
+        assert!(!original_batch_sibling_may_settle(host, host, true));
+        // A sibling is settled whatever the host's own outer left behind:
+        // the terminal member that the host's own outer may have found
+        // does not gate the sibling, so the order the manifest's outers
+        // are iterated in does not decide whether it is consumed.
+        assert!(original_batch_sibling_may_settle(sibling, host, false));
+        assert!(original_batch_sibling_may_settle(sibling, host, true));
     }
 }
 

@@ -47,6 +47,18 @@ fn retryable_proof_source_change(error: &ExecutionCommitError) -> bool {
         || reason.starts_with("proof source changed during validation; retry current inputs; source=")
 }
 
+fn original_terminal_retryable_rollback(error: &ExecutionCommitError, outcome: &NodeExecutionOutcome) -> bool {
+    let ExecutionCommitError::EventStore(crate::RuntimeEventStoreError::CheckedAttemptRolledBack(cause)) = error else { return false; };
+    if outcome.original_terminal_owner.is_none() || outcome.original_synthesize_replan.is_none() { return false; }
+    let Some(terminal) = outcome.domain_events.iter().find(|event| event.event.kind == "runtime.session.terminal_requested")
+        .and_then(|event| serde_json::from_value::<crate::SessionTerminalInput>(event.event.payload.clone()).ok()) else { return false; };
+    let Some(turn) = terminal.turn_id.as_deref() else { return false; };
+    let objective = harness_contract::agent_action::root_objective_id(&terminal.session_id, turn);
+    let program = format!("agentic-program:{}", harness_contract::agent_action::program_id_for_objective(&objective));
+    matches!(cause.as_ref(), crate::RuntimeEventStoreError::SessionAttemptsUnsettled)
+        || matches!(cause.as_ref(), crate::RuntimeEventStoreError::StaleRevision { stream_id, .. } if *stream_id == program)
+}
+
 // The semantic owner may rebuild post-tool observations and the next plan,
 // but cannot rewrite the physical outcome or discard any other read fence.
 fn accepts_goal_revalidation(
@@ -294,6 +306,21 @@ struct CancelOutcomeState {
     polled: bool,
     finished: bool,
     outcome: Option<NodeExecutionOutcome>,
+    superseded_outcomes: Vec<NodeExecutionOutcome>,
+    terminal_replan_cleanup: Option<OriginalTerminalReplanCleanup>,
+    original_binding_closed: bool,
+}
+
+#[derive(Clone)]
+struct OriginalTerminalReplanCleanup {
+    original: NodeExecutionOutcome,
+    candidate: NodeExecutionOutcome,
+    handle: super::registry::OriginalSynthesizeReplanHandle,
+    retained: crate::runtime_event_store::OriginalRetainedTerminal,
+    receipt: Option<crate::AppendTransactionReceipt>,
+    request: Option<Arc<crate::CheckedAppendRequest>>,
+    transferred: bool,
+    retired: bool,
 }
 
 struct ActiveNode {
@@ -314,6 +341,14 @@ struct ActiveNode {
     drain_completed: bool,
     callback_gate: Arc<Mutex<()>>,
     no_dispatch: Option<Arc<super::executors::agent_tool::NoDispatchObservation>>,
+}
+
+/// Exact active owners captured before the supervisor aborts its node tasks.
+pub(crate) struct PumpCancellationOwner {
+    binding: ExecutionNodeBinding,
+    ticket: NodeExecutionTicket,
+    executor: Arc<dyn NodeExecutor>,
+    gate: Arc<Mutex<()>>,
 }
 
 struct PendingTerminalCommit {
@@ -729,7 +764,7 @@ impl ExecutionGraphRunner {
         &self,
         graph: ExecutionGraph,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
-        self.register_continuation(graph, None, None).await
+        self.register_continuation(graph, None, None, None).await
     }
 
     pub(crate) async fn register_continuation(
@@ -737,13 +772,14 @@ impl ExecutionGraphRunner {
         graph: ExecutionGraph,
         actor: Option<harness_contract::agent_action::AgentActorBinding>,
         source_goal_cut: Option<crate::ExpectedStreamRevision>,
+        original_owner: Option<Arc<crate::execution_core::services::OriginalGraphRegistrationOwner>>,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
         self.ensure_mutation_allowed()?;
         validate_execution_graph(&graph)?;
         self.registry.validate_graph(&graph)?;
         match self
             .commit_service
-            .register_continuation_graph_async(graph, actor, source_goal_cut)
+            .register_continuation_graph_async(graph, actor, source_goal_cut, original_owner)
             .await
         {
             Ok(receipt) => Ok(receipt.graph),
@@ -1236,6 +1272,21 @@ impl ExecutionGraphRunner {
                     }
                 }
             }
+            for (index, start) in admitted.iter().enumerate() {
+                if let Err(error) = start.executor.prepare_original_binding(&start.ticket) {
+                    for previous in admitted.iter().take(index) {
+                        self.commit_service.validate_unadmitted_binding_rollback(&previous.ticket)?;
+                        previous.executor.rollback_original_binding(&previous.ticket)?;
+                    }
+                    for (original, observation) in admitted.iter().zip(&observations) {
+                        if let Some(observation) = observation {
+                            self.registry.rollback_unadmitted_builtin_binding(&original.ticket, observation, &self.commit_service)?;
+                        }
+                    }
+                    self.discard_unpolled_wave(&admitted);
+                    return Err(error.into());
+                }
+            }
             {
                 let mut active = self.active.lock().await;
                 for (mut start, no_dispatch) in admitted.drain(..).zip(observations) {
@@ -1323,6 +1374,8 @@ impl ExecutionGraphRunner {
                                 &self.commit_service,
                             )?;
                         }
+                        self.commit_service.validate_unadmitted_binding_rollback(ticket)?;
+                        original.executor.rollback_original_binding(ticket)?;
                     }
                     let aborted = starts
                         .iter()
@@ -1427,8 +1480,14 @@ impl ExecutionGraphRunner {
         }
         if let Some(handoff) = handoff {
             let mut state = handoff.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.finished = true;
-            state.outcome = result.as_ref().ok().map(|(_, outcome)| outcome.clone());
+            if matches!(&result, Err(ExecutionRunnerError::Executor(
+                NodeExecutorError::OriginalCustodyUnknown { .. }
+            ))) {
+                state.finished = false;
+            } else {
+                state.finished = true;
+                state.outcome = result.as_ref().ok().map(|(_, outcome)| outcome.clone());
+            }
             drop(state);
             handoff.ready.notify_one();
         }
@@ -1549,6 +1608,306 @@ impl ExecutionGraphRunner {
             .map(|active| active.callback_gate.clone())
     }
 
+    /// Finish only the still-live original binding; absence is not a receipt.
+    pub(crate) async fn settle_retained_original_callback<B, F>(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        attempt: u32,
+        verify_original: B,
+        verify_calls: F,
+    ) -> Result<Option<NodeExecutionTicket>, ExecutionRunnerError>
+    where
+        B: FnOnce(&NodeExecutionTicket) -> Result<bool, String> + Send,
+        F: FnOnce(&NodeExecutionTicket, Option<&Arc<super::executors::agent_tool::NoDispatchObservation>>) -> Result<bool, String> + Send,
+    {
+        let key = (graph_id.to_owned(), node_id.to_owned());
+        let original = self.active.lock().await.get(&key).filter(|active| {
+            active.ticket.attempt == attempt && active.ticket.graph_id == graph_id
+        }).map(|active| (
+            active.ticket.clone(), active.binding.clone(), Arc::clone(&active.executor),
+            Arc::clone(&active.callback_gate), active.no_dispatch.clone(),
+        ));
+        let Some((ticket, binding, executor, gate, observation)) = original else { return Ok(None) };
+        if ticket.executor_kind == "tool_batch" && observation.is_none() { return Ok(None); }
+        let _owner = gate.lock().await;
+        let matches_original = |active: &ActiveNode| {
+            active.ticket == ticket && active.binding == binding
+                && Arc::ptr_eq(&active.executor, &executor)
+                && Arc::ptr_eq(&active.callback_gate, &gate)
+                && match (&active.no_dispatch, &observation) {
+                    (Some(current), Some(original)) => Arc::ptr_eq(current, original),
+                    (None, None) => true,
+                    _ => false,
+                }
+        };
+        if self.command_intent_waiter(graph_id).is_some()
+            || !self.active.lock().await.get(&key).is_some_and(|active| {
+                matches_original(active)
+                    && active.cancel_outcome.state.lock().ok().is_some_and(|state| !state.polled)
+            })
+        {
+            return Ok(None);
+        }
+        if !verify_original(&ticket).map_err(ExecutionRunnerError::Driver)? {
+            return Ok(None);
+        }
+        let graph = self.state_store.load_async(graph_id).await?;
+        if self.commit_service.binding_callback_disposition(&graph, node_id, &binding)?
+            != CallbackDisposition::Commit
+        {
+            return Ok(None);
+        }
+        self.complete_callback_locked(graph_id, &executor, &ticket, None).await?;
+        if !verify_calls(&ticket, observation.as_ref()).map_err(ExecutionRunnerError::Driver)? {
+            return Ok(None);
+        }
+        if self.command_intent_waiter(graph_id).is_none()
+            && self.active.lock().await.get(&key).is_some_and(|active| {
+                matches_original(active) && active.callback_completed && !active.release_blocked
+                    && active.cancel_outcome.state.lock().ok().is_some_and(|state| !state.polled)
+            }) {
+            Ok(Some(ticket))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn replace_original_terminal_handoff(
+        &self, graph_id: &str, ticket: &NodeExecutionTicket, binding: &ExecutionNodeBinding,
+        executor: &Arc<dyn NodeExecutor>, original: &NodeExecutionOutcome, candidate: &NodeExecutionOutcome,
+        handle: &super::registry::OriginalSynthesizeReplanHandle,
+        retained: &crate::runtime_event_store::OriginalRetainedTerminal,
+    ) -> Result<(), ExecutionRunnerError> {
+        let gate = self.binding_callback_gate(graph_id, ticket).await
+            .ok_or_else(|| ExecutionRunnerError::Driver("original terminal callback gate unavailable".into()))?;
+        let _guard = gate.lock().await;
+        if self.command_intent_waiter(graph_id).is_some() {
+            return Err(ExecutionRunnerError::Driver("original terminal replacement cancelled".into()));
+        }
+        let handoff = self.active.lock().await.get(&(graph_id.to_owned(), ticket.node_id.clone()))
+            .filter(|active| active.ticket == *ticket && active.binding == *binding
+                && Arc::ptr_eq(&active.executor, executor) && Arc::ptr_eq(&active.callback_gate, &gate)
+                && !active.callback_completed)
+            .map(|active| Arc::clone(&active.cancel_outcome))
+            .ok_or_else(|| ExecutionRunnerError::Driver("original terminal replacement owner changed".into()))?;
+        let mut state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+        if !state.finished || state.outcome.as_ref() != Some(original) || state.terminal_replan_cleanup.is_some() {
+            return Err(ExecutionRunnerError::Driver("original terminal handoff differs".into()));
+        }
+        state.superseded_outcomes.push(original.clone());
+        state.outcome = Some(candidate.clone());
+        state.terminal_replan_cleanup = Some(OriginalTerminalReplanCleanup {
+            original: original.clone(), candidate: candidate.clone(), handle: handle.clone(), retained: retained.clone(),
+            receipt: None, request: None, transferred: false, retired: false,
+        });
+        Ok(())
+    }
+
+    async fn replace_rolled_back_replan_handoff(
+        &self, graph_id: &str, ticket: &NodeExecutionTicket, binding: &ExecutionNodeBinding,
+        executor: &Arc<dyn NodeExecutor>, original: &NodeExecutionOutcome,
+        previous: &NodeExecutionOutcome, candidate: &NodeExecutionOutcome,
+    ) -> Result<(), ExecutionRunnerError> {
+        let gate = self.binding_callback_gate(graph_id, ticket).await
+            .ok_or_else(|| ExecutionRunnerError::Driver("original terminal callback gate unavailable".into()))?;
+        let _guard = gate.lock().await;
+        if self.command_intent_waiter(graph_id).is_some() {
+            return Err(ExecutionRunnerError::Driver("original terminal replacement cancelled".into()));
+        }
+        let handoff = self.active.lock().await.get(&(graph_id.to_owned(), ticket.node_id.clone()))
+            .filter(|active| active.ticket == *ticket && active.binding == *binding
+                && Arc::ptr_eq(&active.executor, executor) && Arc::ptr_eq(&active.callback_gate, &gate)
+                && !active.callback_completed)
+            .map(|active| Arc::clone(&active.cancel_outcome))
+            .ok_or_else(|| ExecutionRunnerError::Driver("original terminal replacement owner changed".into()))?;
+        let mut state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+        if state.outcome.as_ref() != Some(previous) {
+            return Err(ExecutionRunnerError::Driver("original replacement handoff differs".into()));
+        }
+        let cleanup = state.terminal_replan_cleanup.as_mut().filter(|cleanup|
+            &cleanup.original == original && &cleanup.candidate == previous && !cleanup.transferred && !cleanup.retired
+                && cleanup.receipt.is_none() && cleanup.request.is_none())
+            .ok_or_else(|| ExecutionRunnerError::Driver("original replacement cleanup differs".into()))?;
+        if !cleanup.retained.owner.replacement_rollback_confirmed_for_outcome(ticket, previous)
+            .map_err(ExecutionRunnerError::Driver)? {
+            return Err(ExecutionRunnerError::Driver("original replacement rollback unconfirmed".into()));
+        }
+        cleanup.candidate = candidate.clone();
+        state.superseded_outcomes.push(previous.clone());
+        state.outcome = Some(candidate.clone());
+        Ok(())
+    }
+
+    // Capture the exact owner and retain its original handoff before waiting.
+    async fn original_terminal_cleanup_handoff(
+        &self, graph_id: &str, ticket: &NodeExecutionTicket,
+        executor: &Arc<dyn NodeExecutor>,
+    ) -> Result<Option<(Arc<Mutex<()>>, Arc<CancelOutcomeHandoff>, OriginalTerminalReplanCleanup)>, ExecutionRunnerError> {
+        let captured = {
+            let active = self.active.lock().await;
+            let Some(owner) = active.get(&(graph_id.to_owned(), ticket.node_id.clone()))
+                .filter(|owner| owner.ticket == *ticket) else { return Ok(None); };
+            if !Arc::ptr_eq(&owner.executor, executor) {
+                return Err(ExecutionRunnerError::Driver("original terminal cleanup owner changed".into()));
+            }
+            (owner.binding.clone(), Arc::clone(&owner.callback_gate), Arc::clone(&owner.cancel_outcome))
+        };
+        self.original_terminal_cleanup_captured(graph_id, ticket, executor, captured).await
+    }
+
+    async fn original_terminal_cleanup_captured(
+        &self, graph_id: &str, ticket: &NodeExecutionTicket, executor: &Arc<dyn NodeExecutor>,
+        (binding, gate, handoff): (ExecutionNodeBinding, Arc<Mutex<()>>, Arc<CancelOutcomeHandoff>),
+    ) -> Result<Option<(Arc<Mutex<()>>, Arc<CancelOutcomeHandoff>, OriginalTerminalReplanCleanup)>, ExecutionRunnerError> {
+        let guard = gate.lock().await;
+        let active = self.active.lock().await;
+        let callback_completed = match active.get(&(graph_id.to_owned(), ticket.node_id.clone())) {
+            Some(owner) if owner.ticket == *ticket && owner.binding == binding
+                && Arc::ptr_eq(&owner.executor, executor) && Arc::ptr_eq(&owner.callback_gate, &gate)
+                && Arc::ptr_eq(&owner.cancel_outcome, &handoff) => owner.callback_completed,
+            Some(_) => return Err(ExecutionRunnerError::Driver("original terminal cleanup owner changed".into())),
+            None => {
+                let state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+                if state.original_binding_closed { return Ok(None); }
+                return Err(ExecutionRunnerError::Driver("original terminal cleanup owner changed".into()));
+            }
+        };
+        drop(active);
+        let cleanup = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?
+            .terminal_replan_cleanup.clone();
+        if callback_completed {
+            if cleanup.as_ref().is_some_and(|cleanup| !cleanup.retired) {
+                return Err(ExecutionRunnerError::Driver("original terminal cleanup unconfirmed".into()));
+            }
+            return Ok(None);
+        }
+        drop(guard);
+        Ok(cleanup.map(|cleanup| (gate, handoff, cleanup)))
+    }
+
+    async fn resume_original_terminal_replan_cleanup(
+        &self, graph_id: &str, ticket: &NodeExecutionTicket, executor: &Arc<dyn NodeExecutor>,
+    ) -> Result<(), ExecutionRunnerError> {
+        let Some((gate, handoff, mut cleanup)) = self.original_terminal_cleanup_handoff(graph_id, ticket, executor).await? else { return Ok(()); };
+        if cleanup.retired { return Ok(()); }
+        if cleanup.receipt.is_none() || cleanup.request.is_none() {
+            let commits = self.commit_service.clone();
+            let retained = cleanup.retained.clone();
+            let candidate = cleanup.candidate.clone();
+            let ticket_copy = ticket.clone();
+            let winner = tokio::task::spawn_blocking(move || commits.original_terminal_replan_winner(&retained, &ticket_copy, &candidate))
+                .await.map_err(|failure| ExecutionRunnerError::Driver(format!("original replan winner read failed: {failure}")))??;
+            let Some((request, receipt)) = winner else {
+                let commits = self.commit_service.clone();
+                let original = cleanup.original.clone();
+                let old_winner = tokio::task::spawn_blocking(move || commits.original_terminal_rollback_decision(&original))
+                    .await.map_err(|failure| ExecutionRunnerError::Driver(format!("original terminal winner read failed: {failure}")))??;
+                if matches!(old_winner, super::commit_service::OriginalTerminalRollbackDecision::Committed(_)) {
+                    let binding = self.active.lock().await.get(&(graph_id.to_owned(), ticket.node_id.clone()))
+                        .filter(|owner| owner.ticket == *ticket && Arc::ptr_eq(&owner.executor, executor)
+                            && Arc::ptr_eq(&owner.callback_gate, &gate) && Arc::ptr_eq(&owner.cancel_outcome, &handoff))
+                        .map(|owner| owner.binding.clone())
+                        .ok_or_else(|| ExecutionRunnerError::Driver("original terminal winner owner changed".into()))?;
+                    self.restore_original_terminal_handoff(graph_id, ticket, &binding, executor, &cleanup.original, &cleanup.candidate).await?;
+                    return Ok(());
+                }
+                return Err(ExecutionRunnerError::Driver("original terminal replan outcome unconfirmed".into()));
+            };
+            cleanup.request = Some(request);
+            cleanup.receipt = Some(receipt);
+        }
+        let request = cleanup.request.clone().ok_or_else(|| ExecutionRunnerError::Driver("original replan request unavailable".into()))?;
+        let receipt = cleanup.receipt.clone().ok_or_else(|| ExecutionRunnerError::Driver("original replan receipt unavailable".into()))?;
+        let commits = self.commit_service.clone();
+        let retained = cleanup.retained.clone();
+        let verify_request = Arc::clone(&request);
+        let verify_receipt = receipt.clone();
+        let graph = graph_id.to_owned();
+        tokio::task::spawn_blocking(move || commits.verify_original_terminal_replan(&retained, &verify_receipt, &verify_request, &graph))
+            .await.map_err(|failure| ExecutionRunnerError::Driver(format!("original replan proof failed: {failure}")))??;
+        {
+            let _guard = gate.lock().await;
+            let active = self.active.lock().await;
+            if !active.get(&(graph_id.to_owned(), ticket.node_id.clone())).is_some_and(|owner|
+                owner.ticket == *ticket && Arc::ptr_eq(&owner.executor, executor)
+                    && Arc::ptr_eq(&owner.callback_gate, &gate) && Arc::ptr_eq(&owner.cancel_outcome, &handoff)
+                    && !owner.callback_completed) {
+                return Err(ExecutionRunnerError::Driver("original terminal cleanup owner changed".into()));
+            }
+            let mut state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+            if state.outcome.as_ref() != Some(&cleanup.candidate) {
+                return Err(ExecutionRunnerError::Driver("original terminal cleanup outcome changed".into()));
+            }
+            let current = state.terminal_replan_cleanup.as_mut().ok_or_else(|| ExecutionRunnerError::Driver("original terminal cleanup missing".into()))?;
+            if current.original != cleanup.original || current.candidate != cleanup.candidate || current.handle != cleanup.handle {
+                return Err(ExecutionRunnerError::Driver("original terminal cleanup identity changed".into()));
+            }
+            current.request = Some(Arc::clone(&request));
+            current.receipt = Some(receipt.clone());
+            cleanup.transferred = current.transferred;
+            cleanup.retired = current.retired;
+        }
+        if cleanup.retired { return Ok(()); }
+        if !cleanup.transferred {
+            cleanup.handle.0.committed(ticket, &cleanup.original).await.map_err(ExecutionRunnerError::Driver)?;
+            let _guard = gate.lock().await;
+            let active = self.active.lock().await;
+            if !active.get(&(graph_id.to_owned(), ticket.node_id.clone())).is_some_and(|owner|
+                owner.ticket == *ticket && Arc::ptr_eq(&owner.executor, executor)
+                    && Arc::ptr_eq(&owner.callback_gate, &gate) && Arc::ptr_eq(&owner.cancel_outcome, &handoff)
+                    && !owner.callback_completed) {
+                return Err(ExecutionRunnerError::Driver("original terminal transfer owner changed".into()));
+            }
+            let mut state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+            let current = state.terminal_replan_cleanup.as_mut().filter(|current| current.original == cleanup.original
+                && current.candidate == cleanup.candidate && current.handle == cleanup.handle)
+                .ok_or_else(|| ExecutionRunnerError::Driver("original terminal transfer identity changed".into()))?;
+            current.transferred = true;
+        }
+        let commits = self.commit_service.clone();
+        let retained = cleanup.retained.clone();
+        let graph = graph_id.to_owned();
+        tokio::task::spawn_blocking(move || commits.retire_original_terminal_after_replan(&retained, &receipt, &request, &graph))
+            .await.map_err(|failure| ExecutionRunnerError::Driver(format!("original terminal retirement failed: {failure}")))??;
+        let _guard = gate.lock().await;
+        let active = self.active.lock().await;
+        if !active.get(&(graph_id.to_owned(), ticket.node_id.clone())).is_some_and(|owner|
+            owner.ticket == *ticket && Arc::ptr_eq(&owner.executor, executor)
+                && Arc::ptr_eq(&owner.callback_gate, &gate) && Arc::ptr_eq(&owner.cancel_outcome, &handoff)
+                && !owner.callback_completed) {
+            return Err(ExecutionRunnerError::Driver("original terminal retirement owner changed".into()));
+        }
+        let mut state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+        let current = state.terminal_replan_cleanup.as_mut().filter(|current| current.original == cleanup.original
+            && current.candidate == cleanup.candidate && current.handle == cleanup.handle && current.transferred)
+            .ok_or_else(|| ExecutionRunnerError::Driver("original terminal retirement identity changed".into()))?;
+        current.retired = true;
+        Ok(())
+    }
+
+    async fn restore_original_terminal_handoff(
+        &self, graph_id: &str, ticket: &NodeExecutionTicket, binding: &ExecutionNodeBinding,
+        executor: &Arc<dyn NodeExecutor>, original: &NodeExecutionOutcome, candidate: &NodeExecutionOutcome,
+    ) -> Result<(), ExecutionRunnerError> {
+        let gate = self.binding_callback_gate(graph_id, ticket).await
+            .ok_or_else(|| ExecutionRunnerError::Driver("original terminal callback gate unavailable".into()))?;
+        let _guard = gate.lock().await;
+        let handoff = self.active.lock().await.get(&(graph_id.to_owned(), ticket.node_id.clone()))
+            .filter(|active| active.ticket == *ticket && active.binding == *binding
+                && Arc::ptr_eq(&active.executor, executor) && Arc::ptr_eq(&active.callback_gate, &gate)
+                && !active.callback_completed)
+            .map(|active| Arc::clone(&active.cancel_outcome))
+            .ok_or_else(|| ExecutionRunnerError::Driver("original terminal winner owner changed".into()))?;
+        let mut state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+        if state.outcome.as_ref() != Some(candidate) || !state.superseded_outcomes.contains(original) {
+            return Err(ExecutionRunnerError::Driver("original terminal winner handoff differs".into()));
+        }
+        state.outcome = Some(original.clone());
+        state.terminal_replan_cleanup = None;
+        Ok(())
+    }
+
     async fn cancel_and_drain_locked(
         &self,
         graph_id: &str,
@@ -1606,16 +1965,70 @@ impl ExecutionGraphRunner {
         Ok(())
     }
 
+    pub(crate) async fn capture_pump_cancellation_owners(
+        &self, graph_id: &str, in_flight: &BTreeSet<String>,
+    ) -> (Vec<PumpCancellationOwner>, bool) {
+        let owners: Vec<_> = self.active.lock().await.iter()
+            .filter(|((graph, node), _)| graph == graph_id && in_flight.contains(node))
+            .map(|(_, active)| PumpCancellationOwner {
+                binding: active.binding.clone(), ticket: active.ticket.clone(),
+                executor: Arc::clone(&active.executor), gate: Arc::clone(&active.callback_gate),
+            }).collect();
+        let missing = owners.len() != in_flight.len();
+        (owners, missing)
+    }
+
+    pub(crate) async fn drain_pump_cancellation_owners(
+        &self, graph_id: &str, owners: Vec<PumpCancellationOwner>,
+    ) -> Result<(), ExecutionRunnerError> {
+        let mut first_error = None;
+        for owner in owners {
+            let cleanup = self.resume_original_terminal_replan_cleanup(graph_id, &owner.ticket, &owner.executor).await;
+            let _guard = owner.gate.lock().await;
+            let matches = self.active.lock().await
+                .get(&(graph_id.to_string(), owner.ticket.node_id.clone()))
+                .is_some_and(|active| active.binding == owner.binding && active.ticket == owner.ticket
+                    && Arc::ptr_eq(&active.executor, &owner.executor)
+                    && Arc::ptr_eq(&active.callback_gate, &owner.gate));
+            if !matches {
+                first_error.get_or_insert_with(|| ExecutionRunnerError::Driver(
+                    "original cancellation owner changed before pump drain".into()));
+                continue;
+            }
+            let result = async {
+                if let Err(error) = cleanup {
+                    self.cancel_and_drain_locked(graph_id, &owner.executor, &owner.ticket).await?;
+                    return Err(error);
+                }
+                let graph = self.state_store.load_async(graph_id).await?;
+                if self.commit_service.binding_callback_disposition(&graph, &owner.ticket.node_id, &owner.binding)?
+                    == CallbackDisposition::Commit
+                {
+                    self.complete_callback_locked(graph_id, &owner.executor, &owner.ticket, None).await
+                } else {
+                    self.cancel_and_drain_locked(graph_id, &owner.executor, &owner.ticket).await
+                }
+            }.await;
+            if let Err(error) = result { first_error.get_or_insert(error); }
+        }
+        match first_error { Some(error) => Err(error), None => Ok(()) }
+    }
+
     async fn active_cancel_observed(
         &self,
         graph_id: &str,
         executor: &Arc<dyn NodeExecutor>,
         ticket: &NodeExecutionTicket,
     ) -> Result<(), ExecutionRunnerError> {
+        let cleanup = self.resume_original_terminal_replan_cleanup(graph_id, ticket, executor).await;
         let Some(gate) = self.binding_callback_gate(graph_id, ticket).await else {
-            return Ok(());
+            return cleanup;
         };
         let _owner = gate.lock().await;
+        if let Err(error) = cleanup {
+            self.cancel_and_drain_locked(graph_id, executor, ticket).await?;
+            return Err(error);
+        }
         let graph = self.state_store.load_async(graph_id).await?;
         let binding = self
             .active
@@ -1647,6 +2060,15 @@ impl ExecutionGraphRunner {
         ticket: &NodeExecutionTicket,
         requested_abort: Option<&str>,
     ) -> Result<(), ExecutionRunnerError> {
+        let handoff = self.active.lock().await.get(&(graph_id.to_string(), ticket.node_id.clone()))
+            .filter(|active| active.ticket == *ticket && Arc::ptr_eq(&active.executor, executor))
+            .map(|active| Arc::clone(&active.cancel_outcome));
+        if let Some(handoff) = handoff {
+            let state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+            if state.terminal_replan_cleanup.as_ref().is_some_and(|cleanup| !cleanup.retired) {
+                return Err(ExecutionRunnerError::Driver("original terminal cleanup unconfirmed".into()));
+            }
+        }
         let state = self
             .active
             .lock()
@@ -1744,7 +2166,7 @@ impl ExecutionGraphRunner {
                         let current = self.state_store.load_async(graph_id).await?;
                         match self
                             .commit_service
-                            .binding_physical_sources_with_witness(
+                            .binding_physical_sources_with_original_reads(
                                 &current,
                                 &ticket.node_id,
                                 &binding,
@@ -1752,6 +2174,8 @@ impl ExecutionGraphRunner {
                                     .as_ref()
                                     .and_then(|observation| observation.witness())
                                     .as_ref(),
+                                &observation.as_ref().map(|owner| owner.original_early_reads()).transpose()
+                                    .map_err(ExecutionRunnerError::Driver)?.unwrap_or_default(),
                             )? {
                             super::commit_service::PhysicalClosureProof::Proven(_) => {
                                 return Ok::<(), ExecutionRunnerError>(());
@@ -1836,13 +2260,14 @@ impl ExecutionGraphRunner {
             match original_handoff {
                 Some(outcome) => {
                     match outcome.original_terminal_owner.as_ref() {
-                        Some(owner) => {
+                        Some(owner) if requests_original_session_terminal(&outcome) => {
                             let owner = Arc::clone(&owner.0);
                             let ticket = ticket.clone();
                             tokio::task::spawn_blocking(move || owner.release_after_original_physical_close(&ticket)).await
                                 .map_err(|error| ExecutionRunnerError::Driver(format!("original terminal release task failed: {error}")))?
                                 .map_err(ExecutionRunnerError::Driver)
                         }
+                        Some(_) => result,
                         // The original Session terminal was requested but no
                         // live owner carries it: Unknown, and the custody of
                         // the original terminal must be retained.
@@ -1887,6 +2312,7 @@ impl ExecutionGraphRunner {
         ticket: &NodeExecutionTicket,
         requested_abort: Option<&str>,
     ) -> Result<(), ExecutionRunnerError> {
+        self.resume_original_terminal_replan_cleanup(graph_id, ticket, executor).await?;
         let Some(gate) = self.binding_callback_gate(graph_id, ticket).await else {
             return Ok(());
         };
@@ -1945,19 +2371,40 @@ impl ExecutionGraphRunner {
                 .state_store
                 .binding_lease_closure(&graph, node_id, binding, position)?
             {
+                if no_dispatch.map(|owner| owner.original_early_reads()).transpose()
+                    .map_err(ExecutionRunnerError::Driver)?.is_some_and(|reads| !reads.is_empty()) {
+                    return Err(ExecutionRunnerError::Driver("existing lease closure cannot authenticate retained early read".into()));
+                }
                 self.registry.forget_builtin_binding(ticket);
                 return Ok(());
             }
+            let early_reads = no_dispatch.map(|owner| owner.original_early_reads()).transpose()
+                .map_err(ExecutionRunnerError::Driver)?.unwrap_or_default();
+            let early_sources = if early_reads.is_empty() { Vec::new() } else {
+                match self.commit_service.binding_physical_sources_with_original_reads(
+                    &graph, node_id, binding,
+                    no_dispatch.and_then(|owner| owner.witness()).as_ref(), &early_reads)? {
+                    super::commit_service::PhysicalClosureProof::Proven(sources) => sources,
+                    super::commit_service::PhysicalClosureProof::Pending(_)
+                    | super::commit_service::PhysicalClosureProof::Unprovable { .. } =>
+                        return Err(ExecutionRunnerError::Driver("original early read sources unconfirmed".into())),
+                }
+            };
             match self
                 .commit_service
-                .commit_binding_lease_closure_with_witness(
+                .commit_binding_lease_closure_with_original_reads(
                     &graph,
                     &released,
                     no_dispatch
                         .and_then(|observation| observation.witness())
                         .as_ref(),
+                    &early_reads,
                 ) {
-                Ok(_) => {
+                Ok(receipt) => {
+                    if let Some(owner) = no_dispatch {
+                        owner.release_original_early_reads(ticket, &early_reads, &early_sources, &receipt)
+                            .map_err(ExecutionRunnerError::Driver)?;
+                    }
                     self.registry.forget_builtin_binding(ticket);
                     return Ok(());
                 }
@@ -1995,6 +2442,7 @@ impl ExecutionGraphRunner {
         let Some((gate, executor, ticket)) = owner else {
             return Ok(None);
         };
+        self.resume_original_terminal_replan_cleanup(graph_id, &ticket, &executor).await?;
         let _owner = gate.lock().await;
         self.complete_callback_locked(graph_id, &executor, &ticket, None)
             .await?;
@@ -2035,6 +2483,7 @@ impl ExecutionGraphRunner {
                 no_dispatch.as_ref(),
             )?;
         }
+        executor.original_binding_released(&ticket)?;
         #[cfg(test)]
         {
             let probe = self.closure_finished_probe.lock().unwrap().clone();
@@ -2057,8 +2506,17 @@ impl ExecutionGraphRunner {
                 "original binding resource owner poisoned after closure".into(),
             )
         })?;
+        // The original gate is still held. Only this owner, after callback,
+        // lease closure and executor release, may certify its own removal.
+        let handoff = Arc::clone(&active.get(&key).expect("owner checked above").cancel_outcome);
+        let mut state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver("original terminal handoff unavailable".into()))?;
+        if state.terminal_replan_cleanup.as_ref().is_some_and(|cleanup| !cleanup.retired) {
+            return Err(ExecutionRunnerError::Driver("original terminal cleanup unconfirmed".into()));
+        }
+        state.original_binding_closed = true;
         let fence = original.owner_fence.take();
         let finished = active.remove(&key);
+        drop(state);
         drop(active);
         drop(original);
         drop(fence);
@@ -2406,6 +2864,7 @@ impl ExecutionGraphRunner {
 
         // Commit terminal graph truth before waking the pump or publishing
         // process-local executor output.
+        let mut original_terminal_retry = None;
         let committed_executor = {
             #[cfg(feature = "test-fixtures")]
             if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "coordination_enter", None, None); }
@@ -2547,6 +3006,106 @@ impl ExecutionGraphRunner {
                 if let (Some(ticket), Err(error)) = (&diagnostic_ticket, &result) { k05_completion_cas_error(ticket, error); }
                 match result {
                     Ok(receipt) => break Ok(receipt),
+                    Err(error) if original_terminal_retry.is_none()
+                        && original_terminal_retryable_rollback(&error, &outcome) => {
+                        let (executor, original_ticket, _) = active_wave.as_ref().ok_or_else(||
+                            ExecutionRunnerError::Driver("original terminal retry owner unavailable".into()))?;
+                        let binding = expected_binding.as_ref().ok_or_else(||
+                            ExecutionRunnerError::Driver("original terminal retry binding unavailable".into()))?;
+                        let original = outcome.clone();
+                        let handle = original.original_synthesize_replan.clone().ok_or_else(||
+                            ExecutionRunnerError::Driver("original Synthesize retry handle unavailable".into()))?;
+                        drop(coordination);
+                        let commits = self.commit_service.clone();
+                        let source = original.clone();
+                        let decision = tokio::task::spawn_blocking(move || commits.original_terminal_rollback_decision(&source))
+                            .await.map_err(|failure| ExecutionRunnerError::Driver(format!("original terminal winner read failed: {failure}")))??;
+                        match decision {
+                            super::commit_service::OriginalTerminalRollbackDecision::Committed(winner) => {
+                                coordination = self.graph_coordination_without_command(graph_id).await;
+                                current = self.state_store.load_async(graph_id).await?;
+                                if current.node_results.get(&node_id) != Some(&original.result)
+                                    || current.recovery_cursor.node_attempts.get(&node_id) != Some(&binding.attempt)
+                                    || !self.active_binding_matches(graph_id, &node_id, Some(binding)).await
+                                { return Err(ExecutionRunnerError::Driver("original terminal winner binding differs".into())); }
+                                break Ok(super::commit_service::ExecutionCommitReceipt {
+                                    graph: current.clone(), transaction: winner.commit, original_replan_request: None,
+                                });
+                            }
+                            super::commit_service::OriginalTerminalRollbackDecision::RolledBack(retained) => {
+                                let candidate = handle.0.prepare(original_ticket, &original).await.map_err(ExecutionRunnerError::Driver)?;
+                                validate_outcome(&node_id, &candidate)?;
+                                let replan = candidate.replan.as_ref().ok_or_else(|| ExecutionRunnerError::Driver("original terminal replacement has no replan".into()))?;
+                                self.registry.validate_nodes(&replan.nodes)?;
+                                if candidate.delivery_envelope.is_some() || candidate.terminal_presentation.is_some() {
+                                    return Err(ExecutionRunnerError::Driver("original terminal replacement is not nonterminal".into()));
+                                }
+                                self.replace_original_terminal_handoff(graph_id, original_ticket, binding, executor, &original, &candidate, &handle, &retained).await?;
+                                coordination = self.graph_coordination_without_command(graph_id).await;
+                                current = self.state_store.load_async(graph_id).await?;
+                                if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running)
+                                    || current.recovery_cursor.node_attempts.get(&node_id) != Some(&binding.attempt)
+                                    || !self.active_binding_matches(graph_id, &node_id, Some(binding)).await
+                                { return Err(ExecutionRunnerError::Driver("original terminal replacement binding changed".into())); }
+                                outcome_sources = self.commit_service.execution_outcome_sources(&current, original_ticket, &candidate)?;
+                                outcome = candidate;
+                                original_terminal_retry = Some((original, handle, retained));
+                                continue;
+                            }
+                        }
+                    }
+                    Err(ExecutionCommitError::EventStore(crate::RuntimeEventStoreError::CheckedAttemptRolledBack(cause)))
+                        if original_terminal_retry.is_some() && attempt < MAX_TRANSITION_ATTEMPTS
+                            && matches!(cause.as_ref(), crate::RuntimeEventStoreError::StaleRevision { .. }) => {
+                        let (original, handle, retained) = original_terminal_retry.as_ref().ok_or_else(||
+                            ExecutionRunnerError::Driver("original terminal retry custody unavailable".into()))?;
+                        let (executor, original_ticket, _) = active_wave.as_ref().ok_or_else(||
+                            ExecutionRunnerError::Driver("original terminal retry owner unavailable".into()))?;
+                        let binding = expected_binding.as_ref().ok_or_else(||
+                            ExecutionRunnerError::Driver("original terminal retry binding unavailable".into()))?;
+                        if !retained.owner.replacement_rollback_confirmed_for_outcome(original_ticket, &outcome)
+                            .map_err(ExecutionRunnerError::Driver)? {
+                            return Err(ExecutionRunnerError::Driver("original replacement rollback unconfirmed".into()));
+                        }
+                        drop(coordination);
+                        let commits = self.commit_service.clone();
+                        let source = original.clone();
+                        let decision = tokio::task::spawn_blocking(move || commits.original_terminal_rollback_decision(&source))
+                            .await.map_err(|failure| ExecutionRunnerError::Driver(format!("original terminal winner read failed: {failure}")))??;
+                        if let super::commit_service::OriginalTerminalRollbackDecision::Committed(winner) = decision {
+                            self.restore_original_terminal_handoff(graph_id, original_ticket, binding, executor, original, &outcome).await?;
+                            coordination = self.graph_coordination_without_command(graph_id).await;
+                            current = self.state_store.load_async(graph_id).await?;
+                            if current.node_results.get(&node_id) != Some(&original.result)
+                                || current.recovery_cursor.node_attempts.get(&node_id) != Some(&binding.attempt)
+                                || !self.active_binding_matches(graph_id, &node_id, Some(binding)).await {
+                                return Err(ExecutionRunnerError::Driver("original terminal winner binding differs".into()));
+                            }
+                            outcome = original.clone();
+                            original_terminal_retry = None;
+                            break Ok(super::commit_service::ExecutionCommitReceipt {
+                                graph: current.clone(), transaction: winner.commit, original_replan_request: None,
+                            });
+                        }
+                        let candidate = handle.0.prepare(original_ticket, original).await.map_err(ExecutionRunnerError::Driver)?;
+                        validate_outcome(&node_id, &candidate)?;
+                        let replan = candidate.replan.as_ref().ok_or_else(|| ExecutionRunnerError::Driver("original terminal replacement has no replan".into()))?;
+                        self.registry.validate_nodes(&replan.nodes)?;
+                        if candidate.delivery_envelope.is_some() || candidate.terminal_presentation.is_some() {
+                            return Err(ExecutionRunnerError::Driver("original terminal replacement is not nonterminal".into()));
+                        }
+                        self.replace_rolled_back_replan_handoff(graph_id, original_ticket, binding, executor, original, &outcome, &candidate).await?;
+                        coordination = self.graph_coordination_without_command(graph_id).await;
+                        current = self.state_store.load_async(graph_id).await?;
+                        if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running)
+                            || current.recovery_cursor.node_attempts.get(&node_id) != Some(&binding.attempt)
+                            || !self.active_binding_matches(graph_id, &node_id, Some(binding)).await {
+                            return Err(ExecutionRunnerError::Driver("original terminal replacement binding changed".into()));
+                        }
+                        outcome_sources = self.commit_service.execution_outcome_sources(&current, original_ticket, &candidate)?;
+                        outcome = candidate;
+                        continue;
+                    }
                     Err(error @ ExecutionCommitError::EventStore(
                         crate::runtime_event_store::RuntimeEventStoreError::StaleRevision { .. },
                     )) if attempt < MAX_TRANSITION_ATTEMPTS => {
@@ -2625,7 +3184,38 @@ impl ExecutionGraphRunner {
                     Err(error) => break Err(error),
                 }
             };
-            if let Err(error) = transition {
+            let receipt = match transition {
+                Ok(receipt) => receipt,
+                Err(error) if original_terminal_retry.is_some() => {
+                    let (original, _handle, _retained) = original_terminal_retry.take().ok_or_else(||
+                        ExecutionRunnerError::Driver("original terminal retry custody unavailable".into()))?;
+                    let (executor, original_ticket, _) = active_wave.as_ref().ok_or_else(||
+                        ExecutionRunnerError::Driver("original terminal winner owner unavailable".into()))?;
+                    let binding = expected_binding.as_ref().ok_or_else(||
+                        ExecutionRunnerError::Driver("original terminal winner binding unavailable".into()))?;
+                    drop(coordination);
+                    let commits = self.commit_service.clone();
+                    let source = original.clone();
+                    let decision = tokio::task::spawn_blocking(move || commits.original_terminal_rollback_decision(&source))
+                        .await.map_err(|failure| ExecutionRunnerError::Driver(format!("original terminal winner read failed: {failure}")))??;
+                    let super::commit_service::OriginalTerminalRollbackDecision::Committed(winner) = decision else {
+                        // Absence of a winner is not proof that one cannot
+                        // still commit; retain both original handoff values.
+                        return Err(error.into());
+                    };
+                    self.restore_original_terminal_handoff(graph_id, original_ticket, binding, executor, &original, &outcome).await?;
+                    coordination = self.graph_coordination_without_command(graph_id).await;
+                    current = self.state_store.load_async(graph_id).await?;
+                    if current.node_results.get(&node_id) != Some(&original.result)
+                        || current.recovery_cursor.node_attempts.get(&node_id) != Some(&binding.attempt)
+                        || !self.active_binding_matches(graph_id, &node_id, Some(binding)).await
+                    { return Err(ExecutionRunnerError::Driver("original terminal winner binding differs".into())); }
+                    outcome = original;
+                    super::commit_service::ExecutionCommitReceipt {
+                        graph: current.clone(), transaction: winner.commit, original_replan_request: None,
+                    }
+                }
+                Err(error) => {
                 if owner_superseded {
                     // A same-key replacement is not the original owner. Do
                     // not call its callback or release its leases.
@@ -2666,6 +3256,19 @@ impl ExecutionGraphRunner {
                 self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
                     .await?;
                 return Err(error.into());
+                }
+            };
+            if let Some((original, handle, retained)) = original_terminal_retry.take() {
+                let (executor, original_ticket, _) = active_wave.as_ref().ok_or_else(||
+                    ExecutionRunnerError::Driver("original terminal retry owner unavailable".into()))?;
+                let binding = expected_binding.as_ref().ok_or_else(||
+                    ExecutionRunnerError::Driver("original terminal retry binding unavailable".into()))?;
+                let _ = (original, handle, retained, binding);
+                if receipt.original_replan_request.is_none() {
+                    return Err(ExecutionRunnerError::Driver("original terminal replan request unavailable".into()));
+                }
+                drop(coordination);
+                self.resume_original_terminal_replan_cleanup(graph_id, original_ticket, executor).await?;
             }
             self.active
                 .lock()
@@ -2752,6 +3355,11 @@ impl ExecutionGraphRunner {
                 self.converge_after_terminal_commit(graph_id).await?;
                 durable_progress.notify_one();
                 Ok(None)
+            }
+            Err(error @ ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { .. })) => {
+                // No original receipt exists: leave the active owner and its
+                // handoff intact for the original cancellation/drain path.
+                Err(error)
             }
             Ok(value) => Ok(Some(value)),
             Err(ExecutionRunnerError::Executor(error)) => {
@@ -2945,12 +3553,20 @@ impl ExecutionGraphRunner {
             }
             owner.cancel_outcome.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).polled = true;
         }
+        let mut original_unknown = None;
+        let mut commits = self.state_store.subscribe_commits();
         let outcome = if let Some(deadline_at_ms) = deadline_at_ms {
             let remaining = Duration::from_millis(deadline_at_ms.saturating_sub(now_ms()));
-            tokio::select! {
-                biased;
-                outcome = executor.poll_or_await(&ticket) => outcome,
-                () = tokio::time::sleep(remaining) => {
+            let result = tokio::time::timeout(remaining, poll_with_original_custody(
+                self, expected_binding, &executor, &ticket, &mut commits, &self.resource_manager, &mut original_unknown,
+            )).await;
+            match result {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    if let Some(error) = original_unknown.take() {
+                        let error = drain_original_unknown(&executor, &ticket, error).await;
+                        return Err(ExecutionRunnerError::Executor(error));
+                    }
                     if executor.cancellation_requires_quiescence(&ticket) {
                         self.active_cancel_observed(graph_id,&executor,&ticket).await?;
                     } else {
@@ -2973,7 +3589,7 @@ impl ExecutionGraphRunner {
                 }
             }
         } else {
-            execute_node_under_ceiling(&executor, &ticket).await
+            execute_node_under_ceiling(self, expected_binding, &executor, &ticket, &mut commits, &self.resource_manager).await
         };
         let node_duration_ms = resource_started
             .elapsed()
@@ -4119,8 +4735,12 @@ fn node_execution_ceiling() -> std::time::Duration {
 /// stopped making progress is cancelled with an explicit summary instead of
 /// hanging the turn forever.
 async fn execute_node_under_ceiling(
+    runner: &ExecutionGraphRunner,
+    expected_binding: Option<&ExecutionNodeBinding>,
     executor: &Arc<dyn NodeExecutor>,
     ticket: &NodeExecutionTicket,
+    commits: &mut tokio::sync::watch::Receiver<u64>,
+    resources: &ExecutionResourceManager,
 ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
     let ceiling = node_execution_ceiling();
     let started = std::time::Instant::now();
@@ -4138,9 +4758,15 @@ async fn execute_node_under_ceiling(
         ceiling_ms,
         "node execution entered bounded ceiling"
     );
-    match tokio::time::timeout(ceiling, executor.poll_or_await(ticket)).await {
+    let mut original_unknown = None;
+    match tokio::time::timeout(ceiling, poll_with_original_custody(
+        runner, expected_binding, executor, ticket, commits, resources, &mut original_unknown,
+    )).await {
         Ok(outcome) => outcome,
         Err(_) => {
+            if let Some(error) = original_unknown {
+                return Err(drain_original_unknown(executor, ticket, error).await);
+            }
             tracing::warn!(
                 graph_id = ticket.graph_id,
                 node_id = ticket.node_id,
@@ -4162,6 +4788,58 @@ async fn execute_node_under_ceiling(
                 .await;
             }
             Ok(deadline_exceeded_outcome(&ticket.node_id, deadline_at_ms))
+        }
+    }
+}
+
+async fn drain_original_unknown(
+    executor: &Arc<dyn NodeExecutor>, ticket: &NodeExecutionTicket, original: NodeExecutorError,
+) -> NodeExecutorError {
+    let result = if executor.cancellation_requires_quiescence(ticket) {
+        executor.cancel_bounded(ticket, PHYSICAL_CLOSURE_BUDGET).await.map_err(|error| error.to_string())
+    } else {
+        match tokio::time::timeout(PHYSICAL_CLOSURE_BUDGET,
+            executor.cancel_bounded(ticket, PHYSICAL_CLOSURE_BUDGET)).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err("original cancellation drain budget expired".into()),
+        }
+    };
+    match result {
+        Ok(()) => original,
+        Err(error) => NodeExecutorError::OriginalCustodyUnknown {
+            node_id: ticket.node_id.clone(), reason: format!("{original}; original cancellation drain unconfirmed: {error}"),
+        },
+    }
+}
+
+async fn poll_with_original_custody(
+    runner: &ExecutionGraphRunner, expected_binding: Option<&ExecutionNodeBinding>,
+    executor: &Arc<dyn NodeExecutor>, ticket: &NodeExecutionTicket,
+    commits: &mut tokio::sync::watch::Receiver<u64>, resources: &ExecutionResourceManager,
+    original_unknown: &mut Option<NodeExecutorError>,
+) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+    match executor.poll_or_await(ticket).await {
+        Err(error @ NodeExecutorError::OriginalCustodyUnknown { .. }) => *original_unknown = Some(error),
+        result => return result,
+    }
+    loop {
+        if runner.command_intent_waiter(&ticket.graph_id).is_some()
+            || !runner.active_binding_matches(&ticket.graph_id, &ticket.node_id, expected_binding).await
+        {
+            return Err(NodeExecutorError::OriginalCustodyUnknown {
+                node_id: ticket.node_id.clone(), reason: "original custody handed to cancellation or replaced binding".into(),
+            });
+        }
+        match executor.reconcile_original_custody(ticket).await {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {},
+            Err(error) => *original_unknown = Some(NodeExecutorError::OriginalCustodyUnknown {
+                node_id: ticket.node_id.clone(), reason: format!("original custody reconciliation unavailable: {error}"),
+            }),
+        }
+        tokio::select! {
+            changed = commits.changed() => { if changed.is_err() { resources.wait_for_change().await; } },
+            () = resources.wait_for_change() => {},
         }
     }
 }
@@ -4396,7 +5074,8 @@ fn executor_error_node_id(error: &NodeExecutorError) -> &str {
         | NodeExecutorError::Poll { node_id, .. }
         | NodeExecutorError::Cancel { node_id, .. }
         | NodeExecutorError::Recover { node_id, .. }
-        | NodeExecutorError::Uncertain { node_id, .. } => node_id,
+        | NodeExecutorError::Uncertain { node_id, .. }
+        | NodeExecutorError::OriginalCustodyUnknown { node_id, .. } => node_id,
     }
 }
 
@@ -5136,14 +5815,40 @@ mod nodispatch_duration_617_tests {
         let retained = active.get(&(graph.clone(), node_id.clone())).unwrap();
         assert_eq!(retained.binding, binding);
         assert!(retained.resources.lock().unwrap().owner_fence.is_some());
+        assert!(retained.callback_completed);
+        let ticket = retained.ticket.clone();
+        let executor = Arc::clone(&retained.executor);
         drop(active);
+        assert!(runner.original_terminal_cleanup_handoff(&graph, &ticket, &executor)
+            .await.unwrap().is_none());
+        let foreign_executor: Arc<dyn NodeExecutor> = Arc::new(ClosureProbeExecutor);
+        assert!(runner.original_terminal_cleanup_handoff(&graph, &ticket, &foreign_executor)
+            .await.is_err());
+        runner.complete_callback_observed(&graph, &executor, &ticket, None)
+            .await.unwrap();
+        assert!(runner.original_terminal_cleanup_handoff(&graph, &ticket, &executor)
+            .await.unwrap().is_none());
         *runner.closure_probe.lock().unwrap() = None;
         *runner.closure_finished_probe.lock().unwrap() = None;
+        let captured = {
+            let active = runner.active.lock().await;
+            let owner = active.get(&(graph.clone(), node_id.clone())).unwrap();
+            (owner.binding.clone(), Arc::clone(&owner.callback_gate), Arc::clone(&owner.cancel_outcome))
+        };
+        let unconfirmed = Arc::new(CancelOutcomeHandoff::default());
+        assert!(runner.original_terminal_cleanup_captured(
+            &graph, &ticket, &executor, (binding.clone(), Arc::clone(&captured.1), Arc::clone(&unconfirmed)),
+        ).await.is_err());
         assert!(runner
             .take_bound_active_node(&graph, &node_id, Some(&binding))
             .await
             .unwrap()
             .is_some());
+        assert!(runner.original_terminal_cleanup_captured(
+            &graph, &ticket, &executor, (binding.clone(), Arc::clone(&captured.1), unconfirmed),
+        ).await.is_err());
+        assert!(runner.original_terminal_cleanup_captured(&graph, &ticket, &executor, captured)
+            .await.unwrap().is_none());
         assert!(runner
             .take_bound_active_node(&graph, &node_id, Some(&binding))
             .await
@@ -5196,6 +5901,13 @@ mod nodispatch_duration_617_tests {
             context: NodeExecutionContext,
         ) -> Result<NodeExecutionTicket, NodeExecutorError> {
             self.inner.start(context).await
+        }
+
+        fn prepare_original_binding(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            self.inner.prepare_original_binding(ticket)
+        }
+        fn rollback_original_binding(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            self.inner.rollback_original_binding(ticket)
         }
 
         async fn poll_or_await(
@@ -5358,6 +6070,49 @@ mod nodispatch_duration_617_tests {
         wrapper.cancellation_finalized(&ticket);
         assert_eq!(inner.finalized.load(Ordering::SeqCst), 1);
         assert_eq!(wrapper.recover(&ticket).await, inner.recover(&ticket).await);
+    }
+
+    #[tokio::test]
+    async fn retained_original_callback_does_not_accept_a_missing_owner() {
+        let (_workspace, _services, runner, graph_id, _prepared, _backend) =
+            original_prepared617().await;
+        assert!(runner.settle_retained_original_callback(&graph_id, "missing-node", 1, |_| Ok(true), |_, _| Ok(true))
+            .await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_original_callback_does_not_accept_an_uncommitted_outcome() {
+        let (_workspace, _services, runner, graph_id, prepared, _backend) =
+            original_prepared617().await;
+        let binding = prepared.binding.clone().unwrap();
+        let (node_id, _outcome) = runner.start_and_execute_node(
+            &graph_id, prepared.node, Some(&binding),
+        ).await.unwrap();
+        let ticket = runner.active.lock().await.get(&(graph_id.clone(), node_id.clone()))
+            .unwrap().ticket.clone();
+        assert!(runner.settle_retained_original_callback(&graph_id, &node_id, ticket.attempt, |_| Ok(true), |_, _| Ok(true))
+            .await.unwrap().is_none());
+        assert!(!runner.active.lock().await.get(&(graph_id, node_id)).unwrap().callback_completed);
+    }
+
+    #[tokio::test]
+    async fn a8_pump_drain_does_not_accept_missing_or_replaced_owner() {
+        let (_workspace, _services, runner, graph_id, prepared, _) = original_prepared617().await;
+        let node_id = prepared.node.id.clone();
+        let missing = BTreeSet::from([node_id.clone(), "missing-original-node".to_string()]);
+        let (owners, absent) = runner.capture_pump_cancellation_owners(&graph_id, &missing).await;
+        assert!(absent);
+        assert_eq!(owners.len(), 1);
+        let original = {
+            let mut active = runner.active.lock().await;
+            let owner = active.get_mut(&(graph_id.clone(), node_id.clone())).unwrap();
+            let original = owner.binding.clone();
+            owner.binding.attempt = owner.binding.attempt.saturating_add(1);
+            original
+        };
+        let error = runner.drain_pump_cancellation_owners(&graph_id, owners).await.unwrap_err();
+        assert!(error.to_string().contains("original cancellation owner changed"));
+        runner.active.lock().await.get_mut(&(graph_id, node_id)).unwrap().binding = original;
     }
 
     async fn original_prepared617() -> (

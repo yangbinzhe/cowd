@@ -165,7 +165,29 @@ pub struct SessionInputRouteReport {
     pub materialized: usize,
     pub retry_scheduled: usize,
     pub blocked: usize,
+    /// Receipts whose status is not one this router produces. An unknown
+    /// status is never counted as blocked: it is counted here, so a status
+    /// nobody knows about cannot be read as a refusal.
+    #[serde(default)]
+    pub unknown: usize,
     pub receipts: Vec<SessionInputRouteReceipt>,
+}
+
+impl SessionInputRouteReport {
+    /// Count one receipt into the bucket its status names.
+    ///
+    /// The buckets this router produces each have their own arm. A status
+    /// nobody produces is counted in its own bucket: the blocked bucket
+    /// holds the named blocked status only, so a status nobody knows about
+    /// can never be read as a refusal.
+    pub(crate) fn count_receipt(&mut self, status: &str) {
+        match status {
+            "materialized" => self.materialized += 1,
+            "retry_scheduled" => self.retry_scheduled += 1,
+            "blocked_ack" => self.blocked += 1,
+            _ => self.unknown += 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +228,90 @@ pub struct SessionExecutionFence {
     input_sequence: usize,
     claim_owner: String,
     claim_token: String,
+    claim_fence_epoch: Option<u64>,
 }
+
+/// Which durable fact of the Session claim failed the fence.
+///
+/// The verdict is a type, not a sentence: a refusal names the fact that was
+/// not ours, so the same seam can attribute a refusal without a new field
+/// family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionExecutionFenceConjunction {
+    /// The returned record is not the captured request.
+    RequestIdentity,
+    /// The record is not the Session this fence was captured for.
+    SessionIdentity,
+    /// The record's Session generation is not the captured one.
+    Generation,
+    /// The record is not the captured input sequence.
+    Sequence,
+    /// The claim is not held under the captured owner.
+    ClaimOwner,
+    /// The claim is not held under the captured token.
+    ClaimToken,
+    /// The claim carries no fence epoch.
+    ClaimFenceEpoch,
+    /// The input record is not a live claim.
+    ClaimStatus,
+    /// The claim's lease has expired.
+    ClaimLease,
+}
+
+/// Whether the durable record is still this fence's own.
+///
+/// The ownership question is answered on its own, so that a released claim
+/// with cleared claim fields is distinguishable from a live claim, without
+/// asserting who released it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionExecutionFenceOwnership {
+    /// The captured claim is live under the captured owner and token.
+    Live,
+    /// This record is not the one the fence was captured for.
+    Foreign,
+    /// Another holder owns the claim.
+    TakenOver,
+    /// The claim fields are absent; the releasing owner is not established.
+    Released,
+}
+
+/// The fence's verdict over one durable input record.
+///
+/// `failed` names the conjunction that refused; `None` means the record is
+/// ours and this phase may start its side effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionExecutionFenceVerdict {
+    /// Whether the record is still ours.
+    pub ownership: SessionExecutionFenceOwnership,
+    /// The conjunction that refused, when it refused.
+    pub failed: Option<SessionExecutionFenceConjunction>,
+}
+
+/// A local Session fence decision, preserving whether the facts were readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionExecutionFenceError {
+    Refused {
+        phase: SessionExecutionFencePhase,
+        verdict: SessionExecutionFenceVerdict,
+        message: String,
+    },
+    Unavailable {
+        phase: SessionExecutionFencePhase,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for SessionExecutionFenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { message, .. } | Self::Unavailable { message, .. } => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionExecutionFenceError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionExecutionFenceSnapshot {
@@ -262,7 +367,154 @@ impl SessionExecutionFence {
             input_sequence,
             claim_owner,
             claim_token,
+            claim_fence_epoch: None,
         })
+    }
+
+    pub(crate) fn matches_ingress(&self, ingress: &crate::TurnIngressRef) -> bool {
+        self.request_id == ingress.request_id
+            && self.session_id == ingress.session_id
+            && self.generation == ingress.session_generation
+            && usize::try_from(ingress.input_sequence).ok() == Some(self.input_sequence)
+            && self.claim_owner == ingress.claim_owner
+            && self.claim_token == ingress.claim_token
+            && ingress.claim_revision != 0
+    }
+
+    /// Bind the immutable epoch captured by the original ingress.
+    pub(crate) fn with_claim_fence_epoch(mut self, epoch: u64) -> Self {
+        self.claim_fence_epoch = Some(epoch);
+        self
+    }
+
+    /// Classify one durable input record against this fence.
+    ///
+    /// This is the fence's whole judgment, without the read: the ownership
+    /// question ("is this record still ours?") and the phase admission
+    /// question ("may this phase start a side effect now?") are answered
+    /// separately, and the conjunction that refused is named.
+    ///
+    /// The acceptance set is exactly the one the fence has always had: the
+    /// captured claim has to be live under the captured owner and token, the
+    /// record has to be a live claim, and the lease has to be unexpired. The
+    /// classification only says *why* a record is not ours; it never admits
+    /// one.
+    pub(crate) fn classify(
+        &self,
+        record: &crate::RuntimeSessionInputRecord,
+    ) -> SessionExecutionFenceVerdict {
+        if record.request_id != self.request_id {
+            return SessionExecutionFenceVerdict {
+                ownership: SessionExecutionFenceOwnership::Foreign,
+                failed: Some(SessionExecutionFenceConjunction::RequestIdentity),
+            };
+        }
+        let verdict = Self::classify_claim(
+            &self.session_id,
+            self.generation,
+            self.input_sequence,
+            &self.claim_owner,
+            &self.claim_token,
+            record,
+        );
+        if verdict.failed.is_none()
+            && self.claim_fence_epoch.is_some()
+            && record.claim_fence_epoch != self.claim_fence_epoch
+        {
+            return SessionExecutionFenceVerdict {
+                ownership: SessionExecutionFenceOwnership::TakenOver,
+                failed: Some(SessionExecutionFenceConjunction::ClaimFenceEpoch),
+            };
+        }
+        verdict
+    }
+
+    /// The same judgment, over the captured identity alone.
+    ///
+    /// The identity is passed in rather than taken from the fence, so that
+    /// the judgment can be exercised as a type over a record without a
+    /// durable read behind it.
+    pub(crate) fn classify_claim(
+        session_id: &str,
+        generation: u64,
+        input_sequence: usize,
+        claim_owner: &str,
+        claim_token: &str,
+        record: &crate::RuntimeSessionInputRecord,
+    ) -> SessionExecutionFenceVerdict {
+        let refuse = |ownership: SessionExecutionFenceOwnership,
+                      failed: SessionExecutionFenceConjunction| {
+            SessionExecutionFenceVerdict {
+                ownership,
+                failed: Some(failed),
+            }
+        };
+        if record.session_id != session_id {
+            return refuse(
+                SessionExecutionFenceOwnership::Foreign,
+                SessionExecutionFenceConjunction::SessionIdentity,
+            );
+        }
+        if record.session_generation != generation {
+            return refuse(
+                SessionExecutionFenceOwnership::Foreign,
+                SessionExecutionFenceConjunction::Generation,
+            );
+        }
+        if record.sequence != input_sequence {
+            return refuse(
+                SessionExecutionFenceOwnership::Foreign,
+                SessionExecutionFenceConjunction::Sequence,
+            );
+        }
+        let ownership = if record.claim_owner.as_deref() == Some(claim_owner) {
+            if record.claim_token.as_deref() != Some(claim_token) {
+                return refuse(
+                    SessionExecutionFenceOwnership::TakenOver,
+                    SessionExecutionFenceConjunction::ClaimToken,
+                );
+            }
+            if record.claim_fence_epoch.is_none() {
+                return refuse(
+                    SessionExecutionFenceOwnership::Live,
+                    SessionExecutionFenceConjunction::ClaimFenceEpoch,
+                );
+            }
+            SessionExecutionFenceOwnership::Live
+        } else if record.claim_owner.is_none()
+            && record.claim_token.is_none()
+            && record.claim_fence_epoch.is_none()
+        {
+            // Cleared fields alone do not identify which claimant released it.
+            SessionExecutionFenceOwnership::Released
+        } else {
+            SessionExecutionFenceOwnership::TakenOver
+        };
+        if ownership != SessionExecutionFenceOwnership::Live {
+            return refuse(ownership, SessionExecutionFenceConjunction::ClaimOwner);
+        }
+        if !matches!(
+            record.status,
+            SessionRuntimeInputStatus::Claimed | SessionRuntimeInputStatus::Running
+        ) {
+            return refuse(
+                SessionExecutionFenceOwnership::Live,
+                SessionExecutionFenceConjunction::ClaimStatus,
+            );
+        }
+        if !record
+            .claim_expires_at_ms
+            .is_some_and(|deadline| deadline > now_ms())
+        {
+            return refuse(
+                SessionExecutionFenceOwnership::Live,
+                SessionExecutionFenceConjunction::ClaimLease,
+            );
+        }
+        SessionExecutionFenceVerdict {
+            ownership,
+            failed: None,
+        }
     }
 
     pub async fn verify(
@@ -280,39 +532,154 @@ impl SessionExecutionFence {
                     self.request_id
                 )
             })?;
-        let claim_is_current = record.session_id == self.session_id
-            && record.session_generation == self.generation
-            && record.sequence == self.input_sequence
-            && record.claim_owner.as_deref() == Some(self.claim_owner.as_str())
-            && record.claim_token.as_deref() == Some(self.claim_token.as_str())
-            && record.claim_fence_epoch.is_some()
-            && matches!(
+        let verdict = self.classify(&record);
+        if let Some(conjunction) = verdict.failed {
+            return Err(format!(
+                "Session execution fence rejected {phase:?}: request={} session={} generation={} status={:?} conjunction={conjunction:?} ownership={:?}",
+                self.request_id,
+                self.session_id,
+                self.generation,
                 record.status,
-                SessionRuntimeInputStatus::Claimed | SessionRuntimeInputStatus::Running
-            )
-            && record
-                .claim_expires_at_ms
-                .is_some_and(|deadline| deadline > now_ms());
-        if claim_is_current {
-            let claim_fence_epoch = record.claim_fence_epoch.ok_or_else(|| {
-                format!(
-                    "Session execution fence rejected {phase:?}: current claim has no fence epoch"
-                )
-            })?;
-            Ok(SessionExecutionFenceSnapshot {
-                request_id: self.request_id.clone(),
-                session_id: self.session_id.clone(),
-                session_generation: self.generation,
-                claim_owner: self.claim_owner.clone(),
-                claim_token: self.claim_token.clone(),
-                claim_fence_epoch,
-            })
-        } else {
-            Err(format!(
-                "Session execution fence rejected {phase:?}: request={} session={} generation={} status={:?}",
-                self.request_id, self.session_id, self.generation, record.status
-            ))
+                verdict.ownership
+            ));
         }
+        let claim_fence_epoch = record.claim_fence_epoch.ok_or_else(|| {
+            format!("Session execution fence rejected {phase:?}: current claim has no fence epoch")
+        })?;
+        Ok(SessionExecutionFenceSnapshot {
+            request_id: self.request_id.clone(),
+            session_id: self.session_id.clone(),
+            session_generation: self.generation,
+            claim_owner: self.claim_owner.clone(),
+            claim_token: self.claim_token.clone(),
+            claim_fence_epoch,
+        })
+    }
+
+    /// Verify this provider phase against the current original Session claim.
+    /// A released claim is not evidence that the original owner released it.
+    pub(crate) async fn verify_attempt(
+        &self,
+        phase: SessionExecutionFencePhase,
+        _member_execution_id: &str,
+    ) -> Result<SessionExecutionFenceSnapshot, SessionExecutionFenceError> {
+        let record = self
+            .query
+            .runtime_input(&self.request_id)
+            .await
+            .map_err(|error| SessionExecutionFenceError::Unavailable {
+                phase,
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| SessionExecutionFenceError::Unavailable {
+                phase,
+                message: format!(
+                    "Session execution fence rejected {phase:?}: request {} no longer exists",
+                    self.request_id
+                ),
+            })?;
+        let verdict = self.classify(&record);
+        if let Some(conjunction) = verdict.failed {
+            return Err(self.typed_refusal(phase, &record, verdict, conjunction));
+        }
+        let Some(expected_epoch) = self.claim_fence_epoch.filter(|epoch| *epoch != 0) else {
+            return Err(SessionExecutionFenceError::Unavailable {
+                phase,
+                message: format!(
+                    "Session execution fence rejected {phase:?}: original claim epoch unavailable"
+                ),
+            });
+        };
+        if record.claim_fence_epoch != Some(expected_epoch) {
+            return Err(self.typed_refusal(
+                phase,
+                &record,
+                verdict,
+                SessionExecutionFenceConjunction::ClaimFenceEpoch,
+            ));
+        }
+        let admission = self
+            .query
+            .input_admission(&self.session_id)
+            .await
+            .map_err(|error| SessionExecutionFenceError::Unavailable {
+                phase,
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| SessionExecutionFenceError::Unavailable {
+                phase,
+                message: format!(
+                    "Session execution fence rejected {phase:?}: Session admission unavailable"
+                ),
+            })?;
+        if admission.session_id != self.session_id || admission.generation != self.generation {
+            return Err(self.typed_refusal(
+                phase,
+                &record,
+                verdict,
+                SessionExecutionFenceConjunction::Generation,
+            ));
+        }
+        if !admission.open {
+            return Err(self.typed_refusal(
+                phase,
+                &record,
+                verdict,
+                SessionExecutionFenceConjunction::ClaimStatus,
+            ));
+        }
+        let claim_fence_epoch =
+            record
+                .claim_fence_epoch
+                .ok_or_else(|| SessionExecutionFenceError::Unavailable {
+                    phase,
+                    message: format!(
+                    "Session execution fence rejected {phase:?}: current claim has no fence epoch"
+                ),
+                })?;
+        Ok(SessionExecutionFenceSnapshot {
+            request_id: self.request_id.clone(),
+            session_id: self.session_id.clone(),
+            session_generation: self.generation,
+            claim_owner: self.claim_owner.clone(),
+            claim_token: self.claim_token.clone(),
+            claim_fence_epoch,
+        })
+    }
+
+    fn typed_refusal(
+        &self,
+        phase: SessionExecutionFencePhase,
+        record: &crate::RuntimeSessionInputRecord,
+        verdict: SessionExecutionFenceVerdict,
+        conjunction: SessionExecutionFenceConjunction,
+    ) -> SessionExecutionFenceError {
+        SessionExecutionFenceError::Refused {
+            phase,
+            verdict: SessionExecutionFenceVerdict {
+                failed: Some(conjunction),
+                ..verdict
+            },
+            message: self.refusal(phase, record, verdict, conjunction),
+        }
+    }
+
+    /// The refusal text, with the conjunction that refused named.
+    fn refusal(
+        &self,
+        phase: SessionExecutionFencePhase,
+        record: &crate::RuntimeSessionInputRecord,
+        verdict: SessionExecutionFenceVerdict,
+        conjunction: SessionExecutionFenceConjunction,
+    ) -> String {
+        format!(
+            "Session execution fence rejected {phase:?}: request={} session={} generation={} status={:?} conjunction={conjunction:?} ownership={:?}",
+            record.request_id,
+            record.session_id,
+            self.generation,
+            record.status,
+            verdict.ownership
+        )
     }
 }
 
@@ -448,6 +815,7 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
             original_replayed_actions: Vec::new(),
             original_agent_child: None,
             original_terminal_owner: None,
+            original_synthesize_replan: None,
             domain_events: vec![RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
                     stream_id: format!("session-dispatch:{}", ticket.idempotency_key),
@@ -1124,12 +1492,9 @@ impl SessionInputRouter {
             };
             report.receipts.push(receipt);
         }
-        for receipt in &report.receipts {
-            match receipt.status.as_str() {
-                "materialized" => report.materialized += 1,
-                "retry_scheduled" => report.retry_scheduled += 1,
-                _ => report.blocked += 1,
-            }
+        for index in 0..report.receipts.len() {
+            let status = report.receipts[index].status.clone();
+            report.count_receipt(&status);
         }
         Ok(report)
     }
@@ -1264,6 +1629,35 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 1131-P1: every status this router produces is counted in its own
+    /// bucket, and the existing buckets keep their meaning.
+    #[test]
+    fn a8_1131_each_produced_status_is_counted_in_its_own_bucket() {
+        let mut report = SessionInputRouteReport::default();
+        report.count_receipt("materialized");
+        report.count_receipt("retry_scheduled");
+        report.count_receipt("blocked_ack");
+        assert_eq!(report.materialized, 1);
+        assert_eq!(report.retry_scheduled, 1);
+        assert_eq!(report.blocked, 1);
+        assert_eq!(report.unknown, 0);
+    }
+
+    /// 1131-N1: an unknown status is counted in its own bucket and never in
+    /// the blocked bucket. A status nobody produces is not a refusal.
+    #[test]
+    fn a8_1131_an_unknown_receipt_status_is_not_counted_as_blocked() {
+        let mut report = SessionInputRouteReport::default();
+        report.count_receipt("materialized");
+        report.count_receipt("a_status_nobody_produces");
+        assert_eq!(
+            report.blocked, 0,
+            "an unknown receipt status must not be counted as blocked"
+        );
+        assert_eq!(report.unknown, 1);
+        assert_eq!(report.materialized, 1);
+    }
+
     use crate::RuntimeServices;
     use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeStatus};
     use session::SessionRecord;
@@ -2141,5 +2535,175 @@ mod tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod fence_verdict_tests {
+    use super::{
+        SessionExecutionFenceConjunction, SessionExecutionFenceOwnership,
+        SessionExecutionFenceVerdict,
+    };
+    use crate::RuntimeSessionInputRecord;
+    use harness_contract::turn::InputRoutingDecision;
+
+    /// The durable record of one Session input, live under one claim.
+    fn live_record() -> RuntimeSessionInputRecord {
+        RuntimeSessionInputRecord {
+            input_id: "input-1".into(),
+            request_id: "request-1".into(),
+            turn_id: "turn-1".into(),
+            message_id: "message-1".into(),
+            session_id: "session-1".into(),
+            sequence: 9,
+            session_generation: 4,
+            decision: InputRoutingDecision::StartNewTurn,
+            target_turn_id: Some("turn-1".into()),
+            classification_json: None,
+            task_route_hint: None,
+            status: crate::RuntimeSessionInputStatus::Running,
+            runtime_commit_cursor: None,
+            attempts: 1,
+            next_attempt_at_ms: 0,
+            claim_owner: Some("owner-1".into()),
+            claim_token: Some("token-1".into()),
+            claim_fence_epoch: Some(2),
+            claim_expires_at_ms: Some(crate::tool_invocation::now_ms() + 600_000),
+            failure_class: None,
+            last_error: None,
+            revision: 2,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            terminal_at_ms: None,
+            runtime_options_json: None,
+            application_receipt: None,
+        }
+    }
+
+    fn classify(record: &RuntimeSessionInputRecord) -> SessionExecutionFenceVerdict {
+        super::SessionExecutionFence::classify_claim(
+            "session-1",
+            4,
+            9,
+            "owner-1",
+            "token-1",
+            record,
+        )
+    }
+
+    /// The fence's own judgment over one durable record, as a type.
+    #[test]
+    fn a_live_claim_under_our_owner_is_ours() {
+        let verdict = classify(&live_record());
+        assert_eq!(verdict.ownership, SessionExecutionFenceOwnership::Live);
+        assert_eq!(verdict.failed, None);
+    }
+
+    /// Every conjunction the fence has always checked is still named, and
+    /// every one of them still refuses.
+    #[test]
+    fn every_conjunction_is_named_and_refuses() {
+        let mut foreign_session = live_record();
+        foreign_session.session_id = "session-other".into();
+        assert_eq!(
+            classify(&foreign_session).failed,
+            Some(SessionExecutionFenceConjunction::SessionIdentity)
+        );
+        let mut foreign_generation = live_record();
+        foreign_generation.session_generation = 5;
+        assert_eq!(
+            classify(&foreign_generation).failed,
+            Some(SessionExecutionFenceConjunction::Generation)
+        );
+        let mut foreign_sequence = live_record();
+        foreign_sequence.sequence = 10;
+        assert_eq!(
+            classify(&foreign_sequence).failed,
+            Some(SessionExecutionFenceConjunction::Sequence)
+        );
+        let mut foreign_owner = live_record();
+        foreign_owner.claim_owner = Some("owner-other".into());
+        assert_eq!(
+            classify(&foreign_owner).failed,
+            Some(SessionExecutionFenceConjunction::ClaimOwner)
+        );
+        let mut foreign_token = live_record();
+        foreign_token.claim_token = Some("token-other".into());
+        assert_eq!(
+            classify(&foreign_token).failed,
+            Some(SessionExecutionFenceConjunction::ClaimToken)
+        );
+        let mut no_epoch = live_record();
+        no_epoch.claim_fence_epoch = None;
+        assert_eq!(
+            classify(&no_epoch).failed,
+            Some(SessionExecutionFenceConjunction::ClaimFenceEpoch)
+        );
+        let mut terminal = live_record();
+        terminal.status = crate::RuntimeSessionInputStatus::Completed;
+        assert_eq!(
+            classify(&terminal).failed,
+            Some(SessionExecutionFenceConjunction::ClaimStatus)
+        );
+        let mut expired = live_record();
+        expired.claim_expires_at_ms = Some(crate::tool_invocation::now_ms() - 1);
+        assert_eq!(
+            classify(&expired).failed,
+            Some(SessionExecutionFenceConjunction::ClaimLease)
+        );
+    }
+
+    /// Negative control: the fence is not widened. A claim that another
+    /// holder took over, and a claim our own ingress released, are both
+    /// still refused - the classification says which one it was, and the
+    /// refusal does not change.
+    #[test]
+    fn a_taken_over_or_released_claim_is_still_refused() {
+        let mut taken_over = live_record();
+        taken_over.claim_owner = Some("owner-other".into());
+        taken_over.claim_token = Some("token-other".into());
+        let verdict = classify(&taken_over);
+        assert_eq!(verdict.ownership, SessionExecutionFenceOwnership::TakenOver);
+        assert_eq!(
+            verdict.failed,
+            Some(SessionExecutionFenceConjunction::ClaimOwner)
+        );
+
+        // Our own ingress execution acked the record and released the claim
+        // with it: the claim fields are cleared and the status is Completed.
+        let mut released = live_record();
+        released.status = crate::RuntimeSessionInputStatus::Completed;
+        released.claim_owner = None;
+        released.claim_token = None;
+        released.claim_fence_epoch = None;
+        released.claim_expires_at_ms = None;
+        released.terminal_at_ms = Some(1);
+        released.runtime_commit_cursor = Some(1);
+        let verdict = classify(&released);
+        assert_eq!(verdict.ownership, SessionExecutionFenceOwnership::Released);
+        assert_eq!(
+            verdict.failed,
+            Some(SessionExecutionFenceConjunction::ClaimOwner)
+        );
+    }
+
+    /// Negative control: the in-turn checks still refuse an illegal
+    /// identity. A record of another Session, another generation or another
+    /// input sequence is not ours, however live its claim is.
+    #[test]
+    fn an_illegal_identity_is_refused_however_live_its_claim_is() {
+        for mutate in [
+            (|record: &mut RuntimeSessionInputRecord| record.session_id = "session-other".into())
+                as fn(&mut RuntimeSessionInputRecord),
+            |record: &mut RuntimeSessionInputRecord| record.session_generation = 9,
+            |record: &mut RuntimeSessionInputRecord| record.sequence = 11,
+        ] {
+            let mut record = live_record();
+            record.claim_expires_at_ms = Some(crate::tool_invocation::now_ms() + 600_000);
+            mutate(&mut record);
+            let verdict = classify(&record);
+            assert_eq!(verdict.ownership, SessionExecutionFenceOwnership::Foreign);
+            assert!(verdict.failed.is_some(), "an illegal identity must refuse");
+        }
     }
 }

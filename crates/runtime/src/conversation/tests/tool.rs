@@ -1314,6 +1314,7 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
         let backend = TurnModelStepBackend {
             ticket: ticket.clone(),
             stop: crate::CancellationToken::new(),
+            local_fence: std::sync::Mutex::new(None),
             runtime,
             state: state.clone(),
             services: services.clone(),
@@ -1479,6 +1480,7 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
             let backend = TurnModelStepBackend {
                 ticket: ticket.clone(),
                 stop: crate::CancellationToken::new(),
+                local_fence: std::sync::Mutex::new(None),
                 runtime,
                 state: Arc::new(tokio::sync::Mutex::new(branch_state)),
                 services: services.clone(),
@@ -1762,6 +1764,7 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
         let backend = TurnModelStepBackend {
             ticket: ticket.clone(),
             stop: crate::CancellationToken::new(),
+            local_fence: std::sync::Mutex::new(None),
             runtime,
             state: Arc::new(tokio::sync::Mutex::new(branch_state)),
             services: services.clone(),
@@ -2095,6 +2098,7 @@ async fn r1_event_replay_host_upstream_non_sources_do_not_emit() {
         let backend = TurnModelStepBackend {
             ticket: ticket.clone(),
             stop: crate::CancellationToken::new(),
+            local_fence: std::sync::Mutex::new(None),
             runtime,
             state: Arc::new(tokio::sync::Mutex::new(state)),
             services: services.clone(),
@@ -2366,6 +2370,73 @@ fn early_read_fingerprint_uses_canonical_tool_arguments_not_json_key_order() {
         early_tool_fingerprint(&left.tasks[0].invocation),
         early_tool_fingerprint(&right.tasks[0].invocation)
     );
+}
+
+#[tokio::test]
+async fn early_original_predispatch_deferral_retains_owner_and_rejects_drift() {
+    use crate::conversation::{EarlyToolCandidate, EarlyToolDispatchResult, EarlyToolDispatcher};
+    use crate::execution_core::graph::{NodeExecutor, executors::ScopedNodeBackend};
+
+    let services = crate::RuntimeServices::in_memory().unwrap();
+    let session = Session::new();
+    let session_id = session.session_id.clone();
+    let (graph, ticket) = r1_branch_graph(&services, &session_id, vec![], ExecutionNodeKind::InlineModel);
+    let goal_id = r1_branch_goal(&services, &session_id);
+    let (runtime, state, _scope) = r1_observation_branch_runtime(
+        session, FinalAnswerClient, &services, &graph, &goal_id,
+    );
+    services.model_step_executor().prepare_original_binding(&ticket).unwrap();
+    let dispatcher = {
+        let runtime = runtime.lock().await;
+        HostEarlyToolDispatcher {
+            tool_executor: Arc::clone(runtime.tool_executor()), services: Arc::clone(&services),
+            event_bus: runtime.cowd_bus().cloned(), ticket: ticket.clone(), session_id,
+            memory_context: runtime.memory_turn_context(), reality_context: runtime.reality_data_lease(),
+            model_lease: None, observation_wave_sequence: 1,
+            decision: runtime.active_turn_strategy().unwrap().decision,
+            permission_policy: runtime.permission_policy().clone(),
+            authorization_negotiator: runtime.authorization_negotiator(),
+            timeout: std::time::Duration::from_secs(60),
+            early_read_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    };
+    let candidate = EarlyToolCandidate {
+        call: ModelToolCall { binding: None, id: "early-original".into(), name: "read_file".into(),
+            input: "{".into(), depends_on: Vec::new() },
+        identity: crate::CausalItemIdentity { model_step_id: "original-step".into(), item_id: "early-original".into(),
+            segment_id: "original-segment".into(), causal_sequence: 1, delta_sequence: 0,
+            tool_call_id: Some("early-original".into()), causal_parent_ids: Vec::new() },
+        ready_at_ms: 1,
+    };
+    let result = dispatcher.dispatch(candidate).await;
+    let EarlyToolDispatchResult::Deferred(original) = &result else {
+        panic!("malformed original read must return before dispatch: {result:?}");
+    };
+    let proof = original.original_undispatched.as_ref().expect("original worker retains its pre-dispatch proof");
+    assert_eq!(proof.ticket, ticket);
+    assert_eq!(proof.call_id, "early-original");
+    let backend = TurnModelStepBackend {
+        ticket: ticket.clone(), stop: crate::CancellationToken::new(),
+        local_fence: std::sync::Mutex::new(None), runtime, state: Arc::new(tokio::sync::Mutex::new(state)),
+        services: Arc::clone(&services),
+    };
+    assert!(backend.confirm_original_early_release(&ticket, &[("early-original".into(), result.clone())]).await.unwrap());
+    assert!(!backend.confirm_original_early_release(&ticket, &[("foreign".into(), result.clone())]).await.unwrap());
+    let mut missing = original.clone();
+    missing.original_undispatched = None;
+    assert!(!backend.confirm_original_early_release(&ticket, &[("early-original".into(), EarlyToolDispatchResult::Deferred(missing))]).await.unwrap());
+    let mut drifted = original.clone();
+    Arc::make_mut(drifted.original_undispatched.as_mut().unwrap()).identity.tool_call_id = Some("foreign".into());
+    assert!(!backend.confirm_original_early_release(&ticket, &[("early-original".into(), EarlyToolDispatchResult::Deferred(drifted))]).await.unwrap());
+    let unknown = EarlyToolDispatchResult::Failed(crate::conversation::EarlyToolFailure {
+        identity: crate::CausalItemIdentity { model_step_id: "original-step".into(), item_id: "early-original".into(),
+            segment_id: "original-segment".into(), causal_sequence: 1, delta_sequence: 0,
+            tool_call_id: Some("early-original".into()), causal_parent_ids: Vec::new() },
+        tool_call_id: "early-original".into(), owner_ticket: Some(ticket.clone()),
+        kind: crate::conversation::EarlyToolFailureKind::AuthorizationCommitUnknown,
+        detail: "original authorization result unknown".into(),
+    });
+    assert!(!backend.confirm_original_early_release(&ticket, &[("early-original".into(), unknown)]).await.unwrap());
 }
 
 #[test]
@@ -2858,7 +2929,7 @@ async fn r612_model_producer_rechecks_goal_and_uses_one_observation_cut() {
             session_generation: 1, input_sequence: 1, claim_owner: "r612-owner".into(),
             claim_token: "r612-claim".into(), claim_revision: 1, handoff_id: None,
         });
-        let backend = TurnModelStepBackend { ticket: ticket.clone(), stop: crate::CancellationToken::new(),
+        let backend = TurnModelStepBackend { ticket: ticket.clone(), stop: crate::CancellationToken::new(), local_fence: std::sync::Mutex::new(None),
             runtime, state: Arc::new(tokio::sync::Mutex::new(state)), services: services.clone() };
         let result = backend.execute(&ticket).await;
         if changed_goal {
@@ -2983,6 +3054,7 @@ fn standard_host_with_services(
             providers: HashMap::from([(
                 "test".to_string(),
                 crate::config::ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     // The test never submits a provider request. A closed
                     // loopback address keeps this fixture inert if a

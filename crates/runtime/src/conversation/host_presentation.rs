@@ -748,6 +748,87 @@ where
     }
 }
 
+/// A retry handle for this exact Synthesize producer; it retains no Runtime owner.
+struct OriginalSynthesizeRetry<C: ApiClient, T: ToolExecutor> {
+    ticket: NodeExecutionTicket,
+    runtime: std::sync::Weak<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
+    state: std::sync::Weak<tokio::sync::Mutex<TurnGraphState>>,
+    services: std::sync::Weak<crate::RuntimeServices>,
+    owner: std::sync::Weak<crate::execution_core::services::OriginalTerminalCommitOwner>,
+    retired: std::sync::Mutex<OriginalSynthesizeRetired>,
+}
+
+#[derive(Default)]
+struct OriginalSynthesizeRetired {
+    transferred: bool,
+    artifact: Option<PendingTerminalArtifact>,
+}
+
+#[async_trait]
+impl<C, T> crate::execution_core::graph::OriginalSynthesizeReplan for OriginalSynthesizeRetry<C, T>
+where C: ApiClient + Send + Sync + 'static, T: ToolExecutor {
+    async fn prepare(&self, ticket: &NodeExecutionTicket, original: &NodeExecutionOutcome) -> Result<NodeExecutionOutcome, String> {
+        if ticket != &self.ticket { return Err("original Synthesize retry ticket differs".into()); }
+        let owner = self.owner.upgrade().ok_or("original terminal owner unavailable")?;
+        if original.original_terminal_owner.as_ref().is_none_or(|candidate| !Arc::ptr_eq(&candidate.0, &owner)) {
+            return Err("original terminal outcome owner differs".into());
+        }
+        let runtime = self.runtime.upgrade().ok_or("original Synthesize runtime unavailable")?;
+        let state = self.state.upgrade().ok_or("original Synthesize state unavailable")?;
+        let services = self.services.upgrade().ok_or("original Synthesize services unavailable")?;
+        let (session, turn, goal, iteration) = {
+            let state = state.lock().await;
+            if state.authenticated_terminal_owner.as_ref().is_none_or(|current| !Arc::ptr_eq(current, &owner))
+                || !terminal_commit_owned_by(state.terminal_commit_owner.as_ref(), &ticket.node_id, ticket.attempt)
+            { return Err("original Synthesize state owner differs".into()); }
+            (state.session_id.clone(), state.turn_id.clone(), state.goal_id.clone(), state.iterations)
+        };
+        let next = dynamic_node(ticket, iteration, "terminal-source-replan", ExecutionNodeKind::InlineModel, "inline_model", "inline_model");
+        let mut candidate = NodeExecutionOutcome::new(completed_result(
+            Some(format!("{}:terminal-source-replan", ticket.graph_id)), ExecutionUsage::default(),
+        )).with_replan(ExecutionGraphReplan {
+            edges: dynamic_edges(&ticket.node_id, &[next.clone()]), nodes: vec![next],
+            reason: "Original terminal source changed; reassess current work".into(), framework_authored: true,
+        });
+        let backend = TurnSynthesizeBackend { runtime, state: Arc::clone(&state), services };
+        candidate = inherit_synthesize_sources(candidate,
+            &freeze_synthesize_goal_sources(backend.services.as_ref(), &session, &turn, &goal)?)?;
+        backend.stage_terminal_publication(ticket, &mut candidate).await?;
+        let state = state.lock().await;
+        if state.authenticated_terminal_owner.as_ref().is_none_or(|current| !Arc::ptr_eq(current, &owner))
+            || !terminal_commit_owned_by(state.terminal_commit_owner.as_ref(), &ticket.node_id, ticket.attempt)
+            || state.session_id != session || state.turn_id != turn
+        { return Err("original Synthesize state changed during retry preparation".into()); }
+        candidate.original_terminal_owner = original.original_terminal_owner.clone();
+        Ok(candidate)
+    }
+
+    async fn committed(&self, ticket: &NodeExecutionTicket, original: &NodeExecutionOutcome) -> Result<(), String> {
+        if ticket != &self.ticket { return Err("original Synthesize retry ticket differs".into()); }
+        let owner = self.owner.upgrade().ok_or("original terminal owner unavailable")?;
+        if original.original_terminal_owner.as_ref().is_none_or(|candidate| !Arc::ptr_eq(&candidate.0, &owner)) {
+            return Err("original terminal outcome owner differs".into());
+        }
+        if self.retired.lock().map_err(|_| "original prepared artifact custody unavailable")?.transferred { return Ok(()); }
+        let state = self.state.upgrade().ok_or("original Synthesize state unavailable")?;
+        let mut state = state.lock().await;
+        let mut retired = self.retired.lock().map_err(|_| "original prepared artifact custody unavailable")?;
+        if retired.transferred { return Ok(()); }
+        if state.authenticated_terminal_owner.as_ref().is_none_or(|current| !Arc::ptr_eq(current, &owner))
+            || !terminal_commit_owned_by(state.terminal_commit_owner.as_ref(), &ticket.node_id, ticket.attempt)
+        { return Err("original terminal owner changed before retry commit".into()); }
+        retired.artifact = state.pending_terminal_artifact.take();
+        state.authenticated_terminal_owner = None;
+        state.delivery_envelope = None;
+        state.terminal_presentation = None;
+        state.terminal_commit_owner = None;
+        state.committed_terminal_answer = None;
+        state.committed_terminal_completion = None;
+        retired.transferred = true;
+        Ok(())
+    }
+}
+
 fn should_reconcile_agentic_terminal(
     role: crate::TurnExecutionRole,
     completion: harness_contract::goal::GoalCompletion,
@@ -911,11 +992,17 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 self.member_requests.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(call.id.clone(), Arc::new(request.clone()));
             }
+            if let Some(capture) = self.early_request_capture {
+                capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(call.id.clone(), Arc::new(request.clone()));
+            }
             // Keep the actual execution request and its original same-call
             // sink under the existing node custody before physical dispatch.
             if let Some(state) = self.scope_state {
                 let carrier = crate::tool_host::OriginalMemberCallCarrier::from_original_request(Arc::new(request.clone()));
-                let pending = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)));
+                let carrier = carrier.clone().with_original_host_call_set(self.ticket, self.calls).unwrap_or(carrier);
+                let pending = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)))
+                    .with_original_host_call_set(self.ticket, &call.id);
 
                 super::host_backend::retain_original_member_batches(state, self.ticket, &[(call.id.clone(), pending)])
                     .await.map_err(|error| error.to_string())?;
@@ -956,10 +1043,14 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 )
             );
 
+            if request.tool_use_id != call.id {
+                return Err("original physical leaf call identity differs".into());
+            }
             self.physical_owner
-                .execute_physical_tool(
+                .execute_physical_tool_for_call(
                     self.ticket,
                     &invocation_id,
+                    Some(&call.id),
                     Box::pin(async move {
                         let (execution, admission) = plane
                             .execute_async_classified_retained(
@@ -1536,6 +1627,7 @@ pub(super) async fn execute_governed_runtime_tool_batch(
         unknown_effects: Mutex::new(HashMap::new()),
         batch_policy_owner: ROOT_BATCH_POLICY_OWNER.try_with(Arc::clone).ok(),
         member_requests: Mutex::new(HashMap::new()),
+        early_request_capture: None,
         action_issuer: ROOT_ACTION_ISSUER.try_with(Arc::clone).ok(),
         single_captures: ROOT_SINGLE_CAPTURES.try_with(Arc::clone).ok(),
         host,
@@ -1612,11 +1704,14 @@ pub(super) async fn execute_governed_runtime_tool_batch(
                     unknown_in_order.push((task.tool_call_id.clone(), unknown.clone()));
                     if let Some(request) = member_requests.get(&call.id) {
                         let carrier = crate::tool_host::OriginalMemberCallCarrier::from_original_request(Arc::clone(request));
+                        let carrier = carrier.clone().with_original_host_call_set(ticket, calls).unwrap_or(carrier);
                         if !carrier.outcomes().is_empty() || carrier.original_request().tool_progress.has_original_member_stop() || unknown.pending_agent_batch().is_some() {
                             let original = crate::PendingAgentBatch::new(
-                                crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)));
+                                crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)))
+                                .with_original_host_call_set(ticket, &call.id);
                             member_batches.push((call.id.clone(), crate::PendingAgentBatch::with_cause(
-                                original, unknown.pending_agent_batch().cloned())));
+                                original, unknown.pending_agent_batch().cloned())
+                                .with_original_host_call_set(ticket, &call.id)));
                         }
                     }
                     unresolved.push(crate::conversation::ToolBatchUnresolved::Unknown { call_id: task.tool_call_id.clone(), detail: unknown.to_string(), terminal_detail: terminal_detail.clone(), commit_error: outcome.terminal_commit_error.clone() });
@@ -1630,9 +1725,11 @@ pub(super) async fn execute_governed_runtime_tool_batch(
         };
         if let Some(request) = member_requests.get(&call.id) {
             let carrier = crate::tool_host::OriginalMemberCallCarrier::from_original_request(Arc::clone(request));
+            let carrier = carrier.clone().with_original_host_call_set(ticket, calls).unwrap_or(carrier);
             if !carrier.outcomes().is_empty() || carrier.original_request().tool_progress.has_original_member_stop() {
                 member_batches.push((call.id.clone(), crate::PendingAgentBatch::new(
-                    crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)))));
+                    crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)))
+                    .with_original_host_call_set(ticket, &call.id)));
             }
         }
         observed_evidence.extend(receipt.observed_evidence.iter().cloned());
@@ -3253,6 +3350,49 @@ where
                 }
             }
         }
+        // A member that settled while this presentation was being prepared
+        // may have changed the answer's sources. Return to the existing model
+        // continuation rather than publish a candidate based on the old cut.
+        let waited = match self.services.wait_for_original_members_before_synthesis(&ticket.graph_id, &session_id, &turn_id).await {
+            Ok(waited) => waited,
+            Err(error) => {
+                let mut state = self.state.lock().await;
+                if terminal_commit_owned_by(state.terminal_commit_owner.as_ref(), &ticket.node_id, ticket.attempt) {
+                    state.delivery_envelope = None;
+                    state.terminal_presentation = None;
+                    state.terminal_commit_owner = None;
+                    state.committed_terminal_answer = None;
+                    state.committed_terminal_completion = None;
+                }
+                return Err(error);
+            }
+        };
+        if waited {
+            {
+                let mut state = self.state.lock().await;
+                if !terminal_commit_owned_by(state.terminal_commit_owner.as_ref(), &ticket.node_id, ticket.attempt) {
+                    return Err("original terminal presentation owner changed while waiting".into());
+                }
+                state.delivery_envelope = None;
+                state.terminal_presentation = None;
+                state.terminal_commit_owner = None;
+                state.committed_terminal_answer = None;
+                state.committed_terminal_completion = None;
+            }
+            let iteration = self.state.lock().await.iterations;
+            let next = dynamic_node(ticket, iteration, "settled-member-source-changed",
+                ExecutionNodeKind::InlineModel, "inline_model", "inline_model");
+            let current_sources = freeze_synthesize_goal_sources(self.services.as_ref(), &session_id, &turn_id, &goal_id)?;
+            return inherit_synthesize_sources(
+                NodeExecutionOutcome::new(completed_result(
+                    Some(format!("{}:settled-member-source-changed", ticket.graph_id)), ExecutionUsage::default(),
+                )).with_replan(ExecutionGraphReplan {
+                    edges: dynamic_edges(&ticket.node_id, &[next.clone()]), nodes: vec![next],
+                    reason: "Original member work settled while preparing the terminal; reassess current sources".into(),
+                    framework_authored: true,
+                }), &current_sources,
+            );
+        }
         // The turn is terminal from here on.
         self.publish_terminal_finalizing().await;
         let terminal_owned = root_terminal_owned_elsewhere(
@@ -3510,7 +3650,14 @@ where
             outcome.attach_original_terminal_owner(Arc::clone(&owner))?;
             let mut state = self.state.lock().await;
             if state.authenticated_terminal_owner.is_some() { return Err("original terminal owner already exists".into()); }
-            state.authenticated_terminal_owner = Some(owner);
+            state.authenticated_terminal_owner = Some(Arc::clone(&owner));
+            outcome.original_synthesize_replan = Some(crate::execution_core::graph::OriginalSynthesizeReplanHandle(Arc::new(
+                OriginalSynthesizeRetry {
+                    ticket: ticket.clone(), runtime: Arc::downgrade(&self.runtime), state: Arc::downgrade(&self.state),
+                    services: Arc::downgrade(&self.services), owner: Arc::downgrade(&owner),
+                    retired: std::sync::Mutex::new(OriginalSynthesizeRetired::default()),
+                }
+            )));
         }
         Ok(outcome)
     }

@@ -311,7 +311,7 @@ impl ProviderEntryTemplate {
         let request_id = uuid::Uuid::new_v4().to_string();
         ProviderEntry {
             model: self.model.clone(),
-            client: self.client.clone().with_original_provider_request_id(request_id.clone()),
+            client: self.client.clone(),
             request_context: ProviderRequestContext {
                 request_id,
                 profile: self.profile.clone(),
@@ -328,9 +328,6 @@ struct ProviderTemplateCacheKey {
     registry_revision: u64,
     model: String,
     transport_fingerprint: crate::TransportProfileFingerprint,
-    /// The identity of the installed physical send authority. A template
-    /// built without one must never be served to a client that has one.
-    physical_send_identity: Option<String>,
 }
 
 #[derive(Default)]
@@ -346,8 +343,6 @@ struct ProviderTemplateCacheState {
 /// cannot reuse a stale route.
 pub struct ProviderClientTemplateCache {
     state: std::sync::Mutex<ProviderTemplateCacheState>,
-    physical_send_factory: std::sync::OnceLock<Arc<crate::physical_send_owner::RuntimePhysicalSendFactory>>,
-    diagnostic_send: Option<Arc<provider::DiagnosticPhysicalSend>>,
     max_entries: usize,
     hits: AtomicU64,
     builds: AtomicU64,
@@ -373,8 +368,6 @@ impl ProviderClientTemplateCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             state: std::sync::Mutex::new(ProviderTemplateCacheState::default()),
-            physical_send_factory: std::sync::OnceLock::new(),
-            diagnostic_send: None,
             max_entries: max_entries.max(1),
             hits: AtomicU64::new(0),
             builds: AtomicU64::new(0),
@@ -382,29 +375,11 @@ impl ProviderClientTemplateCache {
         }
     }
 
-    /// Explicit operator-selected diagnostic mode, fixed before sharing this cache.
-    pub fn diagnostic(reason: &str) -> Result<Self, String> {
-        let mut cache = Self::default();
-        cache.diagnostic_send = Some(Arc::new(provider::DiagnosticPhysicalSend::new(reason)?));
-        Ok(cache)
-    }
-
-    /// Install only a capability already authenticated by the original owner.
-    /// Existing and future clients share it, while request identities are
-    /// bound separately at the actual attempt.
-    pub(crate) fn install_physical_send_factory(
-        &self,
-        factory: Arc<crate::physical_send_owner::RuntimePhysicalSendFactory>,
-    ) -> Result<(), &'static str> {
-        self.physical_send_factory.set(factory).map_err(|_| "physical send factory already installed")
-    }
-
     fn resolve(
         &self,
         snapshot: &ProviderRegistrySnapshot,
         transport_pool: &crate::ProviderTransportPool,
         model: &str,
-        physical_send_authority: Option<Arc<provider::PhysicalSendAuthority>>,
     ) -> Result<ProviderEntry, String> {
         let resolved = model.trim().to_string();
         let (transport_fingerprint, http) = transport_pool
@@ -414,9 +389,6 @@ impl ProviderClientTemplateCache {
             registry_revision: snapshot.revision(),
             model: resolved.clone(),
             transport_fingerprint,
-            physical_send_identity: physical_send_authority.as_ref()
-                .map(|authority| format!("authenticated:{}", authority.attestation().nonce))
-                .or_else(|| self.diagnostic_send.as_ref().map(|diagnostic| format!("diagnostic:{}", provider::body_digest(diagnostic.reason().as_bytes())))),
         };
         {
             let mut state = self
@@ -435,8 +407,6 @@ impl ProviderClientTemplateCache {
             transport_fingerprint,
             http,
             &resolved,
-            physical_send_authority,
-            self.diagnostic_send.clone(),
         )?;
         let entry = template.request_entry();
         let mut state = self
@@ -919,9 +889,6 @@ pub trait ProviderWireEvidenceWriter: Send + Sync {
 
 #[derive(Clone)]
 pub struct ProviderRuntimeClient {
-    /// The installed physical send authority. Without one every provider send
-    /// is refused before it leaves the process.
-    physical_send_authority: Option<Arc<provider::PhysicalSendAuthority>>,
     preparation_resources: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
     control_admission: Option<ControlResourceAdmission>,
     wire_preparations: Arc<AtomicU64>,
@@ -1076,25 +1043,6 @@ impl futures::Stream for ProviderEventStream {
 }
 
 impl ProviderRuntimeClient {
-    /// The identity of the installed physical send authority, used to key the
-    /// provider template cache so an authority is never silently dropped.
-    fn physical_send_identity(&self) -> Option<String> {
-        self.physical_send_authority
-            .as_ref()
-            .map(|authority| authority.attestation().nonce.clone())
-    }
-
-    /// Install the physical send authority. Without one every provider send is
-    /// refused before it leaves the process.
-    #[must_use]
-    pub fn with_physical_send_authority(
-        mut self,
-        authority: Arc<provider::PhysicalSendAuthority>,
-    ) -> Self {
-        self.physical_send_authority = Some(authority);
-        self
-    }
-
     pub fn new(
         registry: Arc<ProviderRegistry>,
         model: String,
@@ -1131,9 +1079,8 @@ impl ProviderRuntimeClient {
         tool_definitions: Vec<ToolDefinition>,
     ) -> Result<Self, String> {
         let snapshot = registry.pin();
-        template_cache.resolve(&snapshot, &transport_pool, &model, None)?;
+        template_cache.resolve(&snapshot, &transport_pool, &model)?;
         Ok(Self {
-            physical_send_authority: None,
             preparation_resources: None,
             control_admission: None,
             wire_preparations: Arc::new(AtomicU64::new(0)),
@@ -1288,12 +1235,8 @@ impl ProviderRuntimeClient {
             &snapshot,
             &self.transport_pool,
             model,
-            self.physical_send_authority.clone(),
         )?;
         self.validate_control_account(&entry)?;
-        if entry.request_context.diagnostic_send_reason.is_some() {
-            return Err("diagnostic control analysis lacks a bound original provider Step".into());
-        }
         let capacity = snapshot.context_window_resolution(model);
         if capacity.source == provider::ModelContextWindowSource::Assumed {
             return Err(
@@ -1337,9 +1280,27 @@ impl ProviderRuntimeClient {
             .with_parent_class_ceiling(class)
             .with_fairness_key(key)
             .with_deadline_at_ms(now.saturating_add(5000));
-            match manager.admit(admission).await.map_err(|e| e.to_string())? {
+            let decision =
+                match admit_preparation_resources(manager, admission, self.turn_cancellation.as_ref())
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Some(decision) => decision,
+                    None => {
+                        return Err(
+                            "control preparation cancelled while waiting for context capacity"
+                                .into(),
+                        );
+                    }
+                };
+            match decision {
                 ResourceAdmissionDecision::Granted { lease, .. } => Some(lease),
-                _ => return Err("control prepared content capacity unavailable".into()),
+                decision => {
+                    return Err(preparation_capacity_failure(
+                        "control prepared content capacity unavailable",
+                        &decision,
+                    ))
+                }
             }
         } else {
             if self.execution_supervisor.is_some() {
@@ -1356,7 +1317,7 @@ impl ProviderRuntimeClient {
                 &entry.model,
                 &entry.request_context.profile.model_capabilities,
                 None,
-                self.reasoning_effort.clone(),
+                self.reasoning_effort.clone().or_else(|| snapshot.resolve(&entry.model).and_then(|provider| provider.reasoning_effort.clone())),
             ),
             protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
             context_window_limit: Some(capacity.tokens),
@@ -1662,7 +1623,6 @@ fn build_provider_entry(
     snapshot: &ProviderRegistrySnapshot,
     transport_pool: &crate::ProviderTransportPool,
     model: &str,
-    physical_send_authority: Option<Arc<provider::PhysicalSendAuthority>>,
 ) -> Result<ProviderEntry, String> {
     let resolved = model.trim().to_string();
     let (transport_fingerprint, http) = transport_pool
@@ -1673,8 +1633,6 @@ fn build_provider_entry(
         transport_fingerprint,
         http,
         &resolved,
-        physical_send_authority,
-        None,
     )
     .map(|template| template.request_entry())
 }
@@ -1684,8 +1642,6 @@ fn build_provider_template(
     transport_fingerprint: crate::TransportProfileFingerprint,
     http: reqwest::Client,
     resolved: &str,
-    physical_send_authority: Option<Arc<provider::PhysicalSendAuthority>>,
-    diagnostic_send: Option<Arc<provider::DiagnosticPhysicalSend>>,
 ) -> Result<ProviderEntryTemplate, String> {
     let (
         client,
@@ -1727,14 +1683,6 @@ fn build_provider_template(
             ));
         }
     };
-    let (client, diagnostic_send_reason) = match (physical_send_authority, diagnostic_send) {
-        (Some(authority), _) => (client.with_physical_send_authority(authority), None),
-        (None, Some(diagnostic)) => {
-            let reason = diagnostic.reason().to_owned();
-            (client.with_diagnostic_physical_send(diagnostic), Some(reason))
-        }
-        (None, None) => (client, None),
-    };
     Ok(ProviderEntryTemplate {
         model: resolved.to_string(),
         client,
@@ -1754,7 +1702,7 @@ fn build_provider_template(
             capabilities,
         },
         transport_fingerprint,
-        diagnostic_send_reason,
+        diagnostic_send_reason: None,
     })
 }
 
@@ -1837,6 +1785,68 @@ impl ApiClient for ProviderRuntimeClient {
             .lock()
             .map(|mut recorded| std::mem::take(&mut *recorded))
             .unwrap_or_default()
+    }
+}
+
+/// The message one preparation's admission failure carries.
+///
+/// The admission decision has three states and the wait reason has eight; a
+/// preparation that was not granted says WHICH of them held it back, so the
+/// failure names its cause instead of collapsing every wait into one
+/// sentence that reads like a capacity wall.
+fn preparation_capacity_failure(
+    prefix: &str,
+    decision: &crate::execution_core::graph::ResourceAdmissionDecision,
+) -> String {
+    match decision {
+        crate::execution_core::graph::ResourceAdmissionDecision::Granted { .. } => {
+            format!("{prefix}: wait_reason=granted")
+        }
+        crate::execution_core::graph::ResourceAdmissionDecision::Deferred { wait_reason, .. }
+        | crate::execution_core::graph::ResourceAdmissionDecision::Overloaded {
+            wait_reason, ..
+        } => format!("{prefix}: wait_reason={wait_reason:?}"),
+    }
+}
+
+/// The fairness key one preparation's admission queues on.
+///
+/// The sibling provider path admits on `session:{id}`, so this path queues on
+/// the same session's admission instead of on a second queue of its own.
+fn preparation_fairness_key(session: Option<&str>) -> String {
+    match session {
+        Some(session) if !session.is_empty() => format!("session:{session}"),
+        _ => "provider-prepare".to_string(),
+    }
+}
+
+/// Admit one preparation's resources, and stop waiting when the turn ends.
+///
+/// The sibling provider path binds the turn's cancellation to its admission
+/// wait; a preparation waits the same way, so a cancelled turn does not sit
+/// out the whole admission window and then fail for a capacity that no
+/// longer matters.
+///
+/// `Ok(None)` means the turn was cancelled while the admission was pending.
+async fn admit_preparation_resources(
+    manager: &crate::execution_core::graph::ExecutionResourceManager,
+    admission: crate::execution_core::graph::ResourceAdmissionRequest,
+    cancellation: Option<&Arc<crate::execution_core::services::TurnCancellationControl>>,
+) -> Result<Option<crate::execution_core::graph::ResourceAdmissionDecision>, String> {
+    let admit = manager.admit(admission);
+    tokio::select! {
+        () = wait_for_turn_cancellation(cancellation) => Ok(None),
+        decision = admit => decision.map(Some).map_err(|error| error.to_string()),
+    }
+}
+
+/// Await the turn's cancellation, when this client has one.
+async fn wait_for_turn_cancellation(
+    cancellation: Option<&Arc<crate::execution_core::services::TurnCancellationControl>>,
+) {
+    match cancellation {
+        Some(control) => control.token().cancelled().await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -2009,28 +2019,6 @@ impl ProviderRuntimeClient {
                     skill_source: request.preparation.skill_source.take(),
                 };
                 fence.validate()?;
-                if let Some(factory) = owner.template_cache.physical_send_factory.get() {
-                    let context = request.provider_evidence_context.as_ref().ok_or_else(|| {
-                        RuntimeError::new("physical send requires the original provider request context")
-                    })?;
-                    let step = request.bound_step.as_ref().ok_or_else(|| {
-                        RuntimeError::new("physical send requires the original bound Step")
-                    })?;
-                    let authority = factory
-                        .for_provider_attempt(context, step.snapshot(), &entry.request_context.request_id)
-                        .map_err(|error| RuntimeError::new(format!("physical send identity: {error}")))?;
-                    entry.client = entry.client.with_physical_send_authority(authority);
-                    entry.request_context.diagnostic_send_reason = None;
-                }
-                if entry.request_context.diagnostic_send_reason.is_some()
-                    && (request.provider_evidence_context.is_none()
-                        || request.bound_step.is_none()
-                        || owner.provider_wire_evidence_writer.is_none())
-                {
-                    return Err(RuntimeError::new(
-                        "diagnostic Provider send requires the original request context, bound Step and evidence writer",
-                    ));
-                }
                 let result = forward_provider_attempt(
                     entry,
                     Some(request.prompt.composition()),
@@ -2186,37 +2174,59 @@ impl ProviderRuntimeClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| RuntimeError::new(e.to_string()))?
                 .as_millis() as u64;
-            let (class, key) = request
+            let (class, session) = request
                 .preparation
                 .preparation_scope
                 .as_ref()
-                .map(|(class, key)| (*class, key.as_str()))
+                .map(|(class, key)| (*class, Some(key.as_str())))
                 .unwrap_or_else(|| {
                     (
                         ExecutionServiceClass::Foreground,
                         request
                             .provider_evidence_context
                             .as_ref()
-                            .map_or("provider-prepare", |c| c.session_id.as_str()),
+                            .map(|context| context.session_id.as_str()),
                     )
                 });
+            // The sibling provider path admits on `session:{id}`; this path
+            // queues on the same session's admission instead of on a second
+            // queue of its own.
+            let fairness_key = preparation_fairness_key(session);
             let admission = ResourceAdmissionRequest::new(
                 class,
                 [(ExecutionResourceKind::ContextBytes, resident)],
             )
-            .with_fairness_key(key)
+            .with_parent_class_ceiling(class)
+            .with_fairness_key(fairness_key.as_str())
             .with_deadline_at_ms(now.saturating_add(5000));
-            match manager.admit(admission).await.map_err(|e| {
+            let decision = match admit_preparation_resources(
+                manager,
+                admission,
+                self.turn_cancellation.as_ref(),
+            )
+            .await
+            .map_err(|error| {
                 RuntimeError::context_capacity(
                     crate::context_ledger::ContextCapacityFailure::RenderOverflow,
-                    e.to_string(),
+                    error,
                 )
             })? {
+                Some(decision) => decision,
+                None => {
+                    return Err(RuntimeError::new(
+                        "provider preparation cancelled while waiting for context capacity",
+                    ));
+                }
+            };
+            match decision {
                 ResourceAdmissionDecision::Granted { lease, .. } => Some(lease),
-                _ => {
+                decision => {
                     return Err(RuntimeError::context_capacity(
                         crate::context_ledger::ContextCapacityFailure::RenderOverflow,
-                        "prepared content capacity unavailable",
+                        preparation_capacity_failure(
+                            "prepared content capacity unavailable",
+                            &decision,
+                        ),
                     ))
                 }
             }
@@ -2293,7 +2303,6 @@ impl ProviderRuntimeClient {
             snapshot,
             &self.transport_pool,
             &request.model,
-            self.physical_send_authority.clone(),
         )
             .map_err(|error| RuntimeError::new(format!("provider candidate unavailable: {error}")))?;
         if self.transport_pool.provider_account_is_fenced(
@@ -2306,7 +2315,7 @@ impl ProviderRuntimeClient {
             &entry.model,
             &entry.request_context.profile.model_capabilities,
             request.reasoning_effort_override.clone(),
-            self.reasoning_effort.clone(),
+            self.reasoning_effort.clone().or_else(|| snapshot.resolve(&entry.model).and_then(|provider| provider.reasoning_effort.clone())),
         );
         if let Some(protocol) = entry.request_context.profile.protocol.as_deref()
             .and_then(ProviderProtocol::parse)
@@ -2540,7 +2549,7 @@ async fn forward_provider_attempt(
     let request_guard = transport_pool.begin_request();
     let mut attempt_usage = None;
     let mut attempt_cache_dimensions_observed = false;
-    let stream_result = forward_provider_stream(
+    let stream_result = Box::pin(forward_provider_stream(
         &entry.client,
         &message_request,
         &prepared.wire,
@@ -2555,7 +2564,7 @@ async fn forward_provider_attempt(
         control,
         &entry.request_context.request_id,
         evidence_writer.as_deref(),
-    )
+    ))
     .await;
     // Provider transport capacity is unrelated to disk-cache persistence.
     // Release it before the bounded cohort barrier so different cache keys
@@ -3652,6 +3661,103 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// P-2: a preparation that was not granted says WHICH wait held it
+    /// back, so the failure names its cause instead of reading like a
+    /// capacity wall.
+    #[test]
+    fn p2_a_preparation_that_is_not_granted_names_its_wait_reason() {
+        use crate::execution_core::graph::{ResourceAdmissionDecision, ResourceWaitReason};
+        let deferred = ResourceAdmissionDecision::Deferred {
+            request_id: uuid::Uuid::new_v4(),
+            wait_reason: ResourceWaitReason::DeadlineExpired,
+            policy_revision: 1,
+        };
+        assert_eq!(
+            super::preparation_capacity_failure(
+                "prepared content capacity unavailable",
+                &deferred,
+            ),
+            "prepared content capacity unavailable: wait_reason=DeadlineExpired",
+        );
+        let overloaded = ResourceAdmissionDecision::Overloaded {
+            request_id: uuid::Uuid::new_v4(),
+            wait_reason: ResourceWaitReason::KeyPendingLimit,
+            policy_revision: 1,
+            pending: 3,
+        };
+        assert_eq!(
+            super::preparation_capacity_failure(
+                "prepared content capacity unavailable",
+                &overloaded,
+            ),
+            "prepared content capacity unavailable: wait_reason=KeyPendingLimit",
+        );
+    }
+
+    /// P-2: the preparation queues on the session's admission, the queue the
+    /// sibling provider path already uses.
+    #[test]
+    fn p2_the_frozen_preparation_queues_on_the_session_fairness_key() {
+        assert_eq!(
+            super::preparation_fairness_key(Some("session-1")),
+            "session:session-1",
+        );
+        assert_eq!(
+            super::preparation_fairness_key(None),
+            "provider-prepare",
+        );
+    }
+
+    /// P-2: a cancelled turn stops waiting for the admission instead of
+    /// sitting out the whole window and then failing for a capacity that no
+    /// longer matters.
+    #[tokio::test]
+    async fn p2_a_cancelled_turn_stops_waiting_for_the_admission() {
+        use crate::execution_core::graph::{
+            ExecutionResourceKind, ExecutionResourceManager, ResourceAdmissionRequest,
+            ResourceQuota,
+        };
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::ContextBytes,
+            ResourceQuota::new(1, 1, 1).unwrap(),
+        )]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        let request = |bytes: usize, deadline_at_ms: u64| {
+            ResourceAdmissionRequest::new(
+                crate::execution_core::graph::ExecutionServiceClass::Foreground,
+                [(ExecutionResourceKind::ContextBytes, bytes)],
+            )
+            .with_deadline_at_ms(deadline_at_ms)
+        };
+        // Hold the only byte the quota has, so the next request has to wait
+        // for it instead of being refused on the spot.
+        let held = manager
+            .admit(request(1, now.saturating_add(30_000)))
+            .await
+            .expect("the held admission");
+        let control = crate::execution_core::services::TurnCancellationControl::operational(
+            "session-1",
+            "turn-1",
+            "execution-1",
+        );
+        control.token().cancel();
+        let decision = super::admit_preparation_resources(
+            &manager,
+            request(1, now.saturating_add(300)),
+            Some(&control),
+        )
+        .await
+        .expect("the admission decision");
+        assert!(
+            decision.is_none(),
+            "a cancelled turn stops waiting for the admission"
+        );
+        drop(held);
+    }
 
     #[test]
     fn control_completion_keeps_absent_usage_unknown_and_reported_zero_known() {
@@ -5208,6 +5314,7 @@ mod tests {
                     providers: HashMap::from([(
                         "fixture".into(),
                         ProviderConfig {
+                            reasoning_effort: None,
                             name: "fixture".into(),
                             base_url: endpoint,
                             api_key: "fixture-secret".into(),
@@ -5725,6 +5832,44 @@ mod tests {
             .is_err());
         assert_eq!(client.wire_preparation_count(), 0);
         assert_eq!(client.transport_pool.stats().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_config_effort_reaches_actual_wire_and_follows_selected_model() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut root, mut request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), workspace.path());
+        let prior_snapshot = root.registry.pin();
+        let (prior_entry, prior_message) = root.prepare_message_request(&request, &prior_snapshot).unwrap();
+        assert!(prior_entry.client.wire_request(&prior_message).unwrap().body.get("reasoning_effort").is_none());
+        std::fs::write(workspace.path().join("config.yaml"),
+            "model: fixture-model\nproviders:\n  fixture:\n    base_url: http://127.0.0.1:1/v1\n    api_key: fixture-secret\n    protocol: completions\n    models: [fixture-model]\n    reasoning_effort: high\n").unwrap();
+        let config = crate::ConfigLoader::new(workspace.path(), workspace.path()).load().unwrap();
+        let mut providers = config.providers().clone();
+        assert_eq!(providers.providers["fixture"].reasoning_effort.as_deref(), Some("high"));
+        let mut other = providers.providers["fixture"].clone();
+        other.name = "other".into();
+        other.models = vec!["other-model".into()];
+        other.reasoning_effort = None;
+        providers.providers.insert("other".into(), other);
+        root.registry.replace(providers).unwrap();
+        let snapshot = root.registry.pin();
+        let (old_entry, old_message) = root.prepare_message_request(&request, &prior_snapshot).unwrap();
+        assert!(old_entry.client.wire_request(&old_message).unwrap().body.get("reasoning_effort").is_none());
+        let (entry, message) = root.prepare_message_request(&request, &snapshot).unwrap();
+        assert_eq!(entry.client.wire_request(&message).unwrap().body["reasoning_effort"], "high");
+        let control = root.prepare_control_analysis("fixture-model", "system", "input", 64).await.unwrap();
+        assert_eq!(control.wire.wire_request().body["reasoning_effort"], "high");
+        let member = ProviderRuntimeClient::new(Arc::clone(&root.registry), "fixture-model".into(), Vec::new()).unwrap();
+        let (entry, message) = member.prepare_message_request(&request, &snapshot).unwrap();
+        assert_eq!(entry.client.wire_request(&message).unwrap().body["reasoning_effort"], "high");
+        request.model = "other-model".into();
+        let (entry, message) = root.prepare_message_request(&request, &snapshot).unwrap();
+        assert!(entry.client.wire_request(&message).unwrap().body.get("reasoning_effort").is_none());
+        assert_eq!(request_reasoning_effort("fixture-model", &["openai_compat_enable_thinking".into()], Some("none".into()), Some("high".into())).as_deref(), Some("none"));
+        root.set_reasoning_effort(Some("medium".into()));
+        request.model = "fixture-model".into();
+        let (entry, message) = root.prepare_message_request(&request, &snapshot).unwrap();
+        assert_eq!(entry.client.wire_request(&message).unwrap().body["reasoning_effort"], "medium");
     }
 
     #[tokio::test]
@@ -6549,6 +6694,7 @@ mod tests {
                 providers: HashMap::from([(
                     "test".to_string(),
                     ProviderConfig {
+                        reasoning_effort: None,
                         name: "test".to_string(),
                         base_url: "https://example.test/v1".to_string(),
                         api_key: "test".to_string(),
@@ -6572,6 +6718,7 @@ mod tests {
                 providers: HashMap::from([(
                     "token-plan".to_string(),
                     ProviderConfig {
+                        reasoning_effort: None,
                         name: "token-plan".to_string(),
                         base_url: "http://127.0.0.1:9/v1".to_string(),
                         api_key: "test".to_string(),
@@ -6666,6 +6813,7 @@ mod tests {
                 providers: HashMap::from([(
                     "token-plan".to_string(),
                     ProviderConfig {
+                        reasoning_effort: None,
                         name: "token-plan".to_string(),
                         base_url: format!("http://{address}/v1"),
                         api_key: "test".to_string(),
@@ -6734,7 +6882,7 @@ mod tests {
         let snapshot = registry.pin();
         let pool = ProviderTransportPool::new(1);
 
-        let error = match build_provider_entry(&snapshot, &pool, "claude-implicit", None) {
+        let error = match build_provider_entry(&snapshot, &pool, "claude-implicit") {
             Ok(_) => panic!("unconfigured models must not infer a provider from the environment"),
             Err(error) => error,
         };
@@ -6749,6 +6897,7 @@ mod tests {
             providers: HashMap::from([(
                 "test".to_string(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     base_url: base_url.to_string(),
                     api_key: "test".to_string(),
@@ -6869,6 +7018,7 @@ mod tests {
             providers: HashMap::from([(
                 "test".to_string(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     base_url: "https://example.test/v1".to_string(),
                     api_key: "test".to_string(),
@@ -6883,8 +7033,8 @@ mod tests {
         let snapshot = registry.pin();
         let pool = ProviderTransportPool::new(2);
 
-        let first = build_provider_entry(&snapshot, &pool, "primary", None).expect("first");
-        let second = build_provider_entry(&snapshot, &pool, "primary", None).expect("second");
+        let first = build_provider_entry(&snapshot, &pool, "primary").expect("first");
+        let second = build_provider_entry(&snapshot, &pool, "primary").expect("second");
 
         assert_ne!(
             first.request_context.request_id,
@@ -6904,6 +7054,7 @@ mod tests {
             providers: HashMap::from([(
                 "test".to_string(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     base_url: "https://example.test/v1".to_string(),
                     api_key: "test".to_string(),
@@ -6920,10 +7071,10 @@ mod tests {
         let cache = super::ProviderClientTemplateCache::new(2);
 
         let first = cache
-            .resolve(&snapshot, &pool, "primary", None)
+            .resolve(&snapshot, &pool, "primary")
             .expect("first route");
         let second = cache
-            .resolve(&snapshot, &pool, "primary", None)
+            .resolve(&snapshot, &pool, "primary")
             .expect("cached route");
 
         assert_ne!(

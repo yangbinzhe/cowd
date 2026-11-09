@@ -1416,6 +1416,7 @@ pub(crate) enum ToolLifecycleReuse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EarlyToolExecutionReceipt {
+    pub original_source: Option<EarlyToolOriginalSource>,
     pub lifecycle: ToolLifecycleReuse,
     pub call: ModelToolCall,
     pub outcome: crate::RuntimeToolExecutionOutcome,
@@ -1424,11 +1425,37 @@ pub(crate) struct EarlyToolExecutionReceipt {
     pub completed_at_ms: u64,
 }
 
+/// Same-call transport captured before dispatch; it is not itself a receipt.
+#[derive(Debug, Clone)]
+pub(crate) struct EarlyToolOriginalSource {
+    pub ticket: crate::execution_core::NodeExecutionTicket,
+    pub request: Arc<crate::RuntimeToolExecutionRequest>,
+    pub completed_calls: Option<Vec<ModelToolCall>>,
+}
+
+impl PartialEq for EarlyToolOriginalSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.ticket == other.ticket && Arc::ptr_eq(&self.request, &other.request)
+            && self.completed_calls == other.completed_calls
+    }
+}
+impl Eq for EarlyToolOriginalSource {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EarlyToolDeferral {
     pub tool_call_id: String,
     pub reason: String,
     pub ready_at_ms: u64,
+    pub(crate) original_undispatched: Option<Arc<EarlyToolUndispatched>>,
+}
+
+/// Original worker's pre-dispatch return and acknowledged authorization writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EarlyToolUndispatched {
+    pub(crate) ticket: crate::execution_core::NodeExecutionTicket,
+    pub(crate) call_id: String,
+    pub(crate) identity: crate::CausalItemIdentity,
+    pub(crate) authorization_events: Vec<crate::DurableRuntimeEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2450,6 +2477,7 @@ async fn consume_provider_stream_inner(
                                         "provider early_tool_start gate is not performance-certified"
                                             .to_string(),
                                     ready_at_ms: candidate.ready_at_ms,
+                                    original_undispatched: None,
                                 });
                             }
                         }
@@ -3931,12 +3959,18 @@ pub trait MemoryCallback: Send + Sync {
 /// An in-process carrier for the original owner's batch result. This is not
 /// serialized and is never an authorization or durable receipt by itself.
 #[derive(Clone)]
-pub struct PendingAgentBatch(std::sync::Arc<PendingAgentBatchValue>);
+pub struct PendingAgentBatch(
+    std::sync::Arc<PendingAgentBatchValue>,
+    Option<(crate::execution_core::NodeExecutionTicket, Vec<ModelToolCall>)>,
+    bool,
+);
 
 pub struct OriginalReplayedPartial {
     pub(crate) replay: std::sync::Arc<crate::agentic::OriginalReplayedAction>,
     /// Original verified physical receipt; the physical driver closes separately.
     pub(crate) physical_receipt: Option<std::sync::Arc<crate::DurableRuntimeEvent>>,
+    /// Present only for an already-observed complete replay; never synthesized.
+    pub(crate) complete_request: Option<std::sync::Arc<crate::RuntimeToolExecutionRequest>>,
 }
 
 /// Same-call packet ceiling outcome retained by the existing node owner.
@@ -4004,7 +4038,55 @@ pub enum PendingAgentBatchValue {
 }
 
 impl PendingAgentBatch {
-    pub fn new(value: PendingAgentBatchValue) -> Self { Self(std::sync::Arc::new(value)) }
+    pub fn new(value: PendingAgentBatchValue) -> Self {
+        // Capture provenance at the original stop producer; it is still only
+        // a claim until the same sink and durable facts are authenticated.
+        let coordinate = match &value {
+            PendingAgentBatchValue::OriginalStopPublication(publication) => match publication.as_ref() {
+                crate::tool_host::OriginalStopPublication::Recorded(stop) =>
+                    Some((stop.coordinate().ticket().clone(), stop.coordinate().call_id().to_owned())),
+                _ => None,
+            },
+            PendingAgentBatchValue::RecordedSink(sink) => match sink.original_member_stop() {
+                crate::tool_host::OriginalStopRead::Available(Some(stop)) =>
+                    Some((stop.coordinate().ticket().clone(), stop.coordinate().call_id().to_owned())),
+                _ => None,
+            },
+            _ => None,
+        };
+        let pending = Self(std::sync::Arc::new(value), None, false);
+        match coordinate {
+            Some((ticket, call_id)) => pending.with_original_host_call_set(&ticket, &call_id),
+            None => pending,
+        }
+    }
+    /// Preserve the original node's complete call set without making it authority.
+    pub(crate) fn with_original_host_call_set(
+        mut self, ticket: &crate::execution_core::NodeExecutionTicket, call_id: &str,
+    ) -> Self {
+        let already_captured = self.2;
+        self.2 = true;
+        if ticket.executor_kind != "tool_batch" { self.1 = None; return self; }
+        let Ok((calls, _)) = crate::host::decode_tool_batch(&ticket.payload_ref) else { self.1 = None; return self };
+        let unique = calls.iter().map(|call| call.id.as_str()).collect::<std::collections::BTreeSet<_>>();
+        if !call_id.is_empty() && unique.len() == calls.len()
+            && calls.iter().filter(|call| call.id == call_id).count() == 1 {
+            match self.1.as_ref() {
+                Some((original, original_calls)) if original != ticket || original_calls != &calls => self.1 = None,
+                Some(_) => {},
+                None if !already_captured => self.1 = Some((ticket.clone(), calls)),
+                None => {},
+            }
+        } else {
+            self.1 = None;
+        }
+        self
+    }
+    pub(crate) fn original_host_call_set(
+        &self,
+    ) -> Option<(&crate::execution_core::NodeExecutionTicket, &[ModelToolCall])> {
+        self.1.as_ref().map(|(ticket, calls)| (ticket, calls.as_slice()))
+    }
     /// Called at the original sequential loop's terminal return; does not authenticate a receipt.
     pub fn original_terminal_boundary(
         sink: crate::ToolProgressSink, publication: std::sync::Arc<crate::tool_host::OriginalStopPublication>,
@@ -4029,9 +4111,11 @@ impl PendingAgentBatch {
             expected != *actual || !matches!(result.as_ref(), crate::tool_host::OriginalMemberSubmitOutcome::Committed(_))) {
             return Err("original terminal prefix unavailable".into());
         }
+        let ticket = stop.coordinate().ticket().clone();
+        let call_id = stop.coordinate().call_id().to_owned();
         Ok(Self::new(PendingAgentBatchValue::OriginalTerminalBoundary(OriginalTerminalBatchBoundary {
             sink, publication, index, total,
-        })))
+        })).with_original_host_call_set(&ticket, &call_id))
     }
     pub fn value(&self) -> &PendingAgentBatchValue { &self.0 }
     pub fn primary_value(&self) -> &PendingAgentBatchValue {
@@ -4057,7 +4141,18 @@ impl PendingAgentBatch {
         match self.value() {
             PendingAgentBatchValue::WithCause { primary, cause } =>
                 primary.same_original_terminal_carrier(request, boundary) && cause.same_original_terminal_carrier(request, boundary),
-            PendingAgentBatchValue::OriginalTerminalBoundary(value) => std::ptr::eq(value, boundary),
+            PendingAgentBatchValue::OriginalTerminalBoundary(value) => {
+                let stop = value.publication.current();
+                std::ptr::eq(value, boundary)
+                    && value.sink.same_original_channels(&request.tool_progress)
+                    && value.index == stop.coordinate().index()
+                    && stop.coordinate().call_id() == request.tool_use_id
+                    && stop.coordinate().outer_key() == request.idempotency_key
+                    && stop.coordinate().step() == request.step_binding.as_ref()
+                    && serde_json::from_str::<serde_json::Value>(&request.input).ok()
+                        .and_then(|input| input.get("actions").and_then(serde_json::Value::as_array).map(Vec::len))
+                        == Some(value.total)
+            },
             PendingAgentBatchValue::OriginalCall(carrier) => carrier.original_request() == request
                 && carrier.original_request().tool_progress.same_original_channels(&request.tool_progress),
             PendingAgentBatchValue::RecordedSink(sink) => request.tool_progress.same_original_channels(sink),
@@ -4067,6 +4162,26 @@ impl PendingAgentBatch {
                     i == j && std::sync::Arc::ptr_eq(a, b))
             },
             PendingAgentBatchValue::OriginalStopPublication(publication) => std::sync::Arc::ptr_eq(publication, &boundary.publication),
+            _ => false,
+        }
+    }
+    pub(crate) fn same_original_stop_carrier(
+        &self, request: &crate::RuntimeToolExecutionRequest,
+        publication: &std::sync::Arc<crate::tool_host::OriginalStopPublication>,
+    ) -> bool {
+        match self.value() {
+            PendingAgentBatchValue::WithCause { primary, cause } =>
+                primary.same_original_stop_carrier(request, publication)
+                    && cause.same_original_stop_carrier(request, publication),
+            PendingAgentBatchValue::OriginalCall(carrier) => carrier.original_request() == request
+                && carrier.original_request().tool_progress.same_original_channels(&request.tool_progress),
+            PendingAgentBatchValue::RecordedSink(sink) => request.tool_progress.same_original_channels(sink),
+            PendingAgentBatchValue::Recorded(recorded) => {
+                let Ok(actual) = request.tool_progress.checked_original_members() else { return false; };
+                recorded.len() == actual.len() && recorded.iter().zip(&actual).all(|((i, a), (j, b))|
+                    i == j && std::sync::Arc::ptr_eq(a, b))
+            },
+            PendingAgentBatchValue::OriginalStopPublication(original) => std::sync::Arc::ptr_eq(original, publication),
             _ => false,
         }
     }
@@ -4110,7 +4225,16 @@ impl PendingAgentBatch {
     }
     pub fn with_cause(primary: PendingAgentBatch, cause: Option<PendingAgentBatch>) -> Self {
         match cause {
-            Some(cause) => Self::new(PendingAgentBatchValue::WithCause { primary, cause }),
+            Some(cause) => {
+                let origin = match (&primary.1, &cause.1) {
+                    (Some(left), Some(right)) if left == right => Some(left.clone()),
+                    _ => None,
+                };
+                let mut result = Self::new(PendingAgentBatchValue::WithCause { primary, cause });
+                result.1 = origin;
+                result.2 = true;
+                result
+            },
             None => primary,
         }
     }
@@ -4363,9 +4487,10 @@ impl ToolError {
     pub(crate) fn original_bounded_acquisition_pending(&self, ticket: &crate::execution_core::NodeExecutionTicket,
         receipt: Option<crate::execution_core::graph::CommittedCallRefusal>) -> Option<PendingAgentBatch> {
         let fact = std::sync::Arc::clone(self.original_bounded_acquisition_failure()?);
+        let call_id = fact.request().tool_use_id.clone();
         Some(PendingAgentBatch::new(PendingAgentBatchValue::OriginalBoundedAcquisition(std::sync::Arc::new(
             OriginalBoundedAcquisitionPending { ticket: ticket.clone(), fact, receipt: receipt.map(std::sync::Arc::new) },
-        ))))
+        ))).with_original_host_call_set(ticket, &call_id))
     }
 
     pub(crate) fn with_original_packet_scope_denial(mut self, fact: std::sync::Arc<crate::agent_in_process_worker::OriginalPacketScopeDenial>) -> Self {
@@ -4389,10 +4514,11 @@ impl ToolError {
     pub(crate) fn original_packet_scope_pending(&self, ticket: &crate::execution_core::NodeExecutionTicket) -> Option<PendingAgentBatch> {
         let fact = self.original_packet_scope_denial.as_ref()?.0.clone();
         let request = std::sync::Arc::clone(&self.original_packet_scope_request.as_ref()?.0);
+        let call_id = request.tool_use_id.clone();
         let receipt = self.original_packet_scope_receipt.as_ref().map(|receipt| std::sync::Arc::clone(&receipt.0));
         Some(PendingAgentBatch::new(PendingAgentBatchValue::OriginalPacketScope(std::sync::Arc::new(
             OriginalPacketScopePending { ticket: ticket.clone(), fact, request, receipt },
-        ))))
+        ))).with_original_host_call_set(ticket, &call_id))
     }
 
     pub(crate) fn from_pre_effect_refusal(
@@ -4530,6 +4656,7 @@ pub(crate) struct PartialToolBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    session_execution_fence_error: Option<crate::session_execution::SessionExecutionFenceError>,
     context_capacity_failure: Option<crate::context_ledger::ContextCapacityFailure>,
     preparation_failure: Option<crate::ProviderPreparationFailure>,
     provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope,
@@ -4555,6 +4682,16 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
+    pub(crate) fn from_session_execution_fence(error: crate::session_execution::SessionExecutionFenceError) -> Self {
+        let mut result = Self::new(error.to_string());
+        result.session_execution_fence_error = Some(error);
+        result
+    }
+
+    pub(crate) fn session_execution_fence_error(&self) -> Option<&crate::session_execution::SessionExecutionFenceError> {
+        self.session_execution_fence_error.as_ref()
+    }
+
     /// Preserve the original typed failure when turn cleanup also fails.
     pub(crate) fn with_turn_cleanup_failure(mut self, reason: &str) -> Self {
         self.message = format!("{}; turn cleanup failed: {reason}", self.message);
@@ -4624,6 +4761,7 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            session_execution_fence_error: None,
             context_capacity_failure: None,
             preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
@@ -4654,6 +4792,7 @@ impl RuntimeError {
     ) -> Self {
         Self {
             message: message.into(),
+            session_execution_fence_error: None,
             context_capacity_failure: None,
             preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
@@ -4726,6 +4865,7 @@ impl RuntimeError {
     ) -> Self {
         Self {
             message: message.into(),
+            session_execution_fence_error: None,
             context_capacity_failure: None,
             preparation_failure: None,
             provider_failure_scope,
@@ -4753,6 +4893,7 @@ impl RuntimeError {
     pub fn with_tool_exposure_miss(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            session_execution_fence_error: None,
             context_capacity_failure: None,
             preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
@@ -4898,6 +5039,42 @@ impl RuntimeError {
     #[must_use]
     pub const fn provider_usage(&self) -> Option<TokenUsage> {
         self.provider_usage
+    }
+}
+
+#[cfg(test)]
+mod session_fence_error_tests {
+    use super::RuntimeError;
+    use crate::session_execution::{
+        SessionExecutionFenceConjunction, SessionExecutionFenceError,
+        SessionExecutionFenceOwnership, SessionExecutionFencePhase, SessionExecutionFenceVerdict,
+    };
+
+    #[test]
+    fn preserves_fence_verdict_and_unavailable_without_changing_the_message() {
+        let failures = [
+            SessionExecutionFenceError::Refused {
+                phase: SessionExecutionFencePhase::ProviderRequest,
+                verdict: SessionExecutionFenceVerdict {
+                    ownership: SessionExecutionFenceOwnership::TakenOver,
+                    failed: Some(SessionExecutionFenceConjunction::ClaimOwner),
+                },
+                message: "original refusal".into(),
+            },
+            SessionExecutionFenceError::Unavailable {
+                phase: SessionExecutionFencePhase::ProviderRequest,
+                message: "original read failure".into(),
+            },
+        ];
+        for failure in failures {
+            let message = failure.to_string();
+            let error = RuntimeError::from_session_execution_fence(failure.clone());
+            assert_eq!(error.to_string(), message);
+            assert_eq!(error.session_execution_fence_error(), Some(&failure));
+            assert_eq!(error.clone().session_execution_fence_error(), Some(&failure));
+        }
+        assert!(RuntimeError::new("provider error").session_execution_fence_error().is_none());
+        assert!(RuntimeError::with_tool_exposure_miss("exposure").session_execution_fence_error().is_none());
     }
 }
 

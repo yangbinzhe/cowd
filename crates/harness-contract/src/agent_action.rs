@@ -4,7 +4,7 @@
 //! references. Runtime identity, authorization, revisions, leases and physical
 //! execution topology are bound by the trusted host in [`AgentActionEnvelope`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -875,6 +875,149 @@ pub struct AgentActionEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
     pub action: AgentAction,
+}
+
+/// Fold complete, ordered applied Program actions into per-execution attempt state.
+/// The caller must prove the journal is complete and ordered; an empty fold is
+/// not by itself evidence that a Program does not exist.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberAttemptFold {
+    attempts: BTreeMap<String, MemberAttemptFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemberAttemptFact {
+    task_ref: String,
+    mode: AgentAttemptMode,
+    generation: u64,
+    unsettled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberAttemptObservation {
+    Applied,
+    /// The caller must authenticate this event and the original Program binding.
+    RootNonMember,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberAttemptFactError {
+    MalformedEnvelope,
+    ForeignLineage,
+    MissingExecution,
+    MismatchedExecution,
+    AmbiguousAttempt,
+    UnprovenRoot,
+    UnverifiedSource,
+}
+
+impl MemberAttemptFold {
+    /// Observe the payload of one `agentic.action_applied` event.
+    pub fn observe_action_applied(
+        &mut self,
+        payload: &serde_json::Value,
+        session_id: &str,
+        turn_id: &str,
+        program_id: &str,
+        original_root_graph: Option<&str>,
+    ) -> Result<MemberAttemptObservation, MemberAttemptFactError> {
+        let envelope: AgentActionEnvelope = serde_json::from_value(
+            payload.get("envelope").cloned().ok_or(MemberAttemptFactError::MalformedEnvelope)?,
+        ).map_err(|_| MemberAttemptFactError::MalformedEnvelope)?;
+        if envelope.actor.session_id != session_id
+            || envelope.actor.turn_id != turn_id
+            || envelope.actor.program_id != program_id
+        {
+            return Err(MemberAttemptFactError::ForeignLineage);
+        }
+        let dispatch = matches!(&envelope.action, AgentAction::TaskAttemptDispatch(_));
+        let settles = matches!(
+            &envelope.action,
+            AgentAction::TaskAttemptFail(_) | AgentAction::TaskSubmit(_)
+                | AgentAction::TaskReview(_) | AgentAction::TaskRelease(_)
+        ) || matches!(&envelope.action, AgentAction::MessagePublish(message)
+            if message.intent.as_ref().is_some_and(|intent| intent.kind == TaskIntentKind::Decline));
+        if !dispatch && !settles {
+            return Ok(MemberAttemptObservation::Applied);
+        }
+        if envelope.actor.kind == AgentActorKind::Root && envelope.actor.execution_id.is_none() {
+            if dispatch || matches!(&envelope.action, AgentAction::TaskAttemptFail(_)) {
+                return Err(MemberAttemptFactError::MissingExecution);
+            }
+            let root = original_root_graph.ok_or(MemberAttemptFactError::UnprovenRoot)?;
+            let physical = envelope.actor.original_execution.as_ref()
+                .ok_or(MemberAttemptFactError::UnprovenRoot)?;
+            if envelope.actor.actor_id != format!("root:{session_id}")
+                || envelope.actor.root_execution_id.as_deref() != Some(root)
+                || physical.graph_id != root || physical.node_id.trim().is_empty()
+                || physical.attempt == 0 || envelope.actor.team_id.is_some()
+                || envelope.actor.agent_id.is_some()
+            {
+                return Err(MemberAttemptFactError::UnprovenRoot);
+            }
+            return Ok(MemberAttemptObservation::RootNonMember);
+        }
+        let execution_id = envelope.actor.execution_id.as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(MemberAttemptFactError::MissingExecution)?;
+        if let AgentAction::TaskAttemptDispatch(input) = &envelope.action {
+            if input.execution_id != execution_id {
+                return Err(MemberAttemptFactError::MismatchedExecution);
+            }
+            if let Some(previous) = self.attempts.get(execution_id) {
+                if previous.task_ref != input.task_ref || previous.mode != input.mode
+                    || previous.generation != input.generation
+                {
+                    return Err(MemberAttemptFactError::AmbiguousAttempt);
+                }
+            }
+            self.attempts.insert(execution_id.to_owned(), MemberAttemptFact {
+                task_ref: input.task_ref.clone(), mode: input.mode,
+                generation: input.generation, unsettled: true,
+            });
+            return Ok(MemberAttemptObservation::Applied);
+        }
+        if let AgentAction::TaskAttemptFail(input) = &envelope.action {
+            if input.execution_id != execution_id {
+                return Err(MemberAttemptFactError::MismatchedExecution);
+            }
+        }
+        let task_ref = match &envelope.action {
+            AgentAction::TaskAttemptFail(input) => Some(input.task_ref.as_str()),
+            AgentAction::TaskSubmit(input) => Some(input.task_ref.as_str()),
+            AgentAction::TaskReview(input) => Some(input.task_ref.as_str()),
+            AgentAction::TaskRelease(input) => Some(input.task_ref.as_str()),
+            AgentAction::MessagePublish(input) => input.intent.as_ref().map(|intent| intent.task_ref.as_str()),
+            AgentAction::StateInspect(_) | AgentAction::TeamCreate(_) | AgentAction::AgentInvite(_)
+            | AgentAction::TaskPublish(_) | AgentAction::TaskClaim(_) | AgentAction::TaskSupersede(_)
+            | AgentAction::TaskWithdraw(_) | AgentAction::TaskAttemptDispatch(_)
+            | AgentAction::ArtifactCommit(_) | AgentAction::ObjectiveUpdate(_)
+            | AgentAction::ObjectiveReview(_) | AgentAction::MembershipUpdate(_)
+            | AgentAction::TeamUpdate(_) | AgentAction::ObjectiveCompleteRequest(_) => None,
+        };
+        if let Some(attempt) = self.attempts.get_mut(execution_id) {
+            if task_ref != Some(attempt.task_ref.as_str()) {
+                return Err(MemberAttemptFactError::AmbiguousAttempt);
+            }
+            if let AgentAction::TaskAttemptFail(input) = &envelope.action {
+                if input.mode != attempt.mode {
+                    return Err(MemberAttemptFactError::AmbiguousAttempt);
+                }
+            }
+            attempt.unsettled = false;
+        }
+        Ok(MemberAttemptObservation::Applied)
+    }
+
+    #[must_use]
+    pub fn is_unsettled(&self, execution_id: &str) -> bool {
+        self.attempts.get(execution_id).is_some_and(|attempt| attempt.unsettled)
+    }
+
+    #[must_use]
+    pub fn any_unsettled(&self) -> bool {
+        self.attempts.values().any(|attempt| attempt.unsettled)
+    }
 }
 
 impl AgentActionEnvelope {

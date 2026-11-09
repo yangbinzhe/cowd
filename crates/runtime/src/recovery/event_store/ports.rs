@@ -168,6 +168,12 @@ pub enum RuntimeEventStoreError {
     CheckedAttemptRolledBack(Box<RuntimeEventStoreError>),
     #[error("original member authority expired before checked commit")]
     CurrentMemberAuthorityExpired,
+    /// The checked terminal cannot close while original member attempts are unsettled.
+    #[error("original Program member attempts remain unsettled")]
+    SessionAttemptsUnsettled,
+    /// The original Session terminal has committed before this new Program write.
+    #[error("original Session terminal has already committed")]
+    SessionTerminalCommitted,
     #[error("invalid runtime event transaction: {0}")]
     InvalidTransaction(String),
     #[error("decision lease `{lease_id}` has already been consumed")]
@@ -190,6 +196,8 @@ impl RuntimeEventStoreError {
             Self::StaleRevision { .. } => "stale_revision",
             Self::CheckedAttemptRolledBack(_) => "checked_attempt_rolled_back",
             Self::CurrentMemberAuthorityExpired => "current_member_authority_expired",
+            Self::SessionAttemptsUnsettled => "session_attempts_unsettled",
+            Self::SessionTerminalCommitted => "session_terminal_committed",
             Self::InvalidTransaction(_) => "invalid_transaction",
             Self::DecisionLeaseAlreadyConsumed { .. } => "decision_lease_already_consumed",
             Self::Serialization(_) => "serialization",

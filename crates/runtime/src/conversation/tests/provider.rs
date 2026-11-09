@@ -2493,7 +2493,8 @@ async fn stale_session_execution_fence(
         "fence-worker",
         token,
     )
-    .unwrap();
+    .unwrap()
+    .with_claim_fence_epoch(running.claim_fence_epoch.expect("original claim epoch"));
     store
         .advance_session_input_generation(
             session_id,
@@ -5036,6 +5037,7 @@ mod r1_native_real_wire {
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
         disconnect: Arc<AtomicBool>,
         reject_output: Arc<AtomicBool>,
+        delay_first_completion: Arc<AtomicBool>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -5053,6 +5055,8 @@ mod r1_native_real_wire {
             let captured = requests.clone();
             let disconnect = Arc::new(AtomicBool::new(false));
             let reject_output = Arc::new(AtomicBool::new(false));
+            let delay_first_completion = Arc::new(AtomicBool::new(false));
+            let delay_first_for_server = delay_first_completion.clone();
             let first_call = Arc::new(Mutex::new(serde_json::json!({"name":"read_file","arguments":
                 serde_json::json!({"path":"target.txt","complete":true}).to_string()})));
             let first_call_for_server = first_call.clone();
@@ -5120,18 +5124,23 @@ mod r1_native_real_wire {
                             }]
                         })
                     };
-                    let response = format!(
-                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    let response_prefix = format!(
+                        "data: {}\n\ndata: {}\n\n",
                         chunk(delta, serde_json::Value::Null),
                         chunk(
                             serde_json::json!({}),
                             serde_json::json!(if ordinal == 1 { "tool_calls" } else { "stop" })
                         )
                     );
+                    let done = "data: [DONE]\n\n";
                     socket.write_all(format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        response.len(), response,
+                        response_prefix.len() + done.len(), response_prefix,
                     ).as_bytes()).await.unwrap();
+                    if ordinal == 1 && delay_first_for_server.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    socket.write_all(done.as_bytes()).await.unwrap();
                 }
             });
             Self {
@@ -5140,6 +5149,7 @@ mod r1_native_real_wire {
                 requests,
                 disconnect,
                 reject_output,
+                delay_first_completion,
                 task,
             }
         }
@@ -5224,7 +5234,8 @@ mod r1_native_real_wire {
 
     struct GovernedReadExecutor {
         host: tools::ToolHost,
-        requests: Mutex<Vec<crate::RuntimeToolExecutionRequest>>,
+        read_mode: AtomicUsize,
+        requests: Arc<Mutex<Vec<crate::RuntimeToolExecutionRequest>>>,
     }
 
     #[async_trait::async_trait]
@@ -5246,10 +5257,21 @@ mod r1_native_real_wire {
             request: &crate::RuntimeToolExecutionRequest,
         ) -> crate::RuntimeToolExecutionOutcome {
             self.requests.lock().unwrap().push(request.clone());
+            if request.tool_name == "read_file" && self.read_mode.load(Ordering::SeqCst) == 2 {
+                return crate::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(), tool_name: request.tool_name.clone(),
+                    status: crate::RuntimeToolExecutionStatus::Unknown, category: request.category,
+                    output: None, error: Some("injected original read unknown".into()),
+                    evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+                    observed_evidence: Vec::new(), pending_agent_batch: None,
+                };
+            }
             let binding = request.step_binding.as_ref().unwrap();
             let step = binding.resolve(Some(self.host.pin_snapshot())).unwrap();
             let input = serde_json::from_str(&request.input).unwrap();
-            let result = if request.tool_name == "tool_orchestrate" {
+            let result = if request.tool_name == "read_file" && self.read_mode.load(Ordering::SeqCst) == 1 {
+                Err(tools::ToolHostError::Execution("injected original read failure".into()))
+            } else if request.tool_name == "tool_orchestrate" {
                 step.lease().execute_with_orchestrated_read_trace(request.authorization.as_ref().unwrap(), &input)
                     .and_then(|(output, children)| {
                         request.tool_progress.record_orchestrated_children(&children)
@@ -5331,11 +5353,16 @@ mod r1_native_real_wire {
         execution: crate::CowdExecutionContext,
         registry: Arc<crate::ProviderRegistry>,
         services: Option<Arc<crate::RuntimeServices>>,
-        _workspace: tempfile::TempDir,
+        live_services: Arc<Mutex<Option<Arc<crate::RuntimeServices>>>>,
+        _workspace: Arc<tempfile::TempDir>,
     }
 
     impl NativeFixture {
         async fn new(body: Option<&str>, recipient: &str) -> Self {
+            Self::new_with_early(body, recipient, false).await
+        }
+
+        async fn new_with_early(body: Option<&str>, recipient: &str, early: bool) -> Self {
             let workspace = tempfile::tempdir().unwrap();
             if let Some(body) = body {
                 fs::write(workspace.path().join("target.txt"), body).unwrap();
@@ -5454,18 +5481,22 @@ mod r1_native_real_wire {
                 outcomes_seen: AtomicUsize::new(0),
             });
             let server = WireServer::start().await;
+            server.delay_first_completion.store(early, Ordering::SeqCst);
             let registry = Arc::new(
                 crate::ProviderRegistry::new(crate::config::ProvidersConfig {
                     providers: std::collections::HashMap::from([(
                         "native-loopback".into(),
                         crate::config::ProviderConfig {
+                            reasoning_effort: None,
                             name: "native-loopback".into(),
                             base_url: server.endpoint.clone(),
                             api_key: "local-fixture-secret".into(),
                             models: vec!["native-wire-model".into()],
                             protocol: Some("completions".into()),
                             parallel_tool_calls: Default::default(),
-                            early_tool_start: Default::default(),
+                            early_tool_start: if early {
+                                model_protocol::provider_config::EarlyToolStartMode::Enabled
+                            } else { Default::default() },
                         },
                     )]),
                 })
@@ -5496,7 +5527,8 @@ mod r1_native_real_wire {
             .unwrap();
             let executor = GovernedReadExecutor {
                 host,
-                requests: Mutex::new(Vec::new()),
+                read_mode: AtomicUsize::new(0),
+                requests: Arc::new(Mutex::new(Vec::new())),
             };
             let mut runtime = ConversationRuntime::new(
                 session,
@@ -5529,7 +5561,8 @@ mod r1_native_real_wire {
                 execution,
                 registry,
                 services: None,
-                _workspace: workspace,
+                live_services: Arc::new(Mutex::new(None)),
+                _workspace: Arc::new(workspace),
             }
         }
 
@@ -5553,6 +5586,7 @@ mod r1_native_real_wire {
             .session_ports(ports.clone(), ports.clone(), self.journal.clone(), ports)
             .build()
             .unwrap();
+            *self.live_services.lock().unwrap() = Some(Arc::clone(&services));
             services.publish_session_execution_policy(
                 self.runtime.session_id().to_string(),
                 self.runtime.permission_policy.execution_policy_control(),
@@ -5605,6 +5639,7 @@ mod r1_native_real_wire {
             let runtime = self
                 .runtime
                 .with_checkpoint_identity(services.workspace_key(), identity);
+            let original_turn_cancelled = runtime.cancellation_token().is_cancelled();
             let lineage = ExecutionGraphLineage {
                 session_id: self.execution.session_id.clone(),
                 turn_id: self.execution.turn_id.clone(),
@@ -5618,30 +5653,72 @@ mod r1_native_real_wire {
                 .expect("release fresh native-wire Runtime producers");
             let (runtime, result) = tokio::time::timeout(
                 Duration::from_secs(30),
-                crate::submit_owned_conversation_turn(
+                Box::pin(crate::submit_owned_conversation_turn(
                     runtime,
                     services.clone(),
                     "Read target.txt and report the current facts",
                     &crate::SharedPrompter::none(),
                     lineage.clone(),
-                ),
+                )),
             )
             .await
             .unwrap()
             .unwrap();
             self.runtime = runtime;
+            assert!(self.runtime.original_turn_control().is_err());
+            assert_eq!(self.runtime.cancellation_token().is_cancelled(), original_turn_cancelled);
+            if result.is_err() {
+                let requests = self.runtime.tool_executor.requests.lock().unwrap();
+                eprintln!("early_witness captured_native_requests={}",
+                    requests.iter().filter(|request| request.tool_use_id == "native-read").count());
+                for request in requests.iter().filter(|request| request.tool_use_id == "native-read") {
+                    let key = &request.idempotency_key;
+                    let effect = format!("execution-effect:{key}");
+                    let events = self.store.list_stream(&effect).unwrap();
+                    eprintln!("early_witness call={} binding_key={:?} request_key={} parent={:?} parent_attempt={:?}",
+                        request.tool_use_id, request.step_binding.as_ref().map(|binding| binding.effect_idempotency_key()),
+                        key, request.parent_execution, request.parent_execution_attempt);
+                    for event in events {
+                        eprintln!("early_witness effect kind={} seq={} cursor={} tx={} tx_index={}",
+                            event.kind, event.sequence, event.commit_cursor, event.transaction_id, event.transaction_index);
+                    }
+                    if let (Some(parent), Some(attempt)) = (&request.parent_execution, request.parent_execution_attempt) {
+                        let stream = format!("execution-agent-receipts:{}:{}:{}", parent.execution_id, parent.node_id, attempt);
+                        for event in self.store.list_stream(&stream).unwrap() {
+                            eprintln!("early_witness owner_index stream={} kind={} seq={} cursor={} tx={} tx_index={} key={}",
+                                stream, event.kind, event.sequence, event.commit_cursor, event.transaction_id,
+                                event.transaction_index, event.payload["idempotency_key"]);
+                        }
+                        if let Ok(graph) = services.graph_state_store().load(&parent.execution_id) {
+                            for node in graph.nodes.iter().filter(|node| node.executor_kind == "tool_batch") {
+                                for attempt in 1..=node.retry_policy.max_attempts {
+                                    let stream = format!("execution-agent-receipts:{}:{}:{}", graph.id, node.id, attempt);
+                                    let events = self.store.list_stream(&stream).unwrap();
+                                    eprintln!("early_witness batch_index stream={} events={}", stream, events.len());
+                                    for event in events {
+                                        eprintln!("early_witness batch_index_event kind={} seq={} cursor={} tx={} tx_index={} key={}",
+                                            event.kind, event.sequence, event.commit_cursor, event.transaction_id,
+                                            event.transaction_index, event.payload["idempotency_key"]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             result.unwrap();
-            let sources = self.runtime.turn_native_tool_sources.lock().unwrap();
-            let source = sources.get("native-read").unwrap_or_else(|| {
-                let kinds = self.store.list_stream(&format!("session:{}",self.runtime.session_id()))
-                    .unwrap().iter().map(|event| (event.kind.clone(),event.status.clone(),event.payload["tool_name"].clone())).collect::<Vec<_>>();
-                let requests = self.server.requests.lock().unwrap();
-                let tools = requests.first().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-                    .and_then(|body| body["tools"].as_array().map(|tools| tools.iter().map(|tool| tool["function"]["name"].clone()).collect::<Vec<_>>()));
-                panic!("native fixture source missing; sources={:?}; wire_requests={}; exposed_tools={tools:?}; session_events={kinds:?}",
-                    sources.keys().collect::<Vec<_>>(),requests.len());
-            }).clone();
-            drop(sources);
+            let source = {
+                let sources = self.runtime.turn_native_tool_sources.lock().unwrap();
+                sources.get("native-read").unwrap_or_else(|| {
+                    let kinds = self.store.list_stream(&format!("session:{}",self.runtime.session_id()))
+                        .unwrap().iter().map(|event| (event.kind.clone(),event.status.clone(),event.payload["tool_name"].clone())).collect::<Vec<_>>();
+                    let requests = self.server.requests.lock().unwrap();
+                    let tools = requests.first().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                        .and_then(|body| body["tools"].as_array().map(|tools| tools.iter().map(|tool| tool["function"]["name"].clone()).collect::<Vec<_>>()));
+                    panic!("native fixture source missing; sources={:?}; wire_requests={}; exposed_tools={tools:?}; session_events={kinds:?}",
+                        sources.keys().collect::<Vec<_>>(),requests.len());
+                }).clone()
+            };
             let call = source.call.clone();
             self.execution = source.execution;
             self.owner = source
@@ -5949,6 +6026,190 @@ mod r1_native_real_wire {
                     .trim_start_matches("sha256:")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn original_early_read_reaches_real_host_with_model_ticket() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
+        let fixture = NativeFixture::new_with_early(Some("alpha\nbeta\n"), "none", true).await;
+        let mut host_tasks = tokio::task::JoinSet::new();
+        host_tasks.spawn(async move { fixture.run_root_host(false).await });
+        let (fixture, call) = host_tasks
+            .join_next()
+            .await
+            .expect("native Host task must exist")
+            .expect("native Host task must complete without panic or cancellation");
+        let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
+        let matching = requests.iter().filter(|request| request.tool_use_id == call.id).collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "the original early read must not be dispatched twice");
+        let request = matching[0];
+        let parent = request.parent_execution.as_ref().expect("original read parent");
+        let graph = fixture.services.as_ref().unwrap().graph_state_store().load(&parent.execution_id).unwrap();
+        let node = graph.nodes.iter().find(|node| node.id == parent.node_id).expect("original parent node");
+        assert_eq!(node.executor_kind, "inline_model", "a ToolBatch fallback is not an early read");
+        assert_eq!(request.step_binding.as_ref(), call.binding.as_ref());
+        assert!(request.authorization.is_some());
+        drop(requests);
+        let receipt = fixture.acquisition(&call);
+        assert_eq!(receipt.kind, "execution.read.receipt");
+        // A carrier whose outcome drifts from the committed receipt is rejected.
+        let request = fixture.runtime.tool_executor.requests.lock().unwrap().iter()
+            .find(|request| request.tool_use_id == call.id).unwrap().clone();
+        let services = fixture.services.as_ref().unwrap();
+        let parent = request.parent_execution.as_ref().unwrap();
+        let graph = services.graph_state_store().load(&parent.execution_id).unwrap();
+        let binding = services.graph_state_store().current_binding(&graph, &parent.node_id,
+            request.parent_execution_attempt.unwrap()).unwrap();
+        let (ticket, _) = services.graph_state_store().binding_start_ticket(&graph, &parent.node_id, &binding).unwrap();
+        let mut unknown: crate::RuntimeToolExecutionOutcome = serde_json::from_value(receipt.payload["outcome"].clone()).unwrap();
+        unknown.status = crate::RuntimeToolExecutionStatus::Unknown;
+        let candidate = crate::conversation::EarlyToolExecutionReceipt {
+            original_source: Some(crate::conversation::EarlyToolOriginalSource {
+                ticket: ticket.clone(), request: Arc::new(request), completed_calls: Some(vec![call.clone()]),
+            }),
+            lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
+            call: call.clone(), outcome: unknown, ready_at_ms: 0, started_at_ms: 0, completed_at_ms: 0,
+        };
+        assert!(!services.commit_service().original_early_read_is_committed(&ticket, &candidate).unwrap(),
+            "a changed carrier outcome must not match the committed terminal receipt");
+    }
+
+    #[tokio::test]
+    async fn original_early_failed_read_is_not_reexecuted_and_keeps_failed_receipt() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") { return; }
+        let fixture = NativeFixture::new_with_early(Some("alpha\nbeta\n"), "none", true).await;
+        fixture.runtime.tool_executor.read_mode.store(1, Ordering::SeqCst);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { fixture.run_root_host(false).await });
+        let (fixture, call) = tasks.join_next().await.expect("Host task exists")
+            .expect("original failed read must close honestly");
+        let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|request| request.tool_use_id == call.id).count(), 1,
+            "a completed failed read must not be dispatched again");
+        drop(requests);
+        let receipt = fixture.acquisition(&call);
+        assert_eq!(receipt.payload["outcome"]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn original_early_unknown_read_keeps_custody_without_redispatch() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") { return; }
+        let fixture = NativeFixture::new_with_early(Some("alpha\nbeta\n"), "none", true).await;
+        fixture.runtime.tool_executor.read_mode.store(2, Ordering::SeqCst);
+        let requests = Arc::clone(&fixture.runtime.tool_executor.requests);
+        let live_services = Arc::clone(&fixture.live_services);
+        let workspace = Arc::clone(&fixture._workspace);
+        let cancellation = fixture.runtime.cancellation_token();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { fixture.run_root_host(false).await });
+        let (services, ticket, request, worker_nonce) = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let services = live_services.lock().unwrap().clone();
+                let request = requests.lock().unwrap().iter()
+                    .find(|request| request.tool_use_id == "native-read").cloned();
+                if let (Some(services), Some(request)) = (services, request) {
+                    if let (Some(parent), Some(attempt)) = (&request.parent_execution, request.parent_execution_attempt) {
+                        if let Ok(graph) = services.graph_state_store().load(&parent.execution_id) {
+                            if let Ok(binding) = services.graph_state_store().current_binding(&graph, &parent.node_id, attempt) {
+                                if let Ok((ticket, _)) = services.graph_state_store().binding_start_ticket(&graph, &parent.node_id, &binding) {
+                                    if let Some((failure, worker_nonce)) = services.model_step_executor().original_unknown_worker_for_test(&ticket, "native-read") {
+                                        assert!(failure.detail.to_ascii_lowercase().contains("unknown"), "original worker must report Unknown");
+                                        assert!(services.execution_supervisor().active_binding_for_ticket_for_test(&ticket).await.is_some(),
+                                            "the same original model binding must retain custody");
+                                        break (services, ticket, request, worker_nonce);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("original Unknown and retained binding must be observed before the test deadline");
+        let before_cancel = services.graph_state_store().load(&ticket.graph_id).unwrap();
+        assert_eq!(before_cancel.node_statuses.get(&ticket.node_id), Some(&ExecutionNodeStatus::Running));
+        assert!(!before_cancel.node_results.contains_key(&ticket.node_id), "Unknown must not fabricate a terminal outcome");
+        let primary = format!("execution-effect:{}", request.idempotency_key);
+        assert!(services.event_store().event_by_idempotency_key(&primary,
+            &format!("{}:read-receipt", request.idempotency_key)).unwrap().is_none(),
+            "Unknown must not fabricate a read receipt");
+        assert_eq!(requests.lock().unwrap().iter().filter(|request| request.tool_use_id == "native-read").count(), 1,
+            "Unknown original read must not be dispatched again");
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled(), "the original turn cancellation token must be signalled");
+        let shutdown_services = Arc::clone(&services);
+        let shutdown_task = tokio::spawn(async move { shutdown_services.shutdown_execution().await });
+        let joined = tokio::time::timeout(Duration::from_secs(30), tasks.join_next()).await
+            .expect("original cancellation must resolve within the test deadline").expect("Host task exists");
+        match joined {
+            Ok(_) => panic!("Unknown must not turn into a successful Host result during cancellation"),
+            Err(error) if error.is_panic() => {
+                let panic = error.into_panic();
+                let reason = panic.downcast_ref::<String>().map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("").to_ascii_lowercase();
+                assert!(!reason.contains("elapsed"), "timeout is not cancellation evidence: {reason}");
+                assert!(reason.contains("cancel") || reason.contains("unknown") || reason.contains("uncertain"),
+                    "failure must come from original cancellation or Unknown custody: {reason}");
+            }
+            Err(error) => assert!(error.is_cancelled(), "unexpected Host join failure: {error}"),
+        }
+        let shutdown = tokio::time::timeout(Duration::from_secs(30), shutdown_task).await
+            .expect("original execution shutdown must complete or report retained custody")
+            .expect("original execution shutdown task must join");
+        assert_eq!(requests.lock().unwrap().iter().filter(|request| request.tool_use_id == "native-read").count(), 1,
+            "cancellation must not redispatch the original Unknown call");
+        let graph = services.graph_state_store().load(&ticket.graph_id).unwrap();
+        assert!(!graph.node_results.get(&ticket.node_id).is_some_and(|result| result.status == ExecutionNodeStatus::Completed),
+            "cancellation must not promote Unknown to completed");
+        assert!(services.model_step_executor().retains_original_early_worker_for_test(&ticket, "native-read", &worker_nonce),
+            "cleanup must retain the exact original Unknown worker; shutdown report: {shutdown:?}");
+        assert!(shutdown.preserved_graphs > 0 || shutdown.errors.iter().any(|error| {
+            let error = error.to_ascii_lowercase();
+            error.contains("unknown") || error.contains("unconfirmed") || error.contains("unresolved")
+        }), "original shutdown must report the preserved or unresolved graph: {shutdown:?}");
+        drop(workspace);
+    }
+
+    #[tokio::test]
+    async fn original_early_deferral_falls_back_to_same_call_in_real_tool_batch() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
+        let fixture = NativeFixture::new_with_early(Some("alpha\nbeta\n"), "none", true).await;
+        let program = serde_json::json!({"steps":[{"id":"read","op":"batch","calls":[
+            {"tool":"read_file","input":{"path":"target.txt","complete":true}}
+        ]}]});
+        *fixture.server.first_call.lock().unwrap() = serde_json::json!({
+            "name":"tool_orchestrate", "arguments":program.to_string()
+        });
+        let mut host_tasks = tokio::task::JoinSet::new();
+        host_tasks.spawn(async move { fixture.run_root_host(false).await });
+        let (fixture, call) = host_tasks
+            .join_next()
+            .await
+            .expect("native Host task must exist")
+            .expect("native Host task must complete without panic or cancellation");
+        let model_node = fixture.owner.node_id.as_ref().expect("original model node");
+        let deferrals = fixture.store.list_stream(&format!("execution-node:{model_node}")).unwrap();
+        assert!(deferrals.iter().any(|event| event.kind == "execution.tool_early_deferred"
+            && event.payload["tool_call_id"] == call.id
+            && event.payload["reason"].as_str().is_some_and(|reason| !reason.is_empty()
+                && reason != "provider early_tool_start gate is not performance-certified")),
+            "the original dispatcher must defer; the disabled performance gate is not a witness");
+        let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
+        let matching = requests.iter().filter(|request| request.tool_use_id == call.id).collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "the deferred call must run exactly once in the original batch");
+        let request = matching[0];
+        let parent = request.parent_execution.as_ref().expect("fallback parent");
+        let graph = fixture.services.as_ref().unwrap().graph_state_store().load(&parent.execution_id).unwrap();
+        let node = graph.nodes.iter().find(|node| node.id == parent.node_id).expect("fallback node");
+        assert_eq!(node.executor_kind, "tool_batch");
+        assert_eq!(request.step_binding.as_ref(), call.binding.as_ref());
+        drop(requests);
+        let receipt = fixture.acquisition(&call);
+        assert_eq!(receipt.kind, "execution.read.receipt");
     }
 
     #[tokio::test]
@@ -6797,6 +7058,7 @@ fn empty_final_completion_is_failure_with_original_usage_not_a_goal_candidate() 
         depends_on: vec![],
     };
     let receipt = EarlyToolExecutionReceipt {
+        original_source: None,
         lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
         call: call.clone(),
         ready_at_ms: 1,

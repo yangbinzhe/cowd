@@ -1809,15 +1809,43 @@ pub(crate) struct OriginalConclusionOwner {
     policy: crate::permissions::PermissionPolicy,
 }
 
-/// One Program action by the member that made it, reduced to what the
-/// recovery predicate needs: whether it opens that member's attempt, closes
-/// it, or neither.
-struct MemberAttemptRecord {
-    execution_id: String,
-    /// Opens the member's attempt.
-    dispatch: bool,
-    /// Closes the member's attempt.
-    settles: bool,
+/// Original ingress handles used for the atomic continuation registration.
+pub(crate) struct OriginalGraphRegistrationOwner {
+    claim: Arc<OriginalSessionClaim>,
+    root_control: Arc<TurnCancellationControl>,
+    requested: Arc<crate::conversation::OriginalTurnInputControl>,
+    input: crate::SessionInputStream,
+    policy: crate::permissions::PermissionPolicy,
+    policy_controls: Arc<RwLock<BTreeMap<String, crate::permissions::SessionExecutionPolicyControl>>>,
+    admission_blocks: Arc<RwLock<BTreeMap<String, String>>>,
+}
+
+impl OriginalGraphRegistrationOwner {
+    pub(crate) fn with_action<T>(&self, f: impl FnOnce(&OriginalSessionClaim, Arc<crate::conversation::MemberCommitControl>, usize) -> Result<T, String>) -> Result<T, String> {
+        self.with_current(|claim, control| f(&self.claim, control, claim.consumed_input_sequence))
+    }
+
+    pub(crate) fn with_current<T>(&self, f: impl FnOnce(&crate::RuntimeOriginalSessionClaim<'_>, Arc<crate::conversation::MemberCommitControl>) -> Result<T, String>) -> Result<T, String> {
+        let original = self.policy.execution_policy_control();
+        with_original_session_policy_handles(&self.admission_blocks, &self.policy_controls, self.claim.session_id(), &original, |_| {
+            let turn = harness_contract::turn::TurnId::from_string(self.claim.turn_id());
+            if self.input.active_turn_id().as_ref() != Some(&turn) { return Err("original registration turn changed".into()); }
+            let fence = self.claim.fence()?;
+            let cursor = self.input.highest_consumed_cursor(&turn);
+            if self.input.active_turn_id().as_ref() != Some(&turn) { return Err("original registration turn changed while reading cursor".into()); }
+            let consumed_input_sequence = match cursor {
+                Some(cursor) if cursor.generation == fence.session_generation =>
+                    usize::try_from(cursor.sequence).map_err(|_| "registration consumed cursor overflow")?.max(fence.input_sequence),
+                Some(_) => return Err("registration consumed cursor generation mismatch".into()),
+                None => fence.input_sequence,
+            };
+            let claim = crate::RuntimeOriginalSessionClaim { session_id: self.claim.session_id(), ingress_message_id: self.claim.message_id(),
+                turn_id: self.claim.turn_id(), fence: &fence, consumed_input_sequence };
+            let control = self.root_control.token().member_commit_control();
+            self.requested.register(&control);
+            f(&claim, control)
+        })
+    }
 }
 
 /// The durable Program journal of one Session turn, told apart by state.
@@ -1846,17 +1874,136 @@ pub(crate) struct OriginalTerminalCommitOwner {
     /// removes the retained owner under the same identity rule.
     release_after_terminal: Arc<dyn Fn(&str, &OriginalSessionClaim) -> bool + Send + Sync>,
     owner: OriginalConclusionOwner,
+    root_control: Arc<TurnCancellationControl>,
+    requested: Arc<crate::conversation::OriginalTurnInputControl>,
     ticket: crate::execution_core::graph::NodeExecutionTicket,
     terminal: Mutex<OriginalTerminalClosureState>,
+    retired_replan: Mutex<Option<crate::AppendTransactionReceipt>>,
 }
 
 #[derive(Default)]
 struct OriginalTerminalClosureState {
     event: Option<crate::DurableRuntimeEvent>,
     released: bool,
+    replacement_requests: Vec<OriginalReplacementAttempt>,
+}
+
+struct OriginalReplacementAttempt {
+    request: Arc<crate::CheckedAppendRequest>,
+    control: Arc<crate::conversation::MemberCommitControl>,
+    confirmed_rollback: bool,
 }
 
 impl OriginalTerminalCommitOwner {
+    pub(crate) fn record_retired_replan(&self, receipt: &crate::AppendTransactionReceipt) -> Result<(), String> {
+        let mut retired = self.retired_replan.lock().map_err(|_| "original terminal retirement poisoned")?;
+        if let Some(existing) = retired.as_ref() {
+            let mut normalized = receipt.clone();
+            normalized.duplicate = existing.duplicate;
+            if *existing != normalized { return Err("original terminal retirement receipt differs".into()); }
+        } else {
+            *retired = Some(receipt.clone());
+        }
+        Ok(())
+    }
+    pub(crate) fn retired_replan_matches(&self, receipt: &crate::AppendTransactionReceipt) -> Result<bool, String> {
+        let retired = self.retired_replan.lock().map_err(|_| "original terminal retirement poisoned")?;
+        Ok(retired.as_ref().is_some_and(|existing| {
+            let mut normalized = receipt.clone();
+            normalized.duplicate = existing.duplicate;
+            *existing == normalized
+        }))
+    }
+    pub(crate) fn retain_replacement_request(
+        &self, request: Arc<crate::CheckedAppendRequest>, control: Arc<crate::conversation::MemberCommitControl>,
+    ) -> Result<(), String> {
+        if !self.owner.control.original_noncommit_reconciled()? || !self.matches_replan_transaction(&request.transaction) {
+            return Err("original terminal replacement request is not authorized".into());
+        }
+        let mut terminal = self.terminal.lock().map_err(|_| "original terminal owner poisoned")?;
+        if terminal.released || terminal.event.is_some() { return Err("original terminal already closed".into()); }
+        if terminal.replacement_requests.iter().any(|old|
+            old.request.transaction.transaction_id == request.transaction.transaction_id && !old.confirmed_rollback) {
+            return Err("original terminal replacement transaction is still unresolved".into());
+        }
+        terminal.replacement_requests.push(OriginalReplacementAttempt { request, control, confirmed_rollback: false });
+        Ok(())
+    }
+
+    pub(crate) fn confirm_replacement_rollback(
+        &self, request: &Arc<crate::CheckedAppendRequest>, control: &Arc<crate::conversation::MemberCommitControl>,
+    ) -> Result<(), String> {
+        if !control.original_noncommit_reconciled()? { return Err("replacement rollback is not confirmed".into()); }
+        let mut terminal = self.terminal.lock().map_err(|_| "original terminal owner poisoned")?;
+        let attempt = terminal.replacement_requests.iter_mut().find(|attempt|
+            Arc::ptr_eq(&attempt.request, request) && Arc::ptr_eq(&attempt.control, control))
+            .ok_or("original replacement control or request differs")?;
+        attempt.confirmed_rollback = true;
+        Ok(())
+    }
+
+    pub(crate) fn replacement_requests_for_outcome(
+        &self, ticket: &crate::execution_core::graph::NodeExecutionTicket,
+        outcome: &crate::execution_core::graph::NodeExecutionOutcome,
+    ) -> Result<Vec<Arc<crate::CheckedAppendRequest>>, String> {
+        if &self.ticket != ticket { return Err("original terminal replacement ticket differs".into()); }
+        let payload = serde_json::to_value(outcome).map_err(|error| error.to_string())?;
+        let key = format!("{}:receipt", ticket.idempotency_key);
+        let terminal = self.terminal.lock().map_err(|_| "original terminal owner poisoned")?;
+        Ok(terminal.replacement_requests.iter().filter(|attempt| {
+            attempt.request.transaction.events.iter().any(|event| event.event.kind == "execution.effect.receipt"
+                && event.idempotency_key.as_deref() == Some(key.as_str()) && event.event.payload == payload)
+        }).map(|attempt| Arc::clone(&attempt.request)).collect())
+    }
+    pub(crate) fn replacement_rollback_confirmed_for_outcome(
+        &self, ticket: &crate::execution_core::graph::NodeExecutionTicket,
+        outcome: &crate::execution_core::graph::NodeExecutionOutcome,
+    ) -> Result<bool, String> {
+        if &self.ticket != ticket { return Err("original terminal replacement ticket differs".into()); }
+        let payload = serde_json::to_value(outcome).map_err(|error| error.to_string())?;
+        let key = format!("{}:receipt", ticket.idempotency_key);
+        let terminal = self.terminal.lock().map_err(|_| "original terminal owner poisoned")?;
+        let Some(attempt) = terminal.replacement_requests.iter().rev().find(|attempt|
+            attempt.request.transaction.events.iter().any(|event| event.event.kind == "execution.effect.receipt"
+                && event.idempotency_key.as_deref() == Some(key.as_str()) && event.event.payload == payload)) else { return Ok(false); };
+        Ok(attempt.confirmed_rollback && attempt.control.original_noncommit_reconciled()?)
+    }
+    pub(crate) fn matches_replan_transaction(&self, transaction: &crate::AppendTransactionRequest) -> bool {
+        let Some(expected) = transaction.expected_streams.iter().find(|source| source.stream_id == self.ticket.graph_id) else { return false; };
+        expected.expected_revision.checked_add(1).is_some_and(|revision|
+            transaction.transaction_id == format!("{}:{}:{revision}:terminal-replan", self.ticket.graph_id, self.ticket.node_id))
+    }
+    pub(crate) fn with_rollback_replacement<T>(
+        &self, f: impl FnOnce(&crate::RuntimeOriginalSessionClaim<'_>, Arc<crate::conversation::MemberCommitControl>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if !self.owner.control.original_noncommit_reconciled()? {
+            return Err("original terminal attempt rollback is not confirmed".into());
+        }
+        {
+            let terminal = self.terminal.lock().map_err(|_| "original terminal owner poisoned")?;
+            if terminal.released || terminal.event.is_some() { return Err("original terminal already closed".into()); }
+        }
+        let original = self.owner.policy.execution_policy_control();
+        with_original_session_policy_handles(&self.admission_blocks, &self.policy_controls, self.owner.claim.session_id(), &original, |_| {
+            let turn = harness_contract::turn::TurnId::from_string(self.owner.claim.turn_id());
+            if self.owner.input.active_turn_id().as_ref() != Some(&turn) { return Err("original terminal turn changed".into()); }
+            let fence = self.owner.claim.fence()?;
+            let cursor = self.owner.input.highest_consumed_cursor(&turn);
+            if self.owner.input.active_turn_id().as_ref() != Some(&turn) { return Err("original terminal turn changed while reading cursor".into()); }
+            let consumed_input_sequence = match cursor {
+                Some(cursor) if cursor.generation == fence.session_generation =>
+                    usize::try_from(cursor.sequence).map_err(|_| "terminal consumed cursor overflow")?.max(fence.input_sequence),
+                Some(_) => return Err("terminal consumed cursor generation mismatch".into()),
+                None => fence.input_sequence,
+            };
+            let claim = crate::RuntimeOriginalSessionClaim { session_id: self.owner.claim.session_id(),
+                ingress_message_id: self.owner.claim.message_id(), turn_id: self.owner.claim.turn_id(),
+                fence: &fence, consumed_input_sequence };
+            let control = self.root_control.token().member_commit_control();
+            self.requested.register(&control);
+            f(&claim, control)
+        })
+    }
     pub(crate) fn record_terminal(&self, ticket: &crate::execution_core::graph::NodeExecutionTicket, event: crate::DurableRuntimeEvent) -> Result<(), String> {
         if self.ticket != *ticket { return Err("original terminal ticket differs".into()); }
         let mut terminal = self.terminal.lock().map_err(|_| "original terminal owner poisoned")?;
@@ -2036,6 +2183,10 @@ impl ActiveExecutionBusLease {
         if root_control.ingress.as_ref() != Some(ingress)
             || !root_control.matches_target(&ingress.session_id, &ingress.turn_id, &self.execution_id)
         { return Err("original Session turn control does not match ingress".into()); }
+        if !fence.matches_ingress(ingress) {
+            return Err("original Session fence does not match ingress".into());
+        }
+        let fence = fence.with_claim_fence_epoch(ingress.claim_revision);
         if self.execution_id != crate::session_ingress_graph_id(
             &ingress.session_id, &ingress.request_id, &ingress.turn_id,
         ) {
@@ -4312,7 +4463,8 @@ impl RuntimeServices {
                     })
                 }
             }),
-            owner, ticket: ticket.clone(), terminal: Mutex::new(OriginalTerminalClosureState::default()),
+            owner, root_control, requested, ticket: ticket.clone(), terminal: Mutex::new(OriginalTerminalClosureState::default()),
+            retired_replan: Mutex::new(None),
         }))
     }
 
@@ -4383,6 +4535,27 @@ impl RuntimeServices {
         Some(OriginalConclusionOwner { claim, input, control, policy: active.original_policy.clone() })
     }
 
+    pub(crate) fn original_graph_registration_owner(
+        &self, graph_id: &str, actor: &harness_contract::agent_action::AgentActorBinding,
+    ) -> Result<Option<Arc<OriginalGraphRegistrationOwner>>, String> {
+        let active = self.resolve_active_execution_bus_with_fence(graph_id).and_then(|(_, _, active)| active);
+        let Some(active) = active else {
+            return if graph_id.starts_with("session-ingress-graph:") {
+                Err("original Session registration owner unavailable".into())
+            } else { Ok(None) };
+        };
+        let (_, root_control, claim, input, requested) = active.for_lineage(&actor.session_id, &actor.turn_id)
+            .ok_or("original registration Session lineage differs")?;
+        if graph_id != crate::session_ingress_graph_id(&actor.session_id, claim.request_id(), &actor.turn_id)
+            || actor.root_execution_id.as_deref() != Some(graph_id)
+        { return Err("original registration graph identity differs".into()); }
+        Ok(Some(Arc::new(OriginalGraphRegistrationOwner {
+            claim, root_control, requested, input, policy: active.original_policy.clone(),
+            policy_controls: Arc::clone(&self.session_execution_policy_controls),
+            admission_blocks: Arc::clone(&self.session_execution_policy_admission_blocks),
+        })))
+    }
+
     /// The durable Program journal of one Session turn.
     ///
     /// One Session turn owns exactly one Program: the objective id is derived
@@ -4413,93 +4586,99 @@ impl RuntimeServices {
         }
     }
 
-    /// One Program action by the member that made it, reduced to what the
-    /// recovery predicate needs.
-    ///
-    /// This is the single fold both predicates use, so the read side and the
-    /// write side can never disagree about one member: a dispatch opens that
-    /// member's attempt, a settlement closes it, and the last record wins.
-    fn member_attempt_records(
+    /// Wait before terminal preparation while this exact ingress owns member work.
+    /// The terminal transaction still decides against the current journal head.
+    pub(crate) async fn wait_for_original_members_before_synthesis(
+        self: &Arc<Self>, graph_id: &str, session_id: &str, turn_id: &str,
+    ) -> Result<bool, String> {
+        let parts = self.original_session_owners.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id).cloned();
+        let Some(parts) = parts else { return Ok(false); };
+        if parts.claim.turn_id() != turn_id
+            || graph_id != crate::session_ingress_graph_id(session_id, parts.claim.request_id(), turn_id)
+        {
+            return Ok(false);
+        }
+        let cancel = parts.root_control.token();
+        let mut commits = self.event_store.subscribe_commits();
+        let mut waited = false;
+        loop {
+            if cancel.is_cancelled() || parts.requested.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("terminal_presentation_cancelled".into());
+            }
+            parts.fence.verify_attempt(crate::SessionExecutionFencePhase::TerminalCommit, graph_id)
+                .await.map_err(|error| error.to_string())?;
+            let services = Arc::clone(self);
+            let session = session_id.to_owned();
+            let turn = turn_id.to_owned();
+            let pending = tokio::task::spawn_blocking(move || {
+                match services.session_program_journal(&session, &turn) {
+                    SessionProgramJournal::NoProgram => Ok(false),
+                    SessionProgramJournal::Unknown => Err("original Program journal unavailable before synthesis".to_string()),
+                    SessionProgramJournal::Journal(events) => services.member_attempt_fold(&events, &session, &turn)
+                        .map(|fold| fold.any_unsettled())
+                        .map_err(|error| format!("original Program attempt facts unavailable before synthesis: {error:?}")),
+                }
+            }).await.map_err(|error| format!("original Program read failed before synthesis: {error}"))??;
+            if !pending { return Ok(waited); }
+            waited = true;
+            tokio::select! {
+                () = cancel.cancelled() => return Err("terminal_presentation_cancelled".into()),
+                changed = commits.changed() => changed.map_err(|_| "original Program notification closed".to_string())?,
+                () = self.resource_manager.wait_for_change() => {},
+            }
+        }
+    }
+
+    fn member_attempt_fold(
+        &self,
         events: &[crate::DurableRuntimeEvent],
-    ) -> Vec<MemberAttemptRecord> {
-        let mut records = Vec::new();
-        for event in events {
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<harness_contract::agent_action::MemberAttemptFold,
+                harness_contract::agent_action::MemberAttemptFactError> {
+        use harness_contract::agent_action::MemberAttemptFactError;
+        let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+        let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+        let stream = format!("agentic-program:{program_id}");
+        let root = self.original_session_owners.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .filter(|owner| owner.claim.turn_id() == turn_id)
+            .map(|owner| crate::session_ingress_graph_id(session_id, owner.claim.request_id(), turn_id));
+        let mut openings = events.iter().filter(|event| event.kind == "agentic.program_opened");
+        openings.next().filter(|opened| {
+            opened.stream_id == stream && opened.scope == crate::RuntimeEventScope::Program
+                && opened.schema_version == 1
+                && opened.payload.get("program_id").and_then(serde_json::Value::as_str) == Some(program_id.as_str())
+                && opened.payload.get("objective_id").and_then(serde_json::Value::as_str) == Some(objective_id.as_str())
+                && opened.payload.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id)
+                && opened.payload.get("turn_id").and_then(serde_json::Value::as_str) == Some(turn_id)
+                && root.is_some()
+                && opened.payload.get("root_execution_id").and_then(serde_json::Value::as_str) == root.as_deref()
+        }).ok_or(MemberAttemptFactError::UnverifiedSource)?;
+        if openings.next().is_some() { return Err(MemberAttemptFactError::UnverifiedSource); }
+        let mut fold = harness_contract::agent_action::MemberAttemptFold::default();
+        for (index, event) in events.iter().enumerate() {
+            let expected = u64::try_from(index).ok().and_then(|index| index.checked_add(1));
+            if event.stream_id != stream || Some(event.sequence) != expected {
+                return Err(MemberAttemptFactError::UnverifiedSource);
+            }
             if event.kind != "agentic.action_applied" {
                 continue;
             }
-            let Some(envelope) = event
-                .payload
-                .get("envelope")
-                .and_then(|value| serde_json::from_value::<
-                    harness_contract::agent_action::AgentActionEnvelope,
-                >(value.clone())
-                .ok())
-            else {
-                continue;
-            };
-            let Some(execution_id) = envelope.actor.execution_id else {
-                continue;
-            };
-            let settles = Self::program_action_settles_attempt(&envelope.action);
-            let dispatch = matches!(
-                envelope.action,
-                harness_contract::agent_action::AgentAction::TaskAttemptDispatch(_)
-            );
-            if settles || dispatch {
-                records.push(MemberAttemptRecord { execution_id, settles, dispatch });
+            if event.scope != crate::RuntimeEventScope::Program
+                || event.status.as_deref() != Some("applied") || event.schema_version != 1
+                || event.actor.as_deref() != event.payload.pointer("/envelope/actor/actor_id").and_then(serde_json::Value::as_str)
+            {
+                return Err(MemberAttemptFactError::UnverifiedSource);
             }
+            fold.observe_action_applied(
+                &event.payload, session_id, turn_id, &program_id, root.as_deref(),
+            )?;
         }
-        records
-    }
-
-    /// Whether one member's attempt is still unsettled: it was dispatched and
-    /// nothing has settled it since.
-    fn member_attempt_record_is_unsettled(
-        records: &[MemberAttemptRecord],
-        member_execution_id: &str,
-    ) -> bool {
-        let mut unsettled = false;
-        for record in records.iter().filter(|record| record.execution_id == member_execution_id) {
-            if record.settles {
-                unsettled = false;
-            }
-            if record.dispatch {
-                unsettled = true;
-            }
-        }
-        unsettled
-    }
-
-    /// Whether any member's attempt is still unsettled, by the same fold.
-    fn any_member_attempt_is_unsettled(records: &[MemberAttemptRecord]) -> bool {
-        let members: std::collections::BTreeSet<&str> =
-            records.iter().map(|record| record.execution_id.as_str()).collect();
-        members
-            .into_iter()
-            .any(|member| Self::member_attempt_record_is_unsettled(records, member))
-    }
-
-    /// Whether one Program action ends the attempt of the member that made it.
-    ///
-    /// These are the durable settlement records of a member attempt, named
-    /// one by one. A failed attempt, a delivered Task, a review decision, a
-    /// released claim and a declined opportunity each end the attempt that
-    /// produced them: the member has nothing left to delegate. The attempt
-    /// registration itself (`TaskAttemptDispatch`) is deliberately absent,
-    /// because it opens an attempt instead of closing one.
-    fn program_action_settles_attempt(action: &harness_contract::agent_action::AgentAction) -> bool {
-        use harness_contract::agent_action::AgentAction;
-        match action {
-            AgentAction::TaskAttemptFail(_)
-            | AgentAction::TaskSubmit(_)
-            | AgentAction::TaskReview(_)
-            | AgentAction::TaskRelease(_) => true,
-            AgentAction::MessagePublish(publish) => publish
-                .intent
-                .as_ref()
-                .is_some_and(|intent| intent.kind == harness_contract::agent_action::TaskIntentKind::Decline),
-            _ => false,
-        }
+        Ok(fold)
     }
 
     /// Per-member recovery liveness, read from the durable Program journal.
@@ -4527,8 +4706,8 @@ impl RuntimeServices {
     ) -> bool {
         match self.session_program_journal(session_id, turn_id) {
             SessionProgramJournal::Journal(events) => {
-                let records = Self::member_attempt_records(&events);
-                Self::member_attempt_record_is_unsettled(&records, member_execution_id)
+                self.member_attempt_fold(&events, session_id, turn_id)
+                    .is_ok_and(|fold| fold.is_unsettled(member_execution_id))
             }
             SessionProgramJournal::Unknown | SessionProgramJournal::NoProgram => false,
         }
@@ -4553,7 +4732,10 @@ impl RuntimeServices {
     ) -> bool {
         match self.session_program_journal(session_id, turn_id) {
             SessionProgramJournal::Journal(events) => {
-                Self::any_member_attempt_is_unsettled(&Self::member_attempt_records(&events))
+                match self.member_attempt_fold(&events, session_id, turn_id) {
+                    Ok(fold) => fold.any_unsettled(),
+                    Err(_) => true,
+                }
             }
             SessionProgramJournal::Unknown => true,
             SessionProgramJournal::NoProgram => false,

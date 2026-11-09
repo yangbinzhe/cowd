@@ -119,6 +119,7 @@ mod tests {
                     providers: HashMap::from([(
                         "memory-fixture".into(),
                         ProviderConfig {
+                            reasoning_effort: None,
                             name: "memory-fixture".into(),
                             base_url: format!("http://{address}/v1"),
                             api_key: "fixture-only".into(),

@@ -1972,7 +1972,12 @@ pub(super) fn result_packet(
     let source = crate::execution_core::graph::graph_id_for_lookup(execution);
     pin_result_source(store, source, cuts)?;
     let graph = graphs.load(execution).map_err(|error| error.to_string())?;
-    if cuts.get(&graph.id) != Some(&graph.revision)
+    // A graph that grew since its cut is another actor advancing it; a graph
+    // with no cut at all is a foreign producer, and a graph strictly older
+    // than its cut means the material moved. The lineage and Session
+    // conjunct below is unchanged.
+    if !cuts.contains_key(&graph.id)
+        || cuts.get(&graph.id).is_some_and(|cut| graph.revision < *cut)
         || graph
             .lineage
             .as_ref()

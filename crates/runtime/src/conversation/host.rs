@@ -1078,6 +1078,152 @@ fn prepare_initial_conversation_graph(
     clippy::panic,
     reason = "a leaked graph-runner Arc would otherwise make it impossible to return the uniquely owned runtime"
 )]
+/// Why this Program stall assessment is being made. The two sources are
+/// separate arms: the loop's own progress bound, and the one assessment the
+/// loop makes when it is about to stop waiting because nothing is waitable
+/// any more. Neither arm carries a new threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgenticProgramStallTrigger {
+    /// The loop's own bound: no verified progress for the recorded number of
+    /// checks, or the collaboration budget elapsed.
+    LoopProgress { stalled_checks: u32, budget_elapsed: bool },
+    /// The loop is about to stop waiting and there is nothing waitable left:
+    /// the root graph is terminal, no child graph is live, and every unsettled
+    /// Task has no active attempt, no live lease and a durable disconnect
+    /// record.
+    LoopExitWithoutWaitableWork,
+}
+
+impl AgenticProgramStallTrigger {
+    /// The named reason this trigger reports. Each arm names only the shape it
+    /// actually observed; neither arm may report a reason it did not observe.
+    fn reason(&self) -> String {
+        match self {
+            AgenticProgramStallTrigger::LoopProgress { stalled_checks, budget_elapsed } => {
+                if *budget_elapsed {
+                    "Execution blocked: the configured collaboration budget was exhausted; the original objective remains unmet and durable work is retained.".to_string()
+                } else {
+                    format!("Execution blocked: no verified progress for {stalled_checks} checks; the original objective remains unmet and durable work is retained.")
+                }
+            }
+            AgenticProgramStallTrigger::LoopExitWithoutWaitableWork => {
+                "Execution blocked: there is nothing left to wait for and nobody is pushing the Program forward: the root graph is terminal, no child graph is live, and every unsettled Task has no active attempt, no live lease and a durable disconnect record; the original objective remains unmet and durable work is retained.".to_string()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod agentic_program_stall_trigger_tests {
+    use super::*;
+
+    #[test]
+    fn a9_loop_exit_trigger_names_the_waitable_work_shape() {
+        let reason = AgenticProgramStallTrigger::LoopExitWithoutWaitableWork.reason();
+        assert!(!reason.is_empty(), "the new trigger must carry a named reason");
+        assert!(!reason.contains("partial"), "the reason must not be a partial verdict");
+        for named in ["root graph is terminal", "no child graph is live",
+            "no active attempt", "no live lease", "durable disconnect record"] {
+            assert!(reason.contains(named), "the reason must name {named}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a9_loop_progress_trigger_keeps_its_original_reason() {
+        let stalled = AgenticProgramStallTrigger::LoopProgress { stalled_checks: 7, budget_elapsed: false };
+        assert_eq!(stalled.reason(),
+            "Execution blocked: no verified progress for 7 checks; the original objective remains unmet and durable work is retained.");
+        let budget = AgenticProgramStallTrigger::LoopProgress { stalled_checks: 7, budget_elapsed: true };
+        assert_eq!(budget.reason(),
+            "Execution blocked: the configured collaboration budget was exhausted; the original objective remains unmet and durable work is retained.");
+    }
+}
+
+/// What one Program stall assessment decided.
+enum AgenticProgramStallOutcome {
+    /// The Program carries the authoritative Blocked conclusion now.
+    Settled,
+    /// The stall did not produce a Blocked conclusion; the caller resets its
+    /// progress counter and keeps waiting.
+    NotBlocked,
+    /// The Program changed under the assessment; the caller keeps waiting with
+    /// its counter unchanged.
+    Retried,
+}
+
+/// The Program stall settlement shared by the ingress wait loop and the one
+/// assessment that loop performs when it is about to stop waiting. The body is
+/// the loop's original stall branch moved verbatim: one committed Runtime
+/// observation, then the existing Program owner that turns it into the
+/// authoritative non-success conclusion. There is still exactly one producer.
+async fn settle_agentic_program_stall(
+    services: &crate::RuntimeServices,
+    state: &Arc<tokio::sync::Mutex<TurnGraphState>>,
+    session_id: &str,
+    turn_id: &str,
+    graph_id: &str,
+    goal: &crate::execution_core::goal::GoalProjection,
+    program: &crate::AgenticProgramProjection,
+    trigger: AgenticProgramStallTrigger,
+) -> Result<AgenticProgramStallOutcome, RuntimeError> {
+    let reason = trigger.reason();
+    let mut observation = runtime_observation(
+        RuntimeObservationIdentity {
+            workspace_id: services.workspace_key().to_string(),
+            session_id: session_id.to_string(), turn_id: Some(turn_id.to_string()), task_id: None,
+            graph_id: graph_id.to_string(), goal_id: goal.goal.id.clone(), node_id: None,
+        }, RuntimeObservationKind::GraphProgress, "runtime.program_stall", program.revision,
+        reason.clone(), format!("program-stall:{}:{}:{}:{}", program.program_id, program.revision, goal.stream_revision,
+            sha256_digest(&serde_json::to_string(&(&goal.progress.criteria, &goal.progress.evidence_refs,
+                &goal.progress.open_unknowns, &goal.goal.obligations)).map_err(|error| RuntimeError::new(error.to_string()))?)),
+        ObservationResultClass::Failed,
+    );
+    observation.failure_class = Some(ObservationFailureClass::Unknown);
+    if let Some(previous) = goal.observations.iter().find(|previous|
+        previous.source == observation.source && previous.source_revision == observation.source_revision
+            && previous.fingerprint == observation.fingerprint)
+    {
+        observation = previous.clone();
+    } else {
+        services.goal_store().record_observation(observation.clone()).map_err(RuntimeError::new)?;
+    }
+    let verdict = match crate::agentic::supervision::reconcile_runtime_stall(
+        services, &services.agent_action_service(), services.objective_supervisor(), &program.program_id, &observation,
+    ) {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            let current = services.agent_action_service().project(&program.program_id)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let current_goal = services.goal_store().projection(&goal.goal.id).map_err(RuntimeError::new)?;
+            if current.revision != program.revision || current_goal.as_ref().is_some_and(|current|
+                current.stream_revision > goal.stream_revision.saturating_add(1))
+                || services.goal_store().exhausted_program_work_cut(&current).map_err(RuntimeError::new)?.is_none() {
+                return Ok(AgenticProgramStallOutcome::Retried);
+            }
+            return Err(RuntimeError::new(error));
+        }
+    };
+    if verdict.objective_verdict.is_none() {
+        return Err(RuntimeError::new("runtime stall did not produce an authoritative Program verdict"));
+    }
+    if !verdict.objective_verdict.as_ref().is_some_and(|verdict|
+        verdict.kind == harness_contract::goal::ObjectiveTerminalKind::Blocked) {
+        return Ok(AgenticProgramStallOutcome::NotBlocked);
+    }
+    let committed_goal = services.goal_store().get(&goal.goal.id).map_err(RuntimeError::new)?
+        .and_then(|goal| goal.terminal)
+        .ok_or_else(|| RuntimeError::new("runtime stall Goal terminal missing"))?;
+    {
+        let mut state = state.lock().await;
+        state.terminal_override = Some((GoalCompletion::Blocked, committed_goal.reason));
+    }
+    crate::execution_core::graph::executors::resolve_agentic_program_wait(
+        &program.program_id, &services.agent_action_service(), services.graph_state_store(),
+        services.execution_supervisor().as_ref(), true,
+    ).await.map_err(RuntimeError::new)?;
+    Ok(AgenticProgramStallOutcome::Settled)
+}
+
 async fn submit_owned_conversation_turn_with_ingress<C, T>(
     mut runtime: Box<crate::ConversationRuntime<C, T>>,
     services: Arc<crate::RuntimeServices>,
@@ -1254,6 +1400,7 @@ where
     let parent_merge_started_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let mut owned_root_scope = None;
     let mut owned_root_bus_lease = None;
+    let mut direct_turn_control = None;
     let mut result = async {
         let state = prepare_turn_graph_state(
             content, prompter, recovered_provider_usage, recovered_provider_attempt_count,
@@ -1341,6 +1488,19 @@ where
             evaluation_control.as_ref(), compile_target, execution_parent, execution_lineage,
             strategy.decision.strategy.understanding.requests_background,
         )?;
+        if execution_role == TurnExecutionRole::RootTurn && ingress.is_none() {
+            let mut runtime = runtime.lock().await;
+            if runtime.original_turn_control().is_err() {
+                let control = crate::execution_core::services::TurnCancellationControl::operational_with_token(
+                    &session_id,
+                    &turn_ref,
+                    &graph.id,
+                    runtime.cancellation_token(),
+                );
+                runtime.install_provider_cancellation_control(Some(Arc::clone(&control)))?;
+                direct_turn_control = Some(control);
+            }
+        }
         if execution_role == TurnExecutionRole::RootTurn && ingress.is_some() {
             let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
                 RuntimeError::new("owned root requires its event bus")
@@ -1823,6 +1983,35 @@ where
                     .is_terminal()
             });
             if !has_program_barrier || !has_non_terminal_work {
+                // One assessment on the way out. When the root graph has no live
+                // work left, the Program can still be open and unfinished; the
+                // existing stall producer answers that with a named non-success
+                // conclusion. A missing Program keeps the old break, and the
+                // loop's exit condition itself is unchanged.
+                if !has_non_terminal_work {
+                    let (session_id, turn_id) = {
+                        let state = state.lock().await;
+                        (state.session_id.clone(), state.turn_id.clone())
+                    };
+                    if let Some((program, goal)) = host_backend::stable_collaboration_sources(
+                        services.as_ref(), &session_id, &turn_id)
+                    {
+                        if program.objective_verdict.is_none() && program.completion_request.is_none() {
+                            let active = crate::execution_core::graph::executors::active_agentic_child_graphs(
+                                &graph_id, &program.program_id, &program, services.graph_state_store(),
+                            ).await.map_err(RuntimeError::new)?;
+                            if active.is_empty()
+                                && services.goal_store().program_tasks_all_durably_disconnected(&program)
+                                    .map_err(RuntimeError::new)?
+                            {
+                                let _ = settle_agentic_program_stall(
+                                    services.as_ref(), &state, &session_id, &turn_id, &graph_id, &goal, &program,
+                                    AgenticProgramStallTrigger::LoopExitWithoutWaitableWork,
+                                ).await?;
+                            }
+                        }
+                    }
+                }
                 break;
             }
             // Program revisions include heartbeats and journal activity. Only
@@ -1901,67 +2090,14 @@ where
             }
             if !legitimate_wait && program.completion_request.is_none()
                 && (stalled_checks >= turn_stall_checks_bound || budget_elapsed) {
-                let reason = if budget_elapsed {
-                    "Execution blocked: the configured collaboration budget was exhausted; the original objective remains unmet and durable work is retained.".to_string()
-                } else {
-                    format!("Execution blocked: no verified progress for {stalled_checks} checks; the original objective remains unmet and durable work is retained.")
-                };
-                let mut observation = runtime_observation(
-                    RuntimeObservationIdentity {
-                        workspace_id: services.workspace_key().to_string(),
-                        session_id: session_id.clone(), turn_id: Some(turn_id.clone()), task_id: None,
-                        graph_id: graph_id.clone(), goal_id: goal.goal.id.clone(), node_id: None,
-                    }, RuntimeObservationKind::GraphProgress, "runtime.program_stall", program.revision,
-                    reason.clone(), format!("program-stall:{}:{}:{}:{}", program.program_id, program.revision, goal.stream_revision,
-                        sha256_digest(&serde_json::to_string(&(&goal.progress.criteria, &goal.progress.evidence_refs,
-                            &goal.progress.open_unknowns, &goal.goal.obligations)).map_err(|error| RuntimeError::new(error.to_string()))?)),
-                    ObservationResultClass::Failed,
-                );
-                observation.failure_class = Some(ObservationFailureClass::Unknown);
-                if let Some(previous) = goal.observations.iter().find(|previous|
-                    previous.source == observation.source && previous.source_revision == observation.source_revision
-                        && previous.fingerprint == observation.fingerprint)
-                {
-                    observation = previous.clone();
-                } else {
-                    services.goal_store().record_observation(observation.clone()).map_err(RuntimeError::new)?;
+                match settle_agentic_program_stall(
+                    services.as_ref(), &state, &session_id, &turn_id, &graph_id, &goal, &program,
+                    AgenticProgramStallTrigger::LoopProgress { stalled_checks, budget_elapsed },
+                ).await? {
+                    AgenticProgramStallOutcome::Settled => { stalled_checks = 0; }
+                    AgenticProgramStallOutcome::NotBlocked => { stalled_checks = 0; continue; }
+                    AgenticProgramStallOutcome::Retried => { continue; }
                 }
-                let verdict = match crate::agentic::supervision::reconcile_runtime_stall(
-                    &services, &services.agent_action_service(), services.objective_supervisor(), &program.program_id, &observation,
-                ) {
-                    Ok(verdict) => verdict,
-                    Err(error) => {
-                        let current = services.agent_action_service().project(&program.program_id)
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        let current_goal = services.goal_store().projection(&goal.goal.id).map_err(RuntimeError::new)?;
-                        if current.revision != program.revision || current_goal.as_ref().is_some_and(|current|
-                            current.stream_revision > goal.stream_revision.saturating_add(1))
-                            || services.goal_store().exhausted_program_work_cut(&current).map_err(RuntimeError::new)?.is_none() {
-                            continue;
-                        }
-                        return Err(RuntimeError::new(error));
-                    }
-                };
-                if verdict.objective_verdict.is_none() {
-                    return Err(RuntimeError::new("runtime stall did not produce an authoritative Program verdict"));
-                }
-                if !verdict.objective_verdict.as_ref().is_some_and(|verdict|
-                    verdict.kind == harness_contract::goal::ObjectiveTerminalKind::Blocked) {
-                    stalled_checks = 0;
-                    continue;
-                }
-                let committed_goal = services.goal_store().get(&goal.goal.id).map_err(RuntimeError::new)?
-                    .and_then(|goal| goal.terminal)
-                    .ok_or_else(|| RuntimeError::new("runtime stall Goal terminal missing"))?;
-                {
-                    let mut state = state.lock().await;
-                    state.terminal_override = Some((GoalCompletion::Blocked, committed_goal.reason));
-                }
-                crate::execution_core::graph::executors::resolve_agentic_program_wait(
-                    &program.program_id, &services.agent_action_service(), services.graph_state_store(),
-                    services.execution_supervisor().as_ref(), true,
-                ).await.map_err(RuntimeError::new)?;
-                stalled_checks = 0;
             }
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -2236,7 +2372,7 @@ where
             }
         }
     }
-    let runtime = Arc::try_unwrap(runtime)
+    let mut runtime = Arc::try_unwrap(runtime)
         .map_err(|_| {
             let reason = "turn executors still hold the conversation runtime; the turn is refused rather than aborting the process";
             match &result {
@@ -2245,6 +2381,16 @@ where
             }
         })?
         .into_inner();
+    if let Some(installed) = direct_turn_control {
+        if runtime.original_turn_control().is_ok_and(|current| Arc::ptr_eq(&current, &installed)) {
+            if let Err(cleanup_error) = runtime.install_provider_cancellation_control(None) {
+                result = Err(match result {
+                    Ok(_) => cleanup_error,
+                    Err(error) => error.with_turn_cleanup_failure(&cleanup_error.to_string()),
+                });
+            }
+        }
+    }
     drop(owned_root_scope);
     drop(owned_root_bus_lease);
     Ok((runtime, result))
@@ -4989,12 +5135,39 @@ impl EvaluationRootScopeRefusal {
     pub(crate) fn request(&self) -> &crate::RuntimeToolExecutionRequest { &self.request }
 }
 
+/// One declared scope of a real tool effect, decided by the evaluation
+/// ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvaluationScopeRequest {
+    /// Expressible in this ceiling's vocabulary, so it is compared with it.
+    Compared(String),
+    /// Outside this ceiling's vocabulary. The kind is named so it cannot
+    /// disappear without a reason: this ceiling is a workspace/network
+    /// ceiling, and every other kind is held by the tool's own authorization
+    /// lease instead - a descriptor scope the lease does not carry is
+    /// refused there (`crates/tools/src/host.rs`).
+    NotRepresented(String),
+}
+
+/// What one descriptor scope assessment decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvaluationScopeOutcome {
+    /// The first scope this ceiling does not authorize. It names every scope
+    /// kind the ceiling could not represent, so a refusal always says which
+    /// resource kinds were involved.
+    violation: Option<String>,
+    /// The scope kinds this ceiling does not represent, in encounter order.
+    not_represented: Vec<String>,
+}
+
 /// Check every real descriptor scope using the same ceiling matcher as the
-/// original graph scope predicate. Unrepresentable effects remain unknown.
+/// original graph scope predicate. Unrepresentable effects remain unknown,
+/// and every scope kind this ceiling cannot represent is named.
 fn evaluation_descriptor_scope_violation(
     allowed: &[String], effect: &harness_contract::tool::ToolEffectDescriptor, workspace_root: &Path,
-) -> Result<Option<String>, RuntimeError> {
+) -> Result<EvaluationScopeOutcome, RuntimeError> {
     let mut violation = None;
+    let mut not_represented: Vec<String> = Vec::new();
     if !allowed.is_empty() {
         use harness_contract::policy::{PermissionOperation, PermissionResource};
         if effect.effect_kind == harness_contract::tool::ToolEffectKind::Unknown {
@@ -5002,12 +5175,13 @@ fn evaluation_descriptor_scope_violation(
         }
         let mut saw_network = false;
         for scope in &effect.scopes {
-            let requested = match scope.resource {
+            let request = match scope.resource {
                 PermissionResource::File => {
                     let mode = match scope.operation {
                         PermissionOperation::Read => "read",
                         PermissionOperation::Write | PermissionOperation::Delete => "write",
-                        _ => return Err(RuntimeError::new("scope assessment unresolved file operation")),
+                        _ => return Err(RuntimeError::new(format!(
+                            "scope assessment unresolved file operation {:?}", scope.operation))),
                     };
                     let target = scope.target.as_deref().filter(|value| !value.is_empty())
                         .ok_or_else(|| RuntimeError::new("scope assessment unresolved file target"))?;
@@ -5022,15 +5196,38 @@ fn evaluation_descriptor_scope_violation(
                     if normalize_workspace_scope(&value).is_none() {
                         return Err(RuntimeError::new("scope assessment unresolved file target"));
                     }
-                    Some(value)
+                    EvaluationScopeRequest::Compared(value)
                 }
-                PermissionResource::Network => { saw_network = true; Some("network:*".to_string()) }
-                _ => None,
+                PermissionResource::Network => {
+                    saw_network = true;
+                    EvaluationScopeRequest::Compared("network:*".to_string())
+                }
+                // The remaining kinds are outside this workspace/network
+                // ceiling, and each one is named here instead of being
+                // skipped in silence.
+                PermissionResource::Shell => EvaluationScopeRequest::NotRepresented("Shell".into()),
+                PermissionResource::Provider => EvaluationScopeRequest::NotRepresented("Provider".into()),
+                PermissionResource::Connector => EvaluationScopeRequest::NotRepresented("Connector".into()),
+                PermissionResource::Channel => EvaluationScopeRequest::NotRepresented("Channel".into()),
+                PermissionResource::Tool => EvaluationScopeRequest::NotRepresented("Tool".into()),
+                PermissionResource::Memory => EvaluationScopeRequest::NotRepresented("Memory".into()),
+                PermissionResource::Matrix => EvaluationScopeRequest::NotRepresented("Matrix".into()),
+                PermissionResource::Session => EvaluationScopeRequest::NotRepresented("Session".into()),
+                PermissionResource::Task => EvaluationScopeRequest::NotRepresented("Task".into()),
+                PermissionResource::Approval => EvaluationScopeRequest::NotRepresented("Approval".into()),
+                PermissionResource::Config => EvaluationScopeRequest::NotRepresented("Config".into()),
             };
-            if let Some(requested) = requested {
-                if violation.is_none() && !allowed.iter()
-                    .any(|allowed| evaluation_scope_authorizes(allowed, &requested)) {
-                    violation = Some(requested);
+            match request {
+                EvaluationScopeRequest::Compared(requested) => {
+                    if violation.is_none() && !allowed.iter()
+                        .any(|allowed| evaluation_scope_authorizes(allowed, &requested)) {
+                        violation = Some(requested);
+                    }
+                }
+                EvaluationScopeRequest::NotRepresented(kind) => {
+                    if !not_represented.iter().any(|seen| seen == &kind) {
+                        not_represented.push(kind);
+                    }
                 }
             }
         }
@@ -5038,7 +5235,17 @@ fn evaluation_descriptor_scope_violation(
             return Err(RuntimeError::new("scope assessment unresolved network effect"));
         }
     }
-    Ok(violation)
+    Ok(EvaluationScopeOutcome { violation, not_represented })
+}
+
+/// The refusal reason for one descriptor scope assessment. A refusal names the
+/// resource kinds this ceiling could not represent, so no kind disappears
+/// from the record without a reason.
+fn evaluation_scope_violation_reason(outcome: EvaluationScopeOutcome) -> Option<String> {
+    let violation = outcome.violation?;
+    if outcome.not_represented.is_empty() { return Some(violation); }
+    Some(format!(
+        "{violation}; scope kinds not represented by this ceiling: {}", outcome.not_represented.join(", ")))
 }
 
 #[cfg(test)]
@@ -5054,18 +5261,18 @@ mod evaluation_descriptor_scope_tests {
         let effect = host.pin_snapshot().describe_effect("glob_search", &serde_json::json!({
             "path":"crates/runtime", "pattern":"**/*.rs"
         }));
-        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &effect, root.path()).unwrap(), None);
-        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates/runtime".into()], &effect, root.path()).unwrap().as_deref(), Some("read:."));
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &effect, root.path()).unwrap().violation, None);
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates/runtime".into()], &effect, root.path()).unwrap().violation.as_deref(), Some("read:."));
         let nested = host.pin_snapshot().describe_effect("glob_search", &serde_json::json!({
             "path":"crates", "pattern":"*/src/*.rs"
         }));
-        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &nested, root.path()).unwrap(), None);
-        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates".into()], &nested, root.path()).unwrap().as_deref(), Some("read:."));
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &nested, root.path()).unwrap().violation, None);
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates".into()], &nested, root.path()).unwrap().violation.as_deref(), Some("read:."));
         let grep = host.pin_snapshot().describe_effect("grep_search", &serde_json::json!({
             "searches":[{"pattern":"a"},{"path":null,"pattern":"b"}]
         }));
-        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &grep, root.path()).unwrap(), None);
-        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates".into()], &grep, root.path()).unwrap().as_deref(), Some("read:."));
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:.".into()], &grep, root.path()).unwrap().violation, None);
+        assert_eq!(evaluation_descriptor_scope_violation(&["read:crates".into()], &grep, root.path()).unwrap().violation.as_deref(), Some("read:."));
         #[cfg(unix)]
         {
             std::fs::create_dir(root.path().join("other")).unwrap();
@@ -5073,11 +5280,11 @@ mod evaluation_descriptor_scope_tests {
             let alias_effect = host.pin_snapshot().describe_effect("glob_search", &serde_json::json!({
                 "path":"alias", "pattern":"**/*.rs"
             }));
-            assert_eq!(evaluation_descriptor_scope_violation(&["read:alias".into()], &alias_effect, root.path()).unwrap().as_deref(), Some("read:."));
+            assert_eq!(evaluation_descriptor_scope_violation(&["read:alias".into()], &alias_effect, root.path()).unwrap().violation.as_deref(), Some("read:."));
             let nested_alias = host.pin_snapshot().describe_effect("glob_search", &serde_json::json!({
                 "path":"alias", "pattern":"*/src/*.rs"
             }));
-            assert_eq!(evaluation_descriptor_scope_violation(&["read:alias".into()], &nested_alias, root.path()).unwrap().as_deref(), Some("read:."));
+            assert_eq!(evaluation_descriptor_scope_violation(&["read:alias".into()], &nested_alias, root.path()).unwrap().violation.as_deref(), Some("read:."));
         }
     }
 
@@ -5093,18 +5300,91 @@ mod evaluation_descriptor_scope_tests {
             assessment:Default::default(),
         };
         let allowed = vec!["read:a.txt".to_string()];
-        assert_eq!(evaluation_descriptor_scope_violation(&allowed, &effect, Path::new("/work")).unwrap().as_deref(), Some("read:b.txt"));
+        assert_eq!(evaluation_descriptor_scope_violation(&allowed, &effect, Path::new("/work")).unwrap().violation.as_deref(), Some("read:b.txt"));
         effect.scopes.pop();
         effect.scopes.push(PermissionScope { resource:Resource::Network, operation:Op::Send, target:None });
         effect.uses_network = true;
-        assert_eq!(evaluation_descriptor_scope_violation(&allowed, &effect, Path::new("/work")).unwrap().as_deref(), Some("network:*"));
+        assert_eq!(evaluation_descriptor_scope_violation(&allowed, &effect, Path::new("/work")).unwrap().violation.as_deref(), Some("network:*"));
         let allowed_network = vec!["read:a.txt".to_string(), "network:*".to_string()];
-        assert_eq!(evaluation_descriptor_scope_violation(&allowed_network, &effect, Path::new("/work")).unwrap(), None);
+        assert_eq!(evaluation_descriptor_scope_violation(&allowed_network, &effect, Path::new("/work")).unwrap().violation, None);
         effect.scopes.pop();
         assert!(evaluation_descriptor_scope_violation(&allowed_network, &effect, Path::new("/work")).is_err());
         effect.uses_network = false;
         effect.scopes[0].target = None;
         assert!(evaluation_descriptor_scope_violation(&allowed_network, &effect, Path::new("/work")).is_err());
+    }
+
+    fn scope_kind_descriptor(resource: Resource, operation: Op, target: Option<&str>) -> ToolEffectDescriptor {
+        ToolEffectDescriptor {
+            tool_id:"scope-kind".into(), descriptor_hash:"fixture".into(), effect_kind:ToolEffectKind::Read,
+            idempotency:ToolIdempotency::Idempotent,
+            scopes:vec![PermissionScope { resource, operation, target:target.map(str::to_string) }],
+            required_permission:ToolPermissionMode::ReadOnly, approval_class:ToolApprovalClass::None,
+            uses_network:false, spawns_process:false, mutates_packages:false, mutates_system:false,
+            assessment:Default::default(),
+        }
+    }
+
+    #[test]
+    fn every_permission_resource_kind_outside_this_ceiling_is_named() {
+        // The evaluation ceiling is a workspace/network ceiling. Every other
+        // resource kind is held by the tool's own authorization lease, so this
+        // gate must not refuse it - but it must name it instead of skipping it
+        // in silence.
+        let kinds = [
+            (Resource::Shell, "Shell"), (Resource::Provider, "Provider"), (Resource::Connector, "Connector"),
+            (Resource::Channel, "Channel"), (Resource::Tool, "Tool"), (Resource::Memory, "Memory"),
+            (Resource::Matrix, "Matrix"), (Resource::Session, "Session"), (Resource::Task, "Task"),
+            (Resource::Approval, "Approval"), (Resource::Config, "Config"),
+        ];
+        for (resource, name) in kinds {
+            let effect = scope_kind_descriptor(resource, Op::Execute, Some("bash"));
+            let outcome = evaluation_descriptor_scope_violation(
+                &["read:.".to_string()], &effect, Path::new("/work")).unwrap();
+            assert_eq!(outcome.not_represented, vec![name.to_string()],
+                "{name} must be named by the scope assessment, never skipped");
+            assert!(outcome.violation.is_none(),
+                "{name} is not this ceiling's business and must not be refused here");
+        }
+    }
+
+    #[test]
+    fn the_kinds_this_ceiling_can_compare_are_not_reported_as_unrepresented() {
+        let file = scope_kind_descriptor(Resource::File, Op::Read, Some("a.txt"));
+        let outcome = evaluation_descriptor_scope_violation(
+            &["read:.".to_string()], &file, Path::new("/work")).unwrap();
+        assert!(outcome.not_represented.is_empty(), "File is compared by this ceiling");
+        assert_eq!(outcome.violation, None);
+        let network = scope_kind_descriptor(Resource::Network, Op::Send, None);
+        let outcome = evaluation_descriptor_scope_violation(
+            &["read:.".to_string()], &network, Path::new("/work")).unwrap();
+        assert!(outcome.not_represented.is_empty(), "Network is compared by this ceiling");
+        assert_eq!(outcome.violation.as_deref(), Some("network:*"));
+    }
+
+    #[test]
+    fn a_refusal_names_the_scope_kinds_this_ceiling_cannot_represent() {
+        let mut effect = scope_kind_descriptor(Resource::File, Op::Read, Some("a.txt"));
+        effect.scopes.push(PermissionScope { resource:Resource::Shell, operation:Op::Execute, target:None });
+        let outcome = evaluation_descriptor_scope_violation(
+            &["read:other".to_string()], &effect, Path::new("/work")).unwrap();
+        assert_eq!(outcome.not_represented, vec!["Shell".to_string()]);
+        let violation = evaluation_scope_violation_reason(outcome)
+            .expect("a file scope outside the ceiling must be refused");
+        assert!(violation.starts_with("read:a.txt"),
+            "the refusing scope stays the first unauthorized scope: {violation}");
+        assert!(violation.contains("Shell"),
+            "the refusal names the scope kind this ceiling cannot represent: {violation}");
+    }
+
+    #[test]
+    fn an_unresolved_file_operation_names_the_operation() {
+        let effect = scope_kind_descriptor(Resource::File, Op::Execute, Some("a.txt"));
+        let error = evaluation_descriptor_scope_violation(
+            &["read:.".to_string()], &effect, Path::new("/work")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Execute"),
+            "the unresolved operation must be named: {message}");
     }
 }
 
@@ -5168,9 +5448,9 @@ impl TurnGraphState {
             name:request.tool_name.clone(), input:request.input.clone(), depends_on:Vec::new() };
         let workspace_root = services.workspace_root();
         let mut violation = evaluation_scope_violation(&self.evaluation_resource_scopes, &[call], workspace_root);
-        let descriptor_violation = evaluation_descriptor_scope_violation(
+        let descriptor_violation = evaluation_scope_violation_reason(evaluation_descriptor_scope_violation(
             &self.evaluation_resource_scopes, &invocation.effect, workspace_root,
-        )?;
+        )?);
         if violation.is_none() { violation = descriptor_violation; }
         Ok(violation.map(|violation| EvaluationRootScopeRefusal {
             context:context.clone(), activity:activity.clone(), attempt, original:original.clone(),
@@ -5220,9 +5500,9 @@ impl TurnGraphState {
             name: request.tool_name.clone(), input: request.input.clone(), depends_on: Vec::new(),
         };
         let mut violation = evaluation_scope_violation(&self.evaluation_resource_scopes, &[call], workspace_root);
-        let descriptor_violation = evaluation_descriptor_scope_violation(
+        let descriptor_violation = evaluation_scope_violation_reason(evaluation_descriptor_scope_violation(
             &self.evaluation_resource_scopes, &invocation.effect, workspace_root,
-        )?;
+        )?);
         if violation.is_none() { violation = descriptor_violation; }
         Ok(violation
             .map(|violation| EvaluationScopeRefusal {
@@ -5664,6 +5944,7 @@ where
         Some(Arc::new(TurnModelStepBackend {
             ticket: ticket.clone(),
             stop: crate::CancellationToken::new(),
+            local_fence: Mutex::new(None),
             runtime: self.runtime.upgrade()?,
             state: self.state.upgrade()?,
             services: self.services.upgrade()?,
@@ -5731,6 +6012,7 @@ where
 struct TurnModelStepBackend<C: ApiClient, T: ToolExecutor> {
     ticket: NodeExecutionTicket,
     stop: crate::CancellationToken,
+    local_fence: Mutex<Option<crate::RuntimeError>>,
     runtime: Arc<tokio::sync::Mutex<Box<crate::ConversationRuntime<C, T>>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: Arc<crate::RuntimeServices>,
@@ -5824,13 +6106,24 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
         let timeout = self.timeout;
         let observation_wave_sequence = self.observation_wave_sequence;
         let early_read_locks = Arc::clone(&self.early_read_locks);
-        Box::pin(async move {
+        let original_identity = candidate.identity.clone();
+        let original_call_id = candidate.call.id.clone();
+        let original_ticket = ticket.clone();
+        let owner = Arc::clone(services.model_step_executor());
+        let work: crate::conversation::EarlyToolDispatchFuture = Box::pin(async move {
+            let original_authorization_events = Mutex::new(Vec::new());
             let defer = |reason: String| {
                 crate::conversation::EarlyToolDispatchResult::Deferred(
                     crate::conversation::EarlyToolDeferral {
                         tool_call_id: candidate.call.id.clone(),
                         reason,
                         ready_at_ms: candidate.ready_at_ms,
+                        original_undispatched: Some(Arc::new(crate::conversation::EarlyToolUndispatched {
+                            ticket: ticket.clone(), call_id: candidate.call.id.clone(),
+                            identity: candidate.identity.clone(),
+                            authorization_events: original_authorization_events.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+                        })),
                     },
                 )
             };
@@ -5853,6 +6146,9 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     return defer(format!("input_contract_rejected:{error}"));
                 }
             };
+            if request.input != candidate.call.input {
+                return defer("early_repaired_input_requires_original_tool_batch".into());
+            }
             let original_executor: Arc<dyn crate::ToolExecutor> = tool_executor.clone();
             let plan_pin = original_executor.pin_step_catalog().map(Arc::new);
             let prepared = match tool_executor.prepare_step_invocations(
@@ -5960,14 +6256,15 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                         services.event_store().inject_append_fault_once(transaction_id, false);
                     }
                 }
-                if let Err(error) =
-                    crate::authorization_negotiator::persist_authorization_transition(
+                let original_event = match
+                    crate::authorization_negotiator::persist_authorization_transition_event(
                         services.event_store(),
                         &authorization_stream_id,
                         "conversation_runtime.early_tool",
                         &transition,
-                    )
-                {
+                    ) {
+                    Ok(event) => event,
+                    Err(error) => {
                     // The append may have committed without an acknowledgement.
                     // Stop this original call before consuming its lease; do
                     // not turn an infrastructure error into a policy refusal.
@@ -5980,7 +6277,10 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                             detail: format!("transition {}: {error}", transition.transition_id),
                         },
                     );
-                }
+                    }
+                };
+                original_authorization_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(original_event);
                 if authorization_negotiator.acknowledge_persisted_transitions(std::slice::from_ref(
                     &transition.transition_id,
                 )) == 1
@@ -6034,7 +6334,15 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 ),
             );
             let calls = [candidate.call.clone()];
+            let original_request = bound_runtime_tool_request(
+                &candidate.call, task, &plan.plan_id, plan.revision, observation_wave_sequence,
+                &session_id, early_execution_policy.sandbox_posture, early_execution_policy.revision,
+                Some(&memory_context), reality_context.as_ref(), model_lease.as_deref(),
+                &ticket, Some(&decision), None, idempotency_keys.get(&candidate.call.id),
+            );
+            let prepared_requests = HashMap::from([(candidate.call.id.clone(), original_request)]);
             let early_invocations = Arc::new(Mutex::new(HashMap::new()));
+            let early_requests = Mutex::new(HashMap::new());
             let early_ticket = ticket.clone();
             let started_at_ms = crate::tool_invocation::now_ms();
             let context = HostGovernedToolContext {
@@ -6064,8 +6372,9 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 policy_failures: None,
                 effective_inputs: None,
                 prepared_effects: None,
-                prepared_requests: None,
+                prepared_requests: Some(&prepared_requests),
                 member_requests: Mutex::new(HashMap::new()),
+                early_request_capture: Some(&early_requests),
                 evaluation_scope_rejections: None,
                 scope_state: None,
                 services: None,
@@ -6089,7 +6398,13 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 .get(&candidate.call.id).cloned();
             let completed_at_ms = crate::tool_invocation::now_ms();
             let Some(outcome) = report.outcomes.pop() else {
-                return defer("early_executor_returned_no_outcome".to_string());
+                return crate::conversation::EarlyToolDispatchResult::Failed(
+                    crate::conversation::EarlyToolFailure {
+                        identity: candidate.identity.clone(), tool_call_id: candidate.call.id.clone(),
+                        owner_ticket: Some(ticket.clone()),
+                        kind: crate::conversation::EarlyToolFailureKind::WorkerOutcomeUnknown,
+                        detail: "early executor returned no original outcome".into(),
+                    });
             };
             let terminal_detail = crate::governed_tool_executor::terminal_reason(&outcome.terminal);
             let Some(receipt) = outcome.receipt else {
@@ -6128,8 +6443,15 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 .and_then(|record| record.original_producer.clone().map(|producer|
                     crate::conversation::ToolLifecycleReuse::PendingOriginal { record, producer }))
                 .unwrap_or(crate::conversation::ToolLifecycleReuse::Unknown);
+            let original_source = early_requests.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&candidate.call.id).cloned()
+                .map(|request| crate::conversation::EarlyToolOriginalSource {
+                    ticket: ticket.clone(), request, completed_calls: None,
+                });
             crate::conversation::EarlyToolDispatchResult::Executed(
                 crate::conversation::EarlyToolExecutionReceipt {
+                    original_source,
                     lifecycle,
                     call: candidate.call,
                     outcome: receipt,
@@ -6138,6 +6460,43 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     completed_at_ms,
                 },
             )
+        });
+        struct AbortOriginalWorker(Option<tokio::task::AbortHandle>);
+        impl Drop for AbortOriginalWorker {
+            fn drop(&mut self) {
+                if let Some(handle) = self.0.take() { handle.abort(); }
+            }
+        }
+        let retained = owner.retain_original_early_worker(&original_ticket, &original_call_id, work);
+        let (worker, abort) = match retained {
+            Ok(retained) => retained,
+            Err(error) => return Box::pin(async move {
+                crate::conversation::EarlyToolDispatchResult::Failed(
+                    crate::conversation::EarlyToolFailure {
+                        identity: original_identity, tool_call_id: original_call_id,
+                        owner_ticket: Some(original_ticket),
+                        kind: crate::conversation::EarlyToolFailureKind::WorkerOutcomeUnknown,
+                        detail: error.to_string(),
+                    })
+            }),
+        };
+        // Construct before returning the future so an unpolled drop still
+        // stops the same retained worker.
+        let mut guard = AbortOriginalWorker(Some(abort));
+        Box::pin(async move {
+            let failure = |detail: String| crate::conversation::EarlyToolDispatchResult::Failed(
+                crate::conversation::EarlyToolFailure {
+                    identity: original_identity.clone(), tool_call_id: original_call_id.clone(),
+                    owner_ticket: Some(original_ticket.clone()),
+                    kind: crate::conversation::EarlyToolFailureKind::WorkerOutcomeUnknown,
+                    detail,
+                });
+            let result = worker.await;
+            guard.0.take();
+            match result {
+                Ok(result) => result,
+                Err(error) => failure(error),
+            }
         })
     }
 }
@@ -7344,10 +7703,13 @@ pub(crate) struct HostOriginalReplay {
     pub(crate) call: ModelToolCall,
     pub(crate) outcome: crate::RuntimeToolExecutionOutcome,
     pub(crate) original_action: std::sync::Arc<crate::agentic::OriginalReplayedAction>,
+    pub(crate) original_request: std::sync::Arc<crate::RuntimeToolExecutionRequest>,
+    pub(crate) physical_receipt: std::sync::Arc<crate::DurableRuntimeEvent>,
 }
 
 struct HostGovernedToolContext<'a> {
     member_requests: Mutex<HashMap<String, Arc<crate::RuntimeToolExecutionRequest>>>,
+    early_request_capture: Option<&'a Mutex<HashMap<String, Arc<crate::RuntimeToolExecutionRequest>>>>,
     batch_policy_owner: Option<Arc<dyn crate::tool_host::AgentBatchPolicyOwner>>,
     action_issuer: Option<Arc<crate::conversation::tool_plane::OwnedRootActionIssuer>>,
     single_captures: Option<Arc<Mutex<HashMap<String, Arc<crate::conversation::tool_plane::OriginalSingleProducerCapture>>>>>,
@@ -8937,9 +9299,12 @@ async fn attach_conversation_graph(
         }
         recovered
     } else {
+        let original_owner = actor.as_ref().map(|actor| {
+            services.original_graph_registration_owner(&graph_id, actor)
+        }).transpose().map_err(RuntimeError::new)?.flatten();
         services
             .execution_supervisor()
-            .register_continuation_graph(graph, actor, source_goal_cut)
+            .register_continuation_graph(graph, actor, source_goal_cut, original_owner)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?
     };

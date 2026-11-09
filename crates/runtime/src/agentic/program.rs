@@ -89,6 +89,11 @@ pub struct AgenticProgramProjection {
     /// model rather than stated by the operator.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub program_warnings: Vec<String>,
+    /// The required writes the Program's reviews settled as failed, in the
+    /// closure projection's entry shape (`name`/`passed`/`evidence`). Older
+    /// durable payloads carry no such key, so it reads as empty.
+    #[serde(default)]
+    pub required_write_failures: Vec<serde_json::Value>,
 }
 
 impl AgenticProgramProjection {
@@ -167,6 +172,7 @@ impl AgenticProgramProjection {
             unresolved: Vec::new(),
             last_reopen_gaps: Vec::new(),
             program_warnings: Vec::new(),
+            required_write_failures: Vec::new(),
         }
     }
 

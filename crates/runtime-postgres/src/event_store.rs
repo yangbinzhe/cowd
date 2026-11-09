@@ -24,6 +24,13 @@ pub struct PostgresRuntimeEventStore {
     recent_interleave: Arc<std::sync::Mutex<Option<RuntimeEventInput>>>,
 }
 
+#[derive(Default)]
+struct SessionOwnerReadCharge {
+    events: usize,
+    bytes: usize,
+    pages: usize,
+}
+
 struct PgOwnedCommitGuard<'a>(&'a dyn runtime::RuntimeTransactionCommitControl, bool);
 impl Drop for PgOwnedCommitGuard<'_> {
     fn drop(&mut self) {
@@ -292,6 +299,171 @@ impl PostgresRuntimeEventStore {
 }
 
 impl PostgresRuntimeEventStore {
+    /// A new Program opening or dispatch must not follow the original terminal.
+    /// This runs under the same original Session row lock as terminal append.
+    fn check_no_original_terminal(
+        tx: &mut PostgresTransaction<'_>,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+        budget: &runtime::SourceCheckBudget,
+    ) -> RuntimeEventStoreResult<SessionOwnerReadCharge> {
+        let terminal_id = format!("turn-terminal:{}", claim.fence.request_id);
+        // Bound and return only immutable terminal identity fields in one SQL
+        // snapshot; delivery status and last_error can change concurrently.
+        let identity_bytes = "256::BIGINT + 6::BIGINT * (octet_length(terminal_id)::BIGINT + octet_length(message_id)::BIGINT + octet_length(session_id)::BIGINT + octet_length(payload_ref)::BIGINT + COALESCE(octet_length(execution_id),0)::BIGINT + COALESCE(octet_length(turn_id),0)::BIGINT + COALESCE(octet_length(request_id),0)::BIGINT + COALESCE(octet_length(input_claim_owner),0)::BIGINT + COALESCE(octet_length(input_claim_token),0)::BIGINT)";
+        let sql = format!("SELECT CASE WHEN ({identity_bytes}) <= $2 THEN jsonb_build_object('terminal_id',terminal_id,'message_id',message_id,'session_id',session_id,'payload_ref',payload_ref,'execution_id',execution_id,'turn_id',turn_id,'request_id',request_id,'session_generation',session_generation,'input_sequence',input_sequence,'input_claim_owner',input_claim_owner,'input_claim_token',input_claim_token,'input_claim_revision',input_claim_revision) END, ({identity_bytes}), commit_cursor FROM runtime_session_outbox WHERE terminal_id=$1");
+        let meta = pg(tx.query_opt(&sql, &[&terminal_id, &to_i64(budget.max_bytes as u64, "source bytes")?]))?;
+        let mut charge = SessionOwnerReadCharge { events: 0, bytes: terminal_id.len().saturating_add(16), pages: 1 };
+        let Some(meta) = meta else { return Ok(charge); };
+        let row_bytes = from_i64(pg(meta.try_get(1))?, "terminal source bytes")?;
+        charge.bytes = charge.bytes.saturating_add(usize::try_from(row_bytes).unwrap_or(usize::MAX));
+        if charge.bytes > budget.max_bytes || charge.pages > budget.max_pages {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("original Session terminal source budget".into()));
+        }
+        let value: Option<Value> = pg(meta.try_get(0))?;
+        let terminal: SessionTerminalInput = serde_json::from_value(value.ok_or_else(||
+            RuntimeEventStoreError::HistoryBudgetExceeded("original Session terminal identity bytes".into()))?)?;
+        let terminal_cursor = from_i64(pg(meta.try_get(2))?, "terminal cursor")?;
+        let root = runtime::session_ingress_graph_id(claim.session_id, &claim.fence.request_id, claim.turn_id);
+        if terminal.session_id != claim.session_id || terminal.turn_id.as_deref() != Some(claim.turn_id)
+            || terminal.request_id.as_deref() != Some(claim.fence.request_id.as_str())
+            || terminal.execution_id.as_deref() != Some(root.as_str())
+            || terminal.session_generation != Some(claim.fence.session_generation)
+            || terminal.input_sequence != u64::try_from(claim.fence.input_sequence).ok()
+            || terminal.input_claim_owner.as_deref() != Some(claim.fence.claim_owner.as_str())
+            || terminal.input_claim_token.as_deref() != Some(claim.fence.claim_token.as_str())
+            || terminal.input_claim_revision != Some(claim.fence.claim_fence_epoch)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original Session terminal claim identity is unavailable or changed".into()));
+        }
+        let stream = format!("session-terminal:{}", claim.fence.request_id);
+        let metadata = pg(tx.query(
+            "SELECT encoded_bytes FROM runtime_events WHERE stream_id=$1 AND kind='runtime.session.terminal_requested' AND scope='session_input' AND schema_version=1 AND commit_cursor=$2 LIMIT 2",
+            &[&stream, &to_i64(terminal_cursor, "terminal cursor")?],
+        ))?;
+        if metadata.len() != 1 {
+            return Err(RuntimeEventStoreError::Corrupt("original Session terminal event unavailable".into()));
+        }
+        charge.events = 1;
+        charge.pages = charge.pages.saturating_add(1);
+        let event_bytes = from_i64(pg(metadata[0].try_get(0))?, "terminal event bytes")?;
+        charge.bytes = charge.bytes.saturating_add(16).saturating_add(usize::try_from(event_bytes).unwrap_or(usize::MAX));
+        if charge.events > budget.max_events || charge.bytes > budget.max_bytes || charge.pages > budget.max_pages {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("original Session terminal event budget".into()));
+        }
+        let rows = pg(tx.query(
+            "SELECT payload FROM runtime_events WHERE stream_id=$1 AND kind='runtime.session.terminal_requested' AND scope='session_input' AND schema_version=1 AND commit_cursor=$2 LIMIT 2",
+            &[&stream, &to_i64(terminal_cursor, "terminal cursor")?],
+        ))?;
+        if rows.len() != 1 {
+            return Err(RuntimeEventStoreError::Corrupt("original Session terminal event changed".into()));
+        }
+        let payload: Value = pg(rows[0].try_get(0))?;
+        let requested: SessionTerminalInput = serde_json::from_value(payload)?;
+        if requested.terminal_id != terminal.terminal_id || requested.session_id != terminal.session_id
+            || requested.message_id != terminal.message_id || requested.execution_id != terminal.execution_id
+            || requested.turn_id != terminal.turn_id || requested.request_id != terminal.request_id
+            || requested.session_generation != terminal.session_generation
+            || requested.input_sequence != terminal.input_sequence
+            || requested.payload_ref != terminal.payload_ref
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original Session terminal event identity is unavailable or changed".into()));
+        }
+        if requested.input_claim_owner != terminal.input_claim_owner
+            || requested.input_claim_token != terminal.input_claim_token
+            || requested.input_claim_revision != terminal.input_claim_revision
+        {
+            // Terminal adoption can change the outbox claim without changing
+            // the original event. Do not treat that difference as corruption
+            // or as authorization for a new dispatch.
+            return Err(RuntimeEventStoreError::InvalidTransaction("original Session terminal claim adoption is not authenticated".into()));
+        }
+        Err(RuntimeEventStoreError::SessionTerminalCommitted)
+    }
+
+    /// Fold the complete Program at the exact head pinned by this terminal.
+    /// Called with the original claim locked; no external work runs under it.
+    fn check_terminal_attempts(
+        tx: &mut PostgresTransaction<'_>,
+        request: &CheckedAppendRequest,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+        charge: &mut SessionOwnerReadCharge,
+        held_since: std::time::Instant,
+    ) -> RuntimeEventStoreResult<()> {
+        let objective = runtime::root_objective_id(claim.session_id, claim.turn_id);
+        let program = runtime::program_id_for_objective(&objective);
+        let stream = format!("agentic-program:{program}");
+        let root = runtime::session_ingress_graph_id(claim.session_id, &claim.fence.request_id, claim.turn_id);
+        if request.transaction.events.iter().any(|event| event.event.stream_id == stream) {
+            return Err(RuntimeEventStoreError::InvalidTransaction("terminal transaction modifies original Program".into()));
+        }
+        let source = request.transaction.expected_streams.iter().find(|source| source.stream_id == stream)
+            .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("terminal original Program source unavailable".into()))?;
+        let head = stream_head(tx, &stream)?;
+        if head != source.expected_revision {
+            return Err(RuntimeEventStoreError::StaleRevision { stream_id: stream, expected: source.expected_revision, actual: head });
+        }
+        if head == 0 { return Ok(()); }
+        let count = usize::try_from(head).map_err(|_| RuntimeEventStoreError::HistoryBudgetExceeded("terminal Program count overflow".into()))?;
+        charge.events = charge.events.saturating_add(count);
+        charge.pages = charge.pages.saturating_add(count.div_ceil(64));
+        if charge.events > request.budget.max_events || charge.pages > request.budget.max_pages {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("terminal Program event budget".into()));
+        }
+        let metadata = pg(tx.query(
+            "SELECT sequence,encoded_bytes FROM runtime_events WHERE stream_id=$1 AND sequence<=$2 ORDER BY sequence LIMIT $3",
+            &[&stream, &to_i64(head, "Program head")?, &to_i64(head, "Program count")?],
+        ))?;
+        if metadata.len() != count {
+            return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program source is incomplete".into()));
+        }
+        for (index, row) in metadata.iter().enumerate() {
+            let sequence = from_i64(pg(row.try_get(0))?, "Program sequence")?;
+            if sequence != u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1) {
+                return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program sequence gap".into()));
+            }
+            let bytes = from_i64(pg(row.try_get(1))?, "Program encoded bytes")?;
+            charge.bytes = charge.bytes.saturating_add(16).saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
+            if charge.bytes > request.budget.max_bytes || held_since.elapsed().as_millis() > u128::from(request.budget.max_lock_millis) {
+                return Err(RuntimeEventStoreError::HistoryBudgetExceeded("terminal Program bytes or time".into()));
+            }
+        }
+        let rows = pg(tx.query(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND sequence<=$2 ORDER BY sequence LIMIT $3"),
+            &[&stream, &to_i64(head, "Program head")?, &to_i64(head, "Program count")?]))?;
+        let events = rows.iter().map(row_to_event).collect::<RuntimeEventStoreResult<Vec<_>>>()?;
+        if events.len() != count {
+            return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program source changed".into()));
+        }
+        let mut openings = events.iter().filter(|event| event.kind == "agentic.program_opened");
+        let opened = openings.next().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("terminal Program opening unavailable".into()))?;
+        if openings.next().is_some() || opened.stream_id != stream || opened.scope != RuntimeEventScope::Program
+            || opened.schema_version != 1
+            || opened.payload.get("program_id").and_then(Value::as_str) != Some(program.as_str())
+            || opened.payload.get("objective_id").and_then(Value::as_str) != Some(objective.as_str())
+            || opened.payload.get("session_id").and_then(Value::as_str) != Some(claim.session_id)
+            || opened.payload.get("turn_id").and_then(Value::as_str) != Some(claim.turn_id)
+            || opened.payload.get("root_execution_id").and_then(Value::as_str) != Some(root.as_str())
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program binding unavailable".into()));
+        }
+        let mut fold = runtime::MemberAttemptFold::default();
+        for (index, event) in events.iter().enumerate() {
+            if event.stream_id != stream || event.sequence != u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1) {
+                return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program order changed".into()));
+            }
+            if event.kind != "agentic.action_applied" { continue; }
+            if event.scope != RuntimeEventScope::Program || event.status.as_deref() != Some("applied")
+                || event.schema_version != 1
+                || event.actor.as_deref() != event.payload.pointer("/envelope/actor/actor_id").and_then(Value::as_str)
+            {
+                return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program action source unavailable".into()));
+            }
+            fold.observe_action_applied(&event.payload, claim.session_id, claim.turn_id, &program, Some(&root))
+                .map_err(|error| RuntimeEventStoreError::InvalidTransaction(format!("terminal Program attempt fact unavailable: {error:?}")))?;
+        }
+        if fold.any_unsettled() { return Err(RuntimeEventStoreError::SessionAttemptsUnsettled); }
+        Ok(())
+    }
+
     fn append_checked_owned_tx(
         &self, request: CheckedAppendRequest, terminal: Option<&SessionTerminalInput>,
         validator: &dyn CheckedSourceValidator,
@@ -314,12 +486,14 @@ impl PostgresRuntimeEventStore {
         // tables from different schemas. The selected production topology
         // constructs both adapters from the same scoped executor.
         let same_schema: bool = pg(tx.query_one(
-            "SELECT COALESCE(to_regclass('session_records') = to_regclass(format('%I.session_records', current_schema())), false) AND COALESCE(to_regclass('session_runtime_outbox') = to_regclass(format('%I.session_runtime_outbox', current_schema())), false) AND COALESCE(to_regclass('runtime_commits') = to_regclass(format('%I.runtime_commits', current_schema())), false) AND COALESCE(to_regclass('runtime_events') = to_regclass(format('%I.runtime_events', current_schema())), false)",
+            "SELECT COALESCE(to_regclass('session_records') = to_regclass(format('%I.session_records', current_schema())), false) AND COALESCE(to_regclass('session_runtime_outbox') = to_regclass(format('%I.session_runtime_outbox', current_schema())), false) AND COALESCE(to_regclass('runtime_commits') = to_regclass(format('%I.runtime_commits', current_schema())), false) AND COALESCE(to_regclass('runtime_events') = to_regclass(format('%I.runtime_events', current_schema())), false) AND COALESCE(to_regclass('runtime_session_outbox') = to_regclass(format('%I.runtime_session_outbox', current_schema())), false)",
             &[],
         ))?.try_get(0).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
         if !same_schema {
             return Err(RuntimeEventStoreError::InvalidTransaction("Session and Runtime transaction schemas differ".into()));
         }
+        let held_since = std::time::Instant::now();
+        let mut pre_read = SessionOwnerReadCharge::default();
         // Match the existing checked owner's transaction identity lock. This
         // makes the duplicate probe and subsequent append one decision.
         lock_original_member_decisions(&mut tx, &request.transaction)?;
@@ -330,13 +504,60 @@ impl PostgresRuntimeEventStore {
             &[&request.transaction.transaction_id],
         ))?.is_some();
         if !already_committed {
+            if terminal.is_some() {
+                let isolation: String = pg(tx.query_one("SHOW transaction_isolation", &[]))?
+                    .try_get(0).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+                if isolation != "read committed" {
+                    return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program source requires read committed isolation".into()));
+                }
+            }
             session_postgres::lock_runtime_input_claim_with_consumed_tx(
                 &mut tx, claim.session_id, claim.ingress_message_id, claim.turn_id, claim.fence,
                 claim.consumed_input_sequence,
             ).map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+            if let Some(terminal) = terminal {
+                let root = runtime::session_ingress_graph_id(claim.session_id, &claim.fence.request_id, claim.turn_id);
+                if terminal.session_id != claim.session_id || terminal.turn_id.as_deref() != Some(claim.turn_id)
+                    || terminal.request_id.as_deref() != Some(claim.fence.request_id.as_str())
+                    || terminal.execution_id.as_deref() != Some(root.as_str())
+                    || terminal.session_generation != Some(claim.fence.session_generation)
+                    || terminal.input_sequence != u64::try_from(claim.fence.input_sequence).ok()
+                    || terminal.input_claim_owner.as_deref() != Some(claim.fence.claim_owner.as_str())
+                    || terminal.input_claim_token.as_deref() != Some(claim.fence.claim_token.as_str())
+                    || terminal.input_claim_revision != Some(claim.fence.claim_fence_epoch)
+                {
+                    pg(tx.rollback())?;
+                    control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+                    return Err(RuntimeEventStoreError::CheckedAttemptRolledBack(Box::new(
+                        RuntimeEventStoreError::InvalidTransaction("terminal differs from original Session claim".into()),
+                    )));
+                }
+                if let Err(error) = Self::check_terminal_attempts(&mut tx, &request, claim, &mut pre_read, held_since) {
+                    pg(tx.rollback())?;
+                    control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+                    return Err(RuntimeEventStoreError::CheckedAttemptRolledBack(Box::new(error)));
+                }
+            } else if request.transaction.events.iter().any(|event| {
+                event.event.kind == "agentic.program_opened"
+                    || (event.event.kind == "agentic.action_applied"
+                        && event.event.payload.pointer("/envelope/action/kind").and_then(Value::as_str)
+                            == Some("task_attempt_dispatch"))
+            }) {
+                if request.transaction.expected_streams.len().saturating_add(1) > request.budget.max_sources {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded("original Session terminal source count".into()));
+                }
+                pre_read = match Self::check_no_original_terminal(&mut tx, claim, &request.budget) {
+                    Ok(charge) => charge,
+                    Err(error) => {
+                        pg(tx.rollback())?;
+                        control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+                        return Err(RuntimeEventStoreError::CheckedAttemptRolledBack(Box::new(error)));
+                    }
+                };
+            }
         }
-        let commit = match append_transaction_in_tx_checked(
-            &mut tx, &request.transaction, terminal, Some((&request, validator)),
+        let commit = match append_transaction_in_tx_checked_charged(
+            &mut tx, &request.transaction, terminal, Some((&request, validator)), pre_read, held_since,
         ) {
             Ok(commit) => commit,
             Err(error @ (RuntimeEventStoreError::StaleRevision { .. }
@@ -368,6 +589,12 @@ impl PostgresRuntimeEventStore {
         }
         let mut guard = PgOwnedCommitGuard(control, false);
         control.before_commit();
+        if held_since.elapsed().as_millis() > u128::from(request.budget.max_lock_millis) {
+            pg(tx.rollback())?;
+            control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+            guard.1 = true;
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("cumulative owner transaction time".into()));
+        }
         if !control.commit_wins().map_err(RuntimeEventStoreError::InvalidTransaction)? {
             pg(tx.rollback())?;
             control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
@@ -3240,6 +3467,19 @@ fn append_transaction_in_tx_checked(
     terminal: Option<&SessionTerminalInput>,
     checked: Option<(&CheckedAppendRequest, &dyn CheckedSourceValidator)>,
 ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+    append_transaction_in_tx_checked_charged(
+        tx, request, terminal, checked, SessionOwnerReadCharge::default(), std::time::Instant::now(),
+    )
+}
+
+fn append_transaction_in_tx_checked_charged(
+    tx: &mut PostgresTransaction<'_>,
+    request: &AppendTransactionRequest,
+    terminal: Option<&SessionTerminalInput>,
+    checked: Option<(&CheckedAppendRequest, &dyn CheckedSourceValidator)>,
+    pre_read: SessionOwnerReadCharge,
+    held_since: std::time::Instant,
+) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
     validate_transaction(request)?;
     RuntimeEventStore::validate_current_content_inputs(request)?;
     if let Some(terminal) = terminal {
@@ -3254,7 +3494,6 @@ fn append_transaction_in_tx_checked(
         Some((request, _)) => request.identity_hash()?,
         None => request_hash_with_terminal(request, terminal)?,
     };
-    let held_since = std::time::Instant::now();
     lock_original_member_decisions(tx, request)?;
     let transaction_lock = format!("cowd-runtime-event-transaction:{}", request.transaction_id);
     pg(tx.query_one(
@@ -3295,10 +3534,18 @@ fn append_transaction_in_tx_checked(
     let mut evidence = checked.map(|(request, _)| CheckedSourceEvidence {
         frame_digest: request.frame_digest.clone(),
         sources: Vec::new(),
-        events_read: 0,
-        bytes_read: 0,
-        pages_read: 0,
+        events_read: pre_read.events,
+        bytes_read: pre_read.bytes,
+        pages_read: pre_read.pages,
     });
+    if let (Some((checked, _)), Some(evidence)) = (checked, evidence.as_ref()) {
+        if evidence.events_read > checked.budget.max_events || evidence.bytes_read > checked.budget.max_bytes
+            || evidence.pages_read > checked.budget.max_pages
+            || held_since.elapsed().as_millis() > u128::from(checked.budget.max_lock_millis)
+        {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("cumulative owner source budget".into()));
+        }
+    }
     for stream in &request.expected_streams {
         let actual = stream_head(tx, &stream.stream_id)?;
         if let Some((checked, validator)) = checked {

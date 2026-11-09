@@ -2477,6 +2477,7 @@ impl AgentActionService {
         envelope: &AgentActionEnvelope,
         goal: Option<(String, u64, RuntimeTransactionEventInput)>,
         verification: Option<&ObjectiveReviewVerification>,
+        required_write_failures: &[serde_json::Value],
         sources: &[ExpectedStreamRevision],
         locks: &crate::runtime_event_store::HeldStreamLocks<'_>,
         control: Arc<crate::conversation::MemberCommitControl>,
@@ -2583,7 +2584,7 @@ impl AgentActionService {
         let captured = std::cell::RefCell::new(None);
         let context = OriginalActionCommit { sources, locks, control, claim, consumed_input_sequence,
             single_call_facts: None, member_call_facts: Some(facts), authority: Some(authority), reservation: Some(reservation), effect_fence: Some(effect_fence), committed_capture: Some(&captured) };
-        let result = self.apply_original_action_locked(envelope, goal, verification, &context);
+        let result = self.apply_original_action_locked(envelope, goal, verification, required_write_failures, &context);
         drop(context);
         let result = (captured.into_inner(), result);
         match result {
@@ -2722,6 +2723,7 @@ impl AgentActionService {
         envelope: &AgentActionEnvelope,
         goal: Option<(String, u64, RuntimeTransactionEventInput)>,
         verification: Option<&ObjectiveReviewVerification>,
+        required_write_failures: &[serde_json::Value],
         invocation: &super::action_invocation::VerifiedActionInvocation,
         tool: &str,
         input: &serde_json::Value,
@@ -2801,7 +2803,7 @@ impl AgentActionService {
         }
         let captured = std::cell::RefCell::new(None);
         let context = OriginalActionCommit { sources, locks, control, claim, consumed_input_sequence, single_call_facts: Some(facts), member_call_facts: None, authority: None, reservation: None, effect_fence: None, committed_capture: Some(&captured) };
-        let observation = self.apply_original_action_locked(envelope, goal, verification, &context);
+        let observation = self.apply_original_action_locked(envelope, goal, verification, required_write_failures, &context);
         let committed = captured.into_inner().map(|append| Arc::new(OriginalCommittedSingle {
             store: append.store, request: append.request, receipt: append.receipt,
             observation: observation.as_ref().ok().map(|value| Arc::new(value.clone())),
@@ -2907,10 +2909,11 @@ impl AgentActionService {
         envelope: &AgentActionEnvelope,
         goal: Option<(String, u64, RuntimeTransactionEventInput)>,
         verification: Option<&ObjectiveReviewVerification>,
+        required_write_failures: &[serde_json::Value],
         context: &OriginalActionCommit<'_>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         self.apply_locked(envelope, &program_stream(&envelope.actor.program_id), goal, verification,
-            context.sources, false, false, Some(context))
+            required_write_failures, context.sources, false, false, Some(context))
     }
 
     /// Locate a committed member from its original outer effect and ordinal.
@@ -3128,6 +3131,29 @@ impl AgentActionService {
         self.apply_with_root_owner(envelope, true, false)
     }
 
+    pub(super) fn apply_runtime_root_completion_owned(
+        &self, envelope: &AgentActionEnvelope,
+        owner: &crate::execution_core::services::OriginalGraphRegistrationOwner,
+    ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        if envelope.actor.kind != AgentActorKind::Root
+            || !matches!(&envelope.action, AgentAction::ObjectiveCompleteRequest(_))
+        { return Err(AgentActionServiceError::Corrupt("invalid Runtime root completion".into())); }
+        if let Err(error) = envelope.validate() {
+            return Ok(rejected(envelope, 0, "invalid_action", &error.to_string()));
+        }
+        let stream = program_stream(&envelope.actor.program_id);
+        let mut streams = vec![stream.clone()];
+        if let Some(physical) = envelope.actor.original_execution.as_ref() { streams.push(physical.graph_id.clone()); }
+        owner.with_action(|claim, control, consumed| {
+            Ok(self.store.with_authenticated_stream_locks(&streams, |locks| {
+                let context = OriginalActionCommit { sources: &[], locks, control, claim,
+                    consumed_input_sequence: consumed, single_call_facts: None, member_call_facts: None,
+                    authority: None, reservation: None, effect_fence: None, committed_capture: None };
+                self.apply_locked(envelope, &stream, None, None, &[], context.sources, true, false, Some(&context))
+            }))
+        }).map_err(AgentActionServiceError::EventStore)?
+    }
+
     pub(super) fn apply_runtime_supervisor(
         &self,
         envelope: &AgentActionEnvelope,
@@ -3136,6 +3162,37 @@ impl AgentActionService {
             return Err(AgentActionServiceError::Corrupt("invalid Runtime supervisor action".into()));
         }
         self.apply_with_root_owner(envelope, false, true)
+    }
+
+    /// Commit a new supervisor dispatch under the original Session owner.
+    pub(super) fn apply_runtime_supervisor_dispatch_owned(
+        &self,
+        envelope: &AgentActionEnvelope,
+        owner: &crate::execution_core::services::OriginalConclusionOwner,
+        consumed_input_sequence: usize,
+    ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        if envelope.actor.kind != AgentActorKind::Supervisor
+            || envelope.actor.original_execution.is_some()
+            || !matches!(&envelope.action, AgentAction::TaskAttemptDispatch(_))
+            || owner.claim.session_id() != envelope.actor.session_id
+            || owner.claim.turn_id() != envelope.actor.turn_id
+        {
+            return Err(AgentActionServiceError::Corrupt("invalid original supervisor dispatch owner".into()));
+        }
+        if let Err(error) = envelope.validate() {
+            return Ok(rejected(envelope, 0, "invalid_action", &error.to_string()));
+        }
+        let stream_id = program_stream(&envelope.actor.program_id);
+        let streams = vec![stream_id.clone()];
+        self.store.with_authenticated_stream_locks(&streams, |locks| {
+            let context = OriginalActionCommit {
+                sources: &[], locks, control: Arc::clone(&owner.control),
+                claim: &owner.claim, consumed_input_sequence,
+                single_call_facts: None, member_call_facts: None, authority: None,
+                reservation: None, effect_fence: None, committed_capture: None,
+            };
+            self.apply_locked(envelope, &stream_id, None, None, &[], context.sources, false, true, Some(&context))
+        })
     }
 
     fn apply_with_root_owner(
@@ -3161,7 +3218,7 @@ impl AgentActionService {
             streams.push(physical.graph_id.clone());
         }
         self.store.with_stream_locks(&streams, || {
-            self.apply_locked(envelope, &stream_id, None, None, &[], internal_root_owner, internal_supervisor, None)
+            self.apply_locked(envelope, &stream_id, None, None, &[], &[], internal_root_owner, internal_supervisor, None)
         })
     }
 
@@ -3176,6 +3233,7 @@ impl AgentActionService {
         expected_goal_stream_revision: u64,
         goal_event: RuntimeTransactionEventInput,
         verification: Option<&ObjectiveReviewVerification>,
+        required_write_failures: &[serde_json::Value],
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         self.apply_with_goal_event_sources_inner(
             envelope,
@@ -3183,6 +3241,7 @@ impl AgentActionService {
             expected_goal_stream_revision,
             goal_event,
             verification,
+            required_write_failures,
             &[],
             false,
         )
@@ -3195,6 +3254,7 @@ impl AgentActionService {
         expected_goal_stream_revision: u64,
         goal_event: RuntimeTransactionEventInput,
         verification: Option<&ObjectiveReviewVerification>,
+        required_write_failures: &[serde_json::Value],
         extra_sources: &[ExpectedStreamRevision],
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         if envelope.actor.kind != AgentActorKind::Root
@@ -3203,7 +3263,7 @@ impl AgentActionService {
             return Err(AgentActionServiceError::Corrupt("invalid authenticated user Goal revision".into()));
         }
         self.apply_with_goal_event_sources_inner(envelope, goal_stream_id, expected_goal_stream_revision,
-            goal_event, verification, extra_sources, true)
+            goal_event, verification, required_write_failures, extra_sources, true)
     }
 
     fn apply_with_goal_event_sources_inner(
@@ -3213,6 +3273,7 @@ impl AgentActionService {
         expected_goal_stream_revision: u64,
         goal_event: RuntimeTransactionEventInput,
         verification: Option<&ObjectiveReviewVerification>,
+        required_write_failures: &[serde_json::Value],
         extra_sources: &[ExpectedStreamRevision],
         internal_root_owner: bool,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
@@ -3255,6 +3316,7 @@ impl AgentActionService {
                 &program_stream_id,
                 Some((goal_stream_id, expected_goal_stream_revision, goal_event)),
                 verification,
+                required_write_failures,
                 extra_sources,
                 internal_root_owner,
                 false,
@@ -3319,6 +3381,7 @@ impl AgentActionService {
         &self,
         envelope: &AgentActionEnvelope,
         verification: &ObjectiveReviewVerification,
+        required_write_failures: &[serde_json::Value],
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         let explicit = match &envelope.action {
             AgentAction::TaskReview(input) => input.evidence_refs.as_slice(),
@@ -3349,7 +3412,7 @@ impl AgentActionService {
             streams.push(physical.graph_id.clone());
         }
         self.store.with_stream_locks(&streams, || {
-            self.apply_locked(envelope, &stream_id, None, Some(verification), &[], false, false, None)
+            self.apply_locked(envelope, &stream_id, None, Some(verification), required_write_failures, &[], false, false, None)
         })
     }
 
@@ -3488,6 +3551,7 @@ impl AgentActionService {
         stream_id: &str,
         goal_event: Option<(String, u64, RuntimeTransactionEventInput)>,
         verification: Option<&ObjectiveReviewVerification>,
+        required_write_failures: &[serde_json::Value],
         extra_sources: &[ExpectedStreamRevision],
         internal_root_owner: bool,
         internal_supervisor: bool,
@@ -4267,6 +4331,12 @@ impl AgentActionService {
             "entity_ref": entity_ref,
             "review_verification": verification,
         });
+        // The named failures of the required writes this review settled as
+        // failed. They are written only when there are any, beside the
+        // review's own verification.
+        if !required_write_failures.is_empty() {
+            action_payload["required_write_failures"] = json!(required_write_failures);
+        }
         if let Some(facts) = member.and_then(|context| context.single_call_facts.as_ref()) {
             action_payload["original_single_call"] = facts.clone();
         }
@@ -4445,6 +4515,10 @@ impl AgentActionService {
             .find(|event| event.kind == PROGRAM_OPENED_EVENT_KIND)
             .ok_or_else(|| AgentActionServiceError::Corrupt("program_not_found".to_string()))?;
         let mut projection = projection_from_opened(program_id, opened)?;
+        // The named failures the Program's reviews settled: read from the
+        // durable applied events, in the order they were applied. The read
+        // happens before the events are moved into the projection.
+        merge_required_write_failures(&mut projection, &events);
         apply_projection_events(&mut projection, events)?;
         self.catch_up_projection(&mut projection, &stream_id, durable_revision)?;
         let projection = Arc::new(projection);
@@ -6315,10 +6389,44 @@ fn projection_from_opened(
     Ok(projection)
 }
 
+/// The named failures the Program's reviews settled, read from the durable
+/// applied events.
+///
+/// One helper, two callers: the rebuild path and the catch-up path read the
+/// same durable facts the same way, so a cached projection and a rebuilt one
+/// carry the same entries. An entry is kept once: the same named failure is
+/// never listed twice.
+fn merge_required_write_failures(
+    projection: &mut AgenticProgramProjection,
+    events: &[crate::DurableRuntimeEvent],
+) {
+    for event in events {
+        let Some(found) = event
+            .payload
+            .get("required_write_failures")
+            .and_then(|entries| entries.as_array())
+        else {
+            continue;
+        };
+        for entry in found {
+            let name = entry.get("name").and_then(|name| name.as_str()).unwrap_or_default();
+            if projection.required_write_failures.iter().any(|existing| {
+                existing.get("name").and_then(|name| name.as_str()) == Some(name)
+            }) {
+                continue;
+            }
+            projection.required_write_failures.push(entry.clone());
+        }
+    }
+}
+
 fn apply_projection_events(
     projection: &mut AgenticProgramProjection,
     events: Vec<crate::DurableRuntimeEvent>,
 ) -> Result<(), AgentActionServiceError> {
+    // The same durable facts, read the same way: the catch-up path carries
+    // the named failures the rebuild path carries.
+    merge_required_write_failures(projection, &events);
     for event in events {
         if event.sequence <= projection.revision {
             continue;

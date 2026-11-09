@@ -291,7 +291,7 @@ impl RuntimeEventStore {
         if request.frame_digest != validator.frame_digest() { return Err(RuntimeEventStoreError::InvalidTransaction("terminal source frame mismatch".into())); }
         let stream_ids = request.transaction.expected_streams.iter().map(|source| source.stream_id.clone()).collect::<Vec<_>>();
         let request = Arc::new(request);
-        self.retain_original_checked_terminal(Arc::clone(&request), terminal.clone(), Arc::clone(control), Arc::clone(terminal_owner))?;
+        self.retain_original_checked_terminal(Arc::clone(&request), terminal.clone(), Arc::clone(control), Arc::clone(terminal_owner), authored_metadata.cloned())?;
         let result = self.with_stream_locks(&stream_ids, ||
             self.backend.append_checked_terminal_cancellable((*request).clone(), terminal, validator, control.as_ref(), claim));
         self.finish_original_checked_terminal(&request, &result)?;

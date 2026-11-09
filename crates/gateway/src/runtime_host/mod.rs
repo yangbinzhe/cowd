@@ -1914,14 +1914,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     };
     let provider_transport_pool = Arc::new(runtime::ProviderTransportPool::default());
-    // The operator chooses diagnostic mode once during Gateway startup. A
-    // later process environment change cannot alter already constructed clients.
-    let provider_template_cache = Arc::new(match std::env::var("COWD_DIAGNOSTIC_UNAUTHENTICATED_SEND") {
-        Ok(reason) => runtime::ProviderClientTemplateCache::diagnostic(&reason)
-            .map_err(|error| format!("invalid diagnostic send configuration: {error}"))?,
-        Err(std::env::VarError::NotPresent) => runtime::ProviderClientTemplateCache::default(),
-        Err(std::env::VarError::NotUnicode(_)) => return Err("diagnostic send reason is not Unicode".into()),
-    });
+    let provider_template_cache = Arc::new(runtime::ProviderClientTemplateCache::default());
     let selected_storage =
         match crate::selected_storage::SelectedStorageTopology::compose_for_runtime(
             runtime_config.storage(),

@@ -6138,6 +6138,7 @@ mod tests {
                 providers: HashMap::from([(
                     "test".into(),
                     ProviderConfig {
+                        reasoning_effort: None,
                         name: "test".into(),
                         base_url: "https://example.test/v1".into(),
                         api_key: "test".into(),

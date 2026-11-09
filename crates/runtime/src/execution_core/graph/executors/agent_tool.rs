@@ -102,6 +102,8 @@ pub(crate) struct NoDispatchObservation {
 struct NoDispatchState {
     entered: bool,
     closed: bool,
+    original_early_reads: std::collections::BTreeMap<String, crate::conversation::EarlyToolExecutionReceipt>,
+    original_early_reads_released: std::collections::BTreeMap<String, (String, u64)>,
     uncertain: Vec<String>,
     inherited_hook_pending: std::collections::BTreeSet<String>,
     bounded_controls: Vec<std::sync::Weak<crate::conversation::MemberCommitControl>>,
@@ -296,6 +298,59 @@ impl NoDispatchObservation {
         self.ticket == *ticket
     }
 
+    /// Keep the already executed read with this original Scoped binding.
+    pub(crate) fn hold_original_early_read(
+        &self, ticket: &NodeExecutionTicket,
+        receipt: crate::conversation::EarlyToolExecutionReceipt,
+    ) -> Result<(), String> {
+        if !self.ticket_matches(ticket) { return Err("early read binding changed".into()); }
+        let Some(planned) = self.calls.iter().find(|call| call.call_id == receipt.call.id) else {
+            return Err("early read outside original batch".into());
+        };
+        if planned.tool_name != receipt.call.name
+            || planned.effect_key.as_deref() != receipt.call.binding.as_ref().map(|b| b.effect_idempotency_key()).as_deref() {
+            return Err("early read call identity changed".into());
+        }
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed { return Err("early read binding is closed".into()); }
+        if state.original_early_reads.get(&receipt.call.id).is_some_and(|prior| prior != &receipt) {
+            return Err("conflicting early read carrier".into());
+        }
+        state.original_early_reads.insert(receipt.call.id.clone(), receipt);
+        Ok(())
+    }
+
+    pub(crate) fn original_early_reads(&self) -> Result<Vec<crate::conversation::EarlyToolExecutionReceipt>, String> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.closed { return Err("original early read binding is still open".into()); }
+        Ok(state.original_early_reads.values().cloned().collect())
+    }
+
+    /// Retire exactly the carrier set covered by the original lease-closure CAS.
+    pub(crate) fn release_original_early_reads(
+        &self, ticket: &NodeExecutionTicket,
+        reads: &[crate::conversation::EarlyToolExecutionReceipt],
+        sources: &[crate::runtime_event_store::ExpectedStreamRevision],
+        receipt: &crate::execution_core::graph::ExecutionCommitReceipt,
+    ) -> Result<(), String> {
+        if !self.ticket_matches(ticket) || receipt.graph.id != ticket.graph_id
+            || receipt.transaction.transaction_id.is_empty() || receipt.transaction.commit_cursor == 0 {
+            return Err("early read release owner or receipt changed".into());
+        }
+        if sources.iter().any(|source| !receipt.transaction.stream_revisions.iter().any(|actual|
+            actual.stream_id == source.stream_id && actual.expected_revision == source.expected_revision)) {
+            return Err("early read release transaction omitted original source".into());
+        }
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.closed || reads.len() != state.original_early_reads.len()
+            || reads.iter().any(|read| state.original_early_reads.get(&read.call.id) != Some(read)) {
+            return Err("early read release carrier changed".into());
+        }
+        let position = (receipt.transaction.transaction_id.clone(), receipt.transaction.commit_cursor);
+        for read in reads { state.original_early_reads_released.insert(read.call.id.clone(), position.clone()); }
+        Ok(())
+    }
+
     pub(super) fn enter(&self) -> bool {
         let mut state = self
             .state
@@ -313,7 +368,7 @@ impl NoDispatchObservation {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.closed || state.entered || !state.uncertain.is_empty() || !state.inherited_hook_pending.is_empty() || !state.refused.is_empty()
+        if state.closed || state.entered || !state.original_early_reads.is_empty() || !state.uncertain.is_empty() || !state.inherited_hook_pending.is_empty() || !state.refused.is_empty()
             || state.member_custody.values().any(|unit| !unit.is_settled())
         {
             return false;
@@ -335,7 +390,7 @@ impl NoDispatchObservation {
                 true
             } else { false }
         });
-        if !state.entered && state.uncertain.is_empty() && state.inherited_hook_pending.is_empty() && state.completed.is_none() {
+        if !state.entered && state.original_early_reads.is_empty() && state.uncertain.is_empty() && state.inherited_hook_pending.is_empty() && state.completed.is_none() {
             let mut calls = self.calls.clone();
             for call in &mut calls {
                 if let Some(refusal) = state.refused.iter().find(|refusal|
@@ -475,7 +530,8 @@ impl NoDispatchObservation {
     }
     pub(crate) fn original_custody_allows_forget(&self, publication_completed: bool) -> bool {
         let Ok(state) = self.state.lock() else { return false; };
-        state.packet_scope_pending.is_empty() && (state.packet_scope_settled.is_empty() || publication_completed)
+        state.original_early_reads.keys().all(|id| state.original_early_reads_released.contains_key(id))
+            && state.packet_scope_pending.is_empty() && (state.packet_scope_settled.is_empty() || publication_completed)
             && state.member_custody.values().all(|unit| unit.is_settled())
     }
     /// Release only after the original commit owner authenticated this exact receipt.

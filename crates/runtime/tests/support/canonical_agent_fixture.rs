@@ -125,6 +125,7 @@ pub async fn services_with_canonical_agent(
         providers: HashMap::from([(
             "test".to_string(),
             model_protocol::provider_config::ProviderConfig {
+                reasoning_effort: None,
                 name: "test".to_string(),
                 base_url: format!("{}/v1", server.base_url),
                 api_key: "test".to_string(),
