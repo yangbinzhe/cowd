@@ -1422,7 +1422,7 @@ fn scope(
     }
 }
 
-fn resource_target(input: &Value) -> Option<String> {
+pub(crate) fn resource_target(input: &Value) -> Option<String> {
     ["path", "url", "server", "uri", "target"]
         .into_iter()
         .find_map(|key| input.get(key).and_then(Value::as_str).map(str::to_string))

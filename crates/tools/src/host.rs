@@ -335,6 +335,33 @@ pub struct OrchestratedChildren {
     pub searches: Option<Vec<OrchestratedSearch>>,
 }
 
+/// Verify an internal grep batch member against its original admitted call.
+/// This does not grant a new Tool scope; each File scope must already belong
+/// to the parent descriptor. The caller still checks the original lease.
+#[must_use]
+pub fn original_grep_batch_member_scopes(
+    parent_input: &Value, parent: &ToolEffectDescriptor, index: usize,
+    child_input: &Value, child: &ToolEffectDescriptor,
+) -> bool {
+    use harness_contract::policy::{PermissionOperation, PermissionResource};
+    use harness_contract::tool::ToolEffectKind;
+    if parent.tool_id != "grep_search" || child.tool_id != "grep_search"
+        || parent.effect_kind != ToolEffectKind::Read || child.effect_kind != ToolEffectKind::Read
+        || parent.uses_network || parent.spawns_process || parent.mutates_packages || parent.mutates_system
+        || child.uses_network || child.spawns_process || child.mutates_packages || child.mutates_system
+        || parent_input.get("searches").and_then(Value::as_array).and_then(|items| items.get(index)) != Some(child_input)
+    { return false; }
+    let parent_tool = parent.scopes.iter().filter(|s| s.resource == PermissionResource::Tool && s.operation == PermissionOperation::Read).count();
+    let child_tool = child.scopes.iter().filter(|s| s.resource == PermissionResource::Tool && s.operation == PermissionOperation::Read).count();
+    parent_tool == 1 && child_tool == 1
+        && parent.scopes.iter().all(|s| (s.resource == PermissionResource::Tool || s.resource == PermissionResource::File) && s.operation == PermissionOperation::Read)
+        && child.scopes.iter().all(|s| s.operation == PermissionOperation::Read
+            && ((s.resource == PermissionResource::Tool
+                && s.target == crate::tool_orchestrator::resource_target(child_input))
+                || (s.resource == PermissionResource::File && parent.scopes.contains(s))))
+        && child.scopes.iter().any(|s| s.resource == PermissionResource::File)
+}
+
 #[derive(Default)]
 struct OrchestratedReadTrace {
     reads: Vec<OrchestratedRead>,
@@ -347,6 +374,7 @@ struct OrchestratedReadTrace {
     parent_descriptor_hash: String,
     parent_authorization: Option<ToolExecutionAuthorization>,
     authorized_scopes: Vec<harness_contract::policy::PermissionScope>,
+    original_grep_batch: Option<(Value, ToolEffectDescriptor)>,
 }
 
 impl std::fmt::Debug for ToolHostLease {
@@ -411,11 +439,14 @@ impl ToolHostLease {
         }
         let (canonical, value) = self.authorize_and_canonicalize(authorization, tool, input)?;
         let mut lease = self.for_authorized_read_cache(authorization)?;
+        let original_grep_batch = (canonical == "grep_search" && value.get("searches").and_then(Value::as_array).is_some())
+            .then(|| (value.clone(), self.describe_effect(&canonical, &value)));
         let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
             authorized_scopes: authorization.authorization_lease.scopes.clone(),
             parent_request_id: authorization.request_id.clone(),
             parent_descriptor_hash: authorization.descriptor_hash.clone(),
             parent_authorization: Some(authorization.clone()),
+            original_grep_batch,
             ..OrchestratedReadTrace::default()
         }));
         lease.orchestrated_read_trace = Some(Arc::clone(&trace));
@@ -498,6 +529,8 @@ impl ToolHostLease {
                 .iter()
                 .all(|scope| trace.authorized_scopes.contains(scope))
         {
+            trace.overflow = true;
+            trace.reads.clear();
             return Ok(());
         }
         let bytes = serde_json::to_vec(input)
@@ -545,10 +578,45 @@ impl ToolHostLease {
     pub(crate) fn record_grep_windows(&self, input: &Value, output: &str,
         windows: Option<Vec<crate::file_ops::GrepReadWindow>>) -> Result<(), String> {
         let Some(trace) = &self.orchestrated_read_trace else { return Ok(()); };
-        let Some(windows) = windows.filter(|windows| !windows.is_empty()) else { return Ok(()); };
-        let effect = self.describe_effect("grep_search", input);
         let mut trace = trace.lock().map_err(|_| "read trace poisoned")?;
-        if effect.scopes.is_empty() || !effect.scopes.iter().all(|scope| trace.authorized_scopes.contains(scope)) { return Ok(()); }
+        let effect = self.describe_effect("grep_search", input);
+        let original_batch_member = self.grep_batch_index.zip(trace.original_grep_batch.as_ref())
+            .is_some_and(|(index, (parent_input, parent))| {
+                parent.descriptor_hash == trace.parent_descriptor_hash
+                    && parent.scopes.iter().all(|scope| trace.authorized_scopes.contains(scope))
+                    && original_grep_batch_member_scopes(parent_input, parent, index, input, &effect)
+            });
+        if effect.scopes.is_empty() || (!original_batch_member
+            && !effect.scopes.iter().all(|scope| trace.authorized_scopes.contains(scope))) {
+            trace.overflow = true;
+            trace.reads.clear();
+            return Ok(());
+        }
+        let Some(windows) = windows else {
+            trace.overflow = true; trace.reads.clear(); return Ok(());
+        };
+        if windows.is_empty() {
+            // A complete non-content result contributes no body candidate, not a no-read fact.
+            let known_non_content = trace.parent_authorization.as_ref().is_some_and(|auth|
+                !auth.request_id.is_empty() && auth.descriptor_hash == trace.parent_descriptor_hash)
+                && input.get("output_mode").and_then(Value::as_str)
+                .filter(|mode| matches!(*mode, "count" | "files_with_matches"))
+                .is_some_and(|mode| {
+                    serde_json::from_str::<Value>(output).ok().is_some_and(|result| {
+                        result.get("mode").and_then(Value::as_str) == Some(mode)
+                            && result.get("content").is_some_and(Value::is_null)
+                            && result.get("scanComplete").and_then(Value::as_bool) == Some(true)
+                            && result.get("truncated").and_then(Value::as_bool) == Some(false)
+                            && result.get("omissions").and_then(Value::as_array).is_some_and(Vec::is_empty)
+                            && result.get("continuationCursor").is_none_or(Value::is_null)
+                            && result.get("next_request").is_none_or(Value::is_null)
+                            && input.get("cursor").is_none_or(Value::is_null)
+                            && input.get("offset").is_none_or(|v| v.is_null() || v.as_u64() == Some(0))
+                    })
+                });
+            if !known_non_content { trace.overflow = true; trace.reads.clear(); }
+            return Ok(());
+        }
         let bytes = output.len().saturating_add(serde_json::to_vec(input).map_err(|e| e.to_string())?.len())
             .saturating_add(windows.iter().map(|w| w.body.len() + w.presentation.len() + w.path.len() + w.relative_path.len() + w.directory_ancestry.as_ref().map_or(0, |(path, root, directory)| path.len() + root.len() + directory.len())).sum::<usize>());
         if trace.reads.len() >= 400 || trace.bytes.saturating_add(bytes) > 4 * 1024 * 1024 {
@@ -1929,6 +1997,86 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_batch_capture_uses_original_parent_and_exact_member() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-batch-parent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit original\n").unwrap();
+        let lease = test_host("batch-parent", &root).pin_snapshot();
+        let child_input = json!({"pattern":"hit","glob":"a.txt"});
+        let input = json!({"path":root.to_str().unwrap(),"searches":[child_input]});
+        let parent = lease.describe_effect("grep_search", &input);
+        let auth = authorization(&parent, None);
+        let (_, captured) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        let reads = captured.reads.unwrap();
+        assert_eq!(reads.len(), 1);
+        let child = &reads[0];
+        assert_eq!(child.grep_batch_index(), Some(0));
+        assert!(original_grep_batch_member_scopes(&input, &parent, 0, child.input(), child.effect()));
+        assert!(!original_grep_batch_member_scopes(&input, &parent, 1, child.input(), child.effect()));
+        assert!(!original_grep_batch_member_scopes(&json!({"searches":[{"pattern":"foreign"}]}), &parent, 0, child.input(), child.effect()));
+        let mut foreign = child.effect().clone();
+        let file = foreign.scopes.iter_mut().find(|scope| scope.resource == harness_contract::policy::PermissionResource::File).unwrap();
+        file.target = Some("../outside".into());
+        assert!(!original_grep_batch_member_scopes(&input, &parent, 0, child.input(), &foreign));
+        let explicit = json!({"searches":[{"path":"a.txt","pattern":"hit"}]});
+        let explicit_parent = lease.describe_effect("grep_search", &explicit);
+        let explicit_auth = authorization(&explicit_parent, None);
+        let (_, captured) = lease.execute_with_read_trace(&explicit_auth, "grep_search", &explicit).unwrap();
+        let explicit_reads = captured.reads.unwrap();
+        assert_eq!(explicit_reads.len(), 1);
+        let explicit_child = &explicit_reads[0];
+        assert!(original_grep_batch_member_scopes(&explicit, &explicit_parent, 0, explicit_child.input(), explicit_child.effect()));
+        let mut forged_tool = explicit_child.effect().clone();
+        let tool_scope = forged_tool.scopes.iter_mut().find(|scope| scope.resource == harness_contract::policy::PermissionResource::Tool).unwrap();
+        tool_scope.target = Some("foreign".into());
+        assert!(!original_grep_batch_member_scopes(&explicit, &explicit_parent, 0, explicit_child.input(), &forged_tool));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_mixed_batch_keeps_content_only_for_complete_non_content_siblings() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-mixed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit one\nmiss\nhit two\n").unwrap();
+        let lease = test_host("batch-mixed", &root).pin_snapshot();
+        let content = json!({"pattern":"hit","glob":"a.txt"});
+        let count = json!({"pattern":"hit","glob":"a.txt","output_mode":"count"});
+        let files = json!({"pattern":"hit","glob":"a.txt","output_mode":"files_with_matches"});
+        let input = json!({"path":root.to_str().unwrap(),"searches":[content, count, files]});
+        let parent = lease.describe_effect("grep_search", &input);
+        let auth = authorization(&parent, None);
+        let (_, captured) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        let reads = captured.reads.unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].grep_batch_index(), Some(0));
+        assert_eq!(reads[0].grep_windows().unwrap().len(), 2);
+        let truncated = json!({"path":root.to_str().unwrap(),"searches":[
+            {"pattern":"hit","glob":"a.txt"},
+            {"pattern":"hit","glob":"a.txt","output_mode":"count","head_limit":1}
+        ]});
+        let auth = authorization(&lease.describe_effect("grep_search", &truncated), None);
+        let (_, captured) = lease.execute_with_read_trace(&auth, "grep_search", &truncated).unwrap();
+        assert!(captured.reads.is_none());
+        // Feed the original member through the same owner with an inconsistent result.
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
+            authorized_scopes: auth.authorization_lease.scopes.clone(),
+            parent_descriptor_hash: auth.descriptor_hash.clone(),
+            parent_authorization: Some(auth.clone()),
+            original_grep_batch: Some((truncated.clone(), lease.describe_effect("grep_search", &truncated))),
+            ..OrchestratedReadTrace::default()
+        }));
+        let mut child = lease.with_grep_batch_index(1);
+        child.orchestrated_read_trace = Some(trace.clone());
+        let fake = json!({"mode":"files_with_matches","content":null,"scanComplete":true,
+            "truncated":false,"omissions":[]});
+        child.record_grep_windows(&truncated["searches"][1], &fake.to_string(), Some(vec![])).unwrap();
+        assert!(trace.lock().unwrap().overflow);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn grep_samecall_private_windows_are_original_and_contiguous() {
         let root = std::env::temp_dir().join(format!("cowd-grep-windows-{}", uuid::Uuid::new_v4()));
@@ -1956,8 +2104,27 @@ mod tests {
             std::fs::write(root.as_path().join("a.txt"), source).unwrap();
             let mut input = input.clone(); input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             let auth = authorization(&lease.describe_effect("grep_search", &input), None);
-            let (_, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
-            assert!(children.reads.unwrap().is_empty());
+            let (output, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+            let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+            if let Some(mode) = extra.get("output_mode").and_then(serde_json::Value::as_str) {
+                // The result is known to contain counts or filenames, not file-body windows.
+                assert_eq!(result["mode"], mode);
+                assert_eq!(result["scanComplete"], true);
+                assert_eq!(result["truncated"], false);
+                assert!(result["content"].is_null());
+                assert_eq!(result["numFiles"], 1);
+                if mode == "count" { assert_eq!(result["numMatches"], 2); }
+                // The complete output has no presented file-body windows;
+                // this says nothing about whether the tool read files internally.
+                assert!(children.reads.as_ref().is_some_and(Vec::is_empty));
+            } else {
+                // A limited content page cannot certify that its windows are complete.
+                assert_eq!(result["mode"], "content");
+                assert_eq!(result["scanComplete"], false);
+                assert_eq!(result["truncated"], true);
+                assert!(!result["next_request"].is_null());
+                assert!(children.reads.is_none());
+            }
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2208,6 +2375,23 @@ mod tests {
             [(0, 0), (1, 0)]
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn orchestrated_unprovable_read_poisons_trace() {
+        let root = std::env::temp_dir();
+        let mut lease = test_host("trace-unprovable", &root).pin_snapshot();
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace::default()));
+        lease.orchestrated_read_trace = Some(Arc::clone(&trace));
+        lease.record_orchestrated_read(0, "read", 0, &json!({"path":"a.txt"}), "body").unwrap();
+        assert!(trace.lock().unwrap().overflow);
+        assert!(trace.lock().unwrap().reads.is_empty());
+
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace::default()));
+        lease.orchestrated_read_trace = Some(Arc::clone(&trace));
+        lease.record_grep_windows(&json!({"path":"."}), "{}", None).unwrap();
+        assert!(trace.lock().unwrap().overflow);
+        assert!(trace.lock().unwrap().reads.is_empty());
     }
 
     #[test]

@@ -5149,6 +5149,12 @@ impl ExecutionCommitService {
                     || outcome.error.is_some() { return None; }
                 crate::context_evidence::child_read_acquisitions(request, scope?, children)
             });
+            // The child list may contain useful individual windows while a
+            // different window failed authentication. Keep those windows,
+            // but do not claim that they cover the entire original trace.
+            let child_acquisitions_complete = children.zip(child_acquisitions.as_ref())
+                .is_some_and(|(children, records)|
+                    crate::context_evidence::original_child_coverage_complete(children, records));
             let mut read_payload = local_network::receipt_payload(
                 &self.event_store,
                 request,
@@ -5177,6 +5183,7 @@ impl ExecutionCommitService {
             }
             if let Some(child_acquisitions) = &child_acquisitions {
                 read_payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] = json!(child_acquisitions);
+                read_payload["child_read_acquisitions_complete"] = json!(child_acquisitions_complete);
             }
             events.push(RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
@@ -5233,6 +5240,7 @@ impl ExecutionCommitService {
                     serde_json::to_value(&acquisition)?;
                 if let Some(child_acquisitions) = &child_acquisitions {
                     agent_receipt.event.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] = json!(child_acquisitions);
+                    agent_receipt.event.payload["child_read_acquisitions_complete"] = json!(child_acquisitions_complete);
                 }
                 self.allocate_receipt_sequence(&mut agent_receipt, &mut expected_streams, &events)?;
                 events.push(agent_receipt);

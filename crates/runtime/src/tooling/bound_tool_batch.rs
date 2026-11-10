@@ -1573,6 +1573,35 @@ pub(crate) mod scope_admission_tests {
     }
 
     #[test]
+    fn original_glob_file_domain_uses_real_mixed_scope_without_widening() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("proof.txt"), "body").unwrap();
+        let host = tools::ToolHost::builtin("glob-domain", workspace.path());
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path()).unwrap();
+        let request = bound_request(&host, "glob_search", json!({"path":".", "pattern":"*.txt"}));
+        let descriptor = &request.compiled_invocation.as_ref().unwrap().effect;
+        let scope = admitted_effect_scope(&request, descriptor, Some(host.pin_snapshot()), &resolver).unwrap();
+        assert!(!scope.complete, "the non-File capability remains outside the overall scope");
+        assert!(crate::context_evidence::original_read_file_domain(descriptor, &scope));
+        let mut missing = scope.clone();
+        missing.targets.clear();
+        assert!(!crate::context_evidence::original_read_file_domain(descriptor, &missing));
+        let mut wrong = scope.clone();
+        wrong.descriptor_hash = "foreign".into();
+        assert!(!crate::context_evidence::original_read_file_domain(descriptor, &wrong));
+        let mut network = descriptor.clone(); network.uses_network = true;
+        assert!(!crate::context_evidence::original_read_file_domain(&network, &scope));
+        let mut process = descriptor.clone(); process.spawns_process = true;
+        assert!(!crate::context_evidence::original_read_file_domain(&process, &scope));
+        let mut packages = descriptor.clone(); packages.mutates_packages = true;
+        assert!(!crate::context_evidence::original_read_file_domain(&packages, &scope));
+        let mut system = descriptor.clone(); system.mutates_system = true;
+        assert!(!crate::context_evidence::original_read_file_domain(&system, &scope));
+        let mut wrong_kind = descriptor.clone(); wrong_kind.effect_kind = harness_contract::tool::ToolEffectKind::Unknown;
+        assert!(!crate::context_evidence::original_read_file_domain(&wrong_kind, &scope));
+    }
+
+    #[test]
     fn shared_scope_builder_authenticates_full_purpose_and_original_step() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("proof.txt"), "before").unwrap();
@@ -1648,6 +1677,29 @@ pub(crate) mod scope_admission_tests {
             std::fs::read_to_string(workspace.path().join("proof.txt")).unwrap(),
             "before"
         );
+    }
+
+    #[test]
+    fn direct_grep_batch_retains_the_original_locked_workspace_target() {
+        use harness_contract::context::WorkspaceObjectKind;
+        use harness_contract::policy::PermissionResource;
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("scope-grep-root", workspace.path());
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path()).unwrap();
+        let request = bound_request(&host, "grep_search", json!({
+            "path": workspace.path().to_str().unwrap(), "searches":[{"pattern":"hit"}]
+        }));
+        let descriptor = &request.compiled_invocation.as_ref().unwrap().effect;
+        let scope = admitted_effect_scope(&request, descriptor, Some(host.pin_snapshot()), &resolver).unwrap();
+        assert!(!scope.complete);
+        let roots = scope.targets.iter().filter(|target| target.declared_scope.resource == PermissionResource::File).collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path.workspace_relative_path, ".");
+        assert_eq!(roots[0].path.object_kind, WorkspaceObjectKind::Directory);
+        assert!(!roots[0].exact && !roots[0].alias_checked && roots[0].physical_identity.is_none());
+        let other = tempfile::tempdir().unwrap();
+        let foreign = crate::path_identity::WorkspacePathIdentityResolver::discover(other.path()).unwrap();
+        assert!(admitted_effect_scope(&request, descriptor, Some(host.pin_snapshot()), &foreign).is_err());
     }
 
     #[test]
@@ -1781,12 +1833,20 @@ pub(crate) fn admitted_effect_scope(
                 return None;
             }
             let target = scope.target.as_ref()?;
-            let (_, identity) = resolved_identities
-                .iter()
-                .find(|(path, _)| path == target)?;
+            let identity = if let Some((_, identity)) = resolved_identities.iter().find(|(path, _)| path == target) {
+                Ok(identity.clone())
+            } else if (matches!(tool_name, "glob_search" | "tool_orchestrate")
+                || tool_name == "grep_search" && input.get("searches").and_then(serde_json::Value::as_array).is_some())
+                && scope.operation == harness_contract::policy::PermissionOperation::Read
+                && resolver.is_workspace_scope(&crate::governed_tool_plan::normalize_resource_path(target)) {
+                // The original workspace lock was admitted above; resolve its
+                // actual directory rather than treating the lock as a file id.
+                pinned_resolver.resolve_existing(target).map_err(|error| ToolError::new(format!(
+                    "tool `{tool_name}` workspace target admission failed: {error}")))
+            } else { return None; };
             Some(
-                resolver
-                    .physical_file_identity_at_admission(identity)
+                identity.and_then(|identity| resolver
+                    .physical_file_identity_at_admission(&identity)
                     .map(
                         |physical_identity| harness_contract::goal::ProofEffectTarget {
                             path: identity.clone(),
@@ -1815,7 +1875,7 @@ pub(crate) fn admitted_effect_scope(
                         ToolError::new(format!(
                             "tool `{tool_name}` physical target admission failed: {error}"
                         ))
-                    }),
+                    })),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;

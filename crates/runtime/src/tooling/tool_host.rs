@@ -889,7 +889,7 @@ pub(crate) enum OriginalEffectCustodyOrigin {
 #[derive(Clone, Default)]
 pub struct ToolProgressSink {
     callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
-    child_reads: std::sync::Arc<std::sync::Mutex<Option<Vec<tools::OrchestratedRead>>>>,
+    child_reads: std::sync::Arc<std::sync::Mutex<Option<Option<Vec<tools::OrchestratedRead>>>>>,
     child_searches: std::sync::Arc<std::sync::Mutex<Option<Option<Vec<tools::OrchestratedSearch>>>>>,
     lifecycle_anchor: std::sync::Arc<std::sync::Mutex<Option<ToolLifecycleAnchor>>>,
     batch_policy_owner: std::sync::Arc<std::sync::Mutex<Option<std::sync::Weak<dyn AgentBatchPolicyOwner>>>>,
@@ -1114,11 +1114,16 @@ impl ToolProgressSink {
     }
     /// Bind actual child candidates to this original per-call channel, not a durable receipt.
     pub fn record_orchestrated_children(&self, children: &tools::OrchestratedChildren) -> Result<(), String> {
-        if let Some(reads) = &children.reads {
+        {
             let mut slot = self.child_reads.lock().map_err(|_| "child read channel poisoned")?;
-            match slot.as_ref() {
-                Some(existing) if existing != reads => return Err("conflicting child read channel".into()),
-                Some(_) => {}, None => *slot = Some(reads.clone()),
+            match (&*slot, &children.reads) {
+                (_, None) => *slot = Some(None),
+                (Some(Some(existing)), Some(reads)) if existing != reads => {
+                    *slot = Some(None);
+                    return Err("conflicting child read channel".into());
+                }
+                (None, Some(reads)) => *slot = Some(Some(reads.clone())),
+                _ => {},
             }
         }
         if let Ok(mut slot) = self.child_searches.lock() {
@@ -1135,7 +1140,7 @@ impl ToolProgressSink {
         self.child_searches.lock().map(|slot| slot.clone().flatten()).map_err(|_| "child search channel poisoned".into())
     }
     pub(crate) fn child_reads(&self) -> Result<Option<Vec<tools::OrchestratedRead>>, String> {
-        Ok(self.child_reads.lock().map_err(|_| "child read channel poisoned")?.clone())
+        Ok(self.child_reads.lock().map_err(|_| "child read channel poisoned")?.clone().flatten())
     }
     pub(crate) fn record_lifecycle_anchor(&self, anchor: ToolLifecycleAnchor) -> Result<(), String> {
         let mut slot = self.lifecycle_anchor.lock().map_err(|_| "tool lifecycle channel poisoned")?;
@@ -2112,6 +2117,19 @@ pub(crate) fn discover_delegated_tool(
 #[cfg(test)]
 mod resource_projection_tests {
     use super::*;
+
+    #[test]
+    fn child_read_overflow_stays_unknown_on_same_channel() {
+        let sink = ToolProgressSink::default();
+        let complete = tools::OrchestratedChildren { reads: Some(Vec::new()), searches: None };
+        let incomplete = tools::OrchestratedChildren { reads: None, searches: None };
+        sink.record_orchestrated_children(&complete).unwrap();
+        assert!(sink.child_reads().unwrap().is_some());
+        sink.record_orchestrated_children(&incomplete).unwrap();
+        assert!(sink.child_reads().unwrap().is_none());
+        sink.record_orchestrated_children(&complete).unwrap();
+        assert!(sink.child_reads().unwrap().is_none());
+    }
 
     #[test]
     fn child_search_overflow_stays_unknown_on_same_channel() {

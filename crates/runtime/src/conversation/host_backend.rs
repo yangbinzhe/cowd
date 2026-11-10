@@ -5308,13 +5308,8 @@ fn is_loop_nudge_repeatable_tool(call: &ModelToolCall) -> bool {
     lower == "state_inspect" && call_declares_wait_for_workers(call)
 }
 
-/// Count the successful, non-wait calls of one batch and report the ones that
-/// have now been issued enough times to stop carrying information.
-///
-/// Extracted so the filter is testable on its own: a call that failed is not
-/// evidence of a decision the model repeated, and a wait is not a repeat at all.
-/// Both exclusions are the difference between a diagnosis that helps and one that
-/// trains the model to ignore it.
+/// Count the non-wait calls requested in one batch and report repeated requests.
+/// A count alone does not establish whether a result or its source changed.
 pub(super) fn record_repeated_calls(
     turn_id: &crate::repetition_guard::RepetitionScope,
     calls: &[ModelToolCall],
@@ -10865,9 +10860,8 @@ where
         // byte-identical `state_inspect` queries across five agent graphs, and
         // the streak guard saw none of it because nothing was ever consecutive.
         //
-        // Diagnose only. The model keeps the decision; it is told the one fact it
-        // was missing - that the call has been made before and produced this
-        // result - and where the same bytes can be had without another call.
+        // Diagnose repeated requests without inferring that their results or
+        // their sources stayed unchanged. The model keeps the decision.
         let repeat_turn = services
             .event_store()
             .repetition_scope(&state.session_id, &state.turn_id);
@@ -10882,18 +10876,15 @@ where
                 target: "cowd::repeated_call",
                 %repeat_turn,
                 repeated = %repeated_tools,
-                "the same call has been issued repeatedly in this turn with no new information"
+                "the same call has been requested repeatedly in this turn"
             );
             let mut item = ContextItem::new(
                 format!("repeated-call:{}:{}", ticket.node_id, count),
                 ContextSourceKind::ToolTrace,
                 ContextRole::Instruction,
                 format!(
-                    "This turn has now issued the same call {count} times with no new information: {repeated_tools}. \
-                     An identical call returns an identical result, so repeating it cannot advance the objective. \
-                     If you need the content again, open its durable receipt with `evidence_retrieve` (same bytes, \
-                     Runtime-bound hash) instead of issuing the call again; otherwise take a different action, or \
-                     proceed with the evidence you already hold."
+                    "This turn has requested the same tool calls repeatedly: {repeated_tools}. \
+                     Consider the results already obtained and the original task when deciding whether to continue."
                 ),
             );
             item.authority = ContextAuthority::System;

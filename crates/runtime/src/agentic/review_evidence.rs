@@ -25,7 +25,7 @@ pub(crate) use policy::{
 };
 pub(crate) use policy::{nested_parent_material, read_delivery_snapshot_for_scope};
 #[cfg(test)]
-pub(crate) use policy::verify_nested_read_for_test;
+pub(crate) use policy::{verify_nested_read_for_test, collect_actual_nested_from_original_host_for_test};
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
 

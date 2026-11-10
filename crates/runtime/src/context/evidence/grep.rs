@@ -61,7 +61,9 @@ pub(super) fn acquisitions(
             return None;
         }
         // An unprovable file does not discard another independently admitted file.
-        if grep_read_target(scope, &record).is_some() {
+        if grep_read_target(scope, &record).is_some()
+            || grep_read_target_for_parent(scope, &record, &input, &request.compiled_invocation.as_ref()?.effect).is_some()
+            || grep_read_target_for_composite(scope, &record, &input, &request.compiled_invocation.as_ref()?.effect).is_some() {
             result.push(record);
         }
     }
@@ -115,9 +117,84 @@ pub(crate) fn grep_original_input_matches(input: &Value, child: &Value) -> bool 
             == read_sha256(&serde_json::to_vec(&child["input"]).unwrap_or_default())
 }
 
+/// Prove the File portion of one original direct grep batch without changing
+/// the completeness claim of the parent effect scope.
+pub(crate) fn direct_grep_file_domain(
+    input: &Value, parent: &harness_contract::tool::ToolEffectDescriptor,
+    scope: &harness_contract::goal::ProofEffectScope, child: &Value,
+) -> bool {
+    if child["parent_tool_name"] != "grep_search" || child["step_index"] != 0
+        || child["position"] != 0 || child["step_id"] != "" || scope.version != 2
+        || scope.descriptor_hash != parent.descriptor_hash || scope.validate_purpose_mapping(parent).is_err()
+        || !grep_original_input_matches(input, child) { return false; }
+    let Some(index) = child["batch_index"].as_u64().and_then(|v| usize::try_from(v).ok()) else { return false; };
+    let Ok(effect) = serde_json::from_value::<harness_contract::tool::ToolEffectDescriptor>(child["effect"].clone()) else { return false; };
+    if !tools::host::original_grep_batch_member_scopes(input, parent, index, &child["input"], &effect) { return false; }
+    original_read_file_domain(parent, scope)
+}
+
+/// Validate the original File/Read domain without widening the mixed scope.
+pub(crate) fn original_read_file_domain(
+    parent: &harness_contract::tool::ToolEffectDescriptor,
+    scope: &harness_contract::goal::ProofEffectScope,
+) -> bool {
+    use harness_contract::policy::{PermissionOperation, PermissionResource};
+    if parent.effect_kind != harness_contract::tool::ToolEffectKind::Read
+        || parent.uses_network || parent.spawns_process || parent.mutates_packages || parent.mutates_system
+        || scope.version != 2 || scope.descriptor_hash != parent.descriptor_hash
+        || scope.validate_purpose_mapping(parent).is_err()
+        || parent.scopes.iter().any(|item| item.operation != PermissionOperation::Read
+            || !matches!(item.resource, PermissionResource::File | PermissionResource::Tool)) {
+        return false;
+    }
+    let files = parent.scopes.iter().filter(|s| s.resource == PermissionResource::File && s.operation == PermissionOperation::Read).collect::<Vec<_>>();
+    !files.is_empty() && files.len() == scope.targets.len()
+        && files.iter().all(|s| scope.targets.iter().filter(|target| &target.declared_scope == *s).count() == 1)
+        && scope.targets.iter().all(|target| {
+            use harness_contract::context::{EvidenceCoverageKind, WorkspaceAccessMode, WorkspaceObjectKind};
+            files.contains(&&target.declared_scope)
+                && target.access_mode == WorkspaceAccessMode::Read
+                && target.coverage == EvidenceCoverageKind::ScopedContent
+                && !target.path.workspace_id.is_empty() && !target.path.repository_id.is_empty()
+                && !target.path.workspace_relative_path.is_empty()
+                && match target.path.object_kind {
+                    WorkspaceObjectKind::File => target.exact && target.alias_checked && target.physical_identity.as_deref().is_some_and(|id| !id.is_empty()),
+                    WorkspaceObjectKind::Directory => !target.exact && !target.alias_checked && target.physical_identity.is_none(),
+                }
+        })
+}
+
+pub(crate) fn grep_read_target_for_parent(
+    scope: &harness_contract::goal::ProofEffectScope, child: &Value, input: &Value,
+    parent: &harness_contract::tool::ToolEffectDescriptor,
+) -> Option<harness_contract::goal::ProofEffectTarget> {
+    if !direct_grep_file_domain(input, parent, scope, child) { return None; }
+    grep_read_target_checked(scope, child, true)
+}
+
+pub(crate) fn grep_read_target_for_composite(
+    scope: &harness_contract::goal::ProofEffectScope, child: &Value, input: &Value,
+    parent: &harness_contract::tool::ToolEffectDescriptor,
+) -> Option<harness_contract::goal::ProofEffectTarget> {
+    if parent.tool_id != "tool_orchestrate" || child["parent_tool_name"] != "tool_orchestrate"
+        || !original_read_file_domain(parent, scope) || !grep_original_input_matches(input, child) {
+        return None;
+    }
+    let effect: harness_contract::tool::ToolEffectDescriptor = serde_json::from_value(child["effect"].clone()).ok()?;
+    if !effect.scopes.iter().all(|item| parent.scopes.contains(item)) { return None; }
+    grep_read_target_checked(scope, child, true)
+}
+
 pub(crate) fn grep_read_target(
     scope: &harness_contract::goal::ProofEffectScope,
     child: &Value,
+) -> Option<harness_contract::goal::ProofEffectTarget> {
+    grep_read_target_checked(scope, child, false)
+}
+
+fn grep_read_target_checked(
+    scope: &harness_contract::goal::ProofEffectScope,
+    child: &Value, verified_file_domain: bool,
 ) -> Option<harness_contract::goal::ProofEffectTarget> {
     use harness_contract::{
         context::{EvidenceCoverageKind, WorkspaceAccessMode, WorkspaceObjectKind},
@@ -129,7 +206,7 @@ pub(crate) fn grep_read_target(
         || !path
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
-        || !scope.complete
+        || (!scope.complete && !verified_file_domain)
         || child["physical_identity"]
             .as_str()?
             .strip_prefix("unix-file:")?

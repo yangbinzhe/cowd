@@ -1110,13 +1110,27 @@ pub(crate) fn verify_nested_read(
             return Err("grep original input mismatch".into());
         }
         let effect: harness_contract::tool::ToolEffectDescriptor = serde_json::from_value(child["effect"].clone()).map_err(|e| e.to_string())?;
-        if !effect.scopes.iter().all(|s| descriptor.scopes.contains(s)) { return Err("grep original scope mismatch".into()); }
         let scope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).map_err(|e| e.to_string())?;
-        crate::context_evidence::grep_read_target(&scope, child).ok_or("grep original target unknown")?
+        if seal.tool_name == "grep_search" && child["batch_index"].is_number() {
+            crate::context_evidence::grep_read_target_for_parent(&scope, child, &parent_input, &descriptor)
+                .ok_or("grep original target unknown")?
+        } else if seal.tool_name == "tool_orchestrate" {
+            crate::context_evidence::grep_read_target_for_composite(&scope, child, &parent_input, &descriptor)
+                .ok_or("grep composite original target unknown")?
+        } else {
+            if !effect.scopes.iter().all(|s| descriptor.scopes.contains(s)) { return Err("grep original scope mismatch".into()); }
+            crate::context_evidence::grep_read_target(&scope, child).ok_or("grep original target unknown")?
+        }
     } else {
     let step = parent_input["steps"].as_array().and_then(|steps| steps.get(step_index as usize)).ok_or("nested step absent")?;
-    let call = step["calls"].as_array().and_then(|calls| calls.get(position as usize)).ok_or("nested call absent")?;
-    if step["id"] != child["step_id"] || step["op"] != "batch" || call["tool"] != "read_file" || call["input"] != child["input"]
+    let call = match step["op"].as_str() {
+        Some("call") if position == 0 => step,
+        Some("batch") => step["calls"].as_array().and_then(|calls| calls.get(position as usize)).ok_or("nested call absent")?,
+        _ => return Err("nested call shape unsupported".into()),
+    };
+    if step["id"] != child["step_id"] || parent_input["steps"].as_array().is_none_or(|steps|
+        steps.iter().filter(|candidate| candidate["id"] == step["id"]).count() != 1)
+        || call["tool"] != "read_file" || call["input"] != child["input"]
         || crate::context_evidence::read_sha256(&serde_json::to_vec(&child["input"]).map_err(|e| e.to_string())?) != child["input_sha256"] { return Err("nested original input mismatch".into()); }
     let effect: harness_contract::tool::ToolEffectDescriptor = serde_json::from_value(child["effect"].clone()).map_err(|e| e.to_string())?;
     if effect.tool_id != "read_file" || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read || effect.scopes.len() != 1
@@ -1124,7 +1138,8 @@ pub(crate) fn verify_nested_read(
     let scope: harness_contract::goal::ProofEffectScope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).map_err(|e| e.to_string())?;
     let mut targets = scope.targets.iter().filter(|target| target.declared_scope == effect.scopes[0]);
     let target = targets.next().ok_or("nested child scope absent")?.clone();
-    if !scope.complete || targets.next().is_some() || !target.exact || !target.alias_checked
+    if (!scope.complete && !crate::context_evidence::original_read_file_domain(&descriptor, &scope))
+        || targets.next().is_some() || !target.exact || !target.alias_checked
         || target.access_mode != harness_contract::context::WorkspaceAccessMode::Read
         || target.coverage != harness_contract::context::EvidenceCoverageKind::ScopedContent
         || target.declared_scope.resource != harness_contract::policy::PermissionResource::File
@@ -3131,6 +3146,263 @@ pub(super) fn read_original_scope(
     .map(Some)
 }
 
+/// Authenticate the original directory-discovery result as a historical
+/// operation. It never proves file contents or the current directory state.
+fn original_glob_discovery(
+    primary: &crate::DurableRuntimeEvent,
+    descriptor: &ToolEffectDescriptor,
+    input: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>, String> {
+    if primary.payload["tool_name"] != "glob_search" {
+        return Ok(None);
+    }
+    if descriptor.tool_id != "glob_search" || descriptor.effect_kind != ToolEffectKind::Read
+        || descriptor.uses_network || descriptor.spawns_process
+        || descriptor.mutates_packages || descriptor.mutates_system
+        || primary.payload["outcome_truncated"] == true
+    {
+        return Err("original discovery has invalid effect or incomplete output".into());
+    }
+    let scope = super::results::require_original_effect_scope(
+        &primary.payload["resolved_effect_scope"], descriptor,
+    )?;
+    if !crate::context_evidence::original_read_file_domain(descriptor, &scope) {
+        return Err("original discovery File domain is incomplete".into());
+    }
+    let input = input.ok_or("original discovery input unavailable")?;
+    let output = primary.payload["outcome"]["output"].as_str()
+        .ok_or("original discovery output unavailable")?;
+    let value: serde_json::Value = serde_json::from_str(output)
+        .map_err(|_| "original discovery output is not JSON")?;
+    let complete = validate_original_glob_pages(input, &value)?;
+    Ok(Some(serde_json::json!({"scope":scope, "sha256":crate::context_evidence::read_sha256(output.as_bytes()),
+        "bytes":output.len(), "reported_scan_complete":complete})))
+}
+
+fn validate_original_glob_pages(input: &serde_json::Value, value: &serde_json::Value) -> Result<bool, String> {
+    let patterns = match input.get("patterns") {
+        Some(value) => value.as_array().filter(|items| !items.is_empty())
+            .ok_or("original discovery patterns invalid")?.iter().collect::<Vec<_>>(),
+        None => vec![input],
+    };
+    let pages: Vec<&serde_json::Value> = if input.get("patterns").is_some() {
+        let results = value["results"].as_array().ok_or("original discovery batch missing")?;
+        if value["type"] != "glob_search" || results.len() != patterns.len()
+            || value["count"].as_u64() != Some(results.len() as u64)
+        { return Err("original discovery batch differs from request".into()); }
+        let mut pages = Vec::with_capacity(results.len());
+        for (position, result) in results.iter().enumerate() {
+            if result["index"].as_u64() != Some(position as u64)
+                || result["status"] != "success" || !result["error"].is_null()
+            { return Err("original discovery batch member unavailable".into()); }
+            pages.push(result.get("output").ok_or("original discovery page missing")?);
+        }
+        pages
+    } else { vec![value] };
+    let mut complete = true;
+    for (pattern, page) in patterns.iter().zip(pages) {
+        if page.get("content").is_some() || page.get("file").is_some() {
+            return Err("original discovery output is not directory metadata".into());
+        }
+        let page: tools::file_ops::GlobSearchOutput = serde_json::from_value(page.clone())
+            .map_err(|_| "original discovery page invalid")?;
+        if pattern.get("pattern").and_then(|value| value.as_str()) != Some(page.pattern.as_str())
+            || page.num_files != page.filenames.len()
+            || (page.scan_complete && (page.truncated || !page.omissions.is_empty()
+                || page.continuation_cursor.is_some() || page.next_request.is_some()))
+            || page.coverage["consistency"] != "live_filesystem"
+        { return Err("original discovery page disagrees with request or coverage".into()); }
+        complete &= page.scan_complete;
+    }
+    Ok(complete)
+}
+
+/// Recover only original child reads whose parent receipt and accepted model
+/// delivery can both be authenticated. Missing or dynamic children stay unknown.
+fn collect_actual_nested_acquisitions(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    primary: &crate::DurableRuntimeEvent,
+    index: &crate::DurableRuntimeEvent,
+    original_input: Option<&serde_json::Value>,
+    session_events: &[crate::DurableRuntimeEvent],
+    boundary: &super::results::ResultInputBoundary,
+    readers: super::ResultContentReaders<'_>,
+    actual: &mut ActualInputSnapshot,
+    windows: &mut std::collections::BTreeMap<String, Vec<ActualFileWindow>>,
+) -> Result<bool, String> {
+    use crate::context_evidence::{ReadExtent, CHILD_READ_ACQUISITIONS_FIELD};
+    if primary.payload["tool_name"] != "tool_orchestrate" { return Ok(false); }
+    let children = primary.payload[CHILD_READ_ACQUISITIONS_FIELD].as_array()
+        .ok_or("original composite child acquisitions unavailable")?;
+    if children.is_empty() || primary.payload[CHILD_READ_ACQUISITIONS_FIELD] != index.payload[CHILD_READ_ACQUISITIONS_FIELD]
+        || primary.payload["child_read_acquisitions_complete"] != true
+        || index.payload["child_read_acquisitions_complete"] != true
+        || primary.payload["outcome_truncated"] == true {
+        return Err("original composite child acquisitions incomplete".into());
+    }
+    let descriptor = super::results::receipt_effect_descriptor(primary)?;
+    let scope = super::results::require_original_effect_scope(&primary.payload["resolved_effect_scope"], &descriptor)?;
+    if !crate::context_evidence::original_read_file_domain(&descriptor, &scope) {
+        return Err("original composite File domain is incomplete".into());
+    }
+    let input = original_input.ok_or("original composite input unavailable")?;
+    let raw_input = primary.payload["original_input"].as_str().ok_or("original composite input absent")?;
+    let stored: serde_json::Value = harness_contract::step::parse_strict_json(raw_input)
+        .map_err(|_| "original composite input invalid")?;
+    if &stored != input || primary.payload["input_sha256"] != crate::context_evidence::read_sha256(raw_input.as_bytes()) {
+        return Err("original composite input identity changed".into());
+    }
+    let steps = input["steps"].as_array().ok_or("original composite steps missing")?;
+    let raw_output = primary.payload["outcome"]["output"].as_str().ok_or("original composite output missing")?;
+    let output: serde_json::Value = serde_json::from_str(raw_output).map_err(|_| "original composite output invalid")?;
+    let trace = output["calls"].as_array().ok_or("original composite trace missing")?;
+    if trace.len() != steps.len() { return Err("original composite trace incomplete".into()); }
+    let mut expected = std::collections::BTreeSet::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for (step_index, step) in steps.iter().enumerate() {
+        let id = step["id"].as_str().filter(|id| !id.is_empty()).ok_or("original composite step identity missing")?;
+        if !ids.insert(id) || trace[step_index]["stepId"] != id || trace[step_index]["status"] != "ok"
+            || trace[step_index]["op"] != step["op"] {
+            return Err("original composite trace identity mismatch".into());
+        }
+        let calls: Vec<&serde_json::Value> = match step["op"].as_str() {
+            Some("call") => vec![step],
+            Some("batch") => step["calls"].as_array().ok_or("original composite batch missing")?.iter().collect(),
+            _ => return Err("original composite dynamic step is unproven".into()),
+        };
+        if trace[step_index]["calls"].as_u64() != Some(calls.len() as u64) {
+            return Err("original composite execution count mismatch".into());
+        }
+        for (position, call) in calls.iter().enumerate() {
+            match call["tool"].as_str() {
+                Some("read_file" | "grep_search") => { expected.insert((step_index as u64, position as u64)); }
+                Some("glob_search") => {
+                    let member = if step["op"] == "call" {
+                        &output["steps"][id]
+                    } else {
+                        let alias = call["as"].as_str().map(str::to_string)
+                            .unwrap_or_else(|| format!("glob_search[{position}]"));
+                        if calls.iter().enumerate().filter(|(i, item)| {
+                            item["as"].as_str().map(str::to_string).unwrap_or_else(||
+                                format!("{}[{i}]", item["tool"].as_str().unwrap_or(""))) == alias
+                        }).count() != 1 { return Err("original composite discovery alias is ambiguous".into()); }
+                        &output["steps"][id][&alias]
+                    };
+                    let member = if step["on_error"] == "collect" && step["op"] == "batch" {
+                        if member["ok"] != true { return Err("original composite discovery failed".into()); }
+                        &member["output"]
+                    } else { member };
+                    let member_input = call.get("input").ok_or("original composite discovery input missing")?;
+                    let complete = validate_original_glob_pages(member_input, member)?;
+                    let _ = complete; // Historical discovery; not a completeness proof.
+                }
+                _ => return Err("original composite child operation is unproven".into()),
+            }
+        }
+    }
+    let mut observed = std::collections::BTreeSet::new();
+    let mut child_positions = std::collections::BTreeSet::new();
+    let mut reader = super::read_source::StoreReadSource(store.as_ref());
+    for child in children {
+        let step = child["step_index"].as_u64().ok_or("original child step missing")?;
+        let position = child["position"].as_u64().ok_or("original child position missing")?;
+        let (batch, window) = match child["tool_name"].as_str() {
+            Some("read_file") if child["batch_index"].is_null() && child["window_index"].is_null() => (None, None),
+            Some("grep_search") => (child["batch_index"].as_u64(), Some(child["window_index"].as_u64()
+                .ok_or("original child window missing")?)),
+            _ => return Err("original composite child kind unknown".into()),
+        };
+        if !expected.contains(&(step, position)) || !child_positions.insert((step, position, batch, window)) {
+            return Err("original composite child is foreign or duplicated".into());
+        }
+        let mut confirmed = None;
+        for event in session_events.iter().filter(|event|
+            event.kind == "context.nested_read_model_observed"
+                && event.commit_cursor < boundary.cursor
+                && event.payload["parent_event_id"] == primary.event_id
+                && event.payload["child"] == *child) {
+            let turn = event.payload["parent"]["step"]["turn_id"].as_str()
+                .ok_or("nested original turn missing")?;
+            let root = boundary.producer.strip_prefix("root-execution:");
+            if let Some(read) = verify_nested_read(&mut reader, event, &program_session(primary)?, turn,
+                root, boundary.packet.as_ref(), &mut actual.sources)? {
+                confirmed = Some(read);
+                break;
+            }
+        }
+        let read = confirmed.ok_or("original composite child delivery unavailable")?;
+        let ReadExtent::FileLines {start_line, line_count, total_lines, source_omitted, ..} = &read.extent else {
+            return Err("original composite child is not a File window".into());
+        };
+        if *start_line == 0 || (*source_omitted && *start_line == 1 && line_count == total_lines) {
+            return Err("original composite child window invalid".into());
+        }
+        let begin = start_line.checked_sub(1).ok_or("nested window underflow")?;
+        let end = begin.checked_add(*line_count).ok_or("nested window overflow")?;
+        let dependency = ActualFileDependency {
+            target: read.target, acquisition_cursor: primary.commit_cursor,
+            consumer_cursor: boundary.cursor, consumer_call_key: boundary.call_key.clone(),
+            source_sha256: read.body.source_sha256, source_bytes: read.body.source_bytes,
+        };
+        if let Some(frame) = readers.process_inputs.filter(|frame| frame.has_original_file_workspace()) {
+            frame.retain_original_file(&dependency.target, &dependency.source_sha256, dependency.source_bytes)?;
+        }
+        let key = super::proof_value_digest(&serde_json::json!([
+            dependency.target, boundary.call_key, dependency.source_sha256, dependency.source_bytes, total_lines
+        ]));
+        windows.entry(key).or_default().push(ActualFileWindow { begin, end, total: *total_lines, dependency });
+        retain_actual_material(&mut actual.material_events, &read.event);
+        observed.insert((step, position));
+    }
+    if observed != expected { return Err("original composite child coverage incomplete".into()); }
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn collect_actual_nested_from_original_host_for_test(
+    store: &std::sync::Arc<RuntimeEventStore>, primary: &crate::DurableRuntimeEvent,
+    index: &crate::DurableRuntimeEvent, session_events: &[crate::DurableRuntimeEvent],
+    input: &str, root: &str,
+) -> Result<Vec<String>, String> {
+    let last_delivery = session_events.iter().filter(|event|
+        event.kind == "context.nested_read_model_observed"
+            && event.payload["parent_event_id"] == primary.event_id)
+        .map(|event| event.commit_cursor).max().ok_or("actual child delivery missing")?;
+    let graph_events = store.list_stream(root).map_err(|error| error.to_string())?;
+    let consumer = session_events.iter().chain(graph_events.iter())
+        .filter(|event| event.commit_cursor > last_delivery)
+        .min_by_key(|event| event.commit_cursor).ok_or("actual continuation boundary missing")?;
+    let boundary = super::results::ResultInputBoundary {
+        producer: format!("root-execution:{root}"), packet: None, step: None,
+        cursor: consumer.commit_cursor, call_key: "original-host-test-consumer".into(),
+        source: harness_contract::goal::ProofInputEvent {
+            stream_id: consumer.stream_id.clone(), sequence: consumer.sequence,
+            event_id: consumer.event_id.clone(), payload_digest: super::proof_value_digest(&consumer.payload),
+        },
+    };
+    let mut actual = ActualInputSnapshot {
+        file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+        sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+    };
+    let mut windows = std::collections::BTreeMap::new();
+    let input: serde_json::Value = harness_contract::step::parse_strict_json(input)
+        .map_err(|error| error.to_string())?;
+    if !collect_actual_nested_acquisitions(store, primary, index, Some(&input), session_events,
+        &boundary, super::ResultContentReaders::default(), &mut actual, &mut windows)? {
+        return Err("original composite was not processed".into());
+    }
+    let mut paths = windows.into_values().map(complete_actual_file_windows)
+        .map(|result| result.map(|dependency| dependency.target.path.workspace_relative_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn program_session(primary: &crate::DurableRuntimeEvent) -> Result<String, String> {
+    primary.payload["replay"]["session_id"].as_str().filter(|id| !id.is_empty())
+        .map(str::to_string).ok_or_else(|| "original composite session missing".into())
+}
+
 fn collect_actual_acquisition(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -3181,6 +3453,21 @@ fn collect_actual_acquisition(
     }
     let seal_value = &primary.payload[READ_ACQUISITION_FIELD];
     if seal_value.is_null() {
+        if collect_actual_nested_acquisitions(store, primary, index, original_input, session_events,
+            boundary, readers, actual, windows)? {
+            actual.canonical_facts.push(serde_json::json!({
+                "grade":"acquired_nested", "producer":boundary.producer,
+                "consumer":boundary.call_key, "consumer_cursor":boundary.cursor,
+                "acquisition_cursor":primary.commit_cursor, "source":primary.event_id,
+                "index":index.event_id,
+            }));
+            return Ok(());
+        }
+        if original_glob_discovery(primary, &descriptor, original_input)?.is_some() {
+            // Primary and index remain in the audited material set above. A
+            // discovery page proves neither file contents nor current absence.
+            return Ok(());
+        }
         if !immutable_receipt_without_workspace_extent(primary, &descriptor, original_input)? {
             return Err("proof_actual_input_extent_unsupported: actual read lacks an original physical extent".into());
         }
@@ -8874,6 +9161,75 @@ mod tests {
             refused.canonical_facts.is_empty(),
             "a refused member read settles nothing"
         );
+
+        // A directory discovery is an authenticated historical operation,
+        // never a FileLines dependency or immutable content.
+        let mut discovery_effect = effect.clone();
+        discovery_effect.tool_id = "glob_search".into();
+        let mut target = actual_dependency_fixture().target;
+        target.path.object_kind = harness_contract::context::WorkspaceObjectKind::Directory;
+        target.exact = false;
+        target.alias_checked = false;
+        target.physical_identity = None;
+        target.declared_scope = discovery_effect.scopes[0].clone();
+        let scope = harness_contract::goal::ProofEffectScope {
+            version: 2, descriptor_hash: discovery_effect.descriptor_hash.clone(),
+            complete: true, targets: vec![target],
+            scope_purposes: vec![harness_contract::goal::ProofEffectScopePurpose {
+                declared_scope: discovery_effect.scopes[0].clone(),
+                purpose: harness_contract::goal::ProofEffectPurpose::InputRead,
+            }],
+        };
+        let page = serde_json::json!({"basePath":".", "pattern":"*.rs", "scanComplete":true,
+            "durationMs":1, "numFiles":1, "filenames":["a.rs"], "truncated":false,
+            "coverage":{"consistency":"live_filesystem"}});
+        let mut glob_primary = primary.clone();
+        let mut glob_index = index.clone();
+        glob_primary.payload["tool_name"] = serde_json::json!("glob_search");
+        glob_primary.payload["effect"] = serde_json::to_value(&discovery_effect).unwrap();
+        glob_primary.payload["replay"]["invocation"]["effect"] = serde_json::to_value(&discovery_effect).unwrap();
+        glob_primary.payload["outcome"]["tool_name"] = serde_json::json!("glob_search");
+        glob_primary.payload["outcome"]["output"] = serde_json::json!(page.to_string());
+        glob_primary.payload["outcome_truncated"] = serde_json::json!(false);
+        glob_primary.payload["resolved_effect_scope"] = serde_json::to_value(&scope).unwrap();
+        glob_index.payload["outcome"] = glob_primary.payload["outcome"].clone();
+        glob_index.payload["effect"] = glob_primary.payload["effect"].clone();
+        glob_index.payload["resolved_effect_scope"] = glob_primary.payload["resolved_effect_scope"].clone();
+        let mut discovery_actual = ActualInputSnapshot {
+            file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+        };
+        let mut discovery_windows = std::collections::BTreeMap::new();
+        let discovery_input = serde_json::json!({"pattern":"*.rs"});
+        collect_actual_acquisition(&store, &program, &glob_primary, &glob_index,
+            Some(&discovery_input), &[], &boundary,
+            super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
+            &mut discovery_actual, &mut discovery_windows).expect("original discovery is authenticated");
+        assert!(discovery_actual.canonical_facts.is_empty());
+        assert_eq!(discovery_actual.material_events.len(), 2);
+        assert!(discovery_windows.is_empty());
+        assert!(discovery_actual.immutable_inputs.is_empty());
+        assert!(original_glob_discovery(&glob_primary, &discovery_effect,
+            Some(&serde_json::json!({"pattern":"different"}))).is_err());
+        glob_primary.payload["outcome_truncated"] = serde_json::json!(true);
+        assert!(original_glob_discovery(&glob_primary, &discovery_effect, Some(&discovery_input)).is_err());
+
+        // A composite without the original complete child ledger cannot be
+        // treated as an empty or successful acquisition.
+        let mut incomplete_primary = primary.clone();
+        incomplete_primary.payload["tool_name"] = serde_json::json!("tool_orchestrate");
+        incomplete_primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] =
+            serde_json::json!([{"step_index":0,"position":0}]);
+        incomplete_primary.payload["child_read_acquisitions_complete"] = serde_json::json!(false);
+        let mut incomplete_index = index.clone();
+        incomplete_index.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] =
+            incomplete_primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].clone();
+        incomplete_index.payload["child_read_acquisitions_complete"] = serde_json::json!(false);
+        assert!(collect_actual_nested_acquisitions(&store, &incomplete_primary, &incomplete_index,
+            None, &[], &boundary, super::super::ResultContentReaders {
+                artifacts: None, history: None, process_inputs: None,
+            }, &mut discovery_actual, &mut discovery_windows).is_err());
+        assert!(discovery_windows.is_empty());
 
         // G-c-N3: the red lines. A read that carries an acquisition seal is
         // judged by that seal, never as an immutable receipt; and a read whose

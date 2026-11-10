@@ -5234,6 +5234,7 @@ mod r1_native_real_wire {
 
     struct GovernedReadExecutor {
         host: tools::ToolHost,
+        expose_grep: bool,
         read_mode: AtomicUsize,
         requests: Arc<Mutex<Vec<crate::RuntimeToolExecutionRequest>>>,
     }
@@ -5271,8 +5272,8 @@ mod r1_native_real_wire {
             let input = serde_json::from_str(&request.input).unwrap();
             let result = if request.tool_name == "read_file" && self.read_mode.load(Ordering::SeqCst) == 1 {
                 Err(tools::ToolHostError::Execution("injected original read failure".into()))
-            } else if request.tool_name == "tool_orchestrate" {
-                step.lease().execute_with_orchestrated_read_trace(request.authorization.as_ref().unwrap(), &input)
+            } else if matches!(request.tool_name.as_str(), "tool_orchestrate" | "grep_search") {
+                step.lease().execute_with_read_trace(request.authorization.as_ref().unwrap(), &request.tool_name, &input)
                     .and_then(|(output, children)| {
                         request.tool_progress.record_orchestrated_children(&children)
                             .map_err(tools::ToolHostError::Execution)?;
@@ -5318,7 +5319,9 @@ mod r1_native_real_wire {
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["read_file".into(), "tool_orchestrate".into()]
+            let mut names = vec!["read_file".into(), "tool_orchestrate".into()];
+            if self.expose_grep { names.push("grep_search".into()); }
+            names
         }
 
         fn registered_tool_effect(
@@ -5363,6 +5366,10 @@ mod r1_native_real_wire {
         }
 
         async fn new_with_early(body: Option<&str>, recipient: &str, early: bool) -> Self {
+            Self::new_with_exposed_grep(body, recipient, early, false).await
+        }
+
+        async fn new_with_exposed_grep(body: Option<&str>, recipient: &str, early: bool, expose_grep: bool) -> Self {
             let workspace = tempfile::tempdir().unwrap();
             if let Some(body) = body {
                 fs::write(workspace.path().join("target.txt"), body).unwrap();
@@ -5512,7 +5519,8 @@ mod r1_native_real_wire {
                 .catalog
                 .definitions(None)
                 .into_iter()
-                .filter(|definition| matches!(definition.name.as_str(), "read_file" | "tool_orchestrate"))
+                .filter(|definition| matches!(definition.name.as_str(), "read_file" | "tool_orchestrate")
+                    || (expose_grep && definition.name == "grep_search"))
                 .map(|definition| crate::ProviderToolDefinition {
                     name: definition.name,
                     description: definition.description,
@@ -5527,6 +5535,7 @@ mod r1_native_real_wire {
             .unwrap();
             let executor = GovernedReadExecutor {
                 host,
+                expose_grep,
                 read_mode: AtomicUsize::new(0),
                 requests: Arc::new(Mutex::new(Vec::new())),
             };
@@ -6213,6 +6222,37 @@ mod r1_native_real_wire {
     }
 
     #[tokio::test]
+    async fn grep_batch_same_owner_commits_and_delivers_original_file_window() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") { return; }
+        let fixture = NativeFixture::new_with_exposed_grep(Some("alpha\nbeta\n"), "none", false, true).await;
+        let input = serde_json::json!({"path":fixture._workspace.path().to_str().unwrap(),
+            "searches":[{"pattern":"alpha","glob":"target.txt"}]});
+        *fixture.server.first_call.lock().unwrap() = serde_json::json!({"name":"grep_search","arguments":input.to_string()});
+        let (fixture, call) = fixture.run_root_host(false).await;
+        let primary = fixture.acquisition(&call);
+        let children = primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].as_array().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["batch_index"], 0);
+        assert_eq!(children[0]["relative_path"], "target.txt");
+        let session = fixture.runtime.session_id();
+        let events = fixture.store.list_stream(&format!("session:{session}")).unwrap();
+        let delivery = events.iter().find(|event| event.kind == "context.nested_read_model_observed"
+            && event.payload["child"]["parent_tool_use_id"] == call.id).unwrap();
+        let root = delivery.payload["parent"]["graph_id"].as_str().unwrap();
+        let services = fixture.services.as_ref().unwrap();
+        let context = harness_contract::projection::ProjectionQueryContext {
+            principal:"nested-test".into(), workspace_id:services.workspace_key().into(),
+            session_scopes:vec![session.into()], mission_scopes:vec![],
+            visibility_grants:vec![format!("workspace:{}", services.workspace_key()),"resource:*".into()],
+            detail_scope:harness_contract::projection::ProjectionDetailScope::Full, authorization_revision:1,
+        };
+        let page = crate::execution_projection::read_evidence(services, root, &context, Default::default()).await.unwrap();
+        assert!(!page.incomplete, "{page:?}");
+        assert!(page.reads.iter().any(|read| read.body_delivered && read.tool_name == "grep_search"
+            && read.path.workspace_relative_path == "target.txt"));
+    }
+
+    #[tokio::test]
     async fn nested_read_real_host_wire_emits_only_actual_children() {
         if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
             return;
@@ -6257,9 +6297,26 @@ mod r1_native_real_wire {
         let request = fixture.runtime.tool_executor.requests.lock().unwrap().iter()
             .find(|request| request.tool_use_id == call.id).unwrap().clone();
         let captured = request.tool_progress.child_reads().unwrap().unwrap();
+        assert_eq!(primary.payload["child_read_acquisitions_complete"], true);
+        let parent = request.parent_execution.as_ref().unwrap();
+        let source = format!("execution-agent-receipts:{}:{}:{}", parent.execution_id,
+            parent.node_id, request.parent_execution_attempt.unwrap());
+        let index = fixture.store.event_by_idempotency_key(&source,
+            &format!("agent-tool-receipt:{}", request.idempotency_key)).unwrap().unwrap();
+        assert_eq!(primary.transaction_id, index.transaction_id);
+        assert_eq!(primary.commit_cursor, index.commit_cursor);
+        assert_eq!(index.payload["child_read_acquisitions_complete"], true);
+        assert_eq!(primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD],
+            index.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD]);
         let scope: harness_contract::goal::ProofEffectScope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).unwrap();
-        assert_ne!(request.authorization.as_ref().unwrap().request_id, request.tool_use_id);
+        let auth = request.authorization.as_ref().unwrap();
+        assert_eq!(auth.request_id, request.tool_use_id);
+        assert!(captured.iter().all(|child| child.parent_request_id() == auth.request_id
+            && child.parent_authorization() == auth));
         assert!(crate::context_evidence::child_read_acquisitions(&request, &scope, &captured).is_some());
+        let mut wrong = request.clone();
+        wrong.authorization.as_mut().unwrap().request_id = "foreign-request".into();
+        assert!(crate::context_evidence::child_read_acquisitions(&wrong, &scope, &captured).is_none());
         let mut wrong = request.clone();
         wrong.authorization.as_mut().unwrap().authorization_lease.signature = "foreign".into();
         assert!(crate::context_evidence::child_read_acquisitions(&wrong, &scope, &captured).is_none());
@@ -6323,6 +6380,13 @@ mod r1_native_real_wire {
         let session = fixture.runtime.session_id();
         let turn = delivery.payload["parent"]["step"]["turn_id"].as_str().unwrap();
         let root = delivery.payload["parent"]["graph_id"].as_str().unwrap();
+        let actual_paths = crate::agentic::review_evidence::collect_actual_nested_from_original_host_for_test(
+            &fixture.store, &primary, &index, &events, &request.input, root).unwrap();
+        assert_eq!(actual_paths, vec!["other.txt".to_string(), "target.txt".to_string()]);
+        let mut incomplete = index.clone();
+        incomplete.payload["child_read_acquisitions_complete"] = serde_json::json!(false);
+        assert!(crate::agentic::review_evidence::collect_actual_nested_from_original_host_for_test(
+            &fixture.store, &primary, &incomplete, &events, &request.input, root).is_err());
         let verify = |event: &DurableRuntimeEvent, session: &str| crate::agentic::review_evidence::verify_nested_read_for_test(
             &fixture.store, event, session, turn, Some(root), None);
         assert!(verify(delivery, session).unwrap());

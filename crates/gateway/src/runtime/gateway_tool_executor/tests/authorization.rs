@@ -326,7 +326,8 @@
             .with_authorization_lease_verifier(Arc::new(runtime::AuthorizationNegotiator::verify_lease_signature)));
         let executor = GatewayToolExecutor::from_tool_host(None, false, host);
         for input in [json!({"path":"a.txt","pattern":".*"}),
-            json!({"searches":[{"path":"a.txt","pattern":"alpha"},{"path":"a.txt","pattern":"beta"}]})] {
+            json!({"searches":[{"path":"a.txt","pattern":"alpha"},{"path":"a.txt","pattern":"beta"}]}),
+            json!({"path":workspace.path().to_str().unwrap(),"searches":[{"glob":"a.txt","pattern":"alpha"},{"glob":"a.txt","pattern":"beta"}]})] {
             let auth = signed_test_authorization(&executor, "grep_search", &input, 1);
             let output = executor.execute_authorized_output_with_progress(&auth, "grep_search", &input.to_string(),
                 None, Some(executor.tool_host.pin_snapshot())).await.unwrap();
