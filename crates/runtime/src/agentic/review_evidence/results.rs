@@ -1040,10 +1040,13 @@ pub(super) fn process_runs_for_boundaries(
     let mut sources = BTreeSet::new();
     for boundary in boundaries {
         if let Some(packet) = &boundary.packet {
+            let graph_cut = pin_result_source(store, packet.graph_id(), cuts)?;
             let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-                .load(packet.graph_id())
+                .load_graph_at_revision(
+                    crate::execution_core::graph::graph_id_for_lookup(packet.graph_id()),
+                    graph_cut,
+                )
                 .map_err(|error| error.to_string())?;
-            pin_result_source(store, packet.graph_id(), cuts)?;
             let attempts = graph
                 .recovery_cursor
                 .node_attempts
@@ -1058,10 +1061,13 @@ pub(super) fn process_runs_for_boundaries(
                 ));
             }
         } else if let Some(root) = boundary.producer.strip_prefix("root-execution:") {
+            let graph_cut = pin_result_source(store, root, cuts)?;
             let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-                .load(root)
+                .load_graph_at_revision(
+                    crate::execution_core::graph::graph_id_for_lookup(root),
+                    graph_cut,
+                )
                 .map_err(|error| error.to_string())?;
-            pin_result_source(store, root, cuts)?;
             for (node, attempts) in &graph.recovery_cursor.node_attempts {
                 for attempt in 1..=*attempts {
                     sources.insert(format!("execution-agent-receipts:{root}:{node}:{attempt}"));
@@ -1081,9 +1087,8 @@ pub(super) fn process_runs_for_boundaries(
                 .as_str()
                 .ok_or("process history original call missing")?;
             let stream = format!("execution-effect:{key}");
-            let primary = store
-                .event_by_idempotency_key(&stream, &format!("{key}:receipt"))
-                .map_err(|error| error.to_string())?;
+            let through = store.stream_revision(&stream).map_err(|error| error.to_string())?;
+            let primary = result_event_at_cut(store, &stream, &format!("{key}:receipt"), through)?;
             let claimed = event.payload["effect_kind"] == "process"
                 || has_process_fact(&event)
                 || !event.payload["process_admission_ref"].is_null();
@@ -1100,7 +1105,7 @@ pub(super) fn process_runs_for_boundaries(
             {
                 continue;
             }
-            pin_result_source(store, &stream, cuts)?;
+            fence_process_history_source(store, &stream, through, cuts)?;
             let run = authenticate_bounded_process(store, &primary)?;
             process_has_no_external_effects(&run)?;
             retain_process_execution(store, &run, cuts)?;
@@ -1884,7 +1889,7 @@ pub(super) fn pin_result_source_with_reader(
     let revision = reader
         .stream_revision(source)
         .map_err(|error| error.to_string())?;
-    if let Some(previous) = cuts.insert(source.to_string(), revision) {
+    if let Some(previous) = cuts.get(source).copied() {
         // A head that moved backwards is a truncated or replaced stream, and
         // growth on any source this review judges is the object under review
         // moving. Only growth on a shared aggregate stream is another actor
@@ -1901,7 +1906,91 @@ pub(super) fn pin_result_source_with_reader(
             ));
         }
     }
+    cuts.insert(source.to_string(), revision);
     Ok(revision)
+}
+
+// The bounded store lookup is bounded by commit cursor, not stream sequence.
+fn result_event_at_cut(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    key: &str,
+    through: u64,
+) -> Result<Option<DurableRuntimeEvent>, String> {
+    result_event_at_cut_with_limit(store, source, key, through, usize::MAX)
+}
+
+fn result_event_at_cut_with_limit(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    key: &str,
+    through: u64,
+    max_bytes: usize,
+) -> Result<Option<DurableRuntimeEvent>, String> {
+    let head = store.stream_revision(source).map_err(|error| error.to_string())?;
+    if head < through {
+        return Err("result original source moved backwards before bounded lookup".into());
+    }
+    if through == 0 {
+        return Ok(None);
+    }
+    // The exact key is unique in its stream. Look up through the greatest
+    // representable store cursor, then apply the independent stream cut.
+    let found = store.bounded_event_by_idempotency_key(source, key, i64::MAX as u64, max_bytes)
+        .map_err(|error| error.to_string())?;
+    if store.stream_revision(source).map_err(|error| error.to_string())? < through {
+        return Err("result original source moved backwards during bounded lookup".into());
+    }
+    match found {
+        crate::RuntimeBoundedEventLookup::Absent => Ok(None),
+        crate::RuntimeBoundedEventLookup::Deferred { required_bytes } => Err(format!(
+            "HistoryBudgetExceeded: result original event requires {required_bytes} bytes"
+        )),
+        crate::RuntimeBoundedEventLookup::Record { record, encoded_bytes } => {
+            struct EncodedBytes(usize);
+            impl std::io::Write for EncodedBytes {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0 = self.0.checked_add(bytes.len())
+                        .ok_or_else(|| std::io::Error::other("result event extent overflow"))?;
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            let mut measured = EncodedBytes(0);
+            serde_json::to_writer(&mut measured, &record).map_err(|error| error.to_string())?;
+            if record.stream_id != source || record.idempotency_key.as_deref() != Some(key)
+                || record.commit_cursor == 0 || encoded_bytes > max_bytes
+                || measured.0 != encoded_bytes
+            {
+                return Err("result original bounded event identity or extent differs".into());
+            }
+            // Multiple events in one transaction can share the anchor cursor.
+            if record.sequence > through { return Ok(None); }
+            if record.sequence == 0 { return Err("result original event sequence invalid".into()); }
+            Ok(Some(*record))
+        }
+    }
+}
+
+/// The head read before a Process-history receipt is only a discovery hint:
+/// the authoritative position for a source is the one recorded by the pin
+/// into the review's cuts. If the stream moved between the two, the receipt
+/// was found under no fence that accepted that position, so discovery is
+/// refused explicitly instead of re-pinning to a newer head or pretending
+/// the read still stands.
+fn fence_process_history_source(
+    store: &crate::RuntimeEventStore,
+    stream: &str,
+    through: u64,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<(), String> {
+    let pinned = pin_result_source(store, stream, cuts)?;
+    if pinned != through {
+        return Err(format!(
+            "process history source changed during discovery; source={stream} read_head={through} pinned_head={pinned}"
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn result_source_events(
@@ -1970,8 +2059,9 @@ pub(super) fn result_packet(
 ) -> Result<AgentTaskPacket, String> {
     let graphs = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store));
     let source = crate::execution_core::graph::graph_id_for_lookup(execution);
-    pin_result_source(store, source, cuts)?;
-    let graph = graphs.load(execution).map_err(|error| error.to_string())?;
+    let graph_cut = pin_result_source(store, source, cuts)?;
+    let graph = graphs.load_graph_at_revision(source, graph_cut)
+        .map_err(|error| error.to_string())?;
     // A graph that grew since its cut is another actor advancing it; a graph
     // with no cut at all is a foreign producer, and a graph strictly older
     // than its cut means the material moved. The lineage and Session
@@ -2009,7 +2099,9 @@ pub(super) fn result_packet(
     {
         return Err("result physical producer packet is ambiguous or unauthenticated".into());
     }
-    pin_result_source(store, &graph.id, cuts)?;
+    if pin_result_source(store, &graph.id, cuts)? != graph_cut {
+        return Err("result producer graph changed during original packet read".into());
+    }
     Ok(packet)
 }
 
@@ -2027,8 +2119,12 @@ fn authenticate_callback_parent_chain(
         if !visited.insert(execution.clone()) {
             return Err("result callback producer parent chain is cyclic".into());
         }
-        pin_result_source(store, &execution, cuts)?;
-        let graph = graphs.load(&execution).map_err(|error| error.to_string())?;
+        let graph_cut = pin_result_source(store, &execution, cuts)?;
+        let graph = graphs.load_graph_at_revision(
+            crate::execution_core::graph::graph_id_for_lookup(&execution),
+            graph_cut,
+        )
+            .map_err(|error| error.to_string())?;
         if cuts.get(&execution) != Some(&graph.revision)
             || graph.lineage.as_ref().is_none_or(|lineage| {
                 lineage.session_id != binding.session_id
@@ -2066,9 +2162,12 @@ fn authenticate_callback_parent_chain(
         {
             return Err("result callback producer lacks its original parent link".into());
         }
-        pin_result_source(store, &parent.execution_id, cuts)?;
+        let parent_cut = pin_result_source(store, &parent.execution_id, cuts)?;
         let original_parent = graphs
-            .load(&parent.execution_id)
+            .load_graph_at_revision(
+                crate::execution_core::graph::graph_id_for_lookup(&parent.execution_id),
+                parent_cut,
+            )
             .map_err(|error| error.to_string())?;
         if !original_parent
             .nodes
@@ -2196,12 +2295,10 @@ pub(super) fn original_tool_primary_and_index(
     }
     let key = step.effect_idempotency_key();
     let source = format!("execution-effect:{key}");
-    pin_result_source(store, &source, cuts)?;
+    let primary_cut = pin_result_source(store, &source, cuts)?;
     let mut selected = None;
     for suffix in ["read-receipt", "receipt"] {
-        if let Some(event) = store
-            .event_by_idempotency_key(&source, &format!("{key}:{suffix}"))
-            .map_err(|error| error.to_string())?
+        if let Some(event) = result_event_at_cut(store, &source, &format!("{key}:{suffix}"), primary_cut)?
         {
             if selected.replace(event).is_some() {
                 return Err("publication has ambiguous original primary receipts".into());
@@ -2234,9 +2331,7 @@ pub(super) fn original_tool_primary_and_index(
         return Err("publication primary does not authenticate its actual output".into());
     }
     if primary.kind == "execution.effect.receipt" {
-        let intent = store
-            .event_by_idempotency_key(&source, &format!("{key}:intent"))
-            .map_err(|error| error.to_string())?
+        let intent = result_event_at_cut(store, &source, &format!("{key}:intent"), primary_cut)?
             .ok_or("result producer effect has no original admitted intent")?;
         if intent.schema_version != 1
             || intent.kind != "execution.effect.intent"
@@ -2285,9 +2380,7 @@ pub(super) fn original_tool_primary_and_index(
         } else {
             "intent"
         };
-        let intent = store
-            .event_by_idempotency_key(&source, &format!("{key}:{suffix}"))
-            .map_err(|error| error.to_string())?
+        let intent = result_event_at_cut(store, &source, &format!("{key}:{suffix}"), primary_cut)?
             .ok_or("root output lacks its original admitted intent")?;
         let (admitted, attempt, graph_revision) =
             authenticate_original_root_owner(store, &intent, cuts)?;
@@ -2343,9 +2436,12 @@ pub(super) fn original_tool_primary_and_index(
     };
     let graph = graph_owned.as_str();
     let node = node_owned.as_str();
-    pin_result_source(store, graph, cuts)?;
+    let graph_cut = pin_result_source(store, graph, cuts)?;
     let graph_state = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-        .load(graph)
+        .load_graph_at_revision(
+            crate::execution_core::graph::graph_id_for_lookup(graph),
+            graph_cut,
+        )
         .map_err(|error| error.to_string())?;
     if cuts.get(graph) != Some(&graph_state.revision)
         || !graph_state
@@ -2466,10 +2562,8 @@ pub(super) fn original_tool_primary_and_index(
     }
     for attempt in first_attempt..=last_attempt {
         let index_source = format!("execution-agent-receipts:{graph}:{node}:{attempt}");
-        pin_result_source(store, &index_source, cuts)?;
-        if let Some(index) = store
-            .event_by_idempotency_key(&index_source, &format!("agent-tool-receipt:{key}"))
-            .map_err(|error| error.to_string())?
+        let index_cut = pin_result_source(store, &index_source, cuts)?;
+        if let Some(index) = result_event_at_cut(store, &index_source, &format!("agent-tool-receipt:{key}"), index_cut)?
         {
             if root_owner.is_none() && packet_attempt == 0 {
                 let states = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store));
@@ -2984,6 +3078,29 @@ fn publication_output(
     decoder.end().map_err(|error| error.to_string())?;
     Ok(Some((value, body.origin)))
 }
+fn result_program_at_cut(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    program_id: &str,
+    through: u64,
+) -> Result<AgenticProgramProjection, String> {
+    let source = format!("agentic-program:{program_id}");
+    if store.stream_revision(&source).map_err(|error| error.to_string())? < through {
+        return Err("result continuation Program moved backwards".into());
+    }
+    let opened = store.list_stream_after(&source, 0, 1, 1, 1024 * 1024)?
+        .into_iter().next().ok_or("result continuation Program opening missing")?;
+    let prior = crate::AgentActionService::new(std::sync::Arc::clone(store))
+        .project_snapshot_bounded(
+            program_id, through, &opened, None,
+            |after, cut| store.list_stream_after(&source, after, cut, 100, 1024 * 1024),
+            |error| error.to_string(),
+        )?;
+    if store.stream_revision(&source).map_err(|error| error.to_string())? < through {
+        return Err("result continuation Program moved backwards during projection".into());
+    }
+    Ok((*prior).clone())
+}
+
 fn publication_sources(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -2999,10 +3116,8 @@ fn publication_sources(
             return Err("result continuation lineage is cyclic".into());
         }
         let source = format!("agentic-program:{}", binding.source_program_id);
-        pin_result_source(store, &source, cuts)?;
-        let prior = crate::AgentActionService::new(std::sync::Arc::clone(store))
-            .project(&binding.source_program_id)
-            .map_err(|error| error.to_string())?;
+        let source_cut = pin_result_source(store, &source, cuts)?;
+        let prior = result_program_at_cut(store, &binding.source_program_id, source_cut)?;
         if prior.session_id != program.session_id
             || prior.root_execution_id.as_deref() != Some(binding.source_root_id.as_str())
             || prior.objective_id != binding.source_objective_id
@@ -3444,9 +3559,12 @@ pub(super) fn resolve_result_metadata_for_phase(
             if !visited.insert(graph_id.clone()) {
                 return Err("cyclic external decision graph lineage".into());
             }
-            pin_result_source(store, &graph_id, &mut cuts)?;
+            let graph_cut = pin_result_source(store, &graph_id, &mut cuts)?;
             let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-                .load(&graph_id)
+                .load_graph_at_revision(
+                    crate::execution_core::graph::graph_id_for_lookup(&graph_id),
+                    graph_cut,
+                )
                 .map_err(|error| error.to_string())?;
             if cuts.get(&graph_id) != Some(&graph.revision)
                 || graph
@@ -3594,9 +3712,13 @@ pub(super) fn resolve_result_metadata_for_phase(
                     .ok_or("result callback original graph missing")?;
                 let node = parent["node_id"].as_str()
                     .ok_or("result callback original node missing")?;
-                pin_result_source(store, execution, &mut cuts)?;
+                let graph_cut = pin_result_source(store, execution, &mut cuts)?;
                 let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-                    .load(execution).map_err(|error| error.to_string())?;
+                    .load_graph_at_revision(
+                        crate::execution_core::graph::graph_id_for_lookup(execution),
+                        graph_cut,
+                    )
+                    .map_err(|error| error.to_string())?;
                 let original = graph.nodes.iter().find(|candidate| candidate.id == node)
                     .ok_or("result callback original producer node missing")?;
                 match original.kind {
@@ -3901,12 +4023,9 @@ pub(super) fn resolve_result_metadata_for_phase(
                     .as_ref()
                     .ok_or("effect input boundary lacks original Step")?;
                 let key = step.effect_idempotency_key();
-                store
-                    .event_by_idempotency_key(
-                        &format!("execution-effect:{key}"),
-                        &format!("{key}:intent"),
-                    )
-                    .map_err(|error| error.to_string())?
+                let source = format!("execution-effect:{key}");
+                let through = *cuts.get(&source).ok_or("effect input source cut missing")?;
+                result_event_at_cut(store, &source, &format!("{key}:intent"), through)?
                     .ok_or("effect original input intent missing")?
             } else {
                 event.clone()
@@ -3991,9 +4110,8 @@ pub(super) fn resolve_result_metadata_for_phase(
             let key = primary.payload["idempotency_key"]
                 .as_str()
                 .ok_or("producer effect identity missing")?;
-            let intent = store
-                .event_by_idempotency_key(&primary.stream_id, &format!("{key}:intent"))
-                .map_err(|error| error.to_string())?
+            let through = *cuts.get(&primary.stream_id).ok_or("producer effect source cut missing")?;
+            let intent = result_event_at_cut(store, &primary.stream_id, &format!("{key}:intent"), through)?
                 .ok_or("producer original input boundary missing")?;
             let step = serde_json::from_value(task["step_binding"].clone())
                 .map_err(|_| "producer effect input boundary has no original Step")?;
@@ -4066,17 +4184,12 @@ pub(super) fn resolve_result_metadata_for_phase(
                     .ok_or("result physical effect has no original index event")?;
                 let (descriptor, scope, intent) =
                     authenticate_effect_receipt(store, event, &packet, &mut cuts)?;
-                let primary = store
-                    .event_by_idempotency_key(
-                        &intent.stream_id,
-                        &format!(
-                            "{}:receipt",
-                            intent.payload["idempotency_key"]
-                                .as_str()
-                                .ok_or("result original effect key missing")?
-                        ),
-                    )
-                    .map_err(|error| error.to_string())?
+                let through = *cuts.get(&intent.stream_id).ok_or("result effect source cut missing")?;
+                let primary = result_event_at_cut(
+                    store, &intent.stream_id,
+                    &format!("{}:receipt", intent.payload["idempotency_key"]
+                        .as_str().ok_or("result original effect key missing")?), through,
+                )?
                     .ok_or("result original terminal missing")?;
                 project_result_effect(
                     store,
@@ -4105,6 +4218,7 @@ pub(super) fn resolve_result_metadata_for_phase(
             "review result has no Runtime-resolved producer:{reference}"
         ));
     }
+
     for (source, expected) in &cuts {
         let observed = store
             .stream_revision(source)
@@ -4142,6 +4256,7 @@ pub(super) fn resolve_result_metadata_for_phase(
         }
     }
     resolved.primary_inputs = actual.immutable_inputs;
+
     resolved.effect_sources = cuts
         .into_iter()
         .map(
@@ -4216,10 +4331,8 @@ pub(super) fn authenticate_read_input(
     {
         return Err("result primary input belongs to a foreign packet/attempt".into());
     }
-    pin_result_source(store, &seal.primary_stream, cuts)?;
-    let primary = store
-        .event_by_idempotency_key(&seal.primary_stream, &seal.primary_key)
-        .map_err(|error| error.to_string())?
+    let through = pin_result_source(store, &seal.primary_stream, cuts)?;
+    let primary = result_event_at_cut(store, &seal.primary_stream, &seal.primary_key, through)?
         .ok_or("result primary input acquisition missing")?;
     if primary.kind != "execution.read.receipt"
         || primary.actor != event.actor
@@ -4327,14 +4440,10 @@ fn authenticate_effect_receipt(
         .as_str()
         .ok_or("result effect lacks its original receipt identity")?;
     let source = format!("execution-effect:{key}");
-    pin_result_source(store, &source, cuts)?;
-    let primary = store
-        .event_by_idempotency_key(&source, &format!("{key}:receipt"))
-        .map_err(|error| error.to_string())?
+    let through = pin_result_source(store, &source, cuts)?;
+    let primary = result_event_at_cut(store, &source, &format!("{key}:receipt"), through)?
         .ok_or("result effect original primary receipt missing")?;
-    let intent = store
-        .event_by_idempotency_key(&source, &format!("{key}:intent"))
-        .map_err(|error| error.to_string())?
+    let intent = result_event_at_cut(store, &source, &format!("{key}:intent"), through)?
         .ok_or("result effect original admitted intent missing")?;
     if intent.schema_version != 1
         || primary.schema_version != 1
@@ -4388,6 +4497,80 @@ fn authenticate_effect_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_keyed_read_respects_stream_cut_inside_one_transaction() {
+        let store = crate::RuntimeEventStore::for_test();
+        let source = "execution-effect:bounded-review-test";
+        let event = |key: &str| crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: source.into(),
+                scope: crate::RuntimeEventScope::ExecutionNode,
+                kind: "test.original".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"key": key}),
+            },
+            idempotency_key: Some(key.into()),
+            schema_version: 1,
+        };
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: "bounded-review-same-transaction".into(),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: source.into(), expected_revision: 0,
+            }],
+            events: vec![event("first"), event("second")],
+        }).unwrap();
+        let first = result_event_at_cut(&store, source, "first", 1).unwrap().unwrap();
+        assert_eq!(first.sequence, 1);
+        assert!(result_event_at_cut(&store, source, "second", 1).unwrap().is_none());
+        let second = result_event_at_cut(&store, source, "second", 2).unwrap().unwrap();
+        assert_eq!(first.commit_cursor, second.commit_cursor);
+        assert!(result_event_at_cut(&store, source, "first", 0).unwrap().is_none());
+        assert!(result_event_at_cut(&store, source, "missing", 2).unwrap().is_none());
+        assert!(result_event_at_cut(&store, source, "first", 3).is_err());
+        let deferred = result_event_at_cut_with_limit(&store, source, "first", 1, 1)
+            .expect_err("over-budget is not absence");
+        assert!(deferred.contains("HistoryBudgetExceeded"), "{deferred}");
+    }
+
+    /// Review-cut closing control: the head read during Process-history
+    /// discovery is a hint, not a fence. When the stream moves between the
+    /// receipt read and the pin, discovery is refused by name with both
+    /// heads recorded; the review never re-pins to a newer head to pretend
+    /// the read still stands, and never invents the missing fence.
+    #[test]
+    fn process_history_discovery_is_refused_when_the_source_moves_without_a_fence() {
+        let store = crate::RuntimeEventStore::for_test();
+        let stream = "execution-effect:discovery-fence";
+        let receipt = |key: &str| crate::RuntimeEventInput {
+            stream_id: stream.into(),
+            scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "execution.effect.receipt".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({"idempotency_key": key}),
+        };
+        store.append(receipt("first")).unwrap();
+        let mut cuts = std::collections::BTreeMap::new();
+        let through = store.stream_revision(stream).unwrap();
+        store.append(receipt("second")).unwrap();
+        let error = fence_process_history_source(&store, stream, through, &mut cuts)
+            .expect_err("an unfenced move must be refused, not absorbed by a newer pin");
+        assert!(
+            error.contains("process history source changed during discovery")
+                && error.contains("read_head=1")
+                && error.contains("pinned_head=2"),
+            "{error}"
+        );
+        // The fence still admits the stable head once both reads agree.
+        let through = store.stream_revision(stream).unwrap();
+        fence_process_history_source(&store, stream, through, &mut cuts)
+            .expect("a read whose pinned head has not moved stands");
+        assert_eq!(cuts[stream], 2);
+    }
 
 
 
@@ -5526,11 +5709,28 @@ mod tests {
             ),
         )
         .unwrap();
+        let program_before_worker = actions.project("metadata-program").unwrap();
         let worker = apply("metadata-worker", root_actor.clone(), AgentAction::AgentInvite(
             serde_json::from_value(serde_json::json!({
                 "team_ref":team, "role":"producer", "mission":"Read original content", "required_capabilities":["read"]
             })).unwrap()
         )).unwrap();
+        let program_after_worker = actions.project("metadata-program").unwrap();
+        assert!(program_after_worker.revision > program_before_worker.revision);
+        assert_eq!(
+            result_program_at_cut(&store, "metadata-program", program_before_worker.revision).unwrap(),
+            program_before_worker,
+        );
+        let program_stream = "agentic-program:metadata-program";
+        let opened = store.list_stream_after(program_stream, 0, 1, 1, 1024 * 1024)
+            .unwrap().into_iter().next().unwrap();
+        let cached_owner = actions.project_snapshot_bounded(
+            "metadata-program", program_before_worker.revision, &opened, None,
+            |after, through| store.list_stream_after(program_stream, after, through, 100, 1024 * 1024),
+            |error| error.to_string(),
+        ).unwrap();
+        assert_eq!(cached_owner.as_ref(), &program_before_worker);
+        assert!(result_program_at_cut(&store, "metadata-program", program_after_worker.revision + 1).is_err());
         let task = apply(
             "metadata-task",
             root_actor.clone(),

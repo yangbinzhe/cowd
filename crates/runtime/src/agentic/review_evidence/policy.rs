@@ -82,7 +82,7 @@ impl ConclusionMaterialDependencies {
 }
 
 /// A bounded historical Session view, not a current authorization or tail.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HistoricalSessionCut {
     source: ExpectedStreamRevision,
     observed_revision: u64,
@@ -90,6 +90,31 @@ pub(crate) struct HistoricalSessionCut {
 impl HistoricalSessionCut {
     pub(super) fn source(&self) -> &ExpectedStreamRevision { &self.source }
     pub(super) fn observed_revision(&self) -> u64 { self.observed_revision }
+
+    /// The only producer of a historical Session cut. It reads the exact
+    /// `session:{session_id}` head from the store itself: a caller can name
+    /// only the material cut its original ProofInputSet was assembled
+    /// against, never report a head. A cut above the durable head is either
+    /// a fabricated window or a truncated stream and is refused.
+    pub(crate) fn for_live_material(
+        store: &crate::RuntimeEventStore,
+        session_id: &str,
+        cut: u64,
+    ) -> Result<Self, String> {
+        let session_source = format!("session:{session_id}");
+        let head = store
+            .stream_revision(&session_source)
+            .map_err(|error| error.to_string())?;
+        if cut > head {
+            return Err(format!(
+                "review Session material cut is beyond head; source={session_source} cut={cut} head={head}"
+            ));
+        }
+        Ok(Self {
+            source: ExpectedStreamRevision { stream_id: session_source, expected_revision: cut },
+            observed_revision: head,
+        })
+    }
 }
 
 impl ProofInputSnapshot {
@@ -449,14 +474,12 @@ pub(crate) fn validate_applied_proof_for_conclusion(
         let inputs = proof.input_set.as_ref().ok_or("review original input cuts missing")?;
         let session_source = format!("session:{}", program.session_id);
         let pre_tail = match inputs.source_revisions.get(&session_source) {
-            Some(cut) => {
-                let head = store.stream_revision(&session_source).map_err(|error| error.to_string())?;
-                if *cut > head { return Err("review Session material cut is beyond head".into()); }
-                Some(HistoricalSessionCut {
-                    source: ExpectedStreamRevision { stream_id: session_source.clone(), expected_revision: *cut },
-                    observed_revision: head,
-                })
-            }
+            // The producer passes the original Program's Session id and the
+            // original ProofInputSet's cut; the head is the constructor's
+            // store read, never a caller report.
+            Some(cut) => Some(HistoricalSessionCut::for_live_material(
+                store, &program.session_id, *cut,
+            )?),
             None => None,
         };
         let snapshot = validate_proof_inputs_for_action_with_tail(store, program, Some(goal), proof, readers, Some(identity), pre_tail.as_ref())?;
@@ -6929,7 +6952,9 @@ fn proof_input_snapshot_for_phase(
             && !authenticated_session_growth {
             return Err("proof external decision source changed".into());
         }
-        sources.insert(source.clone(), current);
+        if sources.insert(source.clone(), current).is_some_and(|previous| previous != current) {
+            return Err("proof source changed during validation; retry current inputs".into());
+        }
     }
     if !physical_unknown.is_empty() {
         return Err(format!("effect_review_pending: opaque Process history may intersect required work: {physical_unknown:?}"));
@@ -10052,6 +10077,58 @@ mod tests {
         .expect("a concurrent append must not invalidate the authenticated Session cut");
         assert_eq!(events.len(), 2, "the read window stops at the historical cut");
         assert_eq!(cuts[source], 3, "the cut records the head the read ended at");
+    }
+
+    /// Review-cut closing control: the named producer keeps the head
+    /// authoritative. `for_live_material` reads the exact Session stream
+    /// itself, so a future cut is refused and a caller's claim about a head
+    /// the store never had resolves against the store's head, not the claim.
+    /// The struct carries no other constructor and its observed head is
+    /// write-private, so there is nothing a caller could self-report.
+    #[test]
+    fn for_live_material_reads_the_store_head_and_refuses_future_cuts() {
+        let store = RuntimeEventStore::for_test();
+        let append = |store: &RuntimeEventStore| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:cut-producer".into(),
+                    scope: RuntimeEventScope::Session,
+                    kind: "test.source-advance".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        };
+        append(&store);
+        append(&store);
+        let cut = HistoricalSessionCut::for_live_material(&store, "cut-producer", 2)
+            .expect("the material cut at the durable head is the normal case");
+        assert_eq!(cut.source().stream_id, "session:cut-producer");
+        assert_eq!(cut.source().expected_revision, 2);
+        assert_eq!(cut.observed_revision(), 2, "the head is the store's read, not a report");
+        let error = HistoricalSessionCut::for_live_material(&store, "cut-producer", 5)
+            .expect_err("a cut above the head must not resolve, whatever the caller claims");
+        assert!(
+            error.contains("beyond head") && error.contains("cut=5") && error.contains("head=2"),
+            "{error}"
+        );
+        append(&store);
+        let grown = HistoricalSessionCut::for_live_material(&store, "cut-producer", 3)
+            .expect("the new durable head admits the new material cut");
+        assert_eq!(grown.observed_revision(), 3);
+        let error = HistoricalSessionCut::for_live_material(&store, "cut-producer", 4)
+            .expect_err("a future cut after growth is still refused");
+        assert!(error.contains("head=3"), "{error}");
+        // A Session stream the store has never seen has head 0: the empty
+        // historical window is a legitimate cut, anything above it is not.
+        let absent = HistoricalSessionCut::for_live_material(&store, "cut-absent", 0)
+            .expect("an empty historical window is a legitimate cut");
+        assert_eq!(absent.observed_revision(), 0);
+        let error = HistoricalSessionCut::for_live_material(&store, "cut-absent", 1)
+            .expect_err("a cut above an absent stream's head is refused");
+        assert!(error.contains("head=0"), "{error}");
     }
 
     #[test]

@@ -3447,7 +3447,20 @@ impl ExecutionGraphRunner {
             state.lease_close_action.clone().ok_or_else(|| ExecutionRunnerError::Driver("original lease closure driver missing".into()))?
         };
         drop(_owner);
-        drop(_coordination);
+        // Keep the graph coordination decision domain across the lease
+        // closure checkpoint commit. This checkpoint is the second durable
+        // append of a terminal wave on the same execution-graph stream:
+        // every graph-stream committer (the coalesced terminal wave,
+        // dependency reduction, a command apply, a start wave) decides its
+        // compare-and-swap revision from a snapshot loaded while holding
+        // this same lock. Dropping the domain here let the checkpoint
+        // append between such a consumer's locked load and its own append,
+        // stale its CAS (the StaleRevision expected N actual N+1 terminal
+        // wave failures with an unresolved original owner), and leave the
+        // failed wave's owner waiting on a head its commit can never
+        // rebase onto. Only the per-node callback gate is released while
+        // the physical close runs, so the one revision decision per domain
+        // hold stays the single source all downstream consumers read.
         let remaining = close_deadline.saturating_duration_since(std::time::Instant::now());
         match tokio::time::timeout(remaining, close_action).await {
             Ok(Ok(())) => {},
@@ -3463,6 +3476,13 @@ impl ExecutionGraphRunner {
                 node_id: ticket.node_id.clone(), reason: "original lease closure completed after deadline".into(),
             }));
         }
+        // The checkpoint above is the last graph revision decision of this
+        // owner's settlement; certification below only removes in-process
+        // ownership and appends nothing to the graph stream. Release the
+        // domain here and re-enter it through the existing
+        // `coordinate_original_gate` discipline (never wait for either lock
+        // while holding the other), so no new lock order is introduced.
+        drop(_coordination);
         let (_coordination, _owner) = self.coordinate_original_gate(graph_id, node_id, &gate, close_deadline).await?;
         #[cfg(test)]
         {
@@ -5385,6 +5405,20 @@ impl ExecutionGraphRunner {
                                 break None;
                             }
                         }
+                        // R02 collect-and-close: a finished replan outcome is
+                        // stopped from further dispatch, its occurred facts are
+                        // aggregated, and the node closes with a named terminal
+                        // state carrying that evidence in the same command
+                        // transaction. Only transitions the original owner must
+                        // commit atomically (delivery envelope, terminal
+                        // presentation, NoDispatch with receipt) or a
+                        // non-terminal result keep this command unknown.
+                        if matches!(outcome.result.status, ExecutionNodeStatus::Cancelled | ExecutionNodeStatus::Completed)
+                            && outcome.replan.is_some()
+                            && outcome.delivery_envelope.is_none()
+                            && outcome.terminal_presentation.is_none() {
+                            break Some(collect_cancelled_outcome(&outcome));
+                        }
                         // A completed operation remains completed. An error,
                         // nonterminal result or outcome requiring another
                         // domain transition remains unknown to this command.
@@ -6191,6 +6225,51 @@ fn executor_error_node_id(error: &NodeExecutorError) -> &str {
     }
 }
 
+
+/// R02 collect-and-close: a cancelled node whose original task already
+/// finished with a dynamic-replan outcome is closed by this command with a
+/// named terminal state carrying the collected facts. Everything that had
+/// happened by that point - the computed result reference, the original
+/// domain facts and source reads, and the same-ticket effect receipt that
+/// this closure commits atomically - is aggregated into the Cancelled
+/// result's summary; the replan itself is collected as evidence and never
+/// dispatched, so the command leaves no partial graph mutation and the
+/// graph keeps converging. Outcomes whose remaining transitions belong to
+/// the original owner's atomic domain (delivery envelope, terminal
+/// presentation, NoDispatch-with-receipt) stay unknown to this command:
+/// per the ruling that unknown is a pre-collection staging state, and they
+/// are not expressible as one graph decision without taking the single
+/// decision away from that owner.
+fn collect_cancelled_outcome(outcome: &NodeExecutionOutcome) -> NodeExecutionOutcome {
+    let mut closure = outcome.clone();
+    let replan = outcome.replan.as_ref().expect("collected closure requires a replan");
+    let collected_nodes = replan
+        .nodes
+        .iter()
+        .map(|spec| spec.id.as_str())
+        .collect::<Vec<_>>()
+        .join("+");
+    let mut collected = format!(
+        "cancelled with collected original facts: outcome {:?}{}; dynamic replan {} node(s) [{collected_nodes}] {} edge(s) reason `{}` collected unapplied",
+        outcome.result.status,
+        outcome
+            .result
+            .result_ref
+            .as_deref()
+            .map(|reference| format!(" result_ref `{reference}`"))
+            .unwrap_or_default(),
+        replan.nodes.len(),
+        replan.edges.len(),
+        replan.reason,
+    );
+    if let Some(summary) = outcome.result.summary.as_deref() {
+        collected.push_str(&format!("; original summary `{summary}`"));
+    }
+    closure.result.status = ExecutionNodeStatus::Cancelled;
+    closure.result.summary = Some(collected);
+    closure.replan = None;
+    closure
+}
 
 fn failed_result(error: &NodeExecutorError) -> ExecutionNodeResult {
     ExecutionNodeResult {
@@ -7086,6 +7165,89 @@ mod nodispatch_duration_617_tests {
         assert!(runner.state_store.binding_lease_closure(&state, &node_id, &binding, position).unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         *runner.closure_probe.lock().unwrap() = None;
+    }
+
+    // The sealed terminal-wave races both came from the second checkpoint of
+    // a wave terminal: the lease-closure `Recovered` append ran while its
+    // owner had already dropped graph coordination, so any coordination-side
+    // consumer (wave leader load-then-CAS, dependency reduction, command)
+    // could see the graph stream head move underneath the revision it had
+    // decided from. This test fixes the schedule: the closure driver parks
+    // at its durable checkpoint section, and a competitor must then find the
+    // graph coordination domain still owned by the closure's own task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn e1_lease_closure_checkpoint_is_decided_inside_graph_coordination() {
+        let (_workspace, services, runner, original_graph, original_node, _) =
+            original_prepared617().await;
+        runner
+            .execute_prepared_pump_node(&original_graph, original_node, Arc::new(Notify::new()))
+            .await
+            .unwrap();
+        services
+            .executor_registry()
+            .register(Arc::new(ClosureProbeExecutor))
+            .unwrap();
+        let (graph, node) = prepare_scoped_k05(&runner, "e1-closure-decision-domain", "domain").await;
+        let binding = node.binding.clone().unwrap();
+        let node_id = node.node.id.clone();
+        let entered = Arc::new(Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = StdMutex::new(release_rx);
+        let probe_graph = graph.clone();
+        let signal = Arc::clone(&entered);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+        *runner.closure_probe.lock().unwrap() = Some(Arc::new(move |id| {
+            if id == probe_graph {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                signal.notify_one();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15));
+            }
+        }));
+        let closer = {
+            let runner = runner.clone();
+            let graph = graph.clone();
+            tokio::spawn(async move {
+                runner
+                    .execute_prepared_pump_node(&graph, node, Arc::new(Notify::new()))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the original lease closure barrier must be reached");
+        // Let the closer task finish the synchronous release of the guards it
+        // held when it created the closure driver, so what is observed below
+        // is the steady parked state, not a half-poll window.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let competitor = tokio::time::timeout(
+            Duration::from_millis(500),
+            runner.graph_coordination_without_command(&graph),
+        )
+        .await;
+        let domain_released_while_closure_pending = competitor.is_ok();
+        drop(competitor);
+        let _ = release_tx.send(());
+        closer.await.unwrap().unwrap();
+        *runner.closure_probe.lock().unwrap() = None;
+        assert!(
+            !domain_released_while_closure_pending,
+            "lease closure must not leave the graph stream open while its checkpoint commit is still pending"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let state = runner.state_store.load(&graph).unwrap();
+        let position = runner
+            .state_store
+            .binding_start_position(&state, &node_id, &binding)
+            .unwrap()
+            .unwrap();
+        assert!(runner
+            .state_store
+            .binding_lease_closure(&state, &node_id, &binding, position)
+            .unwrap());
     }
 
     impl ScopedNodeBackendResolver for Resolver617 {

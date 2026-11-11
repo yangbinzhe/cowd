@@ -1001,6 +1001,26 @@ pub(crate) struct IndependentReview {
     pub required_write_failures: Vec<serde_json::Value>,
 }
 
+fn retain_producer_material_cuts(
+    material: &BTreeMap<String, u64>,
+    snapshot: &[crate::ExpectedStreamRevision],
+) -> Result<BTreeMap<String, u64>, String> {
+    let mut sources = BTreeMap::new();
+    for source in snapshot {
+        if sources.insert(source.stream_id.clone(), source.expected_revision)
+            .is_some_and(|previous| previous != source.expected_revision)
+        {
+            return Err("producer snapshot has conflicting source cuts".into());
+        }
+    }
+    for (source, revision) in material {
+        if sources.get(source) != Some(revision) {
+            return Err("producer material source cut changed during closure".into());
+        }
+    }
+    Ok(sources)
+}
+
 struct ReadCoverage {
     proof: ObjectiveResultReadProof,
     total: Option<usize>,
@@ -3597,11 +3617,9 @@ impl RuntimeServices {
         inputs.acceptance_policy_digest = snapshot.policy_digest;
         inputs.task_refs = snapshot.task_refs;
         inputs.artifact_refs = snapshot.artifact_refs;
-        inputs.source_revisions = snapshot
-            .sources
-            .into_iter()
-            .map(|source| (source.stream_id, source.expected_revision))
-            .collect();
+        inputs.source_revisions = retain_producer_material_cuts(
+            &inputs.source_revisions, &snapshot.sources,
+        )?;
         Ok(IndependentReview {
             producers: producers.into_iter().collect(),
             verification,
@@ -3640,6 +3658,24 @@ impl RuntimeServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_closure_retains_each_discovered_material_cut() {
+        let material = BTreeMap::from([("effect:original".to_string(), 3)]);
+        let source = |stream: &str, revision| crate::ExpectedStreamRevision {
+            stream_id: stream.into(), expected_revision: revision,
+        };
+        let stable = retain_producer_material_cuts(
+            &material, &[source("effect:original", 3), source("session:one", 7)],
+        ).unwrap();
+        assert_eq!(stable["effect:original"], 3);
+        assert_eq!(stable["session:one"], 7);
+        assert!(retain_producer_material_cuts(&material, &[source("session:one", 7)]).is_err());
+        assert!(retain_producer_material_cuts(&material, &[source("effect:original", 4)]).is_err());
+        assert!(retain_producer_material_cuts(
+            &material, &[source("effect:original", 3), source("effect:original", 4)],
+        ).is_err());
+    }
 
     /// An intent and a read in the same delegated receipt stream carry the
     /// same logical sequence under the same payload key, so only a genuine
@@ -3808,6 +3844,7 @@ mod tests {
             error.contains("result metadata source moved backwards during resolution"),
             "{error}"
         );
+        assert_eq!(cuts.get("agentic-graph:abc"), Some(&5));
     }
 
     /// A2f-N2: a source that is not a shared aggregate stream still refuses a
@@ -3836,6 +3873,7 @@ mod tests {
                 error.contains("result metadata source changed during resolution"),
                 "{source}: {error}"
             );
+            assert_eq!(cuts.get(source), Some(&4));
         }
     }
 

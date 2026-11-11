@@ -598,6 +598,9 @@ struct StartRaceExecutor {
 struct ReplanRaceExecutor {
     poll_entered: Notify,
     release_poll: Notify,
+    poll_calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
+    fail_outcome: bool,
 }
 
 struct CancelNestedRunnerExecutor {
@@ -954,10 +957,15 @@ impl NodeExecutor for ReplanRaceExecutor {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        self.poll_calls.fetch_add(1, Ordering::SeqCst);
         self.poll_entered.notify_one();
         self.release_poll.notified().await;
+        let mut result = completed_result(&ticket.node_id);
+        if self.fail_outcome {
+            result.status = ExecutionNodeStatus::Failed;
+        }
         Ok(
-            NodeExecutionOutcome::new(completed_result(&ticket.node_id)).with_replan(
+            NodeExecutionOutcome::new(result).with_replan(
                 ExecutionGraphReplan {
                     nodes: vec![node("late-tool")],
                     edges: vec![ExecutionEdge {
@@ -973,6 +981,7 @@ impl NodeExecutor for ReplanRaceExecutor {
     }
 
     async fn cancel(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         self.release_poll.notify_one();
         Ok(())
     }
@@ -3005,10 +3014,18 @@ fn graph_admission_rejects_missing_canonical_business_lineage_without_panicking(
 
 #[tokio::test]
 async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation() {
+    // R02 collect-and-close positive control: a cancellation that arrives
+    // while the original task is in flight stops further dispatch, collects
+    // every fact that had happened by that point, and closes the node with a
+    // named terminal state carrying that evidence - with no partial graph
+    // mutation and no re-dispatch of the original attempt.
     let (registry, state, commits) = harness();
     let executor = Arc::new(ReplanRaceExecutor {
         poll_entered: Notify::new(),
         release_poll: Notify::new(),
+        poll_calls: AtomicUsize::new(0),
+        cancel_calls: AtomicUsize::new(0),
+        fail_outcome: false,
     });
     registry.register(executor.clone()).unwrap();
     registry
@@ -3017,7 +3034,7 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
             Duration::from_millis(1),
         )))
         .unwrap();
-    let runner = test_runner(registry, state.clone(), commits);
+    let runner = test_runner(registry, state.clone(), commits.clone());
     let mut graph = test_graph("command versus replan");
     let mut model = node("model");
     model.executor_kind = "replan_race".to_string();
@@ -3051,10 +3068,196 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
         projected.node_statuses["model"],
         ExecutionNodeStatus::Cancelled
     );
+    // No partial graph mutation: the collected replan is never admitted and
+    // the durable head moved exactly twice - one command transaction plus
+    // the cancelled owner's lease-closure checkpoint, nothing else.
     assert!(!projected
         .nodes
         .iter()
         .any(|candidate| candidate.id == "late-tool"));
+    assert!(!projected
+        .edges
+        .iter()
+        .any(|edge| edge.to == "late-tool"));
+    assert_eq!(cancelled.revision, running.revision + 2);
+    // The named terminal state carries the collected facts: the original
+    // computed result and the collected-unapplied dynamic replan, so the
+    // durable answer holds the aggregation summary.
+    let closure = cancelled
+        .node_results
+        .get("model")
+        .expect("a collected cancellation closure must carry its node result");
+    assert_eq!(closure.status, ExecutionNodeStatus::Cancelled);
+    let summary = closure
+        .summary
+        .as_deref()
+        .expect("the cancelled answer must carry the collected changes summary");
+    assert!(summary.contains("collected"), "{summary}");
+    assert!(summary.contains("Completed"), "{summary}");
+    assert!(summary.contains("late-tool"), "{summary}");
+    assert!(summary.contains("collected unapplied"), "{summary}");
+    assert_eq!(
+        closure.result_ref.as_deref(),
+        Some("result:model"),
+        "the collected fact keeps the original computed result reference"
+    );
+    // The same-ticket effect receipt closes with the closure: recovery and
+    // every downstream reader consume one decision from one source.
+    let attempt = *projected
+        .recovery_cursor
+        .node_attempts
+        .get("model")
+        .expect("collected cancellation keeps the original attempt");
+    let binding = state
+        .current_binding(&projected, "model", attempt)
+        .expect("original binding");
+    let ticket = NodeExecutionTicket {
+        graph_id: graph_id.clone(),
+        node_id: "model".to_string(),
+        executor_kind: binding.executor_kind.clone(),
+        service_class: projected.service_class,
+        attempt: binding.attempt,
+        idempotency_key: binding.ticket_idempotency_key.clone(),
+        payload_ref: "payload:model".to_string(),
+    };
+    assert!(
+        matches!(
+            commits.inspect_execution_effect(&ticket).unwrap(),
+            ExecutionEffectState::Completed(collected)
+                if collected.result.status == ExecutionNodeStatus::Cancelled
+        ),
+        "the collected closure must commit the same-ticket effect receipt"
+    );
+    // Lease and retirement state is part of the collected facts: the binding
+    // lease closure checkpoint is durable and no owner stays retained.
+    let position = state
+        .binding_start_position(&projected, "model", &binding)
+        .expect("original binding start")
+        .expect("collected cancellation keeps the original binding start");
+    assert!(
+        state
+            .binding_lease_closure(&projected, "model", &binding, position)
+            .expect("lease closure checkpoint"),
+        "the collected cancellation must close the original binding leases"
+    );
+    assert!(!runner.has_retained_shutdown_owners().await);
+    // No re-dispatch: the original attempt polled exactly once.
+    assert_eq!(executor.poll_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(executor.cancel_calls.load(Ordering::SeqCst), 1);
+
+    // Negative control 1: a cancellation with no original facts at all keeps
+    // the plain Cancelled semantics - status flip only, no aggregated result,
+    // a single command revision.
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    let mut graph = test_graph("cancel without facts");
+    graph.nodes.push(node("idle"));
+    let graph_id = graph.id.clone();
+    runner.register(graph).await.unwrap();
+    runner
+        .pump_snapshot(&graph_id, &Default::default())
+        .await
+        .unwrap();
+    let ready = state.load(&graph_id).unwrap();
+    assert_eq!(ready.node_statuses["idle"], ExecutionNodeStatus::Ready);
+    let cancelled = runner
+        .command(
+            &graph_id,
+            ExecutionGraphCommand::Cancel {
+                expected_revision: ready.revision,
+                reason: "queued without facts".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.node_statuses["idle"], ExecutionNodeStatus::Cancelled);
+    assert!(
+        cancelled.node_results.get("idle").is_none(),
+        "a factless cancellation must not fabricate a collected result"
+    );
+    assert_eq!(cancelled.revision, ready.revision + 1);
+
+    // Negative control 2: a finished outcome that only the original owner
+    // can retire (a Failed result carrying a replan) stays unknown to this
+    // command. The rejected command commits nothing: the graph is neither
+    // half-written nor re-dispatched, and the original owner still settles
+    // its single decision afterwards.
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(ReplanRaceExecutor {
+        poll_entered: Notify::new(),
+        release_poll: Notify::new(),
+        poll_calls: AtomicUsize::new(0),
+        cancel_calls: AtomicUsize::new(0),
+        fail_outcome: true,
+    });
+    registry.register(executor.clone()).unwrap();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    let mut graph = test_graph("uncollectable versus replan");
+    let mut model = node("model");
+    model.executor_kind = "replan_race".to_string();
+    graph.nodes.push(model);
+    let graph_id = graph.id.clone();
+    let run = {
+        let runner = runner.clone();
+        tokio::spawn(async move { runner.start(graph).await })
+    };
+    executor.poll_entered.notified().await;
+    let running = state.load(&graph_id).unwrap();
+    let rejected = runner
+        .command(
+            &graph_id,
+            ExecutionGraphCommand::Cancel {
+                expected_revision: running.revision,
+                reason: "uncollectable outcome probe".to_string(),
+            },
+        )
+        .await
+        .expect_err("a Failed outcome with a replan belongs to its original owner");
+    assert!(
+        matches!(&rejected,
+            ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { node_id, .. })
+                if node_id == "model"),
+        "{rejected}"
+    );
+    let intact = state.load(&graph_id).unwrap();
+    assert_eq!(
+        intact.revision, running.revision,
+        "the rejected command must commit no partial mutation"
+    );
+    assert!(!intact
+        .nodes
+        .iter()
+        .any(|candidate| candidate.id == "late-tool"));
+    // The graph still converges through the original owner's own single
+    // decision, and the cancelled probe never forced a re-dispatch.
+    let report = run
+        .await
+        .unwrap()
+        .expect("the original owner settles the graph after the unknown probe");
+    assert_eq!(report.failed, 1);
+    // The owner's own single decision adds the replan; its late successor is
+    // blocked behind the Failed predecessor exactly like any other dependent
+    // work - the probe committed nothing itself.
+    assert_eq!(report.blocked, 1);
+    let settled = state.load(&graph_id).unwrap();
+    assert_eq!(settled.node_statuses["model"], ExecutionNodeStatus::Failed);
+    assert_eq!(
+        settled.node_statuses["late-tool"],
+        ExecutionNodeStatus::Blocked
+    );
+    assert_eq!(executor.poll_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
