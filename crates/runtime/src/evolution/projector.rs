@@ -2861,6 +2861,7 @@ mod tests {
             strategy_feedback: Default::default(),
             evidence_refs: Vec::new(),
             evidence_completeness: EvidenceCompleteness::None,
+            verified: None,
             schema_revision: OUTCOME_SCHEMA_REVISION,
         }
     }

@@ -3889,6 +3889,28 @@ where
                 state.ingress.is_some(),
             )
         };
+        // The durable obligation ledger of this terminal: the acceptance
+        // contract the Runtime compiled for the terminal node and the
+        // evaluation it wrote.  It is the fact the verified business
+        // conclusion is derived from; the model's wording is not.
+        let obligation_ledger = {
+            let usage = &outcome.result.usage;
+            match usage.acceptance_evaluation.as_ref() {
+                Some(evaluation) => {
+                    Some(crate::execution_core::business_conclusion::ObligationLedgerFact::Evaluated {
+                        verdict: evaluation.verdict,
+                        unresolved_obligation_ids: usage
+                            .observed_acceptance
+                            .unresolved_obligation_ids
+                            .clone(),
+                    })
+                }
+                None if !usage.required_acceptance.is_empty() => {
+                    Some(crate::execution_core::business_conclusion::ObligationLedgerFact::Unresolved)
+                }
+                None => None,
+            }
+        };
         let summary = runtime
             .finalize_graph_turn(
                 &content,
@@ -3908,6 +3930,7 @@ where
                 max_tool_concurrency_observed,
                 parallel_tool_batches,
                 terminal_completion,
+                obligation_ledger,
                 defer_memory,
                 recovered_telemetry,
             )

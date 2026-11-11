@@ -1845,6 +1845,9 @@ pub(crate) fn business_observation_ready(scenario: &Value) -> bool {
         && observation.get("execution_scope").and_then(Value::as_str) == Some("session")
         && observation.get("event_status").and_then(Value::as_str) == Some("succeeded")
         && observation.get("terminal_class").and_then(Value::as_str) == Some("succeeded")
+        // The verified business conclusion is the only source of a business
+        // success.  A business observation without one is Unknown.
+        && observation.get("verified_verdict").and_then(Value::as_str) == Some("satisfied")
         && goal_outcome.is_some_and(|value| value.is_null() || value.as_str() == Some("satisfied"))
 }
 
@@ -2636,7 +2639,7 @@ mod gate_tests {
                 "runtime_commit_cursor":"9007199254740993","content_digest":digest,"client_binding_sha256":"b".repeat(64),"received_at_ms":100,
                 "fresh_context_confirmed":true,"ack":ack,"current_context":current
             },
-            "business_observation":{"kind":"runtime.outcome.recorded.v1","execution_scope":"session","execution_id":execution,"session_id":session,"turn_id":turn,"event_status":"succeeded","terminal_class":"succeeded"},
+            "business_observation":{"kind":"runtime.outcome.recorded.v1","execution_scope":"session","execution_id":execution,"session_id":session,"turn_id":turn,"event_status":"succeeded","terminal_class":"succeeded","verified_verdict":"satisfied"},
             "usage_observation_integrity":{"timeline_drained":true,"cursor_monotonic":true,"omitted_changes":0},
             "metrics":{"provider_attempt_count":1,"provider_usage_records":1,"usage_unknown_attempts":0,"provider_attempt_cache_dimensions_unknown_count":0,"model_rounds":1,"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"total_tokens":2}
         })

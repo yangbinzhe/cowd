@@ -2551,9 +2551,49 @@ impl AgentRuntime {
         let turn_id = identity
             .turn_id()
             .ok_or_else(|| "Agent outcome has no canonical turn identity".to_string())?;
+        // The business verdict of an Agent terminal is derived from durable
+        // Runtime facts: the terminal conclusion the Runtime committed and the
+        // durable obligation ledger of the same run.  The Agent's own outcome
+        // wording is preserved verbatim, but it never decides the verdict: an
+        // Agent that completed without a verified acceptance is recorded as a
+        // typed `Unsatisfied`, never as a success.
+        let model_reason = match returned.status {
+            AgentTerminalStatus::Completed => returned.outcome.clone(),
+            AgentTerminalStatus::Failed | AgentTerminalStatus::Cancelled | AgentTerminalStatus::Blocked => {
+                returned.failure.clone().unwrap_or_default()
+            }
+        };
+        let verified = crate::execution_core::business_conclusion::derive_verified_business_conclusion(
+            &crate::execution_core::business_conclusion::BusinessConclusionFacts {
+                model_reason: model_reason.clone(),
+                goal: match returned.status {
+                    AgentTerminalStatus::Completed => {
+                        crate::execution_core::business_conclusion::GoalConclusionFact::Satisfied
+                    }
+                    _ => crate::execution_core::business_conclusion::GoalConclusionFact::NotSatisfied,
+                },
+                goal_reference: format!("agent_run:{}", returned.run_id),
+                ledger: match returned.acceptance_evaluation.as_ref() {
+                    Some(evaluation) => {
+                        crate::execution_core::business_conclusion::ObligationLedgerFact::Evaluated {
+                            verdict: evaluation.verdict,
+                            unresolved_obligation_ids: returned
+                                .observed_acceptance
+                                .unresolved_obligation_ids
+                                .clone(),
+                        }
+                    }
+                    None => crate::execution_core::business_conclusion::ObligationLedgerFact::Unresolved,
+                },
+            },
+        );
         let terminal = match returned.status {
             AgentTerminalStatus::Completed => {
-                harness_contract::outcome::OutcomeTerminalClass::Succeeded(returned.outcome.clone())
+                crate::execution_core::business_conclusion::terminal_class_for_completion(
+                    &verified,
+                    0,
+                    &model_reason,
+                )
             }
             AgentTerminalStatus::Failed => harness_contract::outcome::OutcomeTerminalClass::Failed(
                 returned
@@ -2668,6 +2708,9 @@ impl AgentRuntime {
             },
             evidence_refs,
             evidence_completeness,
+            // The verified business conclusion travels with the durable event
+            // so every consumer reads the same decision.
+            verified: Some(verified),
             schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
         };
         services.outcome_service().record_terminal(&outcome)?;

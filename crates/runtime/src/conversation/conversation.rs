@@ -5144,6 +5144,12 @@ pub struct TurnSummary {
     pub write_attempt_paths: Vec<String>,
     pub max_tool_concurrency_observed: usize,
     pub parallel_tool_batches: usize,
+    /// The durable obligation ledger of this turn, as committed by the
+    /// terminal producer.  It is one of the two durable facts the verified
+    /// business conclusion is derived from; the model's terminal wording is
+    /// never part of it.
+    pub obligation_ledger:
+        Option<crate::execution_core::business_conclusion::ObligationLedgerFact>,
 }
 
 /// One provider decision. Model steps are deliberately side-effect free with

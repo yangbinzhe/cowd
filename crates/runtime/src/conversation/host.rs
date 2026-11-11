@@ -2332,6 +2332,12 @@ where
                     actual_speedup_ratio_bp: None,
                     terminal_reason: format!("{:?}", summary.terminal_completion)
                         .to_ascii_lowercase(),
+                    // The durable obligation ledger the terminal producer
+                    // committed for this turn.  The verified business
+                    // conclusion is derived from it together with the
+                    // terminal conclusion; the wording above is only the
+                    // model's presentation of the turn.
+                    obligation_ledger: summary.obligation_ledger.clone(),
                 },
             ),
             Err(error) => (

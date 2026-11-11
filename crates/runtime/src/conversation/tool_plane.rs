@@ -2913,6 +2913,9 @@ where
         max_tool_concurrency_observed: usize,
         parallel_tool_batches: usize,
         terminal_completion: harness_contract::goal::GoalCompletion,
+        obligation_ledger: Option<
+            crate::execution_core::business_conclusion::ObligationLedgerFact,
+        >,
         defer_post_turn_memory_maintenance: bool,
         recovered_telemetry: Option<crate::RunModelTelemetry>,
     ) -> Result<TurnSummary, RuntimeError> {
@@ -3061,6 +3064,7 @@ where
             write_attempt_paths,
             max_tool_concurrency_observed,
             parallel_tool_batches,
+            obligation_ledger,
         };
         self.record_turn_completed(&summary);
         self.record_ai_kernel_trace_event(

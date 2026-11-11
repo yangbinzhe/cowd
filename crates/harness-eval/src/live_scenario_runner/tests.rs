@@ -2105,7 +2105,8 @@ fn successful_root_outcome_timeline(mut timeline: Value) -> Value {
         "status": "succeeded",
         "payload": {
             "identity": {"execution_graph_ref": "root", "execution_scope":"session"},
-            "terminal": {"class": "succeeded"}
+            "terminal": {"class": "succeeded"},
+            "verified": {"verdict": "satisfied", "reason": "satisfied"}
         }
     });
     let object = timeline
@@ -2133,6 +2134,32 @@ fn completed_tool_event() -> Value {
             "is_error": false
         }
     })
+}
+
+#[test]
+fn s6_root_business_success_requires_a_verified_conclusion() {
+    // An Outcome event without a verified business conclusion is Unknown, not
+    // a success: the consumer may not re-interpret the terminal wording.
+    let timeline = json!({"events": [{
+        "kind": "runtime.outcome.recorded.v1",
+        "status": "succeeded",
+        "payload": {
+            "identity": {"execution_graph_ref": "root", "execution_scope":"session"},
+            "terminal": {"class": "succeeded"}
+        }
+    }]});
+    let outcome = root_business_outcome(&timeline, "root");
+    assert!(!outcome.passed);
+    assert_eq!(outcome.verified_verdict, None);
+    let observation = root_business_observation(&timeline, "root");
+    assert!(observation["verified_verdict"].is_null());
+    // With the durable verified conclusion the same event is a success.
+    let verified_timeline = successful_root_outcome_timeline(json!({}));
+    let outcome = root_business_outcome(&verified_timeline, "root");
+    assert!(outcome.passed);
+    assert_eq!(outcome.verified_verdict.as_deref(), Some("satisfied"));
+    let observation = root_business_observation(&verified_timeline, "root");
+    assert_eq!(observation["verified_verdict"], json!("satisfied"));
 }
 
 #[test]

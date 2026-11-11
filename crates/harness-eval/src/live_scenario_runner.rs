@@ -8768,6 +8768,10 @@ struct RootBusinessOutcome {
     passed: bool,
     event_status: Option<String>,
     terminal_class: Option<String>,
+    /// The verified business conclusion of the Outcome event.  It is the only
+    /// source of a business success: an event that carries no verified
+    /// conclusion is Unknown, never a success.
+    verified_verdict: Option<String>,
 }
 
 /// Bind acceptance to the canonical Runtime outcome for the root execution
@@ -8786,11 +8790,21 @@ fn root_business_outcome(timeline: &Value, root_execution_id: &str) -> RootBusin
         .pointer("/payload/terminal/class")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let verified_verdict = outcome
+        .pointer("/payload/verified/verdict")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     RootBusinessOutcome {
-        passed: event_status.as_deref() == Some("succeeded")
+        // The durable verified conclusion decides the business verdict.  The
+        // event status and the terminal class stay as the record of what the
+        // Runtime wrote, but they cannot promote a run to a success that no
+        // durable fact verified.
+        passed: verified_verdict.as_deref() == Some("satisfied")
+            && event_status.as_deref() == Some("succeeded")
             && terminal_class.as_deref() == Some("succeeded"),
         event_status,
         terminal_class,
+        verified_verdict,
     }
 }
 
@@ -8830,6 +8844,8 @@ pub(crate) fn root_business_observation(timeline: &Value, root_execution_id: &st
         "execution_scope":event.pointer("/payload/identity/execution_scope"),
         "event_status":event.get("status"),
         "terminal_class":event.pointer("/payload/terminal/class"),
+        "verified_verdict":event.pointer("/payload/verified/verdict"),
+        "verified_reason":event.pointer("/payload/verified/reason"),
     })
 }
 

@@ -289,6 +289,11 @@ pub struct TurnStrategyActualOutcome {
     pub quality_score_bp: Option<u16>,
     pub actual_speedup_ratio_bp: Option<u16>,
     pub terminal_reason: String,
+    /// The durable obligation ledger of this turn.  It is the second fact the
+    /// verified business conclusion is derived from; it is never inferred
+    /// from the terminal wording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligation_ledger: Option<crate::execution_core::business_conclusion::ObligationLedgerFact>,
 }
 
 /// The sole strategy identity for one admitted conversation turn. Re-targets,

@@ -7221,3 +7221,168 @@ fn empty_final_completion_is_failure_with_original_usage_not_a_goal_candidate() 
         "the dedicated control owner retains its own rejection"
     );
 }
+
+// S4 success-obligation invariant controls (S6).
+//
+// A completed turn is a business success only when a durable Runtime fact
+// verified it.  The model's terminal wording is preserved, but it never
+// decides the verdict.
+fn s6_canonical_outcome(
+    status: crate::execution_core::TurnStrategyDecisionStatus,
+    terminal_reason: &str,
+    ledger: Option<crate::execution_core::business_conclusion::ObligationLedgerFact>,
+) -> harness_contract::outcome::ExecutionOutcome {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let runtime = ConversationRuntime::new(
+        Session::new(),
+        MockApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["system".to_string()],
+    )
+    .without_memory()
+    .with_runtime_event_store(Arc::clone(&store));
+    let state = runtime
+        .begin_turn_strategy("s6-terminal", "test terminal")
+        .expect("strategy");
+    runtime
+        .finish_turn_strategy(
+            &state.turn_ref,
+            status,
+            crate::execution_core::TurnStrategyActualOutcome {
+                terminal_reason: terminal_reason.to_string(),
+                obligation_ledger: ledger,
+                ..Default::default()
+            },
+        )
+        .expect("finish");
+    let event = store
+        .all_events(20)
+        .expect("outcome")
+        .into_iter()
+        .find(|event| event.kind == crate::execution_core::OUTCOME_EVENT_KIND)
+        .expect("canonical Outcome");
+    serde_json::from_value(event.payload).expect("Outcome contract")
+}
+
+#[test]
+fn s6_nc_a_completion_without_a_verified_obligation_is_not_a_success() {
+    // NC-A: the turn completed and the model announced success, but the
+    // durable obligation ledger has an unmet obligation.  The Outcome must
+    // not say `succeeded`, and the model's own wording must survive.
+    let outcome = s6_canonical_outcome(
+        crate::execution_core::TurnStrategyDecisionStatus::Completed,
+        "satisfied",
+        Some(
+            crate::execution_core::business_conclusion::ObligationLedgerFact::Evaluated {
+                verdict: harness_contract::acceptance::AcceptanceVerdict::Unresolved,
+                unresolved_obligation_ids: vec!["read:reports/q3.md".to_string()],
+            },
+        ),
+    );
+    assert_eq!(outcome.terminal.class_name(), "unsatisfied");
+    assert!(!outcome.terminal.is_success());
+    let verified = outcome.verified.expect("verified conclusion");
+    assert_eq!(
+        verified.verdict,
+        harness_contract::outcome::VerifiedBusinessVerdict::Unsatisfied
+    );
+    assert_eq!(verified.reason, "satisfied");
+    assert!(verified
+        .basis
+        .iter()
+        .any(|basis| basis.reference.contains("read:reports/q3.md")));
+}
+
+#[test]
+fn s6_nc_b_partially_satisfied_obligations_refuse_a_successful_terminal() {
+    // NC-B: three of seven obligations are satisfied.  The terminal stays a
+    // typed Unsatisfied and the unresolved ids stay durable.
+    let unresolved = vec![
+        "read:a".to_string(),
+        "read:b".to_string(),
+        "read:c".to_string(),
+        "read:d".to_string(),
+    ];
+    let outcome = s6_canonical_outcome(
+        crate::execution_core::TurnStrategyDecisionStatus::Completed,
+        "satisfied",
+        Some(
+            crate::execution_core::business_conclusion::ObligationLedgerFact::Evaluated {
+                verdict: harness_contract::acceptance::AcceptanceVerdict::Unsatisfied,
+                unresolved_obligation_ids: unresolved.clone(),
+            },
+        ),
+    );
+    assert_eq!(outcome.terminal.class_name(), "unsatisfied");
+    let verified = outcome.verified.expect("verified conclusion");
+    assert_eq!(
+        verified.verdict,
+        harness_contract::outcome::VerifiedBusinessVerdict::Unsatisfied
+    );
+    let ledger = verified
+        .basis
+        .iter()
+        .find(|basis| basis.kind == "obligation_ledger")
+        .expect("obligation ledger basis");
+    for id in unresolved {
+        assert!(ledger.reference.contains(&id), "{id} must stay durable");
+    }
+}
+
+#[test]
+fn s6_nc_c_failures_are_never_reported_as_success_and_verified_runs_stay_successful() {
+    // NC-C (failure guard): a failed or cancelled terminal is never a
+    // business success.
+    for (status, expected) in [
+        (
+            crate::execution_core::TurnStrategyDecisionStatus::Failed,
+            "failed",
+        ),
+        (
+            crate::execution_core::TurnStrategyDecisionStatus::Cancelled,
+            "cancelled",
+        ),
+    ] {
+        let outcome = s6_canonical_outcome(status, "satisfied", None);
+        assert_eq!(outcome.terminal.class_name(), expected);
+        assert!(!outcome.terminal.is_success());
+    }
+    // NC-C (positive control): a completion whose durable conclusion verified
+    // it, with no outstanding obligation, stays a success.  The invariant
+    // must not over-block real successes.
+    let outcome = s6_canonical_outcome(
+        crate::execution_core::TurnStrategyDecisionStatus::Completed,
+        "satisfied",
+        None,
+    );
+    assert_eq!(outcome.terminal.class_name(), "succeeded");
+    assert!(outcome.terminal.is_success());
+    let verified = outcome.verified.expect("verified conclusion");
+    assert_eq!(
+        verified.verdict,
+        harness_contract::outcome::VerifiedBusinessVerdict::Satisfied
+    );
+    assert!(verified
+        .basis
+        .iter()
+        .any(|basis| basis.kind == "goal_conclusion"));
+}
+
+#[test]
+fn s6_nc_d_an_unreached_evaluation_stays_unknown_and_never_a_success() {
+    // NC-D: the obligation contract exists but its evaluation did not
+    // arrive.  The conclusion is Unknown, so no terminal value is claimed
+    // and the run is never a success.
+    let outcome = s6_canonical_outcome(
+        crate::execution_core::TurnStrategyDecisionStatus::Completed,
+        "satisfied",
+        Some(crate::execution_core::business_conclusion::ObligationLedgerFact::Unresolved),
+    );
+    assert_eq!(outcome.terminal.class_name(), "unsatisfied");
+    let verified = outcome.verified.expect("verified conclusion");
+    assert_eq!(
+        verified.verdict,
+        harness_contract::outcome::VerifiedBusinessVerdict::Unknown
+    );
+}
