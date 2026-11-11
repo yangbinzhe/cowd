@@ -460,13 +460,27 @@ struct CancelOutcomeState {
     cleanup_deadline: Option<std::time::Instant>,
     cleanup_nonce: Option<Arc<()>>,
     terminal_release_action: Option<Shared<BoxFuture<'static, Result<(), String>>>>,
-    lease_close_action: Option<Shared<BoxFuture<'static, Result<(), String>>>>,
+    lease_close_action:
+        Option<Shared<BoxFuture<'static, Result<Option<LeaseClosureCertification>, String>>>>,
     lease_close_resources: Option<Arc<StdMutex<Option<NodeResourceGuards>>>>,
     callback_action: Option<Shared<BoxFuture<'static, Result<(), String>>>>,
     callback_decision: Option<CallbackDisposition>,
     callback_nonce: Option<Arc<()>>,
     callback_deadline: Option<std::time::Instant>,
     proof_inflight: bool,
+}
+
+/// Facts certified by one physical lease release that ran outside the graph
+/// decision domain. The durable checkpoint append — the only graph-stream
+/// revision this closure produces — waits for coordination and commits
+/// inside the same domain every terminal wave, dependency reduction, command
+/// apply and start wave already shares, so a slow physical close (scope or
+/// worktree IO) cannot serialize unrelated successor dispatch behind the
+/// domain lock.
+#[derive(Clone)]
+struct LeaseClosureCertification {
+    early_reads: Vec<crate::conversation::EarlyToolExecutionReceipt>,
+    early_sources: Vec<crate::runtime_event_store::ExpectedStreamRevision>,
 }
 
 // This is a guard on the same original handoff, not another owner. Dropping
@@ -634,6 +648,8 @@ pub(crate) struct ExecutionGraphRunner {
     closure_probe: Arc<StdMutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
     #[cfg(test)]
     closure_finished_probe: Arc<StdMutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
+    #[cfg(test)]
+    lease_closure_checkpoint_probe: Arc<StdMutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
 }
 
 type MutationGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
@@ -809,6 +825,8 @@ impl ExecutionGraphRunner {
             closure_probe: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             closure_finished_probe: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            lease_closure_checkpoint_probe: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -3187,9 +3205,9 @@ impl ExecutionGraphRunner {
         resources: &mut NodeResourceGuards,
         no_dispatch: Option<&Arc<super::executors::agent_tool::NoDispatchObservation>>,
         deadline: std::time::Instant,
-    ) -> Result<(), ExecutionRunnerError> {
+    ) -> Result<Option<LeaseClosureCertification>, ExecutionRunnerError> {
         if !ExecutionBindingLeaseClosure::required(binding) {
-            return Ok(());
+            return Ok(None);
         }
         #[cfg(test)]
         {
@@ -3198,7 +3216,6 @@ impl ExecutionGraphRunner {
                 probe(graph_id);
             }
         }
-        let mut stale_retries = 0;
         loop {
             if std::time::Instant::now() >= deadline {
                 return Err(ExecutionRunnerError::Driver("original lease closure deadline expired".into()));
@@ -3234,7 +3251,7 @@ impl ExecutionGraphRunner {
                     return Err(ExecutionRunnerError::Driver("existing lease closure cannot authenticate retained early read".into()));
                 }
                 self.registry.forget_builtin_binding(ticket);
-                return Ok(());
+                return Ok(None);
             }
             let early_reads = no_dispatch.map(|owner| owner.original_early_reads()).transpose()
                 .map_err(ExecutionRunnerError::Driver)?.unwrap_or_default();
@@ -3262,54 +3279,182 @@ impl ExecutionGraphRunner {
                         return Err(ExecutionRunnerError::Driver("original early read sources unconfirmed".into())),
                 }
             };
-            match self
-                .commit_service
-                .commit_binding_lease_closure_with_original_reads(
-                    &graph,
-                    &released,
-                    no_dispatch
-                        .and_then(|observation| observation.witness())
-                        .as_ref(),
-                    &early_reads,
-                    Some(deadline),
-                ) {
-                Ok(receipt) => {
-                    if let Some(owner) = no_dispatch {
-                        owner.release_original_early_reads(ticket, &early_reads, &early_sources, &receipt)
-                            .map_err(ExecutionRunnerError::Driver)?;
-                    }
-                    self.registry.forget_builtin_binding(ticket);
+            // The physical release above gave back every held lease and the
+            // proof above authenticated the original early reads against the
+            // durable receipts. `released` borrows the fence that stays inside
+            // these guards; the durable checkpoint is decided in one place by
+            // the coordination-side caller below.
+            let _ = released;
+            return Ok(Some(LeaseClosureCertification { early_reads, early_sources }));
+        }
+    }
+
+    /// Commit the durable lease-closure checkpoint for a physical release
+    /// already certified outside the domain. The caller holds graph
+    /// coordination across this call, so this append is one more revision
+    /// decision taken inside the single graph decision domain: no
+    /// coordination-side consumer can have its load-to-CAS window
+    /// invalidated by the checkpoint, while slow physical release IO stays
+    /// off the domain lock. `release_original` is idempotent on a released
+    /// fence and re-derives the same closure against the fresh same-source
+    /// head; only a moved external proof stream retries here.
+    async fn commit_certified_lease_closure_checkpoint(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        ticket: &NodeExecutionTicket,
+        binding: &ExecutionNodeBinding,
+        retained: &Arc<StdMutex<Option<NodeResourceGuards>>>,
+        no_dispatch: Option<&Arc<super::executors::agent_tool::NoDispatchObservation>>,
+        certification: LeaseClosureCertification,
+        deadline: std::time::Instant,
+    ) -> Result<(), ExecutionRunnerError> {
+        let commits = self.commit_service.clone();
+        let stores = self.state_store.clone();
+        let registry = Arc::clone(&self.registry);
+        let worktrees = Arc::clone(&self.worktree_leases);
+        let graph_id = graph_id.to_string();
+        let node_id = node_id.to_string();
+        let ticket = ticket.clone();
+        let binding = binding.clone();
+        let retained = Arc::clone(retained);
+        let no_dispatch = no_dispatch.cloned();
+        let LeaseClosureCertification { early_reads, early_sources } = certification;
+        tokio::task::spawn_blocking(move || {
+            let mut slot = retained.lock().map_err(|_| ExecutionRunnerError::Driver(
+                "original lease closure checkpoint owner unavailable".into(),
+            ))?;
+            let Some(mut original) = slot.take() else {
+                // The original binding owner may already have certified and
+                // removed this binding through its own take of the shared
+                // closure action. The durable checkpoint either exists, in
+                // which case this waiter is complete, or the original owner
+                // still holds the guards elsewhere; nothing is re-appended.
+                let graph = stores.load(&graph_id)?;
+                let durable = match stores
+                    .binding_start_position(&graph, &node_id, &binding)?
+                {
+                    Some(position) => stores
+                        .binding_lease_closure(&graph, &node_id, &binding, position)?,
+                    None => false,
+                };
+                if durable {
                     return Ok(());
                 }
-                Err(ExecutionCommitError::EventStore(
-                    crate::RuntimeEventStoreError::StaleRevision { .. },
-                )) if stale_retries < 7 => {
-                    stale_retries += 1;
-                    continue;
-                },
-                Err(error @ ExecutionCommitError::PhysicalClosureSourceMoved { .. }) => {
+                return Err(ExecutionRunnerError::Driver(
+                    "original lease closure checkpoint resources missing".into(),
+                ));
+            };
+            let outcome = (|| -> Result<(), ExecutionRunnerError> {
+                let mut proof_retries = 0;
+                loop {
                     if std::time::Instant::now() >= deadline {
-                        return Err(error.into());
+                        return Err(ExecutionRunnerError::Driver(
+                            "original lease closure checkpoint deadline expired".into(),
+                        ));
                     }
-                    // Re-read the original closure proof; no effect is redispatched.
-                    std::thread::sleep(super::recovery::PHYSICAL_CLOSURE_RETRY_PAUSE.min(
-                        deadline.saturating_duration_since(std::time::Instant::now()),
-                    ));
-                    continue;
-                },
-                Err(error) => {
-                    // A lost append response is not a rollback. Re-read the
-                    // exact original binding closure before reporting Unknown.
-                    let current = self.state_store.load(graph_id)?;
-                    let exact = self.state_store.binding_lease_closure(&current, node_id, binding, position)?;
-                    if exact && early_reads.is_empty() {
-                        self.registry.forget_builtin_binding(ticket);
+                    let graph = stores.load(&graph_id)?;
+                    let position = stores
+                        .binding_start_position(&graph, &node_id, &binding)?
+                        .ok_or_else(|| ExecutionRunnerError::Driver(
+                            "original lease start missing".into(),
+                        ))?;
+                    let owner = original.owner_fence.as_mut().ok_or_else(|| ExecutionRunnerError::Driver(
+                        "original binding owner capability missing".into(),
+                    ))?;
+                    let released = owner
+                        .release_original(
+                            &graph,
+                            &node_id,
+                            &binding,
+                            position,
+                            &mut original.resource,
+                            &mut original.scope,
+                            &mut original.worktree,
+                            &worktrees,
+                        )
+                        .map_err(ExecutionRunnerError::Driver)?;
+                    if stores.binding_lease_closure(&graph, &node_id, &binding, position)? {
+                        if !early_reads.is_empty() {
+                            return Err(ExecutionRunnerError::Driver(
+                                "existing lease closure cannot authenticate retained early read".into(),
+                            ));
+                        }
+                        registry.forget_builtin_binding(&ticket);
                         return Ok(());
                     }
-                    return Err(error.into());
-                },
-            }
-        }
+                    match commits.commit_binding_lease_closure_with_original_reads(
+                        &graph,
+                        &released,
+                        no_dispatch
+                            .as_ref()
+                            .and_then(|observation| observation.witness())
+                            .as_ref(),
+                        &early_reads,
+                        Some(deadline),
+                    ) {
+                        Ok(receipt) => {
+                            if let Some(owner) = no_dispatch.as_ref() {
+                                owner
+                                    .release_original_early_reads(
+                                        &ticket,
+                                        &early_reads,
+                                        &early_sources,
+                                        &receipt,
+                                    )
+                                    .map_err(ExecutionRunnerError::Driver)?;
+                            }
+                            registry.forget_builtin_binding(&ticket);
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            if matches!(&error, ExecutionCommitError::EventStore(
+                                crate::RuntimeEventStoreError::StaleRevision { stream_id, .. })
+                                if stream_id == &graph_id)
+                            {
+                                // The graph stream moved while its decision
+                                // domain was held: a domain-external writer
+                                // exists again. Surface it, never rebase over it.
+                                return Err(error.into());
+                            }
+                            if matches!(&error, ExecutionCommitError::EventStore(
+                                crate::RuntimeEventStoreError::StaleRevision { .. })
+                                | ExecutionCommitError::PhysicalClosureSourceMoved { .. })
+                            {
+                                // Only an external proof stream can move
+                                // here; re-decide from the fresh durable head
+                                // inside the domain under the shared deadline.
+                                if proof_retries >= 7 || std::time::Instant::now() >= deadline {
+                                    return Err(error.into());
+                                }
+                                proof_retries += 1;
+                                std::thread::sleep(super::recovery::PHYSICAL_CLOSURE_RETRY_PAUSE.min(
+                                    deadline.saturating_duration_since(std::time::Instant::now()),
+                                ));
+                                continue;
+                            }
+                            // A lost append response is not a rollback. Re-read
+                            // the exact original binding closure before
+                            // reporting Unknown.
+                            let current = stores.load(&graph_id)?;
+                            let exact = stores.binding_lease_closure(
+                                &current, &node_id, &binding, position)?;
+                            if exact && early_reads.is_empty() {
+                                registry.forget_builtin_binding(&ticket);
+                                return Ok(());
+                            }
+                            return Err(error.into());
+                        }
+                    }
+                }
+            })();
+            *slot = Some(original);
+            outcome
+        })
+        .await
+        .map_err(|error| ExecutionRunnerError::Driver(format!(
+            "original lease closure checkpoint driver join failed: {error}"
+        )))?
     }
 
     async fn take_bound_active_node(
@@ -3400,6 +3545,7 @@ impl ExecutionGraphRunner {
                 finished.no_dispatch.clone(),
             )
         };
+        let checkpoint_no_dispatch = no_dispatch.clone();
         let close_action = {
             let mut state = handoff.state.lock().map_err(|_| ExecutionRunnerError::Executor(
                 NodeExecutorError::OriginalCustodyUnknown { node_id: ticket.node_id.clone(),
@@ -3433,9 +3579,10 @@ impl ExecutionGraphRunner {
                     let mut original = retained_resources.lock().map_err(|_| "retained resource owner poisoned".to_string())?
                         .take().ok_or_else(|| "retained resource owner missing".to_string())?;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runner.close_active_binding_leases(&graph, &node, &original_ticket, &original_binding,
+                        let certification = runner.close_active_binding_leases(&graph, &node, &original_ticket, &original_binding,
                             &mut original, no_dispatch.as_ref(), close_deadline).map_err(|error| error.to_string())?;
-                        original_executor.original_binding_released(&original_ticket).map_err(|error| error.to_string())
+                        original_executor.original_binding_released(&original_ticket).map_err(|error| error.to_string())?;
+                        Ok(certification)
                     })).unwrap_or_else(|_| Err("original lease closure driver panicked".into()));
                     *retained_resources.lock().map_err(|_| "retained resource owner poisoned".to_string())? = Some(original);
                     result
@@ -3447,42 +3594,72 @@ impl ExecutionGraphRunner {
             state.lease_close_action.clone().ok_or_else(|| ExecutionRunnerError::Driver("original lease closure driver missing".into()))?
         };
         drop(_owner);
-        // Keep the graph coordination decision domain across the lease
-        // closure checkpoint commit. This checkpoint is the second durable
-        // append of a terminal wave on the same execution-graph stream:
-        // every graph-stream committer (the coalesced terminal wave,
-        // dependency reduction, a command apply, a start wave) decides its
-        // compare-and-swap revision from a snapshot loaded while holding
-        // this same lock. Dropping the domain here let the checkpoint
-        // append between such a consumer's locked load and its own append,
-        // stale its CAS (the StaleRevision expected N actual N+1 terminal
-        // wave failures with an unresolved original owner), and leave the
-        // failed wave's owner waiting on a head its commit can never
-        // rebase onto. Only the per-node callback gate is released while
-        // the physical close runs, so the one revision decision per domain
-        // hold stays the single source all downstream consumers read.
+        drop(_coordination);
+        // The physical lease release and its proof run outside the graph
+        // coordination decision domain, so slow scope or worktree IO can
+        // never serialize an unrelated successor's commits behind this
+        // closure. The durable checkpoint it certifies - the only graph
+        // revision this closure produces - is appended below, inside the
+        // same domain that the coalesced terminal wave, dependency
+        // reduction, command applies and start waves already share. That
+        // is where the checkpoint used to slip between another consumer's
+        // locked load and its own append and stale its CAS (the
+        // StaleRevision expected N actual N+1 terminal wave failures with
+        // an unresolved original owner).
         let remaining = close_deadline.saturating_duration_since(std::time::Instant::now());
-        match tokio::time::timeout(remaining, close_action).await {
-            Ok(Ok(())) => {},
+        let lease_closure_certification = match tokio::time::timeout(remaining, close_action).await {
+            Ok(Ok(certification)) => certification,
             Ok(Err(reason)) => return Err(ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown {
                 node_id: ticket.node_id.clone(), reason: format!("original lease closure unconfirmed: {reason}"),
             })),
             Err(_) => return Err(ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown {
                 node_id: ticket.node_id.clone(), reason: "original lease closure remains in flight".into(),
             })),
-        }
+        };
         if std::time::Instant::now() >= close_deadline {
             return Err(ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown {
                 node_id: ticket.node_id.clone(), reason: "original lease closure completed after deadline".into(),
             }));
         }
-        // The checkpoint above is the last graph revision decision of this
-        // owner's settlement; certification below only removes in-process
-        // ownership and appends nothing to the graph stream. Release the
-        // domain here and re-enter it through the existing
-        // `coordinate_original_gate` discipline (never wait for either lock
-        // while holding the other), so no new lock order is introduced.
-        drop(_coordination);
+        #[cfg(test)]
+        {
+            let probe = self.lease_closure_checkpoint_probe.lock().unwrap().clone();
+            if let Some(probe) = probe {
+                probe(graph_id);
+            }
+        }
+        // The checkpoint takes the graph decision domain only, never the
+        // per-node callback gate: a callback winner on the same node must
+        // keep being able to register and finish its action while this
+        // owner's durable closure is appended. The gate is taken again
+        // below for certification exactly as before.
+        if let Some(certification) = lease_closure_certification {
+            let retained = handoff.state.lock().map_err(|_| ExecutionRunnerError::Driver(
+                "original lease closure handoff unavailable".into(),
+            ))?.lease_close_resources.clone().ok_or_else(|| ExecutionRunnerError::Driver(
+                "original retained resources missing".into(),
+            ))?;
+            let checkpoint_coordination = self.graph_coordination(graph_id).await;
+            let checkpoint = self
+                .commit_certified_lease_closure_checkpoint(
+                    graph_id,
+                    node_id,
+                    &ticket,
+                    &binding,
+                    &retained,
+                    checkpoint_no_dispatch.as_ref(),
+                    certification,
+                    close_deadline,
+                )
+                .await;
+            drop(checkpoint_coordination);
+            checkpoint.map_err(|error| ExecutionRunnerError::Executor(
+                NodeExecutorError::OriginalCustodyUnknown {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("original lease closure checkpoint unconfirmed: {error}"),
+                },
+            ))?;
+        }
         let (_coordination, _owner) = self.coordinate_original_gate(graph_id, node_id, &gate, close_deadline).await?;
         #[cfg(test)]
         {
@@ -7169,12 +7346,16 @@ mod nodispatch_duration_617_tests {
 
     // The sealed terminal-wave races both came from the second checkpoint of
     // a wave terminal: the lease-closure `Recovered` append ran while its
-    // owner had already dropped graph coordination, so any coordination-side
-    // consumer (wave leader load-then-CAS, dependency reduction, command)
-    // could see the graph stream head move underneath the revision it had
-    // decided from. This test fixes the schedule: the closure driver parks
-    // at its durable checkpoint section, and a competitor must then find the
-    // graph coordination domain still owned by the closure's own task.
+    // owner held no graph coordination, so any coordination-side consumer
+    // (wave leader load-then-CAS, dependency reduction, command) could see
+    // the graph stream head move underneath the revision it had decided
+    // from. The follow-up failure mode is the opposite coupling: owning the
+    // domain across the whole physical release serializes unrelated
+    // successor dispatch behind slow lease IO. This test fixes the schedule
+    // for both edges: while the physical release runs, the domain must be
+    // acquirable; once the release is certified and the checkpoint attempt
+    // has begun, a competitor holding the domain must keep the graph stream
+    // durable-closure uncommitted until the domain is given back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn e1_lease_closure_checkpoint_is_decided_inside_graph_coordination() {
         let (_workspace, services, runner, original_graph, original_node, _) =
@@ -7207,6 +7388,15 @@ mod nodispatch_duration_617_tests {
                     .recv_timeout(Duration::from_secs(15));
             }
         }));
+        let checkpoint_reached = Arc::new(Notify::new());
+        let checkpoint_graph = graph.clone();
+        let checkpoint_signal = Arc::clone(&checkpoint_reached);
+        *runner.lease_closure_checkpoint_probe.lock().unwrap() =
+            Some(Arc::new(move |id| {
+                if id == checkpoint_graph {
+                    checkpoint_signal.notify_one();
+                }
+            }));
         let closer = {
             let runner = runner.clone();
             let graph = graph.clone();
@@ -7219,24 +7409,43 @@ mod nodispatch_duration_617_tests {
         tokio::time::timeout(Duration::from_secs(5), entered.notified())
             .await
             .expect("the original lease closure barrier must be reached");
-        // Let the closer task finish the synchronous release of the guards it
-        // held when it created the closure driver, so what is observed below
-        // is the steady parked state, not a half-poll window.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let competitor = tokio::time::timeout(
+        // Edge one: the parked physical release must not own the domain, or
+        // every successor commit of this graph would serialize behind lease
+        // IO - the failure mode the first shape of this fix introduced.
+        let domain = tokio::time::timeout(
             Duration::from_millis(500),
             runner.graph_coordination_without_command(&graph),
         )
-        .await;
-        let domain_released_while_closure_pending = competitor.is_ok();
-        drop(competitor);
+        .await
+        .expect("the physical lease release must run outside the graph decision domain");
         let _ = release_tx.send(());
+        // Edge two: once certified, the checkpoint attempt parks on the
+        // domain the test now holds. While the domain is held, the durable
+        // closure cannot exist: the append is decided in one place, inside
+        // the same domain every other graph-stream writer loads under. The
+        // pre-fix shape appended here without the domain and this assertion
+        // goes red deterministically.
+        tokio::time::timeout(Duration::from_secs(5), checkpoint_reached.notified())
+            .await
+            .expect("the certified lease closure checkpoint must reach its decision domain");
+        let pending = runner.state_store.load(&graph).unwrap();
+        let pending_position = runner
+            .state_store
+            .binding_start_position(&pending, &node_id, &binding)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !runner
+                .state_store
+                .binding_lease_closure(&pending, &node_id, &binding, pending_position)
+                .unwrap(),
+            "the lease closure checkpoint must not advance the graph stream outside its decision domain"
+        );
+        drop(domain);
         closer.await.unwrap().unwrap();
         *runner.closure_probe.lock().unwrap() = None;
-        assert!(
-            !domain_released_while_closure_pending,
-            "lease closure must not leave the graph stream open while its checkpoint commit is still pending"
-        );
+        *runner.lease_closure_checkpoint_probe.lock().unwrap() = None;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let state = runner.state_store.load(&graph).unwrap();
         let position = runner
@@ -7248,6 +7457,7 @@ mod nodispatch_duration_617_tests {
             .state_store
             .binding_lease_closure(&state, &node_id, &binding, position)
             .unwrap());
+        assert!(!runner.has_retained_shutdown_owners().await);
     }
 
     impl ScopedNodeBackendResolver for Resolver617 {
