@@ -4090,6 +4090,19 @@ impl ExecutionGraphRunner {
                     }
                     self.take_bound_active_node(graph_id, &node_id, expected_binding.as_ref())
                         .await?;
+                    // The direct successor of this node is released only once
+                    // the original binding's durable lease closure exists:
+                    // `published_dependency_predecessors` keeps a terminal
+                    // predecessor in Running state until its lease closure is
+                    // on disk, so a pump that wakes before that checkpoint
+                    // cannot release the successor yet. The wave commit
+                    // notification above therefore arrives too early to
+                    // release anything, and without a second wake-up the
+                    // successor waits for an unrelated event (the slow
+                    // sibling's completion) before it is dispatched. Wake the
+                    // pump again now that the closure is durable, so a
+                    // committed branch releases its successor immediately.
+                    durable_progress.notify_one();
                     return Ok(());
                 }
                 TerminalCommitDisposition::Superseded => {
