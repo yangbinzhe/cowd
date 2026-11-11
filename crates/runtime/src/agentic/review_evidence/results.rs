@@ -418,6 +418,27 @@ pub(super) fn process_ticket_start(
     selected.ok_or_else(|| "bounded process original ticket attempt was never started".into())
 }
 
+/// A read of original Process material is bounded by the cut that was pinned
+/// for it. When the source moved while the read ran, the material the read
+/// returned is not the material this review certified: the review is refused
+/// by name, with both heads, instead of re-pinning the source to its newer
+/// head and reading past the certified window.
+fn bounded_process_read_fence(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    read_head: u64,
+) -> Result<(), String> {
+    let observed = store
+        .stream_revision(source)
+        .map_err(|error| error.to_string())?;
+    if observed != read_head {
+        return Err(format!(
+            "bounded process original source changed during authentication; source={source} read_head={read_head} observed_head={observed}"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn authenticate_bounded_process(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     primary: &DurableRuntimeEvent,
@@ -429,18 +450,19 @@ pub(super) fn authenticate_bounded_process(
         .filter(|key| !key.is_empty())
         .ok_or("bounded process call identity missing")?;
     let source = format!("execution-effect:{key}");
-    let original = store
-        .event_by_idempotency_key(&source, &format!("{key}:receipt"))
-        .map_err(|error| error.to_string())?
+    // The original Process material is read through the cut this review
+    // pinned for it: the pin comes first, the read is bounded by that cut,
+    // and a source that moved while the read ran is refused by name instead
+    // of being re-pinned to a newer head.
+    let mut cuts = std::collections::BTreeMap::new();
+    let effect_cut = pin_result_source(store, &source, &mut cuts)?;
+    let original = result_event_at_cut(store, &source, &format!("{key}:receipt"), effect_cut)?
         .ok_or("bounded process original primary missing")?;
-    let intent = store
-        .event_by_idempotency_key(&source, &format!("{key}:intent"))
-        .map_err(|error| error.to_string())?
+    let intent = result_event_at_cut(store, &source, &format!("{key}:intent"), effect_cut)?
         .ok_or("bounded process original intent missing")?;
-    let admitted = store
-        .event_by_idempotency_key(&source, &format!("{key}:process-admission"))
-        .map_err(|error| error.to_string())?
+    let admitted = result_event_at_cut(store, &source, &format!("{key}:process-admission"), effect_cut)?
         .ok_or("bounded process original admission missing")?;
+    bounded_process_read_fence(store, &source, effect_cut)?;
     #[cfg(test)]
     let admitted = {
         let mut original = admitted;
@@ -650,7 +672,6 @@ pub(super) fn authenticate_bounded_process(
         return Err("bounded process original input budget exceeded".into());
     }
     let parent = &primary.payload["replay"]["parent_execution"];
-    let mut cuts = std::collections::BTreeMap::new();
     let (graph, node, attempt) = if parent.is_null() {
         authenticate_root_receipt_owner(store, primary, &mut cuts)?;
         let (owner, attempt, _) = original_root_effect_owner(primary)?;
@@ -666,9 +687,15 @@ pub(super) fn authenticate_bounded_process(
         let node_id = parent["node_id"]
             .as_str()
             .ok_or("bounded process parent node missing")?;
+        // The original graph is rebuilt through the cut this review pinned
+        // for it instead of being read from the hot snapshot: a graph that
+        // moved while the read ran is refused by name.
+        let graph_source = crate::execution_core::graph::graph_id_for_lookup(graph_id);
+        let graph_cut = pin_result_source(store, graph_source, &mut cuts)?;
         let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-            .load(graph_id)
+            .load_graph_at_revision(graph_source, graph_cut)
             .map_err(|error| error.to_string())?;
+        bounded_process_read_fence(store, graph_source, graph_cut)?;
         let node = graph
             .nodes
             .iter()
@@ -703,10 +730,15 @@ pub(super) fn authenticate_bounded_process(
         (graph_id.to_string(), node_id.to_string(), attempt)
     };
     let index_source = format!("execution-agent-receipts:{graph}:{node}:{attempt}");
-    let index = store
-        .event_by_idempotency_key(&index_source, &format!("agent-tool-receipt:{key}"))
-        .map_err(|error| error.to_string())?
+    let index_cut = pin_result_source(store, &index_source, &mut cuts)?;
+    let index = result_event_at_cut(
+        store,
+        &index_source,
+        &format!("agent-tool-receipt:{key}"),
+        index_cut,
+    )?
         .ok_or("bounded process original index missing")?;
+    bounded_process_read_fence(store, &index_source, index_cut)?;
     #[cfg(test)]
     let index = {
         let mut original = index;
@@ -4497,6 +4529,91 @@ fn authenticate_effect_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S9 negative control: a source that grows while the original Process
+    /// material is read is refused by name. The read is bounded by the cut
+    /// this review pinned, and the movement is not absorbed by re-pinning
+    /// the source to its newer head and reading past that window.
+    #[test]
+    fn bounded_process_read_refuses_growth_during_the_read_by_name() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let key = "s9-bounded-process-growth";
+        let source = format!("execution-effect:{key}");
+        let event = |idempotency_key: &str| crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: source.clone(),
+                scope: crate::RuntimeEventScope::ExecutionNode,
+                kind: "execution.effect.receipt".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"idempotency_key": key}),
+            },
+            idempotency_key: Some(idempotency_key.to_string()),
+            schema_version: 1,
+        };
+        store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: "s9-bounded-process-growth".into(),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id: source.clone(),
+                    expected_revision: 0,
+                }],
+                events: vec![
+                    event(&format!("{key}:receipt")),
+                    event(&format!("{key}:intent")),
+                    event(&format!("{key}:process-admission")),
+                ],
+            })
+            .unwrap();
+        let primary = store
+            .event_by_idempotency_key(&source, &format!("{key}:receipt"))
+            .unwrap()
+            .unwrap();
+        // The source grows right after the read pinned it.
+        store.inject_read_fault_once(
+            source.clone(),
+            "stream_revision",
+            1,
+            move |store| {
+                store
+                    .append_transaction(crate::AppendTransactionRequest {
+                        transaction_id: "s9-bounded-process-growth-2".into(),
+                        expected_streams: vec![crate::ExpectedStreamRevision {
+                            stream_id: format!("execution-effect:{key}"),
+                            expected_revision: 3,
+                        }],
+                        events: vec![crate::RuntimeTransactionEventInput {
+                            event: crate::RuntimeEventInput {
+                                stream_id: format!("execution-effect:{key}"),
+                                scope: crate::RuntimeEventScope::ExecutionNode,
+                                kind: "execution.effect.receipt".into(),
+                                status: None,
+                                actor: None,
+                                refs: Vec::new(),
+                                payload: serde_json::json!({"idempotency_key": key}),
+                            },
+                            idempotency_key: Some(format!("{key}:growth")),
+                            schema_version: 1,
+                        }],
+                    })
+                    .unwrap();
+            },
+        );
+        let error = match authenticate_bounded_process(&store, &primary) {
+            Ok(_) => {
+                panic!("a source that grows during the bounded-process read must be refused by name")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("bounded process original source changed during authentication")
+                && error.contains("read_head=3")
+                && error.contains("observed_head=4")
+                && error.contains(&source),
+            "{error}"
+        );
+    }
 
     #[test]
     fn original_keyed_read_respects_stream_cut_inside_one_transaction() {
