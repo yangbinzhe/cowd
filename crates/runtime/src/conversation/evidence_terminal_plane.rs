@@ -2266,13 +2266,29 @@ where
                     ),
                 },
             );
+        // The Runtime's own rendering of the turn's terminal conclusion keeps
+        // its historical meaning: it may lower a terminal class, never raise
+        // one.  A completion whose recovered tool failures were not part of a
+        // satisfied conclusion stays a partial failure, and no wording can
+        // turn an unverified completion into a success.
+        let objective_satisfied = outcome.terminal_reason.trim() == "satisfied";
         let terminal = match state.status {
             crate::execution_core::TurnStrategyDecisionStatus::Completed => {
-                crate::execution_core::business_conclusion::terminal_class_for_completion(
+                match crate::execution_core::business_conclusion::terminal_class_for_completion(
                     &verified,
                     outcome.failed_tool_calls,
                     &outcome.terminal_reason,
-                )
+                ) {
+                    harness_contract::outcome::OutcomeTerminalClass::Succeeded(reason)
+                        if outcome.failed_tool_calls > 0 && !objective_satisfied =>
+                    {
+                        harness_contract::outcome::OutcomeTerminalClass::PartialFailure(format!(
+                            "{}; {} tool calls failed before terminal synthesis",
+                            reason, outcome.failed_tool_calls
+                        ))
+                    }
+                    other => other,
+                }
             }
             crate::execution_core::TurnStrategyDecisionStatus::Cancelled => {
                 harness_contract::outcome::OutcomeTerminalClass::Cancelled(
