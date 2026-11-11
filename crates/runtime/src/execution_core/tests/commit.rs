@@ -2167,3 +2167,526 @@ fn own864_exact_receipt_sequence_binds_step_and_effect_not_reused_call_id() {
     foreign.observation_wave_sequence += 1;
     assert!(service.exact_delegated_receipt_sequence(&foreign).is_err());
 }
+
+#[test]
+fn delegated_long_receipt_compact_body_preserves_original_output() {
+    let workspace = tempfile::tempdir().unwrap();
+    let host = tools::ToolHost::builtin("delegated-compact-original", workspace.path());
+    let mut call = crate::bound_tool_batch::scope_admission_tests::bound_request(
+        &host, "read_file", json!({"path":"source.txt","complete":true}));
+    call.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id:"scope2-graph".into(), node_id:"scope2-node".into(),
+    });
+    call.parent_execution_attempt = Some(1);
+    let effect = call.compiled_invocation.as_ref().unwrap().effect.clone();
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(workspace.path().join("artifacts")));
+    store.bind_artifact_store(artifacts).unwrap();
+    let service = ExecutionCommitService::new(store.clone());
+    let mut full = outcome(&call.tool_use_id, &"x".repeat(20_936));
+    full.tool_name = call.tool_name.clone(); full.category = call.category;
+    service.commit_readonly_tool_receipts(&[(call.clone(), full.clone())]).unwrap();
+    assert_eq!(service.completed_original_delegated_read_action(&call, &effect).unwrap(), full);
+    let primary = store.event_by_idempotency_key(&format!("execution-effect:{}", call.idempotency_key),
+        &format!("{}:read-receipt", call.idempotency_key)).unwrap().unwrap();
+    let bytes = primary.payload["delegated_outcome_content_v1"]["bytes"].as_u64().unwrap();
+    assert!(bytes > 16_384 && bytes < 256 * 1024);
+
+    // A separately committed failed result keeps its full error and status;
+    // the successful delegated-action consumer must still refuse it.
+    let failure_store = Arc::new(RuntimeEventStore::for_test());
+    let failure_artifacts = Arc::new(crate::ArtifactStore::for_test_default(workspace.path().join("failure-artifacts")));
+    failure_store.bind_artifact_store(failure_artifacts).unwrap();
+    let failure_service = ExecutionCommitService::new(failure_store);
+    let mut failure = full.clone();
+    failure.status = crate::RuntimeToolExecutionStatus::Failed;
+    failure.output = None;
+    failure.error = Some("e".repeat(20_936));
+    failure_service.commit_readonly_tool_receipts(&[(call.clone(), failure.clone())]).unwrap();
+    assert_eq!(failure_service.completed_tool_effect(&call, &effect).unwrap(), Some(failure));
+    assert!(failure_service.completed_original_delegated_read_action(&call, &effect).is_err());
+}
+
+#[test]
+fn delegated_long_original_receipt_is_atomic_authenticated_and_gc_rooted() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("long.txt"), "original").unwrap();
+    let host = tools::ToolHost::builtin("delegated-long-original", workspace.path());
+    let mut call = crate::bound_tool_batch::scope_admission_tests::bound_request(
+        &host, "read_file", json!({"path":"long.txt","complete":true}));
+    call.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id:"scope2-graph".into(), node_id:"scope2-node".into(),
+    });
+    call.parent_execution_attempt = Some(1);
+    let effect = call.compiled_invocation.as_ref().unwrap().effect.clone();
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let root = workspace.path().join("artifacts");
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(&root));
+    store.bind_artifact_store(artifacts.clone()).unwrap();
+    let service = ExecutionCommitService::new(store.clone());
+    let mut graph = ExecutionGraph::new("delegated original read owner");
+    graph.id = "scope2-graph".into();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id:"scope2-session".into(), turn_id:"scope2-turn".into(), root_task_id:"task".into(),
+        task_id:"task".into(), generation:1,
+    });
+    let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", "original-read");
+    node.id = "scope2-node".into();
+    graph.nodes.push(node);
+    graph = service.register_graph(graph).unwrap().graph;
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = service.transition_node(&graph, "scope2-node", status, None, vec![]).unwrap().graph;
+    }
+    call.governed_plan_id = graph.id.clone();
+    let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path()).unwrap();
+    let scope = crate::bound_tool_batch::admitted_effect_scope(&call, &effect, Some(host.pin_snapshot()), &resolver).unwrap();
+    service.begin_bound_tool_effect(&call, &effect, &scope).unwrap();
+    let mut full = outcome(&call.tool_use_id, &format!("{}original-tail", "z".repeat(300_000)));
+    full.tool_name = call.tool_name.clone();
+    full.category = call.category;
+    service.commit_bound_readonly_tool_receipt(&call, &full, &effect, &scope).unwrap();
+    let stream = format!("execution-effect:{}", call.idempotency_key);
+    let key = format!("{}:read-receipt", call.idempotency_key);
+    let primary = store.event_by_idempotency_key(&stream, &key).unwrap().unwrap();
+    let index = store.event_by_idempotency_key(&delegated_agent_receipt_stream_id(&call).unwrap(),
+        &delegated_agent_receipt_key(&call)).unwrap().unwrap();
+    assert_eq!(primary.transaction_id, index.transaction_id);
+    assert_eq!(primary.commit_cursor, index.commit_cursor);
+    assert!(primary.transaction_index < index.transaction_index);
+    assert_eq!(primary.payload["outcome_truncated"], true);
+    assert_eq!(primary.payload["delegated_outcome_content_v1"], index.payload["delegated_outcome_content_v1"]);
+    assert_eq!(service.completed_original_delegated_read_action(&call, &effect).unwrap(), full);
+    // Run the existing delegated read recovery consumer against the original pair.
+    assert_eq!(agent_tool::agent_read_terminal_from_store(&store, &service, &call, &effect).unwrap(), Some(full.clone()));
+    service.commit_bound_readonly_tool_receipt(&call, &full, &effect, &scope).unwrap();
+    let mut different_tail = full.clone();
+    different_tail.output = Some(format!("{}different-tail", "z".repeat(300_000)));
+    assert!(service.commit_bound_readonly_tool_receipt(&call, &different_tail, &effect, &scope).is_err());
+    let mut foreign = call.clone();
+    foreign.session_id = Some("other-session".into());
+    assert!(service.completed_original_delegated_read_action(&foreign, &effect).is_err());
+    let as_input = |event: &crate::DurableRuntimeEvent| RuntimeTransactionEventInput {
+        event: RuntimeEventInput { stream_id:event.stream_id.clone(), scope:event.scope, kind:event.kind.clone(),
+            status:event.status.clone(), actor:event.actor.clone(), refs:event.refs.clone(), payload:event.payload.clone() },
+        idempotency_key:event.idempotency_key.clone(), schema_version:event.schema_version,
+    };
+    let mut forged_index = as_input(&index);
+    forged_index.event.payload["delegated_outcome_content_v1"]["sha256"] = json!(format!("sha256:{}", "0".repeat(64)));
+    let before_primary = store.stream_revision(&primary.stream_id).unwrap();
+    let before_index = store.stream_revision(&index.stream_id).unwrap();
+    let error = store.append_transaction(AppendTransactionRequest {
+        transaction_id:"forged-delegated-outcome".into(),
+        expected_streams:vec![ExpectedStreamRevision { stream_id:primary.stream_id.clone(), expected_revision:before_primary },
+            ExpectedStreamRevision { stream_id:index.stream_id.clone(), expected_revision:before_index }],
+        events:vec![as_input(&primary), forged_index],
+    }).unwrap_err();
+    assert!(error.to_string().contains("delegated outcome primary/index"), "{error}");
+    assert_eq!(store.stream_revision(&primary.stream_id).unwrap(), before_primary);
+    assert_eq!(store.stream_revision(&index.stream_id).unwrap(), before_index);
+    let mut tampered = primary.clone();
+    tampered.payload["delegated_outcome_content_v1"]["sha256"] = json!(format!("sha256:{}", "0".repeat(64)));
+    let artifact: crate::ArtifactRef = serde_json::from_value(
+        primary.payload["delegated_outcome_content_v1"]["body"]["artifact"].clone()).unwrap();
+    assert_ne!(RuntimeEventStore::delegated_outcome_root(Some(&tampered), Some(&index), &artifact),
+        crate::PreparedContentRoot::Canonical);
+    let record = artifacts.repository().record(artifact.selector.strip_prefix("artifact://").unwrap()).unwrap().unwrap();
+    let (object, _) = artifacts.repository().checkpoint_object_metadata(&record.sha256).unwrap().unwrap();
+    let digest = artifact.sha256.strip_prefix("sha256:").unwrap();
+    let blob = root.join("objects").join(&digest[..2]).join(digest).join(object.generation);
+    let bytes = std::fs::read(&blob).unwrap();
+    std::fs::remove_file(&blob).unwrap();
+    assert!(service.completed_original_delegated_read_action(&call, &effect).is_err());
+    assert!(agent_tool::agent_read_terminal_from_store(&store, &service, &call, &effect).is_err());
+    std::fs::write(&blob, bytes).unwrap();
+    assert_eq!(service.completed_original_delegated_read_action(&call, &effect).unwrap(), full);
+    // The new storage channel must not turn an unknown outcome into success.
+    let unknown_store = Arc::new(RuntimeEventStore::for_test());
+    let unknown_artifacts = Arc::new(crate::ArtifactStore::for_test_default(workspace.path().join("unknown-artifacts")));
+    unknown_store.bind_artifact_store(unknown_artifacts).unwrap();
+    let unknown_service = ExecutionCommitService::new(unknown_store);
+    let mut unknown = full.clone();
+    unknown.status = crate::RuntimeToolExecutionStatus::Unknown;
+    unknown_service.commit_readonly_tool_receipts(&[(call.clone(), unknown)]).unwrap();
+    assert!(unknown_service.completed_original_delegated_read_action(&call, &effect).is_err());
+    drop(unknown_service);
+    let roots = store.quiesced_content_roots();
+    drop(service); drop(store);
+    let mut artifacts = Arc::try_unwrap(artifacts).ok().unwrap();
+    let gc = roots.reconcile_prepared_batch(&mut artifacts, true, "delegated-outcome", "canonical").unwrap();
+    assert_eq!(gc.referenced_canonical, 1);
+    assert_eq!(gc.retired_records, 0);
+    assert_eq!(gc.blocked, 0);
+}
+
+#[test]
+fn agent_leaf_large_outcome_uses_original_node_content_and_transaction() {
+    let workspace = tempfile::tempdir().unwrap();
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(workspace.path().join("artifacts")));
+    store.bind_artifact_store(artifacts.clone()).unwrap();
+    let service = ExecutionCommitService::new(store.clone());
+    let mut graph = ExecutionGraph::new("large original ToolBatch outcome");
+    graph.id = "agent-tool-batch:large-outcome".into();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: "session".into(), turn_id: "turn".into(), root_task_id: "task".into(),
+        task_id: "task".into(), generation: 1,
+    });
+    let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", "fixture");
+    node.id = "agent-tool:large-outcome".into();
+    graph.nodes.push(node);
+    graph = service.register_graph(graph).unwrap().graph;
+    graph = service.transition_node(&graph, "agent-tool:large-outcome", ExecutionNodeStatus::Ready, None, vec![]).unwrap().graph;
+    let binding = ExecutionNodeBinding { executor_kind: "tool_batch".into(),
+        ticket_idempotency_key: graph.nodes[0].idempotency_key.clone(), attempt: 1,
+        resource_lease_refs: vec![], scope_lease_ref: None, worktree_lease_ref: None };
+    graph = service.bind_and_start_node(&graph, "agent-tool:large-outcome", binding).unwrap().graph;
+    let ticket = super::super::registry::NodeExecutionTicket {
+        graph_id: graph.id.clone(), node_id: graph.nodes[0].id.clone(),
+        executor_kind: "tool_batch".into(), service_class: graph.service_class,
+        attempt: 1, idempotency_key: graph.nodes[0].idempotency_key.clone(),
+        payload_ref: graph.nodes[0].payload_ref.clone(),
+    };
+    let original = outcome("large-call", &"large original content\n".repeat(100_000));
+    let result = agent_tool::agent_tool_outcome_at(&original, 123).unwrap();
+    let lost = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    service.inject_node_outcome_response_loss_for_test(&ticket.node_id, lost.clone());
+    let committed = service.transition_execution_outcome(&graph, &ticket, &result, &BTreeMap::new()).unwrap();
+    assert_eq!(lost.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let value = committed.graph.node_results[&ticket.node_id].result_ref.as_deref().unwrap();
+    assert!(value.starts_with("agent-tool-outcome-content-v1:"));
+    assert!(value.len() < 16 * 1024);
+    let restored = agent_tool::resolve_agent_tool_outcome_reference(&store, "session", &graph.id,
+        &ticket.node_id, value).unwrap();
+    assert_eq!(restored, original);
+    assert!(agent_tool::resolve_agent_tool_outcome_reference(&store, "foreign", &graph.id,
+        &ticket.node_id, value).is_err());
+    assert!(agent_tool::resolve_agent_tool_outcome_reference(&store, "session", &graph.id,
+        "foreign-node", value).is_err());
+    let node_event = store.event_by_idempotency_key(&format!("{}:node:{}", graph.id, ticket.node_id),
+        &format!("{}:{}:{}", graph.id, ticket.node_id, committed.graph.revision)).unwrap().unwrap();
+    assert_eq!(node_event.transaction_id, committed.transaction.transaction_id);
+    assert_eq!(node_event.commit_cursor, committed.transaction.commit_cursor);
+    assert_eq!(node_event.payload["result"]["result_ref"], value);
+    let graph_events = store.list_stream(&graph.id).unwrap();
+    let graph_event = graph_events.iter().find(|event| event.transaction_id == node_event.transaction_id).unwrap();
+    assert_eq!(graph_event.commit_cursor, node_event.commit_cursor);
+    let missing = RuntimeEventStore::for_test();
+    assert!(agent_tool::resolve_agent_tool_outcome_reference(&missing, "session", &graph.id,
+        &ticket.node_id, value).is_err());
+    let mut forged = value.to_string();
+    forged.push('x');
+    assert!(agent_tool::resolve_agent_tool_outcome_reference(&store, "session", &graph.id,
+        &ticket.node_id, &forged).is_err());
+    let reference: agent_tool::AgentToolOutcomeReference = serde_json::from_str(
+        value.strip_prefix(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE).unwrap()).unwrap();
+    let artifact: crate::ArtifactRef = serde_json::from_value(reference.content["body"]["artifact"].clone()).unwrap();
+    let origin = crate::PreparedArtifactOrigin::EventBody { stream_id: reference.stream_id,
+        idempotency_key: reference.idempotency_key, kind: "execution_node.transitioned".into() };
+    // Identical bytes and session do not turn another owner's artifact into
+    // the original node's prepared content.
+    let negative_artifacts = Arc::new(crate::ArtifactStore::for_test_default(workspace.path().join("negative-artifacts")));
+    let negative_store = RuntimeEventStore::for_test();
+    negative_store.bind_artifact_store(negative_artifacts.clone()).unwrap();
+    // Reuse the exact bytes prepared by the original content owner. Serialising
+    // the DTO directly can use a different JSON object key order.
+    let bytes = artifacts.read_prepared_blocking(&artifact, "session:session", &origin).unwrap();
+    assert_eq!(serde_json::from_slice::<crate::RuntimeToolExecutionOutcome>(&bytes).unwrap(), original);
+    let source = workspace.path().join("live-outcome.json");
+    std::fs::write(&source, &bytes).unwrap();
+    let live = negative_artifacts.write_path_blocking(harness_contract::context::ArtifactWriteDescriptor {
+        media_type: "application/json".into(), visibility_scope: "session:session".into(),
+        expected_bytes: Some(bytes.len() as u64), original_name: None,
+    }, &source).unwrap();
+    assert_eq!(live.sha256, artifact.sha256);
+    let mut foreign_envelope = reference.content.clone();
+    foreign_envelope["body"]["artifact"] = serde_json::to_value(&live).unwrap();
+    assert!(negative_store.resolve_prepared_agent_tool_content("session:session", &foreign_envelope, &origin).is_err());
+    let foreign_origin = crate::PreparedArtifactOrigin::EventBody {
+        stream_id: "foreign-node".into(), idempotency_key: "foreign-key".into(), kind: "execution_node.transitioned".into() };
+    let foreign = negative_artifacts.write_pre_pinned_blocking("session:session", "foreign", &bytes, &foreign_origin).unwrap();
+    assert_eq!(foreign.sha256, artifact.sha256);
+    foreign_envelope["body"]["artifact"] = serde_json::to_value(&foreign).unwrap();
+    assert!(negative_store.resolve_prepared_agent_tool_content("session:session", &foreign_envelope, &origin).is_err());
+    let foreign_record = negative_artifacts.repository().record(foreign.selector.strip_prefix("artifact://").unwrap()).unwrap().unwrap();
+    negative_artifacts.repository().adopt_live(&foreign_record).unwrap();
+    let restored = negative_store.resolve_prepared_agent_tool_content("session:session", &foreign_envelope, &foreign_origin).unwrap();
+    assert_eq!(serde_json::from_value::<crate::RuntimeToolExecutionOutcome>(restored).unwrap(), original);
+    assert!(negative_store.resolve_prepared_agent_tool_content("session:session", &foreign_envelope, &origin).is_err());
+    let roots = store.quiesced_content_roots();
+    drop(service);
+    drop(store);
+    let mut artifacts = Arc::try_unwrap(artifacts).ok().unwrap();
+    let gc = roots.reconcile_prepared_batch(&mut artifacts, true, "agent-outcome-test", "canonical").unwrap();
+    assert_eq!(gc.referenced_canonical, 1);
+    assert_eq!(gc.retired_records, 0);
+    assert_eq!(gc.blocked, 0);
+    let bytes = artifacts.read_prepared_blocking(&artifact, "session:session", &origin).unwrap();
+    assert_eq!(serde_json::from_slice::<crate::RuntimeToolExecutionOutcome>(&bytes).unwrap(), original);
+}
+
+#[test]
+fn agent_leaf_wave_externalizes_only_needed_results_atomically() {
+    exercise_agent_leaf_wave_externalization(false);
+}
+
+#[test]
+fn agent_leaf_wave_force_externalizes_small_inline_result() {
+    exercise_agent_leaf_wave_externalization(true);
+}
+
+fn exercise_agent_leaf_wave_externalization(force_inline: bool) {
+    let workspace = tempfile::tempdir().unwrap();
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(workspace.path().join("artifacts")));
+    store.bind_artifact_store(artifacts.clone()).unwrap();
+    let service = ExecutionCommitService::new(store.clone());
+    let mut graph = ExecutionGraph::new("large ToolBatch wave");
+    graph.id = "agent-tool-batch:wave-outcome".into();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: "session".into(), turn_id: "turn".into(), root_task_id: "task".into(),
+        task_id: "task".into(), generation: 1,
+    });
+    let node_ids: &[&str] = if force_inline {
+        &["wave-a", "wave-b", "wave-c", "wave-d"]
+    } else {
+        &["wave-a", "wave-b", "wave-c"]
+    };
+    for &id in node_ids {
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", "fixture");
+        node.id = id.into();
+        graph.nodes.push(node);
+    }
+    graph = service.register_graph(graph).unwrap().graph;
+    for &id in node_ids {
+        graph = service.transition_node(&graph, id, ExecutionNodeStatus::Ready, None, vec![]).unwrap().graph;
+        let spec = graph.nodes.iter().find(|node| node.id == id).unwrap();
+        let binding = ExecutionNodeBinding { executor_kind: spec.executor_kind.clone(),
+            ticket_idempotency_key: spec.idempotency_key.clone(), attempt: 1,
+            resource_lease_refs: vec![], scope_lease_ref: None, worktree_lease_ref: None };
+        graph = service.bind_and_start_node(&graph, id, binding).unwrap().graph;
+    }
+    // Each doubled single-node preview fits; three large members together
+    // exceed the wave budget and force the small first candidate.
+    let body = "x".repeat(if force_inline { 350_000 } else { 400_000 });
+    let originals: Vec<_> = node_ids.iter().map(|&id|
+        outcome(id, if force_inline && id == "wave-a" { "small" } else { &body })).collect();
+    let make_transitions = || originals.iter().map(|original| ExecutionTerminalCommit {
+        node_id: original.tool_use_id.clone(),
+        outcome: agent_tool::agent_tool_outcome_at(original, 123).unwrap(), effect_ticket: None,
+    }).collect::<Vec<_>>();
+    if force_inline {
+        const WAVE_BUDGET: usize = 1024 * 1024 - 64 * 1024;
+        let transitions = make_transitions();
+        assert_eq!(transitions[0].node_id, "wave-a", "the small member is the first force candidate");
+        let mut wave_preview = graph.clone();
+        for transition in &transitions {
+            let original = &transition.outcome.result;
+            let from = graph.node_statuses[&transition.node_id];
+            let single = apply_node_transition(&graph, graph.revision, &transition.node_id,
+                original.status, Some(original.clone())).unwrap();
+            let single_event = ExecutionGraphEvent::NodeTransitioned {
+                node_id: transition.node_id.clone(), from, to: original.status,
+                result: Some(original.clone()), binding: None,
+                delta: ExecutionGraphDelta::between(&graph, &single),
+            };
+            let single_bytes = serde_json::to_vec(&single_event).unwrap().len();
+            assert!(single_bytes < WAVE_BUDGET, "single member {} preview {single_bytes} must fit", transition.node_id);
+            let binding = ExecutionGraphStateStore::new(store.clone())
+                .current_binding(&graph, &transition.node_id, 1).unwrap();
+            let spec = graph.nodes.iter().find(|node| node.id == transition.node_id).unwrap();
+            let ticket = super::super::registry::NodeExecutionTicket {
+                graph_id: graph.id.clone(), node_id: transition.node_id.clone(),
+                executor_kind: binding.executor_kind, service_class: graph.service_class,
+                attempt: binding.attempt, idempotency_key: binding.ticket_idempotency_key,
+                payload_ref: spec.payload_ref.clone(),
+            };
+            let prepared = service.prepare_leaf_tool_result(&graph, &ticket, original, false).unwrap();
+            assert_eq!(&prepared, original, "single member must not be externalized before wave sizing");
+            wave_preview = apply_node_transition(&wave_preview, wave_preview.revision,
+                &transition.node_id, original.status, Some(original.clone())).unwrap();
+        }
+        wave_preview.revision = graph.revision.saturating_add(1);
+        let wave = ExecutionGraphEvent::NodesTransitioned {
+            node_ids: transitions.iter().map(|transition| transition.node_id.clone()).collect(),
+            delta: ExecutionGraphDelta::between(&graph, &wave_preview),
+        };
+        let wave_bytes = serde_json::to_vec(&wave).unwrap().len();
+        assert!(wave_bytes > WAVE_BUDGET, "aggregate preview {wave_bytes} must trigger force");
+    }
+    let head = store.stream_revision(&graph.id).unwrap();
+    let mut stale = make_transitions();
+    stale[0].outcome.source_revisions.insert("goal:missing-original-source".into(), 1);
+    assert!(service.transition_nodes(&graph, stale).is_err());
+    assert_eq!(store.stream_revision(&graph.id).unwrap(), head);
+    assert_eq!(ExecutionGraphStateStore::new(store.clone()).load(&graph.id).unwrap(), graph);
+    let receipt = service.transition_nodes(&graph, make_transitions()).unwrap();
+    let stored_refs: Vec<_> = originals.iter().map(|original| receipt.graph.node_results[&original.tool_use_id]
+        .result_ref.as_deref().unwrap()).collect();
+    assert!(stored_refs[0].starts_with("agent-tool-outcome-content-v1:"));
+    if !force_inline {
+        assert!(stored_refs[1..].iter().all(|value| value.starts_with("agent-tool-outcome:")));
+    }
+    let first_reference = stored_refs[0].to_string();
+    let graph_event = store.list_stream(&graph.id).unwrap().into_iter()
+        .find(|event| event.transaction_id == receipt.transaction.transaction_id).unwrap();
+    assert_eq!(graph_event.kind, "execution_graph.checkpoint");
+    let graph_body = store.resolve_graph_record(&graph_event).unwrap();
+    assert_eq!(graph_body["graph"]["node_results"]["wave-a"]["result_ref"], first_reference);
+    let node_key = format!("{}:wave-a:{}", graph.id, receipt.graph.revision);
+    let original_node = store.event_by_idempotency_key(&format!("{}:node:wave-a", graph.id), &node_key).unwrap().unwrap();
+    let mut forged_body = graph_body.clone();
+    forged_body["graph"]["node_results"]["wave-a"]["result_ref"] = serde_json::json!("forged");
+    let forged_key = format!("{}:forged-checkpoint", graph.id);
+    let origin = crate::PreparedArtifactOrigin::EventBody { stream_id: graph.id.clone(),
+        idempotency_key: forged_key.clone(), kind: graph_event.kind.clone() };
+    let mut forged_payload = store.prepare_content("session:session", &forged_key, &forged_body, &origin).unwrap();
+    forged_payload["_runtime_activity_binding"] = graph_event.payload["_runtime_activity_binding"].clone();
+    let convert = |event: &crate::DurableRuntimeEvent| crate::RuntimeTransactionEventInput {
+        event: crate::RuntimeEventInput { stream_id: event.stream_id.clone(), scope: event.scope,
+            kind: event.kind.clone(), status: event.status.clone(), actor: event.actor.clone(),
+            refs: event.refs.clone(), payload: event.payload.clone() },
+        schema_version: event.schema_version, idempotency_key: event.idempotency_key.clone(),
+    };
+    let mut forged_graph = convert(&graph_event);
+    forged_graph.idempotency_key = Some(forged_key);
+    forged_graph.event.payload = forged_payload;
+    let mut forged = crate::AppendTransactionRequest { transaction_id: "forged-checkpoint".into(),
+        expected_streams: vec![], events: vec![forged_graph, convert(&original_node)] };
+    let error = store.validate_content_publication(&mut forged).unwrap_err();
+    assert!(error.to_string().contains("original ToolBatch graph result mismatch"), "{error}");
+    for (original, value) in originals.iter().zip(stored_refs) {
+        assert_eq!(agent_tool::resolve_agent_tool_outcome_reference(&store, "session", &graph.id,
+            &original.tool_use_id, value).unwrap(), *original);
+        let key = format!("{}:{}:{}", graph.id, original.tool_use_id, receipt.graph.revision);
+        let event = store.event_by_idempotency_key(&format!("{}:node:{}", graph.id, original.tool_use_id),
+            &key).unwrap().unwrap();
+        assert_eq!(event.transaction_id, receipt.transaction.transaction_id);
+        assert_eq!(event.commit_cursor, receipt.transaction.commit_cursor);
+    }
+    let reference: agent_tool::AgentToolOutcomeReference = serde_json::from_str(
+        first_reference.strip_prefix(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE).unwrap()).unwrap();
+    if force_inline {
+        assert_eq!(reference.content["body"]["kind"], "inline");
+        return;
+    }
+    let artifact: crate::ArtifactRef = serde_json::from_value(reference.content["body"]["artifact"].clone()).unwrap();
+    // A committed private record must not be retired as an orphan; remove the
+    // isolated test blob to exercise a genuinely missing physical object.
+    let object = artifacts.repository().object(&artifact.sha256).unwrap().unwrap();
+    assert_eq!(object.tier, crate::ArtifactObjectTier::Blob);
+    let digest = artifact.sha256.strip_prefix("sha256:").unwrap();
+    let blob = workspace.path().join("artifacts").join("objects").join(&digest[..2])
+        .join(digest).join(&object.generation);
+    assert!(blob.is_file());
+    std::fs::remove_file(blob).unwrap();
+    assert!(artifacts.repository().record(artifact.selector.strip_prefix("artifact://").unwrap()).unwrap().is_some());
+    assert!(agent_tool::resolve_agent_tool_outcome_reference(&store, "session", &graph.id,
+        "wave-a", &first_reference).is_err());
+}
+
+#[test]
+fn agent_leaf_prepared_outcome_stale_cas_is_not_a_gc_root() {
+    let workspace = tempfile::tempdir().unwrap();
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let artifacts = Arc::new(crate::ArtifactStore::for_test_default(workspace.path().join("artifacts")));
+    store.bind_artifact_store(artifacts.clone()).unwrap();
+    let service = ExecutionCommitService::new(store.clone());
+    let mut graph = ExecutionGraph::new("original leaf stale CAS");
+    graph.id = "agent-tool-batch:stale-outcome".into();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: "session".into(), turn_id: "turn".into(), root_task_id: "task".into(),
+        task_id: "task".into(), generation: 1,
+    });
+    for id in ["stale-owner", "other-node", "committed-owner", "missing-owner"] {
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", "fixture");
+        node.id = id.into(); graph.nodes.push(node);
+    }
+    graph = service.register_graph(graph).unwrap().graph;
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = service.transition_node(&graph, "committed-owner", status, None, vec![]).unwrap().graph;
+    }
+    let committed_spec = graph.nodes.iter().find(|node| node.id == "committed-owner").unwrap();
+    let committed_ticket = super::super::registry::NodeExecutionTicket { graph_id: graph.id.clone(),
+        node_id: committed_spec.id.clone(), executor_kind: "tool_batch".into(), service_class: graph.service_class,
+        attempt: 1, idempotency_key: committed_spec.idempotency_key.clone(), payload_ref: committed_spec.payload_ref.clone() };
+    let committed_original = outcome("committed", &"committed staged bytes\n".repeat(100_000));
+    let committed_node = agent_tool::agent_tool_outcome_at(&committed_original, 123).unwrap();
+    let committed_result = service.prepare_leaf_tool_result(&graph, &committed_ticket, &committed_node.result, false).unwrap();
+    let committed_ref: agent_tool::AgentToolOutcomeReference = serde_json::from_str(committed_result.result_ref.as_deref().unwrap()
+        .strip_prefix(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE).unwrap()).unwrap();
+    let committed_artifact: crate::ArtifactRef = serde_json::from_value(committed_ref.content["body"]["artifact"].clone()).unwrap();
+    let committed_origin = crate::PreparedArtifactOrigin::EventBody { stream_id: committed_ref.stream_id,
+        idempotency_key: committed_ref.idempotency_key, kind: "execution_node.transitioned".into() };
+    graph = service.transition_node(&graph, "committed-owner", ExecutionNodeStatus::Completed, Some(committed_result), vec![]).unwrap().graph;
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = service.transition_node(&graph, "missing-owner", status, None, vec![]).unwrap().graph;
+    }
+    let missing_spec = graph.nodes.iter().find(|node| node.id == "missing-owner").unwrap();
+    let missing_ticket = super::super::registry::NodeExecutionTicket { graph_id: graph.id.clone(),
+        node_id: missing_spec.id.clone(), executor_kind: "tool_batch".into(), service_class: graph.service_class,
+        attempt: 1, idempotency_key: missing_spec.idempotency_key.clone(), payload_ref: missing_spec.payload_ref.clone() };
+    let missing_original = outcome("missing", &"missing staged bytes\n".repeat(100_000));
+    let missing_node = agent_tool::agent_tool_outcome_at(&missing_original, 123).unwrap();
+    let missing_result = service.prepare_leaf_tool_result(&graph, &missing_ticket, &missing_node.result, false).unwrap();
+    let missing_ref: agent_tool::AgentToolOutcomeReference = serde_json::from_str(missing_result.result_ref.as_deref().unwrap()
+        .strip_prefix(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE).unwrap()).unwrap();
+    let missing_artifact: crate::ArtifactRef = serde_json::from_value(missing_ref.content["body"]["artifact"].clone()).unwrap();
+    // This staged origin has no committed node event. Retire precisely the
+    // prepared candidate using the existing uncommitted-content test path.
+    let before_missing = store.stream_revision(&graph.id).unwrap();
+    assert!(store.event_by_idempotency_key(&missing_ref.stream_id, &missing_ref.idempotency_key).unwrap().is_none());
+    let missing_id = missing_artifact.selector.strip_prefix("artifact://").unwrap();
+    let record = artifacts.repository().record(missing_id).unwrap().unwrap();
+    let object = artifacts.repository().object(&record.sha256).unwrap().unwrap();
+    assert_eq!(artifacts.repository().retire_prepared(&crate::PreparedArtifactCandidate {
+        record, generation: object.generation,
+    }).unwrap(), crate::PreparedArtifactRetirement::Removed);
+    assert!(artifacts.repository().record(missing_id).unwrap().is_none());
+    let missing_error = service.transition_node(&graph, "missing-owner", ExecutionNodeStatus::Completed, Some(missing_result), vec![]).err().expect("missing content must reject publication");
+    assert!(missing_error.to_string().contains("original ToolBatch artifact missing"), "{missing_error}");
+    assert_eq!(store.stream_revision(&graph.id).unwrap(), before_missing);
+    assert!(store.event_by_idempotency_key(&missing_ref.stream_id, &missing_ref.idempotency_key).unwrap().is_none());
+    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+        graph = service.transition_node(&graph, "stale-owner", status, None, vec![]).unwrap().graph;
+    }
+    let spec = graph.nodes.iter().find(|node| node.id == "stale-owner").unwrap();
+    let ticket = super::super::registry::NodeExecutionTicket { graph_id: graph.id.clone(),
+        node_id: spec.id.clone(), executor_kind: "tool_batch".into(), service_class: graph.service_class,
+        attempt: 1, idempotency_key: spec.idempotency_key.clone(), payload_ref: spec.payload_ref.clone() };
+    let original = outcome("stale", &"real staged bytes\n".repeat(100_000));
+    let node_outcome = agent_tool::agent_tool_outcome_at(&original, 123).unwrap();
+    let prepared = service.prepare_leaf_tool_result(&graph, &ticket, &node_outcome.result, false).unwrap();
+    let encoded = prepared.result_ref.as_deref().unwrap().strip_prefix(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE).unwrap();
+    let reference: agent_tool::AgentToolOutcomeReference = serde_json::from_str(encoded).unwrap();
+    let artifact: crate::ArtifactRef = serde_json::from_value(reference.content["body"]["artifact"].clone()).unwrap();
+    assert!(artifacts.repository().record(artifact.selector.strip_prefix("artifact://").unwrap()).unwrap().is_some());
+    // Advance an independent original source only after the pre-pinned outcome
+    // and its complete append have been prepared. Advancing the graph itself
+    // would reuse the graph-revision event key and fail at idempotency first.
+    let source = "agent-outcome:stale-source";
+    let graph_head = store.stream_revision(&graph.id).unwrap();
+    assert_eq!(store.stream_revision(source).unwrap(), 0);
+    let append = service.prepare_transition_node(&graph, "stale-owner", ExecutionNodeStatus::Completed,
+        Some(prepared), vec![], &BTreeMap::from([(source.to_string(), 0)]), None).unwrap();
+    store.append(RuntimeEventInput { stream_id: source.into(), scope: RuntimeEventScope::ExecutionNode,
+        kind: "fixture.source".into(), status: None, actor: Some("test".into()), refs: Vec::new(),
+        payload: serde_json::json!({"source":source}) }).unwrap();
+    assert_eq!(store.stream_revision(source).unwrap(), 1);
+    let stale_error = service.commit_prepared_graph_append(append).err().expect("stale source CAS must fail");
+    assert!(matches!(&stale_error,
+        ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision { stream_id, expected: 0, actual: 1 })
+            if stream_id == source), "{stale_error}");
+    assert_eq!(store.stream_revision(&graph.id).unwrap(), graph_head);
+    assert_eq!(ExecutionGraphStateStore::new(store.clone()).load(&graph.id).unwrap(), graph);
+    assert!(store.event_by_idempotency_key(&reference.stream_id, &reference.idempotency_key).unwrap().is_none());
+    let roots = store.quiesced_content_roots();
+    drop(service); drop(store);
+    let mut artifacts = Arc::try_unwrap(artifacts).ok().unwrap();
+    let report = roots.reconcile_prepared_batch(&mut artifacts, true, "agent-outcome-test", "stale").unwrap();
+    assert_eq!(report.blocked, 0);
+    assert!(report.retired_records >= 1);
+    assert!(report.referenced_canonical >= 1);
+    assert!(artifacts.repository().record(artifact.selector.strip_prefix("artifact://").unwrap()).unwrap().is_none());
+    let bytes = artifacts.read_prepared_blocking(&committed_artifact, "session:session", &committed_origin).unwrap();
+    assert_eq!(serde_json::from_slice::<crate::RuntimeToolExecutionOutcome>(&bytes).unwrap(), committed_original);
+}

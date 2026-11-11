@@ -3403,19 +3403,10 @@ fn program_session(primary: &crate::DurableRuntimeEvent) -> Result<String, Strin
         .map(str::to_string).ok_or_else(|| "original composite session missing".into())
 }
 
-fn collect_actual_acquisition(
-    store: &std::sync::Arc<RuntimeEventStore>,
-    program: &AgenticProgramProjection,
+pub(super) fn verify_actual_read_pair(
     primary: &crate::DurableRuntimeEvent,
     index: &crate::DurableRuntimeEvent,
-    original_input: Option<&serde_json::Value>,
-    session_events: &[crate::DurableRuntimeEvent],
-    boundary: &super::results::ResultInputBoundary,
-    readers: super::ResultContentReaders<'_>,
-    actual: &mut ActualInputSnapshot,
-    windows: &mut std::collections::BTreeMap<String, Vec<ActualFileWindow>>,
-) -> Result<(), String> {
-    use crate::context_evidence::{ReadExtent, READ_ACQUISITION_FIELD};
+) -> Result<ToolEffectDescriptor, String> {
     let descriptor = super::results::receipt_effect_descriptor(primary)?;
     if primary.kind != "execution.read.receipt"
         || primary.schema_version != 1
@@ -3442,9 +3433,28 @@ fn collect_actual_acquisition(
         || primary.payload["resolved_effect_scope"] != index.payload["resolved_effect_scope"]
         || primary.payload["outcome"]["status"] != "executed"
         || primary.payload["outcome"]["error"].as_str().is_some()
-        || primary.commit_cursor >= boundary.cursor
         || descriptor.effect_kind != ToolEffectKind::Read
     {
+        return Err("actual input does not authenticate one strictly earlier acquisition".into());
+    }
+    Ok(descriptor)
+}
+
+fn collect_actual_acquisition(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    primary: &crate::DurableRuntimeEvent,
+    index: &crate::DurableRuntimeEvent,
+    original_input: Option<&serde_json::Value>,
+    session_events: &[crate::DurableRuntimeEvent],
+    boundary: &super::results::ResultInputBoundary,
+    readers: super::ResultContentReaders<'_>,
+    actual: &mut ActualInputSnapshot,
+    windows: &mut std::collections::BTreeMap<String, Vec<ActualFileWindow>>,
+) -> Result<(), String> {
+    use crate::context_evidence::{ReadExtent, READ_ACQUISITION_FIELD};
+    let descriptor = verify_actual_read_pair(primary, index)?;
+    if primary.commit_cursor >= boundary.cursor {
         return Err("actual input does not authenticate one strictly earlier acquisition".into());
     }
     for event in [primary, index] {
@@ -3452,6 +3462,22 @@ fn collect_actual_acquisition(
         retain_actual_material(&mut actual.material_events, event);
     }
     let seal_value = &primary.payload[READ_ACQUISITION_FIELD];
+    if primary.payload["tool_name"].as_str() == Some("read_ref") {
+        let input = match (original_input, seal_value.is_null()) {
+            (Some(input), _) => Some(input),
+            (None, true) => return Err("unsealed read_ref original input unavailable".into()),
+            (None, false) => None,
+        };
+        if let Some(input) = input {
+            if crate::agentic::action_invocation::read_ref_directory_input(input)?.is_some() {
+                if !seal_value.is_null() {
+                    return Err("directory metadata has an unexpected acquisition seal".into());
+                }
+                // Directory state is metadata, not immutable artifact material.
+                return Ok(());
+            }
+        }
+    }
     if seal_value.is_null() {
         if collect_actual_nested_acquisitions(store, primary, index, original_input, session_events,
             boundary, readers, actual, windows)? {
@@ -3614,7 +3640,7 @@ fn collect_actual_acquisition(
     Ok(())
 }
 
-fn authenticate_unsealed_delegated_input(
+pub(super) fn authenticate_unsealed_delegated_input(
     store: &std::sync::Arc<RuntimeEventStore>,
     primary: &crate::DurableRuntimeEvent,
     index: &crate::DurableRuntimeEvent,
@@ -8693,6 +8719,18 @@ mod tests {
             },
         });
 
+        // Producer paths can refer to the same physical packet more than once.
+        let source = format!("execution-agent-receipts:{}:{}:{}", packet.graph_id(), packet.node_id(), packet.attempt);
+        let identical = vec![packet.clone(), packet.clone()];
+        assert!(super::super::directory_read_packet(&identical, &source).is_ok());
+        assert!(super::super::directory_read_packet(&identical, "execution-agent-receipts:missing").is_err());
+        let mut changed = packet.clone();
+        changed.objective.push_str(" changed");
+        assert!(super::super::directory_read_packet(&[packet.clone(), changed], &source).is_err());
+        let mut later = packet.clone();
+        later.attempt += 1;
+        assert!(super::super::directory_read_packet(&[later], &source).is_err());
+
         // The member's own read: a unified read of a durable record.
         let input = serde_json::json!({"reference": "artifact://art-gc"});
         let input_text = serde_json::to_string(&input).unwrap();
@@ -9025,6 +9063,14 @@ mod tests {
             .unwrap()
             .clone();
 
+        verify_actual_read_pair(&primary, &index).expect("original Read pair");
+        let mut foreign = index.clone();
+        foreign.transaction_id.push_str("-foreign");
+        assert!(verify_actual_read_pair(&primary, &foreign).is_err());
+        let mut changed = index.clone();
+        changed.payload["outcome"]["status"] = serde_json::json!("failed");
+        assert!(verify_actual_read_pair(&primary, &changed).is_err());
+
         // The member path authenticates the read's original input from the
         // child request, and that input is what the shared predicate reads.
         let mut actual = ActualInputSnapshot {
@@ -9127,6 +9173,26 @@ mod tests {
             "the member read of a durable record settles as an immutable receipt: {:?}",
             settled.canonical_facts
         );
+
+        // Classifier-only controls; original request authentication is exercised above.
+        for (input, should_succeed) in [
+            (Some(serde_json::json!({"reference":"task://task:gc"})), true),
+            (Some(serde_json::json!({"reference":"task://"})), false),
+            (None, false),
+        ] {
+            let mut classified = ActualInputSnapshot {
+                file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+                sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+            };
+            let mut classified_windows = std::collections::BTreeMap::new();
+            let result = collect_actual_acquisition(&store, &program, &primary, &index,
+                input.as_ref(), &[], &boundary,
+                super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
+                &mut classified, &mut classified_windows);
+            assert_eq!(result.is_ok(), should_succeed);
+            assert!(classified.immutable_inputs.is_empty() && classified.canonical_facts.is_empty());
+            assert!(classified_windows.is_empty());
+        }
 
         // G-c-N2: the same member read, judged as a workspace path, is still
         // refused - the extension did not turn a workspace read into a record.

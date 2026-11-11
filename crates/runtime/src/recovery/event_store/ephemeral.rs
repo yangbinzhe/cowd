@@ -172,6 +172,41 @@ mod bounded_read_contract_tests {
     use super::*;
 
     #[test]
+    fn transaction_rejects_duplicate_stream_key_atomically() {
+        let backend = EphemeralRuntimeEventStore::new();
+        let event = |stream: &str, key: Option<&str>| RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: stream.into(), scope: RuntimeEventScope::Agent,
+                kind: "test.event".into(), status: None, actor: None,
+                refs: Vec::new(), payload: serde_json::json!({}),
+            },
+            idempotency_key: key.map(str::to_owned), schema_version: 1,
+        };
+        let request = AppendTransactionRequest {
+            transaction_id: "duplicate-in-request".into(),
+            expected_streams: vec![ExpectedStreamRevision { stream_id: "agent:one".into(), expected_revision: 0 }],
+            events: vec![event("agent:one", Some("same")), event("agent:one", Some("same"))],
+        };
+        assert!(matches!(backend.append_transaction(request), Err(RuntimeEventStoreError::InvalidTransaction(_))));
+        assert_eq!(backend.stream_revision("agent:one").unwrap(), 0);
+        assert!(backend.event_by_idempotency_key("agent:one", "same").unwrap().is_none());
+        let request = AppendTransactionRequest {
+            transaction_id: "duplicate-in-request".into(),
+            expected_streams: vec![
+                ExpectedStreamRevision { stream_id: "agent:one".into(), expected_revision: 0 },
+                ExpectedStreamRevision { stream_id: "agent:two".into(), expected_revision: 0 },
+            ],
+            events: vec![event("agent:one", Some("same")), event("agent:two", Some("same")),
+                event("agent:one", None), event("agent:one", None)],
+        };
+        let receipt = backend.append_transaction(request.clone()).unwrap();
+        assert!(!receipt.duplicate);
+        assert!(backend.append_transaction(request).unwrap().duplicate);
+        assert_eq!(backend.stream_revision("agent:one").unwrap(), 3);
+        assert_eq!(backend.stream_revision("agent:two").unwrap(), 1);
+    }
+
+    #[test]
     fn fixture_evidence_try_lock_and_bytes_reject_before_clone() {
         let backend = Arc::new(EphemeralRuntimeEventStore::new());
         let store = RuntimeEventStore::from_backend(backend.clone());
@@ -425,7 +460,15 @@ impl EphemeralRuntimeEventStore {
                 state.checked_evidence.get(&request.transaction_id).cloned(),
             ));
         }
+        let mut request_keys = BTreeSet::new();
         for input in &request.events {
+            if let Some(key) = input.idempotency_key.as_deref() {
+                if !request_keys.insert((input.event.stream_id.as_str(), key)) {
+                    return Err(RuntimeEventStoreError::InvalidTransaction(
+                        "event idempotency key repeated within transaction".into(),
+                    ));
+                }
+            }
             if input.idempotency_key.as_ref().is_some_and(|key| {
                 state.events.iter().any(|event| {
                     event.stream_id == input.event.stream_id
@@ -1002,8 +1045,28 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
                         primary, node, graph, artifact,
                     ));
                 }
+                if kind == "execution.read.receipt" || kind == "execution.effect.receipt" {
+                    let primary = event(stream_id, idempotency_key);
+                    let index = primary.and_then(|primary|
+                        RuntimeEventStore::process_closure_index_identity(&primary.payload, &primary.refs).ok())
+                        .and_then(|(stream, key)| event(&stream, &key));
+                    return Ok(RuntimeEventStore::delegated_outcome_root(primary, index, artifact));
+                }
                 match event(stream_id, idempotency_key) {
                     None => PreparedContentRoot::Absent,
+                    Some(event) if kind == "execution_node.transitioned"
+                        && event.kind == *kind && event.schema_version == 1
+                        && event.scope == RuntimeEventScope::ExecutionNode => {
+                        if event.activity_binding().is_none_or(|binding|
+                            artifact.visibility_scope != format!("session:{}", binding.session_id)) {
+                            return Ok(PreparedContentRoot::Blocked);
+                        }
+                        match event.payload["result"]["result_ref"].as_str() {
+                            Some(value) => RuntimeEventStore::prepared_agent_tool_outcome_root(
+                                value, stream_id, idempotency_key, artifact),
+                            None => PreparedContentRoot::Blocked,
+                        }
+                    }
                     Some(event) if &event.kind == kind && event.schema_version == 2 => {
                         let session = if kind == "goal.observation" {
                             event.payload["session_id"].as_str().map(str::to_string)

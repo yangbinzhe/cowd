@@ -1447,6 +1447,13 @@ pub(crate) struct EarlyToolDeferral {
     pub reason: String,
     pub ready_at_ms: u64,
     pub(crate) original_undispatched: Option<Arc<EarlyToolUndispatched>>,
+    pub(crate) origin: EarlyToolDeferralOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EarlyToolDeferralOrigin {
+    GateDidNotSpawn,
+    OriginalWorker,
 }
 
 /// Original worker's pre-dispatch return and acknowledged authorization writes.
@@ -1487,6 +1494,9 @@ pub(crate) type EarlyToolDispatchFuture =
 
 pub(crate) trait EarlyToolDispatcher: Send + Sync {
     fn dispatch(&self, candidate: EarlyToolCandidate) -> EarlyToolDispatchFuture;
+    fn confirms_original_undispatched(&self, _call_id: &str, _deferred: &EarlyToolDeferral) -> bool {
+        false
+    }
 }
 
 /// Append-only model-step plan used while Provider items are still arriving.
@@ -2478,6 +2488,7 @@ async fn consume_provider_stream_inner(
                                             .to_string(),
                                     ready_at_ms: candidate.ready_at_ms,
                                     original_undispatched: None,
+                                    origin: EarlyToolDeferralOrigin::GateDidNotSpawn,
                                 });
                             }
                         }
@@ -2570,7 +2581,24 @@ async fn consume_provider_stream_inner(
     for (result, (tool_call_id, identity)) in joined.into_iter().zip(early_worker_identities) {
         match result {
             Ok(EarlyToolDispatchResult::Executed(receipt)) => early_tool_receipts.push(receipt),
-            Ok(EarlyToolDispatchResult::Deferred(deferral)) => early_tool_deferrals.push(deferral),
+            Ok(EarlyToolDispatchResult::Deferred(mut deferral)) => {
+                // Only the collector's no-spawn branch may assert that no
+                // worker existed; a worker cannot assert that about itself.
+                deferral.origin = EarlyToolDeferralOrigin::OriginalWorker;
+                if deferral.tool_call_id != tool_call_id
+                    || deferral.original_undispatched.as_ref().is_some_and(|original| {
+                        original.call_id != tool_call_id || original.identity != identity
+                    })
+                {
+                    early_tool_failures.push(EarlyToolFailure {
+                        identity, tool_call_id, owner_ticket: None,
+                        kind: EarlyToolFailureKind::WorkerOutcomeUnknown,
+                        detail: "original early worker deferral identity differs".into(),
+                    });
+                } else {
+                    early_tool_deferrals.push(deferral);
+                }
+            },
             Ok(EarlyToolDispatchResult::Failed(failure)) => early_tool_failures.push(failure),
             Err(error) => early_tool_failures.push(EarlyToolFailure {
                 identity, tool_call_id, owner_ticket: None,

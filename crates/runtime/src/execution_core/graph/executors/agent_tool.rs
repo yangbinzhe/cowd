@@ -30,6 +30,8 @@ pub(crate) struct NoDispatchFact {
     pub(crate) calls: Vec<NoDispatchCall>,
     pub(crate) never_polled: bool,
     pub(crate) result_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) durable_result_sha256: Option<String>,
     pub(crate) historical_sources: std::collections::BTreeMap<String, u64>,
     pub(crate) start: Option<(u64, u64, u32)>,
     /// Same-operation custody only. A decoded node fact cannot create it.
@@ -406,6 +408,7 @@ impl NoDispatchObservation {
                     calls,
                     never_polled: true,
                     result_sha256: None,
+                    durable_result_sha256: None,
                     historical_sources: Default::default(),
                     start: None,
                     bounded_owners: state.bounded_owners.clone(),
@@ -759,6 +762,7 @@ impl NoDispatchObservation {
                 calls: state.refused.clone(),
                 never_polled: false,
                 result_sha256: Some(no_dispatch_digest(&outcome.result)?),
+                durable_result_sha256: None,
                 historical_sources: Default::default(),
                 start: None,
                 bounded_owners: state.bounded_owners.clone(),
@@ -1022,8 +1026,22 @@ pub(crate) fn is_bound_agent_tool_graph(graph: &ExecutionGraph) -> bool {
 fn requires_original_agent_child(request: &RuntimeToolExecutionRequest) -> bool {
     request.tool_name == "agent_action_batch"
         || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())
+        || is_delegated_directory_read(request)
         || request.compiled_invocation.as_ref().is_none_or(|invocation|
             invocation.effect.effect_kind != harness_contract::tool::ToolEffectKind::Read)
+}
+
+fn is_delegated_directory_read(request: &RuntimeToolExecutionRequest) -> bool {
+    crate::agentic::action_invocation::is_directory_read(&request.tool_name, &request.input)
+}
+
+fn original_directory_effect_inherited(admission: super::super::commit_service::EffectAdmission) -> Result<bool, &'static str> {
+    use super::super::commit_service::EffectAdmission;
+    match admission {
+        EffectAdmission::Admitted => Ok(true),
+        EffectAdmission::NotAdmitted => Ok(false),
+        EffectAdmission::Unreadable => Err("original directory Read admission unreadable"),
+    }
 }
 
 pub(crate) struct AgentToolBatchDispatcher {
@@ -1381,7 +1399,6 @@ impl AgentToolBatchDispatcher {
                 .node_results
                 .get(&node_id)
                 .and_then(|result| result.result_ref.as_deref())
-                .and_then(|value| value.strip_prefix("agent-tool-outcome:"))
                 .ok_or_else(|| {
                     let message = graph.node_results.get(&node_id)
                         .and_then(|result| result.failure.as_ref())
@@ -1389,8 +1406,10 @@ impl AgentToolBatchDispatcher {
                         .unwrap_or_else(|| "Agent ToolBatch has no committed tool outcome".into());
                     phase_failure("node_result", settled.recovery_cursor.node_attempts.get(&node_id).copied(), ToolError::new(message))
                 })?;
-            let mut outcome: RuntimeToolExecutionOutcome = serde_json::from_str(result)
-                .map_err(|error| phase_failure("decode_result", settled.recovery_cursor.node_attempts.get(&node_id).copied(), ToolError::new(error.to_string())))?;
+            let mut outcome = resolve_agent_tool_outcome_reference(
+                services.event_store(), preflight_request.session_id.as_deref().unwrap_or(""),
+                &graph_id, &node_id, result,
+            ).map_err(|error| phase_failure("decode_result", settled.recovery_cursor.node_attempts.get(&node_id).copied(), ToolError::new(error)))?;
             // The serialized result carries no in-process authority; reattach
             // only the same live owner's carrier retained before graph entry.
             outcome.pending_agent_batch = pending;
@@ -1455,6 +1474,68 @@ struct AgentToolBatchBackend {
     services: std::sync::Weak<RuntimeServices>,
     bound: BoundAgentTool,
     stop: crate::bound_tool_batch::BoundToolStop,
+}
+
+/// Durable pointer to the exact node-owned outcome; the original content store
+/// authenticates scope, origin, size and digest before returning its body.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentToolOutcomeReference {
+    pub(crate) stream_id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) content: serde_json::Value,
+}
+
+pub(crate) const AGENT_TOOL_OUTCOME_REFERENCE: &str = "agent-tool-outcome-content-v1:";
+
+pub(crate) fn prepare_agent_tool_outcome_reference(
+    store: &crate::RuntimeEventStore,
+    graph: &ExecutionGraph,
+    ticket: &NodeExecutionTicket,
+    result_ref: &str,
+    revision: u64,
+) -> Result<String, String> {
+    let session = &graph.lineage.as_ref().ok_or("original ToolBatch lineage missing")?.session_id;
+    let raw = result_ref.strip_prefix("agent-tool-outcome:").ok_or("original ToolBatch outcome missing")?;
+    let outcome: RuntimeToolExecutionOutcome = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    let stream_id = format!("{}:node:{}", ticket.graph_id, ticket.node_id);
+    let idempotency_key = format!("{}:{}:{}", ticket.graph_id, ticket.node_id, revision);
+    let origin = crate::PreparedArtifactOrigin::EventBody {
+        stream_id: stream_id.clone(), idempotency_key: idempotency_key.clone(),
+        kind: "execution_node.transitioned".into(),
+    };
+    let content = store.prepare_content(&format!("session:{session}"), &idempotency_key,
+        &serde_json::to_value(outcome).map_err(|e| e.to_string())?, &origin)?;
+    let reference = AgentToolOutcomeReference { stream_id, idempotency_key, content };
+    Ok(format!("{AGENT_TOOL_OUTCOME_REFERENCE}{}", serde_json::to_string(&reference).map_err(|e| e.to_string())?))
+}
+
+pub(crate) fn resolve_agent_tool_outcome_reference(
+    store: &crate::RuntimeEventStore, session: &str, graph_id: &str, node_id: &str, value: &str,
+) -> Result<RuntimeToolExecutionOutcome, String> {
+    if let Some(inline) = value.strip_prefix("agent-tool-outcome:") {
+        return serde_json::from_str(inline).map_err(|e| e.to_string());
+    }
+    if session.is_empty() { return Err("original ToolBatch Session missing".into()); }
+    let encoded = value.strip_prefix(AGENT_TOOL_OUTCOME_REFERENCE).ok_or("unknown ToolBatch outcome representation")?;
+    let reference: AgentToolOutcomeReference = serde_json::from_str(encoded).map_err(|e| e.to_string())?;
+    if reference.stream_id != format!("{graph_id}:node:{node_id}")
+        || !reference.idempotency_key.starts_with(&format!("{graph_id}:{node_id}:")) {
+        return Err("ToolBatch outcome origin mismatch".into());
+    }
+    let event = store.event_by_idempotency_key(&reference.stream_id, &reference.idempotency_key)
+        .map_err(|e| e.to_string())?.ok_or("ToolBatch outcome node event missing")?;
+    if event.kind != "execution_node.transitioned" || event.payload["graph_id"] != graph_id
+        || event.payload["node_id"] != node_id || event.payload["result"]["result_ref"] != value
+        || event.activity_binding().is_none_or(|binding| binding.session_id != session) {
+        return Err("ToolBatch outcome node identity mismatch".into());
+    }
+    let origin = crate::PreparedArtifactOrigin::EventBody {
+        stream_id: reference.stream_id, idempotency_key: reference.idempotency_key,
+        kind: "execution_node.transitioned".into(),
+    };
+    let content = store.resolve_prepared_agent_tool_content(&format!("session:{session}"), &reference.content, &origin)?;
+    serde_json::from_value(content).map_err(|e| e.to_string())
 }
 
 fn agent_tool_outcome(
@@ -1710,7 +1791,19 @@ pub(crate) fn agent_read_terminal_from_store(
             || stale_read_predicate!(trace_context, "event_7", !event.refs.iter().any(|reference| {
                     reference.kind == "agent_attempt" && reference.id == attempt.to_string()
                 }))
-            || stale_read_predicate!(trace_context, "event_8", event.refs.len() != 4)
+            || stale_read_predicate!(trace_context, "event_8", {
+                let content = &event.payload["delegated_outcome_content_v1"];
+                if content.is_null() { event.refs.len() != 4 } else {
+                    let selector = content["body"]["artifact"]["selector"].as_str();
+                    let closure = event.payload["process_closure"]["body"]["artifact"]["selector"].as_str();
+                    let mut expected = std::collections::BTreeSet::new();
+                    if let Some(selector) = selector { expected.insert(selector); }
+                    if let Some(selector) = closure { expected.insert(selector); }
+                    let actual = event.refs.iter().filter(|r| r.kind == "artifact")
+                        .map(|r| r.id.as_str()).collect::<std::collections::BTreeSet<_>>();
+                    selector.is_none() || expected != actual || event.refs.len() != 4 + actual.len()
+                }
+            })
             {
                 return Err(denied());
             }
@@ -2041,12 +2134,14 @@ impl crate::RuntimeExecutionHost for DelegatedActionOwnerHost<'_> {
     }
     async fn execute_runtime_tool(&self, request: &RuntimeToolExecutionRequest) -> RuntimeToolExecutionOutcome {
         if request.tool_name == "agent_action_batch"
-            || !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
+            || !(is_delegated_directory_read(request)
+                || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())) {
             return self.inner.execute_runtime_tool(request).await;
         }
         let invalid = |reason: String| RuntimeToolExecutionOutcome { pending_agent_batch: None,
             tool_use_id: request.tool_use_id.clone(), tool_name: request.tool_name.clone(),
-            status: crate::RuntimeToolExecutionStatus::BlockedPermission, category: request.category,
+            status: if is_delegated_directory_read(request) { crate::RuntimeToolExecutionStatus::Unknown }
+                else { crate::RuntimeToolExecutionStatus::BlockedPermission }, category: request.category,
             output: None, error: Some(reason), evidence_ref: String::new(), observed_evidence: vec![],
         };
         if request != self.original { return invalid("delegated original ToolBatch call changed".into()); }
@@ -2136,6 +2231,7 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
         // The parent may already have committed this same call's effect
         // intent. A local pre-dispatch failure cannot attest a globally empty
         // effect stream; preserve that owner and report uncertainty instead.
+        let mut original_directory_before_intent = false;
         let inherited_effect = if original_child.is_some() {
             match request.tool_progress.original_fresh_effect() {
                 Ok(Some(owner)) if owner.matches_original(services.event_store(), request)
@@ -2147,6 +2243,17 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
                     if request.tool_progress.original_governed_hook().map_err(|error| NodeExecutorError::Uncertain {
                         node_id: ticket.node_id.clone(), reason: error,
                     })?.is_some() {
+                        if is_delegated_directory_read(request) {
+                            let admission = services.commit_service().effect_admission(&request.idempotency_key)
+                                .map_err(|error| NodeExecutorError::Uncertain {
+                                    node_id: ticket.node_id.clone(), reason: error.to_string(),
+                                })?;
+                            let inherited = original_directory_effect_inherited(admission).map_err(|reason| NodeExecutorError::Uncertain {
+                                node_id: ticket.node_id.clone(), reason: reason.into(),
+                            })?;
+                            original_directory_before_intent = !inherited;
+                            inherited
+                        } else {
                         // The owner slot answers the admission question for the
                         // effect families that install one. The Read family never
                         // installs a first-effect owner (see after_commit), so an
@@ -2165,15 +2272,16 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
                                 reason: "original governed effect owner missing".into() });
                         }
                         true
+                        }
                     } else { false }
                 }
             }
         } else { false };
-        if inherited_effect {
+        if inherited_effect || original_directory_before_intent {
             if let Some(observation) = &observation { observation.uncertain(request); }
         }
         let refuse = |reason: String| {
-            if inherited_effect {
+            if inherited_effect || original_directory_before_intent {
                 NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason }
             } else {
                 if let Some(observation) = &observation {
@@ -2222,7 +2330,7 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
         // A provider ToolBatch plan is distinct from its AgentTask graph.
         // Accept that plan only from the same already-committed owner and its
         // original in-process hook, never from a decoded payload alone.
-        let original_governed_plan = if inherited_effect {
+        let original_governed_plan = if inherited_effect || original_directory_before_intent {
             request.tool_progress.original_governed_hook().map_err(|error| NodeExecutorError::Uncertain {
                 node_id: ticket.node_id.clone(), reason: error,
             })?.is_some_and(|hook| hook.original_plan_id() == request.governed_plan_id
@@ -2459,7 +2567,7 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
                 error,
             )
         })
-        .map_err(|error| if inherited_effect || error.is_unknown() {
+        .map_err(|error| if inherited_effect || original_directory_before_intent || error.is_unknown() {
             NodeExecutorError::Uncertain { node_id: ticket.node_id.clone(), reason: error.to_string() }
         } else { fail(error.to_string()) })?;
         let outcome = if outcome.status == crate::RuntimeToolExecutionStatus::Failed
@@ -3743,7 +3851,11 @@ pub(crate) mod a7_member_read_action_tests {
     /// A member AgentTask that stays running: the turn's tool batch and the
     /// Read family's admission both fence on the parent node being live, and a
     /// unit fixture has no provider to finish the turn with.
-    struct PendingAgentTask;
+    #[derive(Clone)]
+    struct PendingAgentTask {
+        cancellation: tokio::sync::watch::Sender<bool>,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
 
     impl crate::execution_core::graph::executors::AgentTaskBackendResolver for PendingAgentTask {
         fn resolve(
@@ -3752,7 +3864,7 @@ pub(crate) mod a7_member_read_action_tests {
         ) -> Option<
             Arc<dyn crate::execution_core::graph::executors::AgentTaskBackend>,
         > {
-            Some(Arc::new(Self))
+            Some(Arc::new(self.clone()))
         }
     }
 
@@ -3762,15 +3874,74 @@ pub(crate) mod a7_member_read_action_tests {
             &self,
             _: harness_contract::agent::AgentTaskPacket,
         ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
-            std::future::pending().await
+            let mut cancellation = self.cancellation.subscribe();
+            self.started.store(true, std::sync::atomic::Ordering::Release);
+            loop {
+                let cancelled = *cancellation.borrow_and_update();
+                if cancelled { break; }
+                cancellation.changed().await.map_err(|_| "a7 cancellation owner disappeared".to_string())?;
+            }
+            Err("a7 original pending agent cancelled".into())
         }
         async fn cancel(
             &self,
             _: &harness_contract::agent::AgentTaskPacket,
         ) -> Result<(), String> {
+            self.cancellation.send_replace(true);
             Ok(())
         }
         fn cancellation_finalized(&self, _: &harness_contract::agent::AgentTaskPacket) {}
+    }
+
+    // Reuse the original controlled backend behind AgentRuntime, so the real
+    // runtime owner, not the fixture, publishes the run lifecycle and exit.
+    #[async_trait::async_trait]
+    impl crate::AgentRuntimeBackend for PendingAgentTask {
+        fn kind(&self) -> crate::AgentBackendKind { crate::AgentBackendKind::InProcess }
+        fn capabilities(&self) -> crate::AgentBackendCapabilities {
+            crate::AgentBackendCapabilities::in_process()
+        }
+        async fn execute(
+            &self,
+            packet: harness_contract::agent::AgentTaskPacket,
+            _selection: crate::AgentModelSelection,
+        ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
+            crate::execution_core::graph::executors::AgentTaskBackend::execute(self, packet).await
+        }
+        async fn command(
+            &self,
+            _handle: &crate::AgentRunHandle,
+            request: &harness_contract::agent::AgentCommandRequest,
+        ) -> Result<(), harness_contract::agent::AgentCommandRejectReason> {
+            if request.command != harness_contract::agent::AgentCommand::Cancel {
+                return Err(harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend);
+            }
+            self.cancellation.send_replace(true);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_agent_task_joins_original_cancel_before_or_after_start() {
+        use crate::execution_core::graph::executors::AgentTaskBackend;
+        for cancel_first in [true, false] {
+            let backend = PendingAgentTask { cancellation: tokio::sync::watch::channel(false).0,
+                started: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
+            let original = backend.clone();
+            let packet = a7_packet();
+            if cancel_first { backend.cancel(&packet).await.unwrap(); }
+            let worker = tokio::spawn(async move {
+                crate::execution_core::graph::executors::AgentTaskBackend::execute(&original, packet).await
+            });
+            if !cancel_first {
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while backend.cancellation.receiver_count() == 0 { tokio::task::yield_now().await; }
+                }).await.unwrap();
+                backend.cancel(&a7_packet()).await.unwrap();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await.unwrap().unwrap();
+            assert_eq!(result.unwrap_err(), "a7 original pending agent cancelled");
+        }
     }
 
     /// Minimal execution host over a builtin ToolHost: it serves the pinned
@@ -3945,6 +4116,13 @@ pub(crate) mod a7_member_read_action_tests {
         .runtime_event_store(Arc::new(
             crate::runtime_event_store::RuntimeEventStore::for_test(),
         ))
+        .provider_registry(Arc::new(crate::ProviderRegistry::new(crate::config::ProvidersConfig {
+            providers: std::collections::HashMap::from([("a7-test".into(), crate::config::ProviderConfig {
+                reasoning_effort: None, name: "a7-test".into(), base_url: "https://example.test/v1".into(),
+                api_key: "test".into(), models: vec!["a7-model".into()], protocol: Some("responses".into()),
+                parallel_tool_calls: Default::default(), early_tool_start: Default::default(),
+            })]),
+        }).unwrap()))
         .artifact_store(Arc::new(crate::ArtifactStore::for_test_default(
             workspace.path().join("test-artifacts"),
         )))
@@ -3973,9 +4151,11 @@ pub(crate) mod a7_member_read_action_tests {
         );
         node.id = NODE.into();
         graph.nodes.push(node);
-        services
-            .agent_task_executor()
-            .install_resolver(Arc::new(PendingAgentTask));
+        let backend = Arc::new(PendingAgentTask {
+            cancellation: tokio::sync::watch::channel(false).0,
+            started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        services.agent_runtime().register_backend(backend.clone());
         services.commit_service().register_graph(graph).unwrap();
         let driver = Arc::clone(&services);
         tokio::spawn(async move {
@@ -3983,11 +4163,14 @@ pub(crate) mod a7_member_read_action_tests {
         });
         for _ in 0..250 {
             let driven = services.graph_state_store().load(GRAPH).unwrap();
-            if driven.node_statuses.get(NODE) == Some(&ExecutionNodeStatus::Running) {
+            if driven.node_statuses.get(NODE) == Some(&ExecutionNodeStatus::Running)
+                && backend.started.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        assert!(backend.started.load(std::sync::atomic::Ordering::Acquire),
+            "the existing AgentRuntime must start the original controlled backend");
         services.publish_session_execution_policy(
             SESSION,
             crate::permissions::SessionExecutionPolicyControl::from_policy(
@@ -4427,6 +4610,63 @@ pub(crate) mod a7_member_read_action_tests {
     }
 
     #[tokio::test]
+    async fn member_directory_read_keeps_original_child_custody() {
+        let fixture = a7_fixture().await;
+        let mut request = member_state_inspect_request(&fixture);
+        request.tool_name = "read_ref".into();
+        request.input = serde_json::json!({"reference":"task://task:a7"}).to_string();
+        assert!(is_delegated_directory_read(&request));
+        assert!(requires_original_agent_child(&request));
+        request.input = serde_json::json!({"reference":"file://workspace/file"}).to_string();
+        assert!(!is_delegated_directory_read(&request));
+        request.input = serde_json::json!({"reference":"task://"}).to_string();
+        assert!(!is_delegated_directory_read(&request));
+    }
+
+    #[tokio::test]
+    async fn directory_read_admission_does_not_turn_unknown_into_fresh() {
+        let fixture = a7_fixture().await;
+        let request = member_state_inspect_request(&fixture);
+        let commit = fixture.services.commit_service();
+        let before = commit.effect_admission(&request.idempotency_key).unwrap();
+        assert_eq!(original_directory_effect_inherited(before), Ok(false));
+        admit_member_read_intent(&fixture.services, &request);
+        let admitted = commit.effect_admission(&request.idempotency_key).unwrap();
+        assert_eq!(original_directory_effect_inherited(admitted), Ok(true));
+        let key = "directory-unreadable";
+        let stream = format!("execution-effect:{key}");
+        fixture.services.event_store().append_transaction(crate::runtime_event_store::AppendTransactionRequest {
+            transaction_id: "directory-unreadable-tx".into(),
+            expected_streams: vec![crate::ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: 0 }],
+            events: vec![crate::runtime_event_store::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput { stream_id: stream, scope: crate::RuntimeEventScope::ExecutionNode,
+                    kind: "execution.effect.member_noncommit".into(), status: None, actor: None,
+                    refs: vec![], payload: serde_json::json!({}) },
+                idempotency_key: Some(format!("{key}:intent")), schema_version: 1,
+            }],
+        }).unwrap();
+        let unreadable = commit.effect_admission(key).unwrap();
+        assert!(original_directory_effect_inherited(unreadable).is_err());
+    }
+
+    #[tokio::test]
+    async fn member_directory_read_without_original_authority_stays_unknown() {
+        let fixture = a7_fixture().await;
+        let mut request = member_state_inspect_request(&fixture);
+        request.tool_name = "read_ref".into();
+        request.input = serde_json::json!({"reference":"task://task:a7"}).to_string();
+        let inner = fixture.services.tool_execution_host().expect("fixture ToolHost");
+        let stop = crate::bound_tool_batch::BoundToolStop::default();
+        let host = DelegatedActionOwnerHost { inner: inner.as_ref(), services: &fixture.services,
+            packet: &fixture.packet, original: &request, parent_stop: None, child_stop: &stop,
+            parent_ticket: None, provider_capture: None };
+        let outcome = crate::RuntimeExecutionHost::execute_runtime_tool(&host, &request).await;
+        assert_eq!(outcome.status, crate::RuntimeToolExecutionStatus::Unknown);
+        assert!(outcome.output.is_none());
+        assert!(outcome.evidence_ref.is_empty());
+    }
+
+    #[tokio::test]
     async fn member_state_inspect_read_action_reaches_a_terminal_with_its_durable_read_receipt() {
         let fixture = a7_fixture().await;
         let request = member_state_inspect_request(&fixture);
@@ -4470,13 +4710,13 @@ pub(crate) mod a7_member_read_action_tests {
                 .is_none(),
             "the Read family never writes a mutation effect receipt"
         );
-        assert!(fixture
-            .services
-            .execution_supervisor()
-            .shutdown()
-            .await
-            .errors
-            .is_empty());
+        let shutdown = fixture.services.execution_supervisor().shutdown().await;
+        assert!(shutdown.errors.is_empty(), "original shutdown errors: {:?}; health: {:?}",
+            shutdown.errors, fixture.services.execution_supervisor().health());
+        let exit = crate::agent_runtime::confirmed_run_exit_snapshot(
+            fixture.services.event_store(), &fixture.packet,
+        ).expect("read original AgentRuntime lifecycle").expect("original AgentRuntime exit");
+        assert!(exit.exit_sources().is_some(), "same original Agent exit must close governed effects");
     }
 
     #[tokio::test]
@@ -4552,12 +4792,12 @@ pub(crate) mod a7_member_read_action_tests {
             receipt_pair(&fixture.services, &request).is_empty(),
             "no durable receipt may exist for an unadmitted member Read action"
         );
-        assert!(fixture
-            .services
-            .execution_supervisor()
-            .shutdown()
-            .await
-            .errors
-            .is_empty());
+        let shutdown = fixture.services.execution_supervisor().shutdown().await;
+        assert!(shutdown.errors.is_empty(), "original shutdown errors: {:?}; health: {:?}",
+            shutdown.errors, fixture.services.execution_supervisor().health());
+        let exit = crate::agent_runtime::confirmed_run_exit_snapshot(
+            fixture.services.event_store(), &fixture.packet,
+        ).expect("read original AgentRuntime lifecycle").expect("original AgentRuntime exit");
+        assert!(exit.exit_sources().is_some(), "same original Agent exit must close governed effects");
     }
 }

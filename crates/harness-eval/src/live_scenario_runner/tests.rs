@@ -2549,6 +2549,43 @@ fn root_terminal_requires_completed_synthesis_not_child_progress() {
 }
 
 #[test]
+fn finalized_failure_requires_same_turn_fence_and_terminal_decision() {
+    let projection = json!({
+        "execution_id":"root", "session_id":"session", "turn_id":"turn",
+        "revision": 3, "cursor": 91,
+        "graph":{"terminal_result_ref":"result", "nodes":[
+            {"kind":"synthesize", "status":"completed"}
+        ]},
+        "terminal_axes":{"source_race":false,"source_cursor":91,
+            "outcome":{"outcome":"partially_satisfied","goal_id":"goal","goal_revision":2,"terminal_fence":"fence"},
+            "execution":{"phase":"draining","settlement":"unknown","coverage_complete":false},
+            "delivery":{"runtime_terminal_ref":"result"}},
+        "live":{"status":"error","turn_id":"turn","terminal_ref":"turn-terminal:request"},
+        "terminal_presentation":{"state":"committed","source_execution_id":"root"},
+        "strategy":{"decision_id":"decision","revision":2,"execution_id":"root","session_id":"session"},
+        "outcomes":[{"kind":"outcome","status":"failed","payload":{"value":{
+            "execution_id":"turn:decision","execution_graph_ref":"root", "session_id":"session",
+            "turn_id":"turn","terminal_class":"failed"
+        }}}]
+    });
+    assert_eq!(finalized_non_success_terminal_ref(&projection, "root", "session", "turn").as_deref(), Some("turn-terminal:request"));
+    for (pointer, replacement) in [
+        ("/live/status", json!("finalizing")),
+        ("/live/turn_id", json!("other-turn")),
+        ("/terminal_axes/source_race", json!(true)),
+        ("/terminal_axes/outcome/terminal_fence", json!("")),
+        ("/terminal_axes/outcome/outcome", json!("satisfied")),
+        ("/terminal_presentation/state", json!("pending")),
+        ("/outcomes/0/payload/value/execution_id", json!("turn:other")),
+        ("/graph/nodes/0/status", json!("running")),
+    ] {
+        let mut changed = projection.clone();
+        *changed.pointer_mut(pointer).unwrap() = replacement;
+        assert!(finalized_non_success_terminal_ref(&changed, "root", "session", "turn").is_none(), "{pointer}");
+    }
+}
+
+#[test]
 fn root_terminal_reports_terminal_failure_without_synthesis() {
     let failed = json!({
         "graph": {"nodes": [

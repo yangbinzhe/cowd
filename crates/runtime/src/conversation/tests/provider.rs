@@ -6066,6 +6066,32 @@ mod r1_native_real_wire {
         // A carrier whose outcome drifts from the committed receipt is rejected.
         let request = fixture.runtime.tool_executor.requests.lock().unwrap().iter()
             .find(|request| request.tool_use_id == call.id).unwrap().clone();
+        let session_events = fixture.store.list_stream(&format!("session:{}", fixture.runtime.session_id())).unwrap();
+        let lifecycle = session_events.iter().filter(|event| event.kind == "tool.invocation.completed"
+            && event.payload["tool_call_id"] == call.id && event.payload["tool_name"] == call.name)
+            .collect::<Vec<_>>();
+        let [lifecycle] = lifecycle.as_slice() else { panic!("one original early lifecycle required") };
+        assert_eq!(lifecycle.payload["governed_plan_id"], request.governed_plan_id);
+        let plans = session_events.iter().filter(|event| event.kind == "tool.execution_plan.created"
+            && event.payload["plan_id"] == request.governed_plan_id).collect::<Vec<_>>();
+        let [plan] = plans.as_slice() else { panic!("the original early plan must be durable") };
+        assert!(plan.commit_cursor < receipt.commit_cursor && receipt.commit_cursor < lifecycle.commit_cursor);
+        let plan_receipt = fixture.store.original_transaction_receipt(&plan.transaction_id).unwrap()
+            .expect("original early plan transaction");
+        assert_eq!(plan_receipt.commit_cursor, plan.commit_cursor);
+        assert_eq!(plan_receipt.event_ids.get(plan.transaction_index as usize), Some(&plan.event_id));
+        assert!(plan_receipt.stream_revisions.iter().any(|source| source.stream_id == plan.stream_id
+            && source.expected_revision < plan.sequence && plan.sequence <= source.committed_revision));
+        let tasks = plan.payload["tasks"].as_array().unwrap().iter().filter(|task|
+            task["tool_call_id"] == call.id && task["tool_name"] == call.name).collect::<Vec<_>>();
+        let [task] = tasks.as_slice() else { panic!("the original early plan must contain the same call") };
+        assert_eq!(task["step_binding"], serde_json::to_value(call.binding.as_ref().unwrap()).unwrap());
+        assert_eq!(task["normalized_input"], harness_contract::step::parse_strict_json(&call.input).unwrap());
+        let identity = &call.binding.as_ref().unwrap().snapshot.identity;
+        for (kind, id) in [("session", identity.session_id.as_str()), ("turn", identity.turn_id.as_str()),
+            ("execution", identity.execution_id.as_deref().unwrap())] {
+            assert!(plan.refs.iter().any(|reference| reference.kind == kind && reference.id == id));
+        }
         let services = fixture.services.as_ref().unwrap();
         let parent = request.parent_execution.as_ref().unwrap();
         let graph = services.graph_state_store().load(&parent.execution_id).unwrap();

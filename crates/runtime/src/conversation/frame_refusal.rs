@@ -44,7 +44,7 @@ impl FrameRefusal {
             self.call.name.clone(),
             format!(
                 "Runtime did not execute this call: {}. \
-                 Nothing from it ran and no state changed. \
+                 Nothing from this tool action ran. \
                  Send the same intended action again in the exact shape above.",
                 self.reason
             ),

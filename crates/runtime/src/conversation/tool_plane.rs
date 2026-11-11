@@ -4,6 +4,35 @@ use super::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+pub(crate) fn persist_governed_tool_plan_event(
+    store: &crate::RuntimeEventStore,
+    session_id: &str,
+    context: Option<&crate::CowdExecutionContext>,
+    plan: &crate::GovernedToolPlan,
+) -> Result<(), RuntimeError> {
+    let mut refs = vec![RuntimeEventRef {
+        kind: "governed_tool_plan".to_string(),
+        id: plan.plan_id.clone(),
+    }];
+    if let Some(context) = context {
+        refs.extend([
+            RuntimeEventRef { kind: "execution".into(), id: context.execution_id.clone() },
+            RuntimeEventRef { kind: "session".into(), id: context.session_id.clone() },
+            RuntimeEventRef { kind: "turn".into(), id: context.turn_id.clone() },
+        ]);
+    }
+    store.append(RuntimeEventInput {
+        stream_id: format!("session:{session_id}"),
+        scope: RuntimeEventScope::Tool,
+        kind: "tool.execution_plan.created".into(),
+        status: Some("planned".into()),
+        actor: Some("conversation_runtime".into()),
+        refs,
+        payload: serde_json::to_value(plan).map_err(|error| RuntimeError::new(error.to_string()))?,
+    }).map_err(RuntimeError::new)?;
+    Ok(())
+}
+
 /// Construct each responsibility future outside its caller's poll frame. The
 /// factory only allocates; polling stays in the original task and cancel scope.
 #[inline(never)]
@@ -938,7 +967,7 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
                 let runtime = self.inner.runtime;
                 let policy = runtime.permission_policy.execution_policy_control().snapshot();
                 _r622_stage = "parent";
-                let parent = match runtime.governed_effect_parent(task) {
+                let parent = match runtime.governed_effect_parent(task, &prepared_hook.effective_input) {
                     Ok(parent) => parent,
                     Err(error) => return GovernedToolAdmission::Failed(error.to_string()),
                 };
@@ -1060,7 +1089,9 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
                 .ok_or_else(|| "tool batch original prepared request is missing".to_string())?;
             let original_request_slot = if prepared.bound_request.as_ref()
                 .is_some_and(|request| request.tool_name == "tool_orchestrate" || request.tool_name == "agent_action_batch"
-                    || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())) {
+                    || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())
+                    || (self.inner.runtime.executor_owns_governed_effect(&request.tool_name, &task.effect)
+                        && crate::agentic::action_invocation::is_directory_read(&request.tool_name, &request.input))) {
                 let slot = Arc::new(Mutex::new(None));
                 self.member_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(task.tool_call_id.clone(), Arc::clone(&slot));
@@ -2640,7 +2671,7 @@ where
                         for call in calls.iter().filter(|call| replays.contains_key(&call.id)) {
                             let task = plan.tasks.iter().find(|task| task.tool_call_id == call.id)
                                 .ok_or_else(|| RuntimeError::new("precompleted scope requires its original compiled call"))?;
-                            let parent = self.governed_effect_parent(task)?;
+                            let parent = self.governed_effect_parent(task, &call.input)?;
                             let request = self.governed_tool_request(task, &plan.plan_id, plan.revision,
                                 iteration, &call.input, None, policy.sandbox_posture, policy.revision, parent.as_ref())?;
                             let effect = self.prepare_call_effect_evidence(ticket, &request)?;
@@ -3715,9 +3746,11 @@ where
     fn governed_effect_parent(
         &self,
         task: &crate::governed_tool_plan::GovernedToolPlanTask,
+        effective_input: &str,
     ) -> Result<Option<(harness_contract::execution_graph::ExecutionParentBinding, u32)>, RuntimeError> {
         let activity = self.cowd_bus.as_ref().and_then(|bus| bus.current_activity_binding());
-        let parent = if self.executor_owns_governed_effect(&task.tool_name, &task.effect) {
+        let parent = if self.executor_owns_governed_effect(&task.tool_name, &task.effect)
+            && !crate::agentic::action_invocation::is_directory_read(&task.tool_name, effective_input) {
             None
         } else {
             checked_delegated_effect_parent(
@@ -4017,7 +4050,7 @@ where
                 // owner even when an executor generally owns other effects.
                 let executor_owns_durable_effect = self.executor_owns_governed_effect(tool_name, &task.effect);
                 let root = self.root_effect_context();
-                let effect_parent = self.governed_effect_parent(task)?;
+                let effect_parent = self.governed_effect_parent(task, &effective_input)?;
                 let root_owner = if !executor_owns_durable_effect && root.is_some() {
                     Some(match caller_owner {
                         Some(owner) => owner.clone(),
@@ -4122,7 +4155,8 @@ where
                     }
                 }
                 if tool_name == "tool_orchestrate" || tool_name == "agent_action_batch"
-                    || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name) {
+                    || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name)
+                    || (executor_owns_durable_effect && crate::agentic::action_invocation::is_directory_read(tool_name, &effective_input)) {
                     crate::tool_host::ORIGINAL_EFFECT_REQUEST.try_with(|slot| {
                         let mut original = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         if original.is_some() { return Err(RuntimeError::new("original effective request already captured")); }
@@ -4232,7 +4266,10 @@ where
                                 }
                             });
                             if executor_owns_durable_effect {
-                                execute().await
+                                match &single_capture {
+                                    Some(capture) => TICKET_ORIGINAL_SINGLE_CAPTURE.scope(Arc::clone(capture), execute()).await,
+                                    None => execute().await,
+                                }
                             } else {
                                 let effect_commit = effect_commit.ok_or_else(|| {
                                     ToolError::new("tool execution lost its durable ledger")
@@ -5461,40 +5498,8 @@ where
         plan: &GovernedToolPlan,
     ) -> Result<(), RuntimeError> {
         if let Some(store) = self.runtime_event_store.as_ref() {
-            let mut refs = vec![RuntimeEventRef {
-                kind: "governed_tool_plan".to_string(),
-                id: plan.plan_id.clone(),
-            }];
-            if let Some(context) = self
-                .cowd_bus()
-                .and_then(crate::CowdEventBus::current_execution_context)
-            {
-                refs.extend([
-                    RuntimeEventRef {
-                        kind: "execution".into(),
-                        id: context.execution_id,
-                    },
-                    RuntimeEventRef {
-                        kind: "session".into(),
-                        id: context.session_id,
-                    },
-                    RuntimeEventRef {
-                        kind: "turn".into(),
-                        id: context.turn_id,
-                    },
-                ]);
-            }
-            store.append(RuntimeEventInput {
-                stream_id: format!("session:{}", self.session_id()),
-                scope: RuntimeEventScope::Tool,
-                kind: "tool.execution_plan.created".into(),
-                status: Some("planned".into()),
-                actor: Some("conversation_runtime".into()),
-                refs,
-                payload: serde_json::to_value(plan)
-                    .map_err(|error| RuntimeError::new(error.to_string()))?,
-            })
-            .map_err(RuntimeError::new)?;
+            let context = self.cowd_bus().and_then(crate::CowdEventBus::current_execution_context);
+            persist_governed_tool_plan_event(store, self.session_id(), context.as_ref(), plan)?;
         }
         if let Ok(mut plans) = self.turn_governed_tool_plans.lock() {
             plans.push(plan.projection());

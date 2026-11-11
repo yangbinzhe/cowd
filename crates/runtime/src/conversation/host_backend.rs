@@ -7617,15 +7617,7 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         let is_submit = call.name == harness_contract::agent_action::TASK_SUBMIT_TOOL_ID;
         let is_review = call.name == harness_contract::agent_action::TASK_REVIEW_TOOL_ID;
         let is_publish = call.name == harness_contract::agent_action::MESSAGE_PUBLISH_TOOL_ID;
-        // A read names a durable reference too, and it is the one place where a
-        // spelling mistake is silent: `read_ref` on `artifact:<id>` resolves to
-        // `Bare` and is delegated to `state_inspect`, so the caller receives
-        // program guidance in place of the artifact body. The reviewers that
-        // must physically read every cited result therefore never accumulate
-        // coverage and are refused with `review_requires_current_physical_reads`.
-        // Normalize the read's reference before the delegation happens.
-        let is_read = call.name == "read_ref" || call.name == "evidence_retrieve";
-        if !is_commit && !is_submit && !is_review && !is_publish && !is_read {
+        if !is_commit && !is_submit && !is_review && !is_publish {
             continue;
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.input) else {
@@ -7635,28 +7627,6 @@ pub(super) async fn resolve_explicit_agentic_content_refs(
         // that dropped `tool://`/`artifact://` is not rejected with
         // unsupported_evidence_ref / issue_disposition_requires_durable_evidence.
         normalize_bare_evidence_refs(&mut value);
-        if is_read {
-            // A read carries nothing else to resolve: it has no message block,
-            // no deliverable and no verdict. Normalizing its reference is the
-            // whole job, so re-encode and move on.
-            if let Some(object) = value.as_object_mut() {
-                for field in ["reference", "evidence_ref"] {
-                    let Some(raw) = object.get(field).and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let normalized = normalize_bare_evidence_ref(raw);
-                    if normalized != raw {
-                        object.insert(field.to_string(), serde_json::Value::String(normalized));
-                    }
-                }
-            }
-            call.input =
-                serde_json::to_string(&value).map_err(|error| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: format!("encode normalized read reference: {error}"),
-                })?;
-            continue;
-        }
         if is_review || is_publish {
             // A review verdict and a discussion publish carry no publishable
             // artifact body; only their evidence references needed normalizing.
@@ -7864,6 +7834,32 @@ pub fn normalize_bare_evidence_ref(reference: &str) -> String {
     trimmed.to_string()
 }
 
+// Run before Native source registration; early candidates that need this
+// transformation must be deferred before an original request is dispatched.
+pub(crate) fn normalize_native_read_input(tool_name: &str, input: &str) -> String {
+    if !matches!(tool_name, "read_ref" | "evidence_retrieve") {
+        return input.to_string();
+    }
+    let Ok(mut value) = harness_contract::step::parse_strict_json(input) else {
+        return input.to_string();
+    };
+    let original = value.clone();
+    normalize_bare_evidence_refs(&mut value);
+    if let Some(object) = value.as_object_mut() {
+        for field in ["reference", "evidence_ref"] {
+            if let Some(raw) = object.get(field).and_then(|v| v.as_str()) {
+                let normalized = normalize_bare_evidence_ref(raw);
+                if normalized != raw {
+                    object.insert(field.to_string(), serde_json::Value::String(normalized));
+                }
+            }
+        }
+    }
+    if value == original { input.to_string() } else {
+        serde_json::to_string(&value).unwrap_or_else(|_| input.to_string())
+    }
+}
+
 fn normalize_bare_evidence_refs(value: &mut serde_json::Value) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -7921,7 +7917,20 @@ fn normalize_ref_array(array: &mut [serde_json::Value]) {
 
 #[cfg(test)]
 mod reference_spelling_tests {
-    use super::normalize_bare_evidence_ref;
+    use super::{normalize_bare_evidence_ref, normalize_native_read_input};
+
+    #[test]
+    fn native_read_input_normalization_preserves_identity_and_invalid_frames() {
+        let raw = r#"{"reference":"artifact:ad3e1d53f09c3d25e1953fda"}"#;
+        let canonical = r#"{"reference":"artifact://ad3e1d53f09c3d25e1953fda"}"#;
+        assert_eq!(normalize_native_read_input("read_ref", raw), canonical);
+        assert_eq!(normalize_native_read_input("read_ref", canonical), canonical);
+        assert_eq!(normalize_native_read_input("state_inspect", raw), raw);
+        let foreign = r#"{"reference":"artifact:another"}"#;
+        assert_ne!(normalize_native_read_input("read_ref", foreign), canonical);
+        let duplicate = r#"{"reference":"artifact:one","reference":"artifact:two"}"#;
+        assert_eq!(normalize_native_read_input("read_ref", duplicate), duplicate);
+    }
 
     /// Runtime hands the model `artifact:<24 hex>` for a one-shot Task
     /// deliverable and repeats it in the `uncovered_result_refs` clause of a
@@ -8172,6 +8181,91 @@ fn original_effect_judgment(
     }
 }
 
+/// Authenticate an Objective review in the Goal event committed alongside the
+/// original Program action. Objective reviews belong to Goal, not the Program
+/// entity projection. This only checks the original checked transaction; it
+/// does not execute or invent an action.
+fn original_goal_review_carried(
+    program_payload: &serde_json::Value,
+    goal_payload: &serde_json::Value,
+    original_goal: &harness_contract::goal::GoalContract,
+    goal: &harness_contract::goal::GoalContract,
+) -> bool {
+    use harness_contract::agent_action::{AgentAction, AgentActionEnvelope, ObjectiveReviewDecision};
+    let Ok(envelope) = serde_json::from_value::<AgentActionEnvelope>(program_payload["envelope"].clone()) else { return false };
+    let AgentAction::ObjectiveReview(input) = &envelope.action else { return false };
+    let Some(binding) = goal.execution_binding.as_ref() else { return false };
+    if envelope.actor.objective_id != binding.objective_id
+        || envelope.actor.program_id != binding.agentic_program_id
+        || envelope.actor.session_id != binding.session_id
+        || envelope.actor.turn_id != binding.turn_id
+        || envelope.actor.root_execution_id.as_deref() != Some(binding.root_execution_id.as_str()) {
+        return false;
+    }
+    let Some(effect) = program_payload.get("entity_ref").and_then(serde_json::Value::as_str) else { return false };
+    if goal_payload.get("action_entity_ref").and_then(serde_json::Value::as_str) != Some(effect) { return false; }
+    let decision = match input.decision {
+        ObjectiveReviewDecision::Satisfied => "satisfied",
+        ObjectiveReviewDecision::Gap => "gap",
+        ObjectiveReviewDecision::Blocked => "blocked",
+    };
+    // Match GoalStore::normalize_criterion_ref against the Goal read by the
+    // original action: an exact known id wins over its suffix.
+    let known = |id: &str| original_goal.criteria.iter().any(|criterion| criterion.id == id)
+        || original_goal.obligations.iter().any(|obligation| obligation.obligation_id == id);
+    let criterion = if known(&input.criterion_ref) { input.criterion_ref.as_str() }
+        else { input.criterion_ref.rsplit_once(':').map(|(_, tail)| tail).filter(|tail| known(tail)).unwrap_or(&input.criterion_ref) };
+    goal.review_refs.iter().any(|reference| reference == effect)
+        && goal.reviews.iter().any(|review| {
+            criterion == review.criterion_ref
+                && (goal.criteria.iter().any(|criterion| criterion.id == review.criterion_ref)
+                    || goal.obligations.iter().any(|obligation| obligation.obligation_id == review.criterion_ref))
+                && review.review_id == effect
+                && review.spec_revision == goal.spec_revision
+                && review.input_manifest_digest == goal.spec_digest
+                && crate::execution_core::goal::objective_review_record_id(&goal.id, &envelope.action_id, &review.criterion_ref) == effect
+                && review.reviewer_actor == envelope.actor.actor_id
+                && review.reviewer_execution_id == envelope.actor.execution_id
+                && review.decision == decision
+                && review.result_refs == input.result_refs
+                && review.evidence_refs == input.evidence_refs
+        })
+}
+
+/// The existing transaction consumer invokes this before advancing its Goal
+/// source. The two events and both stream cuts must be from the same receipt.
+fn original_goal_review_transaction(
+    transaction: &crate::AppendTransactionRequest,
+    receipt: &crate::AppendTransactionReceipt,
+    program_stream: &str,
+    goal_stream: &str,
+    original_goal: &harness_contract::goal::GoalContract,
+    next: &harness_contract::goal::GoalContract,
+) -> Result<Option<(String, serde_json::Value, serde_json::Value)>, String> {
+    let events = transaction.events.iter().enumerate().filter(|(_, event)|
+        event.event.stream_id == program_stream
+            && event.event.payload.pointer("/envelope/action/kind").and_then(serde_json::Value::as_str) == Some("objective_review"))
+        .collect::<Vec<_>>();
+    if events.is_empty() { return Ok(None); }
+    let [(index, event)] = events.as_slice() else { return Err("original Objective review action is ambiguous".into()) };
+    let goal_events = transaction.events.iter().enumerate().filter(|(_, event)| event.event.stream_id == goal_stream).collect::<Vec<_>>();
+    let [(goal_index, goal_event)] = goal_events.as_slice() else { return Err("original Goal action is ambiguous".into()) };
+    let program_advanced = receipt.stream_revisions.iter().any(|cut|
+        cut.stream_id == program_stream && cut.committed_revision > cut.expected_revision);
+    let goal_advanced = receipt.stream_revisions.iter().any(|cut|
+        cut.stream_id == goal_stream && cut.committed_revision > cut.expected_revision);
+    if transaction.transaction_id != receipt.transaction_id
+        || event.event.kind != "agentic.action_applied" || goal_event.event.kind != "goal.revised"
+        || !program_advanced || !goal_advanced
+        || receipt.event_ids.get(*index).is_none() || receipt.event_ids.get(*goal_index).is_none()
+        || serde_json::from_value::<harness_contract::goal::GoalContract>(goal_event.event.payload["goal"].clone()).ok().as_ref() != Some(next)
+        || !original_goal_review_carried(&event.event.payload, &goal_event.event.payload, original_goal, next) {
+        return Err("original Objective review is not carried by its committed Goal".into());
+    }
+    let effect = event.event.payload["entity_ref"].as_str().ok_or("original Objective review identity missing")?;
+    Ok(Some((effect.to_string(), event.event.payload.clone(), goal_event.event.payload.clone())))
+}
+
 /// Read the Program at the settlement head and confirm that every effect this
 /// node's certified actions created is visible in that projection. The
 /// revision the node then declares is one it actually read, not one it
@@ -8375,10 +8469,11 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
     let mut source = before.clone();
     let mut program_source: Option<(String, u64)> = None;
     let mut changed = false;
+    let mut authenticated_goal_reviews = std::collections::BTreeMap::new();
     // Every committed action of this node carries the original owner's
     // Program identity. It is what a Program advance in the gap between two
     // members is compared against.
-    let program_effects = binding.map(|binding| {
+    let mut program_effects = binding.map(|binding| {
         let program_stream = format!("agentic-program:{}", binding.agentic_program_id);
         committed.iter().filter_map(|handle| original_applied_effect(handle, &program_stream)).collect::<Vec<_>>()
     }).unwrap_or_default();
@@ -8412,7 +8507,7 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
             // receipts, and re-deriving it here only produced a second
             // authority that every legitimate concurrency looked like an
             // anomaly.
-            program_source = Some((program_stream, cut.committed_revision));
+            program_source = Some((program_stream.clone(), cut.committed_revision));
         }
         let goal_payload = if let Some(transaction) = transaction {
             let events = transaction.events.iter().enumerate().filter(|(_, event)| event.event.stream_id == goal_stream).collect::<Vec<_>>();
@@ -8428,7 +8523,14 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
         if cut.expected_revision != source.stream_revision || cut.committed_revision != source.stream_revision.checked_add(1).ok_or("Goal revision overflow")? { return Err("Goal changed outside the original actions".into()); }
         let next: harness_contract::goal::GoalContract = serde_json::from_value(goal_payload["goal"].clone())
             .map_err(|error| format!("original committed Goal is unavailable: {error}"))?;
-        if next.id != source.goal.id || next.session_id != source.goal.session_id { return Err("original committed Goal identity differs".into()); }
+        if next.id != source.goal.id || next.session_id != source.goal.session_id
+            || next.execution_binding != source.goal.execution_binding { return Err("original committed Goal identity differs".into()); }
+        if let Some(transaction) = transaction {
+            if let Some((effect, program_payload, goal_payload)) = original_goal_review_transaction(
+                transaction, receipt, &program_stream, &goal_stream, &source.goal, &next)? {
+                authenticated_goal_reviews.insert(effect, (program_payload, goal_payload, source.goal.clone()));
+            }
+        }
         crate::execution_core::goal::GoalProgressReducer::reconcile_goal(&mut source.progress, &source.goal, &next);
         source.goal = next;
         source.stream_revision = cut.committed_revision;
@@ -8449,6 +8551,15 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
         if head < *revision {
             return Err("Program changed between original actions".into());
         }
+        // Goal-owned reviews are proved by their own same-transaction Goal
+        // record above, not by inventing a Program entity for them. Every
+        // other effect remains subject to the Program projection check.
+        for (program_payload, goal_payload, original_goal) in authenticated_goal_reviews.values() {
+            if !original_goal_review_carried(program_payload, goal_payload, original_goal, &source.goal) {
+                return Err("original Objective review is not carried by the final Goal".into());
+            }
+        }
+        program_effects.retain(|(effect, kind)| !(kind == "objective_review" && authenticated_goal_reviews.contains_key(effect)));
         certify_original_program_head(&services, program_id, head, &program_effects)?;
         program_source = Some((stream.clone(), head));
     }
@@ -8725,7 +8836,7 @@ fn original_read_is_committed(
 
 /// Only the original joined worker can attest its pre-dispatch return.
 /// Previously acknowledged authorization writes remain separately durable.
-fn original_early_deferral_sources(
+pub(super) fn original_early_deferral_sources(
     services: &crate::RuntimeServices,
     ticket: &NodeExecutionTicket,
     call_id: &str,
@@ -13415,6 +13526,77 @@ mod original_program_visibility_tests {
 
     fn carried(view: &OriginalProgramEntityView, effect: &str, kind: &str) -> bool {
         original_effect_judgment(view, effect, kind) == OriginalEffectJudgment::Carried
+    }
+
+    #[test]
+    fn objective_review_requires_its_same_action_goal_record() {
+        use harness_contract::goal::{AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract, GoalScope, ObjectiveReviewRecord};
+        let review_id = crate::execution_core::goal::objective_review_record_id("goal:test", "action:test", "criterion");
+        let mut goal = GoalContract {
+            input_contract: None, id: "goal:test".into(), session_id: "session:test".into(),
+            objective: "test".into(), criteria: vec![AcceptanceCriterion { id: "criterion".into(), statement: "test".into(), statement_ref: None, source_refs: vec![], required_evidence: vec![], status: AcceptanceStatus::Open, waiver: None }],
+            constraints: vec![], phase: "execution".into(), evidence_refs: vec![], unresolved: vec![], blockers: vec![], scope: GoalScope::Internal,
+            user_intent_criterion_id: None, source_intent_ref: None, execution_binding: Some(harness_contract::goal::GoalExecutionBinding {
+                objective_id: "objective:test".into(), session_id: "session:test".into(), turn_id: "turn:test".into(), root_execution_id: "root:test".into(), agentic_program_id: "program:test".into(),
+            }), spec_revision: 1, spec_digest: "digest".into(),
+            review_refs: vec![review_id.clone()], reviews: vec![ObjectiveReviewRecord {
+                review_id: review_id.clone(), criterion_ref: "criterion".into(), spec_revision: 1, input_manifest_digest: "digest".into(),
+                result_refs: vec!["artifact:result".into()], evidence_refs: vec!["tool:read".into()], reviewer_actor: "root".into(),
+                reviewer_execution_id: None, producer_refs: vec![], decision: "satisfied".into(), reason_ref: "reason".into(), verification: None,
+            }], waiting: None, participation_requirement: None, obligations: vec![], recovery: None, terminal: None,
+            completion: GoalCompletion::Open, revision: 1, user_sequence: 1,
+        };
+        let program = serde_json::json!({"entity_ref": review_id, "envelope": {
+            "action_id": "action:test", "actor": {"objective_id":"objective:test", "program_id":"program:test", "session_id":"session:test", "turn_id":"turn:test", "root_execution_id":"root:test", "actor_id":"root", "kind":"root"},
+            "action": {"kind":"objective_review", "input": {"criterion_ref":"criterion", "decision":"satisfied", "result_refs":["artifact:result"], "evidence_refs":["tool:read"], "reason_ref":"", "reason":"review"}}
+        }});
+        let goal_event = serde_json::json!({"action_entity_ref":review_id, "goal":goal});
+        assert!(super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
+        let program_stream = "agentic-program:program:test";
+        let goal_stream = "goal:goal:test";
+        let event = |stream: &str, scope, kind: &str, payload| crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput { stream_id: stream.into(), scope, kind: kind.into(), status: Some("applied".into()), actor: Some("test".into()), refs: vec![], payload },
+            idempotency_key: Some(format!("{kind}:test")), schema_version: 1,
+        };
+        let transaction = crate::AppendTransactionRequest {
+            transaction_id: "review:test".into(),
+            expected_streams: vec![crate::ExpectedStreamRevision { stream_id: program_stream.into(), expected_revision: 0 }, crate::ExpectedStreamRevision { stream_id: goal_stream.into(), expected_revision: 0 }],
+            events: vec![event(program_stream, crate::RuntimeEventScope::Program, "agentic.action_applied", program.clone()),
+                event(goal_stream, crate::RuntimeEventScope::Goal, "goal.revised", goal_event.clone())],
+        };
+        let store = crate::RuntimeEventStore::for_test();
+        let receipt = store.append_transaction(transaction.clone()).expect("original Goal and Program transaction");
+        assert!(super::original_goal_review_transaction(&transaction, &receipt, program_stream, goal_stream, &goal, &goal).unwrap().is_some());
+        let mut foreign_receipt = receipt.clone();
+        foreign_receipt.transaction_id = "other".into();
+        assert!(super::original_goal_review_transaction(&transaction, &foreign_receipt, program_stream, goal_stream, &goal, &goal).is_err());
+        let mut missing_goal_receipt = receipt.clone();
+        missing_goal_receipt.event_ids.pop();
+        assert!(super::original_goal_review_transaction(&transaction, &missing_goal_receipt, program_stream, goal_stream, &goal, &goal).is_err());
+        goal.reviews[0].criterion_ref = "other".into();
+        assert!(!super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
+        goal.reviews[0].criterion_ref = "criterion".into();
+        goal.reviews[0].reviewer_actor = "other".into();
+        assert!(!super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
+        goal.reviews[0].reviewer_actor = "root".into();
+        goal.reviews[0].result_refs.clear();
+        assert!(!super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
+        goal.reviews[0].result_refs = vec!["artifact:result".into()];
+        assert!(!super::original_goal_review_carried(&program, &serde_json::json!({"action_entity_ref":"objective_review:other"}), &goal, &goal));
+        goal.reviews[0].decision = "gap".into();
+        assert!(!super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
+        goal.reviews[0].decision = "satisfied".into();
+        goal.review_refs.clear();
+        assert!(!super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
+        goal.review_refs.push(review_id);
+        goal.spec_revision += 1;
+        assert!(!super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
+        goal.spec_revision -= 1;
+        goal.spec_digest = "different".into();
+        assert!(!super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
+        goal.spec_digest = "digest".into();
+        goal.execution_binding.as_mut().unwrap().turn_id = "other".into();
+        assert!(!super::original_goal_review_carried(&program, &goal_event, &goal, &goal));
     }
 
     #[test]

@@ -573,6 +573,20 @@ struct ProjectionScopeReader<'request> {
 }
 
 impl crate::execution_core::graph::TerminalScopeReader for ProjectionScopeReader<'_> {
+    fn validate_external_outcome_binding(&mut self, session: &str, graph_id: &str, node_id: &str,
+        value: &str, source: &DurableRuntimeEvent,
+    ) -> Result<(), crate::execution_core::graph::ExecutionCommitError> {
+        use crate::execution_core::graph::{executors::agent_tool, ExecutionCommitError};
+        let invalid = || ExecutionCommitError::InvalidCommand("original ToolBatch content identity mismatch".into());
+        let encoded = value.strip_prefix(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE).ok_or_else(invalid)?;
+        let reference: agent_tool::AgentToolOutcomeReference = serde_json::from_str(encoded).map_err(|_| invalid())?;
+        let selected = self.budget.canonical_record(self.services, &reference.stream_id,
+            &reference.idempotency_key, self.through).map_err(commit_read_error)?.ok_or_else(invalid)?;
+        if selected.as_ref() != source { return Err(invalid()); }
+        crate::execution_core::graph::validate_external_outcome_binding_from_source(
+            self.services.event_store(), session, graph_id, node_id, value, source,
+        )
+    }
     fn event(
         &mut self,
         stream: &str,

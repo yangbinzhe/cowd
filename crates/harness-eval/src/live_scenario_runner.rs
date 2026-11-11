@@ -2399,9 +2399,62 @@ impl RootExecutionTerminal {
 #[derive(Clone, Debug)]
 struct RootExecutionObservation {
     terminal: RootExecutionTerminal,
+    finalized_non_success: Option<String>,
     fingerprint: String,
     summary: Value,
     response_body_bytes: u64,
+}
+
+// A Session terminal is absorbing even while its effects remain in custody.
+// This observation never upgrades the settlement axis or the success gate.
+fn finalized_non_success_terminal_ref(
+    projection: &Value,
+    execution_id: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<String> {
+    for (key, expected) in [("execution_id", execution_id), ("session_id", session_id), ("turn_id", turn_id)] {
+        if expected.is_empty() || projection.get(key)?.as_str()? != expected { return None; }
+    }
+    if root_execution_terminal_state(projection) != RootExecutionTerminal::Completed
+        || projection.get("revision")?.as_u64()? == 0 { return None; }
+    let cursor = projection.get("cursor")?.as_u64()?;
+    let axes = projection.get("terminal_axes")?;
+    let source_cursor = axes.get("source_cursor")?.as_u64()?;
+    if cursor == 0 || source_cursor == 0 || source_cursor > cursor
+        || axes.get("source_race")?.as_bool()? { return None; }
+    let outcome = axes.get("outcome")?;
+    if !matches!(outcome.get("outcome")?.as_str()?, "partially_satisfied" | "blocked" | "failed" | "cancelled")
+        || outcome.get("goal_id")?.as_str()?.is_empty()
+        || outcome.get("goal_revision")?.as_u64()? == 0
+        || outcome.get("terminal_fence")?.as_str()?.is_empty() { return None; }
+    let live = projection.get("live")?;
+    let terminal_ref = live.get("terminal_ref")?.as_str()?;
+    if !matches!(live.get("status")?.as_str()?, "error" | "cancelled")
+        || live.get("turn_id")?.as_str()? != turn_id
+        || !terminal_ref.starts_with("turn-terminal:") { return None; }
+    let graph = projection.get("graph")?;
+    let result_ref = graph.get("terminal_result_ref")?.as_str()?;
+    if result_ref.is_empty() || axes.pointer("/delivery/runtime_terminal_ref")?.as_str()? != result_ref { return None; }
+    let presentation = projection.get("terminal_presentation")?;
+    if presentation.get("state")?.as_str()? != "committed"
+        || presentation.get("source_execution_id")?.as_str()? != execution_id { return None; }
+    let strategy = projection.get("strategy")?;
+    let decision = strategy.get("decision_id")?.as_str()?;
+    if decision.is_empty() || strategy.get("revision")?.as_u64()? == 0
+        || strategy.get("execution_id")?.as_str()? != execution_id
+        || strategy.get("session_id")?.as_str()? != session_id { return None; }
+    let mut matched = projection.get("outcomes")?.as_array()?.iter().filter(|entry| {
+        let value = &entry["payload"]["value"];
+        entry["kind"] == "outcome" && entry["status"] == value["terminal_class"]
+            && value["execution_id"] == format!("turn:{decision}")
+            && value["execution_graph_ref"] == execution_id
+            && value["session_id"] == session_id && value["turn_id"] == turn_id
+            && matches!(value["terminal_class"].as_str(), Some("failed" | "blocked" | "cancelled" | "partial_failure"))
+    });
+    matched.next()?;
+    if matched.next().is_some() { return None; }
+    Some(terminal_ref.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -4439,6 +4492,34 @@ impl LiveScenarioRunner {
             ),
             Err(error) => (String::new(), json!({"status":"failed","error":error})),
         };
+        if terminal_wait.non_success {
+            let mut diagnostics = self.capture_diagnostics(
+                &session_id, Some(execution_id_ref), &mut observer, started, &mut trace,
+            );
+            let (observation_trace, observation_integrity) = observer.finalize();
+            if let Some(object) = diagnostics.as_object_mut() {
+                object.insert("observation_integrity".into(), observation_integrity);
+            }
+            trace.extend(observation_trace);
+            let agentic_program = self.root_agentic_program(&session_id, turn_id_ref, &mut trace).ok();
+            let mut result = failed_scenario_with_session_execution_and_program(
+                spec, started, trace, session_id, execution_id, turn_id,
+                "runtime terminal non-success; effect settlement remains unconfirmed".into(),
+                diagnostics, agentic_program,
+            );
+            result["collected_evidence"]["terminal_reason"] = json!("runtime_terminal_non_success");
+            result["terminal_id"] = json!(terminal_id);
+            result["terminal_observation"] = terminal_wait.execution_observation;
+            result["delivery_observation"] = delivery_observation;
+            result["terminal_response_summary"] = json!(response_text);
+            result["timeout"] = terminal_wait.report;
+            if let Some(production_trace) = result.get_mut("production_trace").and_then(Value::as_object_mut) {
+                // Selection already required an Available receipt context for this
+                // message; acknowledgement is reported independently.
+                production_trace.insert("message_materialized".into(), json!(true));
+            }
+            return result;
+        }
         let descendant_wait = self.wait_for_descendant_team_acceptance(
             spec.acceptance,
             &expected_reads,
@@ -4624,6 +4705,7 @@ impl LiveScenarioRunner {
         let mut next_session_progress_probe = started;
         let mut root_terminal = RootExecutionTerminal::Pending;
         let mut execution_observation = Value::Null;
+        let mut finalized_non_success = None;
         loop {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             actor.set_observation_deadline(timeout.observation_deadline(
@@ -4673,10 +4755,11 @@ impl LiveScenarioRunner {
                 // as a periodic safety check or immediately at a live terminal
                 // boundary instead of downloading it every two seconds.
                 next_root_probe = now + Duration::from_secs(30);
-                let root = self.root_execution_observation(root_execution_id);
+                let root = self.root_execution_observation(root_execution_id, session_id, turn_id);
                 let root_path = format!("/api/runtime/executions/{root_execution_id}");
                 match root {
                     Ok(observation) => {
+                        finalized_non_success = observation.finalized_non_success;
                         execution_observation =
                             crate::paired_performance::bounded_execution_observation(
                                 &observation.summary,
@@ -4694,6 +4777,7 @@ impl LiveScenarioRunner {
                         }
                     }
                     Err(error) => {
+                        finalized_non_success = None;
                         observer.observe_root(&root_path, &Err(error), None, None, elapsed_ms);
                         // The execution's own projection could not be read. Its
                         // phase is not known from here any more, so it must not
@@ -4708,6 +4792,26 @@ impl LiveScenarioRunner {
             }
             if root_terminal == RootExecutionTerminal::Completed && !message_polled {
                 self.poll_message_deltas(session_id, elapsed_ms, observer)?;
+            }
+            if let Some(terminal_ref) = finalized_non_success.as_deref().filter(|_| {
+                !crate::report::execution_observation_ready(
+                    &execution_observation, root_execution_id, session_id, turn_id,
+                )
+            }) {
+                if let Ok(Some(message_id)) = actor.select_finalized_terminal_message(
+                    &observer.assistant_message_ids(), turn_id, root_execution_id, terminal_ref,
+                ) {
+                    return Ok(TerminalWait {
+                        message_id, execution_observation,
+                        report: timeout.report(
+                            started.elapsed(),
+                            Duration::from_millis(observer.since_last_progress_ms(elapsed_ms)),
+                            observer.progress_observations() as usize,
+                            "root_finalized_non_success", observer.phase(), observer.last_active_phase(),
+                        ),
+                        non_success: true,
+                    });
+                }
             }
             if root_terminal == RootExecutionTerminal::Completed
                 && crate::report::execution_observation_ready(
@@ -4727,6 +4831,7 @@ impl LiveScenarioRunner {
                     return Ok(TerminalWait {
                         message_id,
                         execution_observation,
+                        non_success: false,
                         report: timeout.report(
                             started.elapsed(),
                             Duration::from_millis(observer.since_last_progress_ms(elapsed_ms)),
@@ -4863,6 +4968,8 @@ impl LiveScenarioRunner {
     fn root_execution_observation(
         &self,
         execution_id: &str,
+        session_id: &str,
+        turn_id: &str,
     ) -> Result<RootExecutionObservation, String> {
         let path = format!("/api/runtime/executions/{execution_id}?detail_scope=summary");
         match self.get_json(&path) {
@@ -4874,6 +4981,9 @@ impl LiveScenarioRunner {
                     .map(|bytes| bytes.len() as u64)
                     .unwrap_or_default();
                 let terminal = root_execution_terminal_state(&projection);
+                let finalized_non_success = finalized_non_success_terminal_ref(
+                    &projection, execution_id, session_id, turn_id,
+                );
                 let statuses = root_node_statuses(&projection);
                 let fingerprint = root_progress_fingerprint(&projection, &statuses);
                 let live = projection.get("live").unwrap_or(&Value::Null);
@@ -4894,6 +5004,7 @@ impl LiveScenarioRunner {
                 });
                 Ok(RootExecutionObservation {
                     terminal,
+                    finalized_non_success,
                     fingerprint,
                     summary,
                     response_body_bytes,
@@ -6661,6 +6772,7 @@ struct TerminalWait {
     message_id: String,
     execution_observation: Value,
     report: Value,
+    non_success: bool,
 }
 
 struct DescendantTeamWait {

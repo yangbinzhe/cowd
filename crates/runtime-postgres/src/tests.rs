@@ -3289,6 +3289,72 @@ mod host_transcript_root_460_pg_tests {
         );
         assert_eq!(after.metrics.query_count - before.metrics.query_count, 1);
     }
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn agent_tool_outcome_node_root_is_bounded_and_session_scoped() {
+        let scope = PostgresTestScope::new();
+        let backend = backend(&scope);
+        let (mut input, artifact, _) = header(&"a".repeat(64));
+        input.schema_version = 1;
+        input.event.kind = "execution_node.transitioned".into();
+        let key = input.idempotency_key.clone().unwrap();
+        let stream = input.event.stream_id.clone();
+        let envelope = serde_json::json!({"content_schema":2,"sha256":artifact.sha256,
+            "bytes":artifact.bytes,"body":{"kind":"artifact_ref","artifact":artifact}});
+        let reference = format!("agent-tool-outcome-content-v1:{}", serde_json::json!({
+            "stream_id":stream,"idempotency_key":key,"content":envelope}));
+        input.event.payload["result"] = serde_json::json!({"result_ref":reference});
+        let origin = runtime::PreparedArtifactOrigin::EventBody { stream_id:stream.clone(),
+            idempotency_key:key.clone(), kind:"execution_node.transitioned".into() };
+        assert_eq!(backend.prepared_content_root(&origin, &artifact).unwrap(), runtime::PreparedContentRoot::Absent);
+        persist_untrusted_header(&backend, input);
+        assert_eq!(backend.prepared_content_root(&origin, &artifact).unwrap(), runtime::PreparedContentRoot::Canonical);
+        let mut foreign = artifact.clone();
+        foreign.visibility_scope = "session:foreign".into();
+        assert_eq!(backend.prepared_content_root(&origin, &foreign).unwrap(), runtime::PreparedContentRoot::Blocked);
+        let mut other = artifact.clone();
+        other.selector = format!("artifact://art_{}", "c".repeat(64));
+        assert_eq!(backend.prepared_content_root(&origin, &other).unwrap(), runtime::PreparedContentRoot::Absent);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn delegated_outcome_root_requires_original_same_transaction_pair() {
+        let scope = PostgresTestScope::new();
+        let backend = backend(&scope);
+        let (_, mut artifact, _) = header(&"a".repeat(64));
+        artifact.media_type = "application/json".into();
+        let envelope = serde_json::json!({"content_schema":2,"sha256":artifact.sha256,"bytes":artifact.bytes,
+            "body":{"kind":"artifact_ref","artifact":artifact}});
+        let refs = vec![runtime::RuntimeEventRef { kind:"tool_invocation".into(), id:"call".into() },
+            runtime::RuntimeEventRef { kind:"execution_graph".into(), id:"graph".into() },
+            runtime::RuntimeEventRef { kind:"execution_node".into(), id:"node".into() },
+            runtime::RuntimeEventRef { kind:"agent_attempt".into(), id:"1".into() }];
+        let primary = RuntimeTransactionEventInput { event: RuntimeEventInput {
+            stream_id:"execution-effect:receipt-owner".into(), scope:RuntimeEventScope::ExecutionNode,
+            kind:"execution.read.receipt".into(), status:Some("completed".into()), actor:Some("governed_tool".into()),
+            refs:refs.clone(), payload:serde_json::json!({"idempotency_key":"receipt-owner",
+                "replay":{"session_id":"session-460-pg","parent_execution":{"execution_id":"graph","node_id":"node"}},
+                "outcome_truncated":true,"outcome":{"tool_use_id":"call"},"delegated_outcome_content_v1":envelope}),
+        }, idempotency_key:Some("receipt-owner:read-receipt".into()), schema_version:1 };
+        let index = RuntimeTransactionEventInput { event: RuntimeEventInput {
+            stream_id:"execution-agent-receipts:graph:node:1".into(), scope:RuntimeEventScope::ExecutionNode,
+            kind:"execution.agent_tool.receipt".into(), status:Some("completed".into()), actor:Some("governed_tool".into()),
+            refs, payload:serde_json::json!({"idempotency_key":"receipt-owner","effect_kind":"read",
+                "outcome_truncated":true,"outcome":{"tool_use_id":"call"},"delegated_outcome_content_v1":envelope}),
+        }, idempotency_key:Some("agent-tool-receipt:receipt-owner".into()), schema_version:2 };
+        let origin = runtime::PreparedArtifactOrigin::EventBody { stream_id:primary.event.stream_id.clone(),
+            idempotency_key:primary.idempotency_key.clone().unwrap(), kind:primary.event.kind.clone() };
+        assert_eq!(backend.prepared_content_root(&origin, &artifact).unwrap(), runtime::PreparedContentRoot::Absent);
+        backend.append_transaction(AppendTransactionRequest { transaction_id:"delegated-root-pair".into(),
+            expected_streams:vec![ExpectedStreamRevision { stream_id:primary.event.stream_id.clone(), expected_revision:0 },
+                ExpectedStreamRevision { stream_id:index.event.stream_id.clone(), expected_revision:0 }],
+            events:vec![primary,index], }).unwrap();
+        assert_eq!(backend.prepared_content_root(&origin, &artifact).unwrap(), runtime::PreparedContentRoot::Canonical);
+        let mut wrong = artifact.clone(); wrong.visibility_scope = "session:foreign".into();
+        assert_eq!(backend.prepared_content_root(&origin, &wrong).unwrap(), runtime::PreparedContentRoot::Absent);
+    }
+
 }
 
 mod pg_root_checkout_453_tests {

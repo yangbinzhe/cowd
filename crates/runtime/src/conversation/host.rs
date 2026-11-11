@@ -50,6 +50,7 @@ mod host_backend;
 /// its own actions, so without this a reference Runtime spells `artifact:<24 hex>`
 /// is refused inside a batch while the same reference works when sent directly.
 pub use host_backend::normalize_bare_evidence_ref;
+pub(crate) use host_backend::normalize_native_read_input;
 pub(crate) use host_backend::{pregrant_original_action_receipt, retain_original_member_batches};
 
 pub(crate) fn closure_mutation_tool_ids(rungs: &[String]) -> std::collections::BTreeSet<String> {
@@ -6088,6 +6089,16 @@ fn early_tool_fingerprint(invocation: &harness_contract::tool::GovernedToolInvoc
 }
 
 impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyToolDispatcher<T> {
+    fn confirms_original_undispatched(
+        &self,
+        call_id: &str,
+        deferred: &crate::conversation::EarlyToolDeferral,
+    ) -> bool {
+        host_backend::original_early_deferral_sources(
+            &self.services, &self.ticket, call_id, deferred,
+        ).ok().flatten().is_some()
+    }
+
     fn dispatch(
         &self,
         candidate: crate::conversation::EarlyToolCandidate,
@@ -6124,6 +6135,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                             authorization_events: original_authorization_events.lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
                         })),
+                        origin: crate::conversation::EarlyToolDeferralOrigin::OriginalWorker,
                     },
                 )
             };
@@ -6147,6 +6159,11 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 }
             };
             if request.input != candidate.call.input {
+                return defer("early_repaired_input_requires_original_tool_batch".into());
+            }
+            if crate::host::normalize_native_read_input(&request.tool_name, &request.input)
+                != request.input
+            {
                 return defer("early_repaired_input_requires_original_tool_batch".into());
             }
             let original_executor: Arc<dyn crate::ToolExecutor> = tool_executor.clone();
@@ -6310,6 +6327,26 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 Ok(_) => return defer("tool_policy_not_parallel_safe".to_string()),
                 Err(error) => return defer(format!("tool_policy_denied:{error}")),
             };
+            let Some(step) = candidate.call.binding.as_ref() else {
+                return defer("early_original_plan_step_missing".into());
+            };
+            let Some(context_identity) = event_bus.as_ref().and_then(crate::CowdEventBus::current_execution_context) else {
+                return defer("early_original_plan_context_missing".into());
+            };
+            if context_identity.session_id != session_id || context_identity.session_id != step.snapshot.identity.session_id
+                || context_identity.turn_id != step.snapshot.identity.turn_id
+                || step.snapshot.identity.execution_id.as_deref() != Some(context_identity.execution_id.as_str())
+                || match step.snapshot.identity.run_ref.as_deref() {
+                    Some(run) => run != context_identity.execution_id.as_str(),
+                    None => context_identity.execution_id != ticket.graph_id,
+                } {
+                return defer("early_original_plan_context_mismatch".into());
+            }
+            if let Err(error) = crate::conversation::tool_plane::persist_governed_tool_plan_event(
+                services.event_store(), &session_id, Some(&context_identity), &plan,
+            ) {
+                return defer(format!("early_original_plan_persistence_unknown:{error}"));
+            }
             let mut authorizations = std::collections::HashMap::new();
             authorizations.insert(candidate.call.id.clone(), authorization);
             let early_fingerprint = early_tool_fingerprint(&invocation);
@@ -6392,6 +6429,10 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 idempotency_keys: Some(&idempotency_keys),
                 invocations: Arc::clone(&early_invocations),
             };
+            if context.event_bus.as_ref().and_then(crate::CowdEventBus::current_execution_context).as_ref()
+                != Some(&context_identity) {
+                return defer("early_original_plan_context_changed".into());
+            }
             let mut report = crate::GovernedToolExecutor.execute(&plan, &context).await;
             let unknown = context.unknown_effects.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

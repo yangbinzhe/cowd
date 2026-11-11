@@ -2248,6 +2248,10 @@ async fn aborted_cancel_releases_intent_and_nested_child_graph_can_progress() {
     tokio::task::yield_now().await;
     cancel.abort();
     let _ = cancel.await;
+    // Aborting the command waiter does not end the original cancel future.
+    // Let that same physical operation finish before expecting a graph commit.
+    assert_eq!(state.load(&graph_id).unwrap().node_statuses["cancel-probe"], ExecutionNodeStatus::Running);
+    executor.release_cancel.notify_one();
     tokio::time::timeout(Duration::from_secs(1), run)
         .await
         .expect("old intent waiter is released")
@@ -8027,28 +8031,29 @@ async fn r1_704_hot_recovery_finishes_original_callback_without_stealing_or_reex
         )
         .await
         .is_err());
-    let recovered = runner.recover_graph(&id).await.unwrap();
-    assert!(state
-        .binding_lease_closure(&recovered, "retained704", &binding, position)
-        .unwrap());
-    assert_eq!(
-        recovered.recovery_cursor.node_attempts,
-        before.recovery_cursor.node_attempts
-    );
+    // A generic Poll can also mean that the receipt was written and its
+    // acknowledgement lost. Changing this fixture flag is not proof that
+    // the original callback is safe to run again.
+    assert!(matches!(runner.recover_graph(&id).await,
+        Err(super::recovery::ExecutionRecoveryError::LeaseReconciliation(_))));
+    let retained = state.load(&id).unwrap();
+    assert_eq!(retained, before);
+    assert!(!state.binding_lease_closure(&retained, "retained704", &binding, position).unwrap());
     assert_eq!(executor.polls.load(Ordering::SeqCst), 1);
-    assert_eq!(executor.inner.after_commits.load(Ordering::SeqCst), 1);
-    assert_eq!(runner.recover_graph(&id).await.unwrap(), recovered);
+    assert_eq!(executor.inner.after_commits.load(Ordering::SeqCst), 0);
     let stale = runner
         .command(
             &id,
             ExecutionGraphCommand::Cancel {
-                expected_revision: before.revision,
+                expected_revision: retained.revision.checked_sub(1).expect("registered graph has a prior revision"),
                 reason: "704 stale command must not bypass CAS".into(),
             },
         )
         .await;
-    assert!(stale.is_err());
-    assert_eq!(state.load(&id).unwrap(), recovered);
+    assert!(matches!(stale, Err(ExecutionRunnerError::Commit(
+        ExecutionCommitError::StaleRevision { .. }
+    ))));
+    assert_eq!(state.load(&id).unwrap(), retained);
     assert!(runner.recover_graph("foreign-704").await.is_err());
 }
 
@@ -8171,6 +8176,20 @@ async fn cold_callback_recovery_704(after_effect: bool) {
         drop(commits);
         drop(state);
         drop(events);
+        if !after_effect {
+            // Cancelling the observer is not process death: the pending original
+            // callback still owns its fence and has not published a receipt.
+            let retained_events = old_events.upgrade().expect("original callback retains its event owner");
+            let retained_executor = old_executor.upgrade().expect("original executor remains alive");
+            assert!(retained_events.list_stream(&receipt_stream).unwrap().is_empty());
+            assert_eq!(retained_events.list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket)).unwrap(), original_effect);
+            let retained_state = ExecutionGraphStateStore::new(retained_events.clone());
+            let retained_graph = retained_state.load(&graph_id).unwrap();
+            assert!(!retained_state.binding_lease_closure(&retained_graph, "cold704", &binding, position).unwrap());
+            assert_eq!(retained_executor.polls.load(Ordering::SeqCst), 1);
+            assert!(scopes.try_recover_binding_owner(&fence).unwrap().is_none());
+            continue;
+        }
         tokio::time::timeout(Duration::from_secs(5), async {
             while old_registry.upgrade().is_some()
                 || old_executor.upgrade().is_some()
@@ -8822,13 +8841,13 @@ impl NodeExecutor for ControlledDrain475 {
     }
 }
 
-async fn assert_actual_cancel_gate_475(abort_fails: bool) {
+async fn assert_actual_cancel_gate_475(abort_fails: bool, initially_drained: bool) {
     let events = Arc::new(RuntimeEventStore::for_test());
     let state = ExecutionGraphStateStore::new(events.clone());
     let commits = ExecutionCommitService::new(events.clone());
     let registry = Arc::new(NodeExecutorRegistry::new());
     let executor = Arc::new(ControlledDrain475 {
-        drained: AtomicBool::new(false),
+        drained: AtomicBool::new(initially_drained),
         abort_fails,
         aborts: AtomicUsize::new(0),
         polls: AtomicUsize::new(0),
@@ -8863,25 +8882,44 @@ async fn assert_actual_cancel_gate_475(abort_fails: bool) {
         .into_iter()
         .next()
         .unwrap();
-    let error = runner
-        .command(
-            &graph.id,
-            ExecutionGraphCommand::Cancel {
-                expected_revision: running.revision,
-                reason: "original cancel".into(),
-            },
-        )
-        .await
-        .err()
-        .expect("bounded Ok must not mean physical drain");
-    assert!(error.to_string().contains("without physical quiescence"));
-    assert_eq!(state.load(&graph.id).unwrap(), running);
-    assert!(!state
-        .binding_lease_closure(&running, "drain475", &binding, position)
-        .unwrap());
-    assert_eq!(executor.aborts.load(Ordering::SeqCst), 0);
-    assert!(runner.recover_graph(&graph.id).await.is_err());
-    executor.drained.store(true, Ordering::SeqCst);
+    if !initially_drained {
+        let ticket = fixture_ticket_475(&running, "drain475", &binding);
+        let effect_stream = ExecutionNodeBinding::effect_stream_id(&ticket);
+        let original_effect = events.list_stream(&effect_stream).unwrap();
+        assert_eq!(original_effect.len(), 1, "original intent exists without a receipt");
+        let error = runner
+            .command(
+                &graph.id,
+                ExecutionGraphCommand::Cancel {
+                    expected_revision: running.revision,
+                    reason: "original cancel".into(),
+                },
+            )
+            .await
+            .err()
+            .expect("bounded Ok must not mean physical drain");
+        assert!(error.to_string().contains("without physical quiescence"));
+        assert_eq!(state.load(&graph.id).unwrap(), running);
+        assert!(!state
+            .binding_lease_closure(&running, "drain475", &binding, position)
+            .unwrap());
+        assert_eq!(executor.aborts.load(Ordering::SeqCst), 0);
+        assert!(runner.recover_graph(&graph.id).await.is_err());
+        executor.drained.store(true, Ordering::SeqCst);
+        let retry = runner.command(&graph.id, ExecutionGraphCommand::Cancel {
+            expected_revision: running.revision,
+            reason: "unconfirmed original drain".into(),
+        }).await;
+        assert!(retry.is_err(), "a changed fixture flag is not an original drain receipt");
+        let retained = state.load(&graph.id).unwrap();
+        assert_eq!(retained, running);
+        assert!(!state.binding_lease_closure(&retained, "drain475", &binding, position).unwrap());
+        assert_eq!(events.list_stream(&effect_stream).unwrap(), original_effect);
+        assert!(matches!(commits.inspect_execution_effect(&ticket).unwrap(), ExecutionEffectState::Uncertain));
+        assert_eq!(executor.aborts.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.polls.load(Ordering::SeqCst), 0);
+        return;
+    }
     let result = runner
         .command(
             &graph.id,
@@ -8940,12 +8978,14 @@ async fn assert_actual_cancel_gate_475(abort_fails: bool) {
 
 #[tokio::test]
 async fn r1_475_bounded_cancel_ok_requires_positive_original_drain_before_closure() {
-    assert_actual_cancel_gate_475(false).await;
+    assert_actual_cancel_gate_475(false, false).await;
+    assert_actual_cancel_gate_475(false, true).await;
 }
 
 #[tokio::test]
 async fn r1_475_command_after_abort_failure_keeps_cancelled_binding_unclosed() {
-    assert_actual_cancel_gate_475(true).await;
+    assert_actual_cancel_gate_475(true, false).await;
+    assert_actual_cancel_gate_475(true, true).await;
 }
 
 #[test]

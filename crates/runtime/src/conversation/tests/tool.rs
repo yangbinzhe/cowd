@@ -2415,6 +2415,8 @@ async fn early_original_predispatch_deferral_retains_owner_and_rejects_drift() {
     let proof = original.original_undispatched.as_ref().expect("original worker retains its pre-dispatch proof");
     assert_eq!(proof.ticket, ticket);
     assert_eq!(proof.call_id, "early-original");
+    assert!(dispatcher.confirms_original_undispatched("early-original", original));
+    assert!(!dispatcher.confirms_original_undispatched("foreign", original));
     let backend = TurnModelStepBackend {
         ticket: ticket.clone(), stop: crate::CancellationToken::new(),
         local_fence: std::sync::Mutex::new(None), runtime, state: Arc::new(tokio::sync::Mutex::new(state)),
@@ -2424,9 +2426,11 @@ async fn early_original_predispatch_deferral_retains_owner_and_rejects_drift() {
     assert!(!backend.confirm_original_early_release(&ticket, &[("foreign".into(), result.clone())]).await.unwrap());
     let mut missing = original.clone();
     missing.original_undispatched = None;
+    assert!(!dispatcher.confirms_original_undispatched("early-original", &missing));
     assert!(!backend.confirm_original_early_release(&ticket, &[("early-original".into(), EarlyToolDispatchResult::Deferred(missing))]).await.unwrap());
     let mut drifted = original.clone();
     Arc::make_mut(drifted.original_undispatched.as_mut().unwrap()).identity.tool_call_id = Some("foreign".into());
+    assert!(!dispatcher.confirms_original_undispatched("early-original", &drifted));
     assert!(!backend.confirm_original_early_release(&ticket, &[("early-original".into(), EarlyToolDispatchResult::Deferred(drifted))]).await.unwrap());
     let unknown = EarlyToolDispatchResult::Failed(crate::conversation::EarlyToolFailure {
         identity: crate::CausalItemIdentity { model_step_id: "original-step".into(), item_id: "early-original".into(),

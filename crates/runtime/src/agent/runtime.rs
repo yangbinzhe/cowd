@@ -5044,12 +5044,16 @@ mod tests {
         let owner = runtime.clone();
         let supplied = packet.clone();
         let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
-        // The worker owns a live process group while it runs.
+        // The controlled host has a process group before business GO. Wait
+        // for its protocol handshake as well so this tests a started worker.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while adapter.owned_process_group_is_empty(&packet.run_id(), packet.attempt) != Some(false) {
+        loop {
+            let group_live = adapter.owned_process_group_is_empty(&packet.run_id(), packet.attempt) == Some(false);
+            let protocol_ready = adapter.fixture_exit_diagnostic(&packet)["active"]["protocol_ready"] == true;
+            if group_live && protocol_ready { break; }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the process child never owned a live process group"
+                "the process child never became protocol-ready with a live process group"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

@@ -12,7 +12,7 @@ use super::PHYSICAL_CLOSURE_BUDGET;
 /// publishes a durable commit and wakes the re-proof - and this cap keeps
 /// the cadence bounded when nothing publishes, so the wait never
 /// busy-waits the store and never outlives the budget.
-const PHYSICAL_CLOSURE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+pub(super) const PHYSICAL_CLOSURE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Wait for the next durable commit inside the closure budget, capped by
 /// the smaller of the remaining budget and the retry pause. The whole wait

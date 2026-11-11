@@ -993,6 +993,39 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                         artifact,
                     ));
                 }
+                if kind == "execution.read.receipt" || kind == "execution.effect.receipt" {
+                    let primary = Self::process_closure_root_event(&mut connection, stream_id, idempotency_key)?;
+                    let identity = primary.as_ref().and_then(|primary|
+                        RuntimeEventStore::process_closure_index_identity(&primary.payload, &primary.refs).ok());
+                    let index = match identity {
+                        Some((stream, key)) => Self::process_closure_root_event(&mut connection, &stream, &key)?,
+                        None => None,
+                    };
+                    return Ok(RuntimeEventStore::delegated_outcome_root(primary.as_ref(), index.as_ref(), artifact));
+                }
+                if kind == "execution_node.transitioned" {
+                    let row = connection.query_opt(
+                        "SELECT kind,scope,schema_version,CASE WHEN octet_length(payload#>>'{_runtime_activity_binding,session_id}')<=1024 THEN payload#>>'{_runtime_activity_binding,session_id}' END,CASE WHEN octet_length(payload#>>'{result,result_ref}')<=16384 THEN payload#>>'{result,result_ref}' END FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2",
+                        &[&stream_id, &idempotency_key],
+                    ).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+                    return Ok(match row {
+                        None => PreparedContentRoot::Absent,
+                        Some(row) => {
+                            let actual_kind: String = row.get(0);
+                            let scope: String = row.get(1);
+                            let schema: i64 = row.get(2);
+                            let session: Option<String> = row.get(3);
+                            let value: Option<String> = row.get(4);
+                            if actual_kind != *kind || scope != "execution_node" || schema != 1
+                                || session.is_none_or(|session| artifact.visibility_scope != format!("session:{session}")) {
+                                PreparedContentRoot::Blocked
+                            } else if let Some(value) = value {
+                                RuntimeEventStore::prepared_agent_tool_outcome_root(
+                                    &value, stream_id, idempotency_key, artifact)
+                            } else { PreparedContentRoot::Blocked }
+                        }
+                    });
+                }
                 let row = connection.query_opt(
                     "SELECT CASE WHEN octet_length(kind)<=1024 THEN kind ELSE '' END,schema_version,CASE WHEN octet_length(scope)<=64 THEN scope ELSE '' END,
                      CASE WHEN octet_length((payload->'observation_schema')::TEXT)<=16 THEN payload->'observation_schema' END,

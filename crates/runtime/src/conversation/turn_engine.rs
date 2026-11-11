@@ -72,6 +72,9 @@ impl OriginalSingleProducerCapture {
     pub(crate) fn permission_context(&self) -> Option<PermissionContext> {
         self.permission_context.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
+    pub(crate) fn permission_context_json(&self) -> Option<serde_json::Value> {
+        self.permission_context().as_ref().map(original_permission_context_json)
+    }
     pub(crate) fn owner(&self) -> Option<Arc<SharedPolicyOwner>> {
         self.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
@@ -137,7 +140,7 @@ impl<'a> OriginalSingleCheckedInputs<'a> {
         match self { Self::Root(v) => Some(v.original_decision), Self::Delegated(v) => v.original_decision }
     }
     pub(crate) fn read_ref_target(&self) -> Option<&OriginalReadRefTarget> {
-        match self { Self::Root(v) => v.read_ref_target, Self::Delegated(_) => None }
+        match self { Self::Root(v) => v.read_ref_target, Self::Delegated(v) => v.read_ref_target }
     }
     pub(crate) fn is_delegated(&self) -> bool { matches!(self, Self::Delegated(_)) }
 }
@@ -745,12 +748,86 @@ impl SharedPolicyOwner {
     pub(crate) fn original_policy_control(&self) -> crate::permissions::SessionExecutionPolicyControl {
         self.identity.permission_policy.execution_policy_control()
     }
+    pub(crate) fn uses_original_claim(&self, claim: &crate::execution_core::services::OriginalSessionClaim) -> bool {
+        self.original_session_claim.as_deref().is_some_and(|original| std::ptr::eq(original, claim))
+    }
     pub(crate) fn original_consumption(
         &self, authorization: &harness_contract::tool::ToolExecutionAuthorization,
     ) -> Option<crate::authorization_negotiator::OriginalLeaseConsumption> {
         self.assessment.authorization_negotiator.original_consumption(
             &authorization.authorization_lease, &authorization.request_id)
             .filter(|consumption| consumption.belongs_to(&self.assessment.authorization_negotiator))
+    }
+    /// Authenticate the same producer target for root and delegated calls.
+    pub(crate) fn verify_read_ref_target(
+        &self, expected_ticket: &crate::execution_core::NodeExecutionTicket, request: &crate::RuntimeToolExecutionRequest,
+        events: &[crate::DurableRuntimeEvent], context: &PermissionContext,
+        target: Option<&OriginalReadRefTarget>,
+    ) -> Result<(), String> {
+        if request.tool_name != "read_ref" {
+            return if target.is_none() { Ok(()) } else { Err("unexpected read_ref target".into()) };
+        }
+        let outer = harness_contract::step::parse_strict_json(&request.input).map_err(|e| e.to_string())?;
+        let derived = crate::agentic::action_invocation::read_ref_directory_input(&outer)?;
+        let target = match (derived, target) {
+            (None, None) => return Ok(()),
+            (Some(input), Some(target)) if input == target.input => target,
+            _ => return Err("original read_ref target unavailable or changed".into()),
+        };
+        let session = request.session_id.as_deref().ok_or("original Session missing")?;
+        if target.ticket != *expected_ticket || self.identity.session_id != session
+            || !std::sync::Weak::ptr_eq(&target.original_channel, &request.tool_progress.original_read_ref_identity())
+            || target.authorization.policy_revision != request.policy_revision {
+            return Err("original read_ref target identity changed".into());
+        }
+        let binding = request.step_binding.as_ref().ok_or("original Step missing")?;
+        let step = binding.resolve(self.tool_lease.clone()).map_err(|error| error.to_string())?;
+        let text = serde_json::to_string(&target.input).map_err(|error| error.to_string())?;
+        if step.validate_call(&binding.origin, session, &request.tool_use_id, "state_inspect", &text,
+            chrono::Utc::now().timestamp_millis()).map_err(|error| error.to_string())? != target.input
+            || step.lease().describe_effect("state_inspect", &target.input) != target.effect {
+            return Err("original read_ref Step or effect changed".into());
+        }
+        step.lease().validate_authorization(&target.authorization, "state_inspect", &target.input)
+            .map_err(|error| error.to_string())?;
+        let consumption = self.original_consumption(&target.authorization)
+            .ok_or("original read_ref target consumption unavailable")?;
+        if consumption.lease != target.authorization.authorization_lease {
+            return Err("original read_ref target consumption changed".into());
+        }
+        let mut original_request = serde_json::to_value(request).map_err(|e| e.to_string())?;
+        let mut captured_request = target.original_request.clone();
+        for value in [&mut original_request, &mut captured_request] {
+            let object = value.as_object_mut().ok_or("original read_ref request invalid")?;
+            object.remove("authorization"); object.remove("execution_decision");
+        }
+        if original_request != captured_request { return Err("original read_ref request changed".into()); }
+        let context = original_permission_context_json(context);
+        let ticket = serde_json::to_value(&target.ticket).map_err(|e| e.to_string())?;
+        let expected_step = serde_json::to_value(&request.step_binding).map_err(|e| e.to_string())?;
+        let lease = serde_json::to_value(&target.authorization.authorization_lease).map_err(|e| e.to_string())?;
+        let transition = serde_json::to_value(&consumption.transition).map_err(|e| e.to_string())?;
+        let derived_fact = serde_json::json!({"tool":"state_inspect", "input":target.input, "effect":target.effect});
+        let assessed = events.iter().filter(|event| {
+            let fact = &event.payload["_call_refusal_binding"];
+            let mut pre = fact["request"].clone();
+            let Some(object) = pre.as_object_mut() else { return false; };
+            object.remove("authorization"); object.remove("execution_decision");
+            event.kind == "authorization.capability_assessed"
+                && event.actor.as_deref() == Some("conversation_runtime")
+                && event.stream_id == format!("session:{session}")
+                && fact["owner"]["ticket"] == ticket && fact["step_binding"] == expected_step
+                && fact["call_id"].as_str() == Some(request.tool_use_id.as_str())
+                && fact["effect_key"].as_str() == Some(request.idempotency_key.as_str())
+                && pre == original_request && fact["derived_target"] == derived_fact
+                && event.payload["capability"].as_str() == Some("state_inspect")
+                && event.payload["_original_permission_context"] == context && event.payload["lease"] == lease
+        }).count();
+        let consumed = events.iter().filter(|event| event.kind == "authorization.lease_transition"
+            && event.actor.as_deref() == Some("conversation_runtime") && event.status.as_deref() == Some("consumed")
+            && event.payload == transition).count();
+        if assessed != 1 || consumed != 1 { return Err("original read_ref target producer events unavailable".into()); }
+        Ok(())
     }
     pub(crate) fn new_single_commit_control(&self) -> Arc<crate::conversation::MemberCommitControl> {
         let control = self.cancellation.member_commit_control();
@@ -860,69 +937,7 @@ impl SharedPolicyOwner {
                         && event.payload["idempotency_key"].as_str() == Some(auth.request_id.as_str()) { consumed += 1; }
                 }
                 if assessed != 1 || consumed != 1 { return Err("original single-call assessment/lease provenance mismatch".into()); }
-                if request.tool_name == "read_ref" {
-                    let original_input = harness_contract::step::parse_strict_json(&request.input).map_err(|e| e.to_string())?;
-                    let derived = crate::agentic::action_invocation::read_ref_directory_input(&original_input)?;
-                    match (derived, read_ref_target) {
-                        (None, None) => {},
-                        (Some(derived), Some(target)) => {
-                            let mut original_request = serde_json::to_value(request).map_err(|e| e.to_string())?;
-                            let mut captured_request = target.original_request.clone();
-                            for value in [&mut original_request, &mut captured_request] {
-                                let object = value.as_object_mut().ok_or("original read_ref request invalid")?;
-                                object.remove("authorization"); object.remove("execution_decision");
-                            }
-                            if target.ticket != *ticket || !std::sync::Weak::ptr_eq(&target.original_channel, &request.tool_progress.original_read_ref_identity())
-                                || original_request != captured_request || target.input != derived
-                                || target.authorization.policy_revision != policy.revision {
-                                return Err("original read_ref target identity changed".into());
-                            }
-                            let target_text = serde_json::to_string(&derived).map_err(|e| e.to_string())?;
-                            let validated = step.validate_call(&binding.origin, session, &request.tool_use_id,
-                                "state_inspect", &target_text, chrono::Utc::now().timestamp_millis()).map_err(|e| e.to_string())?;
-                            if validated != derived || step.lease().describe_effect("state_inspect", &derived) != target.effect {
-                                return Err("original read_ref target Step or effect changed".into());
-                            }
-                            step.lease().validate_authorization(&target.authorization, "state_inspect", &derived).map_err(|e| e.to_string())?;
-                            let target_consumption = self.assessment.authorization_negotiator
-                                .original_consumption(&target.authorization.authorization_lease, &target.authorization.request_id)
-                                .ok_or("original read_ref target consumption unavailable")?;
-                            if !target_consumption.belongs_to(&self.assessment.authorization_negotiator)
-                                || target_consumption.lease != target.authorization.authorization_lease {
-                                return Err("original read_ref target consumption owner changed".into());
-                            }
-                            let target_transition = serde_json::to_value(&target_consumption.transition).map_err(|e| e.to_string())?;
-                            let target_lease = serde_json::to_value(&target.authorization.authorization_lease).map_err(|e| e.to_string())?;
-                            let derived_fact = serde_json::json!({"tool":"state_inspect", "input":derived, "effect":target.effect});
-                            let expected_ticket = serde_json::to_value(ticket).map_err(|e| e.to_string())?;
-                            let expected_step = serde_json::to_value(&request.step_binding).map_err(|e| e.to_string())?;
-                            let target_assessed = events.iter().filter(|event| {
-                                let fact = &event.payload["_call_refusal_binding"];
-                                let mut fact_request = fact["request"].clone();
-                                let Some(object) = fact_request.as_object_mut() else { return false; };
-                                object.remove("authorization"); object.remove("execution_decision");
-                                event.kind == "authorization.capability_assessed"
-                                    && event.actor.as_deref() == Some("conversation_runtime")
-                                    && event.stream_id == format!("session:{session}")
-                                    && fact["owner"]["ticket"] == expected_ticket
-                                    && fact["step_binding"] == expected_step
-                                    && fact["call_id"].as_str() == Some(request.tool_use_id.as_str())
-                                    && fact["effect_key"].as_str() == Some(request.idempotency_key.as_str())
-                                    && fact_request == original_request && fact["derived_target"] == derived_fact
-                                    && event.payload["capability"].as_str() == Some("state_inspect")
-                                    && event.payload["_original_permission_context"] == original_permission_context_json(permission_context)
-                                    && event.payload["lease"] == target_lease
-                            }).count();
-                            let target_consumed = events.iter().filter(|event| event.kind == "authorization.lease_transition"
-                                && event.actor.as_deref() == Some("conversation_runtime") && event.status.as_deref() == Some("consumed")
-                                && event.payload == target_transition).count();
-                            if target_assessed != 1 || target_consumed != 1 {
-                                return Err("original read_ref target producer events unavailable".into());
-                            }
-                        },
-                        _ => return Err("original read_ref target owner unavailable".into()),
-                    }
-                } else if read_ref_target.is_some() { return Err("original read_ref target attached to another call".into()); }
+                self.verify_read_ref_target(ticket, request, events, permission_context, read_ref_target)?;
                 if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire)
                     || self.session_input_stream.active_turn_id().as_ref() != Some(&turn) {
                     return Err("original turn no longer active".into());

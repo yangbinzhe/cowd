@@ -1268,7 +1268,35 @@ impl ScopedRuntimeToolExecutor {
                     input,
                 )
             });
-        let request = RuntimeToolExecutionRequest {
+        let directory_read = crate::agentic::action_invocation::is_directory_read(tool_name, input);
+        let original = if directory_read {
+            match crate::tool_host::ORIGINAL_EFFECT_REQUEST.try_with(|slot| {
+                slot.lock().map_err(|_| ToolError::unknown("original request channel poisoned"))?.clone()
+                    .ok_or_else(|| ToolError::unknown("original directory read request missing"))
+            }) {
+                Ok(result) => Some(result?),
+                Err(_) if crate::tool_host::ORIGINAL_MEMBER_PROGRESS.try_with(|_| ()).is_ok() =>
+                    return Err(ToolError::unknown("original Ticket directory read request channel missing")),
+                Err(_) => None,
+            }
+        } else { None };
+        let request = if let Some(original) = original {
+            let original_input = harness_contract::step::parse_strict_json(&original.input)
+                .map_err(|error| ToolError::unknown(format!("original directory read input invalid: {error}")))?;
+            let expected_parent = harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: self.execution_id.clone(), node_id: self.node_id.clone(),
+            };
+            if original.tool_name != tool_name || original_input != parsed_input
+                || original.authorization != authorization || original.step_binding.as_ref() != step_binding
+                || Some(original.tool_use_id.as_str()) != provider_invocation_id
+                || original.session_id.as_deref() != Some(self.session_id.as_str())
+                || original.parent_execution.as_ref() != Some(&expected_parent)
+                || original.parent_execution_attempt != Some(self.attempt)
+                || original.sandbox_posture != self.sandbox_posture || original.policy_revision != self.policy_revision
+                || original.compiled_invocation.as_ref().is_none_or(|invocation| invocation.effect != descriptor)
+            { return Err(ToolError::unknown("original directory read request identity mismatch")); }
+            (*original).clone()
+        } else { RuntimeToolExecutionRequest {
             compiled_invocation: step_binding
                 .map(|binding| {
                     binding.prepare_invocation(
@@ -1312,7 +1340,7 @@ impl ScopedRuntimeToolExecutor {
             evaluation_isolated: self.evaluation_isolated(),
             managed_invocation: self.managed_invocation.clone(),
             tool_progress: crate::ToolProgressSink::default(),
-        };
+        }};
         if tool_name == "agent_action_batch" {
             if crate::agent_in_process_worker::current_original_process_batch_call().is_some() {
                 let pinned = self.host.pin_step_catalog().ok_or_else(|| ToolError::unknown("Process original ToolHost lease missing"))?;
@@ -1964,6 +1992,45 @@ mod original_effect_admission_gate_tests {
     /// A Read-family agent action whose admission is a durable fact is not
     /// refused for a missing owner: the Read family installs no owner, and
     /// the refusal it used to be was wrong.
+    #[tokio::test]
+    async fn directory_read_rejects_missing_or_foreign_original_request() {
+        let host = Arc::new(GateHost { calls: std::sync::atomic::AtomicUsize::new(0) });
+        let executor = gate_executor(host.clone(), None);
+        let authorization = gate_authorization("read_ref", "directory-effect");
+        let input = r#"{"reference":"task://task:original"}"#;
+        let missing = crate::tool_host::ORIGINAL_MEMBER_PROGRESS.scope(
+            crate::ToolProgressSink::default(),
+            executor.execute_scoped_bound("read_ref", input, Some(authorization.clone()), Some("gate-call"), None),
+        ).await.expect_err("a Ticket directory read needs its original request");
+        assert!(missing.is_unknown());
+        let mut original = original_request("read_ref", "directory-effect", &executor, authorization.clone());
+        original.input = input.into();
+        original.compiled_invocation = Some(harness_contract::tool::GovernedToolInvocation {
+            origin: None, contract_version: 1, invocation_id: "gate-call".into(),
+            intent: harness_contract::tool::ToolIntent { invocation_id: "gate-call".into(),
+                tool_name: "read_ref".into(), normalized_input: serde_json::from_str(input).unwrap() },
+            effect: crate::governed_tool_plan::fixture_effect("read_ref", &serde_json::from_str(input).unwrap()),
+            resource_demand: harness_contract::tool::ResourceDemand::default(),
+            explicit_dependencies: vec![], compiled_dependencies: vec![], catalog_revision: 0,
+            descriptor_set_hash: String::new(), idempotency_key: "directory-effect".into(),
+        });
+        let slot = Arc::new(Mutex::new(Some(Arc::new(original.clone()))));
+        let accepted = crate::tool_host::ORIGINAL_EFFECT_REQUEST.scope(slot,
+            executor.execute_scoped_bound("read_ref", input, Some(authorization.clone()), Some("gate-call"), None),
+        ).await.expect_err("the fixture has no original governed hook");
+        assert!(accepted.to_string().contains("original unbound call owner missing"),
+            "the same original request reaches the next owner check: {accepted}");
+        let mut foreign = original;
+        foreign.parent_execution.as_mut().unwrap().node_id = "foreign-node".into();
+        let slot = Arc::new(Mutex::new(Some(Arc::new(foreign))));
+        let mismatch = crate::tool_host::ORIGINAL_EFFECT_REQUEST.scope(slot,
+            executor.execute_scoped_bound("read_ref", input, Some(authorization), Some("gate-call"), None),
+        ).await.expect_err("another parent cannot lend the original channel");
+        assert!(mismatch.is_unknown());
+        assert!(mismatch.to_string().contains("original directory read request identity mismatch"));
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn an_admitted_read_action_is_not_refused_for_a_missing_owner() {
         let store = Arc::new(crate::runtime_event_store::RuntimeEventStore::for_test());

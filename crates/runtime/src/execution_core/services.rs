@@ -1605,6 +1605,11 @@ impl SessionTerminalDeliveryPort {
     }
 }
 
+struct ExecutionShutdownRegistration {
+    deadline: tokio::time::Instant,
+    completion: tokio::sync::watch::Sender<Option<crate::RuntimeExecutionShutdownCompletion>>,
+}
+
 pub struct RuntimeServices {
     workspace_root: PathBuf,
     workspace_key: String,
@@ -1628,6 +1633,7 @@ pub struct RuntimeServices {
     graph_state_store: ExecutionGraphStateStore,
     commit_service: ExecutionCommitService,
     execution_supervisor: Arc<crate::RuntimeExecutionSupervisor>,
+    execution_shutdown: Mutex<Option<ExecutionShutdownRegistration>>,
     approval_queue: Arc<ApprovalQueue>,
     approval_coordinator: Arc<ApprovalCoordinator>,
     execution_capacity_profile: Arc<crate::ExecutionCapacityProfile>,
@@ -2935,6 +2941,7 @@ impl RuntimeServices {
             session_execution_policy_controls,
             session_execution_policy_admission_blocks,
             maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
+            execution_shutdown: Mutex::new(None),
             #[cfg(test)]
             retirement_owner_test_gate: Mutex::new(None),
             resource_evidence_writer,
@@ -3353,27 +3360,85 @@ impl RuntimeServices {
 
     /// Stop the one Runtime execution owner and return auditable per-owner
     /// queue/abort/error evidence to the process host.
-    pub async fn shutdown_execution(&self) -> crate::RuntimeExecutionShutdownReport {
-        self.agent_runtime.fence_run_admission();
-        let mut report = self.execution_supervisor.shutdown().await;
+    pub fn subscribe_execution_shutdown_completion(&self) -> Option<tokio::sync::watch::Receiver<Option<crate::RuntimeExecutionShutdownCompletion>>> {
+        self.execution_shutdown.lock().ok()?.as_ref().map(|owner| owner.completion.subscribe())
+    }
+
+    pub fn execution_shutdown_deadline(&self) -> Option<tokio::time::Instant> {
+        self.execution_shutdown.lock().ok()?.as_ref().map(|owner| owner.deadline)
+    }
+
+    pub async fn shutdown_execution(self: &Arc<Self>) -> crate::RuntimeExecutionShutdownReport {
+        let (deadline, mut completion) = {
+            let mut registered = match self.execution_shutdown.lock() {
+                Ok(registered) => registered,
+                Err(_) => return self.execution_supervisor.unresolved_shutdown_report("original Runtime shutdown owner unavailable"),
+            };
+            if registered.is_none() {
+                self.agent_runtime.fence_run_admission();
+                let deadline = self.execution_supervisor.original_shutdown_deadline();
+                let (sender, _) = tokio::sync::watch::channel(None);
+                *registered = Some(ExecutionShutdownRegistration { deadline, completion: sender.clone() });
+                let original = Arc::clone(self);
+                tokio::spawn(async move {
+                    let result = std::panic::AssertUnwindSafe(original.finish_original_execution_shutdown())
+                        .catch_unwind().await;
+                    let (report, custody_closed) = match result {
+                        Ok(result) => result,
+                        Err(_) => (original.execution_supervisor.unresolved_shutdown_report(
+                            "original Runtime finalization driver panicked; custody is unconfirmed"), false),
+                    };
+                    sender.send_replace(Some(crate::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed }));
+                });
+            }
+            let owner = registered.as_ref().expect("original shutdown registration");
+            (owner.deadline, owner.completion.subscribe())
+        };
+        let observed = async {
+            loop {
+                if let Some(crate::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed }) = completion.borrow().clone() {
+                    let mut report = report;
+                    if !custody_closed && report.errors.is_empty() {
+                        report.errors.push("original Runtime custody remains unconfirmed".into());
+                    }
+                    return report;
+                }
+                if completion.changed().await.is_err() {
+                    return self.execution_supervisor.unresolved_shutdown_report("original Runtime finalization completion channel closed");
+                }
+            }
+        };
+        match tokio::time::timeout_at(deadline, observed).await {
+            Ok(report) => report,
+            Err(_) => {
+                self.execution_supervisor.record_shutdown_observation_timeout();
+                self.execution_supervisor.unresolved_shutdown_report("original Runtime finalization remains unresolved after shutdown deadline")
+            }
+        }
+    }
+
+    async fn finish_original_execution_shutdown(&self) -> (crate::RuntimeExecutionShutdownReport, bool) {
+        let observation = self.execution_supervisor.shutdown_for_runtime().await;
+        if self.execution_supervisor.has_shutdown_failure().await {
+            return (observation, false);
+        }
+        let mut report = self.execution_supervisor.await_original_shutdown().await;
+        if !report.errors.is_empty() { return (report, false); }
         if let Err(error) = self.agent_runtime.drain_retained_runs().await {
             report.errors.push(error);
+            return (report, false);
         }
-        // Original Graph and retained Agent producers must physically drain
-        // before the observation intake is fenced and its writer is joined.
         if let Some(usage) = self.shutdown_skill_usage(Duration::from_secs(5)).await {
-            if !usage.clean {
-                report
-                    .errors
-                    .push(format!("Skill usage shutdown incomplete: {usage:?}"));
-            }
+            if !usage.clean { report.errors.push(format!("Skill usage shutdown incomplete: {usage:?}")); }
         }
         match self.event_store.has_unresolved_original_member_custody() {
             Ok(false) => {}
             Ok(true) => report.errors.push("original member custody remains unresolved".into()),
             Err(_) => report.errors.push("original member custody could not be inspected".into()),
         }
-        report
+        let closed = report.errors.is_empty() && self.execution_supervisor.finish_runtime_shutdown().await;
+        if !closed && report.errors.is_empty() { report.errors.push("original execution custody remains unresolved".into()); }
+        (report, closed)
     }
 
     #[must_use]

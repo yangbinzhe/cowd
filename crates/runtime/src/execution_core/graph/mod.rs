@@ -1,5 +1,5 @@
 mod commit_service;
-pub(crate) use commit_service::{validate_node_ticket_start, validate_node_ticket_start_at_revision};
+pub(crate) use commit_service::{validate_node_ticket_start, validate_node_ticket_start_at_revision, bounded_tool_effect_outcome, tool_effect_outcome_requires_truncation};
 #[cfg(test)]
 pub(crate) use commit_service::bounded_process_tests;
 mod compiler;
@@ -9,6 +9,7 @@ mod host;
 mod recovery;
 mod registry;
 mod runner;
+pub(crate) use runner::PumpCancellationOwner;
 #[cfg(feature = "test-fixtures")]
 pub(crate) use runner::k05_completion_trace;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -29,7 +30,7 @@ pub mod resources;
 /// retirement can share one bound.
 pub(crate) const PHYSICAL_CLOSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub(crate) use commit_service::{execution_lineage_stream_id, process_closure_document, receipt_replay_contract, TerminalScopeReader};
+pub(crate) use commit_service::{validate_external_outcome_binding_from_source, execution_lineage_stream_id, process_closure_document, receipt_replay_contract, TerminalScopeReader};
 pub(crate) use commit_service::{read_effect_admission, read_effect_admission_intent, EffectAdmission};
 pub use commit_service::{
     CallRefusalOwner, CommittedCallRefusal, DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
@@ -64,7 +65,7 @@ pub use resources::{
 pub(crate) use runner::validate_worktree_path;
 #[cfg(test)]
 pub(crate) use commit_service::ExecutionTerminalCommit;
-pub(crate) use runner::ExecutionGraphRunner;
+pub(crate) use runner::{ExecutionGraphRunner, OriginalPumpTask};
 pub use runner::{ExecutionRunReport, ExecutionRunnerError};
 pub use state_store::{graph_id_for_lookup, ExecutionGraphStateStore, ExecutionStateStoreError};
 

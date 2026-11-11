@@ -742,6 +742,10 @@ fn recovery_task_route_control_wire_contract() {
 }
 
 fn provider_registry(lanes: &[&LoopbackProvider]) -> Arc<runtime::ProviderRegistry> {
+    provider_registry_with_early(lanes, false)
+}
+
+fn provider_registry_with_early(lanes: &[&LoopbackProvider], early: bool) -> Arc<runtime::ProviderRegistry> {
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
     let lane = lanes[0];
     *lane.routes.lock().unwrap() = lanes
@@ -766,7 +770,9 @@ fn provider_registry(lanes: &[&LoopbackProvider]) -> Arc<runtime::ProviderRegist
                     models,
                     protocol: Some("completions".into()),
                     parallel_tool_calls: Default::default(),
-                    early_tool_start: Default::default(),
+                    early_tool_start: if early {
+                        model_protocol::provider_config::EarlyToolStartMode::Enabled
+                    } else { Default::default() },
                 },
             )]),
         },
@@ -4626,12 +4632,23 @@ impl RecoveryServices {
     }
 
     async fn stop(self) -> crate::selected_storage::DetachedTestPostgresRestartLease {
+        self.stop_with_original_failure_export(None, None).await
+            .unwrap_or_else(|error| panic!("original Gateway stop unresolved: {error}"))
+    }
+
+    async fn stop_with_original_failure_export(
+        self,
+        original: Option<(String, String, Option<String>, String)>,
+        mut progress: Option<tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>>,
+    ) -> Result<crate::selected_storage::DetachedTestPostgresRestartLease, String> {
+        use futures::FutureExt;
         let Self {
             topology,
             runtime,
             session,
             supervisor,
             notification_reader,
+            physical_calls,
             ..
         } = self;
         let runtime_witness = Arc::downgrade(&runtime);
@@ -4651,17 +4668,116 @@ impl RecoveryServices {
         let matrix_witness = Arc::downgrade(&topology.matrix_store);
         let surface_witness = Arc::downgrade(&topology.surface_messages);
         let connector_witness = Arc::downgrade(&topology.connector_factory);
-        runtime.stop_accepting_for_recovery();
-        supervisor.shutdown().await;
-        let workers = supervisor.health();
-        assert!(!workers.accepting);
-        assert_eq!(workers.forced_aborts, 0);
-        let tasks = runtime.gateway_tasks.shutdown().await;
-        assert_eq!(tasks.panicked, 0);
-        assert_eq!(tasks.forced_aborts, 0);
-        let execution = services.shutdown_execution().await;
-        assert_eq!(execution.forced_aborts, 0);
-        services.shutdown_maintenance().await;
+        let mut cleanup_stage = "stop_accepting";
+        let mut execution_report = None;
+        let mut first_execution_report = None;
+        let shutdown = std::panic::AssertUnwindSafe(async {
+            runtime.stop_accepting_for_recovery();
+            supervisor.stop_accepting();
+            runtime.gateway_tasks.stop_accepting();
+            cleanup_stage = "runtime_execution";
+            let first_execution = services.shutdown_execution().await;
+            first_execution_report = serde_json::to_value(&first_execution).ok();
+            let mut completion = services.subscribe_execution_shutdown_completion()
+                .ok_or("original Runtime execution finalizer was not registered; custody unresolved")?;
+            let deadline = services.execution_shutdown_deadline()
+                .ok_or("original Runtime execution deadline unavailable; custody unresolved")?;
+            let execution = 'original_completion: loop {
+                if let Some(done) = completion.borrow().clone() {
+                    match done {
+                        runtime::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed } => {
+                            execution_report = serde_json::to_value(&report).ok();
+                            if !custody_closed { return Err("original Runtime execution custody remains unresolved".to_string()); }
+                            break report;
+                        }
+                    }
+                }
+                match tokio::time::timeout_at(deadline, completion.changed()).await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(_)) => return Err("original Runtime execution finalizer ended without a completion; custody unresolved".to_string()),
+                    Err(_) => {
+                        eprintln!("full private cleanup evidence pending; process exit may interrupt export");
+                        let first_report = first_execution_report.as_ref()
+                            .ok_or_else(|| "original first execution report could not be serialized".to_string())
+                            .and_then(|report| serde_json::to_vec(&json!({
+                                "cleanup_stage": cleanup_stage,
+                                "first_execution_report": report,
+                            })).map_err(|error| error.to_string()));
+                        match progress.take() {
+                            Some(sender) => { let _ = sender.send(first_report); }
+                            None => return Err("original Runtime execution remains unresolved at its first deadline".to_string()),
+                        }
+                        if let Some((session_id, turn, graph, model)) = original.as_ref() {
+                            let route_facts = json!({"cleanup_stage":cleanup_stage, "first_execution_report":first_execution_report});
+                            let _ = std::panic::AssertUnwindSafe(c_export_original_failure(
+                                &services, &physical_calls, session_id, turn, graph.clone(), model,
+                                "original Runtime execution unresolved at its first deadline",
+                                "original Session control before cleanup", "original Goal before cleanup", None, Some(route_facts)
+                            )).catch_unwind().await;
+                        }
+                        // This is the original stop task, not a second observer or
+                        // a renewed deadline. Keep its dependencies until the
+                        // already-started Runtime finalizer actually ends.
+                        loop {
+                            if let Some(done) = completion.borrow().clone() {
+                                match done {
+                                    runtime::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed } => {
+                                        execution_report = serde_json::to_value(&report).ok();
+                                        if !custody_closed { return Err("original Runtime execution custody remains unresolved".to_string()); }
+                                        break 'original_completion report;
+                                    }
+                                }
+                            }
+                            completion.changed().await.map_err(|_| "original Runtime execution finalizer ended without a completion; custody unresolved".to_string())?;
+                        }
+                    }
+                }
+            };
+            assert_eq!(first_execution.forced_aborts, 0, "original first shutdown observation required forced abort");
+            assert!(first_execution.errors.is_empty(), "original first shutdown observation has {} error(s)", first_execution.errors.len());
+            assert_eq!(execution.forced_aborts, 0,
+                "runtime execution shutdown: errors={} owners={} remaining={} accepted={} completed={} failed={}",
+                execution.errors.len(), execution.owners.len(), execution.remaining_keys,
+                execution.accepted, execution.completed, execution.failed);
+            assert!(execution.errors.is_empty(),
+                "runtime execution shutdown incomplete: {} error(s)", execution.errors.len());
+            assert_eq!(execution.remaining_keys, 0, "runtime execution still has registered keys");
+            assert!(execution.owners.values().all(|owner| owner.active == 0),
+                "runtime execution still has active owners");
+            cleanup_stage = "session_supervisor";
+            supervisor.shutdown().await;
+            let workers = supervisor.health();
+            assert!(!workers.accepting);
+            assert_eq!(workers.forced_aborts, 0);
+            cleanup_stage = "gateway_tasks";
+            let tasks = runtime.gateway_tasks.shutdown().await;
+            assert_eq!(tasks.panicked, 0);
+            assert_eq!(tasks.forced_aborts, 0);
+            cleanup_stage = "runtime_maintenance";
+            services.shutdown_maintenance().await;
+            Ok::<(), String>(())
+        }).catch_unwind().await;
+        if !matches!(&shutdown, Ok(Ok(()))) {
+            if let Some((session_id, turn, graph, model)) = original {
+                let failure = match &shutdown {
+                    Ok(Err(error)) => error.as_str(),
+                    Err(panic) => panic.downcast_ref::<String>().map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("non-string cleanup panic"),
+                    Ok(Ok(())) => unreachable!(),
+                };
+                let route_facts = json!({"cleanup_stage":cleanup_stage, "first_execution_report":first_execution_report, "shutdown_execution_report":execution_report});
+                let export = std::panic::AssertUnwindSafe(c_export_original_failure(
+                    &services, &physical_calls, &session_id, &turn, graph, &model, failure,
+                    "original Session control before cleanup", "original Goal before cleanup", None, Some(route_facts)
+                )).catch_unwind().await;
+                if export.is_err() { eprintln!("original cleanup failure export panicked"); }
+            }
+            match shutdown {
+                Ok(Err(error)) => return Err(error),
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(Ok(())) => unreachable!(),
+            }
+        }
         drop(supervisor);
         drop(session);
         drop(runtime);
@@ -4685,7 +4801,7 @@ impl RecoveryServices {
         assert!(matrix_witness.upgrade().is_none());
         assert!(surface_witness.upgrade().is_none());
         assert!(connector_witness.upgrade().is_none());
-        lease
+        Ok(lease)
     }
 }
 
@@ -6399,7 +6515,23 @@ async fn c_root_tool(
 #[tokio::test]
 #[ignore = "requires isolated COWD_TEST_POSTGRES_URL"]
 async fn c_delegated_gateway_session_ingress_native_claim_original_attempt() {
-    c_original_session_worker_fixture(None).await;
+    c_original_session_worker_fixture(None, false, false).await;
+}
+
+// The original member uses the real Gateway directory reader and its own
+// same-call state_inspect authorization before its ordinary task submission.
+#[tokio::test]
+#[ignore = "requires isolated COWD_TEST_POSTGRES_URL"]
+async fn a8_member_read_ref_uses_original_directory_authority() {
+    c_original_session_worker_fixture(None, false, true).await;
+}
+
+// Reuse the real Session/worker/review chain with the provider spelling seen
+// in #2; its existing receipt and conclusion assertions remain unchanged.
+#[tokio::test]
+#[ignore = "requires isolated COWD_TEST_POSTGRES_URL"]
+async fn a9_delegated_review_normalizes_original_read_before_source_registration() {
+    c_original_session_worker_fixture(None, true, false).await;
 }
 
 // Same production Session/Program/Task producer as the claim test. The only
@@ -6407,17 +6539,36 @@ async fn c_delegated_gateway_session_ingress_native_claim_original_attempt() {
 #[tokio::test]
 #[ignore = "requires isolated COWD_TEST_POSTGRES_URL and a working bounded process sandbox"]
 async fn b_delegated_conversation_ticket_bounded_compute_original_producer() {
-    c_original_session_worker_fixture(Some(0)).await;
+    c_original_session_worker_fixture(Some(0), false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "run alone with isolated Session PG and the real producer fixture"]
 async fn b_delegated_conversation_ticket_missing_bounded_capabilities_fail_closed() {
-    for missing in 1..=3 { c_original_session_worker_fixture(Some(missing)).await; }
+    for missing in 1..=3 { c_original_session_worker_fixture(Some(missing), false, false).await; }
 }
 
 // Inspect only the original Session plan and the corresponding durable receipt
 // pair for this exact root call. A tool message by itself is not a read.
+fn c_original_lifecycle_plan_task<'a>(
+    events: &'a [runtime::DurableRuntimeEvent], call: &str, tool: &str,
+) -> Result<&'a Value, String> {
+    let completions = events.iter().filter(|event| event.kind == "tool.invocation.completed"
+        && event.payload["tool_call_id"] == call && event.payload["tool_name"] == tool
+        && event.payload["status"] == "completed" && event.payload["is_error"] == false).collect::<Vec<_>>();
+    let [completion] = completions.as_slice() else { return Err("original completed tool lifecycle missing or ambiguous".into()); };
+    let plan_id = completion.payload["governed_plan_id"].as_str().filter(|value| !value.is_empty())
+        .ok_or("original completed tool lifecycle plan missing")?;
+    let plans = events.iter().filter(|event| event.kind == "tool.execution_plan.created"
+        && event.actor.as_deref() == Some("conversation_runtime") && event.stream_id == completion.stream_id
+        && event.payload["plan_id"] == plan_id && event.commit_cursor < completion.commit_cursor).collect::<Vec<_>>();
+    let [plan] = plans.as_slice() else { return Err("original completed tool plan missing or ambiguous".into()); };
+    let tasks = plan.payload["tasks"].as_array().ok_or("original completed tool plan tasks missing")?
+        .iter().filter(|task| task["tool_call_id"] == call && task["tool_name"] == tool).collect::<Vec<_>>();
+    let [task] = tasks.as_slice() else { return Err("original completed tool plan call missing or ambiguous".into()); };
+    Ok(task)
+}
+
 fn c_verified_root_artifact_page(
     services: &RecoveryServices, request: &ProviderRequest, session: &str, turn: &str,
     root: &str, call: &str, selector: &str, expected_start: u64, expected_total: Option<u64>,
@@ -6428,12 +6579,8 @@ fn c_verified_root_artifact_page(
     let refusals: Vec<_> = events.iter().filter(|event| event.kind == "tool.call.rejected_before_dispatch"
         && event.payload["tool_call_id"] == call).collect();
     if !refusals.is_empty() { return Err(format!("original root read refused before dispatch: {}", refusals[0].payload["reason"].as_str().unwrap_or("unknown"))); }
-    let tasks: Vec<_> = events.iter().filter(|event| event.kind == "tool.execution_plan.created"
-        && event.actor.as_deref() == Some("conversation_runtime"))
-        .flat_map(|event| event.payload["tasks"].as_array().into_iter().flatten())
-        .filter(|task| task["tool_call_id"] == call && task["tool_name"] == "read_ref").collect();
-    if tasks.len() != 1 { return Err("original root read plan missing or ambiguous".into()); }
-    let step: runtime::step_snapshot::StepCallBinding = serde_json::from_value(tasks[0]["step_binding"].clone())
+    let plan_task = c_original_lifecycle_plan_task(&events, call, "read_ref")?;
+    let step: runtime::step_snapshot::StepCallBinding = serde_json::from_value(plan_task["step_binding"].clone())
         .map_err(|_| "original root read Step binding malformed")?;
     if step.origin.call_id != call || step.snapshot.identity.session_id != session
         || step.snapshot.identity.turn_id != turn || step.snapshot.identity.execution_id.as_deref() != Some(root)
@@ -6491,16 +6638,134 @@ fn c_verified_root_artifact_page(
     let backend = runtime_postgres::PostgresRuntimeEventStore::new(services.topology.postgres_executor.clone())
         .map_err(|error| error.to_string())?;
     if ticket_owner {
+        let graph = runtime.graph_state_store().load(root).map_err(|error| error.to_string())?;
+        let lineage = graph.lineage.as_ref().ok_or("original root ticket lineage missing")?;
+        if graph.parent_execution.is_some() || lineage.session_id != session || lineage.turn_id != turn {
+            return Err("original root ticket lineage differs".into());
+        }
+        let attempt_u32 = u32::try_from(attempt).map_err(|_| "original root ticket attempt out of range")?;
+        let (ticket, position) = runtime.graph_state_store()
+            .original_binding_start_for_test(&graph, node, attempt_u32).map_err(|error| error.to_string())?;
+        if ticket.graph_id != root || ticket.node_id != node || ticket.attempt != attempt_u32
+            || position.1 >= primary.commit_cursor {
+            return Err("original root ticket identity or order differs".into());
+        }
+        let batch = match ticket.executor_kind.as_str() {
+            "tool_batch" => runtime::step_snapshot::decode_persisted_tool_batch_for_test(&ticket.payload_ref)
+                .map_err(|error| error.to_string())?,
+            "inline_model" => {
+                // The original provider frame can execute a read before its
+                // model ticket publishes the successor ToolBatch. Authenticate
+                // that exact frame and then the same-call successor; never
+                // pretend that the earlier receipt belongs to the batch.
+                let frames = events.iter().filter(|event| event.kind == "model.item_completed"
+                    && event.payload["tool_call_id"] == call && event.payload["tool_name"] == "read_ref")
+                    .collect::<Vec<_>>();
+                let [frame] = frames.as_slice() else { return Err("original early model frame missing or ambiguous".into()); };
+                let activity = frame.activity_binding().ok_or("original early model frame owner missing")?;
+                if activity.root_execution_id != root || activity.session_id != session || activity.turn_id != turn
+                    || activity.node_id.as_deref() != Some(node) || frame.commit_cursor <= position.1
+                    || frame.commit_cursor >= primary.commit_cursor {
+                    return Err("original early model frame owner or order differs".into());
+                }
+                let frame_input = frame.payload["content"].as_str().ok_or("original early model frame input missing")?;
+                let original_input = primary.payload["original_input"].as_str().ok_or("original early read input missing")?;
+                let original_value = harness_contract::step::parse_strict_json(original_input).map_err(|error| error.to_string())?;
+                use sha2::{Digest as _, Sha256};
+                let mut step_digest = Sha256::new();
+                step_digest.update(b"tool-effect-step-snapshot-v1\0");
+                step_digest.update(serde_json::to_vec(&step.snapshot).map_err(|error| error.to_string())?);
+                if frame.scope != runtime::RuntimeEventScope::Session || frame.actor.as_deref() != Some("conversation_runtime.model_stream")
+                    || frame.status.as_deref() != Some("completed")
+                    || harness_contract::step::parse_strict_json(frame_input).map_err(|error| error.to_string())?
+                        != plan_task["normalized_input"] || original_value != plan_task["normalized_input"]
+                    || replay["origin"] != serde_json::to_value(&step.origin).map_err(|error| error.to_string())?
+                    || replay["step_snapshot_digest"] != format!("sha256:{:x}", step_digest.finalize())
+                    || replay["payload_digest"] != harness_contract::step::canonical_digest("tool-effect-payload", &original_value)
+                        .map_err(|error| error.to_string())? {
+                    return Err("original early model frame, Step or input differs".into());
+                }
+                let frame_receipt = backend.original_transaction_receipt(&frame.transaction_id).map_err(|error| error.to_string())?
+                    .ok_or("original early model frame transaction missing")?;
+                if frame_receipt.transaction_id != frame.transaction_id || frame_receipt.commit_cursor != frame.commit_cursor
+                    || frame_receipt.event_ids.get(frame.transaction_index as usize) != Some(&frame.event_id)
+                    || !frame_receipt.stream_revisions.iter().any(|source| source.stream_id == frame.stream_id
+                        && source.expected_revision < frame.sequence && frame.sequence <= source.committed_revision) {
+                    return Err("original early model frame transaction differs".into());
+                }
+                let effect_stream = format!("execution-effect:{key}");
+                let intents = runtime.event_reader().list_stream(&effect_stream)?.into_iter()
+                    .filter(|event| event.kind == "execution.read.intent"
+                        && event.idempotency_key.as_deref() == Some(format!("{key}:read-intent").as_str()))
+                    .collect::<Vec<_>>();
+                let [intent] = intents.as_slice() else { return Err("original early read intent missing or ambiguous".into()); };
+                let intent_receipt = backend.original_transaction_receipt(&intent.transaction_id).map_err(|error| error.to_string())?
+                    .ok_or("original early read intent transaction missing")?;
+                if intent.scope != runtime::RuntimeEventScope::ExecutionNode || intent.actor.as_deref() != Some("governed_tool")
+                    || intent.status.as_deref() != Some("inflight") || intent.schema_version != 1
+                    || intent.refs != primary.refs || intent.payload["idempotency_key"] != key
+                    || intent.payload["tool_use_id"] != call || intent.payload["tool_name"] != "read_ref"
+                    || intent.payload["replay"] != *replay || intent.payload["effect"] != primary.payload["effect"]
+                    || intent.payload["input_sha256"] != primary.payload["input_sha256"]
+                    || intent.commit_cursor <= frame.commit_cursor || intent.commit_cursor > primary.commit_cursor || intent.sequence >= primary.sequence
+                    || intent_receipt.transaction_id != intent.transaction_id || intent_receipt.commit_cursor != intent.commit_cursor
+                    || intent_receipt.event_ids.get(intent.transaction_index as usize) != Some(&intent.event_id)
+                    || !intent_receipt.stream_revisions.iter().any(|source| source.stream_id == intent.stream_id
+                        && source.expected_revision < intent.sequence && intent.sequence <= source.committed_revision) {
+                    return Err("original early read intent differs".into());
+                }
+                let mut successor = Vec::new();
+                for candidate in graph.nodes.iter().filter(|candidate| candidate.executor_kind == "tool_batch"
+                    && graph.edges.iter().any(|edge| edge.from == node && edge.to == candidate.id && edge.kind.is_dependency())) {
+                    let value = runtime::step_snapshot::decode_persisted_tool_batch_for_test(&candidate.payload_ref)
+                        .map_err(|error| error.to_string())?;
+                    if value["calls"].as_array().is_some_and(|calls| calls.iter().any(|item| item["id"] == call)) {
+                        successor.push((candidate, value));
+                    }
+                }
+                let [(successor_node, value)] = successor.as_slice() else { return Err("original early read successor missing or ambiguous".into()); };
+                let successor_attempt = *graph.recovery_cursor.node_attempts.get(&successor_node.id)
+                    .ok_or("original early read successor attempt missing")?;
+                let (successor_ticket, successor_position) = runtime.graph_state_store()
+                    .original_binding_start_for_test(&graph, &successor_node.id, successor_attempt).map_err(|error| error.to_string())?;
+                if successor_ticket.graph_id != root || successor_ticket.node_id != successor_node.id
+                    || successor_ticket.executor_kind != "tool_batch" || successor_ticket.payload_ref != successor_node.payload_ref
+                    || successor_position.1 <= primary.commit_cursor {
+                    return Err("original early read successor owner or order differs".into());
+                }
+                let successor_starts = runtime.event_reader().list_stream(root)?.into_iter().filter(|event|
+                    event.sequence == successor_position.0 && event.commit_cursor == successor_position.1
+                        && event.transaction_index == successor_position.2).collect::<Vec<_>>();
+                let [successor_start] = successor_starts.as_slice() else { return Err("original early read successor start missing or ambiguous".into()); };
+                let successor_receipt = backend.original_transaction_receipt(&successor_start.transaction_id).map_err(|error| error.to_string())?
+                    .ok_or("original early read successor transaction missing")?;
+                if successor_receipt.transaction_id != successor_start.transaction_id
+                    || successor_receipt.commit_cursor != successor_start.commit_cursor
+                    || successor_receipt.event_ids.get(successor_start.transaction_index as usize) != Some(&successor_start.event_id)
+                    || !successor_receipt.stream_revisions.iter().any(|source| source.stream_id == successor_start.stream_id
+                        && source.expected_revision < successor_start.sequence && successor_start.sequence <= source.committed_revision) {
+                    return Err("original early read successor transaction differs".into());
+                }
+                value.clone()
+            }
+            _ => return Err("original root ticket executor differs".into()),
+        };
+        let matching_calls = batch["calls"].as_array().ok_or("original root ticket calls missing")?
+            .iter().filter(|item| item["id"] == call).collect::<Vec<_>>();
+        let [original_call] = matching_calls.as_slice() else { return Err("original root ticket call missing or ambiguous".into()); };
+        let original_input = original_call["input"].as_str().ok_or("original root ticket input missing")?;
+        if batch["session_id"] != session || original_call["name"] != "read_ref"
+            || original_call["origin"] != serde_json::to_value(&step.origin).map_err(|error| error.to_string())?
+            || batch["step_snapshots"].get(step.snapshot.identity.step_id.as_str())
+                != Some(&serde_json::to_value(&*step.snapshot).map_err(|error| error.to_string())?)
+            || harness_contract::step::parse_strict_json(original_input).map_err(|error| error.to_string())?
+                != plan_task["normalized_input"] {
+            return Err("original root ticket call, Step or input differs".into());
+        }
         let graph_events = runtime.event_reader().list_stream(root)?;
-        let starts: Vec<_> = graph_events.iter().filter(|event| event.kind == "execution_graph.nodes_started"
-            && event.commit_cursor < primary.commit_cursor
-            && event.payload["body"]["value"]["bindings"][node]["attempt"].as_u64() == Some(attempt)
-            && event.payload["body"]["value"]["bindings"][node]["executor_kind"] == "tool_batch"
-            && event.payload["_runtime_activity_binding"]["root_execution_id"] == root
-            && event.payload["_runtime_activity_binding"]["session_id"] == session
-            && event.payload["_runtime_activity_binding"]["turn_id"] == turn).collect();
-        if starts.len() != 1 { return Err("original root ticket start missing or ambiguous".into()); }
-        let start = starts[0];
+        let starts = graph_events.iter().filter(|event| event.sequence == position.0
+            && event.commit_cursor == position.1 && event.transaction_index == position.2).collect::<Vec<_>>();
+        let [start] = starts.as_slice() else { return Err("original root ticket start missing or ambiguous".into()); };
         let start_receipt = backend.original_transaction_receipt(&start.transaction_id).map_err(|error| error.to_string())?
             .ok_or("original root ticket transaction receipt missing")?;
         if start_receipt.transaction_id != start.transaction_id
@@ -6595,11 +6860,8 @@ fn c_require_original_tool_success(
 ) -> Result<(), String> {
     let runtime = services.runtime.runtime_services();
     let events = runtime.event_reader().list_stream(&format!("session:{session}"))?;
-    let tasks: Vec<_> = events.iter().filter(|event| event.kind == "tool.execution_plan.created")
-        .flat_map(|event| event.payload["tasks"].as_array().into_iter().flatten())
-        .filter(|task| task["tool_call_id"] == call && task["tool_name"] == tool).collect();
-    if tasks.len() != 1 { return Err("original tool plan missing or ambiguous".into()); }
-    let step: runtime::step_snapshot::StepCallBinding = serde_json::from_value(tasks[0]["step_binding"].clone())
+    let plan_task = c_original_lifecycle_plan_task(&events, call, tool)?;
+    let step: runtime::step_snapshot::StepCallBinding = serde_json::from_value(plan_task["step_binding"].clone())
         .map_err(|_| "original tool Step missing")?;
     if step.origin.call_id != call || step.snapshot.identity.session_id != session || step.snapshot.identity.turn_id != turn {
         return Err("original tool Step owner differs".into());
@@ -6659,6 +6921,7 @@ fn c_require_original_tool_success(
 // identities needed to distinguish a missed hook from an actual update.
 fn c_original_review_for_external_goal(
     store: &runtime::RuntimeEventStore,
+    graph_store: &runtime::ExecutionGraphStateStore,
     backend: &runtime_postgres::PostgresRuntimeEventStore,
     ticket_graph: &str, ticket_node: &str, ticket_attempt: u32,
     session: &str, turn: &str, root: &str, program: &str, goal_id: &str,
@@ -6696,15 +6959,39 @@ fn c_original_review_for_external_goal(
         if replay["session_id"] != session || replay["call_id"] != "d-objective-review"
             || parent["execution_id"] != root || ticket_graph != root || ticket_node != node
             || u64::from(ticket_attempt) != attempt || attempt == 0 { continue; }
-        let starts: Vec<_> = store.list_stream(root)?.into_iter().filter(|event| {
-            let binding = &event.payload["body"]["value"]["bindings"][node];
-            event.kind == "execution_graph.nodes_started" && event.commit_cursor < action.commit_cursor
-                && binding["attempt"].as_u64() == Some(attempt) && binding["executor_kind"] == "tool_batch"
-                && binding["ticket_idempotency_key"].as_str().is_some_and(|value| !value.is_empty())
-                && event.payload["_runtime_activity_binding"]["root_execution_id"] == root
-                && event.payload["_runtime_activity_binding"]["session_id"] == session
-                && event.payload["_runtime_activity_binding"]["turn_id"] == turn
-        }).collect();
+        let graph = graph_store.load(root).map_err(|error| error.to_string())?;
+        let lineage = graph.lineage.as_ref().ok_or("original root review lineage missing")?;
+        if graph.parent_execution.is_some() || lineage.session_id != session || lineage.turn_id != turn { continue; }
+        let (ticket, position) = graph_store.original_binding_start_for_test(&graph, node, ticket_attempt)
+            .map_err(|error| error.to_string())?;
+        if ticket.graph_id != root || ticket.node_id != node || ticket.attempt != ticket_attempt
+            || ticket.executor_kind != "tool_batch" || position.1 >= action.commit_cursor { continue; }
+        let batch = runtime::step_snapshot::decode_persisted_tool_batch_for_test(&ticket.payload_ref)
+            .map_err(|error| error.to_string())?;
+        let plan_events = store.list_stream(&format!("session:{session}"))?;
+        let plans = plan_events.iter().filter(|event| event.kind == "tool.execution_plan.created")
+            .flat_map(|event| event.payload["tasks"].as_array().into_iter().flatten())
+            .filter(|task| task["tool_call_id"] == "d-objective-review" && task["tool_name"] == "objective_review")
+            .collect::<Vec<_>>();
+        let [plan] = plans.as_slice() else { continue; };
+        let step: runtime::step_snapshot::StepCallBinding = serde_json::from_value(plan["step_binding"].clone())
+            .map_err(|error| error.to_string())?;
+        let calls = batch["calls"].as_array().ok_or("original objective review ticket calls missing")?
+            .iter().filter(|item| item["id"] == "d-objective-review").collect::<Vec<_>>();
+        let [call] = calls.as_slice() else { continue; };
+        let Some(input) = call["input"].as_str() else { continue; };
+        if batch["session_id"] != session || call["name"] != "objective_review"
+            || step.effect_idempotency_key() != key || step.snapshot.identity.session_id != session
+            || step.snapshot.identity.turn_id != turn || step.snapshot.identity.execution_id.as_deref() != Some(root)
+            || step.snapshot.identity.run_ref.is_some()
+            || call["origin"] != serde_json::to_value(&step.origin).map_err(|error| error.to_string())?
+            || batch["step_snapshots"].get(step.snapshot.identity.step_id.as_str())
+                != Some(&serde_json::to_value(&*step.snapshot).map_err(|error| error.to_string())?)
+            || harness_contract::step::parse_strict_json(input).map_err(|error| error.to_string())?
+                != plan["normalized_input"] { continue; }
+        let starts: Vec<_> = store.list_stream(root)?.into_iter().filter(|event|
+            event.sequence == position.0 && event.commit_cursor == position.1 && event.transaction_index == position.2
+        ).collect();
         let [start] = starts.as_slice() else { continue; };
         let Some(start_receipt) = backend.original_transaction_receipt(&start.transaction_id)
             .map_err(|error| error.to_string())? else { continue; };
@@ -6805,7 +7092,24 @@ fn c_observed_external_goal_cas(graph: &str, node: &str, attempt: u32, goal_stre
     })
 }
 
-async fn c_original_session_worker_fixture(missing: Option<u8>) {
+async fn a8_original_member_coordinates(
+    services: &RecoveryServices, request: &ProviderRequest, session: &str, turn: &str,
+) -> (String, String, u32) {
+    let rows = services.topology.session_store.get_session_domain_events_by_kind_limited(
+        session, "context.provider_request_packed", 0, 10_001).await.unwrap();
+    assert!(rows.len() < 10_001, "original packed events are complete");
+    let packed: Vec<_> = rows.iter().map(|row| session::SessionDomainEvent::from_session_event(row).unwrap())
+        .filter(|event| event.session_id == session && event.payload["turn_id"] == turn
+            && event.payload["body_sha256"] == request.body_sha256).collect();
+    assert_eq!(packed.len(), 1, "one original packed request");
+    let execution = packed[0].payload["execution_id"].as_str().expect("original member execution");
+    let runs: Vec<_> = services.runtime.runtime_services().agent_runtime().list().into_iter()
+        .filter(|run| run.run_id == execution && run.session_id == session).collect();
+    assert_eq!(runs.len(), 1, "one original member run");
+    (runs[0].graph_id.clone(), runs[0].node_id.clone(), runs[0].attempt)
+}
+
+async fn c_original_session_worker_fixture(missing: Option<u8>, native_colon_read: bool, directory_read: bool) {
     let compute = missing.is_some();
     use futures::FutureExt;
     use crate::services::session_service::activation::{EnsureSessionRequest, SessionSource};
@@ -6834,7 +7138,7 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
         std::fs::write(root.path().join("workspace/outside.txt"), "must-not-be-read").unwrap();
     }
     let mut provider = LoopbackProvider::start("root").await;
-    let providers = provider_registry(&[&provider]);
+    let providers = provider_registry_with_early(&[&provider], native_colon_read);
     let topology = SelectedStorageTopology::compose_for_test(
         &root.path().join("home"), &root.path().join("workspace"),
     ).unwrap();
@@ -6918,6 +7222,8 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
             .unwrap().and_then(|program| program.tasks.keys().next().cloned())).await;
         let mut root_wait_sent = false;
         let mut claim_sent = false;
+        let mut directory_sent = false;
+        let mut directory_owner = None;
         let mut claimed_continuation = None;
         let mut compute_stage = 0_u8;
         tokio::time::timeout(Duration::from_secs(90), async {
@@ -6934,11 +7240,54 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
                     }]})).unwrap();
                     claim_sent = true;
                 } else if child && claim_sent {
-                    if !compute || compute_stage == 0 {
+                    if (!compute && !directory_sent) || (compute && compute_stage == 0) {
                         assert!(request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|
                             message["role"] == "tool" && message["tool_call_id"] == "c-ingress-claim")));
                     }
                     if !compute {
+                        if directory_read && !directory_sent {
+                            assert!(request.body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool|
+                                tool["function"]["name"] == "read_ref")));
+                            directory_sent = true;
+                            directory_owner = Some(a8_original_member_coordinates(&services, &request, &session, &turn).await);
+                            request.reply.send(json!({"role":"assistant","content":null,"tool_calls":[{
+                                "index":0,"id":"a8-member-directory","type":"function",
+                                "function":{"name":"read_ref","arguments":json!({"reference":format!("task://{task}")}).to_string()}
+                            }]})).unwrap();
+                            continue;
+                        }
+                        if directory_read {
+                            assert_eq!(Some(a8_original_member_coordinates(&services, &request, &session, &turn).await),
+                                directory_owner, "directory feedback belongs to the original member attempt");
+                            c_require_original_tool_success(&services, &request, &session, &turn, &program_id,
+                                "a8-member-directory", "read_ref", None).expect("original member directory read and feedback");
+                            let events = runtime.event_reader().list_stream(&format!("session:{session}")).unwrap();
+                            let decisions: Vec<_> = events.iter().filter(|event|
+                                event.kind == "authorization.capability_assessed"
+                                && event.payload["capability"] == "state_inspect"
+                                && event.payload["_call_refusal_binding"]["call_id"] == "a8-member-directory"
+                                && event.payload["_call_refusal_binding"]["derived_target"]["input"]["entry_ref"] == task).collect();
+                            assert_eq!(decisions.len(), 1, "one same-call target assessment");
+                            let lease = decisions[0].payload["lease"]["lease_id"].as_str().expect("target lease");
+                            let transitions = runtime.event_reader().list_stream(&format!("authorization-lease:{lease}")).unwrap();
+                            assert_eq!(transitions.iter().filter(|event| event.kind == "authorization.lease_transition"
+                                && event.status.as_deref() == Some("consumed")).count(), 1, "one target consumption");
+                            let ticket = &decisions[0].payload["_call_refusal_binding"]["owner"]["ticket"];
+                            let task_fact = c_original_lifecycle_plan_task(&events, "a8-member-directory", "read_ref").unwrap();
+                            let step: runtime::step_snapshot::StepCallBinding = serde_json::from_value(task_fact["step_binding"].clone()).unwrap();
+                            let key = step.effect_idempotency_key();
+                            let receipts: Vec<_> = runtime.event_reader().list_stream(&format!("execution-effect:{key}")).unwrap()
+                                .into_iter().filter(|event| event.idempotency_key.as_deref() == Some(format!("{key}:read-receipt").as_str())).collect();
+                            assert_eq!(receipts.len(), 1, "one original read receipt");
+                            let replay = &receipts[0].payload["replay"];
+                            let parent = &replay["parent_execution"];
+                            let (graph, node, attempt) = directory_owner.as_ref().expect("original member owner");
+                            assert_eq!(parent["execution_id"], *graph);
+                            assert_eq!(parent["node_id"], *node);
+                            assert_eq!(replay["parent_execution_attempt"].as_u64(), Some(u64::from(*attempt)));
+                            assert_ne!((ticket["graph_id"].as_str(), ticket["node_id"].as_str()),
+                                (parent["execution_id"].as_str(), parent["node_id"].as_str()), "ToolBatch and AgentTask are distinct owners");
+                        }
                         // Hold the real worker at its original provider request while
                         // the claim/receipt assertions below inspect the live owner.
                         claimed_continuation = Some(request);
@@ -7199,6 +7548,9 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
         let mut cas_observed = false;
         let conclusion_hook_result = Arc::new(std::sync::Mutex::new(None::<Result<(String, u64, u64), String>>));
         let conclusion_attempt_result = Arc::new(std::sync::Mutex::new(None::<(bool, Option<runtime::execution_core::services::ConclusionAttemptObservation>)>));
+        if native_colon_read {
+            assert!(claimed_continuation.is_some(), "original worker continuation is required");
+        }
         if let Some(request) = claimed_continuation.take() {
             request.reply.send(json!({"role":"assistant", "content":"The bounded task is complete.", "tool_calls":[{
                 "index":0, "id":"d-original-submit", "type":"function", "function":{
@@ -7279,10 +7631,79 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
                     } else if is_child && !reviewer_read_sent {
                         let (_, selector) = selected.as_ref().expect("original submitted artifact before independent review");
                         reviewer_read_sent = true;
-                        tool_reply("d-review-read", "evidence_retrieve", json!({"evidence_ref":selector}))
+                        let provider_ref = if native_colon_read {
+                            format!("artifact:{}", selector.strip_prefix("artifact://")
+                                .expect("original artifact selector"))
+                        } else { selector.clone() };
+                        tool_reply("d-review-read", "evidence_retrieve", json!({"evidence_ref":provider_ref}))
                     } else if is_child && has_result("d-review-read") && !task_review_sent {
                         c_require_original_tool_success(&services, &request, &session, &turn, &program_id,
                             "d-review-read", "evidence_retrieve", None).expect("original reviewer read outcome");
+                        if native_colon_read {
+                            let session_events = runtime.event_reader().list_stream(&format!("session:{session}")).unwrap();
+                            let read_plan = c_original_lifecycle_plan_task(&session_events, "d-review-read", "evidence_retrieve")
+                                .expect("original read lifecycle plan");
+                            let step: runtime::step_snapshot::StepCallBinding =
+                                serde_json::from_value(read_plan["step_binding"].clone()).unwrap();
+                            let key = step.effect_idempotency_key();
+                            let receipts = runtime.event_reader().list_stream(&format!("execution-effect:{key}"))
+                                .unwrap().into_iter().filter(|event| event.kind == "execution.read.receipt")
+                                .collect::<Vec<_>>();
+                            let [primary] = receipts.as_slice() else { panic!("one original read receipt required") };
+                            assert_eq!(session_events.iter().filter(|event| event.kind == "model.item_completed"
+                                && event.payload["tool_call_id"] == "d-review-read").count(), 1,
+                                "the provider supplied exactly one original read");
+                            let parent = &primary.payload["replay"]["parent_execution"];
+                            let graph = runtime.graph_state_store().load(parent["execution_id"].as_str().unwrap()).unwrap();
+                            let parent_node = graph.nodes.iter().find(|node| node.id == parent["node_id"].as_str().unwrap())
+                                .expect("original AgentTask node");
+                            assert_eq!(parent_node.executor_kind, "agent_task");
+                            let packet: harness_contract::agent::AgentTaskPacket =
+                                serde_json::from_str(&parent_node.payload_ref).unwrap();
+                            let run_id = step.snapshot.identity.run_ref.as_deref().expect("original delegated run");
+                            assert_eq!(step.snapshot.identity.execution_id.as_deref(), Some(run_id));
+                            assert_eq!(packet.run_id(), run_id);
+                            assert_eq!(packet.graph_id(), graph.id);
+                            assert_eq!(packet.node_id(), parent_node.id);
+                            assert_eq!(packet.session_id(), session);
+                            assert_eq!(packet.assignment.execution_identity.turn_id(), Some(turn.as_str()));
+                            let owner = packet.agentic_binding.as_ref().expect("original Program owner");
+                            assert_eq!(owner.program_id, program_id);
+                            assert!(matches!(&owner.focus,
+                                harness_contract::agent::AgenticExecutionFocus::TaskReview { task_ref } if task_ref == &task));
+                            assert_eq!(Some(u64::from(packet.attempt)), primary.payload["replay"]["parent_execution_attempt"].as_u64());
+                            let events = runtime.event_reader().all_events(100_001).unwrap();
+                            assert!(events.len() < 100_001, "original Runtime events may be truncated");
+                            let deferrals = events.iter().filter(|event| event.kind == "execution.tool_early_deferred"
+                                && event.payload["tool_call_id"] == "d-review-read"
+                                && event.payload["reason"] == "early_repaired_input_requires_original_tool_batch")
+                                .collect::<Vec<_>>();
+                            let [deferral] = deferrals.as_slice() else { panic!("one original early deferral required") };
+                            assert!(deferral.commit_cursor < primary.commit_cursor);
+                            let graph_refs = deferral.refs.iter().filter(|r| r.kind == "execution_graph").collect::<Vec<_>>();
+                            let node_refs = deferral.refs.iter().filter(|r| r.kind == "execution_node").collect::<Vec<_>>();
+                            let [child_graph_ref] = graph_refs.as_slice() else { panic!("one original child graph required") };
+                            let [model_ref] = node_refs.as_slice() else { panic!("one original model node required") };
+                            let child = runtime.graph_state_store().load(&child_graph_ref.id).unwrap();
+                            assert_eq!(serde_json::to_value(&child.parent_execution).unwrap(), *parent);
+                            assert_eq!(child.nodes.iter().find(|node| node.id == model_ref.id)
+                                .expect("original child model node").executor_kind, "inline_model");
+                            let batches = child.nodes.iter().filter(|node| node.executor_kind == "tool_batch"
+                                && child.edges.iter().any(|edge| edge.from == model_ref.id
+                                    && edge.to == node.id && edge.kind.is_dependency())).collect::<Vec<_>>();
+                            let [batch] = batches.as_slice() else { panic!("one original ToolBatch required") };
+                            let payload = runtime::step_snapshot::decode_persisted_tool_batch_for_test(&batch.payload_ref).unwrap();
+                            assert_eq!(payload["session_id"], session);
+                            let calls = payload["calls"].as_array().expect("original ToolBatch calls");
+                            let [call] = calls.as_slice() else { panic!("one original ToolBatch call required") };
+                            assert_eq!(call["id"], "d-review-read");
+                            assert_eq!(call["name"], "evidence_retrieve");
+                            assert_eq!(call["origin"], serde_json::to_value(&step.origin).unwrap());
+                            assert_eq!(payload["step_snapshots"].get(step.snapshot.identity.step_id.as_str()).unwrap(),
+                                &serde_json::to_value(&*step.snapshot).unwrap());
+                            let input = harness_contract::step::parse_strict_json(call["input"].as_str().unwrap()).unwrap();
+                            assert_eq!(input, read_plan["normalized_input"]);
+                        }
                         let (_, selector) = selected.as_ref().expect("original reviewed artifact");
                         task_review_sent = true;
                         tool_reply("d-task-review", "task_review", json!({"task_ref":task,"decision":"accept",
@@ -7328,13 +7749,14 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
                                     let predicate_program = program_id.clone();
                                     let goal_id = goal.id.clone();
                                     let predicate_goal = goal_id.clone();
+                                    let predicate_graph_store = runtime.graph_state_store().clone();
                                     let goals = Arc::clone(runtime.goal_store());
                                     let action_result = Arc::clone(&external_goal_result);
                                     let action_match = Arc::clone(&external_review_match);
                                     let goal_stream = format!("goal:{goal_id}");
                                     runtime.fixture_arm_original_goal_read(graph_id.clone(), "d-objective-review".into(), goal_stream,
                                         move |store, graph, node, attempt| {
-                                            match c_original_review_for_external_goal(store, &predicate_backend, graph, node, attempt,
+                                            match c_original_review_for_external_goal(store, &predicate_graph_store, &predicate_backend, graph, node, attempt,
                                                 &predicate_session, &predicate_turn, &predicate_root, &predicate_program, &predicate_goal) {
                                                 Ok(original) => { *predicate_match.lock().unwrap() = Some(original); true }
                                                 Err(_) => false,
@@ -7439,6 +7861,10 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
                 assert!(cas_observed, "original Goal CAS probe must reach the checked commit");
             } else {
                 assert!(original_conclusion_observed, "real Goal and Program conclusion must be observed");
+                if native_colon_read {
+                    assert!(reviewer_read_sent && task_review_sent,
+                        "the original delegated read must complete before review");
+                }
             }
         }
         if cas_probe {
@@ -7621,9 +8047,52 @@ async fn c_original_session_worker_fixture(missing: Option<u8>) {
             failure, "Gateway Session turn binds original claim control; installation unobserved on early failure",
             "Gateway Session ingress owns Goal; inspect original Goal event", None, Some(route_facts)).await;
     }
+    let cleanup_identity = identity.lock().unwrap_or_else(|error| error.into_inner()).clone();
+    let (cleanup_turn, cleanup_graph) = cleanup_identity.map(|(turn, graph)| (turn, Some(graph)))
+        .unwrap_or_else(|| ("unknown-before-admission".into(), None));
+    let cleanup_model = provider.model.clone();
     drop(runtime);
     drop(provider);
-    let cleanup = std::panic::AssertUnwindSafe(services.stop()).catch_unwind().await;
+    let (progress_tx, progress_rx) = tokio::sync::oneshot::channel();
+    let mut cleanup_task = tokio::spawn(async move {
+        std::panic::AssertUnwindSafe(services.stop_with_original_failure_export(Some(
+            (session, cleanup_turn, cleanup_graph, cleanup_model)
+        ), Some(progress_tx))).catch_unwind().await
+    });
+    let (cleanup, first_report) = tokio::select! {
+        result = &mut cleanup_task => (Some(result), None),
+        signal = progress_rx => match signal {
+            Ok(first_report) => (None, Some(first_report)),
+            Err(_) => (Some(cleanup_task.await), None),
+        },
+    };
+    if let Some(first_report) = first_report {
+        // The original report is already available at the deadline. Preserve
+        // it on the existing private tmpfs path before this observer exits;
+        // the larger artifact export remains explicitly best-effort.
+        let saved = first_report.and_then(|bytes| {
+            let root = std::env::var_os("COWD_FIXTURE_EVIDENCE_DIR")
+                .ok_or("private fixture evidence directory missing".to_string())?;
+            let path = std::path::PathBuf::from(root).join("shutdown-first-report.json");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            use std::io::Write;
+            let mut file = options.open(&path).map_err(|error| error.to_string())?;
+            file.write_all(&bytes).map_err(|error| error.to_string())?;
+            Ok::<_, String>(())
+        });
+        match saved {
+            Ok(()) => eprintln!("original first execution report saved to private fixture evidence"),
+            Err(error) => eprintln!("original first execution report unavailable: {error}"),
+        }
+    }
     if let Err(panic) = run { std::panic::resume_unwind(panic); }
-    if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
+    match cleanup {
+        Some(Ok(Ok(Ok(_)))) => {},
+        Some(Ok(Ok(Err(error)))) => panic!("original Gateway stop unresolved: {error}"),
+        Some(Ok(Err(panic))) => std::panic::resume_unwind(panic),
+        Some(Err(error)) => panic!("original Gateway stop task failed: {error}"),
+        None => panic!("original Gateway stop remains unresolved at its first deadline"),
+    }
 }

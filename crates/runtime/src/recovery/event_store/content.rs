@@ -367,6 +367,22 @@ impl RuntimeEventStore {
         }
     }
 
+    /// Recognise the exact committed node-owned ToolBatch outcome slot.
+    pub fn prepared_agent_tool_outcome_root(
+        result_ref: &str, stream_id: &str, key: &str, artifact: &ArtifactRef,
+    ) -> PreparedContentRoot {
+        let Some(encoded) = result_ref.strip_prefix(
+            crate::execution_core::graph::executors::agent_tool::AGENT_TOOL_OUTCOME_REFERENCE,
+        ) else { return PreparedContentRoot::Absent; };
+        let Ok(reference) = serde_json::from_str::<
+            crate::execution_core::graph::executors::agent_tool::AgentToolOutcomeReference,
+        >(encoded) else { return PreparedContentRoot::Blocked; };
+        if reference.stream_id != stream_id || reference.idempotency_key != key {
+            return PreparedContentRoot::Blocked;
+        }
+        Self::prepared_slot_root(&reference.content, artifact)
+    }
+
     pub fn process_closure_artifact(slot: &serde_json::Value) -> Result<ArtifactRef, String> {
         let envelope: ContentEnvelope = serde_json::from_value(slot.clone())
             .map_err(|_| "invalid process closure envelope".to_string())?;
@@ -579,6 +595,109 @@ impl RuntimeEventStore {
         PreparedContentRoot::Canonical
     }
 
+    /// Authenticate the original delegated receipt pair before publishing or
+    /// retaining its externalised, unbounded outcome.
+    pub fn validate_delegated_outcome_pair(
+        primary: &RuntimeEventInput, primary_key: &str, primary_schema: u32,
+        index: &RuntimeEventInput, index_key: &str, index_schema: u32,
+    ) -> Result<ArtifactRef, String> {
+        let slot = &primary.payload["delegated_outcome_content_v1"];
+        let artifact = envelope_artifact(slot)?.ok_or("delegated outcome artifact missing")?;
+        let (index_stream, expected_key) = Self::process_closure_index_identity(&primary.payload, &primary.refs)?;
+        let call = primary.payload["idempotency_key"].as_str().filter(|v| !v.is_empty())
+            .ok_or("delegated outcome call missing")?;
+        let session = primary.payload["replay"]["session_id"].as_str().filter(|v| !v.is_empty())
+            .ok_or("delegated outcome session missing")?;
+        let read = primary.kind == "execution.read.receipt";
+        if (!read && primary.kind != "execution.effect.receipt")
+            || primary.scope != RuntimeEventScope::ExecutionNode || primary_schema != 1
+            || primary.stream_id != format!("execution-effect:{call}")
+            || primary_key != format!("{call}:{}", if read { "read-receipt" } else { "receipt" })
+            || primary.actor.as_deref() != Some("governed_tool") || primary.status.as_deref() != Some("completed")
+            || index.kind != "execution.agent_tool.receipt" || index.scope != RuntimeEventScope::ExecutionNode
+            || index_schema != 2 || index.stream_id != index_stream || index_key != expected_key
+            || index.actor.as_deref() != Some("governed_tool") || index.status.as_deref() != Some("completed")
+            || primary.payload["outcome_truncated"] != true || index.payload["outcome_truncated"] != true
+            || primary.payload["root_effect_owner"] != serde_json::Value::Null
+            || artifact.visibility_scope != format!("session:{session}")
+            || !artifact.is_durable()
+            || (read && index.payload["effect_kind"] != "read")
+        { return Err("delegated outcome original source mismatch".into()); }
+        for field in ["idempotency_key", "outcome", "outcome_truncated", "delegated_outcome_content_v1",
+            "effect", "resolved_effect_scope", "root_effect_owner", "root_effect_context", "process_admission_ref", "process_closure"] {
+            if primary.payload[field] != index.payload[field] {
+                return Err(format!("delegated outcome primary/index {field} mismatch"));
+            }
+        }
+        let refs = |event: &RuntimeEventInput| event.refs.iter().filter(|r| r.kind != "artifact")
+            .map(|r| (r.kind.clone(), r.id.clone())).collect::<std::collections::BTreeSet<_>>();
+        if refs(primary) != refs(index) { return Err("delegated outcome references mismatch".into()); }
+        Ok(artifact)
+    }
+
+    pub fn delegated_outcome_root(primary: Option<&DurableRuntimeEvent>, index: Option<&DurableRuntimeEvent>, artifact: &ArtifactRef) -> PreparedContentRoot {
+        let Some(primary) = primary else { return PreparedContentRoot::Absent; };
+        let slot = &primary.payload["delegated_outcome_content_v1"];
+        if slot.is_null() { return PreparedContentRoot::Absent; }
+        match Self::prepared_slot_root(slot, artifact) {
+            PreparedContentRoot::Canonical => (),
+            other => return other,
+        }
+        let Some(index) = index else { return PreparedContentRoot::Blocked; };
+        let as_input = |event: &DurableRuntimeEvent| RuntimeEventInput {
+            stream_id: event.stream_id.clone(), scope: event.scope, kind: event.kind.clone(),
+            status: event.status.clone(), actor: event.actor.clone(), refs: event.refs.clone(), payload: event.payload.clone(),
+        };
+        if primary.transaction_id.is_empty() || primary.commit_cursor == 0
+            || primary.transaction_id != index.transaction_id || primary.commit_cursor != index.commit_cursor
+            || primary.transaction_index >= index.transaction_index
+            || Self::validate_delegated_outcome_pair(&as_input(primary), primary.idempotency_key.as_deref().unwrap_or(""),
+                primary.schema_version, &as_input(index), index.idempotency_key.as_deref().unwrap_or(""), index.schema_version)
+                .is_err() { return PreparedContentRoot::Blocked; }
+        PreparedContentRoot::Canonical
+    }
+
+    fn delegated_outcome_publications(&self, request: &AppendTransactionRequest)
+        -> RuntimeEventStoreResult<std::collections::BTreeMap<usize, ArtifactRef>> {
+        let invalid = |reason: &str| RuntimeEventStoreError::InvalidTransaction(reason.into());
+        let mut owned = std::collections::BTreeMap::new();
+        for (position, primary) in request.events.iter().enumerate() {
+            if !matches!(primary.event.kind.as_str(), "execution.read.receipt" | "execution.effect.receipt")
+                || primary.event.payload["delegated_outcome_content_v1"].is_null() { continue; }
+            let key = primary.idempotency_key.as_deref().ok_or_else(|| invalid("delegated outcome key missing"))?;
+            let (stream, index_key) = Self::process_closure_index_identity(&primary.event.payload, &primary.event.refs)
+                .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+            let mut matches = request.events.iter().enumerate().filter(|(_, event)|
+                event.event.stream_id == stream && event.idempotency_key.as_deref() == Some(index_key.as_str()));
+            let (index_position, index) = matches.next().ok_or_else(|| invalid("delegated outcome same-transaction index missing"))?;
+            if matches.next().is_some() || index_position <= position || owned.contains_key(&index_position) {
+                return Err(invalid("delegated outcome ambiguous index"));
+            }
+            let artifact = Self::validate_delegated_outcome_pair(&primary.event, key, primary.schema_version,
+                &index.event, &index_key, index.schema_version).map_err(RuntimeEventStoreError::InvalidTransaction)?;
+            let origin = PreparedArtifactOrigin::EventBody { stream_id: primary.event.stream_id.clone(),
+                idempotency_key: key.into(), kind: primary.event.kind.clone() };
+            let full = self.resolve_prepared_agent_tool_content(&artifact.visibility_scope,
+                &primary.event.payload["delegated_outcome_content_v1"], &origin)
+                .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+            let outcome: crate::RuntimeToolExecutionOutcome = serde_json::from_value(full)?;
+            if !crate::execution_core::graph::tool_effect_outcome_requires_truncation(&outcome)
+                || serde_json::to_value(crate::execution_core::graph::bounded_tool_effect_outcome(&outcome))?
+                    != primary.event.payload["outcome"]
+                || Some(outcome.tool_use_id.as_str()) != primary.event.payload["replay"]["call_id"].as_str()
+                || Some(outcome.tool_name.as_str()) != primary.event.payload["tool_name"].as_str() {
+                return Err(invalid("delegated outcome full/bounded identity mismatch"));
+            }
+            owned.insert(position, artifact.clone()); owned.insert(index_position, artifact);
+        }
+        for (position, event) in request.events.iter().enumerate() {
+            if !event.event.payload["delegated_outcome_content_v1"].is_null() && !owned.contains_key(&position) {
+                return Err(invalid("unowned delegated outcome content"));
+            }
+        }
+        Ok(owned)
+    }
+
     fn process_closure_publications(
         &self,
         request: &AppendTransactionRequest,
@@ -679,7 +798,64 @@ impl RuntimeEventStore {
             })
             .collect::<RuntimeEventStoreResult<std::collections::BTreeMap<_, _>>>()?;
         Self::validate_current_content_inputs(request)?;
+        // Bind each externalised leaf outcome to its original node and the
+        // graph mutation in the same transaction before either can publish.
+        for node in &request.events {
+            let Some(value) = node.event.payload["result"]["result_ref"].as_str() else { continue; };
+            let Some(encoded) = value.strip_prefix(
+                crate::execution_core::graph::executors::agent_tool::AGENT_TOOL_OUTCOME_REFERENCE,
+            ) else { continue; };
+            let invalid = || RuntimeEventStoreError::InvalidTransaction("original ToolBatch outcome binding invalid".into());
+            if node.event.kind != "execution_node.transitioned" || node.event.scope != RuntimeEventScope::ExecutionNode
+                || node.schema_version != 1 { return Err(RuntimeEventStoreError::InvalidTransaction("original ToolBatch outcome binding invalid: node kind/scope/schema".into())); }
+            let reference: crate::execution_core::graph::executors::agent_tool::AgentToolOutcomeReference =
+                serde_json::from_str(encoded)?;
+            let key = node.idempotency_key.as_deref().ok_or_else(invalid)?;
+            let graph_id = node.event.payload["graph_id"].as_str().ok_or_else(invalid)?;
+            let node_id = node.event.payload["node_id"].as_str().ok_or_else(invalid)?;
+            let binding = node.event.activity_binding().ok_or_else(invalid)?;
+            if reference.stream_id != node.event.stream_id || reference.idempotency_key != key
+                || reference.stream_id != format!("{graph_id}:node:{node_id}")
+                || binding.root_execution_id.is_empty() { return Err(RuntimeEventStoreError::InvalidTransaction("original ToolBatch outcome binding invalid: node origin".into())); }
+            let origin = PreparedArtifactOrigin::EventBody { stream_id: reference.stream_id.clone(),
+                idempotency_key: reference.idempotency_key.clone(), kind: node.event.kind.clone() };
+            let scope = format!("session:{}", binding.session_id);
+            let body = self.resolve_prepared_agent_tool_content(&scope, &reference.content, &origin)
+                .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+            let _: crate::RuntimeToolExecutionOutcome = serde_json::from_value(body)?;
+            let graphs: Vec<_> = request.events.iter().filter(|input|
+                input.event.scope == RuntimeEventScope::ExecutionGraph && input.event.stream_id == graph_id).collect();
+            if graphs.len() != 1 { return Err(RuntimeEventStoreError::InvalidTransaction("original ToolBatch outcome binding invalid: graph count".into())); }
+            let graph = graphs[0];
+            let graph_binding = graph.event.activity_binding().ok_or_else(invalid)?;
+            if graph_binding.session_id != binding.session_id { return Err(RuntimeEventStoreError::InvalidTransaction("original ToolBatch outcome binding invalid: graph session".into())); }
+            let graph_origin = PreparedArtifactOrigin::EventBody { stream_id: graph.event.stream_id.clone(),
+                idempotency_key: graph.idempotency_key.clone().ok_or_else(invalid)?, kind: graph.event.kind.clone() };
+            let graph_body = self.resolve_content(&scope, &graph.event.payload, &graph_origin)
+                .map_err(RuntimeEventStoreError::InvalidTransaction)?;
+            let graph_result = if graph_body["event"] == "checkpoint" {
+                if graph.event.kind != "execution_graph.checkpoint"
+                    || !matches!(graph_body["cause"].as_str(),
+                        Some("execution_graph.node_transitioned" | "execution_graph.nodes_transitioned"))
+                    || graph_body["graph"]["id"] != graph_id
+                    || graph_body["graph"]["lineage"]["session_id"] != binding.session_id
+                    || graph_body["graph"]["node_statuses"][node_id] != node.event.payload["to"] {
+                    return Err(RuntimeEventStoreError::InvalidTransaction("original ToolBatch checkpoint identity mismatch".into()));
+                }
+                graph_body["graph"]["node_results"].get(node_id)
+            } else {
+                graph_body.get("delta").and_then(|v| v.get("node_result_updates"))
+                    .and_then(|v| v.get(node_id))
+            };
+            if graph_result != node.event.payload.get("result") {
+                return Err(RuntimeEventStoreError::InvalidTransaction("original ToolBatch graph result mismatch".into()));
+            }
+            if graph_body.get("node_id").and_then(serde_json::Value::as_str) == Some(node_id)
+                && graph_body.get("result") != node.event.payload.get("result")
+            { return Err(RuntimeEventStoreError::InvalidTransaction("original ToolBatch graph direct result mismatch".into())); }
+        }
         let process_closures = self.process_closure_publications(request)?;
+        let delegated_outcomes = self.delegated_outcome_publications(request)?;
         let expected = request
             .expected_streams
             .iter()
@@ -773,6 +949,15 @@ impl RuntimeEventStore {
                     self.validate_graph_typed_artifacts(&graph)?;
                 }
                 envelope_artifact(envelope).map_err(RuntimeEventStoreError::InvalidTransaction)?
+            } else if input.event.kind == "execution_node.transitioned"
+                && input.event.payload["result"]["result_ref"].as_str().is_some_and(|value|
+                    value.starts_with(crate::execution_core::graph::executors::agent_tool::AGENT_TOOL_OUTCOME_REFERENCE)) {
+                let value = input.event.payload["result"]["result_ref"].as_str().expect("checked result");
+                let encoded = value.strip_prefix(crate::execution_core::graph::executors::agent_tool::AGENT_TOOL_OUTCOME_REFERENCE)
+                    .expect("checked prefix");
+                let reference: crate::execution_core::graph::executors::agent_tool::AgentToolOutcomeReference =
+                    serde_json::from_str(encoded)?;
+                envelope_artifact(&reference.content).map_err(RuntimeEventStoreError::InvalidTransaction)?
             } else if input.event.kind == "runtime.session.terminal_requested" {
                 let terminal: SessionTerminalInput =
                     serde_json::from_value(input.event.payload.clone())?;
@@ -827,6 +1012,8 @@ impl RuntimeEventStore {
                     || own.as_ref().is_some_and(|artifact| {
                         artifact.selector == reference.id && reference.kind == "artifact"
                     })
+                    || delegated_outcomes.get(&position).is_some_and(|artifact|
+                        artifact.selector == reference.id && reference.kind == "artifact")
                 {
                     continue;
                 }
@@ -845,6 +1032,10 @@ impl RuntimeEventStore {
                             reference.id
                         ))
                     })?;
+            }
+            if let Some(artifact) = delegated_outcomes.get(&position) {
+                let reference = RuntimeEventRef { kind: "artifact".into(), id: artifact.selector.clone() };
+                if !input.event.refs.contains(&reference) { input.event.refs.push(reference); }
             }
             if let Some(artifact) = own {
                 let reference = RuntimeEventRef {
@@ -1342,6 +1533,25 @@ impl RuntimeEventStore {
             body,
         })
         .map_err(|_| "content encoding failed".to_string())
+    }
+
+    pub(crate) fn resolve_prepared_agent_tool_content(
+        &self, scope: &str, envelope: &serde_json::Value, origin: &PreparedArtifactOrigin,
+    ) -> Result<serde_json::Value, String> {
+        let artifact = match envelope_artifact(envelope)? {
+            Some(artifact) => artifact,
+            None => return self.resolve_content(scope, envelope, origin),
+        };
+        let id = artifact.selector.strip_prefix("artifact://").ok_or("invalid ToolBatch artifact selector")?;
+        let store = self.artifacts.get().ok_or("MissingContentStore")?;
+        let record = store.repository().record(id)?.ok_or("original ToolBatch artifact missing")?;
+        if !matches!(record.record_class, crate::ArtifactRecordClass::PrivatePrepared | crate::ArtifactRecordClass::Live)
+            || record.prepared_origin.as_ref() != Some(origin)
+            || record.visibility_scope != scope
+            || !store.repository().prepared_readable(&record, origin)? {
+            return Err("original ToolBatch prepared authority mismatch".into());
+        }
+        self.resolve_content(scope, envelope, origin)
     }
 
     pub(crate) fn resolve_content(
@@ -2930,6 +3140,10 @@ mod verified_observation_tests {
         let inline = writer
             .prepare_content("session:owner", "small", &small, &origin)
             .unwrap();
+        assert_eq!(writer.resolve_prepared_agent_tool_content("session:owner", &inline, &origin).unwrap(), small);
+        let mut corrupt_inline = inline.clone();
+        corrupt_inline["sha256"] = serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+        assert!(writer.resolve_prepared_agent_tool_content("session:owner", &corrupt_inline, &origin).is_err());
         assert_eq!(
             RuntimeEventStore::for_test()
                 .resolve_content("session:owner", &inline, &origin)

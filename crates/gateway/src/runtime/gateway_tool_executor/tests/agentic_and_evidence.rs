@@ -1888,6 +1888,44 @@ async fn publication_query_without_match_keeps_unread_source_as_continuation() {
     assert_eq!(last["coverage"]["complete"], false);
 }
 
+#[test]
+fn bound_step_decodes_only_complete_strict_batch_arrays() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let inner = r#"[{"tool":"team_create","input":{}}]"#;
+    let frame = json!({"actions": inner}).to_string();
+    let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+        &runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "bound-encoded-batch".into(),
+            tool_name: "agent_action_batch".into(),
+            input: frame.clone(),
+            depends_on: vec![],
+        },
+    );
+    request.session_id = Some("bound-encoded-session".into());
+    attach_gateway_step(&executor, &mut request);
+    let binding = request.step_binding.as_ref().unwrap();
+    let repaired = executor.validate_step_tool_input(Some(binding), "agent_action_batch", &frame)
+        .expect("the original pinned Step accepts a complete encoded array");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&repaired).unwrap(),
+        json!({"actions":[{"tool":"team_create","input":{}}]}));
+    for bad in [
+        r#"[{"tool":"team_create","input":{}}, {"tool":"team_create""#,
+        r#"[{"tool":"team_create","tool":"task_publish","input":{}}]"#,
+        r#"{"tool":"team_create","input":{}}"#,
+        r#"[{"input":{}}]"#,
+    ] {
+        let invalid = json!({"actions": bad}).to_string();
+        assert!(executor.validate_step_tool_input(Some(binding), "agent_action_batch", &invalid).is_err());
+    }
+    let mut foreign = binding.clone();
+    foreign.origin.source = harness_contract::step::CallSource::Provider { attempt_id: "foreign".into() };
+    assert!(executor.validate_step_tool_input(Some(&foreign), "agent_action_batch", &frame)
+        .unwrap_err().to_string().contains("step_origin_source_rejected"));
+}
+
 /// Production uses the bound Step validator, not the unbound CLI validator.
 /// Reproduce the observed actions:string / malformed inner entries; this is a
 /// controlled shape counterexample, not a claim of replaying an entire HTTP frame.

@@ -1048,6 +1048,24 @@ impl ExecutionGraphStateStore {
         })
     }
 
+    /// Test access to the same authenticated start reader used by the graph owner.
+    #[cfg(feature = "test-fixtures")]
+    pub fn original_binding_start_for_test(
+        &self,
+        graph: &ExecutionGraph,
+        node_id: &str,
+        attempt: u32,
+    ) -> Result<(super::registry::NodeExecutionTicket, (u64, u64, u32)), ExecutionStateStoreError> {
+        let binding = self.current_binding(graph, node_id, attempt)?;
+        let (ticket, _) = self.binding_start_ticket(graph, node_id, &binding)?;
+        let position = self.binding_start_position(graph, node_id, &binding)?
+            .ok_or_else(|| ExecutionStateStoreError::Corrupt {
+                graph_id: graph.id.clone(),
+                reason: "canonical original binding position missing".into(),
+            })?;
+        Ok((ticket, position))
+    }
+
     pub(crate) fn binding_start_ticket(
         &self,
         graph: &ExecutionGraph,
@@ -2038,9 +2056,9 @@ mod tests {
                 let fresh = (request_index > 0).then(|| self.services());
                 let current = fresh.as_deref().unwrap_or(services);
                 let result = crate::execution_projection::snapshot(current, &self.expected.id, &self.context(current)).await;
-                if fresh.is_some() {
-                    current.shutdown_execution().await;
-                    current.shutdown_maintenance().await;
+                if let Some(ref fresh) = fresh {
+                    fresh.shutdown_execution().await;
+                    fresh.shutdown_maintenance().await;
                 }
                 let projection = result?;
                 if !projection.health.iter().any(|entity| entity.kind == "history_verification" && entity.status.as_deref() == Some("incomplete")) {

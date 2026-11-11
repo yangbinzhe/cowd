@@ -1435,6 +1435,7 @@ mod tests {
             crate::conversation::EarlyToolDispatchResult::Deferred(crate::conversation::EarlyToolDeferral {
                 tool_call_id: "original-call".into(), reason: "test completion".into(), ready_at_ms: 0,
                 original_undispatched: None,
+                origin: crate::conversation::EarlyToolDeferralOrigin::OriginalWorker,
             })
         });
         let (joined, _) = executor.retain_original_early_worker(&original, "original-call", worker).unwrap();

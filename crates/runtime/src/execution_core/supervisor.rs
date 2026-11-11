@@ -17,7 +17,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use super::graph::{
     ExecutionGraphHost, ExecutionGraphHostReceipt, ExecutionGraphRunner, ExecutionRecoveryError,
-    ExecutionRunReport, ExecutionRunnerError,
+    ExecutionRunReport, ExecutionRunnerError, OriginalPumpTask, PumpCancellationOwner,
 };
 use crate::CancellationToken;
 
@@ -75,6 +75,11 @@ pub struct RuntimeExecutionShutdownReport {
     pub owners: std::collections::BTreeMap<String, RuntimeExecutionOwnerReport>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeExecutionShutdownCompletion {
+    Finished { report: RuntimeExecutionShutdownReport, custody_closed: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeWorkAdmissionReceipt {
     pub admission_id: String,
@@ -103,6 +108,7 @@ struct DriverSlotState {
     queued_at_ms: u64,
     active: bool,
     outcome: Option<DriverOutcome>,
+    shutdown_unstarted: Option<(u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -127,22 +133,24 @@ impl DriverSlot {
                 queued_at_ms: 0,
                 active: false,
                 outcome: None,
+                shutdown_unstarted: None,
             }),
             changed: tokio::sync::Notify::new(),
             admission: StdMutex::new(None),
         }
     }
 
-    fn request(&self, now_ms: u64) -> u64 {
+    fn request(&self, now_ms: u64, lifecycle: &AtomicU8) -> Option<u64> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN { return None; }
         state.requested_generation = state.requested_generation.saturating_add(1);
         if !state.active {
             state.queued_at_ms = now_ms;
         }
-        state.requested_generation
+        Some(state.requested_generation)
     }
 
     fn start(&self) -> u64 {
@@ -180,6 +188,9 @@ impl DriverSlot {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.shutdown_unstarted.is_some_and(|(first, last)| (first..=last).contains(&generation)) {
+            return Some(DriverOutcome::Aborted("execution cancelled during shutdown".to_string()));
+        }
         (state.completed_generation >= generation)
             .then(|| state.outcome.clone())
             .flatten()
@@ -190,7 +201,28 @@ impl DriverSlot {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !state.active && state.completed_generation >= state.requested_generation
+        !state.active && (state.completed_generation >= state.requested_generation
+            || state.shutdown_unstarted.is_some_and(|(_, last)| last >= state.requested_generation))
+    }
+
+    fn abort_unstarted_on_shutdown(&self, active_generation: Option<u64>) {
+        let changed = {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let first = state.completed_generation.saturating_add(1)
+                .max(active_generation.map_or(0, |generation| generation.saturating_add(1)));
+            if state.completed_generation >= state.requested_generation
+                || active_generation == Some(u64::MAX)
+                || (state.active && active_generation.is_none())
+                || first > state.requested_generation
+            {
+                false
+            } else {
+                let last = state.requested_generation;
+                state.shutdown_unstarted = Some((first, last));
+                true
+            }
+        };
+        if changed { self.changed.notify_waiters(); }
     }
 
     fn requested_generation(&self) -> u64 {
@@ -318,6 +350,9 @@ enum OwnedCompletionStatus {
 struct ShutdownDrainState {
     dispatcher: Option<JoinHandle<()>>,
     preserved_graphs: Option<usize>,
+    deadline: Option<tokio::time::Instant>,
+    deadline_observed: bool,
+    physical_drained: bool,
     errors: Vec<String>,
     physical_drain:
         Option<Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + 'static>>>,
@@ -344,6 +379,9 @@ pub struct RuntimeExecutionSupervisor {
     queue_capacity: usize,
     queue_partitions: u16,
     shutdown_timeout: Duration,
+    shutdown_observation_deadline: OnceLock<tokio::time::Instant>,
+    preserved_snapshot: std::sync::atomic::AtomicUsize,
+    preserved_snapshot_ready: std::sync::atomic::AtomicBool,
     graph_settled_observer: Arc<OnceLock<GraphSettledObserver>>,
     graph_producer_gate: StdMutex<GraphProducerGate>,
     session_recovery_owner: OnceLock<Arc<crate::RuntimeEventStore>>,
@@ -545,6 +583,9 @@ impl RuntimeExecutionSupervisor {
             queue_capacity,
             queue_partitions: DEFAULT_QUEUE_PARTITIONS,
             shutdown_timeout,
+            shutdown_observation_deadline: OnceLock::new(),
+            preserved_snapshot: std::sync::atomic::AtomicUsize::new(0),
+            preserved_snapshot_ready: std::sync::atomic::AtomicBool::new(false),
             graph_settled_observer: Arc::new(OnceLock::new()),
             #[cfg(any(test, feature = "test-fixtures"))]
             verdict_resolutions: StdMutex::new(HashMap::new()),
@@ -577,6 +618,14 @@ impl RuntimeExecutionSupervisor {
         graph_id: &str,
     ) -> Result<ExecutionGraph, ExecutionRecoveryError> {
         self.runner.recover_graph(graph_id).await
+    }
+
+    pub(crate) async fn commit_live_prepared_outcome(
+        &self,
+        ticket: &super::graph::NodeExecutionTicket,
+        prepared: &super::graph::NodeExecutionOutcome,
+    ) -> Result<ExecutionGraph, ExecutionRunnerError> {
+        self.runner.commit_live_prepared_outcome(ticket, prepared).await
     }
 
     fn ensure_dispatcher(&self) -> Result<(), ExecutionRunnerError> {
@@ -649,16 +698,6 @@ impl RuntimeExecutionSupervisor {
         Ok(())
     }
 
-    fn slot(&self, graph_id: &str) -> Arc<DriverSlot> {
-        Arc::clone(
-            self.slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(graph_id.to_string())
-                .or_insert_with(|| Arc::new(DriverSlot::new())),
-        )
-    }
-
     pub(crate) fn graph_producers_released(&self) -> bool {
         self.graph_producer_gate
             .lock()
@@ -684,8 +723,21 @@ impl RuntimeExecutionSupervisor {
             let graph = self.runner.state_store().load_async(graph_id).await?;
             self.ensure_graph_session_recovery_admitted(&graph)?;
         }
-        let slot = self.slot(graph_id);
-        let generation = slot.request(now_ms());
+        let (slot, generation) = {
+            let mut slots = self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.metrics.lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
+                return Err(ExecutionRunnerError::SupervisorUnavailable("shutdown has started".to_string()));
+            }
+            let created = !slots.contains_key(graph_id);
+            let slot = Arc::clone(slots.entry(graph_id.to_string()).or_insert_with(|| Arc::new(DriverSlot::new())));
+            match slot.request(now_ms(), &self.metrics.lifecycle) {
+                Some(generation) => (slot, generation),
+                None => {
+                    if created { slots.remove(graph_id); }
+                    return Err(ExecutionRunnerError::SupervisorUnavailable("shutdown has started".to_string()));
+                }
+            }
+        };
         {
             let mut gate = self
                 .graph_producer_gate
@@ -1056,9 +1108,6 @@ impl RuntimeExecutionSupervisor {
     }
 
     fn cleanup_slot(&self, graph_id: &str, slot: &Arc<DriverSlot>) {
-        if !slot.idle() || Arc::strong_count(slot) > 2 {
-            return;
-        }
         let mut slots = self
             .slots
             .lock()
@@ -1066,6 +1115,7 @@ impl RuntimeExecutionSupervisor {
         if slots
             .get(graph_id)
             .is_some_and(|current| Arc::ptr_eq(current, slot))
+            && slot.idle() && Arc::strong_count(slot) <= 2
         {
             slots.remove(graph_id);
         }
@@ -1222,9 +1272,40 @@ impl RuntimeExecutionSupervisor {
     }
 
     pub async fn shutdown(&self) -> RuntimeExecutionShutdownReport {
+        self.shutdown_impl(false).await
+    }
+
+    pub(crate) async fn shutdown_for_runtime(&self) -> RuntimeExecutionShutdownReport {
+        self.shutdown_impl(true).await
+    }
+
+    pub(crate) fn original_shutdown_deadline(&self) -> tokio::time::Instant {
+        *self.shutdown_observation_deadline.get_or_init(|| tokio::time::Instant::now() + self.shutdown_timeout)
+    }
+
+    pub(crate) fn unresolved_shutdown_report(&self, reason: &str) -> RuntimeExecutionShutdownReport {
+        let mut errors = vec![reason.to_owned()];
+        if !self.preserved_snapshot_ready.load(Ordering::Acquire) {
+            errors.push("original preserved graph count is not yet available".into());
+        }
+        self.shutdown_report(self.preserved_snapshot.load(Ordering::Acquire), 0, errors)
+    }
+
+    pub(crate) fn record_shutdown_observation_timeout(&self) {
+        self.metrics.record_error("original Runtime finalization exceeded its observation deadline");
+    }
+
+    async fn shutdown_impl(&self, defer_close: bool) -> RuntimeExecutionShutdownReport {
         // This is a shutdown-owner lock, not a graph/data lock. Keeping the
         // join handle here lets another waiter resume an abandoned shutdown.
-        let mut shutdown = self.shutdown_state.lock().await;
+        let original_deadline = self.original_shutdown_deadline();
+        let mut shutdown = match tokio::time::timeout_at(original_deadline, self.shutdown_state.lock()).await {
+            Ok(shutdown) => shutdown,
+            Err(_) => {
+                self.record_shutdown_observation_timeout();
+                return self.unresolved_shutdown_report("original execution shutdown owner remains in flight");
+            }
+        };
         let prior = self
             .metrics
             .lifecycle
@@ -1242,6 +1323,8 @@ impl RuntimeExecutionSupervisor {
                 shutdown.errors.clone(),
             );
         }
+        let deadline = *shutdown.deadline.get_or_insert(original_deadline);
+        self.runner.install_shutdown_deadline(deadline.into_std());
 
         let graph_ids = self
             .slots
@@ -1271,6 +1354,8 @@ impl RuntimeExecutionSupervisor {
             })
             .count();
         let preserved_graphs = *shutdown.preserved_graphs.get_or_insert(preserved_graphs);
+        self.preserved_snapshot.store(preserved_graphs, Ordering::Release);
+        self.preserved_snapshot_ready.store(true, Ordering::Release);
         self.cancellation.cancel();
         if shutdown.dispatcher.is_none() {
             shutdown.dispatcher = self
@@ -1280,28 +1365,47 @@ impl RuntimeExecutionSupervisor {
                 .take();
         }
         if let Some(dispatcher) = shutdown.dispatcher.as_mut() {
-            if tokio::time::timeout(self.shutdown_timeout, &mut *dispatcher)
-                .await
-                .is_err()
-            {
-                dispatcher.abort();
-                let _ = (&mut *dispatcher).await;
-                let forced = self.metrics.force_abort_active_owners().max(1);
-                self.metrics
-                    .forced_aborts
-                    .fetch_add(forced, Ordering::Relaxed);
-                self.metrics.active_drivers.store(0, Ordering::Relaxed);
-                self.metrics.active_owned_tasks.store(0, Ordering::Relaxed);
-                shutdown
-                    .errors
-                    .push("execution dispatcher exceeded shutdown timeout".to_string());
+            match tokio::time::timeout_at(deadline, &mut *dispatcher).await {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => {
+                    shutdown.errors.push(format!("original execution dispatcher failed: {error}"));
+                    shutdown.dispatcher.take();
+                    return self.shutdown_report(preserved_graphs, 0, shutdown.errors.clone());
+                },
+                Err(_) => {
+                    let reason = "original execution dispatcher remains unresolved after shutdown deadline";
+                    if !shutdown.deadline_observed {
+                        self.metrics.record_error(reason.to_string());
+                        shutdown.deadline_observed = true;
+                    }
+                    let mut errors = shutdown.errors.clone();
+                    errors.push(reason.to_string());
+                    return self.shutdown_report(preserved_graphs, 0, errors);
+                }
             }
         }
         shutdown.dispatcher.take();
+        // The registry drain contract begins only after process-local drivers
+        // stop. A retained original node is still such a driver.
+        let owners = tokio::time::timeout_at(deadline, self.runner.has_retained_shutdown_owners()).await;
+        if !matches!(owners, Ok(false)) {
+            let reason = "original execution owner remains unresolved after shutdown";
+            if !shutdown.deadline_observed {
+                self.metrics.record_error(reason.to_string());
+                shutdown.deadline_observed = true;
+            }
+            let mut errors = shutdown.errors.clone(); errors.push(reason.to_string());
+            return self.shutdown_report(preserved_graphs, 0, errors);
+        }
         // No producer/driver remains. Retained effects must finish before the
         // Runtime is reported closed; a shutdown timeout cannot unlock a write.
         // Their graph attempts remain recoverable, not business-cancelled.
-        if shutdown.physical_drain.is_none() {
+        if !shutdown.physical_drained && shutdown.physical_drain.is_none() && tokio::time::Instant::now() >= deadline {
+            let mut errors = shutdown.errors.clone();
+            errors.push("original physical drain was not registered before shutdown deadline".into());
+            return self.shutdown_report(preserved_graphs, 0, errors);
+        }
+        if !shutdown.physical_drained && shutdown.physical_drain.is_none() {
             let runner = Arc::clone(&self.runner);
             shutdown.physical_drain =
                 Some(Box::pin(
@@ -1310,11 +1414,20 @@ impl RuntimeExecutionSupervisor {
         }
         // The original state owns this exact aggregation, including already
         // observed errors. Dropping a waiter must not restart and wash them out.
-        let errors = shutdown
-            .physical_drain
-            .as_mut()
-            .expect("original drain")
-            .await;
+        let errors = if shutdown.physical_drained { Vec::new() } else {
+            match tokio::time::timeout_at(deadline, shutdown.physical_drain.as_mut().expect("original drain")).await {
+                Ok(errors) => errors,
+                Err(_) => {
+                    let reason = "original physical drain remains unresolved after shutdown deadline";
+                    if !shutdown.deadline_observed {
+                        self.metrics.record_error(reason.to_string());
+                        shutdown.deadline_observed = true;
+                    }
+                    let mut errors = shutdown.errors.clone(); errors.push(reason.to_string());
+                    return self.shutdown_report(preserved_graphs, 0, errors);
+                }
+            }
+        };
         let drained = errors.is_empty();
         for error in errors {
             if !shutdown.errors.contains(&error) {
@@ -1322,12 +1435,55 @@ impl RuntimeExecutionSupervisor {
             }
         }
         shutdown.physical_drain = None;
-        if drained {
+        if drained { shutdown.physical_drained = true; }
+        if drained && !defer_close {
             self.metrics
                 .lifecycle
                 .store(LIFECYCLE_CLOSED, Ordering::Release);
         }
         self.shutdown_report(preserved_graphs, 0, shutdown.errors.clone())
+    }
+
+    // The RuntimeServices original finalization driver starts before the
+    // observation deadline and retains this same dispatcher/drain sequence.
+    pub(crate) async fn await_original_shutdown(&self) -> RuntimeExecutionShutdownReport {
+        let mut shutdown = self.shutdown_state.lock().await;
+        let preserved = shutdown.preserved_graphs.unwrap_or(0);
+        let mut dispatcher_failed = false;
+        if let Some(dispatcher) = shutdown.dispatcher.as_mut() {
+            if let Err(error) = dispatcher.await {
+                shutdown.errors.push(format!("original execution dispatcher failed: {error}"));
+                dispatcher_failed = true;
+            }
+        }
+        shutdown.dispatcher.take();
+        if dispatcher_failed { return self.shutdown_report(preserved, 0, shutdown.errors.clone()); }
+        // Original retained tasks are process-local drivers, including the
+        // non-retaining ToolBatch path. Their own handoffs must finish first.
+        self.runner.wait_retained_shutdown_owners().await;
+        if !shutdown.physical_drained && shutdown.physical_drain.is_none() {
+            let runner = Arc::clone(&self.runner);
+            shutdown.physical_drain = Some(Box::pin(async move { runner.drain_physical_execution().await }));
+        }
+        if !shutdown.physical_drained {
+            let errors = shutdown.physical_drain.as_mut().expect("original drain").await;
+            shutdown.physical_drained = errors.is_empty();
+            for error in errors { if !shutdown.errors.contains(&error) { shutdown.errors.push(error); } }
+            shutdown.physical_drain = None;
+        }
+        self.shutdown_report(preserved, 0, shutdown.errors.clone())
+    }
+
+    pub(crate) async fn has_shutdown_failure(&self) -> bool {
+        !self.shutdown_state.lock().await.errors.is_empty()
+    }
+
+    pub(crate) async fn finish_runtime_shutdown(&self) -> bool {
+        let shutdown = self.shutdown_state.lock().await;
+        if shutdown.dispatcher.is_some() || !shutdown.physical_drained
+            || self.runner.has_retained_shutdown_owners().await { return false; }
+        self.metrics.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
+        true
     }
 
     fn shutdown_report(
@@ -1392,6 +1548,40 @@ impl ExecutionGraphHost for RuntimeExecutionSupervisor {
     }
 }
 
+fn close_queued_for_shutdown(
+    receiver: &mut mpsc::Receiver<SupervisorMessage>,
+    reaper_receiver: &mut mpsc::Receiver<SupervisorMessage>,
+    slots: &StdMutex<HashMap<String, Arc<DriverSlot>>>,
+    active: &HashMap<String, u64>,
+    metrics: &SupervisorMetrics,
+) {
+    receiver.close();
+    reaper_receiver.close();
+    while let Ok(message) = receiver.try_recv() {
+        if let SupervisorMessage::Owned { owner, .. } = message {
+            metrics.owner_submitted(&owner);
+            metrics.owner_aborted(&owner);
+        }
+    }
+    while let Ok(SupervisorMessage::Owned { owner, .. }) = reaper_receiver.try_recv() {
+        metrics.owner_submitted(&owner);
+        metrics.owner_aborted(&owner);
+    }
+    let pending = slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter().map(|(graph_id, slot)| (Arc::clone(slot), active.get(graph_id).copied())).collect::<Vec<_>>();
+    for (slot, generation) in pending { slot.abort_unstarted_on_shutdown(generation); }
+}
+
+async fn drain_closed_queue(receiver: &mut mpsc::Receiver<SupervisorMessage>, metrics: &SupervisorMetrics) {
+    // A permit acquired before close can still deliver after try_recv is empty.
+    while let Some(message) = receiver.recv().await {
+        if let SupervisorMessage::Owned { owner, .. } = message {
+            metrics.owner_submitted(&owner);
+            metrics.owner_aborted(&owner);
+        }
+    }
+}
+
 async fn dispatch_loop(
     mut receiver: mpsc::Receiver<SupervisorMessage>,
     mut reaper_receiver: mpsc::Receiver<SupervisorMessage>,
@@ -1411,20 +1601,9 @@ async fn dispatch_loop(
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => {
-                receiver.close();
-                reaper_receiver.close();
-                while let Ok(message) = receiver.try_recv() {
-                    if let SupervisorMessage::Owned { owner, .. } = message {
-                        metrics.owner_submitted(&owner);
-                        metrics.owner_aborted(&owner);
-                    }
-                }
-                while let Ok(SupervisorMessage::Owned { owner, .. }) =
-                    reaper_receiver.try_recv()
-                {
-                    metrics.owner_submitted(&owner);
-                    metrics.owner_aborted(&owner);
-                }
+                close_queued_for_shutdown(&mut receiver, &mut reaper_receiver, &slots, &active, &metrics);
+                tokio::join!(drain_closed_queue(&mut receiver, &metrics),
+                    drain_closed_queue(&mut reaper_receiver, &metrics));
 
                 while let Some(joined) = workers.join_next().await {
                     match joined {
@@ -1441,6 +1620,7 @@ async fn dispatch_loop(
                                 .cloned()
                             {
                                 slot.finish(generation, outcome.clone());
+                                slot.abort_unstarted_on_shutdown(None);
                             }
                             notify_graph_settled(&graph_settled_observer, &graph_id);
                             match outcome {
@@ -1494,19 +1674,7 @@ async fn dispatch_loop(
                     slots.drain().map(|(_, slot)| slot).collect::<Vec<_>>()
                 };
                 for slot in retained {
-                    let generation = slot
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .requested_generation;
-                    if !slot.idle() {
-                        slot.finish(
-                            generation,
-                            DriverOutcome::Aborted(
-                                "execution cancelled during shutdown".to_string(),
-                            ),
-                        );
-                    }
+                    slot.abort_unstarted_on_shutdown(None);
                 }
                 break;
             }
@@ -1767,9 +1935,41 @@ async fn run_completion_pump(
     let durable_progress = Arc::new(Notify::new());
     let mut active_nodes = JoinSet::new();
     let mut in_flight = BTreeSet::new();
+    let mut protected = BTreeSet::new();
+    let mut reasons = std::collections::BTreeMap::<String, String>::new();
+    let mut originals = HashMap::new();
+    let mut original_tasks = HashMap::new();
+    let mut panic_cleanup_started = BTreeSet::new();
+    let mut deferred_nodes = BTreeSet::new();
+    let mut waited_without_progress = false;
+    let retained = match runner.retained_original_pumps(graph_id).await {
+        Ok(retained) => retained,
+        Err(error) => return DriverOutcome::Failed(error.to_string()),
+    };
+    for (node, task, owner) in retained {
+        original_tasks.insert(node.clone(), Arc::clone(&task));
+        let reason = match task.classify(&node) {
+            Some(Err(error)) => error.to_string(),
+            Some(Ok(())) => format!("original pump for `{node}` awaits owner reconciliation"),
+            None => format!("original pump for `{node}` remains pending"),
+        };
+        protected.insert(node.clone());
+        in_flight.insert(node.clone());
+        reasons.insert(node.clone(), reason);
+        originals.insert(node.clone(), (Arc::clone(&task), owner));
+        active_nodes.spawn(async move { let result = task.observe(&node).await; (node, result) });
+    }
 
     loop {
-        let snapshot = match runner.pump_snapshot(graph_id, &in_flight).await {
+        if cancellation.is_cancelled() {
+            if let Err(error) = abort_pump_nodes(&runner, graph_id, &in_flight, &mut active_nodes).await {
+                return DriverOutcome::Failed(format!("original cancellation drain unconfirmed: {error}"));
+            }
+            return DriverOutcome::Aborted(
+                "execution cancelled while graph pump was running".to_string(),
+            );
+        }
+        let snapshot = match runner.pump_snapshot_with_unknown(graph_id, &in_flight, &protected).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 if let Err(drain) = abort_pump_nodes(&runner, graph_id, &in_flight, &mut active_nodes).await {
@@ -1789,10 +1989,11 @@ async fn run_completion_pump(
         let ready = snapshot
             .ready
             .into_iter()
+            .filter(|node| !deferred_nodes.contains(&node.id))
             .take(available)
             .collect::<Vec<_>>();
         let mut admission_deferred = false;
-        let prepared = match runner.prepare_ready_wave(graph_id, ready).await {
+        let prepared = match runner.prepare_ready_wave_with_unknown(graph_id, ready, &protected).await {
             Ok(prepared) => prepared,
             Err(ExecutionRunnerError::ResourceDeferred { .. }) => {
                 admission_deferred = true;
@@ -1806,18 +2007,32 @@ async fn run_completion_pump(
             }
         };
         for prepared in prepared {
+            if !prepared.has_startup_error() { waited_without_progress = false; }
             let node_id = prepared.node.id.clone();
             if !in_flight.insert(node_id.clone()) {
                 continue;
             }
+            let original_task = if prepared.has_startup_error() {
+                None
+            } else {
+                let (task, sender) = OriginalPumpTask::new();
+                if let Err(error) = runner.register_original_pump_task(graph_id, &prepared, Arc::clone(&task)).await {
+                    in_flight.remove(&node_id);
+                    if let Err(drain) = abort_pump_nodes(&runner, graph_id, &in_flight, &mut active_nodes).await {
+                        return DriverOutcome::Failed(format!("{error}; original drain unconfirmed: {drain}"));
+                    }
+                    return DriverOutcome::Failed(error.to_string());
+                }
+                original_tasks.insert(node_id.clone(), Arc::clone(&task));
+                Some((task, sender))
+            };
             let runner = Arc::clone(&runner);
             let graph_id = graph_id.to_string();
             let progress = Arc::clone(&durable_progress);
-            active_nodes.spawn(async move {
-                let binding_for_panic = prepared.binding.clone();
-                let runner_for_panic = Arc::clone(&runner);
-                let graph_id_for_panic = graph_id.clone();
-                let node_id_for_panic = node_id.clone();
+            let task_node_id = node_id.clone();
+            let panic_task = original_task.as_ref().map(|(task, _)| Arc::clone(task));
+            let work = async move {
+                let node_id_for_panic = task_node_id.clone();
                 let executed = AssertUnwindSafe(async move {
                     runner
                         .execute_prepared_pump_node(&graph_id, prepared, progress)
@@ -1826,25 +2041,26 @@ async fn run_completion_pump(
                 .catch_unwind()
                 .await;
                 match executed {
-                    Ok(result) => (node_id, result),
+                    Ok(result) => result,
                     Err(payload) => {
+                        if let Some(task) = panic_task { task.mark_panicked(); }
                         let reason = panic_message(payload);
-                        let result = runner_for_panic
-                            .isolate_node_failure(
-                                &graph_id_for_panic,
-                                &node_id_for_panic,
-                                binding_for_panic.as_ref(),
-                                format!("node panicked: {reason}"),
-                            )
-                            .await;
-                        let result = match result {
-                            Err(ExecutionRunnerError::CommandSuperseded { .. }) => Ok(()),
-                            result => result,
-                        };
-                        (node_id_for_panic, result)
+                        Err(ExecutionRunnerError::Executor(super::graph::NodeExecutorError::OriginalCustodyUnknown {
+                            node_id: node_id_for_panic,
+                            reason: format!("original pump task panicked: {reason}"),
+                        }))
                     }
                 }
-            });
+            };
+            if let Some((task, sender)) = original_task {
+                tokio::spawn(async move { let _ = sender.send(work.await); });
+                active_nodes.spawn(async move {
+                    let result = task.observe(&node_id).await;
+                    (node_id, result)
+                });
+            } else {
+                active_nodes.spawn(async move { (node_id, work.await) });
+            }
         }
 
         #[cfg(test)]
@@ -1853,8 +2069,23 @@ async fn run_completion_pump(
                 active_nodes.len(), in_flight.len(), admission_deferred, snapshot.report.waiting, snapshot.report.revision);
         }
         if active_nodes.is_empty() {
+            if !deferred_nodes.is_empty() && (protected.is_empty() || !waited_without_progress) {
+                if !protected.is_empty() { waited_without_progress = true; }
+                tokio::select! { _ = cancellation.cancelled() => {}, () = runner.wait_for_resource_change() => {} }
+                deferred_nodes.clear();
+                continue;
+            }
+            if !protected.is_empty() && admission_deferred && !waited_without_progress {
+                waited_without_progress = true;
+                tokio::select! { _ = cancellation.cancelled() => {}, () = runner.wait_for_resource_change() => {} }
+                continue;
+            }
+            if let Some(reason) = reasons.values().next() { return DriverOutcome::Failed(reason.clone()); }
             if admission_deferred {
-                runner.wait_for_resource_change().await;
+                tokio::select! {
+                    _ = cancellation.cancelled() => {}
+                    () = runner.wait_for_resource_change() => {}
+                }
                 continue;
             }
             match runner.terminal_report(graph_id).await {
@@ -1887,6 +2118,9 @@ async fn run_completion_pump(
                 // Durable terminal truth is already committed. Re-read it and
                 // release direct successors without waiting for unrelated work.
             }
+            () = runner.wait_for_resource_change(), if !deferred_nodes.is_empty() => {
+                deferred_nodes.clear();
+            }
             joined = active_nodes.join_next() => {
                 #[cfg(test)]
                 if std::env::var_os("COWD_R622_TRACE").is_some() { eprintln!("r622_toolbatch phase=pump_wake source=node_join"); }
@@ -1895,6 +2129,21 @@ async fn run_completion_pump(
                 };
                 match joined {
                     Ok((node_id, Ok(()))) => {
+                        if let Some((task, owner)) = originals.remove(&node_id) {
+                            if !runner.original_pump_was_closed(&task, &owner) {
+                                let same = runner.original_pump_matches(graph_id, &node_id, &task, &owner).await;
+                                let detail = if same { "original pump completed without confirmed binding release" } else { "original pump owner changed before confirmed release" };
+                                if panic_cleanup_started.contains(&node_id) {
+                                    reasons.entry(node_id.clone()).and_modify(|reason| reason.push_str(&format!("; {detail}"))).or_insert_with(|| detail.into());
+                                } else {
+                                    reasons.insert(node_id.clone(), detail.into());
+                                }
+                                protected.insert(node_id);
+                                continue;
+                            }
+                            protected.remove(&node_id);
+                            if !panic_cleanup_started.contains(&node_id) { reasons.remove(&node_id); }
+                        }
                         in_flight.remove(&node_id);
                         // A durable terminal wave wakes many sibling tasks at
                         // once. Drain them before re-projecting the same graph;
@@ -1904,10 +2153,38 @@ async fn run_completion_pump(
                         while let Some(joined) = active_nodes.try_join_next() {
                             match joined {
                                 Ok((node_id, Ok(()))) => {
+                                    if let Some((task, owner)) = originals.remove(&node_id) {
+                                        if !runner.original_pump_was_closed(&task, &owner) {
+                                            let same = runner.original_pump_matches(graph_id, &node_id, &task, &owner).await;
+                                            let detail = if same { "original pump completed without confirmed binding release" } else { "original pump owner changed before confirmed release" };
+                                            if panic_cleanup_started.contains(&node_id) {
+                                                reasons.entry(node_id.clone()).and_modify(|reason| reason.push_str(&format!("; {detail}"))).or_insert_with(|| detail.into());
+                                            } else {
+                                                reasons.insert(node_id.clone(), detail.into());
+                                            }
+                                            protected.insert(node_id);
+                                            continue;
+                                        }
+                                        protected.remove(&node_id);
+                                        if !panic_cleanup_started.contains(&node_id) { reasons.remove(&node_id); }
+                                    }
                                     in_flight.remove(&node_id);
                                 }
                                 Ok((node_id, Err(error))) => {
-                                    if matches!(error, ExecutionRunnerError::ResourceDeferred { .. }) {
+                                    if matches!(&error, ExecutionRunnerError::Executor(super::graph::NodeExecutorError::OriginalCustodyUnknown { .. })) {
+                                        protected.insert(node_id.clone());
+                                        let mut reason = error.to_string();
+                                        if let Some(task) = original_tasks.get(&node_id).filter(|task| task.requires_original_cleanup()) {
+                                            if panic_cleanup_started.insert(node_id.clone()) {
+                                                match schedule_panicked_original_cleanup(&runner, graph_id, &node_id, task, &reason, &mut active_nodes).await {
+                                                    Ok(owner) => { originals.insert(node_id.clone(), (Arc::clone(task), owner)); }
+                                                    Err(detail) => reason.push_str(&format!("; original cleanup unconfirmed: {detail}")),
+                                                }
+                                            }
+                                        }
+                                        reasons.insert(node_id, reason);
+                                    } else if matches!(error, ExecutionRunnerError::ResourceDeferred { .. }) {
+                                        deferred_nodes.insert(node_id.clone());
                                         in_flight.remove(&node_id);
                                         resource_deferred = true;
                                     } else if !matches!(
@@ -1932,19 +2209,35 @@ async fn run_completion_pump(
                                 }
                             }
                         }
-                        if resource_deferred {
+                        if resource_deferred && protected.is_empty() {
                             runner.wait_for_resource_change().await;
+                            deferred_nodes.clear();
                         }
                     }
                     Ok((node_id, Err(error))) => {
+                        if matches!(&error, ExecutionRunnerError::Executor(super::graph::NodeExecutorError::OriginalCustodyUnknown { .. })) {
+                            protected.insert(node_id.clone());
+                            let mut reason = error.to_string();
+                            if let Some(task) = original_tasks.get(&node_id).filter(|task| task.requires_original_cleanup()) {
+                                if panic_cleanup_started.insert(node_id.clone()) {
+                                    match schedule_panicked_original_cleanup(&runner, graph_id, &node_id, task, &reason, &mut active_nodes).await {
+                                        Ok(owner) => { originals.insert(node_id.clone(), (Arc::clone(task), owner)); }
+                                        Err(detail) => reason.push_str(&format!("; original cleanup unconfirmed: {detail}")),
+                                    }
+                                }
+                            }
+                            reasons.insert(node_id, reason);
+                            continue;
+                        }
                         if matches!(error, ExecutionRunnerError::ResourceDeferred { .. }) {
+                            deferred_nodes.insert(node_id.clone());
                             in_flight.remove(&node_id);
                             // Keep the graph driver alive across soft resource
                             // pressure. `wait_for_change` is notification-led
                             // with a bounded fallback, so a release cannot
                             // strand a Ready node and a missed notification
                             // cannot spin forever.
-                            runner.wait_for_resource_change().await;
+                            if protected.is_empty() { runner.wait_for_resource_change().await; deferred_nodes.clear(); }
                             continue;
                         }
                         // Node-local executor failures are already isolated
@@ -1979,7 +2272,40 @@ async fn run_completion_pump(
     }
 }
 
-async fn abort_pump_nodes(
+// The pump has already returned before this is scheduled.  Waiting for the
+// retained pump from inside its own work future would wait on itself.
+async fn schedule_panicked_original_cleanup(
+    runner: &Arc<ExecutionGraphRunner>,
+    graph_id: &str,
+    node_id: &str,
+    task: &Arc<OriginalPumpTask>,
+    panic_reason: &str,
+    active_nodes: &mut JoinSet<(String, Result<(), ExecutionRunnerError>)>,
+) -> Result<PumpCancellationOwner, &'static str> {
+    let nodes = BTreeSet::from([node_id.to_owned()]);
+    let (mut owners, missing) = runner.capture_pump_cancellation_owners(graph_id, &nodes).await;
+    if missing || owners.len() != 1 { return Err("original cancellation owner missing"); }
+    let owner = owners.pop().ok_or("original cancellation owner missing")?;
+    if !runner.original_pump_matches(graph_id, node_id, task, &owner).await {
+        return Err("original pump owner changed");
+    }
+    let retained_owner = owner.clone();
+    let runner = Arc::clone(runner);
+    let graph_id = graph_id.to_owned();
+    let node_id = node_id.to_owned();
+    let panic_reason = panic_reason.to_owned();
+    active_nodes.spawn(async move {
+        let cleanup = runner.drain_pump_cancellation_owners(&graph_id, vec![owner]).await;
+        let result = cleanup.map_err(|error| ExecutionRunnerError::Executor(
+            super::graph::NodeExecutorError::OriginalCustodyUnknown {
+                node_id: node_id.clone(), reason: format!("{panic_reason}; original cleanup unconfirmed: {error}"),
+            }));
+        (node_id, result)
+    });
+    Ok(retained_owner)
+}
+
+pub(crate) async fn abort_pump_nodes(
     runner: &ExecutionGraphRunner,
     graph_id: &str,
     in_flight: &BTreeSet<String>,
@@ -2059,15 +2385,13 @@ fn cleanup_idle_slot(
     graph_id: &str,
     slot: &Arc<DriverSlot>,
 ) {
-    if !slot.idle() || Arc::strong_count(slot) > 2 {
-        return;
-    }
     let mut slots = slots
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if slots
         .get(graph_id)
         .is_some_and(|current| Arc::ptr_eq(current, slot))
+        && slot.idle() && Arc::strong_count(slot) <= 2
     {
         slots.remove(graph_id);
     }
@@ -2136,12 +2460,106 @@ mod completion_pump_tests {
     };
     use crate::runtime_event_store::RuntimeEventStore;
 
+    #[tokio::test]
+    async fn shutdown_closes_unstarted_child_wakes_without_overwriting_running_generation() {
+        let metrics = SupervisorMetrics::new();
+        let child = Arc::new(DriverSlot::new());
+        let child_generation = child.request(1, &metrics.lifecycle).unwrap();
+        let duplicate = child.request(2, &metrics.lifecycle).unwrap();
+        let parent = Arc::new(DriverSlot::new());
+        let running_generation = parent.request(1, &metrics.lifecycle).unwrap();
+        assert_eq!(parent.start(), running_generation);
+        let newer_generation = parent.request(2, &metrics.lifecycle).unwrap();
+        let slots = StdMutex::new(HashMap::from([
+            ("child".to_string(), Arc::clone(&child)),
+            ("parent".to_string(), Arc::clone(&parent)),
+        ]));
+        let active = HashMap::from([("parent".to_string(), running_generation)]);
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (_reaper_sender, mut reaper) = mpsc::channel(1);
+        sender.try_send(SupervisorMessage::Wake("child".into())).unwrap_or_else(|_| panic!("original child wake admission failed"));
+        sender.try_send(SupervisorMessage::Wake("child".into())).unwrap_or_else(|_| panic!("duplicate child wake admission failed"));
+        let late_permit = sender.try_reserve().unwrap();
+        let late_owned_permit = sender.try_reserve().unwrap();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let mut workers = JoinSet::new();
+        let child_waiter = Arc::clone(&child);
+        workers.spawn(async move {
+            let notified = child_waiter.changed.notified();
+            let _ = ready.send(());
+            if let Some(outcome) = child_waiter.observation(child_generation) { return outcome; }
+            notified.await;
+            child_waiter.observation(child_generation).expect("original child slot must resolve")
+        });
+        waiting.await.unwrap();
+        metrics.lifecycle.store(LIFECYCLE_CLOSING, Ordering::Release);
+        close_queued_for_shutdown(&mut receiver, &mut reaper, &slots, &active, &metrics);
+        let mut late_drain = Box::pin(drain_closed_queue(&mut receiver, &metrics));
+        assert!(futures::poll!(&mut late_drain).is_pending());
+        late_permit.send(SupervisorMessage::Wake("child".into()));
+        late_owned_permit.send(SupervisorMessage::Owned {
+            owner: "late-owned".into(), work: Box::pin(async { Ok(()) }),
+        });
+        late_drain.await;
+        let owners = metrics.owners.lock().unwrap();
+        assert_eq!(owners["late-owned"].submitted, 1);
+        assert_eq!(owners["late-owned"].aborted, 1);
+        assert_eq!(owners["late-owned"].completed, 0);
+        drop(owners);
+        assert!(matches!(workers.join_next().await.unwrap().unwrap(), DriverOutcome::Aborted(_)));
+        assert!(matches!(child.observation(duplicate), Some(DriverOutcome::Aborted(_))));
+        assert!(parent.observation(running_generation).is_none());
+        assert!(matches!(parent.observation(newer_generation), Some(DriverOutcome::Aborted(_))));
+        assert!(parent.state.lock().unwrap().active);
+        parent.finish(running_generation, DriverOutcome::Failed("original worker result".into()));
+        assert!(matches!(parent.observation(running_generation), Some(DriverOutcome::Failed(ref reason)) if reason == "original worker result"));
+        assert!(matches!(parent.observation(newer_generation), Some(DriverOutcome::Aborted(_))));
+        assert!(child.request(3, &metrics.lifecycle).is_none());
+        assert!(sender.try_send(SupervisorMessage::Wake("child".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_late_enqueue_without_creating_a_slot() {
+        let supervisor = test_supervisor(Arc::new(PumpTestExecutor::new([])));
+        let report = supervisor.shutdown().await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(supervisor.enqueue("late-graph").await.is_err());
+        assert!(supervisor.slots.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleanup_rechecks_slot_under_the_same_map_lock_as_request() {
+        let lifecycle = AtomicU8::new(LIFECYCLE_OPEN);
+        let slot = Arc::new(DriverSlot::new());
+        let generation = slot.request(1, &lifecycle).unwrap();
+        slot.finish(generation, DriverOutcome::Failed("original".into()));
+        let slots = Arc::new(StdMutex::new(HashMap::from([("graph".to_string(), slot)])));
+        let guard = slots.lock().unwrap();
+        let cleanup_slot = Arc::clone(guard.get("graph").unwrap());
+        let cleanup_slots = Arc::clone(&slots);
+        let (started, waiting) = std::sync::mpsc::sync_channel(0);
+        let cleaner = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            cleanup_idle_slot(&cleanup_slots, "graph", &cleanup_slot);
+        });
+        waiting.recv().unwrap();
+        let next = guard.get("graph").unwrap().request(2, &lifecycle).unwrap();
+        drop(guard);
+        cleaner.join().unwrap();
+        let slots = slots.lock().unwrap();
+        let current = slots.get("graph").expect("accepted generation must remain mapped");
+        assert_eq!(current.requested_generation(), next);
+        assert!(current.observation(next).is_none());
+    }
+
     struct PumpTestExecutor {
         kind: &'static str,
         release: Option<Arc<Notify>>,
         delays: BTreeMap<String, Duration>,
         panic_nodes: BTreeSet<String>,
         cancel_error_nodes: BTreeSet<String>,
+        conflict_nodes: BTreeSet<String>,
+        cancellations: Mutex<Vec<String>>,
         running: AtomicUsize,
         max_running: AtomicUsize,
         slow_finished: AtomicBool,
@@ -2158,6 +2576,8 @@ mod completion_pump_tests {
                 delays: delays.into_iter().collect(),
                 panic_nodes: BTreeSet::new(),
                 cancel_error_nodes: BTreeSet::new(),
+                conflict_nodes: BTreeSet::new(),
+                cancellations: Mutex::new(Vec::new()),
                 running: AtomicUsize::new(0),
                 max_running: AtomicUsize::new(0),
                 slow_finished: AtomicBool::new(false),
@@ -2169,6 +2589,11 @@ mod completion_pump_tests {
 
         fn with_panic_node(mut self, node_id: &str) -> Self {
             self.panic_nodes.insert(node_id.to_string());
+            self
+        }
+
+        fn with_conflicting_goal_cut(mut self, node_id: &str) -> Self {
+            self.conflict_nodes.insert(node_id.to_owned());
             self
         }
 
@@ -2189,6 +2614,7 @@ mod completion_pump_tests {
     #[async_trait]
     impl NodeExecutor for PumpTestExecutor {
         async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            self.cancellations.lock().unwrap().push(ticket.node_id.clone());
             if self.cancel_error_nodes.contains(&ticket.node_id) {
                 Err(NodeExecutorError::Cancel {
                     node_id: ticket.node_id.clone(),
@@ -2269,7 +2695,7 @@ mod completion_pump_tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(ticket.node_id.clone());
-            Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+            let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
                 status: ExecutionNodeStatus::Completed,
                 result_ref: Some(format!("result:{}", ticket.node_id)),
                 wait_class: None,
@@ -2278,7 +2704,23 @@ mod completion_pump_tests {
                 failure: None,
                 usage: Default::default(),
                 finished_at_ms: 1,
-            }))
+            });
+            if self.conflict_nodes.contains(&ticket.node_id) {
+                outcome.delivery_envelope = Some(serde_json::from_value(serde_json::json!({
+                    "envelope_id":"pump-conflict-envelope","revision":1,
+                    "objective_id":"pump-conflict-objective","created_at_ms":1
+                })).unwrap());
+                let stream = "goal:pump-conflict";
+                outcome.source_revisions.insert(stream.into(), 1);
+                outcome.domain_events.push(crate::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: stream.into(), scope: crate::RuntimeEventScope::Goal,
+                        kind: "goal.observation".into(), status: None, actor: None, refs: Vec::new(),
+                        payload: serde_json::json!({"goal_source":{"stream_id":stream,"sequence":2}}),
+                    }, schema_version: 2, idempotency_key: Some("pump-conflict".into()),
+                });
+            }
+            Ok(outcome)
         }
     }
 
@@ -2574,6 +3016,93 @@ mod completion_pump_tests {
     }
 
     #[tokio::test]
+    async fn a8_runtime_finalization_survives_observer_cancel_and_releases_service() {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let release = Arc::new(Semaphore::new(0));
+        let mut held = PhysicalDrainProbe122::new("a8-finalization-held");
+        *held.driver.get_mut() = Some({
+            let release = Arc::clone(&release);
+            tokio::spawn(async move { let _permit = release.acquire().await.unwrap(); })
+        });
+        let held = Arc::new(held);
+        services.executor_registry().register(held.clone()).unwrap();
+        let weak = Arc::downgrade(&services);
+        assert!(services.subscribe_execution_shutdown_completion().is_none());
+        let first = {
+            let services = Arc::clone(&services);
+            tokio::spawn(async move { services.shutdown_execution().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while held.calls.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let mut completion = services.subscribe_execution_shutdown_completion().unwrap();
+        first.abort(); assert!(first.await.unwrap_err().is_cancelled());
+        drop(services);
+        assert!(weak.upgrade().is_some(), "the original finalizer retains the service");
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if completion.borrow().is_some() { break; }
+                completion.changed().await.unwrap();
+            }
+        }).await.unwrap();
+        assert!(matches!(completion.borrow().as_ref(),
+            Some(crate::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed: true })
+                if report.errors.is_empty() && report.forced_aborts == 0));
+        assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a8_runtime_finalization_reports_original_physical_panic_as_not_closed() {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let mut failed = PhysicalDrainProbe122::new("a8-finalization-panic");
+        failed.panic = true;
+        services.executor_registry().register(Arc::new(failed)).unwrap();
+        let report = services.shutdown_execution().await;
+        assert!(!report.errors.is_empty());
+        assert_eq!(services.execution_supervisor().health().lifecycle, "closing");
+        let completion = services.subscribe_execution_shutdown_completion().unwrap();
+        assert!(matches!(completion.borrow().as_ref(),
+            Some(crate::RuntimeExecutionShutdownCompletion::Finished { custody_closed: false, .. })));
+    }
+
+    #[tokio::test]
+    async fn a8_runtime_deadline_unknown_late_completion_uses_same_driver() {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let release = Arc::new(Semaphore::new(0));
+        let mut held = PhysicalDrainProbe122::new("a8-finalization-late");
+        *held.driver.get_mut() = Some({
+            let release = Arc::clone(&release);
+            tokio::spawn(async move { let _permit = release.acquire().await.unwrap(); })
+        });
+        let held = Arc::new(held);
+        services.executor_registry().register(held.clone()).unwrap();
+        let first = services.shutdown_execution().await;
+        assert_eq!(first.forced_aborts, 0);
+        assert!(!first.errors.is_empty());
+        assert_eq!(services.execution_supervisor().health().lifecycle, "closing");
+        let mut completion = services.subscribe_execution_shutdown_completion().unwrap();
+        assert!(completion.borrow().is_none());
+        assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if completion.borrow().is_some() { break; }
+                completion.changed().await.unwrap();
+            }
+        }).await.unwrap();
+        assert!(matches!(completion.borrow().as_ref(),
+            Some(crate::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed: true })
+                if report.errors.is_empty() && report.forced_aborts == 0));
+        assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(services.execution_supervisor().health().lifecycle, "closed");
+        assert!(services.execution_supervisor().health().last_error.is_some());
+    }
+
+    #[tokio::test]
     async fn abandoned_shutdown_retains_dispatcher_join_for_concurrent_waiters() {
         let supervisor = Arc::new(test_supervisor(Arc::new(PumpTestExecutor::new([]))));
         let release = Arc::new(Notify::new());
@@ -2628,6 +3157,43 @@ mod completion_pump_tests {
         assert_eq!(supervisor.health().lifecycle, "closed");
         assert_eq!(second, third);
         assert_eq!(second.forced_aborts, 0);
+    }
+
+    #[tokio::test]
+    async fn a8_shutdown_deadline_retains_original_dispatcher_and_rejoins_late_result() {
+        let mut supervisor = test_supervisor(Arc::new(PumpTestExecutor::new([])));
+        supervisor.shutdown_timeout = Duration::from_millis(20);
+        let supervisor = Arc::new(supervisor);
+        let release = Arc::new(Notify::new());
+        let exited = Arc::new(AtomicBool::new(false));
+        *supervisor.dispatcher.lock().unwrap() = Some({
+            let release = Arc::clone(&release); let exited = Arc::clone(&exited);
+            tokio::spawn(async move { release.notified().await; exited.store(true, Ordering::SeqCst); })
+        });
+        let first = supervisor.shutdown().await;
+        assert_eq!(first.forced_aborts, 0);
+        assert!(first.errors.iter().any(|error| error.contains("dispatcher remains unresolved")));
+        assert_eq!(supervisor.health().lifecycle, "closing");
+        assert!(supervisor.shutdown_state.lock().await.dispatcher.is_some());
+        assert!(!exited.load(Ordering::SeqCst));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !exited.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let second = supervisor.shutdown().await;
+        assert!(second.errors.iter().any(|error| error.contains("physical drain was not registered")), "{second:?}");
+        assert_eq!(second.forced_aborts, 0);
+        assert_eq!(supervisor.health().lifecycle, "closing");
+        assert!(supervisor.health().last_error.is_some_and(|error| error.contains("dispatcher remains unresolved")));
+    }
+
+    #[tokio::test]
+    async fn a8_dispatcher_panic_is_reported_without_claiming_closed() {
+        let supervisor = test_supervisor(Arc::new(PumpTestExecutor::new([])));
+        *supervisor.dispatcher.lock().unwrap() = Some(tokio::spawn(async { panic!("original dispatcher panic") }));
+        let report = supervisor.shutdown().await;
+        assert!(report.errors.iter().any(|error| error.contains("original execution dispatcher failed")));
+        assert_eq!(supervisor.health().lifecycle, "closing");
     }
 
     #[tokio::test]
@@ -3160,6 +3726,31 @@ mod completion_pump_tests {
     }
 
     #[tokio::test]
+    async fn conflicting_original_pump_drains_same_ticket_and_keeps_unknown_custody() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = Arc::new(PumpTestExecutor::new([]).with_conflicting_goal_cut("conflict-node"));
+        let (supervisor, state, events, _resources) = panic_resource_fixture(executor.clone(), workspace.path());
+        let mut graph = ExecutionGraph::new("original pump conflicting goal cut");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let mut node = test_node("conflict-node");
+        node.kind = ExecutionNodeKind::Materialize;
+        graph.nodes.push(node);
+        let graph_id = graph.id.clone();
+        let result = tokio::time::timeout(Duration::from_secs(2), supervisor.submit_and_wait_terminal(
+            graph, ExecutionGraphCommand::Start { expected_revision: 0 },
+        )).await.expect("original pump must return rather than await itself");
+        let error = result.expect_err("the original conflicting outcome must stay uncommitted");
+        assert!(error.to_string().contains("observation source conflicts with causal read-set"), "{error}");
+        assert!(error.to_string().contains("original call custody"), "{error}");
+        assert_eq!(executor.cancellations.lock().unwrap().as_slice(), &["conflict-node"]);
+        let current = state.load(&graph_id).unwrap();
+        assert_eq!(current.node_statuses["conflict-node"], ExecutionNodeStatus::Running);
+        let binding = state.current_binding(&current, "conflict-node", 1).unwrap();
+        assert!(state.binding_retirement_record(&current, "conflict-node", &binding).unwrap().is_none());
+        assert!(events.event_by_idempotency_key("goal:pump-conflict", "pump-conflict").unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn node_panic_cleanup_failure_remains_unsettled_and_reaches_original_driver_error() {
         let workspace = tempfile::tempdir().unwrap();
         let executor = Arc::new(
@@ -3242,9 +3833,13 @@ mod completion_pump_tests {
         let mut graph = ExecutionGraph::new("node panic isolation");
         graph.id = "completion-pump-panic-isolation".to_string();
         crate::test_support::attach_execution_graph_lineage(&mut graph);
-        graph.nodes = vec![test_node("panic-node"), test_node("healthy-node")];
+        graph.nodes = vec![test_node("panic-node"), test_node("healthy-node"), test_node("dependent-node")];
+        graph.edges.push(harness_contract::execution_graph::ExecutionEdge {
+            from: "panic-node".into(), to: "dependent-node".into(),
+            kind: harness_contract::execution_graph::ExecutionEdgeKind::DependsOn,
+        });
 
-        let (_, report) = supervisor
+        let error = supervisor
             .submit_and_wait(
                 graph,
                 ExecutionGraphCommand::Start {
@@ -3252,10 +3847,17 @@ mod completion_pump_tests {
                 },
             )
             .await
-            .expect("graph completes despite one node panic");
+            .expect_err("unresolved original custody must remain visible");
 
-        assert_eq!(report.failed, 1);
-        assert_eq!(report.completed, 1);
+        assert!(error.to_string().contains("original pump task panicked"));
+        let graph = supervisor.runner.state_store().load("completion-pump-panic-isolation").unwrap();
+        assert_eq!(graph.node_statuses["healthy-node"], ExecutionNodeStatus::Completed);
+        assert_eq!(graph.node_statuses["panic-node"], ExecutionNodeStatus::Running);
+        assert!(!graph.node_statuses["dependent-node"].is_terminal());
+        let state = supervisor.runner.state_store();
+        let binding = state.current_binding(&graph, "panic-node", 1).unwrap();
+        let position = state.binding_start_position(&graph, "panic-node", &binding).unwrap().unwrap();
+        assert!(!state.binding_lease_closure(&graph, "panic-node", &binding, position).unwrap());
         assert!(
             executor
                 .calls
@@ -3264,7 +3866,54 @@ mod completion_pump_tests {
                 .contains(&"healthy-node".to_string()),
             "the unrelated ready node must still execute"
         );
+        assert!(!executor.calls.lock().unwrap().contains(&"dependent-node".to_string()));
         supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn original_pump_reentry_rejoins_same_ticket_before_or_after_completion() {
+        for complete_before_reentry in [false, true] {
+            let release = Arc::new(Notify::new());
+            let mut executor = PumpTestExecutor::new([]);
+            executor.release = Some(Arc::clone(&release));
+            let executor = Arc::new(executor);
+            let supervisor = test_supervisor(Arc::clone(&executor));
+            let runner = Arc::clone(&supervisor.runner);
+            let mut graph = ExecutionGraph::new("original pump observer reentry");
+            crate::test_support::attach_execution_graph_lineage(&mut graph);
+            graph.nodes.push(test_node("original"));
+            let graph = runner.register(graph).await.unwrap();
+            let graph_id = graph.id.clone();
+            let first = {
+                let runner = Arc::clone(&runner);
+                let graph_id = graph_id.clone();
+                tokio::spawn(async move { run_completion_pump(runner, &graph_id, 2, CancellationToken::new()).await })
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while executor.running.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+            }).await.unwrap();
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            if complete_before_reentry {
+                release.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while runner.state_store().load(&graph_id).unwrap().node_statuses["original"] != ExecutionNodeStatus::Completed {
+                        tokio::task::yield_now().await;
+                    }
+                }).await.unwrap();
+            }
+            let resumed = {
+                let runner = Arc::clone(&runner);
+                let graph_id = graph_id.clone();
+                tokio::spawn(async move { run_completion_pump(runner, &graph_id, 2, CancellationToken::new()).await })
+            };
+            if !complete_before_reentry { release.notify_one(); }
+            let result = tokio::time::timeout(Duration::from_secs(2), resumed).await.unwrap().unwrap();
+            assert!(matches!(result, DriverOutcome::Completed(ref report) if report.completed == 1), "{result:?}");
+            assert_eq!(executor.poll_started_at.lock().unwrap().len(), 1, "the original ticket must not be dispatched twice");
+            assert_eq!(executor.calls.lock().unwrap().as_slice(), &["original"]);
+            assert_eq!(runner.state_store().load(&graph_id).unwrap().node_statuses["original"], ExecutionNodeStatus::Completed);
+        }
     }
 
     #[tokio::test]
@@ -3331,6 +3980,81 @@ mod completion_pump_tests {
         assert_eq!(report.completed, 1);
         assert_eq!(executor.calls.lock().unwrap().as_slice(), &["recovered"]);
         supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_resource_deferred_graph_without_retiring_its_ready_node() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = Arc::new(PumpTestExecutor::new([]));
+        let (supervisor, state, _events, resources) =
+            panic_resource_fixture(executor.clone(), workspace.path());
+        let lease = resources.acquire(ExecutionResourceKind::Tool, None).await.unwrap();
+        let mut graph = ExecutionGraph::new("shutdown while tool capacity is held");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let mut node = test_node("deferred-at-shutdown");
+        node.kind = ExecutionNodeKind::Materialize;
+        graph.nodes.push(node);
+        let graph_id = graph.id.clone();
+        supervisor.register_graph(graph).await.unwrap();
+        let waiting_resources = resources.clone();
+        let earlier_waiter = tokio::spawn(async move {
+            waiting_resources.acquire(ExecutionResourceKind::Tool, None).await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while resources.snapshot(&ExecutionResourceKind::Tool).unwrap().queued_waiters != 1 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        let snapshot = supervisor.runner.pump_snapshot(&graph_id, &BTreeSet::new()).await.unwrap();
+        assert_eq!(snapshot.ready.len(), 1);
+        let mut prepared = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.runner.prepare_ready_wave(&graph_id, snapshot.ready),
+        ).await.expect("quota admission must defer without waiting").unwrap();
+        assert_eq!(prepared.len(), 1);
+        let result = supervisor.runner.execute_prepared_pump_node(
+            &graph_id, prepared.pop().unwrap(), Arc::new(Notify::new()),
+        ).await;
+        assert!(matches!(result, Err(ExecutionRunnerError::ResourceDeferred { .. })));
+        assert_eq!(resources.snapshot(&ExecutionResourceKind::Tool).unwrap().queued_waiters, 1);
+        assert_eq!(resources.snapshot(&ExecutionResourceKind::Tool).unwrap().cancelled_rate_basis_points, None);
+        supervisor.notify_graph(&graph_id).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let graph = state.load(&graph_id).unwrap();
+            if supervisor.metrics.active_drivers.load(Ordering::Acquire) == 1
+                && graph.node_statuses["deferred-at-shutdown"] == ExecutionNodeStatus::Ready
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        // Hold the original lease across several resource retry wakeups.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(supervisor.metrics.active_drivers.load(Ordering::Acquire), 1);
+        assert!(executor.calls.lock().unwrap().is_empty());
+
+        let report = tokio::time::timeout(Duration::from_secs(1), supervisor.shutdown())
+            .await
+            .expect("the original graph worker must join after cancellation");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.forced_aborts, 0);
+        assert_eq!(report.cancelled_graphs, 0);
+        assert_eq!(report.preserved_graphs, 1);
+        assert_eq!(state.load(&graph_id).unwrap().node_statuses["deferred-at-shutdown"], ExecutionNodeStatus::Ready);
+        assert_eq!(resources.snapshot(&ExecutionResourceKind::Tool).unwrap().active_leases, 1);
+        assert_eq!(resources.snapshot(&ExecutionResourceKind::Tool).unwrap().queued_waiters, 1);
+        assert_eq!(resources.snapshot(&ExecutionResourceKind::Tool).unwrap().cancelled_rate_basis_points, None);
+        drop(lease);
+        let granted = tokio::time::timeout(Duration::from_secs(1), earlier_waiter)
+            .await.unwrap().unwrap().unwrap();
+        drop(granted);
+        let next = tokio::time::timeout(Duration::from_secs(1), resources.acquire(ExecutionResourceKind::Tool, None))
+            .await.unwrap().unwrap();
+        drop(next);
+        assert_eq!(resources.snapshot(&ExecutionResourceKind::Tool).unwrap().queued_waiters, 0);
     }
 
     #[tokio::test]

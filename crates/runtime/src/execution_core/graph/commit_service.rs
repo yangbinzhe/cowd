@@ -22,6 +22,7 @@ use crate::runtime_event_store::{
 };
 
 use super::events::{ExecutionGraphDelta, ExecutionGraphEvent, ExecutionNodeBinding};
+use super::executors::agent_tool;
 use super::state_store::ExecutionGraphStateStore;
 
 #[path = "commit_pipeline.rs"]
@@ -33,7 +34,7 @@ mod local_network;
 #[path = "tool_receipt_query.rs"]
 mod tool_receipt_query;
 pub(crate) use commit_pipeline::execution_lineage_stream_id;
-pub(crate) use commit_pipeline::{receipt_lifecycle_anchor, receipt_replay_contract};
+pub(crate) use commit_pipeline::{receipt_lifecycle_anchor, receipt_replay_contract, bounded_tool_effect_outcome, tool_effect_outcome_requires_truncation};
 use commit_pipeline::*;
 pub(super) use commit_pipeline::{graph_identity_refs, graph_status};
 pub(crate) use tool_receipt_query::ToolReceiptQuery;
@@ -712,6 +713,11 @@ pub(crate) fn process_closure_document(
 }
 
 pub(crate) trait TerminalScopeReader {
+    fn validate_external_outcome_binding(&mut self, session: &str, graph_id: &str, node_id: &str,
+        value: &str, source: &crate::DurableRuntimeEvent) -> Result<(), ExecutionCommitError> {
+        let _ = (session, graph_id, node_id, value, source);
+        Err(ExecutionCommitError::InvalidCommand("original ToolBatch content reader missing".into()))
+    }
     fn event(
         &mut self,
         stream: &str,
@@ -724,9 +730,78 @@ pub(crate) trait TerminalScopeReader {
     ) -> Result<Option<crate::CommittedStreamRevision>, ExecutionCommitError>;
 }
 
+fn validate_no_dispatch_result_digest(
+    fact: &super::executors::agent_tool::NoDispatchFact,
+    result: &ExecutionNodeResult,
+) -> Result<bool, ExecutionCommitError> {
+    let digest = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(result)?));
+    let external = result.result_ref.as_deref().is_some_and(|value|
+        value.starts_with(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE));
+    if external {
+        let original_digest_valid = fact.result_sha256.as_deref()
+            .and_then(|value| value.strip_prefix("sha256:"))
+            .is_some_and(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        if !original_digest_valid || fact.durable_result_sha256.as_deref() != Some(digest.as_str()) {
+            return Err(ExecutionCommitError::InvalidCommand("NoDispatch durable result binding mismatch".into()));
+        }
+    } else if fact.result_sha256.as_deref() != Some(digest.as_str())
+        || fact.durable_result_sha256.as_deref().is_some_and(|value| value != digest)
+    {
+        return Err(ExecutionCommitError::InvalidCommand("NoDispatch result digest mismatch".into()));
+    }
+    Ok(external)
+}
+
+pub(crate) fn validate_external_outcome_binding_from_source(
+    store: &RuntimeEventStore, session: &str, graph_id: &str, node_id: &str,
+    value: &str, source: &crate::DurableRuntimeEvent,
+) -> Result<(), ExecutionCommitError> {
+    let invalid = || ExecutionCommitError::InvalidCommand("original ToolBatch content identity mismatch".into());
+    if session.is_empty() { return Err(invalid()); }
+    let encoded = value.strip_prefix(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE).ok_or_else(invalid)?;
+    let reference: agent_tool::AgentToolOutcomeReference = serde_json::from_str(encoded).map_err(|_| invalid())?;
+    let revision = source.payload["graph_revision"].as_u64().ok_or_else(invalid)?;
+    let stream = format!("{graph_id}:node:{node_id}");
+    let key = format!("{graph_id}:{node_id}:{revision}");
+    if reference.stream_id != stream || reference.idempotency_key != key
+        || source.stream_id != stream || source.idempotency_key.as_deref() != Some(key.as_str())
+        || source.kind != "execution_node.transitioned" || source.payload["graph_id"] != graph_id
+        || source.payload["node_id"] != node_id || source.payload["result"]["result_ref"] != value
+        || source.activity_binding().is_none_or(|binding| binding.session_id != session)
+    { return Err(invalid()); }
+    let origin = crate::PreparedArtifactOrigin::EventBody {
+        stream_id: stream, idempotency_key: key, kind: "execution_node.transitioned".into(),
+    };
+    let scope = format!("session:{session}");
+    match reference.content["body"]["kind"].as_str() {
+        Some("inline") => {
+            let value = store.resolve_content(&scope, &reference.content, &origin)
+                .map_err(ExecutionCommitError::InvalidCommand)?;
+            let _: crate::RuntimeToolExecutionOutcome = serde_json::from_value(value)?;
+        }
+        Some("artifact_ref") => {
+            let artifact: crate::ArtifactRef = serde_json::from_value(reference.content["body"]["artifact"].clone())?;
+            if reference.content["content_schema"] != 2 || !artifact.is_durable()
+                || artifact.visibility_scope != scope || artifact.media_type != "application/json"
+                || reference.content["sha256"] != artifact.sha256
+                || reference.content["bytes"] != artifact.bytes
+            { return Err(invalid()); }
+            // The original commit owner already validated the complete body
+            // against this reference before publishing the node and binding.
+            // This check does not claim that the artifact remains readable now.
+        }
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
 struct StoredTerminalScopeReader<'store>(&'store RuntimeEventStore);
 
 impl TerminalScopeReader for StoredTerminalScopeReader<'_> {
+    fn validate_external_outcome_binding(&mut self, session: &str, graph_id: &str, node_id: &str,
+        value: &str, source: &crate::DurableRuntimeEvent) -> Result<(), ExecutionCommitError> {
+        validate_external_outcome_binding_from_source(self.0, session, graph_id, node_id, value, source)
+    }
     fn event(
         &mut self,
         stream: &str,
@@ -2948,6 +3023,52 @@ mod scope_commit_tests {
     }
 
     #[test]
+    fn directory_read_receipt_uses_original_request_without_artifact_seal() {
+        let (store, service, graph, _root, _owner) = root_fixture();
+        let workspace = tempfile::tempdir().unwrap();
+        let catalog = tools::ToolCatalog::builtin().with_runtime_tools(vec![tools::RuntimeToolDefinition {
+            name: "read_ref".into(), description: Some("Read a reference".into()),
+            input_schema: json!({"type":"object","properties":{"reference":{"type":"string"}},
+                "required":["reference"],"additionalProperties":false}),
+            required_permission: tools::permissions::PermissionMode::ReadOnly,
+            effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+                resolver_id: "runtime.readonly".into(), resolver_version: 1,
+            },
+        }]).unwrap();
+        let host = tools::ToolHost::new("scope2-directory", workspace.path(), tools::ToolHostSnapshot::new(
+            Arc::new(catalog), Arc::new(tools::lsp_client::LspRegistry::new()), None));
+        let mut request = bound_request(&host, "read_ref", json!({"reference":"task://task:original"}));
+        request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: graph.id, node_id: "scope2-node".into(),
+        });
+        request.parent_execution_attempt = Some(1);
+        let descriptor = &request.compiled_invocation.as_ref().unwrap().effect;
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path()).unwrap();
+        let scope = crate::bound_tool_batch::admitted_effect_scope(&request, descriptor, Some(host.pin_snapshot()), &resolver).unwrap();
+        let outcome = crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(), tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Executed, category: request.category,
+            output: Some(json!({"kind":"state_inspect","status":"ok"}).to_string()), error: None,
+            evidence_ref: "directory-receipt".into(), observed_evidence: vec![], pending_agent_batch: None,
+        };
+        service.commit_bound_readonly_tool_receipt(&request, &outcome, descriptor, &scope).unwrap();
+        let primary = store.event_by_idempotency_key(&format!("execution-effect:{}", request.idempotency_key),
+            &format!("{}:read-receipt", request.idempotency_key)).unwrap().unwrap();
+        let index = store.event_by_idempotency_key("execution-agent-receipts:scope2-graph:scope2-node:1",
+            &format!("agent-tool-receipt:{}", request.idempotency_key)).unwrap().unwrap();
+        assert!(primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null());
+        ExecutionCommitService::validate_proof_bound_tool_request(&request, &primary, &index).unwrap();
+        let mut foreign = index.clone();
+        foreign.transaction_id.push_str("-foreign");
+        assert!(ExecutionCommitService::validate_proof_bound_tool_request(&request, &primary, &foreign).is_err());
+        let mut wrong_request = request.clone();
+        wrong_request.input = json!({"reference":"artifact://different"}).to_string();
+        assert!(ExecutionCommitService::validate_proof_bound_tool_request(&wrong_request, &primary, &index).is_err());
+        wrong_request.input = json!({"reference":"task://"}).to_string();
+        assert!(ExecutionCommitService::validate_proof_bound_tool_request(&wrong_request, &primary, &index).is_err());
+    }
+
+    #[test]
     fn incomplete_scope_metadata_is_not_an_execution_denial_or_a_strong_proof() {
         for (command, expected_kind) in [
             ("printf authorized", ToolEffectKind::Read),
@@ -3345,6 +3466,21 @@ fn merge_outcome_source_revisions(
     Ok(())
 }
 
+// Only the original transaction owner may bind the final representation,
+// after authenticating the original witness and selecting durable content.
+fn bind_no_dispatch_durable_result(
+    fact: &mut super::executors::agent_tool::NoDispatchFact,
+    result: &ExecutionNodeResult,
+) -> Result<(), ExecutionCommitError> {
+    if fact.result_sha256.is_none() || fact.never_polled {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "NoDispatch result binding has no authenticated original result".into(),
+        ));
+    }
+    fact.durable_result_sha256 = Some(format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(result)?)));
+    Ok(())
+}
+
 /// Whether a node's physical closure can be proven. `Pending` means the
 /// durable facts that could still prove it have not landed; `Unprovable` names
 /// a ring that can never hold for this node, so waiting cannot help.
@@ -3722,7 +3858,7 @@ impl ExecutionCommitService {
         // This is only a verification input; it is never returned or used as
         // evidence that the physical owner has closed.
         let fact = NoDispatchFact { ticket:ticket.clone(), calls, never_polled:false,
-            result_sha256:None, historical_sources:Default::default(), start:None, bounded_owners:Default::default(), original_node:None };
+            result_sha256:None, durable_result_sha256:None, historical_sources:Default::default(), start:None, bounded_owners:Default::default(), original_node:None };
         let graph_fence = self.event_store.transaction_stream_revision_exact(&transaction, &ticket.graph_id)?;
         if graph_fence.is_none_or(|fence| fence.expected_revision < started.revision)
             || self.no_dispatch_physical_sources(&fact)?.is_none() {
@@ -5048,7 +5184,7 @@ impl ExecutionCommitService {
             }
             let identity = json!([receipt_replay_contract(request)?, request.tool_name,
                 request.input, request.observation_wave_sequence, request.authorized_scopes,
-                request.authorization, bounded_tool_effect_outcome(outcome)]);
+                request.authorization, format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(outcome)?))]);
             if let Some(previous) = staged.insert(request.idempotency_key.clone(), identity.clone()) {
                 if previous != identity {
                     return Err(ExecutionCommitError::InvalidCommand(
@@ -5071,9 +5207,14 @@ impl ExecutionCommitService {
                 .event_by_idempotency_key(&stream_id, &receipt_key)?
             {
                 validate_readonly_tool_receipt(request, &existing.payload)?;
-                if existing.payload["outcome"]
-                    != serde_json::to_value(bounded_tool_effect_outcome(outcome))?
-                {
+                let same_outcome = if existing.payload["outcome_truncated"] == true
+                    && delegated_agent_receipt_stream_id(request).is_some() {
+                    serde_json::to_value(self.resolve_delegated_receipt_outcome(request, &existing)?)?
+                        == serde_json::to_value(outcome)?
+                } else {
+                    existing.payload["outcome"] == serde_json::to_value(bounded_tool_effect_outcome(outcome))?
+                };
+                if !same_outcome {
                     return Err(ExecutionCommitError::InvalidCommand(
                         "read terminal outcome collision".into(),
                     ));
@@ -5175,6 +5316,10 @@ impl ExecutionCommitService {
                     "process_closure": closure.cloned(),
                 }),
             )?;
+            let full_outcome = self.prepare_delegated_receipt_outcome(request, outcome, true)?;
+            if let Some(content) = &full_outcome {
+                read_payload["delegated_outcome_content_v1"] = content.clone();
+            }
             if let Some(anchor) = receipt_lifecycle_anchor(request)? {
                 read_payload["lifecycle_anchor"] = anchor;
             }
@@ -5216,6 +5361,9 @@ impl ExecutionCommitService {
                     },
                 )
             {
+                if let Some(content) = &full_outcome {
+                    agent_receipt.event.payload["delegated_outcome_content_v1"] = content.clone();
+                }
                 agent_receipt.event.payload["root_effect_context"] = root_intent
                     .map_or(serde_json::Value::Null, |intent| {
                         intent.payload["root_effect_context"].clone()
@@ -6288,7 +6436,80 @@ impl ExecutionCommitService {
             validate_mutation_tool_fingerprint(request, effect, &receipt.payload, "receipt")?;
         }
         self.validate_terminal_scope(request, effect, receipt, read)?;
+        if receipt.payload["outcome_truncated"] == true && delegated_agent_receipt_stream_id(request).is_some() {
+            return self.resolve_delegated_receipt_outcome(request, receipt);
+        }
         Ok(serde_json::from_value(receipt.payload["outcome"].clone())?)
+    }
+
+    // Full delegated outcomes are bound to the original primary receipt; the
+    // index in the same transaction carries the identical content envelope.
+    fn prepare_delegated_receipt_outcome(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+        read: bool,
+    ) -> Result<Option<serde_json::Value>, ExecutionCommitError> {
+        if delegated_agent_receipt_stream_id(request).is_none()
+            || !tool_effect_outcome_requires_truncation(outcome)
+        {
+            return Ok(None);
+        }
+        let session = request.session_id.as_deref().filter(|value| !value.is_empty())
+            .ok_or_else(|| ExecutionCommitError::InvalidCommand(
+                "original delegated receipt session missing".into()))?;
+        let stream_id = format!("execution-effect:{}", request.idempotency_key);
+        let key = format!("{}:{}", request.idempotency_key,
+            if read { "read-receipt" } else { "receipt" });
+        let origin = crate::PreparedArtifactOrigin::EventBody {
+            stream_id, idempotency_key: key.clone(),
+            kind: if read { "execution.read.receipt" } else { "execution.effect.receipt" }.into(),
+        };
+        self.event_store.prepare_content(
+            &format!("session:{session}"), &key, &serde_json::to_value(outcome)?, &origin,
+        ).map(Some).map_err(ExecutionCommitError::InvalidCommand)
+    }
+
+    fn resolve_delegated_receipt_outcome(
+        &self, request: &crate::RuntimeToolExecutionRequest, primary: &crate::DurableRuntimeEvent,
+    ) -> Result<crate::RuntimeToolExecutionOutcome, ExecutionCommitError> {
+        let denied = || ExecutionCommitError::InvalidCommand("original delegated receipt is incomplete or inconsistent".into());
+        let index_stream = delegated_agent_receipt_stream_id(request).ok_or_else(denied)?;
+        let index = self.event_store.event_by_idempotency_key(&index_stream, &delegated_agent_receipt_key(request))?
+            .ok_or_else(denied)?;
+        let primary_key = primary.idempotency_key.as_deref().ok_or_else(denied)?;
+        let index_key = index.idempotency_key.as_deref().ok_or_else(denied)?;
+        let as_input = |event: &crate::DurableRuntimeEvent| RuntimeEventInput {
+            stream_id: event.stream_id.clone(), scope: event.scope, kind: event.kind.clone(),
+            status: event.status.clone(), actor: event.actor.clone(), refs: event.refs.clone(), payload: event.payload.clone(),
+        };
+        let artifact = RuntimeEventStore::validate_delegated_outcome_pair(&as_input(primary), primary_key,
+            primary.schema_version, &as_input(&index), index_key, index.schema_version).map_err(|_| denied())?;
+        let txn = self.event_store.original_transaction_receipt(&primary.transaction_id)?.ok_or_else(denied)?;
+        if primary.transaction_id != index.transaction_id || primary.commit_cursor != index.commit_cursor
+            || primary.transaction_index >= index.transaction_index || txn.transaction_id != primary.transaction_id
+            || txn.commit_cursor != primary.commit_cursor
+            || txn.event_ids.get(primary.transaction_index as usize) != Some(&primary.event_id)
+            || txn.event_ids.get(index.transaction_index as usize) != Some(&index.event_id)
+            || !txn.stream_revisions.iter().any(|v| v.stream_id == primary.stream_id && v.expected_revision < primary.sequence && primary.sequence <= v.committed_revision)
+            || !txn.stream_revisions.iter().any(|v| v.stream_id == index_stream && v.expected_revision < index.sequence && index.sequence <= v.committed_revision)
+            || primary.payload["replay"] != receipt_replay_contract(request)?
+            || index.payload["authorized_scopes"] != serde_json::to_value(&request.authorized_scopes)?
+            || index.payload["effect_scope"] != serde_json::to_value(request.authorization.as_ref().map(|value| &value.scope))?
+            || Self::receipt_observation_sequence(&index) != Some(request.observation_wave_sequence)
+            || primary.refs != index.refs || Some(artifact.visibility_scope.as_str()) != request.session_id.as_deref().map(|v| format!("session:{v}")).as_deref()
+        { return Err(denied()); }
+        let origin = crate::PreparedArtifactOrigin::EventBody { stream_id: primary.stream_id.clone(),
+            idempotency_key: primary_key.into(), kind: primary.kind.clone() };
+        let value = self.event_store.resolve_prepared_agent_tool_content(&artifact.visibility_scope,
+            &primary.payload["delegated_outcome_content_v1"], &origin).map_err(|_| denied())?;
+        let full: crate::RuntimeToolExecutionOutcome = serde_json::from_value(value)?;
+        if full.tool_use_id != request.tool_use_id || full.tool_name != request.tool_name
+            || full.category != request.category
+            || !tool_effect_outcome_requires_truncation(&full)
+            || serde_json::to_value(bounded_tool_effect_outcome(&full))? != primary.payload["outcome"]
+        { return Err(denied()); }
+        Ok(full)
     }
 
     /// Consume the original delegated action's complete primary and index.
@@ -6339,7 +6560,11 @@ impl ExecutionCommitService {
         self.validate_terminal_scope(request, effect, &primary, read)?;
         let txn = self.event_store.original_transaction_receipt(&primary.transaction_id)?
             .ok_or_else(|| invalid("original delegated receipt transaction missing"))?;
-        let outcome: crate::RuntimeToolExecutionOutcome = serde_json::from_value(primary.payload["outcome"].clone())?;
+        let outcome: crate::RuntimeToolExecutionOutcome = if primary.payload["outcome_truncated"] == true {
+            self.resolve_delegated_receipt_outcome(request, &primary)?
+        } else {
+            serde_json::from_value(primary.payload["outcome"].clone())?
+        };
         if primary.scope != RuntimeEventScope::ExecutionNode
             || index.scope != RuntimeEventScope::ExecutionNode
             || primary.kind != if read { "execution.read.receipt" } else { "execution.effect.receipt" }
@@ -6361,8 +6586,8 @@ impl ExecutionCommitService {
             || !txn.stream_revisions.iter().any(|source| source.stream_id == index_stream
                 && source.expected_revision < index.sequence && index.sequence <= source.committed_revision)
             || primary.refs != index.refs
-            || primary.payload["outcome_truncated"] != false
-            || index.payload["outcome_truncated"] != false
+            || (primary.payload["outcome_truncated"] != false && primary.payload["outcome_truncated"] != true)
+            || primary.payload["outcome_truncated"] != index.payload["outcome_truncated"]
             || primary.payload["outcome"] != index.payload["outcome"]
             || Self::receipt_observation_sequence(&index) != Some(request.observation_wave_sequence)
             || index.payload["authorized_scopes"] != serde_json::to_value(&request.authorized_scopes)?
@@ -6371,7 +6596,7 @@ impl ExecutionCommitService {
             || outcome.tool_use_id != request.tool_use_id || outcome.tool_name != request.tool_name
             || outcome.status != crate::RuntimeToolExecutionStatus::Executed
             || outcome.error.is_some() || outcome.output.is_none()
-            || tool_effect_outcome_requires_truncation(&outcome)
+            || (primary.payload["outcome_truncated"] == false && tool_effect_outcome_requires_truncation(&outcome))
         {
             return Err(invalid("original delegated receipt is incomplete or inconsistent"));
         }
@@ -6505,8 +6730,18 @@ impl ExecutionCommitService {
             }
             validate_readonly_tool_receipt(request, &primary.payload)?;
             let invocation = request.compiled_invocation.as_ref().ok_or_else(denied)?;
+            let directory_read = if request.tool_name == "read_ref" {
+                let input = harness_contract::step::parse_strict_json(&request.input).map_err(|_| denied())?;
+                crate::agentic::action_invocation::read_ref_directory_input(&input)
+                    .map_err(|_| denied())?.is_some()
+            } else { false };
+            if directory_read && (primary.transaction_id != index.transaction_id
+                || primary.commit_cursor != index.commit_cursor || index.transaction_index <= primary.transaction_index) {
+                return Err(denied());
+            }
             let immutable_artifact =
                 matches!(request.tool_name.as_str(), "evidence_retrieve" | "read_ref")
+                    && !directory_read
                     && !invocation.effect.scopes.iter().any(|scope| {
                         scope.resource == harness_contract::policy::PermissionResource::File
                     });
@@ -7704,9 +7939,12 @@ impl ExecutionCommitService {
         if result.status != ExecutionNodeStatus::Completed {
             return Err(invalid("original child node did not complete"));
         }
-        let encoded = result.result_ref.as_deref().and_then(|value| value.strip_prefix("agent-tool-outcome:"))
+        let encoded = result.result_ref.as_deref()
             .ok_or_else(|| invalid("original child tool outcome missing"))?;
-        let actual: crate::RuntimeToolExecutionOutcome = serde_json::from_str(encoded)?;
+        let session = request.session_id.as_deref().unwrap_or("");
+        let actual = agent_tool::resolve_agent_tool_outcome_reference(
+            &self.event_store, session, &ticket.graph_id, &ticket.node_id, encoded,
+        ).map_err(|error| invalid(&error))?;
         if actual.status == crate::RuntimeToolExecutionStatus::Unknown
             || actual.tool_use_id != request.tool_use_id || actual.tool_name != request.tool_name {
             return Err(invalid("original child outcome remains unknown"));
@@ -8160,9 +8398,11 @@ impl ExecutionCommitService {
             return Ok(());
         }
         if let Some(original) = self.completed_tool_effect(request, effect)? {
-            if serde_json::to_value(&original)?
-                != serde_json::to_value(bounded_tool_effect_outcome(outcome))?
-            {
+            let expected = if delegated_agent_receipt_stream_id(request).is_some()
+                && tool_effect_outcome_requires_truncation(outcome) {
+                serde_json::to_value(outcome)?
+            } else { serde_json::to_value(bounded_tool_effect_outcome(outcome))? };
+            if serde_json::to_value(&original)? != expected {
                 return Err(ExecutionCommitError::InvalidCommand(
                     "mutation terminal outcome collision".into(),
                 ));
@@ -8319,6 +8559,10 @@ impl ExecutionCommitService {
             idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
             schema_version: 1,
         }];
+        let full_outcome = self.prepare_delegated_receipt_outcome(request, outcome, false)?;
+        if let Some(content) = &full_outcome {
+            events[0].event.payload["delegated_outcome_content_v1"] = content.clone();
+        }
         if let Some(anchor) = receipt_lifecycle_anchor(request)? {
             events[0].event.payload["lifecycle_anchor"] = anchor;
         }
@@ -8334,6 +8578,9 @@ impl ExecutionCommitService {
                 })
             })
         {
+            if let Some(content) = &full_outcome {
+                agent_receipt.event.payload["delegated_outcome_content_v1"] = content.clone();
+            }
             agent_receipt.event.payload["root_effect_context"] =
                 intent.payload["root_effect_context"].clone();
             agent_receipt.event.payload["process_admission_ref"] =
@@ -10702,6 +10949,47 @@ impl ExecutionCommitService {
         Ok(Some((result, record)))
     }
 
+    fn prepare_leaf_tool_result(
+        &self, graph: &ExecutionGraph, ticket: &super::registry::NodeExecutionTicket,
+        result: &ExecutionNodeResult, force: bool,
+    ) -> Result<ExecutionNodeResult, ExecutionCommitError> {
+        let mut durable_result = result.clone();
+        {
+            let current = durable_result.result_ref.as_deref().unwrap_or("");
+            // Measure both original encoded publication shapes, reserving space
+            // for durable-event metadata and the bounded history checkpoint.
+            let preview = apply_node_transition(graph, graph.revision, &ticket.node_id,
+                durable_result.status, Some(durable_result.clone()))?;
+            let from = *graph.node_statuses.get(&ticket.node_id)
+                .ok_or_else(|| ExecutionCommitError::InvalidCommand("original node missing".into()))?;
+            let node = node_transition_event(&preview, &ticket.node_id, from,
+                durable_result.status, Some(durable_result.clone()))?;
+            let graph_event = ExecutionGraphEvent::NodeTransitioned {
+                node_id: ticket.node_id.clone(), from, to: durable_result.status,
+                result: Some(durable_result.clone()), binding: None,
+                delta: ExecutionGraphDelta::between(graph, &preview),
+            };
+            let transaction_id = format!("{}:{}:{}:{}", graph.id, ticket.node_id, preview.revision, durable_result.status as u8);
+            let persisted = crate::DurableRuntimeEvent {
+                event_id: "runtime-event-00000000-0000-0000-0000-000000000000".into(),
+                stream_id: node.event.stream_id.clone(), sequence: u64::MAX,
+                scope: node.event.scope, kind: node.event.kind.clone(), status: node.event.status.clone(),
+                actor: node.event.actor.clone(), payload: node.event.payload.clone(), refs: node.event.refs.clone(),
+                created_at_ms: u64::MAX, commit_cursor: u64::MAX, transaction_id,
+                transaction_index: u32::MAX, schema_version: node.schema_version,
+                idempotency_key: node.idempotency_key.clone(),
+            };
+            let too_large = serde_json::to_vec(&persisted)?.len() > 1024 * 1024
+                || serde_json::to_vec(&graph_event)?.len() > 1024 * 1024 - 64 * 1024;
+            if current.starts_with("agent-tool-outcome:") && (too_large || force) {
+                durable_result.result_ref = Some(agent_tool::prepare_agent_tool_outcome_reference(
+                    &self.event_store, graph, ticket, current, graph.revision.saturating_add(1),
+                ).map_err(ExecutionCommitError::InvalidCommand)?);
+            }
+        }
+        Ok(durable_result)
+    }
+
     fn prepare_execution_outcome(
         &self,
         graph: &ExecutionGraph,
@@ -10764,6 +11052,9 @@ impl ExecutionCommitService {
             merge_outcome_source_revisions(&mut sources, &fact.historical_sources)?;
         }
         let expected = &sources;
+        let durable_result = if leaf && outcome.replan.is_none() {
+            self.prepare_leaf_tool_result(graph, ticket, &outcome.result, false)?
+        } else { outcome.result.clone() };
         let mut prepared = if let Some(replan) = &outcome.replan {
             self.prepare_transition_node_with_replan(
                 graph,
@@ -10782,7 +11073,7 @@ impl ExecutionCommitService {
                 graph,
                 &ticket.node_id,
                 outcome.result.status,
-                Some(outcome.result.clone()),
+                Some(durable_result),
                 outcome.domain_events.clone(),
                 expected,
                 Some(outcome),
@@ -10791,7 +11082,7 @@ impl ExecutionCommitService {
         prepared.original_terminal_owner = outcome.original_terminal_owner.as_ref().map(|owner| Arc::clone(&owner.0));
         prepared.events.extend(self.materialize_original_batch_prefixes(ticket, &outcome.original_batch_prefixes, &outcome.original_pending_batches, outcome.original_agent_child.as_ref().map(|child| child.0.as_ref()))?);
         prepared.events.extend(self.materialize_original_replayed_actions(ticket, &outcome.original_replayed_actions)?);
-        if let Some(fact) = no_dispatch {
+        if let Some(mut fact) = no_dispatch {
             let key = format!(
                 "{}:{}:{}",
                 graph.id, ticket.node_id, prepared.graph.revision
@@ -10809,6 +11100,8 @@ impl ExecutionCommitService {
                         "NoDispatch generated Node result missing".into(),
                     )
                 })?;
+            let durable: ExecutionNodeResult = serde_json::from_value(node_event.event.payload["result"].clone())?;
+            bind_no_dispatch_durable_result(&mut fact, &durable)?;
             node_event.event.payload["no_dispatch"] = serde_json::to_value(fact)?;
         }
         if !leaf {
@@ -11331,6 +11624,49 @@ impl ExecutionCommitService {
                 self.validate_execution_effect_receipt(ticket)?;
             }
         }
+        let mut durable_results = BTreeMap::new();
+        for transition in &transitions {
+            let spec = graph.nodes.iter().find(|node| node.id == transition.node_id)
+                .ok_or_else(|| ExecutionCommitError::InvalidCommand("terminal wave node missing".into()))?;
+            if spec.kind == ExecutionNodeKind::ToolBatch && spec.executor_kind == "tool_batch" {
+                let ticket = batch_tickets.get(&transition.node_id)
+                    .ok_or_else(|| ExecutionCommitError::InvalidCommand("terminal wave original ticket missing".into()))?;
+                durable_results.insert(transition.node_id.clone(),
+                    self.prepare_leaf_tool_result(graph, ticket, &transition.outcome.result, false)?);
+            }
+        }
+        // Size the actual aggregate wave delta, not just individual results.
+        // Deterministic input order decides which additional original leaf
+        // outcomes are externalised if the combined graph event is too large.
+        let candidate_ids: Vec<_> = transitions.iter().filter(|transition| durable_results.contains_key(&transition.node_id))
+            .map(|transition| transition.node_id.clone()).collect();
+        let mut candidates = candidate_ids.iter();
+        while !durable_results.is_empty() {
+            let mut preview = graph.clone();
+            for transition in &transitions {
+                let result = durable_results.get(&transition.node_id).unwrap_or(&transition.outcome.result);
+                preview = apply_node_transition(&preview, preview.revision, &transition.node_id,
+                    result.status, Some(result.clone()))?;
+            }
+            preview.revision = graph.revision.saturating_add(1);
+            let wave = ExecutionGraphEvent::NodesTransitioned {
+                node_ids: transitions.iter().map(|transition| transition.node_id.clone()).collect(),
+                delta: ExecutionGraphDelta::between(graph, &preview),
+            };
+            if serde_json::to_vec(&wave)?.len() <= 1024 * 1024 - 64 * 1024 { break; }
+            let mut moved = false;
+            while let Some(node_id) = candidates.next() {
+                let result = durable_results.get(node_id).expect("wave candidate");
+                if !result.result_ref.as_deref().is_some_and(|value| value.starts_with("agent-tool-outcome:")) { continue; }
+                let ticket = batch_tickets.get(node_id).ok_or_else(||
+                    ExecutionCommitError::InvalidCommand("terminal wave original ticket missing".into()))?;
+                let external = self.prepare_leaf_tool_result(graph, ticket, result, true)?;
+                durable_results.insert(node_id.clone(), external);
+                moved = true;
+                break;
+            }
+            if !moved { return Err(ExecutionCommitError::InvalidCommand("terminal wave graph body exceeds history budget".into())); }
+        }
         let mut next = graph.clone();
         let mut transition_facts = Vec::with_capacity(transitions.len());
         for transition in &transitions {
@@ -11351,7 +11687,7 @@ impl ExecutionCommitService {
                 next.revision,
                 &transition.node_id,
                 transition.outcome.result.status,
-                Some(transition.outcome.result.clone()),
+                Some(durable_results.get(&transition.node_id).unwrap_or(&transition.outcome.result).clone()),
             )?;
             transition_facts.push((
                 transition.node_id.clone(),
@@ -11367,9 +11703,12 @@ impl ExecutionCommitService {
                 node_id,
                 *from,
                 *to,
-                Some(transition.outcome.result.clone()),
+                Some(durable_results.get(&transition.node_id).unwrap_or(&transition.outcome.result).clone()),
             )?;
             if let Some(fact) = no_dispatch_facts.get(node_id) {
+                let mut fact = fact.clone();
+                let durable = durable_results.get(node_id).unwrap_or(&transition.outcome.result);
+                bind_no_dispatch_durable_result(&mut fact, durable)?;
                 node_event.event.payload["no_dispatch"] = serde_json::to_value(fact)?;
             }
             domain_events.push(node_event);
@@ -11703,6 +12042,8 @@ impl ExecutionCommitService {
         }
         let mut originals = BTreeMap::new();
         let mut outcome_sources = BTreeMap::new();
+        let mut no_dispatch_facts = BTreeMap::new();
+        let mut leaf_results = BTreeMap::new();
         for transition in &outcomes {
             if originals.contains_key(&transition.node_id)
                 || graph.node_statuses.get(&transition.node_id) != Some(&ExecutionNodeStatus::Running)
@@ -11710,7 +12051,6 @@ impl ExecutionCommitService {
                 || transition.outcome.replan.is_some()
                 || transition.outcome.delivery_envelope.is_some()
                 || transition.outcome.terminal_presentation.is_some()
-                || transition.outcome.no_dispatch.is_some()
                 || matches!(command, ExecutionGraphCommand::CancelNode { node_id, .. } if node_id != &transition.node_id)
             {
                 return Err(ExecutionCommitError::InvalidCommand("cancelled effect handoff does not match the original running node".into()));
@@ -11727,12 +12067,31 @@ impl ExecutionCommitService {
                 .current_binding(graph, &transition.node_id, attempt)
                 .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
             let original = super::registry::NodeExecutionTicket { graph_id:graph.id.clone(), node_id:spec.id.clone(),
-                executor_kind:binding.executor_kind, service_class:graph.service_class,
-                attempt:binding.attempt, idempotency_key:binding.ticket_idempotency_key, payload_ref:spec.payload_ref.clone() };
+                executor_kind:binding.executor_kind.clone(), service_class:graph.service_class,
+                attempt:binding.attempt, idempotency_key:binding.ticket_idempotency_key.clone(), payload_ref:spec.payload_ref.clone() };
             if transition.effect_ticket.as_ref() != Some(&original) {
                 return Err(ExecutionCommitError::InvalidCommand("cancelled effect ticket does not match the original binding".into()));
             }
-            self.validate_execution_effect_receipt(&original)?;
+            validate_node_ticket_start(&self.event_store, &original, None)?;
+            let leaf = spec.kind == ExecutionNodeKind::ToolBatch && spec.executor_kind == "tool_batch";
+            if leaf {
+                let witness = transition.outcome.no_dispatch.as_ref().ok_or_else(||
+                    ExecutionCommitError::InvalidCommand("cancelled leaf has no original NoDispatch witness".into()))?;
+                let fact = self.materialize_no_dispatch_fact(graph, &original, &binding, witness,
+                    Some(&transition.outcome.result))?;
+                merge_outcome_source_revisions(&mut outcome_sources, &fact.historical_sources)?;
+                no_dispatch_facts.insert(transition.node_id.clone(), fact);
+                // The cold NoDispatch reader must authenticate the original
+                // result through the same prepared content owner when this
+                // representation is externalized.
+                leaf_results.insert(transition.node_id.clone(),
+                    self.prepare_leaf_tool_result(graph, &original, &transition.outcome.result, false)?);
+            } else {
+                if transition.outcome.no_dispatch.is_some() {
+                    return Err(ExecutionCommitError::InvalidCommand("NoDispatch requires the original ToolBatch leaf".into()));
+                }
+                self.validate_execution_effect_receipt(&original)?;
+            }
             originals.insert(transition.node_id.clone(), transition);
         }
         let (command_name, reason) = command_metadata(command);
@@ -11900,7 +12259,8 @@ impl ExecutionCommitService {
         }
         for (node_id, transition) in &originals {
             next.node_statuses.insert(node_id.clone(), transition.outcome.result.status);
-            next.node_results.insert(node_id.clone(), transition.outcome.result.clone());
+            next.node_results.insert(node_id.clone(), leaf_results.get(node_id)
+                .unwrap_or(&transition.outcome.result).clone());
         }
         next.revision = next.revision.saturating_add(1);
         validate_execution_graph(&next).map_err(|error| {
@@ -11915,15 +12275,26 @@ impl ExecutionCommitService {
             .filter_map(|(node_id, to)| {
                 let from = graph.node_statuses[node_id];
                 (from != *to).then(|| node_transition_event(&next, node_id, from, *to,
-                    originals.get(node_id).map(|item| item.outcome.result.clone())))
+                    originals.get(node_id).map(|item| leaf_results.get(node_id)
+                        .unwrap_or(&item.outcome.result).clone())))
             })
             .collect::<Result<_, _>>()?;
         for transition in originals.values() {
+            if let Some(fact) = no_dispatch_facts.get(&transition.node_id) {
+                let event = node_events.iter_mut().find(|event| event.event.payload["node_id"] == transition.node_id)
+                    .ok_or_else(|| ExecutionCommitError::InvalidCommand("cancelled NoDispatch transition event missing".into()))?;
+                let mut fact = fact.clone();
+                let durable = leaf_results.get(&transition.node_id).unwrap_or(&transition.outcome.result);
+                bind_no_dispatch_durable_result(&mut fact, durable)?;
+                event.event.payload["no_dispatch"] = serde_json::to_value(fact)?;
+            }
             node_events.extend(transition.outcome.domain_events.clone());
             let ticket = transition.effect_ticket.as_ref().expect("validated original effect ticket");
             node_events.extend(self.materialize_original_batch_prefixes(ticket, &transition.outcome.original_batch_prefixes, &transition.outcome.original_pending_batches, transition.outcome.original_agent_child.as_ref().map(|child| child.0.as_ref()))?);
             node_events.extend(self.materialize_original_replayed_actions(ticket, &transition.outcome.original_replayed_actions)?);
-            node_events.push(execution_effect_receipt_event(ticket, &transition.outcome)?);
+            if !no_dispatch_facts.contains_key(&transition.node_id) {
+                node_events.push(execution_effect_receipt_event(ticket, &transition.outcome)?);
+            }
         }
         if let Some((node_id, result_ref, correlation_id)) = external_resolution {
             node_events.push(RuntimeTransactionEventInput {
@@ -12607,9 +12978,12 @@ impl ExecutionCommitService {
             }
             let result: ExecutionNodeResult =
                 serde_json::from_value(source.payload["result"].clone())?;
-            let digest = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&result)?));
-            if fact.result_sha256.as_deref() != Some(digest.as_str()) {
-                return Err(invalid("NoDispatch result digest mismatch".into()));
+            if validate_no_dispatch_result_digest(&fact, &result)? {
+                let reference = result.result_ref.as_deref()
+                    .ok_or_else(|| invalid("NoDispatch external result missing".into()))?;
+                let session = graph.lineage.as_ref()
+                    .ok_or_else(|| invalid("NoDispatch original Session missing".into()))?.session_id.as_str();
+                reader.validate_external_outcome_binding(session, &graph.id, &ticket.node_id, reference, source)?;
             }
             let mut expected_root = root_binding.clone();
             let current_root = graph_source
@@ -12889,7 +13263,12 @@ impl ExecutionCommitService {
         let (ticket, _) = store.binding_start_ticket(graph, node, binding)
             .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
         let completion = self.committed_node_attempt(graph, node, binding)?;
-        witness.authenticate(&ticket, completion.as_ref().map(|(result, _)| result))
+        let original_result = completion.as_ref().map(|(result, _)| result);
+        let external = original_result.and_then(|result| result.result_ref.as_deref())
+            .is_some_and(|reference| reference.starts_with(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE));
+        // The canonical source has checked the durable binding; the witness
+        // must still match the original pre-externalization digest below.
+        witness.authenticate(&ticket, if external { None } else { original_result })
             .map_err(ExecutionCommitError::InvalidCommand)?;
         let original = witness.fact();
         if fact.ticket != original.ticket || fact.calls != original.calls
@@ -14211,18 +14590,24 @@ impl ExecutionCommitService {
             return Ok(false);
         };
         let read = primary.kind == "execution.read.receipt";
-        let stored: crate::RuntimeToolExecutionOutcome =
-            serde_json::from_value(primary.payload["outcome"].clone())?;
-        if (read && primary.payload["outcome_truncated"] != false)
-            || (!primary.payload["outcome_truncated"].is_null()
+        let externalized = primary.payload["outcome_truncated"] == true;
+        let stored: crate::RuntimeToolExecutionOutcome = if externalized {
+            self.resolve_delegated_receipt_outcome(request, &primary)?
+        } else { serde_json::from_value(primary.payload["outcome"].clone())? };
+        if externalized && stored.status == crate::RuntimeToolExecutionStatus::Unknown {
+            return Ok(false);
+        }
+        if (read && !externalized && primary.payload["outcome_truncated"] != false)
+            || (!externalized && !primary.payload["outcome_truncated"].is_null()
                 && primary.payload["outcome_truncated"] != false)
-            || (!index.payload["outcome_truncated"].is_null()
+            || (!externalized && !index.payload["outcome_truncated"].is_null()
                 && index.payload["outcome_truncated"] != false)
-            || tool_effect_outcome_requires_truncation(&stored)
-            || stored
+            || (externalized && index.payload["outcome_truncated"] != true)
+            || (!externalized && tool_effect_outcome_requires_truncation(&stored))
+            || (!externalized && stored
                 .error
                 .as_ref()
-                .is_some_and(|error| error.chars().count() >= MAX_TOOL_EFFECT_RECEIPT_CHARS)
+                .is_some_and(|error| error.chars().count() >= MAX_TOOL_EFFECT_RECEIPT_CHARS))
         {
             return Ok(false);
         }
@@ -14300,7 +14685,7 @@ impl ExecutionCommitService {
                 .ok_or_else(|| invalid("bound mutation original index intent missing"))?;
             Self::validate_proof_bound_tool_request(request, &intent, &index_intent)?;
             self.validate_terminal_scope(request, descriptor, &primary, false)?;
-            serde_json::from_value(primary.payload["outcome"].clone())?
+            stored.clone()
         };
         if let Some(issuer_source) = self.validate_stored_local_network_receipt(&primary, descriptor)? {
             sources.push(issuer_source);
@@ -15090,7 +15475,7 @@ impl ExecutionCommitService {
         &self, graph: &ExecutionGraph, released: &super::resources::ReleasedBindingLeases<'_>,
         witness: Option<&super::executors::agent_tool::NoDispatchWitness>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
-        self.commit_binding_lease_closure_with_original_reads(graph, released, witness, &[])
+        self.commit_binding_lease_closure_with_original_reads(graph, released, witness, &[], None)
     }
 
     pub(super) fn commit_binding_lease_closure_with_original_reads(
@@ -15099,6 +15484,7 @@ impl ExecutionCommitService {
         released: &super::resources::ReleasedBindingLeases<'_>,
         witness: Option<&super::executors::agent_tool::NoDispatchWitness>,
         original_reads: &[crate::conversation::EarlyToolExecutionReceipt],
+        deadline: Option<std::time::Instant>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let invalid = |reason: &str| ExecutionCommitError::InvalidCommand(reason.into());
         if !released.authentic_for(graph) {
@@ -15165,6 +15551,9 @@ impl ExecutionCommitService {
             .revision
             .checked_add(1)
             .ok_or_else(|| invalid("lease closure revision overflow"))?;
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(invalid("original lease closure deadline expired"));
+        }
         self.append_graph_event_with_expected_domain_revisions(
             &next,
             graph.revision,
@@ -15851,6 +16240,40 @@ impl ExecutionCommitService {
         }
         let mut events = vec![graph_input];
         events.extend(domain_events);
+        if events.iter().any(|input| input.event.payload["result"]["result_ref"].as_str().is_some_and(|value|
+            value.starts_with(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE))) {
+            for (position, input) in events.iter().enumerate() {
+                if input.event.kind == "execution_node.transitioned" {
+                    let mut refs = input.event.refs.clone();
+                    // Publication may add this same prepared artifact as a reverse ref.
+                    if let Some(value) = input.event.payload["result"]["result_ref"].as_str()
+                        .and_then(|value| value.strip_prefix(agent_tool::AGENT_TOOL_OUTCOME_REFERENCE)) {
+                        let reference: agent_tool::AgentToolOutcomeReference = serde_json::from_str(value)?;
+                        if let Some(selector) = reference.content.pointer("/body/artifact/selector").and_then(serde_json::Value::as_str) {
+                            let reference = RuntimeEventRef { kind: "artifact".into(), id: selector.into() };
+                            if !refs.contains(&reference) { refs.push(reference); }
+                        }
+                    }
+                    let event = crate::DurableRuntimeEvent {
+                        event_id: "runtime-event-00000000-0000-0000-0000-000000000000".into(),
+                        stream_id: input.event.stream_id.clone(), sequence: u64::MAX,
+                        scope: input.event.scope, kind: input.event.kind.clone(), status: input.event.status.clone(),
+                        actor: input.event.actor.clone(), refs, payload: input.event.payload.clone(),
+                        created_at_ms: u64::MAX, commit_cursor: u64::MAX,
+                        transaction_id: transaction_id.clone(), transaction_index: u32::try_from(position)
+                            .map_err(|_| ExecutionCommitError::InvalidCommand("event position overflow".into()))?,
+                        schema_version: input.schema_version, idempotency_key: input.idempotency_key.clone(),
+                    };
+                    if serde_json::to_vec(&event)?.len() > 1024 * 1024 {
+                        return Err(ExecutionCommitError::InvalidCommand("ToolBatch node event exceeds timeline budget".into()));
+                    }
+                }
+                if input.event.scope == RuntimeEventScope::ExecutionGraph
+                    && input.event.payload["bytes"].as_u64().is_none_or(|bytes| bytes > (1024 * 1024 - 64 * 1024) as u64) {
+                    return Err(ExecutionCommitError::InvalidCommand("ToolBatch graph body exceeds history budget".into()));
+                }
+            }
+        }
         let refreshable_lineage = expected_streams
             .iter()
             .filter(|source| {
@@ -16395,6 +16818,7 @@ mod recovery_physical_450_tests {
             calls,
             never_polled: false,
             result_sha256: None,
+            durable_result_sha256: None,
             historical_sources: BTreeMap::new(),
             start: None,
             bounded_owners: BTreeMap::new(),
@@ -17192,11 +17616,38 @@ mod no_dispatch_ordering_tests {
             }],
             never_polled: true,
             result_sha256: None,
+            durable_result_sha256: None,
             historical_sources: std::collections::BTreeMap::new(),
             start: None,
             bounded_owners: std::collections::BTreeMap::new(),
             original_node: None,
         }
+    }
+
+    #[test]
+    fn external_result_requires_both_original_and_durable_bindings() {
+        use sha2::Digest as _;
+        let outcome = crate::RuntimeToolExecutionOutcome {
+            tool_use_id: "call-1".into(), tool_name: "read_file".into(),
+            status: crate::RuntimeToolExecutionStatus::Failed,
+            category: crate::ToolSafetyCategory::ReadOnly, output: None,
+            error: Some("refused".into()), evidence_ref: String::new(),
+            observed_evidence: vec![], pending_agent_batch: None,
+        };
+        let mut result = crate::execution_core::graph::executors::agent_tool::agent_tool_outcome_at(&outcome, 123).unwrap().result;
+        let mut witness = fact("key-covered");
+        witness.never_polled = false;
+        witness.result_sha256 = Some(format!("sha256:{:x}", sha2::Sha256::digest(serde_json::to_vec(&result).unwrap())));
+        assert!(!super::validate_no_dispatch_result_digest(&witness, &result).unwrap());
+        result.result_ref = Some("agent-tool-outcome-content-v1:reference".into());
+        assert!(super::validate_no_dispatch_result_digest(&witness, &result).is_err());
+        witness.durable_result_sha256 = Some(format!("sha256:{:x}", sha2::Sha256::digest(serde_json::to_vec(&result).unwrap())));
+        assert!(super::validate_no_dispatch_result_digest(&witness, &result).unwrap());
+        result.result_ref = Some("agent-tool-outcome-content-v1:foreign".into());
+        assert!(super::validate_no_dispatch_result_digest(&witness, &result).is_err());
+        result.result_ref = Some("agent-tool-outcome-content-v1:reference".into());
+        witness.result_sha256 = None;
+        assert!(super::validate_no_dispatch_result_digest(&witness, &result).is_err());
     }
 
     #[test]

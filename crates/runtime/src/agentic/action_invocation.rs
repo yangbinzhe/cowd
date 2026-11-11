@@ -13,6 +13,11 @@ pub(crate) fn read_ref_directory_input(input: &Value) -> Result<Option<Value>, S
     input.program_directory_inspect_input().map_err(|error| error.to_string())
 }
 
+pub(crate) fn is_directory_read(tool: &str, input: &str) -> bool {
+    tool == "read_ref" && harness_contract::step::parse_strict_json(input).ok()
+        .and_then(|input| read_ref_directory_input(&input).ok()).flatten().is_some()
+}
+
 /// Actual active Session ingress/control/policy owner for a verified
 /// delegated actor. It is a borrowed commit input, not a new signer.
 pub(crate) struct DelegatedOriginalSessionOwner {
@@ -51,6 +56,7 @@ pub(crate) struct DelegatedSingleCheckedInputs<'a> {
     pub(crate) request: &'a crate::RuntimeToolExecutionRequest,
     pub(crate) original_events: &'a [crate::DurableRuntimeEvent],
     pub(crate) original_decision: Option<&'a crate::execution_core::RuntimeExecutionDecision>,
+    pub(crate) read_ref_target: Option<&'a crate::conversation::OriginalReadRefTarget>,
     _seal: (),
 }
 
@@ -84,6 +90,8 @@ impl DelegatedOriginalSessionOwner {
             return Err("original provider lease producer mismatch".into());
         }
         let events = capture.events();
+        let original_context = capture.permission_context();
+        let expected_context = capture.permission_context_json();
         let transition = serde_json::to_value(&consumption.transition).map_err(|e| e.to_string())?;
         let compiled = request.compiled_invocation.as_ref().ok_or("original provider compiled effect missing")?;
         let mut assessed = 0usize; let mut consumed = 0usize;
@@ -106,14 +114,27 @@ impl DelegatedOriginalSessionOwner {
                     && pre["compiled_invocation"]["effect"] == serde_json::to_value(&compiled.effect).map_err(|e| e.to_string())?
                     && original_input.as_ref() == Some(&self.original_input)
                     && event.payload["lease"]["lease_id"].as_str() == Some(auth.authorization_lease.lease_id.as_str())
-                    && event.payload.get("_original_permission_context").is_some() { assessed += 1; }
+                    && (if request.tool_name == "read_ref" {
+                        expected_context.as_ref() == event.payload.get("_original_permission_context")
+                            && expected_context.is_some()
+                    } else { event.payload.get("_original_permission_context").is_some() }) { assessed += 1; }
             }
             if event.kind == "authorization.lease_transition" && event.scope == crate::RuntimeEventScope::Tool
                 && event.actor.as_deref() == Some("conversation_runtime") && event.status.as_deref() == Some("consumed")
                 && event.payload == transition && event.payload["idempotency_key"].as_str() == Some(auth.request_id.as_str()) { consumed += 1; }
         }
         if assessed != 1 || consumed != 1 { return Err("original provider assessment or lease mismatch".into()); }
+        let read_ref_target = if request.tool_name == "read_ref" { capture.read_ref_target()? } else { None };
+        if read_ref_target.is_some() && !producer.uses_original_claim(self.claim()) {
+            return Err("original read_ref Session claim differs".into());
+        }
+        if read_ref_target.as_ref().is_some_and(|target|
+            !self.packet.permission_ceiling.permits(target.effect.required_permission)
+                || !self.packet.permission_ceiling.permits(target.authorization.authorization_lease.ceiling)) {
+            return Err("original Agent packet does not permit read_ref target".into());
+        }
         let mut streams = additional_streams.to_vec(); streams.push(self.ticket.graph_id.clone());
+        if let Some(target) = &read_ref_target { streams.push(target.ticket.graph_id.clone()); }
         streams.push(format!("session:{}", self.claim().session_id()));
         streams.extend(events.iter().map(|event| event.stream_id.clone())); streams.sort(); streams.dedup();
         self.with_policy(services, |policy| {
@@ -122,7 +143,29 @@ impl DelegatedOriginalSessionOwner {
                 || snapshot.revision != auth.policy_revision || snapshot.sandbox_posture != request.sandbox_posture {
                 return Err("original provider policy changed".into());
             }
+            if read_ref_target.as_ref().is_some_and(|target|
+                !snapshot.permission_mode.permits(target.effect.required_permission)
+                    || !snapshot.permission_mode.permits(target.authorization.authorization_lease.ceiling)) {
+                return Err("original provider policy does not permit read_ref target".into());
+            }
             services.event_store().with_authenticated_stream_locks(&streams, |held| {
+                if let Some(target) = &read_ref_target {
+                    crate::execution_core::graph::validate_node_ticket_start(services.event_store(), &target.ticket, None)
+                        .map_err(|error| error.to_string())?;
+                    if target.authorization.authorization_lease.principal_id != auth.authorization_lease.principal_id
+                        || target.effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
+                        || target.effect.uses_network || target.effect.spawns_process || target.effect.scopes.is_empty()
+                        || target.effect.scopes.iter().any(|scope|
+                            scope.resource != harness_contract::policy::PermissionResource::Tool
+                                || scope.operation != harness_contract::policy::PermissionOperation::Read) {
+                        return Err("original read_ref target authority changed".into());
+                    }
+                }
+                if request.tool_name == "read_ref" || read_ref_target.is_some() {
+                    let target_ticket = read_ref_target.as_ref().map_or(&self.ticket, |target| &target.ticket);
+                    producer.verify_read_ref_target(target_ticket, request, &events,
+                        original_context.as_ref().ok_or("original permission context unavailable")?, read_ref_target.as_ref())?;
+                }
                 // Hold the original producer decision through checked append;
                 // a conflicting rebind cannot race the commit decision.
                 capture.with_original_decision(|original_decision| {
@@ -144,7 +187,7 @@ impl DelegatedOriginalSessionOwner {
                     stream_id: stream_id.clone(), expected_revision: services.event_store().stream_revision(stream_id).map_err(|e| e.to_string())?,
                 })).collect::<Result<Vec<_>, String>>()?;
                 append(DelegatedSingleCheckedInputs { held, sources: &sources, control: self.control(), claim: self.claim(),
-                    consumed_input_sequence, ticket: &self.ticket, request, original_events: &events, original_decision: Some(original_decision), _seal: () })
+                    consumed_input_sequence, ticket: &self.ticket, request, original_events: &events, original_decision: Some(original_decision), read_ref_target: read_ref_target.as_ref(), _seal: () })
                 })
             })
         })
@@ -253,7 +296,7 @@ impl DelegatedOriginalSessionOwner {
                     stream_id: stream_id.clone(), expected_revision: services.event_store().stream_revision(stream_id).map_err(|e| e.to_string())?,
                 })).collect::<Result<Vec<_>, String>>()?;
                 append(DelegatedSingleCheckedInputs { held, sources: &sources, control: self.control(), claim: self.claim(),
-                    consumed_input_sequence, ticket: &self.ticket, request, original_events: &events, original_decision: None, _seal: () })
+                    consumed_input_sequence, ticket: &self.ticket, request, original_events: &events, original_decision: None, read_ref_target: None, _seal: () })
             })
         })
     }
@@ -397,8 +440,9 @@ impl VerifiedActionInvocation {
         };
         let derived = batch_index.is_none() && scope.outer_tool == "read_ref" && tool == "state_inspect"
             && scope.read_ref_target.as_ref().is_some_and(|target|
-                &target.input == input && target.ticket.graph_id == original.graph_id
-                    && target.ticket.node_id == original.node_id && target.ticket.attempt == original.attempt
+                &target.input == input && (scope.delegated_session_owner.is_some()
+                    || (target.ticket.graph_id == original.graph_id
+                        && target.ticket.node_id == original.node_id && target.ticket.attempt == original.attempt))
                     && read_ref_directory_input(&scope.outer_input).is_ok_and(|derived| derived.as_ref() == Some(input)));
         if expected_id != action_id || (!derived && (expected_tool != tool || &expected_input != input)) {
             return Err("action is not the original authorized call or batch entry");
@@ -622,10 +666,28 @@ where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Outpu
         child_stop.register_commit_control(&owner.owner.control);
         if let Some(stop) = parent_stop { stop.register_commit_control(&owner.owner.control); }
     }
+    let read_ref_target = if request.tool_name == "read_ref" {
+        let expected = read_ref_directory_input(&input)?;
+        match expected {
+            Some(expected) => {
+                if !packet.allowed_tools.iter().any(|tool| tool == "state_inspect") {
+                    return Err("original Agent packet does not admit read_ref target".into());
+                }
+                let capture = provider_capture.ok_or("unknown: original read_ref producer unavailable")?;
+                let target = capture.read_ref_target()?.ok_or("unknown: original read_ref target unavailable")?;
+                if target.input != expected || !std::sync::Weak::ptr_eq(&target.original_channel,
+                    &request.tool_progress.original_read_ref_identity()) {
+                    return Err("original read_ref target differs".into());
+                }
+                Some(target)
+            }
+            None => None,
+        }
+    } else { None };
     let capability = VerifiedActionInvocation::from_owner(OwnerAdmissionWitness {
         original_request: request.clone(), session_id: actor.session_id.clone(), turn_id: actor.turn_id.clone(),
         original_execution: Some(original_execution), root_owner: None, delegated_session_owner, step_id: identity.step_id.clone(), call_id: request.tool_use_id.clone(),
-        effect_key: request.idempotency_key.clone(), outer_tool: request.tool_name.clone(), outer_input: input, read_ref_target: None, actor: Some(actor),
+        effect_key: request.idempotency_key.clone(), outer_tool: request.tool_name.clone(), outer_input: input, read_ref_target, actor: Some(actor),
     }).map_err(str::to_string)?;
     struct InvocationLifetime(Arc<ActionInvocationScope>);
     impl Drop for InvocationLifetime {

@@ -83,6 +83,6 @@ pub use strategy_decision::{
     TurnStrategyDecisionState, TurnStrategyDecisionStatus,
 };
 pub use supervisor::{
-    RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionShutdownReport,
+    RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionShutdownReport, RuntimeExecutionShutdownCompletion,
     RuntimeExecutionSupervisor, RuntimeWorkAdmissionReceipt,
 };

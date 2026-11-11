@@ -2735,7 +2735,7 @@ impl AgentActionService {
         let original_decision = original.original_decision();
         let derived_read = original.read_ref_target().is_some_and(|target|
             request.tool_name == "read_ref" && tool == "state_inspect"
-                && target.ticket == *ticket && target.input == *input);
+                && (original.is_delegated() || target.ticket == *ticket) && target.input == *input);
         let sources = original.sources();
         let locks = original.held();
         let control = original.control();

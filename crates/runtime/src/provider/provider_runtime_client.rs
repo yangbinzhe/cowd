@@ -3133,115 +3133,12 @@ async fn forward_provider_stream(
         }
         // A single event advances one action at a time. The shared action
         // executor keeps the original send/flush order and backpressure.
-        enum EventAction {
-            Flush,
-            Send(AssistantEvent),
-            SendMany(Vec<AssistantEvent>),
-            Text(String),
-            Continue,
-            Done,
-        }
-        let mut event = Some(event);
-        let mut phase = 0_u8;
-        loop {
-            let action = if phase == 0 {
-                phase = 1;
-                if matches!(event.as_ref(), Some(
-                    ApiStreamEvent::MessageStart(_)
-                    | ApiStreamEvent::ContentBlockStart(_)
-                    | ApiStreamEvent::ContentBlockStop(_)
-                    | ApiStreamEvent::MessageDelta(_)
-                    | ApiStreamEvent::MessageStop(_)
-                )) { EventAction::Flush } else { EventAction::Continue }
-            } else if phase == 1 {
-                match event.as_mut().expect("event remains until its action is prepared") {
-                    ApiStreamEvent::MessageStart(start) => {
-                        let mut events = Vec::new();
-                        for (index, block) in std::mem::take(&mut start.message.content).into_iter().enumerate() {
-                            let Ok(index) = u32::try_from(index) else { break; };
-                            push_provider_output_block(block, index, &mut events, &mut pending_tools, true);
-                        }
-                        phase = 2;
-                        EventAction::SendMany(events)
-                    }
-                    ApiStreamEvent::ContentBlockStart(_) => {
-                        let Some(ApiStreamEvent::ContentBlockStart(start)) = event.take() else { unreachable!() };
-                        let mut events = Vec::new();
-                        push_provider_output_block(start.content_block, start.index, &mut events, &mut pending_tools, true);
-                        phase = 3;
-                        EventAction::SendMany(events)
-                    }
-                    ApiStreamEvent::ContentBlockDelta(_) => {
-                        let Some(ApiStreamEvent::ContentBlockDelta(delta)) = event.take() else { unreachable!() };
-                        phase = 3;
-                        match delta.delta {
-                            ContentBlockDelta::TextDelta { text } if !text.is_empty() => EventAction::Text(text),
-                            ContentBlockDelta::TextDelta { .. } => EventAction::Continue,
-                            ContentBlockDelta::InputJsonDelta { partial_json } => {
-                                if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) { input.push_str(&partial_json); }
-                                EventAction::Continue
-                            }
-                            ContentBlockDelta::ReasoningSummaryDelta { text } => EventAction::Send(AssistantEvent::ReasoningSummaryDelta(text)),
-                            ContentBlockDelta::ThinkingDelta { thinking } => EventAction::Send(AssistantEvent::PrivateReasoningDelta(thinking)),
-                            ContentBlockDelta::SignatureDelta { signature } => EventAction::Send(AssistantEvent::SignatureDelta(signature)),
-                        }
-                    }
-                    ApiStreamEvent::ContentBlockStop(stop) => {
-                        phase = 2;
-                        match pending_tools.remove(&stop.index) {
-                            Some((id, name, input)) => EventAction::Send(AssistantEvent::ToolUse { id, name, input }),
-                            None => EventAction::Continue,
-                        }
-                    }
-                    ApiStreamEvent::MessageDelta(delta) => {
-                        if delta.usage_observed {
-                            let usage = merge_provider_usage_max(cumulative_usage, delta.usage.token_usage());
-                            cumulative_usage = Some(usage);
-                            *attempt_usage = Some(usage);
-                            *attempt_cache_dimensions_observed |= delta.cache_dimensions_observed;
-                        }
-                        phase = 3;
-                        match delta.delta.stop_reason.clone() {
-                            Some(stop_reason) => EventAction::Send(AssistantEvent::MessageBoundary { stop_reason: Some(stop_reason) }),
-                            None => EventAction::Continue,
-                        }
-                    }
-                    ApiStreamEvent::MessageStop(_) => {
-                        phase = 2;
-                        match cumulative_usage {
-                            Some(usage) => EventAction::Send(AssistantEvent::Usage(usage)),
-                            None => EventAction::Continue,
-                        }
-                    }
-                }
-            } else if phase == 2 {
-                phase = 3;
-                match event.take().expect("event retained for its post-action") {
-                    ApiStreamEvent::MessageStart(start) => {
-                        if start.message.usage_observed {
-                            let usage = merge_provider_usage_max(cumulative_usage, start.message.usage.token_usage());
-                            cumulative_usage = Some(usage);
-                            *attempt_usage = Some(usage);
-                            *attempt_cache_dimensions_observed |= start.message.cache_dimensions_observed;
-                        }
-                        EventAction::Continue
-                    }
-                    ApiStreamEvent::ContentBlockStop(stop) => EventAction::Send(AssistantEvent::ItemCompleted { index: stop.index }),
-                    ApiStreamEvent::MessageStop(_) => { saw_stop = true; EventAction::Continue }
-                    _ => unreachable!("only events with a post-action reach this phase"),
-                }
-            } else {
-                EventAction::Done
-            };
-            let accepted = match action {
-                EventAction::Flush => flush_pending_text(sender, &mut pending_text, emit_output, &stream_callback, &mut emitted).await,
-                EventAction::Send(event) => forward_event(sender, event, emit_output, &stream_callback, &mut emitted).await,
-                EventAction::SendMany(events) => forward_events(sender, events, emit_output, &stream_callback, &mut emitted).await,
-                EventAction::Text(text) => forward_text_delta(sender, text, &mut pending_text, emit_output, &stream_callback, &mut emitted).await,
-                EventAction::Continue => true,
-                EventAction::Done => break,
-            };
-            if !accepted { return Ok(ForwardedProviderStream::ConsumerDropped); }
+        if !Box::pin(forward_provider_event(
+            event, &mut pending_tools, &mut cumulative_usage, attempt_usage,
+            attempt_cache_dimensions_observed, &mut saw_stop, sender, emit_output,
+            &stream_callback, &mut pending_text, &mut emitted,
+        )).await {
+            return Ok(ForwardedProviderStream::ConsumerDropped);
         }
         if first_semantic { diag.record("first_content_handler_complete", &transport_activity); semantic_recorded = true; }
     }
@@ -3281,6 +3178,134 @@ async fn forward_provider_stream(
         &stream_callback, sender, attempt_usage, attempt_cache_dimensions_observed,
         control, &mut emitted,
     ).await
+}
+
+// Process one decoded event on the original producer task, preserving its
+// send order, backpressure, and owned stream.
+async fn forward_provider_event(
+    event: ApiStreamEvent,
+    pending_tools: &mut BTreeMap<u32, (String, String, String)>,
+    cumulative_usage: &mut Option<TokenUsage>,
+    attempt_usage: &mut Option<TokenUsage>,
+    attempt_cache_dimensions_observed: &mut bool,
+    saw_stop: &mut bool,
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
+    emit_output: bool,
+    stream_callback: &Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
+    pending_text: &mut String,
+    emitted: &mut bool,
+) -> bool {
+    enum EventAction {
+        Flush,
+        Send(AssistantEvent),
+        SendMany(Vec<AssistantEvent>),
+        Text(String),
+        Continue,
+        Done,
+    }
+    let mut event = Some(event);
+    let mut phase = 0_u8;
+    loop {
+        let action = if phase == 0 {
+            phase = 1;
+            if matches!(event.as_ref(), Some(
+                ApiStreamEvent::MessageStart(_)
+                | ApiStreamEvent::ContentBlockStart(_)
+                | ApiStreamEvent::ContentBlockStop(_)
+                | ApiStreamEvent::MessageDelta(_)
+                | ApiStreamEvent::MessageStop(_)
+            )) { EventAction::Flush } else { EventAction::Continue }
+        } else if phase == 1 {
+            match event.as_mut().expect("event remains until its action is prepared") {
+                ApiStreamEvent::MessageStart(start) => {
+                    let mut events = Vec::new();
+                    for (index, block) in std::mem::take(&mut start.message.content).into_iter().enumerate() {
+                        let Ok(index) = u32::try_from(index) else { break; };
+                        push_provider_output_block(block, index, &mut events, pending_tools, true);
+                    }
+                    phase = 2;
+                    EventAction::SendMany(events)
+                }
+                ApiStreamEvent::ContentBlockStart(_) => {
+                    let Some(ApiStreamEvent::ContentBlockStart(start)) = event.take() else { unreachable!() };
+                    let mut events = Vec::new();
+                    push_provider_output_block(start.content_block, start.index, &mut events, pending_tools, true);
+                    phase = 3;
+                    EventAction::SendMany(events)
+                }
+                ApiStreamEvent::ContentBlockDelta(_) => {
+                    let Some(ApiStreamEvent::ContentBlockDelta(delta)) = event.take() else { unreachable!() };
+                    phase = 3;
+                    match delta.delta {
+                        ContentBlockDelta::TextDelta { text } if !text.is_empty() => EventAction::Text(text),
+                        ContentBlockDelta::TextDelta { .. } => EventAction::Continue,
+                        ContentBlockDelta::InputJsonDelta { partial_json } => {
+                            if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) { input.push_str(&partial_json); }
+                            EventAction::Continue
+                        }
+                        ContentBlockDelta::ReasoningSummaryDelta { text } => EventAction::Send(AssistantEvent::ReasoningSummaryDelta(text)),
+                        ContentBlockDelta::ThinkingDelta { thinking } => EventAction::Send(AssistantEvent::PrivateReasoningDelta(thinking)),
+                        ContentBlockDelta::SignatureDelta { signature } => EventAction::Send(AssistantEvent::SignatureDelta(signature)),
+                    }
+                }
+                ApiStreamEvent::ContentBlockStop(stop) => {
+                    phase = 2;
+                    match pending_tools.remove(&stop.index) {
+                        Some((id, name, input)) => EventAction::Send(AssistantEvent::ToolUse { id, name, input }),
+                        None => EventAction::Continue,
+                    }
+                }
+                ApiStreamEvent::MessageDelta(delta) => {
+                    if delta.usage_observed {
+                        let usage = merge_provider_usage_max(*cumulative_usage, delta.usage.token_usage());
+                        *cumulative_usage = Some(usage);
+                        *attempt_usage = Some(usage);
+                        *attempt_cache_dimensions_observed |= delta.cache_dimensions_observed;
+                    }
+                    phase = 3;
+                    match delta.delta.stop_reason.clone() {
+                        Some(stop_reason) => EventAction::Send(AssistantEvent::MessageBoundary { stop_reason: Some(stop_reason) }),
+                        None => EventAction::Continue,
+                    }
+                }
+                ApiStreamEvent::MessageStop(_) => {
+                    phase = 2;
+                    match *cumulative_usage {
+                        Some(usage) => EventAction::Send(AssistantEvent::Usage(usage)),
+                        None => EventAction::Continue,
+                    }
+                }
+            }
+        } else if phase == 2 {
+            phase = 3;
+            match event.take().expect("event retained for its post-action") {
+                ApiStreamEvent::MessageStart(start) => {
+                    if start.message.usage_observed {
+                        let usage = merge_provider_usage_max(*cumulative_usage, start.message.usage.token_usage());
+                        *cumulative_usage = Some(usage);
+                        *attempt_usage = Some(usage);
+                        *attempt_cache_dimensions_observed |= start.message.cache_dimensions_observed;
+                    }
+                    EventAction::Continue
+                }
+                ApiStreamEvent::ContentBlockStop(stop) => EventAction::Send(AssistantEvent::ItemCompleted { index: stop.index }),
+                ApiStreamEvent::MessageStop(_) => { *saw_stop = true; EventAction::Continue }
+                _ => unreachable!("only events with a post-action reach this phase"),
+            }
+        } else {
+            EventAction::Done
+        };
+        let accepted = match action {
+            EventAction::Flush => flush_pending_text(sender, pending_text, emit_output, stream_callback, emitted).await,
+            EventAction::Send(event) => forward_event(sender, event, emit_output, stream_callback, emitted).await,
+            EventAction::SendMany(events) => forward_events(sender, events, emit_output, stream_callback, emitted).await,
+            EventAction::Text(text) => forward_text_delta(sender, text, pending_text, emit_output, stream_callback, emitted).await,
+            EventAction::Continue => true,
+            EventAction::Done => break,
+        };
+        if !accepted { return false; }
+    }
+    true
 }
 
 // Entered only after the original stream has been dropped at empty EOF.
@@ -3661,6 +3686,37 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn provider_event_phase_preserves_text_before_original_tool_completion() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let mut pending = BTreeMap::from([(7, ("original-call".to_string(),
+            "read_ref".to_string(), r#"{"reference":"artifact://x"}"#.to_string()))]);
+        let mut cumulative = None;
+        let mut usage = None;
+        let mut cache_observed = false;
+        let mut saw_stop = false;
+        let mut text = "earlier text".to_string();
+        let mut emitted = false;
+        let event = provider::StreamEvent::ContentBlockStop(provider::ContentBlockStopEvent { index: 7 });
+        assert!(super::forward_provider_event(event, &mut pending, &mut cumulative,
+            &mut usage, &mut cache_observed, &mut saw_stop, &sender, false,
+            &None, &mut text, &mut emitted).await);
+        assert!(matches!(receiver.recv().await.unwrap().unwrap(), AssistantEvent::TextDelta(value)
+            if value == "earlier text"));
+        assert!(matches!(receiver.recv().await.unwrap().unwrap(), AssistantEvent::ToolUse { id, name, input }
+            if id == "original-call" && name == "read_ref" && input == r#"{"reference":"artifact://x"}"#));
+        assert!(matches!(receiver.recv().await.unwrap().unwrap(), AssistantEvent::ItemCompleted { index: 7 }));
+        assert!(pending.is_empty());
+        assert!(!saw_stop);
+        drop(receiver);
+        text.push_str("unobserved");
+        let event = provider::StreamEvent::MessageStop(provider::MessageStopEvent {});
+        assert!(!super::forward_provider_event(event, &mut pending, &mut cumulative,
+            &mut usage, &mut cache_observed, &mut saw_stop, &sender, false,
+            &None, &mut text, &mut emitted).await);
+        assert!(!saw_stop, "a dropped consumer cannot be recorded as completed");
+    }
 
     /// P-2: a preparation that was not granted says WHICH wait held it
     /// back, so the failure names its cause instead of reading like a

@@ -37,6 +37,31 @@ fn add_token_usage(total: &mut TokenUsage, usage: TokenUsage) {
 const INTERACTIVE_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 30_000;
 const DELEGATED_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 300_000;
 
+fn strict_input_semantics_match(original: &str, validated: &str) -> bool {
+    harness_contract::step::parse_strict_json(original).ok()
+        .zip(harness_contract::step::parse_strict_json(validated).ok())
+        .is_some_and(|(original, validated)| original == validated)
+}
+
+// A completed early call or an attempted early worker needs its original
+// owner reconciliation; a schema refusal alone cannot prove non-dispatch.
+fn early_batch_input_may_have_run(
+    call_id: &str,
+    receipts: &[EarlyToolExecutionReceipt],
+    deferrals: &[EarlyToolDeferral],
+    dispatcher: Option<&dyn EarlyToolDispatcher>,
+) -> bool {
+    receipts.iter().any(|receipt| receipt.call.id == call_id)
+        || deferrals.iter().any(|deferred| {
+            deferred.tool_call_id == call_id
+                && match deferred.origin {
+                    EarlyToolDeferralOrigin::GateDidNotSpawn => deferred.original_undispatched.is_some(),
+                    EarlyToolDeferralOrigin::OriginalWorker => dispatcher
+                        .is_none_or(|owner| !owner.confirms_original_undispatched(call_id, deferred)),
+                }
+        })
+}
+
 // Proactive context reduction fires when the fixed transcript already occupies
 // this percentage of the smallest configured candidate window. It pre-empts the
 // hard "cannot fit" failure through the existing semantic-checkpoint pipeline.
@@ -2879,11 +2904,27 @@ where
             // trip, paid so that no consumer can ever observe an unrepaired
             // frame regardless of what is inserted between here and there.
             for call in &mut calls {
-                if let Ok(repaired) = self.tool_executor.validate_step_tool_input(
+                let validation = self.tool_executor.validate_step_tool_input(
                     call.binding.as_ref(),
                     &call.name,
                     &call.input,
-                ) {
+                );
+                // Serialization alone must not replace the bytes owned by an
+                // earlier call (nor force an already-consumed call to run again).
+                if call.name == "agent_action_batch" && validation.as_ref().is_ok_and(|repaired| {
+                    strict_input_semantics_match(&call.input, repaired)
+                }) {
+                    continue;
+                }
+                if call.name == "agent_action_batch"
+                    && (validation.is_err() || validation.as_ref().is_ok_and(|input| input != &call.input))
+                    && early_batch_input_may_have_run(&call.id, &early_tool_receipts, &early_tool_deferrals, early_dispatcher.as_deref())
+                {
+                    return Err(RuntimeError::new(
+                        "original early tool custody is unresolved for an input requiring validation or normalization",
+                    ).with_effect_receipts(early_tool_receipts).with_provider_usage(observed_usage));
+                }
+                if let Ok(repaired) = validation {
                     if repaired != call.input {
                         // A repair that only closes a cut-off frame is not the
                         // same as one that fixes a quoting mistake: items were
@@ -2907,6 +2948,9 @@ where
                         call.input = repaired;
                     }
                 }
+            }
+            for call in &mut calls {
+                call.input = crate::host::normalize_native_read_input(&call.name, &call.input);
             }
             let requested_tool_call_count = calls.len();
             self.remember_original_root_calls(&calls)?;
@@ -3518,6 +3562,32 @@ where
 #[cfg(test)]
 mod provider_admission_tests {
     use super::*;
+
+    #[test]
+    fn encoded_batch_never_rewrites_a_possibly_executed_early_call() {
+        assert!(strict_input_semantics_match(r#"{ "b": 2, "a": 1 }"#, r#"{"a":1,"b":2}"#));
+        assert!(!strict_input_semantics_match(r#"{"actions":"[]"}"#, r#"{"actions":[]}"#));
+        assert!(!strict_input_semantics_match(r#"{"a":1,"a":1}"#, r#"{"a":1}"#));
+        let call = ModelToolCall { binding: None, id: "original".into(),
+            name: "agent_action_batch".into(), input: "{}".into(), depends_on: vec![] };
+        let receipt = EarlyToolExecutionReceipt {
+            original_source: None, lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
+            call: call.clone(), ready_at_ms: 1, started_at_ms: 2, completed_at_ms: 3,
+            outcome: crate::RuntimeToolExecutionOutcome { pending_agent_batch: None,
+                tool_use_id: call.id.clone(), tool_name: call.name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: crate::ToolSafetyCategory::ReadOnly, output: None, error: None,
+                evidence_ref: String::new(), observed_evidence: vec![] },
+        };
+        assert!(early_batch_input_may_have_run("original", &[receipt], &[], None));
+        let mut deferred = EarlyToolDeferral { tool_call_id: "original".into(),
+            reason: "unknown original worker".into(), ready_at_ms: 0, original_undispatched: None,
+            origin: EarlyToolDeferralOrigin::OriginalWorker };
+        assert!(early_batch_input_may_have_run("original", &[], &[deferred.clone()], None));
+        deferred.origin = EarlyToolDeferralOrigin::GateDidNotSpawn;
+        assert!(!early_batch_input_may_have_run("original", &[], &[deferred], None));
+        assert!(!early_batch_input_may_have_run("original", &[], &[], None));
+    }
 
     #[test]
     fn clean_terminal_ledger_is_present_even_with_native_tool_history() {

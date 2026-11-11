@@ -217,6 +217,23 @@ raise SystemExit(1)
 PY
 }
 
+group_has_live_members() {
+  python3 - "$1" <<'PY'
+import pathlib, sys
+group = int(sys.argv[1])
+for entry in pathlib.Path('/proc').iterdir():
+    if not entry.name.isdigit():
+        continue
+    try:
+        f = (entry / 'stat').read_text().rsplit(') ', 1)[1].split()
+        if int(f[2]) == group and int(f[3]) == group and f[0] not in ('Z', 'X'):
+            raise SystemExit(0)
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        continue
+raise SystemExit(1)
+PY
+}
+
 signal_owned() {
   local pid=$1 signal=$2 group=${3:-0}
   if [[ "$group" == 1 ]]; then
@@ -255,7 +272,7 @@ stop_owned() {
   [[ -n "$pid" ]] || return 0
   [[ -n "${CHILD_START[$pid]:-}" ]] || return 1
   group=${CHILD_GROUP[$pid]}
-  if owned_running "$pid" "${CHILD_START[$pid]}" || { [[ "$group" == 1 ]] && group_has_members "$pid"; }; then
+  if owned_running "$pid" "${CHILD_START[$pid]}" || { [[ "$group" == 1 ]] && group_has_live_members "$pid"; }; then
     signal_owned "$pid" TERM "$group" || return 1
   fi
   deadline=$((SECONDS + term_seconds))
@@ -267,7 +284,7 @@ stop_owned() {
       reaped=1
       [[ "$LAST_WAIT_STATUS" != 127 ]] || return 1
     fi
-    if [[ "$reaped" == 1 ]] && { [[ "$group" != 1 ]] || ! group_has_members "$pid"; }; then
+    if [[ "$reaped" == 1 ]] && { [[ "$group" != 1 ]] || ! group_has_live_members "$pid"; }; then
       break
     fi
     if ((SECONDS >= deadline)); then
@@ -994,6 +1011,8 @@ storage:
 gateway:
   enabled: true
   session_reset: none
+  capacity:
+    runtime_stack_bytes: 16777216
   platforms:
     - platformType: api_server
       enabled: true

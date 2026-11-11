@@ -4136,6 +4136,7 @@ mod immutable_native_acquisition_tests {
                 .unwrap();
             let mut session = Session::new();
             session.session_id = "scope2-session".into();
+            let bus = crate::CowdEventBus::new();
             let runtime = ConversationRuntime::new(
                 session,
                 AcquisitionApi,
@@ -4144,7 +4145,33 @@ mod immutable_native_acquisition_tests {
                 vec![],
             )
             .without_memory()
+            .with_cowd_event_bus(bus.clone())
             .with_runtime_event_store(store.clone());
+            let _execution = bus.enter_execution(crate::CowdExecutionContext {
+                execution_id: "scope2-graph".into(),
+                session_id: "scope2-session".into(),
+                turn_id: "scope2-turn".into(),
+            });
+            let input = crate::host::normalize_native_read_input(
+                "evidence_retrieve", r#"{"evidence_ref":"artifact:original"}"#,
+            );
+            assert_eq!(input, request.input);
+            let original = ModelToolCall {
+                id: request.tool_use_id.clone(), name: request.tool_name.clone(), input,
+                depends_on: vec![], binding: request.step_binding.clone(),
+            };
+            runtime.remember_native_tool_calls(std::slice::from_ref(&original)).unwrap();
+            runtime.remember_native_tool_calls(std::slice::from_ref(&original)).unwrap();
+            let mut foreign = original.clone();
+            foreign.input = r#"{"evidence_ref":"artifact://foreign"}"#.into();
+            assert!(runtime.remember_native_tool_calls(&[foreign]).is_err());
+            let mut foreign_step = original.clone();
+            foreign_step.binding.as_mut().unwrap().origin.origin_step_id = "foreign-step".into();
+            assert!(runtime.remember_native_tool_calls(&[foreign_step]).is_err());
+            let mut foreign_call = original.clone();
+            foreign_call.binding.as_mut().unwrap().origin.call_id = "foreign-call".into();
+            assert!(runtime.remember_native_tool_calls(&[foreign_call]).is_err());
+            assert_eq!(runtime.turn_native_tool_sources.lock().unwrap()[&original.id].call, original);
             let source = NativeToolSource {
                 call: ModelToolCall {
                     id: request.tool_use_id.clone(),

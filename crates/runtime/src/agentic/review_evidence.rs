@@ -1611,6 +1611,20 @@ fn effect_observation_refs(
     Ok(actual.into_iter().collect())
 }
 
+fn directory_read_packet<'a>(
+    packets: &'a [AgentTaskPacket],
+    source: &str,
+) -> Result<&'a AgentTaskPacket, String> {
+    let mut matches = packets.iter().filter(|packet| source == format!(
+        "execution-agent-receipts:{}:{}:{}", packet.graph_id(), packet.node_id(), packet.attempt));
+    let packet = matches.next().ok_or("directory read original packet unavailable or ambiguous")?;
+    let digest = proof_value_digest(packet);
+    if matches.any(|other| proof_value_digest(other) != digest) {
+        return Err("directory read original packet unavailable or ambiguous".into());
+    }
+    Ok(packet)
+}
+
 /// The review path reads through the durable-verified store, not the hot cache.
 /// Event notification precedes the writer's cache publish, so a hot read can miss
 /// a graph that exists; a failure produced by that window is timing, not a dead
@@ -3300,7 +3314,45 @@ impl RuntimeServices {
                             }
                         }
                     }
-                    if !immutable_material
+                    // An authenticated Program-directory read is metadata,
+                    // not an artifact or a physical workspace acquisition.
+                    let mut directory_metadata = false;
+                    if !immutable_material && packet_read && name == "read_ref"
+                        && event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null()
+                        && scope.as_ref().is_none_or(|scope| !scope.complete || scope.targets.is_empty()) {
+                        let packet = directory_read_packet(&packets, &source)?;
+                        let key = event.payload["idempotency_key"].as_str().ok_or("directory read original key missing")?;
+                        let primary_stream = format!("execution-effect:{key}");
+                        let mut authenticated = policy::ActualInputSnapshot {
+                            file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+                            sources: material_revisions.clone(), material_events: Vec::new(), canonical_facts: Vec::new(),
+                        };
+                        results::pin_result_source(self.event_store(), &primary_stream, &mut authenticated.sources)?;
+                        let original = self.event_store().event_by_idempotency_key(&primary_stream, &format!("{key}:read-receipt"))
+                            .map_err(|error| error.to_string())?.ok_or("directory read original primary missing")?;
+                        if original.commit_cursor > material_discovery_cursor {
+                            return Err("directory read crosses the review discovery cut".into());
+                        }
+                        policy::verify_actual_read_pair(&original, &event)?;
+                        if !original.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
+                            return Err("directory read primary/index seal differs".into());
+                        }
+                        let input = policy::authenticate_unsealed_delegated_input(
+                            self.event_store(), &original, &event, packet, &mut authenticated)?;
+                        if crate::agentic::action_invocation::read_ref_directory_input(&input)?.is_some() {
+                            let original_fact = harness_contract::goal::ProofInputEvent {
+                                stream_id: original.stream_id.clone(), sequence: original.sequence,
+                                event_id: original.event_id.clone(), payload_digest: proof_value_digest(&original.payload),
+                            };
+                            if !material_events.contains(&original_fact) { material_events.push(original_fact); }
+                            for fact in authenticated.material_events {
+                                if !material_events.contains(&fact) { material_events.push(fact); }
+                            }
+                            material_revisions = authenticated.sources;
+                            directory_metadata = true;
+                        }
+                    }
+                    if !directory_metadata && !immutable_material
                         && !policy::goal_metadata_tool(name)
                         && (packets.iter().any(|packet| {
                             !initial_material_packets.contains(packet.graph_id())
@@ -3322,7 +3374,7 @@ impl RuntimeServices {
                                 .into(),
                         );
                     }
-                    if !immutable_material
+                    if !directory_metadata && !immutable_material
                         && counts_as_physical_read(name)
                         && scope
                             .as_ref()

@@ -129,7 +129,8 @@ pub(super) fn validate_executor_domain_events(
             || event.event.kind == "execution_node.agent_batch_member"
             || event.event.kind == "execution_node.agent_batch_prefix"
             || event.event.kind == "execution_node.agent_batch_manifest"
-            || event.event.kind == "execution_node.agent_batch_pending")
+            || event.event.kind == "execution_node.agent_batch_pending"
+            || event.event.kind == "execution_node.transitioned")
     {
         return Err(ExecutionCommitError::InvalidCommand(
             "executor domain input cannot author reserved execution effect facts".into(),
@@ -183,6 +184,16 @@ mod reserved_node_effect_452_tests {
                         if reason == "executor domain input cannot author reserved execution effect facts"));
             }
         }
+    }
+
+    #[test]
+    fn executor_domain_cannot_forge_no_dispatch_on_a_node_transition() {
+        let mut forged = domain("execution_node.transitioned", "execution_commit_service", RuntimeEventScope::ExecutionNode);
+        assert!(matches!(validate_executor_domain_events(&[forged.clone()]),
+            Err(ExecutionCommitError::InvalidCommand(_))));
+        forged.event.payload = json!({"no_dispatch":{"durable_result_sha256":"sha256:forged"}});
+        assert!(matches!(validate_executor_domain_events(&[forged]),
+            Err(ExecutionCommitError::InvalidCommand(_))));
     }
 
     #[test]
@@ -451,7 +462,7 @@ pub(super) fn delegated_agent_receipt_event(
     })
 }
 
-pub(super) fn bounded_tool_effect_outcome(
+pub(crate) fn bounded_tool_effect_outcome(
     outcome: &crate::RuntimeToolExecutionOutcome,
 ) -> crate::RuntimeToolExecutionOutcome {
     let mut bounded = outcome.clone();
@@ -474,7 +485,7 @@ pub(super) fn bounded_tool_effect_outcome(
     bounded
 }
 
-pub(super) fn tool_effect_outcome_requires_truncation(
+pub(crate) fn tool_effect_outcome_requires_truncation(
     outcome: &crate::RuntimeToolExecutionOutcome,
 ) -> bool {
     outcome

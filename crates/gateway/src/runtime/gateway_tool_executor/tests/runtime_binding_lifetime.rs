@@ -153,7 +153,7 @@ mod runtime_binding_lifetime {
         }
     }
 
-    async fn drain_runtime_binding_fixture(services: &runtime::RuntimeServices) {
+    async fn drain_runtime_binding_fixture(services: &Arc<runtime::RuntimeServices>) {
         let report = services.shutdown_execution().await;
         assert_eq!(report.forced_aborts, 0, "{report:?}");
         assert_eq!(report.remaining_keys, 0, "{report:?}");

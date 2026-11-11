@@ -460,7 +460,7 @@ pub use execution_core::{
     LegacyOutcomeImportReceipt, OutcomeRecordReceipt, ProcessClosurePublicationAuthority,
     RuntimeCompileTarget, RuntimeEventReader, RuntimeTimelinePage, RuntimeEvidenceSummary, RuntimeExecutionDecision,
     RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionPatternCandidate,
-    RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, RuntimeExecutionShutdownReport,
+    RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, RuntimeExecutionShutdownReport, RuntimeExecutionShutdownCompletion,
     RuntimeExecutionSupervisor, RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,
     RuntimeWorkAdmissionReceipt, SessionTerminalDeliveryPort, StrategyDecisionEngine,
     StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome, TurnStrategyDecisionState,

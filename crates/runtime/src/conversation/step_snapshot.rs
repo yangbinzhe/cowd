@@ -409,8 +409,30 @@ impl BoundStep {
                 None => error,
             })
         };
-        let input = harness_contract::step::parse_strict_json(input)
+        let mut input = harness_contract::step::parse_strict_json(input)
             .map_err(|error| input_error(error.to_string()))?;
+        // Only the authenticated, pinned batch schema can authorize decoding
+        // this provider spelling; the original schema still validates the result.
+        if tool_name == "agent_action_batch" {
+            let array_in_schema = self.lease.snapshot().catalog.definitions(None).into_iter()
+                .find(|definition| definition.name == tool_name)
+                .and_then(|definition| definition.input_schema.get("properties")
+                    .and_then(|properties| properties.get("actions"))
+                    .and_then(|schema| schema.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|kind| kind == "array"))
+                .unwrap_or(false);
+            if array_in_schema {
+                if let Some(serde_json::Value::String(encoded)) = input.get("actions") {
+                    let decoded = harness_contract::step::parse_strict_json(encoded)
+                        .map_err(|_| input_error("$.actions must contain a complete valid JSON array; no items were inferred or discarded".into()))?;
+                    if !decoded.is_array() {
+                        return Err(input_error("$.actions must contain a complete valid JSON array".into()));
+                    }
+                    input["actions"] = decoded;
+                }
+            }
+        }
         self.lease
             .validate_input(tool_name, &input)
             .map_err(|error| input_error(error.to_string()))?;
@@ -603,6 +625,13 @@ pub(crate) fn decode_persisted_tool_batch_value(
     payload: &str,
 ) -> Result<serde_json::Value, serde_json::Error> {
     decode_persisted_batch_value(payload, PersistedBatchKind::Normal)
+}
+
+#[cfg(feature = "test-fixtures")]
+pub fn decode_persisted_tool_batch_for_test(
+    payload: &str,
+) -> Result<serde_json::Value, serde_json::Error> {
+    decode_persisted_tool_batch_value(payload)
 }
 
 pub(crate) fn decode_persisted_bound_agent_tool_value(
