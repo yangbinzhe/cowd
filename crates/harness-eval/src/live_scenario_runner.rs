@@ -4487,7 +4487,7 @@ impl LiveScenarioRunner {
         let delivery = actor.confirm_terminal_delivery(&terminal_id, turn_id_ref, execution_id_ref);
         let (response_text, delivery_observation) = match delivery {
             Ok(delivery) => (
-                message_text(&json!({"blocks":delivery.blocks})),
+                terminal_answer_text(&delivery.blocks),
                 delivery.observation,
             ),
             Err(error) => (String::new(), json!({"status":"failed","error":error})),
@@ -8718,6 +8718,90 @@ fn message_text(message: &Value) -> String {
         }
     }
     String::new()
+}
+
+/// The terminal answer of a delivered Session message, read by block type.
+///
+/// A Provider is allowed to project a reasoning summary ahead of the answer
+/// block. `message_text` reads the first string under a `text` key whatever
+/// block it belongs to, so a reasoning summary would be handed to the
+/// scenario oracles as if it were the answer. Only a `text` block is the
+/// answer here; a message that carries none has no terminal answer, which
+/// keeps the existing "no durable answer" semantics instead of promoting
+/// reasoning prose into a business answer.
+#[must_use]
+pub(crate) fn terminal_answer_text(blocks: &Value) -> String {
+    blocks
+        .as_array()
+        .and_then(|blocks| {
+            blocks.iter().find(|block| {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+            })
+        })
+        .and_then(|block| block.get("text").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(test)]
+mod terminal_answer_extraction_tests {
+    use super::terminal_answer_text;
+    use serde_json::json;
+
+    /// Positive control, the shape the real 029-a run produced: a reasoning
+    /// summary ahead of the answer block must yield the answer block.
+    #[test]
+    fn a_reasoning_summary_ahead_of_the_answer_still_yields_the_answer() {
+        let blocks = json!([
+            {"type": "reasoning_summary", "text": "The memory was found. Answer in Chinese. Just answer."},
+            {"type": "text", "text": "两个值都已在记忆中找到：仓库代号 WH-1；出库口令 OUT-2"}
+        ]);
+        let answer = terminal_answer_text(&blocks);
+        assert!(
+            answer.contains("WH-1") && answer.contains("OUT-2"),
+            "the answer block must be read: {answer}"
+        );
+        assert!(
+            !answer.contains("Just answer"),
+            "reasoning prose must not be read as the answer: {answer}"
+        );
+    }
+
+    /// Negative control: reasoning alone is not a terminal answer. The
+    /// existing "no durable answer" reading stays, so an unanswered turn is
+    /// never credited with an answer it did not deliver.
+    #[test]
+    fn reasoning_without_an_answer_block_is_not_read_as_an_answer() {
+        let blocks = json!([
+            {"type": "reasoning_summary", "text": "Thinking about it."},
+            {"type": "thinking", "thinking": "private chain of thought"}
+        ]);
+        assert!(terminal_answer_text(&blocks).is_empty());
+    }
+
+    /// Control: the first non-empty `text` block is the answer; tool frames
+    /// and blank text blocks are not.
+    #[test]
+    fn the_first_non_empty_text_block_is_the_answer() {
+        let blocks = json!([
+            {"type": "tool_use", "id": "call-1", "name": "read_file", "input": "{}"},
+            {"type": "text", "text": "   "},
+            {"type": "text", "text": "final answer"}
+        ]);
+        assert_eq!(terminal_answer_text(&blocks), "final answer");
+    }
+
+    /// Control: a payload that is not a block array keeps the historical empty
+    /// reading instead of inventing an answer.
+    #[test]
+    fn a_message_without_answer_blocks_has_no_terminal_answer() {
+        assert_eq!(terminal_answer_text(&json!([])), "");
+        assert_eq!(terminal_answer_text(&json!("not-an-array")), "");
+    }
 }
 
 fn find_string_by_key(value: &Value, keys: &[&str]) -> Option<String> {
