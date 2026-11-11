@@ -250,6 +250,13 @@ pub enum SessionExecutionFenceConjunction {
     ClaimOwner,
     /// The claim is not held under the captured token.
     ClaimToken,
+    /// The captured claim was released while this request was still admitted.
+    ///
+    /// A mid-air release is not a refusal of this request: the admission was
+    /// decided once, and a later release of the claim (the input going back
+    /// to the queue for another worker) must not turn an already admitted
+    /// request into a terminal rejection.
+    ClaimOwnerMidAir,
     /// The claim carries no fence epoch.
     ClaimFenceEpoch,
     /// The input record is not a live claim.
@@ -273,6 +280,12 @@ pub enum SessionExecutionFenceOwnership {
     TakenOver,
     /// The claim fields are absent; the releasing owner is not established.
     Released,
+    /// The claim fields are absent while the request itself is still live.
+    ///
+    /// The input went back to the queue after this request was admitted.  The
+    /// release happened after the admission decision, so it is not evidence
+    /// against this request.
+    ReleasedMidAir,
 }
 
 /// The fence's verdict over one durable input record.
@@ -299,6 +312,22 @@ pub(crate) enum SessionExecutionFenceError {
         phase: SessionExecutionFencePhase,
         message: String,
     },
+}
+
+impl SessionExecutionFenceError {
+    /// Whether this refusal may be retried.
+    ///
+    /// A mid-air release is not a terminal fact about the request: the input
+    /// went back to the queue after this request was admitted, so the same
+    /// work may run again under a fresh admission.  Every other refusal is
+    /// terminal, including the owner's own terminal withdrawal.
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused { verdict, .. }
+                if verdict.ownership == SessionExecutionFenceOwnership::ReleasedMidAir
+        )
+    }
 }
 
 impl std::fmt::Display for SessionExecutionFenceError {
@@ -486,10 +515,24 @@ impl SessionExecutionFence {
             && record.claim_fence_epoch.is_none()
         {
             // Cleared fields alone do not identify which claimant released it.
-            SessionExecutionFenceOwnership::Released
+            //
+            // A release of a record that already reached its terminal state is
+            // the owner's own terminal withdrawal: the request must not run
+            // any more.  A release of a record that is still live is a
+            // mid-air release: the input went back to the queue after this
+            // request was admitted, so the release is not evidence against
+            // this request and must not become a terminal rejection.
+            if record.status.is_terminal() {
+                SessionExecutionFenceOwnership::Released
+            } else {
+                SessionExecutionFenceOwnership::ReleasedMidAir
+            }
         } else {
             SessionExecutionFenceOwnership::TakenOver
         };
+        if ownership == SessionExecutionFenceOwnership::ReleasedMidAir {
+            return refuse(ownership, SessionExecutionFenceConjunction::ClaimOwnerMidAir);
+        }
         if ownership != SessionExecutionFenceOwnership::Live {
             return refuse(ownership, SessionExecutionFenceConjunction::ClaimOwner);
         }
@@ -2541,7 +2584,8 @@ mod tests {
 #[cfg(test)]
 mod fence_verdict_tests {
     use super::{
-        SessionExecutionFenceConjunction, SessionExecutionFenceOwnership,
+        SessionExecutionFenceConjunction, SessionExecutionFenceError,
+        SessionExecutionFenceOwnership, SessionExecutionFencePhase,
         SessionExecutionFenceVerdict,
     };
     use crate::RuntimeSessionInputRecord;
@@ -2685,6 +2729,63 @@ mod fence_verdict_tests {
             verdict.failed,
             Some(SessionExecutionFenceConjunction::ClaimOwner)
         );
+    }
+
+    /// S7 negative control, first edge: the request was admitted while the
+    /// input was live, and the claim was released afterwards - the input went
+    /// back to the queue for another worker.  That release is not evidence
+    /// against this request, so the fence names it as a mid-air release and
+    /// the refusal is retryable.  It must never become the terminal
+    /// `ClaimOwner` rejection that leaves an unknown custody behind.
+    #[test]
+    fn a_mid_air_release_of_a_live_input_is_a_retryable_refusal() {
+        let mut mid_air = live_record();
+        mid_air.status = crate::RuntimeSessionInputStatus::Queued;
+        mid_air.claim_owner = None;
+        mid_air.claim_token = None;
+        mid_air.claim_fence_epoch = None;
+        mid_air.claim_expires_at_ms = None;
+        let verdict = classify(&mid_air);
+        assert_eq!(
+            verdict.ownership,
+            SessionExecutionFenceOwnership::ReleasedMidAir
+        );
+        assert_eq!(
+            verdict.failed,
+            Some(SessionExecutionFenceConjunction::ClaimOwnerMidAir)
+        );
+        let refusal = SessionExecutionFenceError::Refused {
+            phase: SessionExecutionFencePhase::ProviderRequest,
+            verdict,
+            message: "mid-air release".to_string(),
+        };
+        assert!(refusal.is_retryable());
+    }
+
+    /// S7 negative control, second edge: the owner withdrew terminally.  The
+    /// refusal stays terminal and typed - it is not retried, and it is not a
+    /// mid-air release.
+    #[test]
+    fn a_terminal_withdrawal_stays_a_terminal_typed_refusal() {
+        let mut withdrawn = live_record();
+        withdrawn.status = crate::RuntimeSessionInputStatus::Cancelled;
+        withdrawn.claim_owner = None;
+        withdrawn.claim_token = None;
+        withdrawn.claim_fence_epoch = None;
+        withdrawn.claim_expires_at_ms = None;
+        withdrawn.terminal_at_ms = Some(1);
+        let verdict = classify(&withdrawn);
+        assert_eq!(verdict.ownership, SessionExecutionFenceOwnership::Released);
+        assert_eq!(
+            verdict.failed,
+            Some(SessionExecutionFenceConjunction::ClaimOwner)
+        );
+        let refusal = SessionExecutionFenceError::Refused {
+            phase: SessionExecutionFencePhase::ProviderRequest,
+            verdict,
+            message: "terminal withdrawal".to_string(),
+        };
+        assert!(!refusal.is_retryable());
     }
 
     /// Negative control: the in-turn checks still refuse an illegal

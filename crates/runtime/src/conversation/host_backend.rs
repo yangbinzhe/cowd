@@ -4156,12 +4156,32 @@ where
                         }));
                     }
                 }
-                if error.session_execution_fence_error().is_some() {
+                if let Some(fence) = error.session_execution_fence_error() {
                     *self.local_fence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                         Some(error.clone());
-                    return Err(NodeExecutorError::OriginalCustodyUnknown {
-                        node_id: ticket.node_id.clone(), reason: error.to_string(),
-                    });
+                    // A fence refusal is a durable, named fact about this
+                    // request's ownership, not an unknown custody.  The node
+                    // closes on that fact: a mid-air release is retryable,
+                    // because the input went back to the queue after this
+                    // request was admitted, and an owner's terminal
+                    // withdrawal is a typed terminal failure.  Neither leaves
+                    // the original callback custody Unknown.
+                    let retryable = fence.is_retryable();
+                    return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                        status: ExecutionNodeStatus::Failed,
+                        result_ref: None,
+                        wait_class: None,
+                        summary: None,
+                        evidence_refs: Vec::new(),
+                        failure: Some(harness_contract::execution_graph::ExecutionFailure {
+                            kind: "session_execution_fence".into(),
+                            message: error.to_string(),
+                            retryable,
+                            evidence_refs: Vec::new(),
+                        }),
+                        usage: ExecutionUsage::default(),
+                        finished_at_ms: user_application_clock(),
+                    }));
                 }
                 // A provider failure is execution evidence, not an implicit
                 // graph terminal. Preserve it and let the same Goal policy

@@ -63,6 +63,29 @@ pub enum RuntimeSessionInputStatus {
     Expired,
 }
 
+impl RuntimeSessionInputStatus {
+    /// Whether this status is a terminal state of the input.
+    ///
+    /// A terminal input is closed: its owner withdrew or finished it, and no
+    /// further work may run under it.  A live input that lost its claim is a
+    /// different fact - the input went back to the queue - and must not be
+    /// read as a terminal withdrawal.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::Supplemented
+                | Self::Failed
+                | Self::Blocked
+                | Self::Cancelled
+                | Self::Expired
+                | Self::RejectedDuplicate
+                | Self::RejectedPolicy
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSessionInputRecord {
     pub input_id: String,
