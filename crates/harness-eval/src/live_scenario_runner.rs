@@ -9309,9 +9309,20 @@ mod read_evidence_consumer_tests {
     }
 
     fn timeline() -> Value {
+        // A durable Outcome event carries the verified business conclusion.
+        // Without it the business verdict is Unknown, so a synthetic success
+        // event has to state the durable conclusion it is standing for: a
+        // satisfied verdict, the committed terminal conclusion, and an
+        // acceptance evaluation whose obligation ledger is Evaluated with an
+        // empty unresolved set.  Only the fixture changes here - the consumer
+        // predicates keep the S6 invariant that an unreadable verified
+        // conclusion is Unknown, never a success.
         json!({"events":[{
             "kind":"runtime.outcome.recorded.v1","status":"succeeded",
-            "payload":{"identity":{"execution_graph_ref":"graph","execution_scope":"session"},"terminal":{"class":"succeeded"}}
+            "payload":{"identity":{"execution_graph_ref":"graph","execution_scope":"session"},"terminal":{"class":"succeeded"},
+                      "verified":{"verdict":"satisfied","reason":"satisfied",
+                                  "basis":[{"kind":"goal_conclusion","reference":"synthesize:graph"},
+                                           {"kind":"acceptance_evaluation","reference":"satisfied"}]}}
         }]})
     }
 
