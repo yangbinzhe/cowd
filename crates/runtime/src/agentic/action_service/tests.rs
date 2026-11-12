@@ -4947,3 +4947,171 @@ fn original_member_error_categories_never_include_error_details() {
     assert_eq!(error.fixed_kind(), "member_cancelled");
     assert_eq!(error.fixed_store_kind(), None);
 }
+
+#[test]
+fn l1_existing_agent_ref_gate_rejects_definition_ref_with_durable_candidates() {
+    use crate::execution_core::graph::{
+        ExecutionCommitService, ExecutionGraphStateStore, ExecutionNodeBinding,
+        NodeExecutionTicket,
+    };
+    use harness_contract::execution_graph::{
+        ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+        ExecutionNodeStatus,
+    };
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let graphs = ExecutionGraphStateStore::new(Arc::clone(&store));
+    let service = AgentActionService::new(Arc::clone(&store)).with_graph_store(graphs);
+    let mut graph = ExecutionGraph::new("L1 ref gate").with_lineage(ExecutionGraphLineage {
+        session_id: "session-1".into(),
+        turn_id: "turn-l1-ref".into(),
+        root_task_id: "task:l1".into(),
+        task_id: "task:l1".into(),
+        generation: 1,
+    });
+    graph.nodes.push(ExecutionNodeSpec {
+        id: "l1-node".into(),
+        kind: ExecutionNodeKind::InlineModel,
+        payload_ref: "payload:l1".into(),
+        executor_kind: "l1-test".into(),
+        idempotency_key: "l1:attempt".into(),
+        lease_ref: None,
+        acceptance: Default::default(),
+        retry_policy: Default::default(),
+        resource_scopes: Vec::new(),
+        work: None,
+    });
+    let commits = ExecutionCommitService::new(Arc::clone(&store));
+    let graph = commits.register_graph(graph).unwrap().graph;
+    let graph = commits
+        .transition_node(&graph, "l1-node", ExecutionNodeStatus::Ready, None, Vec::new())
+        .unwrap()
+        .graph;
+    let binding = ExecutionNodeBinding {
+        executor_kind: "l1-test".into(),
+        ticket_idempotency_key: "l1:attempt".into(),
+        attempt: 1,
+        resource_lease_refs: Vec::new(),
+        scope_lease_ref: None,
+        worktree_lease_ref: None,
+    };
+    let graph = commits
+        .bind_and_start_nodes(
+            &graph,
+            std::collections::BTreeMap::from([("l1-node".into(), binding.clone())]),
+            vec![NodeExecutionTicket {
+                graph_id: graph.id.clone(),
+                node_id: "l1-node".into(),
+                executor_kind: "l1-test".into(),
+                service_class: graph.service_class,
+                attempt: 1,
+                idempotency_key: "l1:attempt".into(),
+                payload_ref: "payload:l1".into(),
+            }],
+        )
+        .unwrap()
+        .graph;
+    ExecutionGraphStateStore::new(Arc::clone(&store))
+        .binding_start_ticket(&graph, "l1-node", &binding)
+        .unwrap();
+    let objective = harness_contract::agent_action::root_objective_id("session-1", "turn-l1-ref");
+    let program = harness_contract::agent_action::program_id_for_objective(&objective);
+    let l1 = |action_id: &str, action| {
+        let mut envelope = root_in_turn("turn-l1-ref", action_id, action);
+        envelope.actor.actor_id = "root:session-1".into();
+        envelope.actor.objective_id = objective.clone();
+        envelope.actor.program_id = program.clone();
+        envelope.actor.root_execution_id = Some(graph.id.clone());
+        envelope.actor.original_execution = Some(
+            harness_contract::agent_action::OriginalAgentExecution {
+                graph_id: graph.id.clone(),
+                node_id: "l1-node".into(),
+                attempt: 1,
+            },
+        );
+        envelope
+    };
+    let team = service
+        .apply(&l1(
+            "l1-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Builders".into(),
+                mission: "build".into(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let mut durable = Vec::new();
+    for index in 0..2 {
+        let input: AgentInviteInput = serde_json::from_value(json!({
+            "team_ref": team, "role": "Builder", "mission": "build",
+            "required_capabilities": ["read"]
+        }))
+        .unwrap();
+        durable.push(
+            service
+                .apply(&l1(
+                    &format!("l1-agent-{index}"),
+                    AgentAction::AgentInvite(input),
+                ))
+                .expect("invite")
+                .changed_refs[0]
+                .clone(),
+        );
+    }
+    let before = service.project_snapshot(&program).unwrap().revision;
+    let placeholder: AgentInviteInput = serde_json::from_value(json!({
+        "team_ref": team, "role": "Reuse", "mission": "build",
+        "required_capabilities": ["read"],
+        "existing_agent_ref": "builtin/cowd/autonomous"
+    }))
+    .unwrap();
+    let denied = service
+        .apply(&l1("l1-placeholder", AgentAction::AgentInvite(placeholder)))
+        .expect("placeholder invite")
+        .clone();
+    assert_eq!(denied.status, AgentActionStatus::Rejected);
+    let error = denied.error.expect("the refusal is named");
+    assert_eq!(error.code, "unknown_existing_agent_ref");
+    assert!(
+        error.message.contains(&durable[0]) && error.message.contains(&durable[1]),
+        "{error:?}"
+    );
+    assert!(
+        error.message.contains("Definition ids, not invite references"),
+        "{error:?}"
+    );
+    assert_eq!(service.project_snapshot(&program).unwrap().revision, before);
+    // L1b (e2 ②): a blank-but-present ref is refused by name too, not silently
+    // converted into a create-new invite.
+    let blank: AgentInviteInput = serde_json::from_value(json!({
+        "team_ref": team, "role": "Reuse", "mission": "build",
+        "required_capabilities": ["read"],
+        "existing_agent_ref": "   "
+    }))
+    .unwrap();
+    let blank_denied = service
+        .apply(&l1("l1-blank", AgentAction::AgentInvite(blank)))
+        .expect("blank invite");
+    assert_eq!(blank_denied.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        blank_denied.error.expect("named").code,
+        "unknown_existing_agent_ref"
+    );
+    assert_eq!(service.project_snapshot(&program).unwrap().revision, before);
+    let reuse: AgentInviteInput = serde_json::from_value(json!({
+        "team_ref": team, "role": "Reuse", "mission": "build",
+        "required_capabilities": ["read"],
+        "existing_agent_ref": durable[0]
+    }))
+    .unwrap();
+    let accepted = service
+        .apply(&l1("l1-reuse", AgentAction::AgentInvite(reuse)))
+        .expect("reuse invite");
+    assert_eq!(accepted.status, AgentActionStatus::Applied);
+    // The refusal removed the poison: no `builtin/…` key can enter the
+    // projection, so a later publish can never block on it as an effect.
+    let projection = service.project_snapshot(&program).unwrap();
+    assert!(!projection.agents.keys().any(|key| key.starts_with("builtin/")));
+}

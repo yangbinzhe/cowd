@@ -3717,6 +3717,54 @@ impl AgentActionService {
             ));
         }
 
+        // ── L1: `existing_agent_ref` must resolve to a durable Agent ────────
+        // The runnable catalog publishes Definition ids like
+        // `builtin/cowd/<tool>`, and a model can pass one as an invite's
+        // `existing_agent_ref`. The invite then effects under that raw string,
+        // while Program certification parses entity ids as `kind:id` against a
+        // known kind set - `builtin` never carries, so a later publish batch
+        // on the same node blocks as `effect_completion_uncertain` with
+        // `retryable: false` and the run stalls before review can exist.
+        // Reject the unresolvable ref before any durable write, naming the
+        // Agents the Program actually has so the model can self-correct;
+        // never rewrite a reference on the model's behalf.
+        if let AgentAction::AgentInvite(input) = &envelope.action {
+            if let Some(provided) = input.existing_agent_ref.as_deref() {
+                // L1b (e2 ②): a blank-but-present ref is the model's own malformed
+                // input, not an intent to create; never silently convert it.
+                let reference = provided.trim();
+                if reference.is_empty() {
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "unknown_existing_agent_ref",
+                        "`existing_agent_ref` is blank; omit the field to invite a new Agent",
+                    ));
+                }
+                if !projection.agents.contains_key(reference) {
+                    let mut known = projection.agents.keys().cloned().collect::<Vec<_>>();
+                    known.sort();
+                    let listed = if known.is_empty() {
+                        "no Agent exists in this Program yet; invite a new Agent by omitting `existing_agent_ref`".to_string()
+                    } else {
+                        known.truncate(8);
+                        format!(
+                            "durable Agents in this Program: {}; catalog entries such as `builtin/cowd/<tool>` are Definition ids, not invite references",
+                            known.join(", ")
+                        )
+                    };
+                    return Ok(rejected(
+                        envelope,
+                        projection.revision,
+                        "unknown_existing_agent_ref",
+                        &format!(
+                            "`existing_agent_ref` {reference} matches no Agent of this Program; {listed}"
+                        ),
+                    ));
+                }
+            }
+        }
+
         // ── Idempotency gate ────────────────────────────────────────────────
         // An already-Accepted Task is closed. Re-reviewing or re-submitting it
         // burns a provider round and an event without changing any fact. A live
