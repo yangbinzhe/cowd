@@ -1901,6 +1901,151 @@ pub(super) async fn resolve_material(
     )
 }
 
+/// One pinned source, classified against the window this review already pinned.
+enum SourcePinJudgment {
+    /// The head is admissible: this is the window the review pins.
+    Pinned(u64),
+    /// The head moved against the pinned window, naming both revisions.
+    Refused {
+        movement: ReviewSourceMovement,
+        pinned_cut: u64,
+        observed_head: u64,
+    },
+}
+
+/// The single place that decides whether a source head still matches a review's
+/// pinned window.
+///
+/// The refusal sentence and the rebuild ticket both come out of here, so a
+/// rebuild can never disagree with the refusal it is rebuilding from.
+///
+/// A head that moved backwards is a truncated or replaced stream, and growth on
+/// any source this review judges is the object under review moving. Only growth
+/// on a shared aggregate stream is another actor appending while this review
+/// reads, which leaves the pinned window unchanged.
+fn judge_source_head(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    source: &str,
+    cuts: &std::collections::BTreeMap<String, u64>,
+) -> Result<SourcePinJudgment, String> {
+    let revision = reader
+        .stream_revision(source)
+        .map_err(|error| error.to_string())?;
+    let Some(previous) = cuts.get(source).copied() else {
+        return Ok(SourcePinJudgment::Pinned(revision));
+    };
+    if revision < previous {
+        return Ok(SourcePinJudgment::Refused {
+            movement: ReviewSourceMovement::Backwards,
+            pinned_cut: previous,
+            observed_head: revision,
+        });
+    }
+    if revision != previous && !super::repin_accepts_moved_head(source, previous, revision) {
+        return Ok(SourcePinJudgment::Refused {
+            movement: ReviewSourceMovement::ForwardNotAccepted,
+            pinned_cut: previous,
+            observed_head: revision,
+        });
+    }
+    Ok(SourcePinJudgment::Pinned(revision))
+}
+
+/// The refusal sentence for one movement. Both resolution-time shapes keep the
+/// wording the pin has produced since A2f, character for character.
+fn source_refusal_sentence(
+    movement: ReviewSourceMovement,
+    source: &str,
+    pinned_cut: u64,
+    observed_head: u64,
+) -> String {
+    let lead = match movement {
+        ReviewSourceMovement::Backwards => {
+            "result metadata source moved backwards during resolution"
+        }
+        ReviewSourceMovement::ForwardNotAccepted => {
+            "result metadata source changed during resolution"
+        }
+    };
+    format!("{lead}; rebuild the review; source={source} expected={pinned_cut} actual={observed_head} phase=result_source_pin")
+}
+
+/// Whether a source head still leaves the result package self-consistent inside
+/// the cut it pinned.
+///
+/// The package can only cite what it read, and every read here is bounded by the
+/// pinned cut: `result_source_events` pages a stream strictly below that cut and
+/// validates its per-source sequence, and `result_source_events_at_session_cut`
+/// reads the original material cut against the independently authenticated head.
+/// A shared aggregate that grew above the pinned cut therefore added nothing this
+/// review can cite. Demanding the live head equal the pinned cut turned a busy
+/// Session into an unresolvable review: the 030 T7 stalled frames (2458/2482,
+/// 889/905, 1831/1849, each after three rebuilds) all named `source=session:...`.
+///
+/// What still refuses is what always refused. A head that is not the pinned cut
+/// and not admissible growth is a truncated or replaced stream, so the material
+/// already cited may no longer be there; and on a source this review judges,
+/// growth is the object under review moving, which the earlier work proved must
+/// not be absorbed.
+pub(crate) fn result_cut_remains_consistent(
+    source: &str,
+    pinned_cut: u64,
+    observed_head: u64,
+) -> bool {
+    observed_head == pinned_cut
+        || super::repin_accepts_moved_head(source, pinned_cut, observed_head)
+}
+
+/// The result package's closing cut fence over every source it pinned.
+fn verify_result_package_cuts(
+    store: &crate::RuntimeEventStore,
+    reference: &str,
+    cuts: &std::collections::BTreeMap<String, u64>,
+) -> Result<(), String> {
+    for (source, expected) in cuts {
+        let observed = store
+            .stream_revision(source)
+            .map_err(|error| error.to_string())?;
+        if result_cut_remains_consistent(source, *expected, observed) {
+            continue;
+        }
+        return Err(format!(
+            "result metadata changed after original effect enumeration: result={reference} source={source} expected={expected} observed={observed}; rebuild the review"
+        ));
+    }
+    Ok(())
+}
+
+/// Fold the actual-input phase's cuts into the package's own cuts.
+///
+/// The published value is the later of the two, which is what keeps the promise
+/// every consumer relies on: a published cut is never below a revision this
+/// review actually read. A cut that shrank, or any movement on a source the
+/// review judges, still refuses with the sentence this path has always produced.
+///
+/// Every entry is judged before anything is written. The caller aborts the whole
+/// resolution on refusal, and the next attempt re-pins from durable facts, so a
+/// refused merge leaving a half-folded map behind would be a mutated hint with no
+/// owner - the write is all of it or none of it.
+fn merge_actual_input_cuts(
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+    actual: &std::collections::BTreeMap<String, u64>,
+) -> Result<(), String> {
+    for (source, revision) in actual {
+        if let Some(previous) = cuts.get(source).copied() {
+            if !result_cut_remains_consistent(source, previous, *revision) {
+                return Err("actual result input source moved during enumeration".into());
+            }
+        }
+    }
+    for (source, revision) in actual {
+        if !cuts.get(source).is_some_and(|previous| *previous >= *revision) {
+            cuts.insert(source.clone(), *revision);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn pin_result_source(
     store: &crate::RuntimeEventStore,
     source: &str,
@@ -1918,27 +2063,315 @@ pub(super) fn pin_result_source_with_reader(
     source: &str,
     cuts: &mut std::collections::BTreeMap<String, u64>,
 ) -> Result<u64, String> {
-    let revision = reader
-        .stream_revision(source)
-        .map_err(|error| error.to_string())?;
-    if let Some(previous) = cuts.get(source).copied() {
-        // A head that moved backwards is a truncated or replaced stream, and
-        // growth on any source this review judges is the object under review
-        // moving. Only growth on a shared aggregate stream is another actor
-        // appending while this review reads, which leaves the pinned window
-        // unchanged.
-        if revision < previous {
-            return Err(format!(
-                "result metadata source moved backwards during resolution; rebuild the review; source={source} expected={previous} actual={revision} phase=result_source_pin"
-            ));
+    match judge_source_head(reader, source, cuts)? {
+        SourcePinJudgment::Pinned(revision) => {
+            cuts.insert(source.to_string(), revision);
+            Ok(revision)
         }
-        if revision != previous && !super::repin_accepts_moved_head(source, previous, revision) {
-            return Err(format!(
-                "result metadata source changed during resolution; rebuild the review; source={source} expected={previous} actual={revision} phase=result_source_pin"
-            ));
+        SourcePinJudgment::Refused { movement, pinned_cut, observed_head } => Err(
+            source_refusal_sentence(movement, source, pinned_cut, observed_head),
+        ),
+    }
+}
+
+/// Which way the authoritative head moved against the window a review pinned.
+///
+/// Both shapes are the resolution-time refusals this pin has always produced,
+/// and only their names decide whether a rebuild may open a window: growth on a
+/// source the review judges can be re-read at a fresh head, a head that moved
+/// backwards cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSourceMovement {
+    /// The stream truncated or was replaced: its head fell below the pin.
+    Backwards,
+    /// The head grew on a source this review judges, not a shared aggregate.
+    ForwardNotAccepted,
+}
+
+impl ReviewSourceMovement {
+    /// Whether a refusal of this shape may be rebuilt at a fresh head at all.
+    ///
+    /// A head that moved backwards means the material the reviewer read may no
+    /// longer be there, so re-reading at "whatever the head is now" would
+    /// resolve the review against a window nobody observed. That shape settles
+    /// on its original refusal instead of rebuilding.
+    pub(crate) fn rebuildable(self) -> bool {
+        matches!(self, Self::ForwardNotAccepted)
+    }
+}
+
+/// The named rebuild record a refused source pin produces.
+///
+/// Before this record existed, a refusal travelled only as a sentence. That
+/// sentence already named the source, the pinned cut and the head, but nothing
+/// bound it to the review that had been refused: the runner could not tell
+/// which ticket and attempt to rebuild, nor prove that a rebuild re-read the
+/// same source it was refused on instead of quietly choosing a wider window.
+/// The ticket carries exactly that: original ticket, original attempt, original
+/// pinned cut, and the head the store reported at refusal time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewRepinTicket {
+    review_ref: String,
+    attempt: u32,
+    source: String,
+    pinned_cut: u64,
+    observed_head: u64,
+    movement: ReviewSourceMovement,
+}
+
+impl ReviewRepinTicket {
+    pub(crate) fn review_ref(&self) -> &str {
+        &self.review_ref
+    }
+    pub(crate) fn attempt(&self) -> u32 {
+        self.attempt
+    }
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+    pub(crate) fn pinned_cut(&self) -> u64 {
+        self.pinned_cut
+    }
+    pub(crate) fn observed_head(&self) -> u64 {
+        self.observed_head
+    }
+    pub(crate) fn movement(&self) -> ReviewSourceMovement {
+        self.movement
+    }
+
+    /// The identity a bounded rebuild budget counts refusals against: the same
+    /// review ticket and attempt refusing twice is the signal to settle on a
+    /// named Unknown rather than to rebuild a third time.
+    pub(crate) fn lineage(&self) -> (&str, u32) {
+        (self.review_ref.as_str(), self.attempt)
+    }
+
+    /// The refusal sentence. For the two resolution-time shapes this is the
+    /// wording the pin has always produced, so the propagated reason does not
+    /// change shape when a ticket exists alongside it.
+    pub(crate) fn reason(&self) -> String {
+        source_refusal_sentence(self.movement, &self.source, self.pinned_cut, self.observed_head)
+    }
+
+    /// Rebuild the ticket from a propagated refusal reason, bound to the review
+    /// ticket and attempt the caller is resolving.
+    ///
+    /// Strict by construction: the reason has to match this grammar exactly, and
+    /// anything else yields `None`, so a rebuild never runs on a guess and a
+    /// rebuild-time refusal (which is not a fresh rebuild request) cannot be
+    /// laundered into another rebuild.
+    pub(crate) fn from_refusal(review_ref: &str, attempt: u32, reason: &str) -> Option<Self> {
+        let (movement, rest) = if let Some(rest) =
+            reason.strip_prefix("result metadata source moved backwards during resolution; rebuild the review; source=")
+        {
+            (ReviewSourceMovement::Backwards, rest)
+        } else if let Some(rest) =
+            reason.strip_prefix("result metadata source changed during resolution; rebuild the review; source=")
+        {
+            (ReviewSourceMovement::ForwardNotAccepted, rest)
+        } else {
+            return None;
+        };
+        let (source, rest) = rest.split_once(" expected=")?;
+        let (pinned_cut, rest) = rest.split_once(" actual=")?;
+        let (observed_head, tail) = rest.split_once(" phase=result_source_pin")?;
+        if !tail.is_empty() || source.is_empty() {
+            return None;
+        }
+        Some(Self {
+            review_ref: review_ref.to_string(),
+            attempt,
+            source: source.to_string(),
+            pinned_cut: pinned_cut.parse().ok()?,
+            observed_head: observed_head.parse().ok()?,
+            movement,
+        })
+    }
+}
+
+/// The one way a review names the node whose source it is pinning.
+///
+/// Every pin site has to hand over the same identity or a bounded rebuild
+/// budget would count two refusals of the same review as one of it and one of
+/// something else, so the format lives here rather than at each call site.
+pub(crate) fn node_review_ref(graph_id: &str, node_id: &str) -> String {
+    format!("{graph_id}/{node_id}")
+}
+
+/// Why one pin or rebuild request did not get a window, named per shape.
+///
+/// The rebuild side has to tell these apart: a window that moved again is a
+/// budget question, an unreadable store is not a review verdict at all, and a
+/// ticket belonging to another review ticket or attempt is a dispatch bug.
+/// Collapsing them into one sentence is what made the old refusal impossible to
+/// act on, so each shape keeps its own wording here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RepinRejection {
+    /// The pin refused this source: its head moved while the review read it.
+    Refused(ReviewRepinTicket),
+    /// A backwards head is not a rebuildable window; the review keeps its
+    /// original refusal instead of re-reading at a head nobody observed.
+    NotRebuildable(ReviewRepinTicket),
+    /// The refused ticket belongs to another review ticket or attempt.
+    Identity {
+        refused: ReviewRepinTicket,
+        review_ref: String,
+        attempt: u32,
+    },
+    /// The map does not pin the window this ticket refused on.
+    Window { refused: ReviewRepinTicket, pinned: u64 },
+    /// The store's head fell behind the head the refusal reported.
+    BehindHead { refused: ReviewRepinTicket, head: u64 },
+    /// The store could not report a head for the refused source at all.
+    Unavailable(String),
+}
+
+impl RepinRejection {
+    /// The reason to propagate. `Refused` and `NotRebuildable` render the
+    /// sentence the pin has always produced, so wiring the ticket into a call
+    /// site changes no wording on either refusal path.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::Refused(ticket) | Self::NotRebuildable(ticket) => ticket.reason(),
+            Self::Identity { refused, review_ref, attempt } => format!(
+                "review rebuild ticket belongs to another review; source={} expected={}#{} actual={review_ref}#{attempt} movement=identity-mismatch phase=result_source_repin",
+                refused.source, refused.review_ref, refused.attempt
+            ),
+            Self::Window { refused, pinned } => format!(
+                "review rebuild ticket does not name the pinned window; source={} expected={} actual={pinned} movement=window-mismatch phase=result_source_repin",
+                refused.source, refused.pinned_cut
+            ),
+            Self::BehindHead { refused, head } => format!(
+                "review rebuild head is behind the refused head; source={} expected={} actual={head} movement=head-behind-refused-head phase=result_source_repin",
+                refused.source, refused.observed_head
+            ),
+            Self::Unavailable(error) => error.clone(),
         }
     }
-    cuts.insert(source.to_string(), revision);
+
+    /// The refused ticket, whenever this rejection is about a window at all.
+    pub(crate) fn ticket(&self) -> Option<&ReviewRepinTicket> {
+        match self {
+            Self::Refused(ticket) | Self::NotRebuildable(ticket) => Some(ticket),
+            Self::Identity { refused, .. }
+            | Self::Window { refused, .. }
+            | Self::BehindHead { refused, .. } => Some(refused),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// The pin for one named review ticket and attempt: the same judgment, but a
+/// refusal comes back as a rebuild ticket instead of only a sentence.
+pub(crate) fn pin_result_source_ticketed(
+    store: &crate::RuntimeEventStore,
+    review_ref: &str,
+    attempt: u32,
+    source: &str,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, RepinRejection> {
+    pin_result_source_ticketed_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        review_ref,
+        attempt,
+        source,
+        cuts,
+    )
+}
+
+pub(crate) fn pin_result_source_ticketed_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    review_ref: &str,
+    attempt: u32,
+    source: &str,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, RepinRejection> {
+    match judge_source_head(reader, source, cuts) {
+        Ok(SourcePinJudgment::Pinned(revision)) => {
+            cuts.insert(source.to_string(), revision);
+            Ok(revision)
+        }
+        Ok(SourcePinJudgment::Refused { movement, pinned_cut, observed_head }) => Err(
+            RepinRejection::Refused(ReviewRepinTicket {
+                review_ref: review_ref.to_string(),
+                attempt,
+                source: source.to_string(),
+                pinned_cut,
+                observed_head,
+                movement,
+            }),
+        ),
+        Err(error) => Err(RepinRejection::Unavailable(error)),
+    }
+}
+
+/// Open the rebuild window for one refused review source.
+///
+/// Three rules are deliberate. There is no `cut` parameter: the window comes from
+/// the store, so a caller cannot report a head, and every read the rebuilt
+/// review makes still goes through the original authority rules - a Session
+/// material cut above the durable head is still refused
+/// (`HistoricalSessionCut::for_live_material`), and growth inside the new window
+/// is still refused by the ordinary pin. A rebuild may only move forward: a head
+/// that has fallen behind the head the refusal reported means the stream was
+/// truncated or replaced, so the material that review read is no longer there.
+/// The third rule is that the window is only ever opened for the review ticket
+/// and attempt the refusal was bound to.
+///
+/// This entry does not absorb the growth it refused, and it does not widen what
+/// a review may cite beyond the head the store itself reported at rebuild time.
+/// A second movement is refused again by the ordinary pin, which produces a
+/// second ticket on the same lineage; the caller's bounded rebuild budget then
+/// decides when the review settles to a named Unknown.
+pub(crate) fn repin_at_fresh_head(
+    store: &crate::RuntimeEventStore,
+    review_ref: &str,
+    attempt: u32,
+    ticket: &ReviewRepinTicket,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, RepinRejection> {
+    repin_at_fresh_head_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        review_ref,
+        attempt,
+        ticket,
+        cuts,
+    )
+}
+
+pub(crate) fn repin_at_fresh_head_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    review_ref: &str,
+    attempt: u32,
+    ticket: &ReviewRepinTicket,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, RepinRejection> {
+    if ticket.review_ref != review_ref || ticket.attempt != attempt {
+        return Err(RepinRejection::Identity {
+            refused: ticket.clone(),
+            review_ref: review_ref.to_string(),
+            attempt,
+        });
+    }
+    if !ticket.movement.rebuildable() {
+        // A backwards head is a truncated or replaced stream. The rebuild would
+        // resolve the review at a head nobody observed, so the original refusal
+        // stands and the caller settles the review instead of rebuilding.
+        return Err(RepinRejection::NotRebuildable(ticket.clone()));
+    }
+    if let Some(pinned) = cuts.get(ticket.source.as_str()).copied() {
+        if pinned != ticket.pinned_cut {
+            return Err(RepinRejection::Window { refused: ticket.clone(), pinned });
+        }
+    }
+    let revision = match reader.stream_revision(ticket.source.as_str()) {
+        Ok(revision) => revision,
+        Err(error) => return Err(RepinRejection::Unavailable(error)),
+    };
+    if revision < ticket.observed_head {
+        return Err(RepinRejection::BehindHead { refused: ticket.clone(), head: revision });
+    }
+    cuts.insert(ticket.source.clone(), revision);
     Ok(revision)
 }
 
@@ -4251,16 +4684,7 @@ pub(super) fn resolve_result_metadata_for_phase(
         ));
     }
 
-    for (source, expected) in &cuts {
-        let observed = store
-            .stream_revision(source)
-            .map_err(|error| error.to_string())?;
-        if observed != *expected {
-            return Err(format!(
-                "result metadata changed after original effect enumeration: result={reference} source={source} expected={expected} observed={observed}; rebuild the review"
-            ));
-        }
-    }
+    verify_result_package_cuts(store, reference, &cuts)?;
     for run in process_runs_for_boundaries(store, &resolved.input_boundaries, &mut cuts)? {
         if !resolved
             .process_runs
@@ -4279,14 +4703,7 @@ pub(super) fn resolve_result_metadata_for_phase(
         allow_history_growth,
         session_tail,
     )?;
-    for (source, revision) in &actual.sources {
-        if cuts
-            .insert(source.clone(), *revision)
-            .is_some_and(|previous| previous != *revision)
-        {
-            return Err("actual result input source moved during enumeration".into());
-        }
-    }
+    merge_actual_input_cuts(&mut cuts, &actual.sources)?;
     resolved.primary_inputs = actual.immutable_inputs;
 
     resolved.effect_sources = cuts
@@ -7254,5 +7671,150 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    /// 030 T7 control ①: a busy Session. The result package's closing cut fence is
+    /// self-consistency inside the pinned cut, not equality with the live head,
+    /// because every read here is bounded by that cut and cannot have cited the
+    /// events that arrived after it.
+    #[test]
+    fn t7_a_session_that_kept_appending_leaves_the_package_consistent() {
+        let store = crate::RuntimeEventStore::for_test();
+        let busy = "session:busy-t7";
+        let append = |key: &str| crate::RuntimeEventInput {
+            stream_id: busy.into(),
+            scope: crate::RuntimeEventScope::Session,
+            kind: "test.session-append".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({"key": key}),
+        };
+        for key in ["one", "two", "three"] {
+            store.append(append(key)).unwrap();
+        }
+        let mut cuts = std::collections::BTreeMap::new();
+        cuts.insert(busy.to_string(), store.stream_revision(busy).unwrap());
+        assert_eq!(cuts[busy], 3);
+        // The Session keeps growing while this review is still resolving.
+        for key in ["four", "five"] {
+            store.append(append(key)).unwrap();
+        }
+        super::verify_result_package_cuts(&store, "artifact:t7", &cuts)
+            .expect("growth above the pinned cut cites nothing this review read");
+        assert_eq!(cuts[busy], 3, "the fence does not chase the head: the cut stays put");
+        super::verify_result_package_cuts(&store, "artifact:t7", &cuts)
+            .expect("the fence is idempotent while the aggregate keeps appending");
+    }
+
+    /// 030 T7 control ②: the movement this fence must still refuse, with the
+    /// sentence it has always produced.
+    #[test]
+    fn t7_true_drift_is_still_refused_with_the_original_sentence() {
+        let store = crate::RuntimeEventStore::for_test();
+        let judged = "agentic-program:judged-t7";
+        let append = || crate::RuntimeEventInput {
+            stream_id: judged.into(),
+            scope: crate::RuntimeEventScope::Session,
+            kind: "test.judged-append".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({}),
+        };
+        store.append(append()).unwrap();
+        store.append(append()).unwrap();
+        let mut cuts = std::collections::BTreeMap::new();
+        cuts.insert(judged.to_string(), 2);
+        // The object under review itself moved: never a busy aggregate.
+        store.append(append()).unwrap();
+        let error = super::verify_result_package_cuts(&store, "artifact:t7", &cuts)
+            .expect_err("growth of a judged source is refused, not rebuilt around");
+        assert_eq!(
+            error,
+            "result metadata changed after original effect enumeration: result=artifact:t7 source=agentic-program:judged-t7 expected=2 observed=3; rebuild the review"
+        );
+        // A pinned cut above the durable head is a fabricated window or a
+        // truncated stream, on every source class.
+        for source in [judged, "session:busy-t7"] {
+            let mut beyond = std::collections::BTreeMap::new();
+            beyond.insert(source.to_string(), 9_999);
+            assert!(
+                super::verify_result_package_cuts(&store, "artifact:t7", &beyond).is_err(),
+                "a pinned cut above the head must still refuse: {source}"
+            );
+        }
+    }
+
+    /// 030 T7: both closing fences share one judgment, so the source classes and
+    /// movement directions decide identically for them.
+    #[test]
+    fn t7_the_shared_judgment_covers_every_source_class_and_movement() {
+        for source in [
+            "session:one",
+            "execution-lineage:one",
+            "agentic-graph:one",
+            "session-ingress-graph:one",
+        ] {
+            assert!(super::result_cut_remains_consistent(source, 4, 4), "{source} unchanged");
+            assert!(super::result_cut_remains_consistent(source, 4, 5), "{source} aggregate growth");
+            assert!(!super::result_cut_remains_consistent(source, 4, 3), "{source} backwards");
+        }
+        for source in [
+            "agentic-program:one",
+            "goal:one",
+            "execution-effect:one",
+            "execution-agent-receipts:graph:node:1",
+            "artifact:one",
+        ] {
+            assert!(super::result_cut_remains_consistent(source, 4, 4), "{source} unchanged");
+            assert!(!super::result_cut_remains_consistent(source, 4, 5), "{source} judged growth");
+            assert!(!super::result_cut_remains_consistent(source, 4, 3), "{source} backwards");
+        }
+    }
+
+    /// 030 T7: merging the actual-input phase publishes the later cut - a published
+    /// cut must never sit below a revision this review read - and still refuses a
+    /// cut that shrank or a judged source that moved.
+    #[test]
+    fn t7_the_actual_input_merge_publishes_the_later_cut_only_for_aggregates() {
+        let aggregate = "session:merge-t7";
+        let mut cuts = std::collections::BTreeMap::new();
+        cuts.insert(aggregate.to_string(), 2_458);
+        let mut actual = std::collections::BTreeMap::new();
+        actual.insert(aggregate.to_string(), 2_482);
+        super::merge_actual_input_cuts(&mut cuts, &actual)
+            .expect("a busy Session's later cut covers both phases' reads");
+        assert_eq!(cuts[aggregate], 2_482);
+        let mut shrunk = std::collections::BTreeMap::new();
+        shrunk.insert(aggregate.to_string(), 2_000);
+        assert_eq!(
+            super::merge_actual_input_cuts(&mut cuts, &shrunk)
+                .expect_err("a cut that moved backwards is a replaced stream"),
+            "actual result input source moved during enumeration"
+        );
+        assert_eq!(cuts[aggregate], 2_482, "a refused merge rewrites nothing");
+        // Atomicity across entries: the foldable entry sorts first, so a
+        // half-folded map would show its new value even though the merge refused.
+        let foldable = "agentic-graph:merge-t7";
+        let mut pair = std::collections::BTreeMap::new();
+        pair.insert(foldable.to_string(), 6_u64);
+        pair.insert(aggregate.to_string(), 2_482_u64);
+        let mut incoming = std::collections::BTreeMap::new();
+        incoming.insert(foldable.to_string(), 9_u64);
+        incoming.insert(aggregate.to_string(), 2_400_u64);
+        assert!(super::merge_actual_input_cuts(&mut pair, &incoming).is_err());
+        assert_eq!(pair[foldable], 6, "a refused merge does not fold the entry before it");
+        assert_eq!(pair[aggregate], 2_482);
+        let judged = "execution-effect:merge-t7";
+        let mut judged_cuts = std::collections::BTreeMap::new();
+        judged_cuts.insert(judged.to_string(), 4);
+        let mut judged_actual = std::collections::BTreeMap::new();
+        judged_actual.insert(judged.to_string(), 5);
+        assert_eq!(
+            super::merge_actual_input_cuts(&mut judged_cuts, &judged_actual)
+                .expect_err("the object under review moving still refuses"),
+            "actual result input source moved during enumeration"
+        );
     }
 }

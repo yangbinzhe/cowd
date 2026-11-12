@@ -3160,7 +3160,10 @@ fn r357_retained_request9_cut_replays_under_the_unchanged_byte_limit() -> anyhow
 fn r6_refused_api_preserves_actual_path_status_and_body_before_return() -> anyhow::Result<()> {
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir()?;
+    // The recorded refusal's 0o600 mode is part of the evidence; the
+    // fixture root therefore needs media where chmod actually holds.
+    let base = original_server::tests::permission_faithful_temp_base()?;
+    let root = tempfile::tempdir_in(base)?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let base = format!("http://{}", listener.local_addr()?);

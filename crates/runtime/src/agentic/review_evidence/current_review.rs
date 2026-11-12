@@ -808,7 +808,14 @@ fn authenticate_closed_node_review_member(
 ) -> Result<harness_contract::agent_action::AgentActionObservation, String> {
     let graphs = crate::ExecutionGraphStateStore::new(store.clone());
     let graph = graphs.load(&ticket.graph_id).map_err(|e| e.to_string())?;
-    let graph_revision = super::results::pin_result_source(store, &ticket.graph_id, sources)?;
+    let graph_revision = super::results::pin_result_source_ticketed(
+        store,
+        &super::results::node_review_ref(&ticket.graph_id, &ticket.node_id),
+        ticket.attempt,
+        &ticket.graph_id,
+        sources,
+    )
+    .map_err(|rejection| rejection.reason())?;
     // A graph that grew since the pin is another actor advancing it; only a
     // graph strictly older than the pin means the material under this member
     // moved. Everything below - the binding, the original ticket, the start

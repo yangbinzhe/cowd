@@ -4724,11 +4724,14 @@ pub(super) fn actual_input_snapshot_for_phase(
                 let index = if !value.is_null() {
                     let seal = crate::context_evidence::decode_read_acquisition(value)
                         .map_err(str::to_string)?;
-                    super::results::pin_result_source(
+                    super::results::pin_result_source_ticketed(
                         store,
+                        &super::results::node_review_ref(&seal.graph_id, &seal.node_id),
+                        seal.attempt,
                         &seal.index_stream,
                         &mut actual.sources,
-                    )?;
+                    )
+                    .map_err(|rejection| rejection.reason())?;
                     store
                         .event_by_idempotency_key(&seal.index_stream, &seal.index_key)
                         .map_err(|error| error.to_string())?
@@ -4743,7 +4746,14 @@ pub(super) fn actual_input_snapshot_for_phase(
                         "execution-agent-receipts:{}:{node}:{attempt}",
                         owner.root_execution_id
                     );
-                    super::results::pin_result_source(store, &source, &mut actual.sources)?;
+                    super::results::pin_result_source_ticketed(
+                        store,
+                        &super::results::node_review_ref(&owner.root_execution_id, node),
+                        attempt,
+                        &source,
+                        &mut actual.sources,
+                    )
+                    .map_err(|rejection| rejection.reason())?;
                     let key = primary.payload["idempotency_key"]
                         .as_str()
                         .ok_or("actual root read identity missing")?;
@@ -10129,6 +10139,74 @@ mod tests {
         let error = HistoricalSessionCut::for_live_material(&store, "cut-absent", 1)
             .expect_err("a cut above an absent stream's head is refused");
         assert!(error.contains("head=0"), "{error}");
+    }
+
+    /// T1a-R2: the rebuild window keeps the live-material discipline. The head
+    /// comes from the store, a Session material cut above the durable head is
+    /// still refused after a rebuild, and growth inside the rebuilt window is
+    /// refused again instead of being absorbed into the window.
+    #[test]
+    fn t1a_the_rebuild_window_keeps_the_live_material_discipline() {
+        let store = RuntimeEventStore::for_test();
+        let append = |store: &RuntimeEventStore, stream: &str, scope| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: stream.into(),
+                    scope,
+                    kind: "test.source-advance".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        };
+        let receipts = "execution-agent-receipts:t1a-rebuild:agent:1";
+        let session = "session:t1a-rebuild";
+        let review = "agentic-graph:t1a-rebuild/agent:1";
+        for _ in 0..2 {
+            append(&store, receipts, RuntimeEventScope::ExecutionNode);
+        }
+        for _ in 0..3 {
+            append(&store, session, RuntimeEventScope::Session);
+        }
+        let mut cuts = std::collections::BTreeMap::new();
+        assert_eq!(
+            super::super::results::pin_result_source(&store, receipts, &mut cuts)
+                .expect("the first pin reads the durable head"),
+            2
+        );
+        append(&store, receipts, RuntimeEventScope::ExecutionNode);
+        let rejection = super::super::pin_result_source_ticketed(
+            &store, review, 1, receipts, &mut cuts,
+        )
+        .expect_err("growth on the receipts stream is refused");
+        let ticket = rejection.ticket().expect("window refusal").clone();
+        assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (2, 3));
+        assert_eq!(
+            super::super::repin_at_fresh_head(&store, review, 1, &ticket, &mut cuts)
+                .expect("the store itself opens the rebuild window"),
+            3
+        );
+        assert_eq!(cuts[receipts], 3);
+        // The rebuilt review still cites through the material-cut rule: a cut
+        // above the durable head is refused whatever the caller claims.
+        let error = HistoricalSessionCut::for_live_material(&store, "t1a-rebuild", 4)
+            .expect_err("a material cut above the head stays refused after a rebuild");
+        assert!(error.contains("head=3"), "{error}");
+        let cut = HistoricalSessionCut::for_live_material(&store, "t1a-rebuild", 3)
+            .expect("the durable head admits its own material cut");
+        assert_eq!(cut.observed_revision(), 3, "the head is the store's read, not a report");
+        // Growth after the window opened is refused again, never absorbed.
+        append(&store, receipts, RuntimeEventScope::ExecutionNode);
+        let second_rejection = super::super::pin_result_source_ticketed(
+            &store, review, 1, receipts, &mut cuts,
+        )
+        .expect_err("growth inside the rebuilt window is refused");
+        let second = second_rejection.ticket().expect("window refusal").clone();
+        assert_eq!((second.pinned_cut(), second.observed_head()), (3, 4));
+        assert_eq!(second.lineage(), ticket.lineage(), "one review, two refusals");
+        assert_eq!(cuts[receipts], 3, "the refused growth does not move the window");
     }
 
     #[test]

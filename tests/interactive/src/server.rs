@@ -211,10 +211,14 @@ struct OwnedRoot {
 
 impl OwnedRoot {
     fn create() -> Result<Self> {
+        Self::create_in(std::env::temp_dir())
+    }
+
+    fn create_in(base: PathBuf) -> Result<Self> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         for _ in 0..32 {
             let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = base.join(format!(
                 "cowd-it-server-{}-{stamp}-{sequence}",
                 std::process::id()
             ));
@@ -966,6 +970,59 @@ pub(crate) mod tests {
     use super::{owned_health, private_config};
     use std::path::Path;
 
+    /// Return the first writable temporary base where Unix mode bits
+    /// round-trip a chmod. Some mounted media (the data disk behind the
+    /// gate's `TMPDIR`) accepts `set_permissions` and then always reports
+    /// `0o777`, so file-mode evidence written there cannot be evaluated.
+    /// Candidates are probed (`$TMPDIR`, then `/tmp`); if no base is
+    /// faithful the caller fails by name instead of asserting against a
+    /// filesystem that pretends chmod succeeded.
+    pub(crate) fn permission_faithful_temp_base() -> anyhow::Result<std::path::PathBuf> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let mut bases = vec![std::env::temp_dir()];
+        let fallback = std::path::PathBuf::from("/tmp");
+        if !bases.contains(&fallback) {
+            bases.push(fallback);
+        }
+        for base in bases {
+            let sequence = super::NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let probe = base.join(format!(
+                "cowd-permission-probe-{}-{stamp}-{sequence}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            if builder.create(&probe).is_err() {
+                continue;
+            }
+            let faithful = (|| -> anyhow::Result<bool> {
+                let file = probe.join("file-probe");
+                std::fs::write(&file, b"probe")?;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+                if std::fs::metadata(&file)?.permissions().mode() & 0o777 != 0o600 {
+                    return Ok(false);
+                }
+                let dir = probe.join("dir-probe");
+                std::fs::create_dir(&dir)?;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+                if std::fs::metadata(&dir)?.permissions().mode() & 0o777 != 0o755 {
+                    return Ok(false);
+                }
+                Ok(true)
+            })();
+            let _ = std::fs::remove_dir_all(&probe);
+            if matches!(faithful, Ok(true)) {
+                return Ok(base);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "No permission-faithful temporary media (probed $TMPDIR and /tmp): refusing to assert file modes on a filesystem that pretends chmod succeeded"
+        ))
+    }
+
     #[test]
     fn receipt_requires_exact_launch_and_complete_original_owner_counters() {
         use serde_json::json;
@@ -1582,7 +1639,9 @@ server.serve_forever()
     fn background_error_response_is_preserved_before_business_assertions() -> anyhow::Result<()> {
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
-        let root = super::OwnedRoot::create()?;
+        // This test's evidence is the saved response's 0o600 file mode, so
+        // its root must live on media where chmod is real, not pretended.
+        let root = super::OwnedRoot::create_in(permission_faithful_temp_base()?)?;
         let path = root.path.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;

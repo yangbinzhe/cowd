@@ -5,6 +5,21 @@ pub(crate) use identity::review_result_identity;
 mod policy;
 pub(crate) mod read_source;
 mod results;
+
+// The rebuild record and its entry point belong to the review evidence domain,
+// but a refusal travels outward as a reason string, so the runner half of the
+// rebuild loop (T1b) consumes them through this module rather than reaching
+// into `results`.
+pub(crate) use results::{
+    node_review_ref, pin_result_source_ticketed, ReviewRepinTicket,
+};
+// The rebuild entry and its two refusal shapes are consumed only by tests until
+// T1b wires them into dispatch. Keeping them unconditional trips
+// #![deny(unused_imports)] in the production profile, so they are gated exactly
+// like `coverage::evidence_contains` below; T1b's wiring lifts this gate back
+// with no other edit.
+#[cfg(test)]
+pub(crate) use results::{repin_at_fresh_head, RepinRejection, ReviewSourceMovement};
 // The record-path entries re-verify a proof without a live action, so they
 // are the fixture and completion-lane entry points as well.
 #[cfg(test)]
@@ -36,6 +51,38 @@ use sha2::{Digest, Sha256};
 
 use super::program::AgenticProgramProjection;
 use crate::RuntimeServices;
+
+/// The closing producer-metadata fence of an independent review.
+///
+/// Every published cut came out of a bounded read: the resolution paged each
+/// stream up to that cut and validated its per-source sequence, so a stream that
+/// grew afterwards added nothing this review can cite. Comparing the live head
+/// for strict equality is the same defect the result package's own cut fence had
+/// (030 T7): a busy Session could never settle, and this sentence is recognised
+/// by neither review classifier, so the refusal landed untyped. The comparison now
+/// goes through the one shared judgment. What still refuses is unchanged - growth
+/// of a source the review judges, a head that moved backwards, and a cut above the
+/// head - and the refusal wording is kept character for character.
+fn verify_producer_metadata_cuts<'sources>(
+    store: &crate::RuntimeEventStore,
+    sources: impl Iterator<Item = &'sources crate::ExpectedStreamRevision>,
+) -> Result<(), String> {
+    for source in sources {
+        let observed = store
+            .stream_revision(&source.stream_id)
+            .map_err(|error| error.to_string())?;
+        if !results::result_cut_remains_consistent(
+            &source.stream_id,
+            source.expected_revision,
+            observed,
+        ) {
+            return Err(
+                "producer metadata changed during result resolution; retry current results".into(),
+            );
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ResultContentReaders<'reader> {
@@ -2045,19 +2092,12 @@ impl RuntimeServices {
             None
         };
 
-        for source in resolved.iter().flat_map(|result| &result.effect_sources) {
-            if self
-                .event_store()
-                .stream_revision(&source.stream_id)
-                .map_err(|error| error.to_string())?
-                != source.expected_revision
-            {
-                return Err(
-                    "producer metadata changed during result resolution; retry current results"
-                        .into(),
-                );
-            }
-        }
+        verify_producer_metadata_cuts(
+            self.event_store(),
+            resolved
+                .iter()
+                .flat_map(|result| result.effect_sources.iter()),
+        )?;
         for result in &resolved {
             for producer in &result.producers {
                 if independence_required
@@ -3166,12 +3206,17 @@ impl RuntimeServices {
                                         },
                                         &mut acquisition,
                                     )?;
+                                    let review_ref =
+                                        node_review_ref(&seal.graph_id, &seal.node_id);
                                     for original in [&original_primary, &index] {
-                                        results::pin_result_source(
+                                        pin_result_source_ticketed(
                                             self.event_store(),
+                                            &review_ref,
+                                            seal.attempt,
                                             &original.stream_id,
                                             &mut acquisition.sources,
-                                        )?;
+                                        )
+                                        .map_err(|rejection| rejection.reason())?;
                                         acquisition.material_events.push(
                                             harness_contract::goal::ProofInputEvent {
                                                 stream_id: original.stream_id.clone(),
@@ -3347,7 +3392,14 @@ impl RuntimeServices {
                             file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
                             sources: material_revisions.clone(), material_events: Vec::new(), canonical_facts: Vec::new(),
                         };
-                        results::pin_result_source(self.event_store(), &primary_stream, &mut authenticated.sources)?;
+                        pin_result_source_ticketed(
+                            self.event_store(),
+                            &node_review_ref(packet.graph_id(), packet.node_id()),
+                            packet.attempt,
+                            &primary_stream,
+                            &mut authenticated.sources,
+                        )
+                        .map_err(|rejection| rejection.reason())?;
                         let original = self.event_store().event_by_idempotency_key(&primary_stream, &format!("{key}:read-receipt"))
                             .map_err(|error| error.to_string())?.ok_or("directory read original primary missing")?;
                         if original.commit_cursor > material_discovery_cursor {
@@ -3875,6 +3927,419 @@ mod tests {
             );
             assert_eq!(cuts.get(source), Some(&4));
         }
+    }
+
+    /// T1a-N1: a refused source pin produces the named rebuild ticket, and the
+    /// ticket's own reason is the sentence the pin has always produced. The
+    /// source and the two revisions below are the shape the 029 explicit-team
+    /// run died on: the receipts stream grew while one reviewer was resolving.
+    #[test]
+    fn t1a_a_refused_growth_produces_a_named_ticket_that_repins_at_the_fresh_head() {
+        let receipts =
+            "execution-agent-receipts:agentic-graph:one:agentic-graph:one:agent:1";
+        let review = "agentic-graph:one/agent:1";
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert(receipts.to_string(), 14);
+        assert_eq!(
+            super::results::pin_result_source_ticketed_with_reader(
+                &mut reader, review, 1, receipts, &mut cuts,
+            )
+            .expect("the first pin reads the head as its window"),
+            14
+        );
+        reader.revisions.insert(receipts.to_string(), 16);
+        let rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 1, receipts, &mut cuts,
+        )
+        .expect_err("growth on a receipts stream is still refused");
+        let ticket = rejection
+            .ticket()
+            .expect("a window refusal carries its ticket")
+            .clone();
+        assert_eq!(ticket.review_ref(), review);
+        assert_eq!(ticket.attempt(), 1);
+        assert_eq!(ticket.source(), receipts);
+        assert_eq!(ticket.pinned_cut(), 14, "the cut this review pinned");
+        assert_eq!(ticket.observed_head(), 16, "the head the store reported");
+        assert_eq!(ticket.movement(), super::ReviewSourceMovement::ForwardNotAccepted);
+        assert!(ticket.movement().rebuildable());
+        assert_eq!(
+            ticket.reason(),
+            format!(
+                "result metadata source changed during resolution; rebuild the review; source={receipts} expected=14 actual=16 phase=result_source_pin"
+            ),
+            "the ticket must not change the propagated wording"
+        );
+        assert_eq!(
+            super::ReviewRepinTicket::from_refusal(review, 1, &ticket.reason()).as_ref(),
+            Some(&ticket),
+            "the reason round-trips back into the same ticket"
+        );
+        assert_eq!(cuts[receipts], 14, "a refusal leaves the window where it was");
+        // The rebuild window comes from the store: the caller names only who it is.
+        assert_eq!(
+            super::results::repin_at_fresh_head_with_reader(
+                &mut reader, review, 1, &ticket, &mut cuts,
+            )
+            .expect("the rebuild opens at the fresh head"),
+            16
+        );
+        assert_eq!(cuts[receipts], 16);
+        assert_eq!(
+            super::results::pin_result_source_ticketed_with_reader(
+                &mut reader, review, 1, receipts, &mut cuts,
+            )
+            .expect("a settled window lets the rebuilt review resolve"),
+            16
+        );
+    }
+
+    /// T1a-N2: a rebuilt window that moves again is refused again on the same
+    /// lineage, and a rebuild refusal cannot be laundered into a fresh rebuild.
+    #[test]
+    fn t1a_a_rebuilt_window_that_moves_again_refuses_again_on_the_same_lineage() {
+        let source = "execution-effect:abc";
+        let review = "agentic-graph:two/agent:1";
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert(source.to_string(), 14);
+        super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 2, source, &mut cuts,
+        )
+        .expect("the first pin");
+        reader.revisions.insert(source.to_string(), 16);
+        let first_rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 2, source, &mut cuts,
+        )
+        .expect_err("the first growth refuses");
+        let first = first_rejection.ticket().expect("window refusal").clone();
+        assert_eq!(
+            super::results::repin_at_fresh_head_with_reader(
+                &mut reader, review, 2, &first, &mut cuts,
+            )
+            .expect("the rebuild opens"),
+            16
+        );
+        // The window the rebuild just opened is what moved: refused again.
+        reader.revisions.insert(source.to_string(), 18);
+        let second_rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 2, source, &mut cuts,
+        )
+        .expect_err("a second growth refuses again");
+        let second = second_rejection.ticket().expect("window refusal").clone();
+        assert_eq!(
+            second.lineage(),
+            first.lineage(),
+            "both refusals belong to one review attempt, which is what a bounded budget counts"
+        );
+        assert_eq!((second.pinned_cut(), second.observed_head()), (16, 18));
+        let rebuild_refusal = super::RepinRejection::Window { refused: first.clone(), pinned: 999 };
+        assert!(rebuild_refusal.reason().contains("movement=window-mismatch"));
+        assert!(
+            super::ReviewRepinTicket::from_refusal(review, 2, &rebuild_refusal.reason()).is_none(),
+            "a rebuild refusal is a budget answer, not a fresh rebuild request"
+        );
+    }
+
+    /// T1a-N3: a head that moved backwards keeps its original refusal and is not
+    /// a rebuildable window. Re-reading at "whatever the head is now" would
+    /// resolve the review against material nobody observed.
+    #[test]
+    fn t1a_a_backwards_head_is_refused_and_never_rebuildable() {
+        let source = "agentic-program:abc";
+        let review = "agentic-graph:three/agent:1";
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert(source.to_string(), 5);
+        super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 3, source, &mut cuts,
+        )
+        .expect("the first pin");
+        reader.revisions.insert(source.to_string(), 3);
+        let rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 3, source, &mut cuts,
+        )
+        .expect_err("a backwards head is refused");
+        let ticket = rejection.ticket().expect("window refusal").clone();
+        assert_eq!(ticket.movement(), super::ReviewSourceMovement::Backwards);
+        assert!(!ticket.movement().rebuildable());
+        assert_eq!(
+            ticket.reason(),
+            "result metadata source moved backwards during resolution; rebuild the review; source=agentic-program:abc expected=5 actual=3 phase=result_source_pin"
+        );
+        let refused = super::results::repin_at_fresh_head_with_reader(
+            &mut reader, review, 3, &ticket, &mut cuts,
+        )
+        .expect_err("a backwards head does not open a rebuild window");
+        assert_eq!(refused, super::RepinRejection::NotRebuildable(ticket.clone()));
+        assert_eq!(refused.reason(), ticket.reason(), "the refusal wording survives untouched");
+        assert_eq!(cuts[source], 5, "a refused rebuild leaves the window alone");
+    }
+
+    /// T1a-N4: the rebuild entry opens a window only for the review that was
+    /// refused, only at the window it was refused on, and never below the head
+    /// the refusal reported.
+    #[test]
+    fn t1a_the_rebuild_entry_refuses_a_foreign_review_a_stale_window_and_a_shrunken_head() {
+        let source = "execution-agent-receipts:agentic-graph:four:agent:1";
+        let review = "agentic-graph:four/agent:1";
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert(source.to_string(), 14);
+        super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 1, source, &mut cuts,
+        )
+        .expect("the first pin");
+        reader.revisions.insert(source.to_string(), 16);
+        let rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 1, source, &mut cuts,
+        )
+        .expect_err("the growth refuses");
+        let ticket = rejection.ticket().expect("window refusal").clone();
+        let foreign = super::results::repin_at_fresh_head_with_reader(
+            &mut reader, "agentic-graph:other/agent:1", 7, &ticket, &mut cuts,
+        )
+        .expect_err("another review cannot spend this refusal");
+        assert!(foreign.reason().contains("movement=identity-mismatch"), "{}", foreign.reason());
+        assert!(foreign.reason().contains("actual=agentic-graph:other/agent:1#7"));
+        assert_eq!(cuts[source], 14);
+        // A stale window: the entry this map pins is no longer the refused one.
+        cuts.insert(source.to_string(), 15);
+        let stale = super::results::repin_at_fresh_head_with_reader(
+            &mut reader, review, 1, &ticket, &mut cuts,
+        )
+        .expect_err("a moved window is refused");
+        assert!(stale.reason().contains("movement=window-mismatch"), "{}", stale.reason());
+        assert!(stale.reason().contains("actual=15"));
+        cuts.insert(source.to_string(), 14);
+        // The stream shrank below the head the refusal reported.
+        reader.revisions.insert(source.to_string(), 15);
+        let behind = super::results::repin_at_fresh_head_with_reader(
+            &mut reader, review, 1, &ticket, &mut cuts,
+        )
+        .expect_err("a truncated stream is not a rebuild window");
+        assert!(
+            behind.reason().contains("movement=head-behind-refused-head"),
+            "{}",
+            behind.reason()
+        );
+        assert!(behind.reason().contains("actual=15"));
+        assert_eq!(cuts[source], 14, "none of the three rewrites the window");
+    }
+
+    /// T1a-N5: an accepted pin produces no ticket, so a shared aggregate that
+    /// keeps growing never triggers a rebuild at all.
+    #[test]
+    fn t1a_an_accepted_pin_produces_no_ticket_and_a_shared_aggregate_never_needs_one() {
+        for source in [
+            "session:one",
+            "agentic-graph:abc",
+            "execution-lineage:abc",
+            "session-ingress-graph:abc",
+        ] {
+            let review = "agentic-graph:five/agent:1";
+            let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+            let mut cuts = std::collections::BTreeMap::new();
+            reader.revisions.insert(source.to_string(), 4);
+            assert_eq!(
+                super::results::pin_result_source_ticketed_with_reader(
+                    &mut reader, review, 5, source, &mut cuts,
+                )
+                .expect("the first pin"),
+                4
+            );
+            reader.revisions.insert(source.to_string(), 5);
+            assert_eq!(
+                super::results::pin_result_source_ticketed_with_reader(
+                    &mut reader, review, 5, source, &mut cuts,
+                )
+                .expect("growth on a shared aggregate is another actor appending"),
+                5
+            );
+            assert_eq!(cuts[source], 5, "the pinned window moved with the aggregate");
+        }
+        assert!(super::ReviewRepinTicket::from_refusal("review", 1, "some other failure").is_none());
+    }
+
+    /// T1a-R1: the source shapes the field refusals actually used, replayed in
+    /// memory. Each one refuses, names its own window, and rebuilds at the head
+    /// the store reports - including the 028-era refusal, which is why the
+    /// rebuild is not read as a 029 regression.
+    #[test]
+    fn t1a_the_field_refusal_shapes_rebuild_from_their_own_windows() {
+        for (source, pinned, head) in [
+            (
+                "execution-agent-receipts:agentic-graph:33637f01:agentic-graph:33637f01:agent:1",
+                14,
+                16,
+            ),
+            (
+                "execution-agent-receipts:agentic-graph:8c0a6fd5:agentic-graph:8c0a6fd5:agent:1",
+                3,
+                6,
+            ),
+            ("execution-effect:read-key", 4, 5),
+            ("agentic-program:abc", 7, 8),
+        ] {
+            let review = "agentic-graph:replay/agent:1";
+            let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+            let mut cuts = std::collections::BTreeMap::new();
+            reader.revisions.insert(source.to_string(), pinned);
+            super::results::pin_result_source_ticketed_with_reader(
+                &mut reader, review, 1, source, &mut cuts,
+            )
+            .expect("the first pin");
+            reader.revisions.insert(source.to_string(), head);
+            let rejection = super::results::pin_result_source_ticketed_with_reader(
+                &mut reader, review, 1, source, &mut cuts,
+            )
+            .expect_err("a moved head on these sources is refused");
+            let ticket = rejection.ticket().expect("window refusal").clone();
+            assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (pinned, head), "{source}");
+            assert_eq!(
+                super::results::repin_at_fresh_head_with_reader(
+                    &mut reader, review, 1, &ticket, &mut cuts,
+                )
+                .expect("the rebuild opens at the store's head"),
+                head,
+                "{source}"
+            );
+            assert_eq!(cuts[source], head);
+        }
+    }
+
+    /// 030 T7 (e2 option B): the review's closing producer-metadata fence is
+    /// self-consistency inside the published cut. The cuts below are produced by
+    /// the real pinning and bounded paging path, not by hand.
+    #[test]
+    fn t7_the_producer_metadata_fence_settles_a_busy_session_and_still_refuses_drift() {
+        let store = crate::RuntimeEventStore::for_test();
+        let append = |store: &crate::RuntimeEventStore, stream: &str, scope| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: stream.into(),
+                    scope,
+                    kind: "test.t7-append".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        };
+        let session = "session:t7-v3";
+        let mut cuts = std::collections::BTreeMap::new();
+        for _ in 0..3 {
+            append(&store, session, crate::RuntimeEventScope::Session);
+        }
+        assert_eq!(
+            super::results::result_source_events(&store, session, &mut cuts)
+                .expect("the real bounded read")
+                .len(),
+            3
+        );
+        let published = vec![crate::ExpectedStreamRevision {
+            stream_id: session.into(),
+            expected_revision: cuts[session],
+        }];
+        assert_eq!(published[0].expected_revision, 3);
+        // The Session keeps appending while the reviewer is still resolving. The
+        // fence used to refuse this with an unclassified sentence.
+        for _ in 0..2 {
+            append(&store, session, crate::RuntimeEventScope::Session);
+        }
+        super::verify_producer_metadata_cuts(&store, published.iter())
+            .expect("growth above the published cut cites nothing this review read");
+        assert_eq!(cuts[session], 3, "the fence does not chase the head");
+        assert_eq!(
+            published[0].expected_revision, 3,
+            "the published cut stays published"
+        );
+        // A judged source moving is the object under review moving: still refused,
+        // with the sentence unchanged.
+        let judged = "execution-effect:t7-v3-key";
+        let mut judged_cuts = std::collections::BTreeMap::new();
+        append(&store, judged, crate::RuntimeEventScope::ExecutionNode);
+        super::results::result_source_events(&store, judged, &mut judged_cuts).unwrap();
+        append(&store, judged, crate::RuntimeEventScope::ExecutionNode);
+        let drift = vec![crate::ExpectedStreamRevision {
+            stream_id: judged.into(),
+            expected_revision: judged_cuts[judged],
+        }];
+        assert_eq!(
+            super::verify_producer_metadata_cuts(&store, drift.iter())
+                .expect_err("a judged source that moved still refuses"),
+            "producer metadata changed during result resolution; retry current results"
+        );
+        // A published cut above the durable head is a fabricated window or a
+        // truncated stream, and refuses on the aggregate class too.
+        let beyond = vec![crate::ExpectedStreamRevision {
+            stream_id: session.into(),
+            expected_revision: 9_999,
+        }];
+        assert!(
+            super::verify_producer_metadata_cuts(&store, beyond.iter())
+                .expect_err("a cut above the head must refuse")
+                .contains("producer metadata changed during result resolution")
+        );
+    }
+
+    /// 030 T7 v4 (option 甲): the same fence on a quiet stream, on a published cut
+    /// that sits below the head, and on a published cut above the head.
+    ///
+    /// The middle case is the one this control first got backwards: a Session
+    /// stream published at cut 0 whose head has since advanced to 1 is the same
+    /// durable fact as "the aggregate grew above the published cut", which the
+    /// sibling busy-Session control asserts must be admitted. A published cut
+    /// above the durable head is the shape that cannot be a busy stream - a
+    /// fabricated window or a truncated log - and that one still refuses with the
+    /// untouched sentence. Nothing here re-pins: admitting growth must leave both
+    /// the published value and the pinned cut exactly where they were.
+    #[test]
+    fn t7_the_producer_metadata_fence_passes_by_equality_and_treats_a_lower_published_cut_as_growth() {
+        let store = crate::RuntimeEventStore::for_test();
+        let quiet = "session:t7-v3-quiet";
+        let mut cuts = std::collections::BTreeMap::new();
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: quiet.into(),
+                scope: crate::RuntimeEventScope::Session,
+                kind: "test.t7-append".into(),
+                status: None,
+                actor: None,
+                refs: vec![],
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        super::results::result_source_events(&store, quiet, &mut cuts).unwrap();
+        let published = vec![crate::ExpectedStreamRevision {
+            stream_id: quiet.into(),
+            expected_revision: cuts[quiet],
+        }];
+        super::verify_producer_metadata_cuts(&store, published.iter())
+            .expect("an unchanged head satisfies the fence by equality");
+        assert_eq!(cuts[quiet], 1);
+        let below = vec![crate::ExpectedStreamRevision {
+            stream_id: quiet.into(),
+            expected_revision: 0,
+        }];
+        super::verify_producer_metadata_cuts(&store, below.iter())
+            .expect("a head above a published Session cut is growth, not a replaced stream");
+        assert_eq!(
+            below[0].expected_revision, 0,
+            "admitting growth never chases the head: the published value stays"
+        );
+        assert_eq!(cuts[quiet], 1, "admitting growth never re-pins");
+        let beyond = vec![crate::ExpectedStreamRevision {
+            stream_id: quiet.into(),
+            expected_revision: 9_999,
+        }];
+        assert_eq!(
+            super::verify_producer_metadata_cuts(&store, beyond.iter())
+                .expect_err("a published cut above the durable head cannot be a quiet stream"),
+            "producer metadata changed during result resolution; retry current results"
+        );
     }
 
     /// A2f-P2: the paging path reads the same predicate, so the graph streams

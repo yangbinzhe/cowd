@@ -1492,6 +1492,41 @@ impl GatewayRuntimeShutdownCoordinator {
         reason
     }
 
+    // Close the original shutdown transaction when the already started Runtime
+    // finalizer terminally rejects instead of closing it: the completion channel
+    // closed, the finalizer finished with custody unresolved, or the finalizer
+    // task ended without ever publishing a completion. Every one of these
+    // rejections releases the caller that owns process termination, so the
+    // truthful failed receipt must already live in the original private
+    // directory before the release - the same publish-before-release ordering
+    // the first-deadline rejection established, with the same honest content:
+    // the typed code heads the first failure entry, the execution axes stay as
+    // observed (a finalizer report the rejection already carries is recorded
+    // verbatim; an absent one is reported missing by `finish`), and no clean
+    // receipt is manufactured. Returns the rejection text unchanged for the
+    // caller's `Err`, so the CLI/log prose and the outer verdict stay as-is.
+    fn finish_finalization_rejection(
+        &self,
+        typed_code: &str,
+        reason: String,
+        phases: Vec<String>,
+        execution_started: bool,
+        execution: Option<runtime::RuntimeExecutionShutdownReport>,
+        active_turns: Option<crate::runtime_service::ActiveTurnDrainReport>,
+        memory: Option<memory::cognitive::MemoryBackgroundShutdownReport>,
+    ) -> String {
+        self.finish(GatewayRuntimeShutdownReport {
+            phases,
+            failures: vec![format!("{typed_code}: {reason}")],
+            execution_started,
+            execution,
+            active_turns,
+            memory,
+            tasks: Default::default(),
+        });
+        reason
+    }
+
     // Register the one original shutdown before any caller awaits it. A dropped
     // waiter does not drop the driver or its original dependency Arcs.
     async fn coordinate_original<F, Fut>(self: &Arc<Self>, shutdown: F) -> Result<GatewayRuntimeShutdownReport, String>
@@ -1748,7 +1783,20 @@ async fn shutdown_runtime_host_resources(
                 if completion.borrow().is_none() {
                     match tokio::time::timeout_at(deadline, completion.changed()).await {
                         Ok(Ok(())) => {},
-                        Ok(Err(_)) => return Err("original Runtime execution completion channel closed; custody unresolved".into()),
+                        Ok(Err(_)) => {
+                            // Terminal rejection: publish the typed receipt into
+                            // the original private directory before releasing the
+                            // caller (see `finish_finalization_rejection`).
+                            return Err(coordinator.finish_finalization_rejection(
+                                "shutdown_completion_channel_closed",
+                                "original Runtime execution completion channel closed; custody unresolved".to_string(),
+                                phases.clone(),
+                                execution_started,
+                                None,
+                                active_turn_report.clone(),
+                                memory_report.clone(),
+                            ));
+                        }
                         Err(_) => {
                             enter_phase(&mut phases, "drain_runtime_pending", &failures);
                             // The original deadline rejection releases the caller that
@@ -1773,11 +1821,38 @@ async fn shutdown_runtime_host_resources(
                     if let Some(done) = completion.borrow().clone() {
                         match done {
                             runtime::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed: true } => break report,
-                            runtime::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed: false } =>
-                                return Err(format!("original Runtime execution finalizer ended with custody unresolved; first observations: {}; final errors: {}", failures.join("; "), report.errors.join("; "))),
+                            runtime::RuntimeExecutionShutdownCompletion::Finished { report, custody_closed: false } => {
+                                let reason = format!(
+                                    "original Runtime execution finalizer ended with custody unresolved; first observations: {}; final errors: {}",
+                                    failures.join("; "),
+                                    report.errors.join("; ")
+                                );
+                                // The finalizer's own report is known here, so
+                                // the receipt records it verbatim alongside the
+                                // typed rejection instead of discarding it.
+                                return Err(coordinator.finish_finalization_rejection(
+                                    "shutdown_finalizer_custody_unresolved",
+                                    reason,
+                                    phases.clone(),
+                                    execution_started,
+                                    Some(report),
+                                    active_turn_report.clone(),
+                                    memory_report.clone(),
+                                ));
+                            }
                         }
                     }
-                    completion.changed().await.map_err(|_| "original Runtime execution finalizer ended without a completion; custody unresolved")?;
+                    if completion.changed().await.is_err() {
+                        return Err(coordinator.finish_finalization_rejection(
+                            "shutdown_finalizer_no_completion",
+                            "original Runtime execution finalizer ended without a completion; custody unresolved".to_string(),
+                            phases.clone(),
+                            execution_started,
+                            None,
+                            active_turn_report.clone(),
+                            memory_report.clone(),
+                        ));
+                    }
                 };
                 if execution_report.forced_aborts > 0 {
                     failures.push(format!(
@@ -4034,6 +4109,160 @@ mod final_shutdown_receipt_tests {
             .coordinate(|| async { panic!("follower must not rerun the original shutdown") })
             .await;
         assert_eq!(follower, existing);
+    }
+
+    #[tokio::test]
+    async fn channel_closed_rejection_publishes_typed_receipt_before_release() {
+        let root = private_receipt_directory();
+        let target = target(root.path());
+        let path = target.path();
+        let coordinator = GatewayRuntimeShutdownCoordinator::with_receipt(
+            GatewayRuntimeTaskSet::new(Duration::from_secs(1)),
+            Some(target),
+        );
+        let reason = coordinator.finish_finalization_rejection(
+            "shutdown_completion_channel_closed",
+            "original Runtime execution completion channel closed; custody unresolved".to_string(),
+            vec!["stop_accepting".into(), "drain_ingress".into(), "drain_runtime".into()],
+            true,
+            None,
+            None,
+            None,
+        );
+        // The caller's rejection text stays byte-identical to the pre-receipt
+        // prose: the receipt adds a typed reason, it never swallows one.
+        assert_eq!(
+            reason,
+            "original Runtime execution completion channel closed; custody unresolved"
+        );
+        assert!(
+            path.symlink_metadata().is_ok(),
+            "the receipt must exist once the rejection is terminal, not only after a clean close"
+        );
+        let page: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let failures: Vec<&str> = page["report"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(failures[0], format!("shutdown_completion_channel_closed: {reason}"));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("Runtime execution shutdown report missing after startup")));
+        assert_eq!(page["report"]["execution"], serde_json::Value::Null);
+        // A late clean close rejoins and never rewrites the published rejection.
+        let bytes = std::fs::read(&path).unwrap();
+        let late = coordinator.coordinate(|| async { report() }).await;
+        assert!(!late.failures.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn custody_unresolved_rejection_records_finalizer_report_without_erasing_failures() {
+        let root = private_receipt_directory();
+        let target = target(root.path());
+        let path = target.path();
+        let coordinator = GatewayRuntimeShutdownCoordinator::with_receipt(
+            GatewayRuntimeTaskSet::new(Duration::from_secs(1)),
+            Some(target),
+        );
+        let finalizer_report = runtime::RuntimeExecutionShutdownReport {
+            errors: vec!["original owner unknown".into()],
+            ..Default::default()
+        };
+        let reason = coordinator.finish_finalization_rejection(
+            "shutdown_finalizer_custody_unresolved",
+            format!(
+                "original Runtime execution finalizer ended with custody unresolved; first observations: {}; final errors: {}",
+                "Runtime execution first observation: stall".to_string(),
+                finalizer_report.errors.join("; ")
+            ),
+            vec!["drain_runtime".into(), "drain_runtime_pending".into()],
+            true,
+            Some(finalizer_report),
+            None,
+            None,
+        );
+        assert!(reason.starts_with("original Runtime execution finalizer ended with custody unresolved; "));
+        let page: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let failures: Vec<&str> = page["report"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert!(failures[0].starts_with("shutdown_finalizer_custody_unresolved: "));
+        // The finalizer report the rejection carries is recorded verbatim and
+        // nothing claims a clean execution close. `finish` keeps its existing
+        // dedup contract: an error already named inside another failure line is
+        // not restated as a second line, so the typed rejection line must carry
+        // the finalizer error, and the report axis must hold it verbatim.
+        assert_eq!(page["report"]["execution"]["errors"][0], "original owner unknown");
+        assert!(failures[0]
+            .contains("final errors: original owner unknown")
+            || failures
+                .iter()
+                .any(|failure| failure.contains("Runtime execution shutdown incomplete: original owner unknown")));
+        assert!(!failures
+            .iter()
+            .any(|failure| failure.contains("report missing after startup")));
+        let bytes = std::fs::read(&path).unwrap();
+        let late = coordinator.coordinate(|| async { report() }).await;
+        assert!(!late.failures.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn finalizer_no_completion_rejection_publishes_typed_receipt() {
+        let root = private_receipt_directory();
+        let target = target(root.path());
+        let path = target.path();
+        let coordinator = GatewayRuntimeShutdownCoordinator::with_receipt(
+            GatewayRuntimeTaskSet::new(Duration::from_secs(1)),
+            Some(target),
+        );
+        let reason = coordinator.finish_finalization_rejection(
+            "shutdown_finalizer_no_completion",
+            "original Runtime execution finalizer ended without a completion; custody unresolved".to_string(),
+            vec!["drain_runtime".into()],
+            true,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            reason,
+            "original Runtime execution finalizer ended without a completion; custody unresolved"
+        );
+        let page: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let failures: Vec<&str> = page["report"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(failures[0], format!("shutdown_finalizer_no_completion: {reason}"));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("Runtime execution shutdown report missing after startup")));
+        // Production shape (no fixture): still a terminal rejection, never a
+        // silent hang, and followers receive the same typed report.
+        let plain = GatewayRuntimeShutdownCoordinator::new(GatewayRuntimeTaskSet::new(Duration::from_secs(1)));
+        let plain_reason = plain.finish_finalization_rejection(
+            "shutdown_finalizer_no_completion",
+            reason.clone(),
+            vec!["drain_runtime".into()],
+            true,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(plain_reason, reason);
+        let existing = plain
+            .completed_report()
+            .expect("the rejection closes the original transaction");
+        assert_eq!(existing.failures[0], format!("shutdown_finalizer_no_completion: {reason}"));
     }
 
     #[test]

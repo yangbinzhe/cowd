@@ -8286,33 +8286,73 @@ fn original_goal_review_transaction(
     Ok(Some((effect.to_string(), event.event.payload.clone(), goal_event.event.payload.clone())))
 }
 
-/// Read the Program at the settlement head and confirm that every effect this
-/// node's certified actions created is visible in that projection. The
-/// revision the node then declares is one it actually read, not one it
-/// assumed.
+/// Which Program cut a node's own certified effects have to be visible at.
+///
+/// The node writes the Program back under the live head, and that fence stays
+/// exactly as it was. What must not travel with the fence is the *evidence*
+/// check: this node's facts are guaranteed only at the cut its own commits
+/// produced. Reading the projection at the live head let a later, legitimate
+/// advance by somebody else (a rework that resets a claim generation, or the
+/// bounded review rebuild landing a fresh cut) decide whether work this node
+/// already completed counted as carried, and one such refusal blocked the whole
+/// batch as `effect_completion_uncertain` with `retryable: false`. So the cut
+/// is the node's own, while a stream that moved backwards below it stays the
+/// original refusal.
+fn original_program_certification_cut(own_cut: u64, live_head: u64) -> Result<u64, String> {
+    if live_head < own_cut {
+        return Err("Program changed between original actions".into());
+    }
+    Ok(own_cut)
+}
+
+/// Judge this node's certified effects against one Program entity view. The
+/// refusal names the effect, the action kind, the cut actually certified at and
+/// the live head, so a blocked publish can be classified from its own sentence
+/// instead of only from a batch-level wrapper.
+fn certify_original_program_effects(
+    view: &OriginalProgramEntityView,
+    effects: &[(String, String)],
+    certified_cut: u64,
+    live_head: u64,
+) -> Result<(), String> {
+    for (effect, action_kind) in effects.iter() {
+        if original_effect_judgment(view, effect, action_kind) == OriginalEffectJudgment::NotCarried {
+            return Err(format!(
+                "original Program effect is not visible at the certified head; effect={effect} action={action_kind} certified_cut={certified_cut} live_head={live_head}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read the Program at the cut this node's own certified actions produced and
+/// confirm every effect is visible there. The revision certified is one the
+/// node actually wrote, not one it assumed, and the live head is reported
+/// beside it rather than used as the window.
 fn certify_original_program_head(
     services: &Arc<crate::RuntimeServices>,
     program_id: &str,
-    revision: u64,
+    own_cut: u64,
+    live_head: u64,
     effects: &[(String, String)],
 ) -> Result<(), String> {
+    let certified_cut = original_program_certification_cut(own_cut, live_head)?;
     let store = services.event_store();
     let stream = format!("agentic-program:{}", program_id);
     let opened = store.event_by_idempotency_key(&stream, "agentic-program-opened")
         .map_err(|error| error.to_string())?
         .ok_or("original Program opening missing")?;
     let actions = services.agent_action_service();
-    let projection = actions.project_snapshot_bounded(program_id, revision, &opened, None,
+    let projection = actions.project_snapshot_bounded(program_id, certified_cut, &opened, None,
         |after, through| store.list_stream_after(&stream, after, through, 100, 1024 * 1024),
         |error| error.to_string())
         .map_err(|error| format!("original Program projection unavailable: {error}"))?;
-    let view = original_program_entity_view(&projection);
-    for (effect, action_kind) in effects.iter() {
-        if original_effect_judgment(&view, effect, action_kind) == OriginalEffectJudgment::NotCarried {
-            return Err("original Program effect is not visible at the certified head".into());
-        }
-    }
-    Ok(())
+    certify_original_program_effects(
+        &original_program_entity_view(&projection),
+        effects,
+        certified_cut,
+        live_head,
+    )
 }
 
 /// Reuse the original conclusion owner only for an authenticated completion
@@ -8488,6 +8528,12 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
     let binding = before.goal.execution_binding.as_ref();
     let mut source = before.clone();
     let mut program_source: Option<(String, u64)> = None;
+    // The highest Program revision this node's own certified commits produced.
+    // `program_source` only ever holds the last handle's cut, so a node whose
+    // actions advanced the Program more than once would certify against one
+    // commit while its other effects came from a later one. The certification
+    // window is the max over this node's own commits.
+    let mut own_program_cut: Option<u64> = None;
     let mut changed = false;
     let mut authenticated_goal_reviews = std::collections::BTreeMap::new();
     // Every committed action of this node carries the original owner's
@@ -8528,6 +8574,7 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
             // authority that every legitimate concurrency looked like an
             // anomaly.
             program_source = Some((program_stream.clone(), cut.committed_revision));
+            own_program_cut = Some(own_program_cut.map_or(cut.committed_revision, |previous| previous.max(cut.committed_revision)));
         }
         let goal_payload = if let Some(transaction) = transaction {
             let events = transaction.events.iter().enumerate().filter(|(_, event)| event.event.stream_id == goal_stream).collect::<Vec<_>>();
@@ -8560,17 +8607,19 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
     if let Some((stream, revision)) = program_source.as_ref() {
         let program_id = binding.map(|binding| binding.agentic_program_id.as_str())
             .ok_or("original committed Program binding missing")?;
-        // The node writes the Program back under its own fence, so that fence
-        // has to be the certified head at settlement. The head is not assumed:
-        // the Program projection at that revision is read, and every effect
-        // this node's own certified actions created must be visible in it. An
-        // unrelated writer that did not carry this node's work forward does
-        // not satisfy that check, and a Program that moves again after this
-        // read is rejected by the node transaction's own CAS.
+        // The node writes the Program back under the live head, so the fence is
+        // unchanged and a Program that moves again before that write is still
+        // rejected by the node transaction's own CAS. The certification is a
+        // different question from the fence: it asks whether this node's own
+        // certified effects are visible, and that is only ever decidable at the
+        // cut this node produced. An unrelated writer that did not carry this
+        // node's work forward still fails the check, because the check reads
+        // the projection through this node's own commits.
         let head = services.event_store().stream_revision(stream).map_err(|error| error.to_string())?;
-        if head < *revision {
-            return Err("Program changed between original actions".into());
-        }
+        let certified_cut = original_program_certification_cut(
+            own_program_cut.unwrap_or(*revision),
+            head,
+        )?;
         // Goal-owned reviews are proved by their own same-transaction Goal
         // record above, not by inventing a Program entity for them. Every
         // other effect remains subject to the Program projection check.
@@ -8580,7 +8629,7 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
             }
         }
         program_effects.retain(|(effect, kind)| !(kind == "objective_review" && authenticated_goal_reviews.contains_key(effect)));
-        certify_original_program_head(&services, program_id, head, &program_effects)?;
+        certify_original_program_head(&services, program_id, certified_cut, head, &program_effects)?;
         program_source = Some((stream.clone(), head));
     }
     // This fixture-only read marks the exact same-call post-action boundary.
@@ -13706,6 +13755,87 @@ mod original_program_visibility_tests {
         let outcome = store.append_transaction(request);
         assert!(matches!(outcome, Err(crate::RuntimeEventStoreError::StaleRevision { .. })),
             "a Program write after the declared head must fail the node transaction closed");
+    }
+
+    /// T5-N1: the certification window is the cut this node's own commits
+    /// produced, never the live head. A later legitimate advance by another
+    /// writer must not be able to turn this node's own carried effect into a
+    /// batch-blocking refusal.
+    #[test]
+    fn t5_certification_reads_the_nodes_own_cut_and_not_the_live_head() {
+        let own_cut = 14;
+        let live_head = 20;
+        assert_eq!(
+            super::original_program_certification_cut(own_cut, live_head).expect("forward is fine"),
+            own_cut,
+            "the certified window is the node's own commit cut"
+        );
+        // The effect this node produced (a claim) is visible at its own cut, and
+        // an unrelated writer's later rework reset it at the live head.
+        let mut at_own_cut = OriginalProgramEntityView::default();
+        at_own_cut.tasks.insert("task:abc".to_string(), OriginalTaskView {
+            claim_generation: 1, review_generation: 0, reviewed_by: false, review_outcome: false });
+        let mut at_live_head = OriginalProgramEntityView::default();
+        at_live_head.tasks.insert("task:abc".to_string(), OriginalTaskView::default());
+        let effects = vec![("task:abc".to_string(), "task_claim".to_string())];
+        assert!(
+            super::certify_original_program_effects(&at_own_cut, &effects, own_cut, live_head).is_ok(),
+            "work this node certified at its own cut stays carried"
+        );
+        let blocked = super::certify_original_program_effects(&at_live_head, &effects, live_head, live_head)
+            .expect_err("the old window is recorded so the regression cannot come back silently");
+        assert!(blocked.contains("effect=task:abc"), "{blocked}");
+    }
+
+    /// T5-N2: a genuinely absent effect is still refused, and the refusal names
+    /// the effect, the action kind, the certified cut and the live head. Nothing
+    /// is softened: the only change is that the sentence now carries its own
+    /// evidence instead of only a batch-level wrapper.
+    #[test]
+    fn t5_a_true_absent_effect_is_still_refused_with_named_evidence() {
+        let view = view();
+        let effects = vec![("task:missing".to_string(), "task_publish".to_string())];
+        let error = super::certify_original_program_effects(&view, &effects, 7, 9)
+            .expect_err("an effect nobody produced is not carried");
+        assert!(
+            error.starts_with("original Program effect is not visible at the certified head"),
+            "the original sentence survives untouched as the prefix: {error}"
+        );
+        assert_eq!(
+            error,
+            "original Program effect is not visible at the certified head; effect=task:missing action=task_publish certified_cut=7 live_head=9"
+        );
+    }
+
+    /// T5-N3: the placeholder shape that really blocked the 029 small-team run
+    /// (`":null"` as an agent ref) is refused at the node's own cut too. This
+    /// ticket does not launder the validation gap that belongs to 030-C1: an
+    /// unsplitable effect fails at every cut, which is exactly why it is a
+    /// separate face from the window choice.
+    #[test]
+    fn t5_a_placeholder_ref_is_still_refused_and_named() {
+        let view = view();
+        let effects = vec![(":null".to_string(), "agent_invite".to_string())];
+        let error = super::certify_original_program_effects(&view, &effects, 3, 3)
+            .expect_err("a placeholder ref is not a Program entity at any cut");
+        assert!(error.contains("effect=:null"), "{error}");
+        assert!(error.contains("action=agent_invite"), "{error}");
+    }
+
+    /// T5-N4: a stream that fell below this node's own cut keeps its original
+    /// refusal byte for byte, and the node's declared write head is still the
+    /// live head, so the CAS fence is untouched by the window change.
+    #[test]
+    fn t5_a_backwards_stream_keeps_the_original_refusal_and_the_fence() {
+        assert_eq!(
+            super::original_program_certification_cut(20, 17)
+                .expect_err("a truncated or replaced stream is not a window"),
+            "Program changed between original actions"
+        );
+        assert_eq!(
+            super::original_program_certification_cut(20, 20).expect("equal head is the node's own cut"),
+            20
+        );
     }
 }
 

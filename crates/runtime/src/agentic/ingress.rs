@@ -79,7 +79,34 @@ const MAX_REVIEW_SOURCE_CHANGED_RETRIES: u32 = 3;
 const MAX_REVIEW_PRECONDITION_RETRIES: u32 = 12;
 const MAX_REVIEW_PROGRAM_REBUILDS: u32 = 3;
 
+/// T8 bounds: how far an evidence refusal hint may read into the Session
+/// journal to name a repair, and how many candidate receipts one
+/// disambiguation hint may name. The scan is a hint-side read with no
+/// acceptance meaning; the bounds keep a long Session's refusal short.
+const MAX_EVIDENCE_HINT_RECEIPT_SCAN: usize = 512;
+const MAX_EVIDENCE_HINT_CANDIDATES: usize = 8;
+
+/// T1b budget: how many times one physical review ticket and attempt may re-drive
+/// its own evidence build at a fresh source cut before the dispatch stops and
+/// names the gap.
+///
+/// This is a separate budget from `MAX_REVIEW_SOURCE_CHANGED_RETRIES` because it
+/// buys a different thing. The streak budget counts refusals that stay on today's
+/// settle path; a rebuild consumes a named record the review evidence domain
+/// hands over (the refused source, the cut it pinned, the head the store
+/// reported) and re-reads at that head. Two is the bound the plan sets: one
+/// rebuild proves the window can be reached, a second proves it is moving, and a
+/// third is the loop the ledger used to call an unexplained wedge.
+const MAX_REVIEW_CUT_REBUILDS: u32 = 2;
+
 static REVIEW_SOURCE_CHANGED_STREAK: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Process-local rebuild bookkeeping keyed by the dispatching node's own
+/// `graph/node/attempt`, mirroring the streak mechanism above so the rebuild
+/// budget is one authority of the same shape rather than a second style of
+/// liveness state.
+static REVIEW_CUT_REBUILDS: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Retry-class review rejection caused by a concurrently-changing source. These
@@ -168,6 +195,152 @@ fn clear_review_streak(key: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(key);
+}
+
+fn bump_review_rebuild(key: &str) -> u32 {
+    let mut rebuilds = REVIEW_CUT_REBUILDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = rebuilds.entry(key.to_string()).or_insert(0);
+    *entry = entry.saturating_add(1);
+    *entry
+}
+
+fn clear_review_rebuild(key: &str) {
+    REVIEW_CUT_REBUILDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
+/// The dispatch identity a rebuild budget counts against: the physical node that
+/// owns this review action. A Runtime-authored or root action without a physical
+/// owner has no rebuild budget at all, so it keeps the path it has today.
+fn review_rebuild_key_for(graph_id: &str, node_id: &str, attempt: u32) -> String {
+    format!("{}/{attempt}", super::review_evidence::node_review_ref(graph_id, node_id))
+}
+
+fn review_rebuild_key(envelope: &AgentActionEnvelope) -> Option<String> {
+    let physical = envelope.actor.original_execution.as_ref()?;
+    Some(review_rebuild_key_for(
+        &physical.graph_id,
+        &physical.node_id,
+        physical.attempt,
+    ))
+}
+
+/// The named rebuild record behind a refusal, if this refusal carries one.
+///
+/// The grammar belongs to the review evidence domain (T1a), and it is strict: a
+/// reason that does not match exactly is not a rebuild request. The dispatch half
+/// therefore never grows a second parser - it asks for the ticket, and if the
+/// sentence reached it wrapped by an outer layer it retries once from the first
+/// occurrence of the sentence so a refusal is not silently demoted to today's
+/// settle path. If T1a later exposes a search entry, this is the one place that
+/// changes.
+fn review_repin_ticket_for(
+    graph_id: &str,
+    node_id: &str,
+    attempt: u32,
+    reason: &str,
+) -> Option<super::review_evidence::ReviewRepinTicket> {
+    let review_ref = super::review_evidence::node_review_ref(graph_id, node_id);
+    // Try the reason verbatim first, then the sentence sliced out of a wrapped
+    // refusal. A missing slice is not an error: it only means there is nothing
+    // further to try.
+    let candidates = [Some(reason.to_string()), own_pin_sentence(reason)]
+        .into_iter()
+        .flatten();
+    for candidate in candidates {
+        if let Some(ticket) =
+            super::review_evidence::ReviewRepinTicket::from_refusal(&review_ref, attempt, &candidate)
+        {
+            return Some(ticket);
+        }
+    }
+    None
+}
+
+fn review_repin_ticket(
+    envelope: &AgentActionEnvelope,
+    reason: &str,
+) -> Option<super::review_evidence::ReviewRepinTicket> {
+    let physical = envelope.actor.original_execution.as_ref()?;
+    review_repin_ticket_for(&physical.graph_id, &physical.node_id, physical.attempt, reason)
+}
+
+/// Slice out the pin sentence a wrapped refusal still carries verbatim. Anything
+/// that is not one of the two shapes yields `None`.
+fn own_pin_sentence(reason: &str) -> Option<String> {
+    for prefix in [
+        "result metadata source moved backwards during resolution; rebuild the review; source=",
+        "result metadata source changed during resolution; rebuild the review; source=",
+    ] {
+        if let Some(start) = reason.find(prefix) {
+            let tail = &reason[start..];
+            let end = tail
+                .find(" phase=result_source_pin")
+                .map(|end| end + " phase=result_source_pin".len())
+                .unwrap_or(tail.len());
+            return Some(tail[..end].to_string());
+        }
+    }
+    None
+}
+
+/// The one spelling of the rebuild bound.
+///
+/// Both review-window sentences used to word the bound independently, and they
+/// drifted (`bounded 2` versus `2 bounded`), which is exactly how a wedge came to
+/// read as two different classes depending on which sentence a consumer looked
+/// at. One generator, one token: a consumer can match the same literal in the
+/// caller-facing reason and in the durable settlement reason.
+fn review_rebuild_budget_token() -> String {
+    format!("bounded {MAX_REVIEW_CUT_REBUILDS}")
+}
+
+/// The terminal reason once the rebuild budget is spent. It names the budget and
+/// the ticket's own facts so the durable event carries the cause rather than a
+/// batch-level wrapper, and it is deliberately *not* an attempt failure: the
+/// window nobody could settle is Unknown, and the dispatch must not re-drive the
+/// old effect on the strength of a refused read.
+fn review_rebuild_unknown_reason(
+    ticket: &super::review_evidence::ReviewRepinTicket,
+    used: u32,
+    reason: &str,
+) -> String {
+    format!(
+        "review_window_unknown: review cut rebuild exhausted after {used} attempts at {budget}; \
+         ticket review_ref={review_ref} attempt={attempt} source={source} \
+         pinned_cut={pinned_cut} observed_head={observed_head} movement={movement:?}; \
+         last refusal: {reason}",
+        budget = review_rebuild_budget_token(),
+        review_ref = ticket.review_ref(),
+        attempt = ticket.attempt(),
+        source = ticket.source(),
+        pinned_cut = ticket.pinned_cut(),
+        observed_head = ticket.observed_head(),
+        movement = ticket.movement(),
+    )
+}
+
+/// The durable settlement reason for an exhausted rebuild budget.
+///
+/// It is deliberately *stable* per review lineage: the Task reducer treats an
+/// identical `last_failure` as "no new fact" and blocks the Task instead of
+/// handing the same refused read another dispatch. The varying evidence (the
+/// cut pinned, the head the store reported, the refusal sequence) travels in
+/// the caller-facing reason above, which lands in this node's own transcript,
+/// while the journal keeps one classifiable sentence per wedge.
+fn review_rebuild_settlement_reason(ticket: &super::review_evidence::ReviewRepinTicket) -> String {
+    format!(
+        "review_window_unknown: review {review_ref} attempt {attempt} source {source} \
+         cut rebuilds exhausted at {budget} (grammar result_source_pin)",
+        budget = review_rebuild_budget_token(),
+        review_ref = ticket.review_ref(),
+        attempt = ticket.attempt(),
+        source = ticket.source(),
+    )
 }
 
 /// Supervisor actor for a Runtime-authored attempt settlement. Mirrors the
@@ -385,10 +558,8 @@ impl RuntimeServices {
                             action.kind(),
                             actor.session_id
                         );
-                        if let Some(canonical) = hint {
-                            message.push_str(&format!(
-                                ". The durable receipt Runtime recorded for this tool call is tool://{canonical}; copy that exact reference"
-                            ));
+                        if let Some(hint) = hint {
+                            message.push_str(&format!(". {hint}"));
                         }
                         unresolvable.push(message);
                         continue;
@@ -496,27 +667,42 @@ impl RuntimeServices {
         Ok(())
     }
 
-    /// The canonical durable receipt id for a tool call whose cited content
-    /// suffix is corrupted. The stable call-id prefix still selects exactly
-    /// one recorded receipt (an ambiguous prefix resolves to nothing), so the
-    /// hint can only hand back what Runtime durably recorded - it can never
-    /// invent an id, and the caller's action is still rejected.
+    /// The repair hint for a cited `tool://` receipt that resolved to nothing.
+    ///
+    /// The original leg is unchanged: the stable call-id prefix still selects
+    /// exactly one recorded receipt (an ambiguous prefix resolves to nothing)
+    /// and its sentence is produced character for character. Two further legs
+    /// answer the shapes the prefix could not, as measured on the live
+    /// escalation - a call id that drifted by one character earned zero hints
+    /// across the whole Session, and one content suffix is legitimately
+    /// durable under several call ids. Drift within one edit is named as a
+    /// suggestion; a shared content suffix lists its candidate receipts by
+    /// name instead of picking one. Every leg can only hand back ids Runtime
+    /// durably recorded: it can never invent an id, rewrite the citation, or
+    /// turn the refusal into acceptance - the caller's action is still
+    /// rejected on the same path as before.
     async fn canonical_tool_evidence_hint(
         &self,
         session_id: &str,
         evidence_id: &str,
     ) -> Option<String> {
-        let (call_id, _suffix) = evidence_id.rsplit_once('-')?;
-        if call_id.is_empty() {
-            return None;
+        let recorded_unique = match evidence_id.rsplit_once('-') {
+            Some((call_id, _suffix)) if !call_id.is_empty() => self
+                .session_evidence_access(session_id, call_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|access| access.evidence_ref.id),
+            _ => None,
+        };
+        if recorded_unique.is_some() {
+            return tool_evidence_hint(evidence_id, recorded_unique.as_deref(), &[]);
         }
-        let access = self
-            .session_evidence_access(session_id, call_id)
+        let receipts = self
+            .session_evidence_receipt_ids(session_id, MAX_EVIDENCE_HINT_RECEIPT_SCAN)
             .await
-            .ok()
-            .flatten()?;
-        let canonical = access.evidence_ref.id;
-        (canonical != evidence_id).then_some(canonical)
+            .unwrap_or_default();
+        tool_evidence_hint(evidence_id, None, &receipts)
     }
 
     /// Delegated ToolHost entry. The capability exists only during the
@@ -694,6 +880,12 @@ impl RuntimeServices {
                 match built {
                     Ok(review) => {
                         clear_review_streak(&key);
+                        // A verdict settles the window question for this ticket:
+                        // the rebuild budget is bookkeeping for an in-flight
+                        // wedge, not a score to carry into the next attempt.
+                        if let Some(budget_key) = review_rebuild_key(envelope) {
+                            clear_review_rebuild(&budget_key);
+                        }
                         break Some(review);
                     }
                     Err(error) if is_review_program_advanced(&error) => {
@@ -711,6 +903,52 @@ impl RuntimeServices {
                         continue;
                     }
                     Err(error) => {
+                        if let Some(ticket) = review_repin_ticket(envelope, &error) {
+                            if ticket.movement().rebuildable() {
+                                let budget_key = review_rebuild_key(envelope)
+                                    .unwrap_or_else(|| ticket.lineage().0.to_string());
+                                let used = bump_review_rebuild(&budget_key);
+                                if used <= MAX_REVIEW_CUT_REBUILDS {
+                                    // T1b: one bounded rebuild of the same review
+                                    // task at a fresh cut. The evidence build pins
+                                    // the head the store reports now, so the
+                                    // re-read is against observed material rather
+                                    // than a wider claimed window, and the T1a
+                                    // discipline (growth inside the new window is
+                                    // refused again, never absorbed) still applies.
+                                    program = actions
+                                        .project(&envelope.actor.program_id)
+                                        .map_err(|projection_error| projection_error.to_string())?;
+                                    continue;
+                                }
+                                clear_review_rebuild(&budget_key);
+                                // The window could not be reached inside the
+                                // bounded rebuilds. Name it as Unknown and let
+                                // the existing attempt reducer close it: this is
+                                // a scheduling checkpoint, not a re-drive of the
+                                // refused read, and the stable settlement reason
+                                // makes a repeat wedge block instead of dispatch
+                                // the same refused read again.
+                                let settlement = self
+                                    .settle_wedged_review_attempt(
+                                        envelope,
+                                        &program,
+                                        &review_rebuild_settlement_reason(&ticket),
+                                    )
+                                    .await;
+                                let unknown = review_rebuild_unknown_reason(&ticket, used, &error);
+                                return Err(match settlement {
+                                    Ok(()) => unknown,
+                                    Err(settle_error) => format!(
+                                        "{unknown}; runtime review-window settlement failed: {settle_error}"
+                                    ),
+                                });
+                            }
+                            // A head that moved backwards means the material the
+                            // reviewer read may no longer exist. That is not a
+                            // rebuildable window, so it keeps its original
+                            // refusal and today's settlement path untouched.
+                        }
                         if is_review_source_changed_retry(&error) {
                             // A precondition the caller has not satisfied yet is not
                             // a failed attempt, so it draws on its own budget. Both
@@ -1272,6 +1510,141 @@ fn objective_artifact_integration_score(
     teams.len()
 }
 
+/// Split a receipt reference into the stable call-id part and a trailing
+/// content suffix shaped like the one Runtime records: at least eight hex
+/// characters after the last `-`. Everything before that `-` is the call id,
+/// matching the split the original hint leg already used; without a suffix
+/// the whole reference is the call id.
+fn receipt_id_parts(reference: &str) -> (&str, Option<&str>) {
+    match reference.rsplit_once('-') {
+        Some((call, suffix))
+            if suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            (call, Some(suffix))
+        }
+        Some((call, _suffix)) => (call, None),
+        None => (reference, None),
+    }
+}
+
+/// Levenshtein distance at most one between two call ids: one substituted,
+/// inserted, or deleted character - the drift shape the escalation ledger
+/// measured. An exact match is deliberately not drift: the resolution legs
+/// own that case, so a correction hint never suggests a self-rewrite.
+/// Receipt call ids are ASCII, so byte indexing is character indexing.
+fn within_one_edit(cited: &str, recorded: &str) -> bool {
+    match cited.len().abs_diff(recorded.len()) {
+        0 => cited
+            .bytes()
+            .zip(recorded.bytes())
+            .filter(|(left, right)| left != right)
+            .count()
+            == 1,
+        1 => {
+            let (short, long) = if cited.len() < recorded.len() {
+                (cited, recorded)
+            } else {
+                (recorded, cited)
+            };
+            let common = short
+                .bytes()
+                .zip(long.bytes())
+                .take_while(|(left, right)| left == right)
+                .count();
+            short.as_bytes()[common..] == long.as_bytes()[common + 1..]
+        }
+        _ => false,
+    }
+}
+
+/// Name candidate receipts, bounded so one refusal cannot sprawl.
+fn name_receipt_candidates(candidates: &[&str]) -> String {
+    let shown = candidates.len().min(MAX_EVIDENCE_HINT_CANDIDATES);
+    let mut names = candidates[..shown]
+        .iter()
+        .map(|id| format!("tool://{id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if candidates.len() > shown {
+        names.push_str(&format!(" (and {} more)", candidates.len() - shown));
+    }
+    names
+}
+
+/// The hint decision itself, split from the journal reads so every shape the
+/// refusal can name is directly testable. Leg order: the receipt the call-id
+/// prefix resolved (the original sentence, kept character for character),
+/// then one-edit call-id drift, then a content suffix recorded under
+/// several call ids. A single near neighbour is named as "appears to be";
+/// several, or a suffix shared by several, list the candidates instead of
+/// guessing. Nothing here rewrites the citation or resolves anything - the
+/// refusal lands on the same unresolvable path with one more sentence.
+///
+/// The drift leg binds the content suffix as well as the call id (R48.3,
+/// taken as 甲): resolution of a named receipt does not require the receipt
+/// to belong to the citing call (`ingress.rs:569-586` checks content
+/// integrity of whatever `tool://` id it is handed), so a candidate within
+/// one edit on the call id but a different content suffix could point the
+/// model at another call's provenance. Requiring `recorded digest ==
+/// cited digest` keeps the suggestion honest: the escalation shape - one
+/// character adrift with the suffix intact - still gets corrected, and an
+/// unrelated near neighbour without the same content earns nothing.
+fn tool_evidence_hint(
+    cited: &str,
+    recorded_unique: Option<&str>,
+    receipts: &[String],
+) -> Option<String> {
+    if let Some(canonical) = recorded_unique {
+        return (canonical != cited).then(|| {
+            format!(
+                "The durable receipt Runtime recorded for this tool call is tool://{canonical}; copy that exact reference"
+            )
+        });
+    }
+    let (cited_call, cited_digest) = receipt_id_parts(cited);
+    if cited_call.is_empty() {
+        return None;
+    }
+    let near: Vec<&str> = receipts
+        .iter()
+        .map(String::as_str)
+        .filter(|id| {
+            let (recorded_call, recorded_digest) = receipt_id_parts(id);
+            cited_digest == recorded_digest
+                && within_one_edit(cited_call, recorded_call)
+        })
+        .collect();
+    match near.len() {
+        1 => {
+            let candidate = near[0];
+            let (recorded_call, _) = receipt_id_parts(candidate);
+            Some(format!(
+                "No receipt matches the cited reference, but the recorded call id {recorded_call} is one edit away from the cited one; the durable receipt appears to be tool://{candidate}; copy that exact reference"
+            ))
+        }
+        0 => {
+            let cited_digest = cited_digest?;
+            let shared: Vec<&str> = receipts
+                .iter()
+                .map(String::as_str)
+                .filter(|id| receipt_id_parts(id).1 == Some(cited_digest))
+                .collect();
+            (shared.len() >= 2).then(|| {
+                format!(
+                    "No receipt matches the cited reference; the cited content suffix is recorded under {} durable receipts in this Session: {}; cite the full tool:// reference returned by the intended completed tool call",
+                    shared.len(),
+                    name_receipt_candidates(&shared)
+                )
+            })
+        }
+        _ => Some(format!(
+            "No receipt matches the cited reference; {} recorded call ids are within one edit of the cited one: {}; cite the full tool:// reference returned by the intended completed tool call",
+            near.len(),
+            name_receipt_candidates(&near)
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,6 +1784,118 @@ mod tests {
         // The streak restarts after a settlement or a clean verdict.
         assert_eq!(bump_review_streak(key), 1);
         clear_review_streak(key);
+    }
+
+    const T1B_FORWARD: &str = "result metadata source changed during resolution; \
+     rebuild the review; source=execution-agent-receipts:t1b:agent:1 expected=14 \
+     actual=16 phase=result_source_pin";
+    const T1B_BACKWARDS: &str = "result metadata source moved backwards during resolution; \
+     rebuild the review; source=execution-agent-receipts:t1b:agent:1 expected=16 \
+     actual=15 phase=result_source_pin";
+
+    fn t1b_ticket(reason: &str) -> super::super::review_evidence::ReviewRepinTicket {
+        review_repin_ticket_for("agentic-graph:t1b", "agent:1", 4, reason)
+            .expect("a pin refusal carries its rebuild ticket")
+    }
+
+    /// T1b-N1: the rebuild budget is bounded at the named two, and the shape
+    /// that exceeds it is a typed Unknown that names its own evidence. It must
+    /// not be an attempt settlement, because settling would hand the root a
+    /// retryable failure and re-dispatch the very effect this read refused.
+    #[test]
+    fn t1b_the_rebuild_budget_is_bounded_and_the_excess_is_a_typed_unknown() {
+        let ticket = t1b_ticket(T1B_FORWARD);
+        assert!(ticket.movement().rebuildable(), "a forward head is rebuildable");
+        assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (14, 16));
+        assert_eq!(ticket.attempt(), 4, "the ticket keeps the refused attempt");
+        let key = review_rebuild_key_for("agentic-graph:t1b", "agent:1", 4);
+        clear_review_rebuild(&key);
+        assert_eq!(bump_review_rebuild(&key), 1);
+        assert_eq!(bump_review_rebuild(&key), 2);
+        assert!(2 <= MAX_REVIEW_CUT_REBUILDS, "the plan's bound is two");
+        let unknown = review_rebuild_unknown_reason(&ticket, 3, T1B_FORWARD);
+        assert!(unknown.starts_with("review_window_unknown:"), "{unknown}");
+        assert!(unknown.contains("bounded 2"), "{unknown}");
+        assert!(unknown.contains("source=execution-agent-receipts:t1b:agent:1"), "{unknown}");
+        assert!(unknown.contains("pinned_cut=14 observed_head=16"), "{unknown}");
+        assert!(unknown.contains(T1B_FORWARD), "the original refusal travels verbatim");
+        assert!(
+            !unknown.contains("settled"),
+            "an exhausted rebuild is not an attempt settlement: {unknown}"
+        );
+        clear_review_rebuild(&key);
+        assert_eq!(bump_review_rebuild(&key), 1, "the budget restarts for the next attempt");
+        clear_review_rebuild(&key);
+    }
+
+    /// T1b-N2: a head that moved backwards is not a window anybody observed. It
+    /// produces a ticket (T1a names it) but never a rebuild, so today's refusal
+    /// and today's settlement path keep it exactly as they had it.
+    #[test]
+    fn t1b_a_backwards_head_is_never_a_rebuild_request() {
+        let ticket = t1b_ticket(T1B_BACKWARDS);
+        assert_eq!(ticket.movement(), super::super::review_evidence::ReviewSourceMovement::Backwards);
+        assert!(!ticket.movement().rebuildable(), "a rebuilt window would be invented");
+    }
+
+    /// T1b-N3: the dispatch half must not lose a rebuildable ticket just because
+    /// an outer layer wrapped the refusal sentence, and it must not invent one
+    /// for a refusal that is not a pin refusal at all.
+    #[test]
+    fn t1b_a_wrapped_refusal_still_yields_the_ticket_and_other_refusals_yield_none() {
+        let wrapped = format!("runtime review evidence failed: {T1B_FORWARD}; see attempt history");
+        let ticket = t1b_ticket(&wrapped);
+        assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (14, 16), "{ticket:?}");
+        assert_eq!(ticket.reason(), T1B_FORWARD, "the wording survives the round trip");
+        assert!(
+            review_repin_ticket_for("agentic-graph:t1b", "agent:1", 4, "review physical attempt is stale").is_none(),
+            "a non-pin refusal is not a rebuild request"
+        );
+        assert!(
+            review_repin_ticket_for("agentic-graph:t1b", "agent:1", 4, "").is_none(),
+            "an empty reason is not a rebuild request"
+        );
+    }
+
+    /// T1b-N4: the durable settlement sentence must be stable per review
+    /// lineage. The Task reducer only blocks a repeat wedge when the failure
+    /// reason is identical, so a sentence carrying a moving head would hand the
+    /// refused read another dispatch instead of settling it.
+    #[test]
+    fn t1b_the_settlement_reason_is_stable_and_names_no_moving_head() {
+        let first = t1b_ticket(T1B_FORWARD);
+        let grown = review_repin_ticket_for(
+            "agentic-graph:t1b",
+            "agent:1",
+            4,
+            "result metadata source changed during resolution; rebuild the review; \
+             source=execution-agent-receipts:t1b:agent:1 expected=16 actual=23 phase=result_source_pin",
+        )
+        .expect("the same lineage refusing at a later head");
+        assert_eq!(
+            review_rebuild_settlement_reason(&first),
+            review_rebuild_settlement_reason(&grown),
+            "one lineage, one settlement sentence"
+        );
+        let reason = review_rebuild_settlement_reason(&first);
+        assert!(reason.starts_with("review_window_unknown:"), "{reason}");
+        assert!(reason.contains("bounded 2"), "{reason}");
+        // The anti-drift lock: the caller-facing reason and the durable
+        // settlement reason must spell the bound with the same literal token.
+        // This is the assertion that would have caught the first run's red.
+        let budget = review_rebuild_budget_token();
+        assert!(
+            reason.contains(&budget)
+                && review_rebuild_unknown_reason(&first, 3, T1B_FORWARD).contains(&budget),
+            "one budget token, both sentences: settlement={reason} caller={}",
+            review_rebuild_unknown_reason(&first, 3, T1B_FORWARD)
+        );
+        assert!(!reason.contains("14"), "the pinned cut is not in the stable sentence: {reason}");
+        assert!(!reason.contains("16"), "the observed head is not in the stable sentence: {reason}");
+        assert!(
+            review_rebuild_unknown_reason(&first, 3, T1B_FORWARD).contains("pinned_cut=14"),
+            "the evidence still reaches the caller-facing reason"
+        );
     }
 
     fn task_fixture(
@@ -1695,6 +2180,314 @@ mod tests {
             !attempt_error.contains("points to missing durable content"),
             "{attempt_error}"
         );
+    }
+
+    /// 030 T8 control (1): a one-character drift in the call-id part - the
+    /// shape that earned zero hints across the whole escalation Session - is
+    /// answered by naming the closest recorded call id and its durable
+    /// receipt, never by rewriting or resolving the citation.
+    #[test]
+    fn t8_a_one_character_call_drift_is_corrected_by_name_never_by_rewriting() {
+        let canonical = "tool-raw-chatcmpl-tool-aa0d514a557763e5-2c77431438342406";
+        let receipts = vec![canonical.to_string()];
+        for (shape, cited) in [
+            (
+                "substitution",
+                "tool-raw-chatcmpl-tool-aa0d514a557763e6-2c77431438342406",
+            ),
+            (
+                "deletion",
+                "tool-raw-chatcmpl-tool-aa0d514a557763e-2c77431438342406",
+            ),
+        ] {
+            let hint = tool_evidence_hint(cited, None, &receipts)
+                .unwrap_or_else(|| panic!("a {shape} drift must earn a named hint"));
+            assert!(
+                hint.contains(&format!("appears to be tool://{canonical}")),
+                "the hint names the one durable receipt: {hint}"
+            );
+            assert!(
+                hint.contains("tool-raw-chatcmpl-tool-aa0d514a557763e5"),
+                "the recorded call id is named as the suggestion: {hint}"
+            );
+            assert!(hint.contains("copy that exact reference"), "{hint}");
+            assert!(
+                !hint.contains(cited),
+                "the hint never repeats the citation as if it were valid: {hint}"
+            );
+        }
+        // An exact citation is the resolution legs' own case, and a drift
+        // wider than one edit is a guess the hint must refuse to make.
+        assert!(tool_evidence_hint(canonical, None, &receipts).is_none());
+        assert!(tool_evidence_hint(
+            "tool-raw-chatcmpl-tool-ffffff514a557763e9-2c77431438342406",
+            None,
+            &receipts,
+        )
+        .is_none());
+        // R48.3 (甲): a receipt one edit away on the call id but carrying a
+        // different content suffix is not suggestion material - copying it
+        // would resolve to another call's provenance, and the refusal must
+        // not point there.
+        assert!(tool_evidence_hint(
+            "tool-raw-chatcmpl-tool-aa0d514a557763e6-deadbeefdeadbeef",
+            None,
+            &receipts,
+        )
+        .is_none());
+    }
+
+    /// 030 T8 control (2): a content suffix that several call ids
+    /// legitimately share - the escalation measured one suffix under four
+    /// receipts - disambiguates by naming every candidate, never by picking.
+    #[test]
+    fn t8_a_shared_digest_suffix_lists_candidate_call_ids_by_name() {
+        let digest = "3ab2c55c2949bfc1";
+        let mut receipts: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|tail| format!("tool-raw-chatcmpl-tool-000000000000000{tail}-{digest}"))
+            .collect();
+        receipts.push("tool-raw-chatcmpl-tool-111111111111111f-deadbeefdeadbeef".to_string());
+        let cited = "tool-raw-chatcmpl-tool-ffffffffffffffff-3ab2c55c2949bfc1";
+        let hint = tool_evidence_hint(cited, None, &receipts)
+            .expect("a shared suffix must name its candidates");
+        assert!(hint.contains("recorded under 4 durable receipts"), "{hint}");
+        for tail in ["a", "b", "c", "d"] {
+            assert!(
+                hint.contains(&format!(
+                    "tool://tool-raw-chatcmpl-tool-000000000000000{tail}-{digest}"
+                )),
+                "every candidate is named: {hint}"
+            );
+        }
+        assert!(
+            !hint.contains("111111111111111f"),
+            "an unrelated receipt is not listed: {hint}"
+        );
+        // A suffix recorded under exactly one receipt is not disambiguation
+        // material either: there is nothing to choose between, and the call
+        // legs above already had their chance.
+        assert!(tool_evidence_hint(
+            "tool-raw-chatcmpl-tool-ffffffffffffffff-deadbeefdeadbeef",
+            None,
+            &receipts,
+        )
+        .is_none());
+        // Naming stays bounded even when the suffix is popular.
+        let crowded = (0..9)
+            .map(|i| format!("tool-raw-call-{i:02}-{digest}"))
+            .collect::<Vec<_>>();
+        let hint = tool_evidence_hint("tool-raw-call-xx-3ab2c55c2949bfc1", None, &crowded)
+            .expect("nine holders still disambiguate");
+        assert!(hint.contains("recorded under 9 durable receipts"), "{hint}");
+        assert!(hint.contains("(and 1 more)"), "the list is capped: {hint}");
+    }
+
+    /// 030 T8 control (3): the leg that already worked keeps its behavior
+    /// exactly - the original sentence, character for character - and two
+    /// one-edit neighbours disambiguate by listing instead of guessing.
+    #[test]
+    fn t8_the_exact_call_leg_keeps_its_original_sentence() {
+        let canonical = "tool-raw-chatcmpl-tool-aa0d514a557763e5-2c77431438342406";
+        let cited = "tool-raw-chatcmpl-tool-aa0d514a557763e5-6";
+        assert_eq!(
+            tool_evidence_hint(cited, Some(canonical), &[])
+                .expect("the original leg still hints"),
+            format!(
+                "The durable receipt Runtime recorded for this tool call is tool://{canonical}; copy that exact reference"
+            )
+        );
+        // A citation already equal to the recorded receipt earns no hint.
+        assert!(tool_evidence_hint(canonical, Some(canonical), &[]).is_none());
+        // Two recorded call ids within one edit list both instead of picking.
+        let receipts = vec![
+            canonical.to_string(),
+            "tool-raw-chatcmpl-tool-aa0d514a557763e4-2c77431438342406".to_string(),
+        ];
+        let hint = tool_evidence_hint(
+            "tool-raw-chatcmpl-tool-aa0d514a557763e7-2c77431438342406",
+            None,
+            &receipts,
+        )
+        .expect("an ambiguous drift lists candidates");
+        assert!(
+            hint.contains("2 recorded call ids are within one edit"),
+            "{hint}"
+        );
+        assert!(hint.contains(&format!("tool://{canonical}")), "{hint}");
+        assert!(
+            hint.contains("tool://tool-raw-chatcmpl-tool-aa0d514a557763e4-2c77431438342406"),
+            "{hint}"
+        );
+    }
+
+    /// 030 T8: the drift bound is exactly one edit - substitution, insertion,
+    /// or deletion - and nothing wider, including no self-match.
+    #[test]
+    fn t8_within_one_edit_bounds_the_drift() {
+        assert!(within_one_edit("abcd", "abce"));
+        assert!(within_one_edit("abcd", "abcde"));
+        assert!(within_one_edit("abcd", "bcd"));
+        assert!(!within_one_edit("abcd", "abcd"));
+        assert!(!within_one_edit("abcd", "abde"));
+        assert!(!within_one_edit("abcd", "wxyz"));
+        assert!(!within_one_edit("abcd", "abcdefgh"));
+    }
+
+    /// 030 T8: both drifted shapes - a one-character call-id drift and a
+    /// foreign call citing a shared content suffix - earn their hints through
+    /// the real validation refusal, which stays a refusal.
+    #[tokio::test]
+    async fn drifted_call_ids_are_refused_with_the_correction_named() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
+        use harness_contract::agent_action::{AgentActorKind, TaskSubmitInput};
+        use harness_contract::reality::EvidenceRef;
+
+        let canonical = "tool-raw-chatcmpl-tool-aa0d514a557763e5-2c77431438342406";
+        let digest = "3ab2c55c2949bfc1";
+        let shared: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|tail| format!("tool-raw-chatcmpl-tool-000000000000000{tail}-{digest}"))
+            .collect();
+        let temp = tempfile::tempdir().expect("temp");
+        let store = std::sync::Arc::new(crate::test_support::session_store());
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "s1".to_string(),
+                platform: "test".to_string(),
+                chat_id: "evidence-hint-drift".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-10-10T00:00:00Z".to_string(),
+                last_activity: "2026-10-10T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("session");
+        let artifacts = std::sync::Arc::new(
+            crate::ArtifactStore::for_test(
+                temp.path().to_path_buf(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        );
+        let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store);
+        let facade = crate::context_evidence::raw::RawEvidenceFacade::new(
+            crate::context_evidence::raw::SessionPortRawEvidenceStore::new(
+                ports.clone(),
+                artifacts,
+            ),
+        );
+        for id in std::iter::once(canonical.to_string()).chain(shared.iter().cloned()) {
+            facade
+                .persist(crate::context_evidence::raw::RawEvidenceWrite {
+                    evidence_ref: EvidenceRef::observed("tool", id.clone()),
+                    session_id: "s1".to_string(),
+                    media_type: "text/plain".to_string(),
+                    visibility_scope: "session:s1".to_string(),
+                    payload: format!("recorded body for {id}"),
+                    metadata: serde_json::json!({
+                        "tool_name": "read_ref",
+                        "tool_call_id": id,
+                    }),
+                })
+                .await
+                .expect("durable evidence");
+        }
+
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let services = crate::RuntimeServices::test_builder(temp.path(), workspace)
+            .session_ports(ports.clone(), ports.clone(), ports.clone(), ports)
+            .build()
+            .expect("services");
+        let actor = harness_contract::agent_action::AgentActorBinding {
+            original_execution: None,
+            objective_id: "objective".to_string(),
+            program_id: "program".to_string(),
+            session_id: "s1".to_string(),
+            turn_id: "turn".to_string(),
+            root_execution_id: None,
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: "review".to_string(),
+            model_lease: "test".to_string(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: vec![],
+            actor_id: "agent:1".to_string(),
+            kind: AgentActorKind::Agent,
+            execution_id: None,
+            team_id: None,
+            agent_id: Some("agent:1".to_string()),
+        };
+        let drifted = "tool-raw-chatcmpl-tool-aa0d514a557763e6-2c77431438342406";
+        let action = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task:1".to_string(),
+            deliverable: None,
+            artifact_refs: vec![],
+            evidence_refs: vec![format!("tool://{drifted}")],
+            unresolved: vec![],
+        });
+        let error = services
+            .validate_agent_action_evidence(&actor, &action)
+            .await
+            .expect_err("a drifted call id must never resolve");
+        assert!(error.contains("has no canonical durable receipt"), "{error}");
+        assert!(
+            error.contains(&format!("appears to be tool://{canonical}")),
+            "the refusal names the closest recorded receipt: {error}"
+        );
+        assert!(error.contains("copy that exact reference"), "{error}");
+        // R48.3 (甲) end to end: the same drifted call id with a foreign
+        // content suffix earns no suggestion - the refusal stands alone.
+        let mismatched = "tool-raw-chatcmpl-tool-aa0d514a557763e6-deadbeefdeadbeef";
+        let action = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task:1".to_string(),
+            deliverable: None,
+            artifact_refs: vec![],
+            evidence_refs: vec![format!("tool://{mismatched}")],
+            unresolved: vec![],
+        });
+        let error = services
+            .validate_agent_action_evidence(&actor, &action)
+            .await
+            .expect_err("a drifted call id over a foreign suffix must never resolve");
+        assert!(error.contains("has no canonical durable receipt"), "{error}");
+        assert!(
+            !error.contains("appears to be"),
+            "no suggestion across a content mismatch: {error}"
+        );
+
+        let foreign = "tool-raw-chatcmpl-tool-ffffffffffffffff-3ab2c55c2949bfc1";
+        let action = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task:1".to_string(),
+            deliverable: None,
+            artifact_refs: vec![],
+            evidence_refs: vec![format!("tool://{foreign}")],
+            unresolved: vec![],
+        });
+        let error = services
+            .validate_agent_action_evidence(&actor, &action)
+            .await
+            .expect_err("a shared suffix must never resolve to one call");
+        assert!(error.contains("has no canonical durable receipt"), "{error}");
+        assert!(
+            error.contains("recorded under 4 durable receipts"),
+            "the refusal disambiguates: {error}"
+        );
+        for id in &shared {
+            assert!(
+                error.contains(&format!("tool://{id}")),
+                "every candidate is named: {error}"
+            );
+        }
     }
 }
 

@@ -254,6 +254,60 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
         }
         Ok(stem_match)
     }
+
+    async fn session_evidence_receipt_ids(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, session::SessionError> {
+        // Read-only mirror of the journal `evidence_access` walks, bounded by
+        // `limit`, oldest journal sequences first: it lists recorded receipt
+        // ids and decides nothing. The resolution tiers above stay the single
+        // authority on acceptance. A Session past `limit` receipts reads as
+        // no hint at all - today's exact behavior, never a wrong one (R48/e2
+        // 三.1: oldest-first bounded is deliberate at 030; newest-first needs
+        // store support and is a 031 face).
+        let service = self.service()?;
+        let mut from_sequence = 0;
+        let mut ids: Vec<String> = Vec::new();
+        while ids.len() < limit {
+            let Some((_, events)) = service
+                .stored_domain_events_by_kind_page(
+                    session_id,
+                    runtime::RuntimeSessionEventKind::EvidenceRawPersisted.as_str(),
+                    from_sequence,
+                    128.min(limit - ids.len()).max(1),
+                )
+                .await?
+            else {
+                break;
+            };
+            if events.is_empty() {
+                break;
+            }
+            let mut next_sequence = from_sequence;
+            for stored in events {
+                next_sequence = next_sequence.max(stored.sequence.saturating_add(1));
+                let event = session::SessionDomainEvent::from_session_event(&stored)
+                    .map_err(|error| session::SessionError::Store(error.to_string()))?;
+                if let Some(recorded) =
+                    runtime::context_evidence::raw::persisted_evidence_id(&event.payload)
+                {
+                    ids.push(recorded.to_string());
+                    if ids.len() == limit {
+                        return Ok(ids);
+                    }
+                }
+            }
+            if next_sequence <= from_sequence {
+                return Err(session::SessionError::Store(
+                    "evidence event pagination did not advance".to_string(),
+                ));
+            }
+            from_sequence = next_sequence;
+        }
+        Ok(ids)
+    }
 }
 
 /// The stable call id of a `tool://` receipt with a trailing hex content hash

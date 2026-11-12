@@ -1204,6 +1204,7 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
         "expired",
         "shared-expired",
         "body-timeout",
+        "transport-abort",
     ] {
         let [a, _] = u5_fixture_resource_events();
         let mut script = Vec::new();
@@ -1291,7 +1292,15 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
                 Duration::ZERO,
             ));
         }
-        let mut fixture = U5SingleCaseHttpFixture::start_wire(script);
+        // H1-N3: a deliberate connection abort must reach the consumer as the
+        // transport error it is, never as a laundered budget verdict or a success.
+        let mut fixture = if fault == "transport-abort" {
+            U5SingleCaseHttpFixture::start_status(
+                script.into_iter().map(|(p, v, u, d)| (p, v, u, d, 1)).collect(),
+            )
+        } else {
+            U5SingleCaseHttpFixture::start_wire(script)
+        };
         let mut owner = u5_fixture_owner();
         owner.base_url = fixture.url.clone();
         let mut runner = u5_fixture_runner(&fixture.url);
@@ -1338,6 +1347,17 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
                 assert_eq!(requests.len(), 1);
                 assert!(started.elapsed() < Duration::from_secs(1));
             }
+            "transport-abort" => {
+                assert!(
+                    requests.is_empty(),
+                    "the abort answers nothing, so no request is recorded: {requests:?}"
+                );
+                assert!(error.contains("error sending request"), "{error}");
+                assert!(
+                    !error.contains("byte budget") && !error.contains("before IO"),
+                    "a refused connection must not be relabelled as a budget verdict: {error}"
+                );
+            }
             _ => unreachable!(),
         }
     }
@@ -1380,7 +1400,14 @@ impl U5SingleCaseHttpFixture {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
         let server = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // Supply is event-driven, not wall-clock-driven. The former
+            // five-second absolute lifetime starved the consumer under load
+            // and rewrote product budget refusals into transport errors, so
+            // the thread now lives until the script is fully served or its
+            // owner stops it. The long cap below is a liveness watchdog for a
+            // pathological hang, not a service deadline: no consumer-facing
+            // window moves, every test deadline stays on the consumer side.
+            let liveness = Instant::now() + Duration::from_secs(120);
             let mut requests = Vec::new();
             let mut served = vec![false; script.len()];
             loop {
@@ -1389,7 +1416,7 @@ impl U5SingleCaseHttpFixture {
                 }
                 let mut stream = loop {
                     if stopping.load(std::sync::atomic::Ordering::SeqCst)
-                        || Instant::now() >= deadline
+                        || Instant::now() >= liveness
                     {
                         return requests;
                     }
@@ -1401,19 +1428,46 @@ impl U5SingleCaseHttpFixture {
                         Err(error) => panic!("NoRealU5 accept: {error}"),
                     }
                 };
+                // A scripted abort closes the accepted connection before the
+                // request is read and before anything is answered. Whether
+                // the peer's kernel then sees a reset or a clean shutdown is
+                // platform behaviour; the consumer contract the negative
+                // control guards is identical for both shapes: a refused
+                // connection must stay a transport error, must record no
+                // answered request, and must never reach a budget verdict or
+                // an Ok.
+                let abort_now = script
+                    .iter()
+                    .zip(served.iter())
+                    .find(|(_, done)| !**done)
+                    .is_some_and(|((_, _, _, _, status), _)| *status == 1);
+                if abort_now {
+                    return requests;
+                }
                 stream
-                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .set_read_timeout(Some(Duration::from_millis(250)))
                     .unwrap();
                 stream
-                    .set_write_timeout(Some(Duration::from_millis(200)))
+                    .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let mut bytes = Vec::new();
                 let (headers, body) = loop {
-                    assert!(bytes.len() < 16_384 && Instant::now() < deadline);
+                    assert!(bytes.len() < 16_384);
+                    if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                        return requests;
+                    }
                     let mut chunk = [0; 1024];
-                    let count = stream.read(&mut chunk).unwrap();
-                    assert!(count > 0, "NoRealU5 incomplete HTTP request");
-                    bytes.extend_from_slice(&chunk[..count]);
+                    match stream.read(&mut chunk) {
+                        // An early client close is a consumer-side event:
+                        // keep the recordings and end this connection, never
+                        // panic and never re-label it.
+                        Ok(0) => return requests,
+                        Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                || error.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(error) => panic!("NoRealU5 read: {error}"),
+                    }
                     if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
                         let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
                         let length = headers
@@ -1474,9 +1528,11 @@ impl U5SingleCaseHttpFixture {
                     )
                 };
                 // A bounded consumer may close early on size/deadline errors.
-                // Request parsing/order and all consumer assertions still fail normally.
+                // A failed write ends only this connection: the recordings
+                // stay and the rest of the script keeps being served, so one
+                // early close can no longer starve the later pages.
                 if stream.write_all(header.as_bytes()).is_err() {
-                    return requests;
+                    continue;
                 }
                 let wake = Instant::now() + *delay;
                 while Instant::now() < wake {
@@ -1485,9 +1541,7 @@ impl U5SingleCaseHttpFixture {
                     }
                     thread::sleep(Duration::from_millis(1));
                 }
-                if stream.write_all(&body).is_err() {
-                    return requests;
-                }
+                let _ = stream.write_all(&body);
             }
         });
         Self {
@@ -1574,6 +1628,17 @@ fn u5_event_first_observation_case(case: &str) -> Result<(Value, U5CancelContext
         }
         if case == "event-budget" {
             response["total"] = json!(513);
+            // A 513-row total on a one-row page promises more pages; the
+            // reader's pagination contract rejects an inconsistent page
+            // before the budget check, so this fixture must keep has_more
+            // truthful to exercise the intended budget refusal.
+            response["has_more"] = json!(true);
+        }
+        if case == "count-lies" {
+            // Negative control for the pagination contract itself: the
+            // count exceeds the returned rows while has_more claims the
+            // page is complete.
+            response["total"] = json!(5);
         }
         script.push(wire(
             EVENTS,
@@ -1582,7 +1647,7 @@ fn u5_event_first_observation_case(case: &str) -> Result<(Value, U5CancelContext
         ));
     }
     let before_graph_failure =
-        ["deadline", "permission", "wrong-page", "event-budget"].contains(&case);
+        ["deadline", "permission", "wrong-page", "event-budget", "count-lies"].contains(&case);
     let selected_failure = [
         "selected-404",
         "selected-invariant",
@@ -1736,6 +1801,7 @@ fn u5_event_first_original_observer_rejects_foreign_closed_and_failed_boundaries
         ("permission", "evidence response rejected"),
         ("wrong-page", "page identity mismatch"),
         ("event-budget", "exceeds event budget"),
+        ("count-lies", "pagination contract mismatch"),
         ("deadline", "coverage missing"),
     ] {
         let error = u5_event_first_observation_case(case).err().expect(case);
@@ -5391,6 +5457,131 @@ fn unreadable_execution_projection_marks_progress_unobservable() {
     observer.mark_stalled();
     observer.mark_unobservable();
     assert_eq!(observer.phase(), "unobservable");
+}
+
+// The wait loop's second terminal source: the root's own durable outcome
+// receipt on the cursor-complete timeline. Terminal receipt present with no
+// usable projection plane stops the wait by name; every other shape keeps
+// the existing behaviour, including a readable projection with authority
+// and a succeeded class (the message plane still owns that exit).
+#[test]
+fn root_terminal_receipt_stops_the_wait_by_name_before_watchdogs() {
+    let receipt = |class: Option<&str>, status: Option<&str>, cursor: u64, graph: &str, scope: &str| {
+        json!({"kind":"runtime.outcome.recorded.v1","commit_cursor":cursor,
+               "status":status,
+               "payload":{"identity":{"execution_graph_ref":graph,"execution_scope":scope},
+                          "terminal":{"class":class}}})
+    };
+    let timeline_of = |events: Vec<Value>| json!({"events":events});
+    let failed_root = receipt(Some("failed"), Some("failed"), 6244, "root-a", "session");
+    // Negative control A: terminal receipt present, projection plane has
+    // nothing to say - stop waiting, named, with the receipt's identity.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![failed_root.clone()]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        Some(("failed".to_string(), Some(6244))),
+        "a root-recorded terminal outcome must end the wait before any watchdog window"
+    );
+    // The receipt must name the root's own session-scoped execution.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(Some("failed"), Some("failed"), 3, "other-graph", "session")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        None,
+        "another execution's terminal receipt cannot end this wait"
+    );
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(Some("failed"), Some("failed"), 3, "root-a", "child")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        None,
+        "a child-scoped receipt is not the root's terminal decision"
+    );
+    // No receipt: the existing watchdog contract keeps its role.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        None
+    );
+    // A readable projection with a finalized reference keeps authority: the
+    // existing named finalization exit (and its message selection) runs.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![failed_root.clone()]),
+            "root-a",
+            Some("terminal-ref-from-projection"),
+            &RootExecutionTerminal::Pending,
+        ),
+        None
+    );
+    // A Completed projection stays on the message-plane path.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![failed_root.clone()]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Completed,
+        ),
+        None
+    );
+    // Succeeded receipts do not trigger the awaiting-review stop.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(Some("succeeded"), Some("succeeded"), 9, "root-a", "session")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        None,
+        "a succeeded root keeps the durable-message exit, never the reconstruction stop"
+    );
+    // Missing class falls back to the event status, then to a named unknown.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(None, Some("cancelled"), 11, "root-a", "session")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        Some(("cancelled".to_string(), Some(11)))
+    );
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(None, None, 12, "root-a", "session")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        Some(("unknown".to_string(), Some(12))),
+        "a recorded terminal without a parseable class is still terminal, and named honestly"
+    );
+    // The latest root receipt wins across generations.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![
+                receipt(Some("failed"), Some("failed"), 10, "root-a", "session"),
+                receipt(Some("cancelled"), Some("cancelled"), 20, "root-a", "session"),
+            ]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        Some(("cancelled".to_string(), Some(20)))
+    );
 }
 
 

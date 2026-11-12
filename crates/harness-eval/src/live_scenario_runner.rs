@@ -4843,6 +4843,32 @@ impl LiveScenarioRunner {
                     });
                 }
             }
+            // The root's own durable outcome receipt on the cursor-complete
+            // timeline is the second terminal source. When the execution
+            // projection was unreadable from here the projection-derived
+            // finalized reference is gone, and without this exit the
+            // watchdogs would misname an already-recorded root terminal as
+            // harness stall. This stop is an observation, not a verdict:
+            // review reconstruction still has to rebuild from the receipt,
+            // and a readable projection keeps authority through the exits
+            // above.
+            if let Some((class, commit_cursor)) = root_terminal_awaiting_review_reconstruction(
+                &observer.timeline(),
+                root_execution_id,
+                finalized_non_success.as_deref(),
+                &root_terminal,
+            ) {
+                return Err(format!(
+                    "root_terminal_awaiting_review_reconstruction: class={} commit_cursor={} phase={} last_active_phase={} progress_observations={} message_cursor={} timeline_cursor={}; the root outcome is durably recorded and the wait stopped at that receipt rather than at an observation window",
+                    class,
+                    commit_cursor.map_or_else(|| "unknown".to_string(), |cursor| cursor.to_string()),
+                    observer.phase(),
+                    observer.last_active_phase(),
+                    observer.progress_observations(),
+                    observer.next_message_sequence(),
+                    observer.timeline_cursor().unwrap_or("-"),
+                ));
+            }
             let elapsed = started.elapsed();
             let elapsed_ms = elapsed.as_millis() as u64;
             let since_progress = Duration::from_millis(observer.since_last_progress_ms(elapsed_ms));
@@ -8913,6 +8939,38 @@ fn root_business_event<'event>(
                     .and_then(Value::as_str)
                     == Some(root_execution_id)
         })
+}
+
+/// Decide whether a wait loop must stop on the root's own durable terminal
+/// receipt. The receipt (root-scoped, session-scope identity, latest
+/// generation) is a second terminal source next to the execution
+/// projection: when the projection is unreadable from this observer, the
+/// projection-derived `finalized_non_success` reference is lost and the
+/// watchdogs would otherwise misname an already-recorded root terminal as
+/// harness stall or observation-limit. The decision returns `None` (stay on
+/// the existing paths) whenever the projection plane still has authority
+/// (a finalized reference exists, or the root projection reads Completed),
+/// no root receipt is on the timeline, or the receipt's class is
+/// `succeeded` (the normal message plane keeps its exit). A non-success
+/// class yields the class and commit cursor for the named
+/// `root_terminal_awaiting_review_reconstruction` stop.
+fn root_terminal_awaiting_review_reconstruction(
+    timeline: &Value,
+    root_execution_id: &str,
+    finalized_non_success: Option<&str>,
+    root_terminal: &RootExecutionTerminal,
+) -> Option<(String, Option<u64>)> {
+    if finalized_non_success.is_some() || matches!(root_terminal, RootExecutionTerminal::Completed) {
+        return None;
+    }
+    let event = root_business_event(timeline, root_execution_id)?;
+    let class = event
+        .pointer("/payload/terminal/class")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("status").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_string();
+    (class != "succeeded").then(|| (class, event.get("commit_cursor").and_then(Value::as_u64)))
 }
 
 pub(crate) fn root_business_observation(timeline: &Value, root_execution_id: &str) -> Value {

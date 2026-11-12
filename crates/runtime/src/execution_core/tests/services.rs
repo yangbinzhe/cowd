@@ -5222,6 +5222,14 @@ impl crate::SessionRuntimeQueryPort for A8SessionQueryPort {
     ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, session::SessionError> {
         Ok(None)
     }
+
+    async fn session_evidence_receipt_ids(
+        &self,
+        _session_id: &str,
+        _limit: usize,
+    ) -> Result<Vec<String>, session::SessionError> {
+        Ok(Vec::new())
+    }
 }
 
 fn a8_original_ingress() -> crate::TurnIngressRef {

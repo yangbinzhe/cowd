@@ -7280,6 +7280,19 @@ impl RuntimeServices {
         };
         query.evidence_access(session_id, evidence_id).await
     }
+
+    /// List the Session's recorded durable receipt ids for refusal hints.
+    /// Read-only: nothing on an acceptance path may resolve through here.
+    pub(crate) async fn session_evidence_receipt_ids(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, session::SessionError> {
+        let Some(query) = self.session_query_port.get() else {
+            return Ok(Vec::new());
+        };
+        query.session_evidence_receipt_ids(session_id, limit).await
+    }
     pub fn tool_execution_host(&self) -> Option<&Arc<dyn crate::RuntimeExecutionHost>> {
         self.tool_execution_host.as_ref()
     }
