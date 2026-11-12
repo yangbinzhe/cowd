@@ -22,6 +22,8 @@ fn r1_a_applied_review_recognises_its_own_call() {
 #[test]
 fn r1_a_live_review_that_authenticates_to_nothing_exempts_nothing() {
     let action = AgentAction::TaskReview(TaskReviewInput {
+        gaps: Vec::new(),
+        directed_actions: Vec::new(),
         task_ref: "task".into(),
         decision: TaskReviewDecision::Accept,
         reason: "actual independent evidence".into(),
@@ -49,6 +51,8 @@ fn r1_a_live_review_that_authenticates_to_nothing_exempts_nothing() {
 #[test]
 fn r1_a_live_review_binds_to_the_call_it_performs() {
     let action = AgentAction::TaskReview(TaskReviewInput {
+        gaps: Vec::new(),
+        directed_actions: Vec::new(),
         task_ref: "task".into(),
         decision: TaskReviewDecision::Accept,
         reason: "actual independent evidence".into(),

@@ -8664,10 +8664,21 @@ mod tests {
         let mut judged_cuts = std::collections::BTreeMap::new();
         let mut grown_judged = ScriptedHead { heads: [5_u64, 7].into() };
         pin(&mut grown_judged, "agentic-program:one", &mut judged_cuts).unwrap();
+        let drift = pin(&mut grown_judged, "agentic-program:one", &mut judged_cuts).unwrap_err();
+        // 032 K4b (A2): identity is the code, not the wording; the facts the
+        // old verbatim assertion pinned are still asserted individually.
         assert_eq!(
-            pin(&mut grown_judged, "agentic-program:one", &mut judged_cuts).unwrap_err(),
-            "result metadata source changed during resolution; rebuild the review; \
-             source=agentic-program:one expected=5 actual=7 phase=result_source_pin"
+            super::super::reason_code::reason_code_of(&drift),
+            Some(super::super::reason_code::ReviewRefusalCode::ResultSourceChangedDuringResolution),
+            "the drift refusal is named by its own code: {drift}"
+        );
+        assert!(
+            drift.contains("source=agentic-program:one expected=5 actual=7"),
+            "the projection still carries the window facts: {drift}"
+        );
+        assert!(
+            drift.contains("phase=result_source_pin"),
+            "the projection still carries its phase: {drift}"
         );
 
         let mut backwards_cuts = std::collections::BTreeMap::new();

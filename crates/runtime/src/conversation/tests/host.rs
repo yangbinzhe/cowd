@@ -69,6 +69,10 @@ fn the_closure_view_never_calls_a_gap_both_open_and_closed() {
         program.tasks.insert(
             format!("task:{index}"),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: format!("task:{index}"),
                 team_id: "team:1".to_string(),
                 title: (*title).to_string(),
@@ -229,6 +233,10 @@ fn the_control_plane_requirement_is_derived_from_the_program_not_written_as_lite
     program.tasks.insert(
         "task:0".to_string(),
         crate::AgenticTaskProjection {
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
             task_id: "task:0".into(),
             team_id: "team:1".into(),
             title: "t".into(),
@@ -547,6 +555,10 @@ fn multiple_results_do_not_create_synthesis_debt_or_discharge_goal_review() {
         program.tasks.insert(
             format!("task:{index}"),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: format!("task:{index}"),
                 team_id: "team:1".into(),
                 title: format!("task {index}"),

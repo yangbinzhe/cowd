@@ -244,6 +244,12 @@ fn revision_seed(
         task.claim_execution_id = None;
         task.claimed_at_ms = None;
         task.lease_expires_at_ms = None;
+        // 032 K3 (B8): the continuation re-seed must not erase outstanding
+        // attempt facts. Every attempt leaving the active set without a
+        // durable terminal keeps its full identity in the unsettled list,
+        // exactly like the rework release path in work_market.
+        task.unsettled_released_attempts
+            .extend(task.active_attempts.values().cloned());
         task.active_attempts.clear();
         // Counters bound an authorization's physical retries, not all future
         // user-authorized attempts. Historical failures remain in the source.
@@ -830,14 +836,19 @@ mod tests {
     /// Path 4 - a continuation cannot carry an uncertain claim across the
     /// turn.  The fence it inherits is fenced forward: the generation moves so
     /// the old execution's token cannot be replayed, the claim fields are
-    /// cleared, the attempts are dropped, and the Task waits for an explicit
-    /// reconciliation instead of looking busy.
+    /// cleared, the attempts are settled by name into the task's unsettled
+    /// ledger (032 K3/B8: a re-seed must not erase attempt facts), and the
+    /// Task waits for an explicit reconciliation instead of looking busy.
     #[test]
     fn a_continuation_fences_the_claim_it_cannot_carry_over() {
         let mut source = crate::AgenticProgramProjection::empty("program", "objective");
         source.tasks.insert(
             "task".to_string(),
             crate::AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: "task".to_string(),
                 team_id: "team".to_string(),
                 title: "task".to_string(),
@@ -916,6 +927,10 @@ mod tests {
         assert_eq!(task.claimed_at_ms, None);
         assert_eq!(task.lease_expires_at_ms, None);
         assert!(task.active_attempts.is_empty());
+        let settled = &task.unsettled_released_attempts;
+        assert_eq!(settled.len(), 1, "the released attempt keeps its identity");
+        assert_eq!(settled[0].execution_id, "old-root");
+        assert_eq!(settled[0].generation, 4);
         assert!(
             task.unresolved
                 .iter()

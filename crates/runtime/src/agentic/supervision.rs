@@ -281,6 +281,10 @@ mod tests {
         artifact_refs: Vec<&str>,
     ) -> AgenticTaskProjection {
         AgenticTaskProjection {
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
             task_id: task_id.to_string(),
             team_id: team_id.to_string(),
             title: task_id.to_string(),

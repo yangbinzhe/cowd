@@ -2657,6 +2657,8 @@ mod tests {
 
     fn review_action() -> AgentAction {
         AgentAction::TaskReview(TaskReviewInput {
+            gaps: Vec::new(),
+            directed_actions: Vec::new(),
             task_ref: "task:one".into(),
             decision: TaskReviewDecision::Accept,
             reason: "independently read".into(),
@@ -2841,6 +2843,8 @@ mod tests {
         let other_action = CurrentReviewContext {
             action_id: &key,
             action: &AgentAction::TaskReview(TaskReviewInput {
+                gaps: Vec::new(),
+                directed_actions: Vec::new(),
                 task_ref: "task:two".into(),
                 decision: TaskReviewDecision::Accept,
                 reason: "independently read".into(),
@@ -2857,6 +2861,8 @@ mod tests {
         let other_verdict = CurrentReviewContext {
             action_id: &key,
             action: &AgentAction::TaskReview(TaskReviewInput {
+                gaps: Vec::new(),
+                directed_actions: Vec::new(),
                 task_ref: "task:one".into(),
                 decision: TaskReviewDecision::Rework,
                 reason: "independently read".into(),

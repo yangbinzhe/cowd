@@ -4,6 +4,7 @@ mod identity;
 pub(crate) use identity::review_result_identity;
 mod policy;
 pub(crate) mod read_source;
+pub(crate) mod reason_code;
 mod results;
 
 // The rebuild record and its entry point belong to the review evidence domain,
@@ -4521,6 +4522,10 @@ mod tests {
     /// generation 1 bound to `graph` / `agent:1` / `membership:1`.
     fn reviewed_task() -> crate::agentic::program::AgenticTaskProjection {
         let mut task = crate::agentic::program::AgenticTaskProjection {
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
             task_id: "task".to_string(),
             team_id: "team".to_string(),
             title: "long task".to_string(),
@@ -5030,6 +5035,10 @@ mod tests {
             program.tasks.insert(
                 task_id.to_string(),
                 crate::AgenticTaskProjection {
+                    obligations: Vec::new(),
+                    rework_directives: Vec::new(),
+                    unsettled_released_attempts: Vec::new(),
+                    terminal_note: None,
                     task_id: task_id.to_string(),
                     team_id: "team:1".to_string(),
                     title: "work".to_string(),
@@ -5098,6 +5107,10 @@ mod tests {
         program.tasks.insert(
             "task:empty".to_string(),
             crate::AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 claim_renewal_streak: 0,
                 task_id: "task:empty".to_string(),
                 team_id: "team:1".to_string(),

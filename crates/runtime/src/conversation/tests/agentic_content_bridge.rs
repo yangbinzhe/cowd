@@ -608,6 +608,10 @@ async fn a_submitted_task_with_no_reviewer_is_named_with_its_action() {
     let mut program = crate::AgenticProgramProjection::empty("awaiting-review", "original-goal");
     program.session_id = "awaiting-review-session".into();
     let base = crate::AgenticTaskProjection {
+        obligations: Vec::new(),
+        rework_directives: Vec::new(),
+        unsettled_released_attempts: Vec::new(),
+        terminal_note: None,
         task_id: "task:delivered".to_string(),
         team_id: "team:a".to_string(),
         title: "delivered work".to_string(),
@@ -693,6 +697,10 @@ async fn a_program_with_every_task_under_review_carries_no_action() {
     let mut program = crate::AgenticProgramProjection::empty("all-reviewed", "original-goal");
     program.session_id = "all-reviewed-session".into();
     let mut task = crate::AgenticTaskProjection {
+        obligations: Vec::new(),
+        rework_directives: Vec::new(),
+        unsettled_released_attempts: Vec::new(),
+        terminal_note: None,
         task_id: "task:1".to_string(),
         team_id: "team:a".to_string(),
         title: "under review".to_string(),

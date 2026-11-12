@@ -457,6 +457,26 @@ pub struct AgenticTaskProjection {
     /// the objective.
     #[serde(default)]
     pub criterion_source: harness_contract::agent_action::CriterionSource,
+    /// 032 K1: compiled criterion record of this Task (single source:
+    /// `compile_task_obligations` at publish). Hand-built fixtures leave it
+    /// empty; every replayed Program recomputes it from the durable publish
+    /// envelope, so old events gain the record without a migration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligations: Vec<AgenticTaskObligation>,
+    /// 032 K3: rework directives carried by review verdicts (durable facts
+    /// for the next claim; never an auto-dispatch source).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rework_directives: Vec<AgenticReworkDirective>,
+    /// 032 K3 (B8): attempts released by a Rework/Challenge verdict without a
+    /// durable terminal. The clear stops being an erasure: each entry keeps
+    /// its execution_id, agent, mode and generation, so the new round cannot
+    /// inherit - or launder - an unsettled physical effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsettled_released_attempts: Vec<AgenticTaskAttemptProjection>,
+    /// 032 K3 (B10): the exhaustion note of a Blocked transition - failure
+    /// family only, never a satisfied bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_note: Option<String>,
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub obligation_refs: Vec<String>,
@@ -516,6 +536,39 @@ pub struct AgenticTaskProjection {
     pub cancel_evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_retirement: Option<AgenticTaskRetirement>,
+}
+
+/// One compiled acceptance criterion of a Task (032 K1). The record is
+/// produced exactly once, at publish, by `compile_task_obligations` - the B1
+/// single source. Every later reader (the rework anchor, the K2 review input
+/// pack, completion read-outs) consumes this list; recompiling prose or checks
+/// anywhere else is the second-source failure the ledger named twice (the
+/// "documented domains" and the invented-counterexample runs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgenticTaskObligation {
+    /// Stable key inside the Task: `acceptance` for the authoritative prose,
+    /// `check:<index>` for each machine-checkable hint.
+    pub key: String,
+    pub text: String,
+    /// The prose stays authoritative; checks are hint-ranked criteria of the
+    /// same compiled record, never a second standard (B2).
+    pub authoritative: bool,
+    /// Provenance travels with every criterion (B3): an agent-invented
+    /// statement was never the operator's requirement.
+    pub criterion_source: harness_contract::agent_action::CriterionSource,
+}
+
+/// A rework directive carried by a review verdict (032 K3). Durable fact for
+/// the next claim; Runtime never auto-dispatches from it - dispatch stays with
+/// the root/supervisor owners, so the verdict channel cannot become a second
+/// admission path (v2 audit red line three).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AgenticReworkDirective {
+    pub source_action_id: String,
+    #[serde(default)]
+    pub gaps: Vec<String>,
+    #[serde(default)]
+    pub directed_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

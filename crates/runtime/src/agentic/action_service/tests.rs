@@ -3734,6 +3734,8 @@ fn a_rework_round_must_be_reviewable_again_in_its_own_graph() {
             "team:round-reducer",
             "agent:reviewer",
             AgentAction::TaskReview(TaskReviewInput {
+                gaps: Vec::new(),
+                directed_actions: Vec::new(),
                 task_ref: task.into(),
                 decision: TaskReviewDecision::Rework,
                 operator_requirement: Some("test objective".into()),
@@ -3781,6 +3783,10 @@ fn reopened_program_receipts_never_advertise_the_exit_action() {
         },
     );
     let task = crate::AgenticTaskProjection {
+        obligations: Vec::new(),
+        rework_directives: Vec::new(),
+        unsettled_released_attempts: Vec::new(),
+        terminal_note: None,
         task_id: "task:1".to_string(),
         team_id: "team:1".to_string(),
         title: "delivered".to_string(),
@@ -4015,6 +4021,10 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
         },
     );
     let mut task = crate::AgenticTaskProjection {
+        obligations: Vec::new(),
+        rework_directives: Vec::new(),
+        unsettled_released_attempts: Vec::new(),
+        terminal_note: None,
         task_id: "task:1".to_string(),
         team_id: "team:1".to_string(),
         title: "delivered".to_string(),
@@ -4434,6 +4444,8 @@ async fn program_evidence_alias_preflight_preserves_scope_and_content_guards() {
     .actor;
     let review = |reference: String| {
         AgentAction::TaskReview(TaskReviewInput {
+            gaps: Vec::new(),
+            directed_actions: Vec::new(),
             task_ref: "task:preflight-only".into(),
             decision: TaskReviewDecision::Accept,
             reason: "retained content".into(),
@@ -4510,6 +4522,8 @@ fn review_rejects_a_goal_from_another_program_even_with_matching_wording() {
             &team,
             &reviewer,
             AgentAction::TaskReview(TaskReviewInput {
+                gaps: Vec::new(),
+                directed_actions: Vec::new(),
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Rework,
                 reason: "missing evidence".into(),
@@ -4547,6 +4561,8 @@ fn rework_without_operator_wording_is_refused() {
             &team,
             &reviewer,
             AgentAction::TaskReview(TaskReviewInput {
+                gaps: Vec::new(),
+                directed_actions: Vec::new(),
                 operator_requirement: None,
                 task_ref: task.clone(),
                 decision: TaskReviewDecision::Rework,

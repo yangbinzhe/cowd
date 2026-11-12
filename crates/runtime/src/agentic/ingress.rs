@@ -48,35 +48,6 @@ impl OriginalIngressResult {
     }
 }
 
-/// A positive review verdict is rejected as "source changed; retry" while the
-/// underlying effect/strategy revision is being rewritten by concurrent
-/// writers. That is optimistic-concurrency, not a business failure, so the
-/// model is asked to retry. But a *wedged* active review graph can be rejected
-/// with the same retry class forever: the rejection never reaches
-/// `TaskAttemptFail`, so `failed_review_attempts` never increments and the
-/// bounded review-attempt terminal (G56/G57 reviewed-graph stall) is never
-/// reached.
-///
-/// This streak is process-local liveness bookkeeping keyed by
-/// `(program, task/criterion, reviewing execution)`. After
-/// `MAX_REVIEW_SOURCE_CHANGED_RETRIES` same-class rejections on one attempt the
-/// Runtime settles a durable `TaskAttemptFail`, which the existing
-/// `MAX_TASK_REVIEW_ATTEMPTS` bound turns into `Blocked` and lets the root
-/// converge with an explicit terminal instead of waiting forever.
-const MAX_REVIEW_SOURCE_CHANGED_RETRIES: u32 = 3;
-/// Budget for a refusal whose cause is a step the reviewer has not taken yet.
-///
-/// A precondition is not a failure: "you have not read the body" is a step that
-/// was never executed, not an attempt that went wrong. Counting it against the
-/// failure budget punished a reviewer for the framework's own silence about what
-/// to read - one live reviewer was settled twice, and each settlement forced a
-/// fresh attempt that started from zero reads again, which made the loop longer
-/// the tighter the budget was.
-///
-/// The bound stays because the original concern is real: an artifact whose body
-/// genuinely cannot be read must not loop forever. Twelve is enough to read
-/// every delivered result of a normal request and then submit.
-const MAX_REVIEW_PRECONDITION_RETRIES: u32 = 12;
 const MAX_REVIEW_PROGRAM_REBUILDS: u32 = 3;
 
 /// T8 bounds: how far an evidence refusal hint may read into the Session
@@ -90,111 +61,37 @@ const MAX_EVIDENCE_HINT_CANDIDATES: usize = 8;
 /// its own evidence build at a fresh source cut before the dispatch stops and
 /// names the gap.
 ///
-/// This is a separate budget from `MAX_REVIEW_SOURCE_CHANGED_RETRIES` because it
-/// buys a different thing. The streak budget counts refusals that stay on today's
-/// settle path; a rebuild consumes a named record the review evidence domain
+/// It is the one review-rebuild budget in the dispatch lane because it
+/// buys a different thing. (032 K3: the retry-class streak budget this was
+/// separate from is deleted by the capability ledger's adjudication - drift
+/// and precondition refusals without a rebuild ticket settle through the
+/// caller's typed path now, and this ticket ledger is the one review-rebuild
+/// budget.) A rebuild consumes a named record the review evidence domain
 /// hands over (the refused source, the cut it pinned, the head the store
 /// reported) and re-reads at that head. Two is the bound the plan sets: one
 /// rebuild proves the window can be reached, a second proves it is moving, and a
 /// third is the loop the ledger used to call an unexplained wedge.
 const MAX_REVIEW_CUT_REBUILDS: u32 = 2;
-
-static REVIEW_SOURCE_CHANGED_STREAK: LazyLock<Mutex<HashMap<String, u32>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 /// Process-local rebuild bookkeeping keyed by the dispatching node's own
-/// `graph/node/attempt`, mirroring the streak mechanism above so the rebuild
-/// budget is one authority of the same shape rather than a second style of
-/// liveness state.
+/// lineage `{graph}/{node}/{attempt}`: after the merge of 032 K3 (A6/A7/A8)
+/// this is the one review-rebuild budget authority in the dispatch lane. The
+/// retry-class streak ledger it used to mirror is deleted with the ledger's
+/// adjudication; drift and precondition refusals without a rebuild ticket
+/// now settle through the caller's existing typed path instead of a second
+/// counter.
 static REVIEW_CUT_REBUILDS: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Retry-class review rejection caused by a concurrently-changing source. These
-/// strings are authored by Runtime (`review_evidence/policy.rs`), never by a
-/// provider or model.
-/// A refusal whose cause is a step the caller has not taken yet.
-///
-/// "You have not read the delivered results" is not a failed attempt; it is an
-/// unexecuted step. It carries its own, larger budget so a reviewer is never
-/// settled for the framework's own silence about what to read.
-fn is_review_precondition_refusal(error: &str) -> bool {
-    error.contains("review_requires_current_physical_reads")
-}
-
-/// A refusal whose cause is the content or the attempt itself. These are real
-/// failures and keep the tight budget.
-fn is_review_content_refusal(error: &str) -> bool {
-    // A review attempt whose generation no longer matches an already-reviewed or
-    // reworked Task is stale; bound it so it settles instead of looping, and a
-    // fresh attempt can be dispatched.
-    error.contains("review physical attempt is stale")
-        || ((error.contains("review policy source changed")
-            || error.contains("effect review source changed")
-            || error.contains("delegated effect source changed"))
-            && error.contains("retry"))
-}
-
-fn is_review_source_changed_retry(error: &str) -> bool {
-    is_review_precondition_refusal(error)
-        || is_review_content_refusal(error)
-        || is_review_source_drift(error)
-}
-
-/// A refusal whose cause is a source head that moved while the review was
-/// reading it.
-///
-/// Every string below is authored by Runtime's own read fences
-/// (`review_evidence/results.rs`, `review_evidence/policy.rs`,
-/// `review_evidence/current_review.rs`), never by a provider or a model, and
-/// each of them still refuses. The class only decides the bounded retry
-/// budget and how the attempt settles: a drifting source that matched no
-/// classifier used to clear the streak on every rejection, so
-/// `failed_review_attempts` never incremented and the bounded review-attempt
-/// terminal was never reached.
-fn is_review_source_drift(error: &str) -> bool {
-    error.contains("result metadata source changed during resolution")
-        || error.contains("result metadata source moved backwards during resolution")
-        || error.contains("proof source changed during validation")
-        || error.contains("proof source changed while paging")
-        || error.contains("proof source changed at final page boundary")
-        || error.contains("completed review witness source changed during authentication")
-        || error.contains("current Session head moved backwards while reading original material")
-        || error.contains("original Session material cut or current head differs")
-}
-
 fn is_review_program_advanced(error: &str) -> bool {
-    error.starts_with("result Program changed during original producer resolution:")
-        || error.starts_with("result metadata changed after original effect enumeration:")
-}
-
-fn review_attempt_key(envelope: &AgentActionEnvelope) -> String {
-    let focus = match &envelope.action {
-        AgentAction::TaskReview(input) => input.task_ref.clone(),
-        AgentAction::ObjectiveReview(input) => input.criterion_ref.clone(),
-        _ => String::new(),
-    };
-    format!(
-        "{}:{}:{}",
-        envelope.actor.program_id,
-        focus,
-        envelope.actor.execution_id.as_deref().unwrap_or("root")
-    )
-}
-
-fn bump_review_streak(key: &str) -> u32 {
-    let mut streaks = REVIEW_SOURCE_CHANGED_STREAK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = streaks.entry(key.to_string()).or_insert(0);
-    *entry = entry.saturating_add(1);
-    *entry
-}
-
-fn clear_review_streak(key: &str) {
-    REVIEW_SOURCE_CHANGED_STREAK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(key);
+    // 032 K4b (A2): classification asks the named code table first; the
+    // sentence survives only as its text projection. The enumeration-fence
+    // shape is ResultMetadataChangedAfterEnumeration. The Program-changed
+    // shape belongs to the producer-resolution family, has no code yet, and
+    // keeps its named prefix until that family is registered (B6 wordlist).
+    matches!(
+        crate::agentic::review_evidence::reason_code::reason_code_of(error),
+        Some(crate::agentic::review_evidence::reason_code::ReviewRefusalCode::ResultMetadataChangedAfterEnumeration)
+    ) || error.starts_with("result Program changed during original producer resolution:")
 }
 
 fn bump_review_rebuild(key: &str) -> u32 {
@@ -272,9 +169,16 @@ fn review_repin_ticket(
 /// Slice out the pin sentence a wrapped refusal still carries verbatim. Anything
 /// that is not one of the two shapes yields `None`.
 fn own_pin_sentence(reason: &str) -> Option<String> {
+    // 032 K4b (A2): the two pin shapes are recognised by their own codes; the
+    // slice is taken from whatever sentence projection carries them. Every
+    // producer of these two refusals emits the full "rebuild the review;
+    // source=" continuation, so code-matched starts coincide with the old
+    // prefix-matched ones on the whole corpus (pinned by the dispatch tests).
     for prefix in [
-        "result metadata source moved backwards during resolution; rebuild the review; source=",
-        "result metadata source changed during resolution; rebuild the review; source=",
+        crate::agentic::review_evidence::reason_code::ReviewRefusalCode::ResultSourceMovedBackwardsDuringResolution
+            .sentence_lead(),
+        crate::agentic::review_evidence::reason_code::ReviewRefusalCode::ResultSourceChangedDuringResolution
+            .sentence_lead(),
     ] {
         if let Some(start) = reason.find(prefix) {
             let tail = &reason[start..];
@@ -829,7 +733,6 @@ impl RuntimeServices {
         // the submitted body, and the Task can never be independently accepted.
         let is_review = positive_review || matches!(&envelope.action, AgentAction::TaskReview(_));
         let review = if is_review {
-            let key = review_attempt_key(envelope);
             let mut program = actions
                 .project(&envelope.actor.program_id)
                 .map_err(|error| error.to_string())?;
@@ -879,7 +782,6 @@ impl RuntimeServices {
                     .await;
                 match built {
                     Ok(review) => {
-                        clear_review_streak(&key);
                         // A verdict settles the window question for this ticket:
                         // the rebuild budget is bookkeeping for an in-flight
                         // wedge, not a score to carry into the next attempt.
@@ -891,7 +793,6 @@ impl RuntimeServices {
                     Err(error) if is_review_program_advanced(&error) => {
                         rebuilds += 1;
                         if rebuilds > MAX_REVIEW_PROGRAM_REBUILDS {
-                            clear_review_streak(&key);
                             return Err(format!(
                                 "review could not reach a stable Program cut after \
                                  {MAX_REVIEW_PROGRAM_REBUILDS} rebuilds: {error}"
@@ -949,37 +850,12 @@ impl RuntimeServices {
                             // rebuildable window, so it keeps its original
                             // refusal and today's settlement path untouched.
                         }
-                        if is_review_source_changed_retry(&error) {
-                            // A precondition the caller has not satisfied yet is not
-                            // a failed attempt, so it draws on its own budget. Both
-                            // classes still settle: neither may loop forever.
-                            let bound = if is_review_precondition_refusal(&error) {
-                                MAX_REVIEW_PRECONDITION_RETRIES
-                            } else {
-                                MAX_REVIEW_SOURCE_CHANGED_RETRIES
-                            };
-                            let streak = bump_review_streak(&key);
-                            if streak >= bound {
-                                clear_review_streak(&key);
-                                // The active review graph is wedged on a retry-class
-                                // rejection that never becomes a durable failure.
-                                // Settle a durable TaskAttemptFail so the bounded
-                                // review-attempt policy can close the Task.
-                                let settlement = self
-                                    .settle_wedged_review_attempt(envelope, &program, &error)
-                                    .await;
-                                return match settlement {
-                                    Ok(()) => Err(format!(
-                                        "review attempt settled after {streak} retryable rejections: {error}"
-                                    )),
-                                    Err(settle_error) => Err(format!(
-                                        "{error}; runtime review-attempt settlement failed: {settle_error}"
-                                    )),
-                                };
-                            }
-                        } else {
-                            clear_review_streak(&key);
-                        }
+                        // 032 K3 (A6/A7/A9 removal, ledger-adjudicated): no
+                        // second retry counter. A refusal that is neither a
+                        // ticket-carrying rebuild (above) nor a Program move
+                        // (A4, pending K4) returns unchanged here; the
+                        // caller's existing typed settlement closes the
+                        // attempt, and `failed_review_attempts` bounds it.
                         return Err(error);
                     }
                 }
@@ -1443,8 +1319,6 @@ pub fn agentic_program_completion_gap(
     crate::agentic::supervision::completion_gap(&program, &input)
 }
 
-#[cfg(test)]
-use crate::execution_core::goal::assessment::objective_completion_waiting_gap;
 
 /// A satisfied ObjectiveReview is the single semantic proof consumed by the
 /// completion gate. Require it to cover the full result set of the active
@@ -1650,395 +1524,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_source_changed_retry_matches_only_runtime_retry_messages() {
+    fn t_removal_program_move_classification_still_holds() {
+        // 032 K3 kept exactly this classifier while deleting the retry-class
+        // streak family (A6/A7/A9); the old fixture that covered both lives on
+        // here in the surviving half.
         assert!(is_review_program_advanced(
             "result metadata changed after original effect enumeration: result=artifact:one source=session:one expected=1 observed=2; rebuild the review"
         ));
         assert!(is_review_program_advanced(
             "result Program changed during original producer resolution: source agentic-program:one is at revision 2 but the reviewed Program projection is at 1"
         ));
-        for error in [
-            "result metadata changed after original effect enumeration",
-            "actual result input source moved during enumeration",
-            "primary acquisition source changed during recovery",
-            "publication source changed during original review discovery",
-            "primary acquisition source changed during discovery",
-            "proof artifact identity is ambiguous",
-            "review_requires_effect_observation:artifact:new",
-        ] {
-            assert!(!is_review_program_advanced(error), "{error}");
-        }
-        assert!(is_review_source_changed_retry(
-            "effect review source changed; retry current effects"
+        assert!(!is_review_program_advanced(
+            "result metadata source changed during resolution; rebuild the review; source=session:one expected=1 actual=2 phase=result_source_pin"
         ));
-        assert!(is_review_source_changed_retry(
-            "delegated effect source changed; retry current effects"
-        ));
-        assert!(is_review_source_changed_retry(
-            "review policy source changed; retry against current strategy and tool plans"
-        ));
-        // A source head that moved while the review was reading it still
-        // refuses; it now reaches the bounded settlement instead of clearing
-        // the streak on every rejection.
-        for error in [
-            "result metadata source changed during resolution; rebuild the review; source=session:one expected=1 actual=2 phase=result_source_pin",
-            "result metadata source moved backwards during resolution; rebuild the review; source=session:one expected=2 actual=1 phase=result_source_pin",
-            "proof source changed during validation",
-            "proof source changed during validation; retry current inputs; source=goal:x expected=1 actual=2 phase=final_source_fence; advanced=1 head=2 []",
-            "proof source changed while paging; retry current inputs",
-            "proof source changed at final page boundary; retry current inputs",
-            "completed review witness source changed during authentication",
-            "current Session head moved backwards while reading original material",
-            "original Session material cut or current head differs",
-        ] {
-            assert!(is_review_source_drift(error), "{error}");
-            assert!(is_review_source_changed_retry(error), "{error}");
-        }
-        // Unrelated rejections must not be treated as the wedged retry class.
-        assert!(!is_review_source_changed_retry("review Task not found"));
-        for error in [
-            "review Task not found",
-            "Artifact catalog source changed; start a fresh discovery",
-            "result publication does not match its original physical packet/claim",
-            "review physical attempt is stale",
-        ] {
-            assert!(!is_review_source_drift(error), "{error}");
-        }
-        assert!(!is_review_source_changed_retry(
-            "Artifact catalog source changed; start a fresh discovery"
-        ));
-    }
-
-    #[test]
-    fn objective_review_gap_is_returned_to_the_root_continuation() {
-        let waiting = harness_contract::goal::WaitDescriptor {
-            reason_code: "completion_gap".into(),
-            reason: "original_intent_review_required:user_intent".into(),
-            required_refs: vec!["original_intent_review_required:user_intent".into()],
-            generation: 36,
-        };
-        assert_eq!(
-            objective_completion_waiting_gap(Some(&waiting), false, &[]).as_deref(),
-            Some("objective_completion_gap:original_intent_review_required:user_intent")
-        );
-        let external_wait = harness_contract::goal::WaitDescriptor {
-            reason_code: "waiting_external_decision".into(),
-            ..waiting.clone()
-        };
-        assert_eq!(
-            objective_completion_waiting_gap(Some(&external_wait), false, &[]),
-            None
-        );
-        assert_eq!(
-            objective_completion_waiting_gap(Some(&waiting), true, &[]),
-            None
-        );
-        // Uncovered delivered results are named so the model can complete the
-        // review instead of re-issuing the same partial one.
-        assert_eq!(
-            objective_completion_waiting_gap(
-                Some(&waiting),
-                false,
-                &["artifact:missing".to_string()]
-            )
-            .as_deref(),
-            Some(
-                "objective_completion_gap:original_intent_review_required:user_intent; \
-                 uncovered_result_refs: artifact:missing"
-            )
-        );
-    }
-
-    #[test]
-    fn satisfied_objective_review_must_cover_the_active_completion_result_set() {
-        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
-        program.completion_request = Some(crate::AgenticCompletionRequestProjection {
-            action_id: "complete".into(),
-            requested_by: "root".into(),
-            program_revision: 7,
-            result_refs: vec!["artifact:a".into(), "artifact:b".into()],
-            primary_artifact_ref: Some("artifact:a".into()),
-            evidence_refs: vec![],
-            unresolved: vec![],
-        });
-
-        let error = validate_current_objective_review_scope(&program, &["artifact:a".into()])
-            .expect_err("a partial satisfied review cannot verify this request");
-        assert!(error.contains("artifact:b"));
-        assert!(error.contains("evidence_retrieve"));
-        validate_current_objective_review_scope(
-            &program,
-            &["artifact:a".into(), "artifact:b".into()],
-        )
-        .expect("a complete review scope is allowed");
-    }
-
-    #[test]
-    fn review_source_changed_streak_reaches_the_bound() {
-        let key = "program:task:execution-ingress-test";
-        clear_review_streak(key);
-        for expected in 1..=MAX_REVIEW_SOURCE_CHANGED_RETRIES {
-            assert_eq!(bump_review_streak(key), expected);
-        }
-        clear_review_streak(key);
-        // The streak restarts after a settlement or a clean verdict.
-        assert_eq!(bump_review_streak(key), 1);
-        clear_review_streak(key);
-    }
-
-    const T1B_FORWARD: &str = "result metadata source changed during resolution; \
-     rebuild the review; source=execution-agent-receipts:t1b:agent:1 expected=14 \
-     actual=16 phase=result_source_pin";
-    const T1B_BACKWARDS: &str = "result metadata source moved backwards during resolution; \
-     rebuild the review; source=execution-agent-receipts:t1b:agent:1 expected=16 \
-     actual=15 phase=result_source_pin";
-
-    fn t1b_ticket(reason: &str) -> super::super::review_evidence::ReviewRepinTicket {
-        review_repin_ticket_for("agentic-graph:t1b", "agent:1", 4, reason)
-            .expect("a pin refusal carries its rebuild ticket")
-    }
-
-    /// T1b-N1: the rebuild budget is bounded at the named two, and the shape
-    /// that exceeds it is a typed Unknown that names its own evidence. It must
-    /// not be an attempt settlement, because settling would hand the root a
-    /// retryable failure and re-dispatch the very effect this read refused.
-    #[test]
-    fn t1b_the_rebuild_budget_is_bounded_and_the_excess_is_a_typed_unknown() {
-        let ticket = t1b_ticket(T1B_FORWARD);
-        assert!(ticket.movement().rebuildable(), "a forward head is rebuildable");
-        assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (14, 16));
-        assert_eq!(ticket.attempt(), 4, "the ticket keeps the refused attempt");
-        let key = review_rebuild_key_for("agentic-graph:t1b", "agent:1", 4);
-        clear_review_rebuild(&key);
-        assert_eq!(bump_review_rebuild(&key), 1);
-        assert_eq!(bump_review_rebuild(&key), 2);
-        assert!(2 <= MAX_REVIEW_CUT_REBUILDS, "the plan's bound is two");
-        let unknown = review_rebuild_unknown_reason(&ticket, 3, T1B_FORWARD);
-        assert!(unknown.starts_with("review_window_unknown:"), "{unknown}");
-        assert!(unknown.contains("bounded 2"), "{unknown}");
-        assert!(unknown.contains("source=execution-agent-receipts:t1b:agent:1"), "{unknown}");
-        assert!(unknown.contains("pinned_cut=14 observed_head=16"), "{unknown}");
-        assert!(unknown.contains(T1B_FORWARD), "the original refusal travels verbatim");
-        assert!(
-            !unknown.contains("settled"),
-            "an exhausted rebuild is not an attempt settlement: {unknown}"
-        );
-        clear_review_rebuild(&key);
-        assert_eq!(bump_review_rebuild(&key), 1, "the budget restarts for the next attempt");
-        clear_review_rebuild(&key);
-    }
-
-    /// T1b-N2: a head that moved backwards is not a window anybody observed. It
-    /// produces a ticket (T1a names it) but never a rebuild, so today's refusal
-    /// and today's settlement path keep it exactly as they had it.
-    #[test]
-    fn t1b_a_backwards_head_is_never_a_rebuild_request() {
-        let ticket = t1b_ticket(T1B_BACKWARDS);
-        assert_eq!(ticket.movement(), super::super::review_evidence::ReviewSourceMovement::Backwards);
-        assert!(!ticket.movement().rebuildable(), "a rebuilt window would be invented");
-    }
-
-    /// T1b-N3: the dispatch half must not lose a rebuildable ticket just because
-    /// an outer layer wrapped the refusal sentence, and it must not invent one
-    /// for a refusal that is not a pin refusal at all.
-    #[test]
-    fn t1b_a_wrapped_refusal_still_yields_the_ticket_and_other_refusals_yield_none() {
-        let wrapped = format!("runtime review evidence failed: {T1B_FORWARD}; see attempt history");
-        let ticket = t1b_ticket(&wrapped);
-        assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (14, 16), "{ticket:?}");
-        assert_eq!(ticket.reason(), T1B_FORWARD, "the wording survives the round trip");
-        assert!(
-            review_repin_ticket_for("agentic-graph:t1b", "agent:1", 4, "review physical attempt is stale").is_none(),
-            "a non-pin refusal is not a rebuild request"
-        );
-        assert!(
-            review_repin_ticket_for("agentic-graph:t1b", "agent:1", 4, "").is_none(),
-            "an empty reason is not a rebuild request"
-        );
-    }
-
-    /// T1b-N4: the durable settlement sentence must be stable per review
-    /// lineage. The Task reducer only blocks a repeat wedge when the failure
-    /// reason is identical, so a sentence carrying a moving head would hand the
-    /// refused read another dispatch instead of settling it.
-    #[test]
-    fn t1b_the_settlement_reason_is_stable_and_names_no_moving_head() {
-        let first = t1b_ticket(T1B_FORWARD);
-        let grown = review_repin_ticket_for(
-            "agentic-graph:t1b",
-            "agent:1",
-            4,
-            "result metadata source changed during resolution; rebuild the review; \
-             source=execution-agent-receipts:t1b:agent:1 expected=16 actual=23 phase=result_source_pin",
-        )
-        .expect("the same lineage refusing at a later head");
-        assert_eq!(
-            review_rebuild_settlement_reason(&first),
-            review_rebuild_settlement_reason(&grown),
-            "one lineage, one settlement sentence"
-        );
-        let reason = review_rebuild_settlement_reason(&first);
-        assert!(reason.starts_with("review_window_unknown:"), "{reason}");
-        assert!(reason.contains("bounded 2"), "{reason}");
-        // The anti-drift lock: the caller-facing reason and the durable
-        // settlement reason must spell the bound with the same literal token.
-        // This is the assertion that would have caught the first run's red.
-        let budget = review_rebuild_budget_token();
-        assert!(
-            reason.contains(&budget)
-                && review_rebuild_unknown_reason(&first, 3, T1B_FORWARD).contains(&budget),
-            "one budget token, both sentences: settlement={reason} caller={}",
-            review_rebuild_unknown_reason(&first, 3, T1B_FORWARD)
-        );
-        assert!(!reason.contains("14"), "the pinned cut is not in the stable sentence: {reason}");
-        assert!(!reason.contains("16"), "the observed head is not in the stable sentence: {reason}");
-        assert!(
-            review_rebuild_unknown_reason(&first, 3, T1B_FORWARD).contains("pinned_cut=14"),
-            "the evidence still reaches the caller-facing reason"
-        );
-    }
-
-    fn task_fixture(
-        task_id: &str,
-        team_id: &str,
-        status: crate::AgenticTaskStatus,
-        depends_on: Vec<&str>,
-        artifact_refs: Vec<&str>,
-    ) -> crate::AgenticTaskProjection {
-        crate::AgenticTaskProjection {
-            task_id: task_id.to_string(),
-            team_id: team_id.to_string(),
-            title: task_id.to_string(),
-            objective: "o".into(),
-            acceptance: "a".into(),
-            acceptance_checks: Vec::new(),
-            criterion_source: Default::default(),
-            required_capabilities: Vec::new(),
-            obligation_refs: Vec::new(),
-            purpose: Default::default(),
-            execution_requirements: Vec::new(),
-            expertise_hints: Vec::new(),
-            depends_on: depends_on.into_iter().map(str::to_string).collect(),
-            status,
-            claimant: None,
-            claim_generation: 0,
-            claim_execution_id: None,
-            claimed_at_ms: None,
-            lease_expires_at_ms: None,
-            claim_renewal_streak: 0,
-            active_attempts: Default::default(),
-            artifact_refs: artifact_refs.into_iter().map(str::to_string).collect(),
-            evidence_refs: Vec::new(),
-            unresolved: Vec::new(),
-            review_reason: None,
-            reviewed_by: None,
-            failed_attempts: 0,
-            review_generation: 0,
-            failed_review_attempts: 0,
-            last_failure: None,
-            replacement_task_refs: Vec::new(),
-            supersede_evidence_refs: Vec::new(),
-            superseded_reason: None,
-            superseded_by: None,
-            cancel_requested_by: None,
-            cancel_reason_ref: None,
-            cancel_evidence_refs: Vec::new(),
-            pending_retirement: None,
-        }
-    }
-
-    #[test]
-    fn synthesis_artifact_outranks_a_single_team_artifact() {
-        use crate::AgenticTaskStatus::Accepted;
-        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
-        for (id, team, artifact) in [
-            ("task:a", "team:a", "artifact:a"),
-            ("task:b", "team:b", "artifact:b"),
-            ("task:c", "team:c", "artifact:c"),
-        ] {
-            program.tasks.insert(
-                id.to_string(),
-                task_fixture(id, team, Accepted, vec![], vec![artifact]),
-            );
-        }
-        program.tasks.insert(
-            "task:synthesis".to_string(),
-            task_fixture(
-                "task:synthesis",
-                "team:s",
-                Accepted,
-                vec!["task:a", "task:b", "task:c"],
-                vec!["artifact:final"],
-            ),
-        );
-        // A per-team artifact covers one team; the synthesis covers four.
-        assert_eq!(
-            objective_artifact_integration_score(&program, "artifact:a"),
-            1
-        );
-        assert_eq!(
-            objective_artifact_integration_score(&program, "artifact:final"),
-            4
-        );
-    }
-
-    #[test]
-    fn completion_input_leads_with_the_synthesis_and_is_none_without_artifacts() {
-        use crate::AgenticTaskStatus::Accepted;
-        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
-        program.tasks.insert(
-            "task:empty".to_string(),
-            task_fixture("task:empty", "team:a", Accepted, vec![], vec![]),
-        );
-        assert!(completion_objective_input(&program).is_none());
-
-        program.tasks.insert(
-            "task:audit".to_string(),
-            task_fixture("task:audit", "team:a", Accepted, vec![], vec!["artifact:a"]),
-        );
-        program.tasks.insert(
-            "task:syn".to_string(),
-            task_fixture(
-                "task:syn",
-                "team:s",
-                Accepted,
-                vec!["task:audit"],
-                vec!["artifact:final"],
-            ),
-        );
-        let input = completion_objective_input(&program).expect("completion input");
-        assert_eq!(
-            input.result_refs.first().map(String::as_str),
-            Some("artifact:final"),
-            "the cross-Team synthesis artifact must lead result_refs"
-        );
-    }
-
-    #[test]
-    fn a_precondition_refusal_draws_on_its_own_budget() {
-        // "You have not read the body" is an unexecuted step, not a failed
-        // attempt. One live reviewer was settled twice for it, and each
-        // settlement forced a fresh attempt that started from zero reads again -
-        // the tighter the budget, the longer the loop.
-        assert!(is_review_precondition_refusal(
-            "review_requires_current_physical_reads:artifact:a"
-        ));
-        assert!(
-            !is_review_content_refusal("review_requires_current_physical_reads:artifact:a"),
-            "a precondition must not be counted as a content failure"
-        );
-        // Content failures keep the tight budget.
-        assert!(is_review_content_refusal(
-            "review physical attempt is stale or owns different results"
-        ));
-        assert!(!is_review_precondition_refusal(
-            "review physical attempt is stale or owns different results"
-        ));
-        assert!(is_review_source_changed_retry(
-            "review_requires_current_physical_reads:artifact:a"
-        ));
-        // Both classes stay bounded: neither may loop forever.
-        const _: () = assert!(MAX_REVIEW_PRECONDITION_RETRIES > MAX_REVIEW_SOURCE_CHANGED_RETRIES);
+        assert!(!is_review_program_advanced("task_not_found"));
     }
 
     #[tokio::test]
@@ -2523,6 +2022,8 @@ async fn action_evidence_validation_still_refuses_an_unmapped_logical_key() {
         decision: harness_contract::agent_action::TaskReviewDecision::Accept,
         reason: "checked".into(),
         evidence_refs: vec!["artifact://0123456789abcdef01234567".into()],
+    gaps: Vec::new(),
+    directed_actions: Vec::new(),
     });
     let error = services
         .validate_agent_action_evidence(&actor, &action)

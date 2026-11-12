@@ -2046,6 +2046,42 @@ fn merge_actual_input_cuts(
     Ok(())
 }
 
+/// The completeness of an original tool outcome, as a three-state fact.
+///
+/// A missing flag is not false: a record that never recorded completeness
+/// cannot be read as complete. The Host side refuses that shape outright
+/// (`conversation/host_backend.rs`), so the review-evidence domain must not
+/// treat the same durable record as complete. The two domains used to disagree
+/// about one record, and the review side was the permissive one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OutcomeCompleteness {
+    Complete,
+    Truncated,
+}
+
+/// Read the recorded completeness of an original tool outcome.
+pub(super) fn outcome_completeness(
+    primary: &DurableRuntimeEvent,
+) -> Result<OutcomeCompleteness, String> {
+    outcome_completeness_of(&primary.payload).map_err(|error| {
+        format!("{error}; source={} event={}", primary.stream_id, primary.event_id)
+    })
+}
+
+/// The three-state reading itself, over the recorded payload.
+pub(super) fn outcome_completeness_of(
+    payload: &serde_json::Value,
+) -> Result<OutcomeCompleteness, String> {
+    match payload
+        .get("outcome_truncated")
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(false) => Ok(OutcomeCompleteness::Complete),
+        Some(true) => Ok(OutcomeCompleteness::Truncated),
+        None => Err("original tool outcome completeness was not recorded".to_string()),
+    }
+}
+
 pub(super) fn pin_result_source(
     store: &crate::RuntimeEventStore,
     source: &str,
@@ -3304,28 +3340,34 @@ fn original_tool_body(
     let identity = original_output_identity(owner)?;
     if let Some(task) = task {
         match original_tool_primary(store, owner, task, cuts) {
-            Ok(primary) if primary.payload["outcome_truncated"] != true => {
-                if let Some(output) = primary.payload["outcome"]["output"].as_str() {
-                    if limit.is_some_and(|limit| output.len() as u64 > limit) {
-                        return Ok(None);
-                    }
-                    let bytes = output.as_bytes().to_vec();
-                    let bytes = match identity {
-                        Some((digest, expected)) => {
-                            checked_original_bytes(bytes, digest, expected)?
+            Ok(primary) => {
+                match outcome_completeness(&primary)? {
+                    OutcomeCompleteness::Complete => {
+                        if let Some(output) = primary.payload["outcome"]["output"].as_str() {
+                            if limit.is_some_and(|limit| output.len() as u64 > limit) {
+                                return Ok(None);
+                            }
+                            let bytes = output.as_bytes().to_vec();
+                            let bytes = match identity {
+                                Some((digest, expected)) => {
+                                    checked_original_bytes(bytes, digest, expected)?
+                                }
+                                None => bytes,
+                            };
+                            if canonical_original_bytes(owner, &bytes).is_ok() {
+                                return Ok(Some(OriginalToolBody {
+                                    bytes,
+                                    origin: ResultOrigin::Strong,
+                                    content: None,
+                                }));
+                            }
                         }
-                        None => bytes,
-                    };
-                    if canonical_original_bytes(owner, &bytes).is_ok() {
-                        return Ok(Some(OriginalToolBody {
-                            bytes,
-                            origin: ResultOrigin::Strong,
-                            content: None,
-                        }));
                     }
+                    // A truncated original is not a complete body: the preview
+                    // path below is the only remaining source.
+                    OutcomeCompleteness::Truncated => {}
                 }
             }
-            Ok(_) => {}
             Err(error)
                 if error.starts_with("result_origin_requires_original_immutable_content:") => {}
             Err(error) => return Err(error),
@@ -4729,7 +4771,10 @@ pub(super) fn original_acquisition_output(
         &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
     )
     .map_err(str::to_string)?;
-    if primary.payload["outcome_truncated"] != true {
+    if matches!(
+        outcome_completeness(primary)?,
+        OutcomeCompleteness::Complete
+    ) {
         if let Some(output) = primary.payload["outcome"]["output"].as_str() {
             if crate::context_evidence::read_body_seal(&seal.tool_name, output).as_ref()
                 == Some(&seal.body)
@@ -4945,6 +4990,41 @@ fn authenticate_effect_receipt(
 
 #[cfg(test)]
 mod tests {
+    /// K4-F1: the completeness of an original tool outcome is a three-state
+    /// fact, and a record that never recorded completeness is refused by name.
+    ///
+    /// The red state of this control is the old reading: the review-evidence
+    /// domain compared `payload["outcome_truncated"] != true`, so a record with
+    /// no completeness flag at all counted as "not truncated" while the Host
+    /// domain refuses the very same record. The green state is the named
+    /// refusal below.
+    #[test]
+    fn t1a_an_unrecorded_outcome_completeness_is_refused_by_name() {
+        // Two shapes are the same fact: the field absent, and the field present
+        // but null. A reading that refuses one and lets the other through is the
+        // old partial form, and it is the shape this control pins shut.
+        for missing in [
+            serde_json::json!({"outcome": {"output": "body"}}),
+            serde_json::json!({"outcome": {"output": "body"}, "outcome_truncated": null}),
+        ] {
+            let error = super::outcome_completeness_of(&missing)
+                .expect_err("a record that never recorded completeness must refuse");
+            assert!(
+                error.contains("completeness was not recorded"),
+                "{error}"
+            );
+        }
+        // The two recorded states keep their meaning.
+        assert_eq!(
+            super::outcome_completeness_of(&serde_json::json!({"outcome_truncated": false})),
+            Ok(super::OutcomeCompleteness::Complete)
+        );
+        assert_eq!(
+            super::outcome_completeness_of(&serde_json::json!({"outcome_truncated": true})),
+            Ok(super::OutcomeCompleteness::Truncated)
+        );
+    }
+
     use super::*;
 
     /// S9 negative control: a source that grows while the original Process
@@ -7730,9 +7810,20 @@ mod tests {
         store.append(append()).unwrap();
         let error = super::verify_result_package_cuts(&store, "artifact:t7", &cuts)
             .expect_err("growth of a judged source is refused, not rebuilt around");
+        // 032 K4b (A2): code equality replaces the verbatim sentence equality;
+        // the drift facts and the rebuild instruction stay individually pinned.
         assert_eq!(
-            error,
-            "result metadata changed after original effect enumeration: result=artifact:t7 source=agentic-program:judged-t7 expected=2 observed=3; rebuild the review"
+            super::super::reason_code::reason_code_of(&error),
+            Some(super::super::reason_code::ReviewRefusalCode::ResultMetadataChangedAfterEnumeration),
+            "true growth is refused under its own named code: {error}"
+        );
+        assert!(
+            error.contains("result=artifact:t7 source=agentic-program:judged-t7 expected=2 observed=3"),
+            "the refusal still carries the drift facts: {error}"
+        );
+        assert!(
+            error.contains("rebuild the review"),
+            "the refusal still carries its instruction: {error}"
         );
         // A pinned cut above the durable head is a fabricated window or a
         // truncated stream, on every source class.

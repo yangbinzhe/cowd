@@ -3621,6 +3621,8 @@ mod tests {
                 &reviewer_id,
                 "execution-agentic-reviewer",
                 AgentAction::TaskReview(TaskReviewInput {
+                    gaps: Vec::new(),
+                    directed_actions: Vec::new(),
                     operator_requirement: None,
                     task_ref: research_task_id.clone(),
                     decision: TaskReviewDecision::Accept,
@@ -3680,6 +3682,8 @@ mod tests {
                 &analyst_id,
                 "execution-agentic-analyst",
                 AgentAction::TaskReview(TaskReviewInput {
+                    gaps: Vec::new(),
+                    directed_actions: Vec::new(),
                     operator_requirement: None,
                     task_ref: synthesis_task_id.clone(),
                     decision: TaskReviewDecision::Accept,

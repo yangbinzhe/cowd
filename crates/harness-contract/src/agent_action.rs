@@ -342,6 +342,15 @@ pub struct TaskReviewInput {
     /// receipt: IDs. Runtime already knows which artifacts belong to the Task.
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    /// 032 K3: named gaps the verdict leaves open (optional; default empty so
+    /// every existing payload keeps its exact wire shape). K2's MissionVerdict
+    /// fills the same fields - one shape, no second directive list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<String>,
+    /// Actions the reviewer asks for next. Durable fact for the next claim and
+    /// for the root's dispatch decisions; Runtime never dispatches from here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directed_actions: Vec<String>,
 }
 
 /// Model-authored treatment of a source-bound issue. This classifies evidence;

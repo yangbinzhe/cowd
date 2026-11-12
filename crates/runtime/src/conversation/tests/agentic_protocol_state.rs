@@ -745,6 +745,8 @@ async fn rework_attempt_cannot_reuse_artifacts_from_an_earlier_claim() {
             &fixture.reviewer_ref,
             "review-attempt-one",
             AgentAction::TaskReview(TaskReviewInput {
+                gaps: Vec::new(),
+                directed_actions: Vec::new(),
                 operator_requirement: Some(fixture.root.objective_summary.clone()),
                 task_ref: fixture.task_ref.clone(),
                 decision: TaskReviewDecision::Rework,
@@ -1113,6 +1115,8 @@ async fn delegated_review_is_pending_only_until_its_durable_verdict() {
             &fixture.reviewer_ref,
             "agent-review-active",
             AgentAction::TaskReview(TaskReviewInput {
+                gaps: Vec::new(),
+                directed_actions: Vec::new(),
                 operator_requirement: None,
                 task_ref: fixture.task_ref.clone(),
                 decision: TaskReviewDecision::Accept,

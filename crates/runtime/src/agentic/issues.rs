@@ -232,6 +232,10 @@ mod tests {
         projection.tasks.insert(
             "task:1".to_string(),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: "task:1".to_string(),
                 team_id: "team:1".to_string(),
                 title: "t".to_string(),

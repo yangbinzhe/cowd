@@ -2944,6 +2944,10 @@ mod cohort_tests {
         dynamic.tasks.insert(
             "task-dynamic".to_string(),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: "task-dynamic".to_string(),
                 team_id: "team-cache".to_string(),
                 title: "Dynamic task".to_string(),

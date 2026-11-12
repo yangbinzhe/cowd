@@ -35,6 +35,7 @@ pub mod knowledge;
 pub mod live;
 pub mod managed_agent;
 pub mod mission;
+pub mod mission_verdict;
 pub mod outcome;
 pub mod policy;
 pub mod projection;

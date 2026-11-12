@@ -966,39 +966,72 @@ fn validate_task_review(
     // the operator's own criteria did not require. The rework loop that ended those
     // runs was manufactured here, not by the author.
     //
-    // The Task declares `acceptance_checks`, and `objective_review` already carries a
-    // `criterion_ref` for exactly this purpose. `task_review` was the one verdict that
-    // could not say what it was judging, so a reviewer substituted its own standard
-    // for the operator's. An accept needs no anchor - accepting is never an overreach -
-    // but a rework sends someone back to work, and that has to be answerable to the
-    // declared criteria.
-    if input.decision == TaskReviewDecision::Rework && !task.acceptance_checks.is_empty() {
-        let anchored = task.acceptance_checks.iter().any(|check| {
-            let needle = check.trim();
-            // A check is prose, so match on a distinctive run rather than the whole
-            // string: a reviewer paraphrases, but it cannot paraphrase away the
-            // subject of the criterion.
-            needle.len() >= 12 && input.reason.contains(&needle[..12])
-                || needle.len() < 12 && input.reason.contains(needle)
-        });
-        if !anchored {
-            let declared = task
-                .acceptance_checks
-                .iter()
-                .map(|check| format!("- {check}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Some((
-                "rework_without_declared_criterion",
-                format!(
-                    "a rework must name the declared acceptance criterion it failed. \
-                     This Task declares:\n{declared}\n\
-                     Quote the criterion you are rejecting. If your objection is \
-                     outside these criteria, it may be recorded in `reason` alongside \
-                     an accept as a non-blocking observation - it cannot force the \
-                     author to redo work the operator did not ask for."
-                ),
-            ));
+    // 032 K1 (B1): anchor against the compiled criterion record - the
+    // publish-time single source produced by `compile_task_obligations`. The
+    // old gate ran only when `acceptance_checks` was non-empty, so a prose-only
+    // Task left reviewers free to reject against standards nobody declared;
+    // the authoritative prose is now itself a criterion (`key=acceptance`),
+    // which closes exactly that hole. A hand-built fixture without compiled
+    // obligations keeps the previous checks-only behavior unchanged.
+    if input.decision == TaskReviewDecision::Rework {
+        // 032 K1b (B1): the authoritative prose is itself a criterion, so a
+        // prose-only Task is never exempt from the anchor. The set below always
+        // carries the prose - the old "no compiled record and no checks => skip
+        // the anchor" path let a reviewer reject against standards nobody
+        // declared, which is the hole the two live runs fell into.
+        let mut criteria: Vec<&str> = if task.obligations.is_empty() {
+            task.acceptance_checks.iter().map(String::as_str).collect()
+        } else {
+            task.obligations.iter().map(|item| item.text.as_str()).collect()
+        };
+        let prose = task.acceptance.trim();
+        if !prose.is_empty() && !criteria.iter().any(|criterion| criterion.trim() == prose) {
+            criteria.push(prose);
+        }
+        if !criteria.is_empty() {
+            let anchored = criteria.iter().any(|criterion| {
+                let needle = criterion.trim();
+                // Criteria are prose, so match on a distinctive run rather
+                // than the whole string: a reviewer paraphrases, but it
+                // cannot paraphrase away the subject of the criterion.
+                // The run is now taken over the authoritative prose too, so
+                // the window cannot assume byte==char: walk down to a char
+                // boundary before slicing.
+                let mut head = needle.len().min(12);
+                while head > 0 && !needle.is_char_boundary(head) {
+                    head -= 1;
+                }
+                needle.len() >= 12 && head > 0 && input.reason.contains(&needle[..head])
+                    || needle.len() < 12 && input.reason.contains(needle)
+            });
+            if !anchored {
+                let declared = if task.obligations.is_empty() {
+                    criteria
+                        .iter()
+                        .map(|criterion| format!("- {criterion}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    task.obligations
+                        .iter()
+                        .map(|item| {
+                            format!("- {} ({})", item.text, if item.authoritative { "authoritative" } else { "hint" })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                return Some((
+                    "rework_without_declared_criterion",
+                    format!(
+                        "a rework must name the declared acceptance criterion it failed. \
+                         This Task declares:\n{declared}\n\
+                         Quote the criterion you are rejecting. If your objection is \
+                         outside these criteria, it may be recorded in `reason` alongside \
+                         an accept as a non-blocking observation - it cannot force the \
+                         author to redo work the operator did not ask for."
+                    ),
+                ));
+            }
         }
     }
     if let Some(reference) = input
@@ -1140,6 +1173,10 @@ mod reclaim_discipline_tests {
                 acceptance: "durable evidence".to_string(),
                 acceptance_checks: Vec::new(),
                 criterion_source: Default::default(),
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 required_capabilities: Vec::new(),
                 obligation_refs: Vec::new(),
                 purpose: Default::default(),
@@ -1314,4 +1351,45 @@ mod reclaim_discipline_tests {
             "the model must know the claim is not its job: {detail}"
         );
     }
+
+    #[test]
+    fn k1_b_rework_anchors_on_compiled_criteria_prose_only_included() {
+        use harness_contract::agent_action::{TaskReviewDecision, TaskReviewInput};
+        let acceptance = "the answer quotes Cargo.toml exactly";
+        let mut projection = projection_with_streak(0);
+        {
+            let task = projection.tasks.get_mut("task").unwrap();
+            task.status = AgenticTaskStatus::Submitted;
+            // The reviewer must not be the author: the self-review guards run
+            // before the criterion anchor, so the fixture keeps them apart.
+            task.claimant = Some("agent:author".to_string());
+            task.claim_execution_id = Some("exec-author".to_string());
+            task.acceptance = acceptance.to_string();
+            task.acceptance_checks = Vec::new();
+            task.obligations = crate::agentic::work_market::compile_task_obligations(
+                acceptance, &task.acceptance_checks, task.criterion_source,
+            );
+        }
+        let mut request = envelope("exec-1");
+        let unanchored = |reason: &str| AgentAction::TaskReview(TaskReviewInput {
+            gaps: Vec::new(),
+            directed_actions: Vec::new(),
+            task_ref: "task".into(),
+            decision: TaskReviewDecision::Rework,
+            reason: reason.into(),
+            operator_requirement: None,
+            evidence_refs: vec!["tool://call-9-0123456789abcdef".into()],
+        });
+        // 032 K1 (B1): a prose-only Task is no longer an unanchored hole - the
+        // authoritative prose itself is a compiled criterion.
+        request.action = unanchored("the workspace lacks a documented domain index");
+        let rejection = validate_transition(&projection, &request, 10_000, None)
+            .expect("a rework against standards nobody declared must be refused by name");
+        assert_eq!(rejection.0, "rework_without_declared_criterion");
+        assert!(rejection.1.contains("authoritative"), "the refusal lists the real criteria:\n{}", rejection.1);
+        request.action = unanchored("the answer quotes Cargo.toml exactly is missing at line 12");
+        assert!(validate_transition(&projection, &request, 10_000, None).is_none(),
+            "quoting the compiled prose anchors the rework");
+    }
+
 }

@@ -1751,6 +1751,10 @@ mod task_claim_verdict_tests {
         projection.tasks.insert(
             "task".to_string(),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: "task".to_string(),
                 team_id: "team".to_string(),
                 title: "task".to_string(),
@@ -2249,6 +2253,10 @@ mod task_claim_verdict_tests {
         projection.tasks.insert(
             "task".to_string(),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: "task".to_string(),
                 team_id: "team".to_string(),
                 title: "task".to_string(),

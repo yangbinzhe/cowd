@@ -3800,6 +3800,10 @@ fn closure_view_preserves_goal_gap_without_count_derived_synthesis() {
         program.tasks.insert(
             id.to_string(),
             crate::AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: id.to_string(),
                 team_id: "team:1".to_string(),
                 title: format!("delivery {id}"),
@@ -3919,6 +3923,10 @@ fn citable_refs_states_what_exists_and_never_what_to_choose() {
         program.tasks.insert(
             id.to_string(),
             crate::AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: id.to_string(),
                 team_id: "team:1".to_string(),
                 title: format!("delivery {id}"),
@@ -4009,6 +4017,10 @@ fn closure_view_does_not_infer_goal_readiness_from_accepted_counts() {
         },
     );
     let mut task = crate::AgenticTaskProjection {
+        obligations: Vec::new(),
+        rework_directives: Vec::new(),
+        unsettled_released_attempts: Vec::new(),
+        terminal_note: None,
         claim_renewal_streak: 0,
         task_id: "task:1".to_string(),
         team_id: "team:1".to_string(),

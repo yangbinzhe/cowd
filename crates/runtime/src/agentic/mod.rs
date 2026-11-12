@@ -40,7 +40,7 @@ pub use program::{
     AgentMemberProjection, AgenticArtifactProjection, AgenticCompletionRequestProjection,
     AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,
     AgenticProgramProjection, AgenticProgramStatus, AgenticTaskAttemptProjection,
-    AgenticTaskProjection, AgenticTaskRetirement,
+    AgenticTaskObligation, AgenticTaskProjection, AgenticTaskRetirement,
     AgenticTaskStatus, AgenticTeamLifecycle, AgenticTeamProjection, AgenticTopicEntryProjection,
 };
 pub(crate) use read_model::AgenticReadModel;
