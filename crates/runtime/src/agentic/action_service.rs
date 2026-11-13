@@ -4193,6 +4193,12 @@ impl AgentActionService {
                         "{message}; terminal_obligations={}",
                         serde_json::to_string(&obligations).unwrap_or_else(|_| "[]".into())
                     );
+                    // The durable rejection record is the fact that bounds
+                    // the completion loop; a record that could not be written
+                    // must not be reported as if it had been. Propagate the
+                    // failure instead of dropping it (the F2b call below
+                    // does the same), so the close-out attempt fails loudly
+                    // rather than pretending it was recorded.
                     self.record_completion_rejection(
                         &projection,
                         envelope,
@@ -4200,7 +4206,7 @@ impl AgentActionService {
                         &message,
                         physical_source.as_ref(),
                         member,
-                    );
+                    )?;
                     return Ok(rejected(envelope, projection.revision, code, &message));
                 }
                 // F2b: an authorization-time completion rejection never became a
