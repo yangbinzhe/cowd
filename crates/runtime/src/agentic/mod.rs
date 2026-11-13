@@ -9,6 +9,7 @@ mod action_service;
 pub mod action_invocation;
 pub(crate) mod continuation;
 pub(crate) mod coordination;
+pub(crate) mod budget_ledger_mirror;
 pub(crate) mod execution;
 mod ingress;
 pub(crate) mod issues;

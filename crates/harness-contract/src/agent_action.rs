@@ -548,7 +548,8 @@ pub struct ObjectiveCompleteRequestInput {
     /// EXCEPTION EXIT: the model judges the goal unreachable after repeated
     /// attempts with no new progress. Requires a non-empty `blocked_reason`,
     /// `human_review_required` and at least one `recommended_next_action`;
-    /// Runtime falsifies it with the no-progress streak before accepting it.
+    /// Runtime refuses it while the Program still has work in flight, so a
+    /// blocked exit is accepted only once the remaining work is exhausted.
     #[serde(default)]
     pub blocked: bool,
     #[serde(default)]
@@ -1461,6 +1462,29 @@ mod tests {
         assert!(wait.wait_for_workers);
         assert!(
             serde_json::from_str::<StateInspectInput>(r#"{"wait_for_workers":"true"}"#).is_err()
+        );
+    }
+
+    /// 034 GB-3 (a9 half): the blocked-exit teaching text must name the gate
+    /// that is actually live. It used to name the no-progress streak gate,
+    /// which the gate consolidation removed - a model that reads "Runtime
+    /// falsifies it with the no-progress streak" is being told about a gate
+    /// that does not exist, and cannot tell what will actually refuse it.
+    #[test]
+    fn the_blocked_exit_text_names_the_live_gate_and_no_deleted_one() {
+        let schema = serde_json::to_value(schemars::schema_for!(ObjectiveCompleteRequestInput))
+            .expect("schema");
+        let description = schema["properties"]["blocked"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !description.to_lowercase().contains("streak"),
+            "the blocked-exit text still names the deleted no-progress streak gate: {description}"
+        );
+        assert!(
+            description.contains("in flight") || description.contains("exhausted"),
+            "the blocked-exit text does not name the live gate: {description}"
         );
     }
 
