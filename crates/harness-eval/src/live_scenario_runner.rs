@@ -7000,6 +7000,26 @@ pub(crate) struct WaitStop {
     pub(crate) commit_cursor: Option<u64>,
 }
 
+impl From<String> for WaitStop {
+    /// An error the observer hit while looking is not a fact about the work.
+    ///
+    /// The observer failed to read something - the receipt authority, a
+    /// message delta, a timeline delta - so it knows nothing about how the
+    /// work ended. That is an inferred stop, and an inferred stop may not
+    /// cancel a running execution: the observer that cannot read is not the
+    /// one that decides. The prose the model reads is unchanged; only the
+    /// class of the stop is new.
+    fn from(message: String) -> Self {
+        Self {
+            kind: ObservationStopKind::Inferred,
+            code: "wait_stop_unknown",
+            message,
+            class: None,
+            commit_cursor: None,
+        }
+    }
+}
+
 /// Whether the observer may cancel the lineage after this stop.
 ///
 /// A registered terminal means the work is already over, so the cancel is a
