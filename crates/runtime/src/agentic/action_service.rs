@@ -3592,13 +3592,16 @@ impl AgentActionService {
         if envelope.actor.kind == AgentActorKind::Supervisor && !internal_supervisor {
             return Err(AgentActionServiceError::Corrupt("Runtime supervisor owner required".into()));
         }
-        // 033 S3-D REVERTED (e2 audit: the predicate was action-name
-        // enumeration with an incomplete set, the ingress gate ahead of it
-        // made the change inert on the live path, and the promised positive
-        // pin was not delivered). The gate keeps its 032 semantics for ALL
-        // Root actions; the effect-class carrier is a named 034 item.
+        // 033 S3-D was reverted (032 semantics kept) because it was an
+        // incomplete action-name enumeration; 034 GB-4 re-does the split
+        // PROPERLY: one effect-class predicate in harness-contract, consulted
+        // identically here and at the ingress gate position, with ArtifactCommit
+        // AND TaskSubmit's deliverable path both classified as physical.
+        // 034 GB-4: the SAME effect-class predicate the ingress gate consults
+        // - two gate positions, one judgment, one exit reason.
         if envelope.actor.kind == AgentActorKind::Root
             && physical.is_none()
+            && envelope.action.requires_original_physical_execution()
             && !internal_root_owner
         {
             return Err(AgentActionServiceError::Corrupt("new root action requires original physical execution".into()));

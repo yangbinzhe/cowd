@@ -827,7 +827,9 @@ impl RuntimeServices {
                 return Ok(OriginalIngressResult::Single(replay));
             }
         }
-        if envelope.actor.kind == AgentActorKind::Root && envelope.actor.original_execution.is_none()
+        if envelope.actor.kind == AgentActorKind::Root
+            && envelope.actor.original_execution.is_none()
+            && envelope.action.requires_original_physical_execution()
             && !(internal_completion && matches!(&envelope.action, AgentAction::ObjectiveCompleteRequest(_)))
         {
             return Err("new root action requires original physical execution".to_string());

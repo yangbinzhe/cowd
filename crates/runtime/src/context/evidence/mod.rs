@@ -419,8 +419,25 @@ pub(crate) fn read_body_seal(tool_name: &str, output: &str) -> Option<ReadBodySe
         if value["kind"] != "evidence_retrieve" || value["available"] != true {
             return None;
         }
-        let total_chunks = value["total_chunks"].as_u64()?;
         let values = value["chunks"].as_array()?;
+        // 033 S8: the seal builder must judge the envelope the read tool
+        // actually produces. The tool carries the artifact's total size and
+        // the chunk width, not a chunk count; demanding a field it never
+        // writes left every artifact read unsealed, and an unsealed read has
+        // no original physical extent - the review could then never judge it.
+        // The count is derived from the two numbers the tool does write; every
+        // proof check below is unchanged.
+        let total_chunks = match value["total_chunks"].as_u64() {
+            Some(total) => total,
+            None => {
+                let bytes = value["bytes"].as_u64()?;
+                let width = value["chunk_bytes"].as_u64()?;
+                if width == 0 {
+                    return None;
+                }
+                bytes.div_ceil(width)
+            }
+        };
         // 033 S3 (seal capacity is a budget, not a proof): the per-chunk
         // acquisition seal carries one digest per returned chunk, so the
         // number of chunks it can carry is a receipt-size budget. Refusing to
@@ -1657,6 +1674,50 @@ mod tests {
             super::ReadExtent::ArtifactChunks { total_chunks, chunks } => {
                 assert_eq!(total_chunks, 34);
                 assert_eq!(chunks.len(), 34, "every returned chunk is proven");
+            }
+            other => panic!("a chunked artifact read seals as chunk coverage: {other:?}"),
+        }
+    }
+
+
+    /// 033 S8 (F2 repro control): the acquisition seal must recognise the
+    /// envelope the read tool actually produces.
+    ///
+    /// The live S8 runs read small artifacts through `read_ref`, and the
+    /// envelope the tool returns carries `available`, `bytes`, `chunk_bytes`,
+    /// `chunks` (with `index`/`byte_start`/`byte_end`/`content`/`encoding`)
+    /// and `coverage` - it does NOT carry `total_chunks`. The seal builder
+    /// demanded `total_chunks`, so every artifact read settled without a
+    /// seal, and the review's actual-input judgment had to refuse it.
+    ///
+    /// Green form: after the fix the same live envelope carries a seal, so
+    /// the read has a home - the sealed path, where its extent is proven.
+    #[test]
+    fn s8_a_the_live_read_envelope_shape_has_no_acquisition_seal() {
+        let live = serde_json::json!({
+            "kind": "evidence_retrieve",
+            "available": true,
+            "bytes": 65,
+            "chunk_bytes": 1500,
+            "encoding": "utf8",
+            "evidence_ref": "artifact://art_676785eb2ac14fc8bc5204a94cd00fa1",
+            "sha256": format!("sha256:{}", "a".repeat(64)),
+            "coverage": {
+                "byte_start": 0, "byte_end": 65, "complete": true,
+                "selection": "sequential_content", "total_bytes": 65
+            },
+            "chunks": [{
+                "index": 0, "byte_start": 0, "byte_end": 65,
+                "content": "I have sufficient evidence. Writing the report and submitting it.",
+                "encoding": "utf8"
+            }]
+        });
+        let sealed = super::read_body_seal("read_ref", &live.to_string())
+            .expect("GREEN: the live envelope shape yields an acquisition seal, so the read has a home");
+        match sealed.extent {
+            super::ReadExtent::ArtifactChunks { total_chunks, chunks } => {
+                assert_eq!(total_chunks, 1, "the artifact's chunk count is derived");
+                assert_eq!(chunks.len(), 1, "the returned chunk is proven");
             }
             other => panic!("a chunked artifact read seals as chunk coverage: {other:?}"),
         }

@@ -643,6 +643,24 @@ pub enum AgentAction {
 }
 
 impl AgentAction {
+    /// 034 GB-4: the effect class the physical-binding gates consult.
+    ///
+    /// A Root action needs to name an original physical execution only when
+    /// it PERSISTS a physical artifact body: `ArtifactCommit` and
+    /// `TaskSubmit` (whose deliverable is persisted through exactly the same
+    /// artifact path - see the deliverable docs above). Program-state actions
+    /// (team/task/message/review verdicts) name the Program instead, and
+    /// refusing them with a physical-execution requirement produced a dead
+    /// end no durable state could repair (the 033 S3-D lesson: the gate was
+    /// right, the CLASS was missing; and the class must be one predicate,
+    /// consulted identically at both gate positions - ingress and the action
+    /// service - never two dialects).
+    #[must_use]
+    pub const fn requires_original_physical_execution(&self) -> bool {
+        matches!(self, Self::ArtifactCommit(_) | Self::TaskSubmit(_))
+    }
+
+impl AgentAction {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {

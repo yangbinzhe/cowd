@@ -4653,7 +4653,23 @@ pub(super) fn actual_input_snapshot_for_phase(
                     actual_read_source_fault(&mut original);
                     original
                 };
-                let original_input = if !event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
+                // 033 S8 (one owner for the seal decision): the effect
+                // receipt (the primary) owns the acquisition - it carries the
+                // body and the outcome. The observation twin must agree with
+                // it. A pair that disagrees is refused by name instead of
+                // being routed silently into the other gate, where the read
+                // had no home: sealed on one side, unsealed on the other.
+                let primary_sealed =
+                    !primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null();
+                let twin_sealed =
+                    !event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null();
+                if primary_sealed != twin_sealed {
+                    return Err(
+                        "proof_actual_input_extent_unsupported: the read pair disagrees about its acquisition seal"
+                            .into(),
+                    );
+                }
+                let original_input = if primary_sealed {
                     super::results::authenticate_read_input(
                         store,
                         &event,
