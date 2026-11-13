@@ -216,7 +216,37 @@ impl GatewayToolExecutor {
         }
         let mut repaired = Vec::new();
         for (field, schema) in &properties {
+            // The derived schema answers with a `$ref` into the definitions, so
+            // the node as written carries no type and no members. A repair that
+            // reads it as written never fires on the fields that need it.
+            let schema = harness_contract::tool_input_contract::resolve_schema_node(
+                &definition.input_schema,
+                schema,
+            );
             let expected = schema.get("type").and_then(serde_json::Value::as_str);
+            // A literal that differs from a legal member only in case is the
+            // same shape the contract closed the field to, spelled differently.
+            // The schema is the authority on the member, so put the spelling
+            // back instead of refusing the call for a letter.
+            if let Some(serde_json::Value::String(text)) = object.get(field) {
+                if let Some(legal) =
+                    harness_contract::tool_input_contract::normalize_schema_literal(
+                        schema,
+                        &serde_json::Value::String(text.clone()),
+                    )
+                {
+                    let original_len = text.chars().count();
+                    object.insert(field.clone(), legal);
+                    repaired.push(CoercedField {
+                        field: field.clone(),
+                        truncated: false,
+                        salvaged_items: 0,
+                        dropped_items: 0,
+                        original_len,
+                    });
+                    continue;
+                }
+            }
             // A number quoted as a string is the same one-shot corruption as a
             // container quoted as a string. The schema is the authority on what
             // the field wants, so coerce rather than making the model guess the
@@ -314,6 +344,20 @@ impl GatewayToolExecutor {
         head.starts_with('$').then_some(head)
     }
 
+    /// The field a violated path names.
+    ///
+    /// The path is written as `$.evidence_refs` or `$.entries[0].input`; the
+    /// field is its last named segment, so the sibling hint can name the
+    /// family the field belongs to.
+    fn violated_field(path: &str) -> Option<String> {
+        let last = path.rsplit('.').next()?;
+        let name: String = last
+            .chars()
+            .take_while(|character| character.is_alphanumeric() || *character == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
         let lease = self.tool_host.pin_snapshot();
         let definition = lease
@@ -355,6 +399,13 @@ impl GatewayToolExecutor {
         // background.
         let error_text = error.to_string();
         let violated_path = Self::violated_path(&error_text);
+        // The bounce is the model's one retry, so it says which legal name
+        // belongs where: a model that moved a name from a sibling tool is told
+        // the sibling's name and where it is legal.
+        let violated_field = violated_path.as_deref().and_then(Self::violated_field);
+        let sibling_hint = violated_field
+            .as_deref()
+            .and_then(harness_contract::reference_vocab::sibling_vocab_hint);
         let message = match definition.as_ref() {
             Some(definition) => {
                 let path_form = violated_path.as_deref().and_then(|path| {
@@ -397,6 +448,10 @@ impl GatewayToolExecutor {
                 }
             }
             None => error.to_string(),
+        };
+        let message = match sibling_hint {
+            Some(hint) => format!("{message}. sibling_vocab_hint: {hint}"),
+            None => message,
         };
         ToolError::from_failure(
             harness_contract::tool::ToolExecutionFailure::input_contract(
@@ -825,13 +880,6 @@ impl GatewayToolExecutor {
         let repaired_fields = if binding.tool_lease.is_some() { Vec::new() } else {
             self.coerce_string_typed_structured_fields(tool_name, &mut value)
         };
-        if !repaired_fields.is_empty() {
-            tracing::info!(
-                tool_name,
-                ?repaired_fields,
-                "coerced string-typed structured tool input fields at the schema boundary"
-            );
-        }
         if tool_name == "agent_action_batch" {
             return Err(ToolError::unknown("unknown: original batch request/owner unavailable"));
         }

@@ -2079,6 +2079,86 @@ fn bound_step_refusal_carries_the_existing_pinned_schema_example() {
     );
 }
 
+/// A one-shot deliverable that arrived quoted is put back into shape at the
+/// boundary.
+///
+/// The repair the boundary already had never fired on this field: the field's
+/// schema node is a `$ref` into the definitions, so the repair read no type
+/// there and left the quote in place - and the shape gate then refused the
+/// call for a shape it could have repaired. One live run lost an objective to
+/// exactly this.
+#[test]
+fn a_quoted_one_shot_deliverable_is_repaired_at_the_shape_gate() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let frame = json!({
+        "task_ref": "task-1",
+        "deliverable": "{\"block_index\": 2, \"kind\": \"report\", \"title\": \"Result\"}",
+    });
+    let accepted = executor
+        .validate_tool_input("task_submit", &frame.to_string())
+        .unwrap_or_else(|error| panic!("a quoted deliverable must be repaired: {error}"));
+    let value: serde_json::Value = serde_json::from_str(&accepted).expect("json");
+    assert!(
+        value["deliverable"].is_object(),
+        "the quoted block became an object: {value}"
+    );
+}
+
+/// A literal the contract closed the field to, written in another case, is put
+/// back into the contract's spelling instead of being refused.
+///
+/// The shape gate used to refuse the call for a letter, and the refusal cost
+/// the model an interaction for a spelling it could not have known. The schema
+/// is the authority on the member, so the boundary repairs the spelling.
+#[test]
+fn a_literal_written_in_another_case_is_repaired_at_the_shape_gate() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let frame = json!({
+        "task_ref": "task-1",
+        "decision": "Accept",
+        "reason": "the deliverable is there",
+    });
+    let accepted = executor
+        .validate_tool_input("task_review", &frame.to_string())
+        .unwrap_or_else(|error| panic!("a case-drifted literal must be repaired: {error}"));
+    let value: serde_json::Value = serde_json::from_str(&accepted).expect("json");
+    assert_eq!(
+        value["decision"], "accept",
+        "the contract's spelling is restored: {value}"
+    );
+}
+
+/// A value that names no legal member is not repaired: the shape face does not
+/// choose a member for the model.
+///
+/// This is the mirror of the repair: the repair only ever restores a spelling
+/// the schema already closed the field to, and never invents one.
+#[test]
+fn a_literal_that_names_no_member_is_still_refused() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let frame = json!({
+        "task_ref": "task-1",
+        "decision": "nonsense",
+        "reason": "the deliverable is there",
+    });
+    let error = executor
+        .validate_tool_input("task_review", &frame.to_string())
+        .expect_err("a value that names no legal member must still be refused");
+    assert!(
+        error.to_string().contains("enum"),
+        "the refusal must name the closed field: {error}"
+    );
+}
+
 #[tokio::test]
 async fn k02_orchestration_partial_receipt_recovers_same_session_bounded_pages() {
     use base64::Engine;

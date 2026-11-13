@@ -257,6 +257,74 @@ impl ExampleCoverage {
     }
 }
 
+/// The schema node a field really means.
+///
+/// A derived schema answers with a `$ref` into the definitions, and a choice of
+/// named variants answers with a `$ref` inside its first branch. A repair that
+/// reads the node as it was written therefore reads **no type and no members**
+/// on exactly the fields that need repairing: the one-shot deliverable block
+/// is a named struct, and its quote-corrupted form is what the shape gate
+/// refused over and over.
+#[must_use]
+pub fn resolve_schema_node<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
+    let defs = root.get("$defs").and_then(Value::as_object);
+    let mut current = follow_ref(node, defs);
+    for _ in 0..MAX_REF_DEPTH {
+        let mut next = None;
+        for keyword in ["oneOf", "anyOf"] {
+            if let Some(variants) = current.get(keyword).and_then(Value::as_array) {
+                if let Some(first) = variants.first() {
+                    let resolved = follow_ref(first, defs);
+                    if !std::ptr::eq(resolved, current) {
+                        next = Some(resolved);
+                    }
+                }
+            }
+        }
+        match next {
+            Some(resolved) => current = resolved,
+            None => break,
+        }
+    }
+    current
+}
+
+/// The legal spelling of one literal, when the value names it in another case.
+///
+/// A schema that closes a field to a fixed set of values is the authority on
+/// what those values are. When the model's value differs from a legal member
+/// **only in case**, and exactly one member matches that way, the member is the
+/// value the model meant: the shape is the same shape, spelled the way the
+/// contract spells it.
+///
+/// Two members that differ only in case are two members, not one - then the
+/// value names nothing and nothing is repaired.
+#[must_use]
+pub fn normalize_schema_literal(schema_node: &Value, value: &Value) -> Option<Value> {
+    let serde_json::Value::String(text) = value else {
+        return None;
+    };
+    let members: Vec<&Value> = match schema_node.get("enum").and_then(Value::as_array) {
+        Some(values) => values.iter().collect(),
+        None => match schema_node.get("const") {
+            Some(one) => vec![one],
+            None => return None,
+        },
+    };
+    let matching = members
+        .iter()
+        .filter(|member| {
+            member
+                .as_str()
+                .is_some_and(|member| member.eq_ignore_ascii_case(text))
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [only] if only.as_str() != Some(text.as_str()) => Some((**only).clone()),
+        _ => None,
+    }
+}
+
 /// How much of the example budget is spent, and which fields the budget cost.
 struct RenderState {
     rendered: usize,
@@ -970,6 +1038,77 @@ mod tests {
             degraded: 40,
         };
         assert!(!lost.instance_window_holds());
+    }
+
+    /// A field's schema node resolves to the shape it really means.
+    ///
+    /// The derived schema answers with a `$ref` into the definitions, and a
+    /// choice of named variants answers with a `$ref` inside its first branch.
+    /// A repair that reads the node as written reads no type at all on exactly
+    /// the fields that need repairing.
+    #[test]
+    fn a_field_schema_resolves_to_the_shape_it_means() {
+        let root = serde_json::json!({
+            "$defs": {
+                "Deliverable": {"type": "object", "required": ["block_index"]},
+                "Decision": {"type": "string", "enum": ["accept", "rework"]},
+            },
+            "type": "object",
+            "properties": {
+                "deliverable": {"$ref": "#/$defs/Deliverable"},
+                "decision": {"$ref": "#/$defs/Decision"},
+                "optional": {"anyOf": [{"$ref": "#/$defs/Deliverable"}, {"type": "null"}]},
+            },
+        });
+        let properties = root
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("properties");
+        let deliverable = resolve_schema_node(&root, &properties["deliverable"]);
+        assert_eq!(deliverable.get("type").and_then(serde_json::Value::as_str), Some("object"));
+        let decision = resolve_schema_node(&root, &properties["decision"]);
+        assert_eq!(
+            decision.get("enum").and_then(serde_json::Value::as_array).map(Vec::len),
+            Some(2)
+        );
+        let optional = resolve_schema_node(&root, &properties["optional"]);
+        assert_eq!(optional.get("type").and_then(serde_json::Value::as_str), Some("object"));
+    }
+
+    /// A literal that differs from a legal member only in case is put back into
+    /// the contract's spelling - but only when exactly one member matches.
+    ///
+    /// Two members that differ only in case are two members: the value names
+    /// neither, and nothing is repaired.
+    #[test]
+    fn a_literal_is_repaired_only_when_one_member_matches() {
+        let schema = serde_json::json!({"enum": ["accept", "challenge", "rework"]});
+        assert_eq!(
+            normalize_schema_literal(&schema, &serde_json::json!("Accept")),
+            Some(serde_json::json!("accept"))
+        );
+        // A value that names no member is not repaired.
+        assert_eq!(
+            normalize_schema_literal(&schema, &serde_json::json!("nonsense")),
+            None
+        );
+        // Two members that differ only in case: nothing is repaired.
+        let ambiguous = serde_json::json!({"enum": ["Accept", "accept"]});
+        assert_eq!(
+            normalize_schema_literal(&ambiguous, &serde_json::json!("ACCEPT")),
+            None
+        );
+        // A const is a member of one.
+        let fixed = serde_json::json!({"const": "task_review"});
+        assert_eq!(
+            normalize_schema_literal(&fixed, &serde_json::json!("Task_Review")),
+            Some(serde_json::json!("task_review"))
+        );
+        // A value that already holds is not touched.
+        assert_eq!(
+            normalize_schema_literal(&schema, &serde_json::json!("accept")),
+            None
+        );
     }
 
     /// A required field the budget cost is never dropped silently.
