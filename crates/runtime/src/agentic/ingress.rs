@@ -452,21 +452,45 @@ impl RuntimeServices {
                     .session_evidence_access(&actor.session_id, evidence_id)
                     .await;
                 let access = match resolved {
-                    Ok(Some(access)) => access,
-                    Ok(None) => {
-                        let hint = self
-                            .canonical_tool_evidence_hint(&actor.session_id, evidence_id)
-                            .await;
-                        let mut message = format!(
-                            "{} evidence {evidence_ref} has no canonical durable receipt in Session {}; use a tool:// reference returned by a completed tool call in this Session",
-                            action.kind(),
-                            actor.session_id
-                        );
-                        if let Some(hint) = hint {
-                            message.push_str(&format!(". {hint}"));
+                    Ok(Some(access)) => {
+                        // The legacy call-id form resolves, but it pins no
+                        // content: a submission has to name the full canonical
+                        // receipt. The form stays readable - the refusal names
+                        // the canonical receipt, so the model repairs in one
+                        // round instead of guessing variants.
+                        if self.cited_receipt_is_legacy(&actor.session_id, evidence_id).await {
+                            let hint = self
+                                .canonical_tool_evidence_hint(&actor.session_id, evidence_id)
+                                .await;
+                            let mut message = format!(
+                                "{} evidence {evidence_ref} is the legacy call-id form, which pins no content: name the full canonical receipt (tool-raw-<call>-<content digest>). code={}",
+                                action.kind(),
+                                harness_contract::refusal_codes::EvidenceRefusalCode::LegacyCallOnlyForm
+                                    .code()
+                            );
+                            if let Some(hint) = hint {
+                                message.push_str(&format!(". {hint}"));
+                            }
+                            unresolvable.push(message);
+                            continue;
                         }
-                        unresolvable.push(message);
-                        continue;
+                        access
+                    }
+                    Ok(None) => {
+                        match self
+                            .resolve_tool_evidence(
+                                &actor.session_id,
+                                evidence_id,
+                                action.kind(),
+                            )
+                            .await
+                        {
+                            ToolEvidenceResolution::Resolved(access) => access,
+                            ToolEvidenceResolution::Refused(message) => {
+                                unresolvable.push(message);
+                                continue;
+                            }
+                        }
                     }
                     Err(error) => {
                         return Err(format!(
@@ -623,6 +647,92 @@ impl RuntimeServices {
         // Preserve checked-transaction uncertainty across the original caller.
         self.submit_agent_action_from_owner(envelope, false, false, Some((capability, tool, original_input)), None)
             .await.map_err(crate::AgentActionServiceError::EventStore)?.into_single_typed()
+    }
+
+    /// Whether the cited id is the legacy call-id form.
+    ///
+    /// The legacy form resolves - the call's own entry is recorded - but it
+    /// pins no content: two receipts of the same call could be behind it. A
+    /// submission has to name the full canonical receipt, and the refusal names
+    /// it, so the model repairs in one round. The form stays readable
+    /// everywhere else.
+    async fn cited_receipt_is_legacy(&self, session_id: &str, cited: &str) -> bool {
+        let recorded = self
+            .session_evidence_receipt_ids(session_id, MAX_EVIDENCE_HINT_RECEIPT_SCAN)
+            .await
+            .unwrap_or_default();
+        if recorded.iter().any(|receipt| receipt == cited) {
+            // It is a recorded receipt: the canonical form.
+            return false;
+        }
+        recorded
+            .iter()
+            .any(|receipt| receipt.len() > cited.len() && receipt.starts_with(cited))
+    }
+
+    /// Resolve one cited tool receipt at the submission surface.
+    ///
+    /// A citation that names no receipt is not always a wrong citation: a model
+    /// writes a hex character, a separator or the end of a content suffix
+    /// differently, and the receipt it meant is already recorded. The repair
+    /// names exactly one receipt, and the content is verified against that
+    /// receipt before it is accepted - so the repair moves a citation to the
+    /// receipt it was aiming at and never invents one.
+    ///
+    /// A citation that matches more than one receipt is refused by name: the
+    /// model gets the candidates and the whole call, and Runtime does not
+    /// choose.
+    async fn resolve_tool_evidence(
+        &self,
+        session_id: &str,
+        cited: &str,
+        kind: &str,
+    ) -> ToolEvidenceResolution {
+        let recorded = self
+            .session_evidence_receipt_ids(session_id, MAX_EVIDENCE_HINT_RECEIPT_SCAN)
+            .await
+            .unwrap_or_default();
+        match repair_receipt_citation(cited, &recorded) {
+            EvidenceCitation::Canonical(canonical) => {
+                match self.session_evidence_access(session_id, &canonical).await {
+                    Ok(Some(access)) => ToolEvidenceResolution::Resolved(access),
+                    _ => {
+                        let hint = self.canonical_tool_evidence_hint(session_id, cited).await;
+                        ToolEvidenceResolution::Refused(unrepaired_evidence_refusal(
+                            kind, cited, session_id, hint,
+                        ))
+                    }
+                }
+            }
+            EvidenceCitation::Ambiguous(candidates) => {
+                // The ambiguity has one class in one ledger: the typed payload
+                // is rendered into the prose, so the sentence a model reads and
+                // the record a reader parses cannot drift apart.
+                let ambiguity = harness_contract::reference_ambiguity::AmbiguousReference::new(
+                    cited,
+                    candidates,
+                );
+                ToolEvidenceResolution::Refused(format!(
+                    "{kind} evidence tool://{cited} matches {} recorded receipts in Session {session_id} ({}); cite the full tool:// reference of the intended completed tool call. diagnostics={}",
+                    ambiguity.candidate_count(),
+                    name_receipt_candidates(
+                        &ambiguity
+                            .candidates()
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                    ),
+                    serde_json::to_string(&ambiguity.payload_capped(MAX_EVIDENCE_HINT_CANDIDATES))
+                        .unwrap_or_default(),
+                ))
+            }
+            EvidenceCitation::Unrepairable => {
+                let hint = self.canonical_tool_evidence_hint(session_id, cited).await;
+                ToolEvidenceResolution::Refused(unrepaired_evidence_refusal(
+                    kind, cited, session_id, hint,
+                ))
+            }
+        }
     }
 
     /// The candidate carries no grant. The original action transaction decides
@@ -1401,6 +1511,124 @@ fn receipt_id_parts(reference: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The refusal for a citation that names no recorded receipt.
+fn unrepaired_evidence_refusal(
+    kind: &str,
+    cited: &str,
+    session_id: &str,
+    hint: Option<String>,
+) -> String {
+    let mut message = format!(
+        "{kind} evidence tool://{cited} has no canonical durable receipt in Session {session_id}; use a tool:// reference returned by a completed tool call in this Session. code={}",
+        harness_contract::refusal_codes::EvidenceRefusalCode::UnrepairedCitation.code()
+    );
+    if let Some(hint) = hint {
+        message.push_str(&format!(". {hint}"));
+    }
+    message
+}
+
+/// What a repair of one cited receipt found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EvidenceCitation {
+    /// Exactly one recorded receipt matches the citation under a repairable
+    /// shape: the server can name the canonical receipt itself.
+    Canonical(String),
+    /// More than one recorded receipt matches: the citation does not name one
+    /// receipt, and guessing would attach the wrong content.
+    Ambiguous(Vec<String>),
+    /// No recorded receipt matches.
+    Unrepairable,
+}
+
+/// The canonical receipt a citation names, repairing the three shapes a model is
+/// known to write.
+///
+/// The shapes are measured, not imagined: a hex character slipped in the
+/// content suffix, a separator drifted between the call parts, and the content
+/// suffix truncated at either end - one live run cited `tool-raw-...-6` for the
+/// durable `tool-raw-...-2c77431438342406`. The call id still has to match:
+/// the repair moves a citation to the receipt it was aiming at, it never
+/// invents a receipt.
+///
+/// A citation that matches more than one receipt is ambiguous, and an ambiguous
+/// citation is refused by name rather than resolved to a guess.
+pub(crate) fn repair_receipt_citation(
+    cited: &str,
+    recorded: &[String],
+) -> EvidenceCitation {
+    let (cited_call, cited_suffix) = match cited.rsplit_once('-') {
+        Some((call, suffix)) => (call, Some(suffix)),
+        None => (cited, None),
+    };
+    // The legacy call-id form pins no content: repairing it would be choosing
+    // which receipt the model meant.
+    let Some(cited_suffix) = cited_suffix else {
+        return EvidenceCitation::Unrepairable;
+    };
+    let candidates = recorded
+        .iter()
+        .filter(|receipt| {
+            let (recorded_call, recorded_digest) = receipt_id_parts(receipt);
+            let Some(recorded_digest) = recorded_digest else {
+                return false;
+            };
+            call_parts_match(cited_call, recorded_call)
+                && digest_parts_match(cited_suffix, recorded_digest)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match candidates.len() {
+        0 => EvidenceCitation::Unrepairable,
+        1 => EvidenceCitation::Canonical(candidates[0].clone()),
+        _ => EvidenceCitation::Ambiguous(candidates),
+    }
+}
+
+/// The call parts of two citations match when they are equal, when only their
+/// separators drifted, or when one is a single edit away from the other.
+fn call_parts_match(cited: &str, recorded: &str) -> bool {
+    cited == recorded
+        || cited.replace('_', "-") == recorded.replace('_', "-")
+        || within_one_edit(cited, recorded)
+}
+
+/// The content suffixes of two citations match when they are equal, when one is
+/// the other truncated at either end, or when a single hex character slipped.
+fn digest_parts_match(cited: &str, recorded: &str) -> bool {
+    cited == recorded
+        || cited.starts_with(recorded)
+        || recorded.starts_with(cited)
+        || cited.ends_with(recorded)
+        || recorded.ends_with(cited)
+        || hex_one_apart(cited, recorded)
+}
+
+/// One hex character differs between two equal-length hex strings.
+fn hex_one_apart(left: &str, right: &str) -> bool {
+    if left.len() != right.len() || left.is_empty() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .filter(|(left, right)| left != right)
+        .count()
+        == 1
+        && left
+            .bytes()
+            .zip(right.bytes())
+            .all(|(left, right)| left.is_ascii_hexdigit() && right.is_ascii_hexdigit())
+}
+
+/// The outcome of resolving one cited tool receipt at the submission surface.
+pub(crate) enum ToolEvidenceResolution {
+    /// The receipt resolved - exactly, or by a repair that named one receipt.
+    Resolved(harness_contract::context::EvidenceAccessRef),
+    /// The citation does not pin one durable receipt; the refusal says which
+    /// shape it was.
+    Refused(String),
+}
+
 /// Levenshtein distance at most one between two call ids: one substituted,
 /// inserted, or deleted character - the drift shape the escalation ledger
 /// measured. An exact match is deliberately not drift: the resolution legs
@@ -1504,10 +1732,22 @@ fn tool_evidence_hint(
                 .filter(|id| receipt_id_parts(id).1 == Some(cited_digest))
                 .collect();
             (shared.len() >= 2).then(|| {
+                // The ambiguity is typed, not only reported. The prose a model
+                // reads is rendered from the same typed payload the durable
+                // record carries, so the two cannot drift apart, and a reader
+                // downstream can tell this refusal apart from every other
+                // unresolvable reference instead of scraping prose for it.
+                let ambiguity =
+                    harness_contract::reference_ambiguity::AmbiguousReference::new(
+                        cited,
+                        shared.iter().map(|id| (*id).to_string()).collect(),
+                    );
                 format!(
-                    "No receipt matches the cited reference; the cited content suffix is recorded under {} durable receipts in this Session: {}; cite the full tool:// reference returned by the intended completed tool call",
-                    shared.len(),
-                    name_receipt_candidates(&shared)
+                    "No receipt matches the cited reference; the cited content suffix is recorded under {} durable receipts in this Session: {}; cite the full tool:// reference returned by the intended completed tool call; diagnostics={}",
+                    ambiguity.candidate_count(),
+                    name_receipt_candidates(&shared),
+                    serde_json::to_string(&ambiguity.payload_capped(MAX_EVIDENCE_HINT_CANDIDATES))
+                        .unwrap_or_default(),
                 )
             })
         }
@@ -1522,6 +1762,122 @@ fn tool_evidence_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_contract::agent_action::{
+        MessagePublishInput, TaskReviewDecision, TaskReviewInput, TeamCreateInput,
+    };
+
+    /// 033 S7 (supplementary pin): the 032 invariant - a Root actor without
+    /// an original physical receipt is refused at the ingress gate - holds
+    /// for every program-state action shape, not only for the ones the
+    /// action service happens to see.
+    ///
+    /// This is the pin that 033 S3-D was missing: the effect-class gate in
+    /// the action service is masked by this ingress gate, so a narrowing
+    /// there changes nothing in the live scene. The four shapes below are
+    /// pinned against the ingress path, and the current tree's behaviour is
+    /// the pin.
+    #[tokio::test]
+    async fn s7_a_root_without_a_physical_receipt_is_refused_at_the_ingress_gate() {
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let root_actor = AgentActorBinding {
+            original_execution: None,
+            objective_id: "objective".into(),
+            program_id: "program".into(),
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            root_execution_id: None,
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: "pin the ingress gate".into(),
+            model_lease: "test".into(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: Vec::new(),
+            actor_id: "root".into(),
+            kind: AgentActorKind::Root,
+            execution_id: None,
+            team_id: None,
+            agent_id: None,
+        };
+        let shapes: Vec<(&str, AgentAction)> = vec![
+            (
+                "team-create",
+                AgentAction::TeamCreate(TeamCreateInput {
+                    name: "Readers".into(),
+                    mission: "read evidence".into(),
+                    objective: None,
+                }),
+            ),
+            (
+                "task-publish",
+                AgentAction::TaskPublish(
+                    serde_json::from_value(serde_json::json!({
+                        "team_ref": "team",
+                        "title": "Evidence",
+                        "objective": "read evidence",
+                        "acceptance": "cited evidence",
+                        "required_capabilities": ["read"]
+                    }))
+                    .unwrap(),
+                ),
+            ),
+            (
+                "message-publish",
+                AgentAction::MessagePublish(MessagePublishInput {
+                    topic_ref: "topic".into(),
+                    summary: Some("progress".into()),
+                    content_ref: None,
+                    refs: Vec::new(),
+                    recipients: Vec::new(),
+                    issue_dispositions: Vec::new(),
+                    intent: None,
+                }),
+            ),
+            (
+                "task-review",
+                AgentAction::TaskReview(TaskReviewInput {
+                    task_ref: "task".into(),
+                    decision: TaskReviewDecision::Rework,
+                    reason: "the answer does not cite the declared criterion".into(),
+                    operator_requirement: None,
+                    evidence_refs: Vec::new(),
+                    gaps: Vec::new(),
+                    directed_actions: Vec::new(),
+                }),
+            ),
+        ];
+        for (shape, action) in shapes {
+            let envelope = AgentActionEnvelope {
+                action_id: format!("s7-{shape}"),
+                actor: root_actor.clone(),
+                expected_revision: None,
+                action,
+            };
+            let message = match services
+                .submit_agent_action_from_owner(&envelope, false, false, None, None)
+                .await
+            {
+                Ok(_) => panic!("{shape}: a Root action without an original physical receipt must be refused at the ingress gate"),
+                Err(error) => error,
+            };
+            // The ingress path refuses it before the Program can see it.
+            // Which ingress gate speaks first depends on the caller's
+            // provenance: a call that arrives without an admitted capability
+            // is refused at the capability gate (ingress.rs:703), and a call
+            // that carries its capability but no original physical receipt is
+            // refused at the binding gates (ingress.rs:707 for every public
+            // actor, ingress.rs:723 for the Root shape). The invariant this
+            // pins is the one 033 S3-D missed: the Root shape never reaches
+            // the action service from the ingress path without a physical
+            // receipt, so a narrowing in the service cannot change the live
+            // scene.
+            assert!(
+                message.contains("original single-call capability missing")
+                    || message.contains("original authenticated execution")
+                    || message.contains("original physical execution"),
+                "{shape}: the ingress gate names the missing binding: {message}"
+            );
+        }
+    }
 
     #[test]
     fn t_removal_program_move_classification_still_holds() {
@@ -1538,6 +1894,92 @@ mod tests {
             "result metadata source changed during resolution; rebuild the review; source=session:one expected=1 actual=2 phase=result_source_pin"
         ));
         assert!(!is_review_program_advanced("task_not_found"));
+    }
+
+    /// The three transcription shapes a server repairs are repaired to the one
+    /// receipt they name.
+    ///
+    /// A model writes a hex character, a separator or the end of a content
+    /// suffix differently, and the receipt it meant is already recorded. The
+    /// repair names exactly one receipt, so the content that is verified is the
+    /// content that was meant.
+    #[test]
+    fn a_transcription_drift_is_repaired_to_the_one_receipt_it_names() {
+        let canonical = "tool-raw-chatcmpl-tool-aa0d514a557763e5-2c77431438342406";
+        let recorded = vec![canonical.to_string()];
+        // The tail of the content suffix was cut.
+        assert_eq!(
+            repair_receipt_citation("tool-raw-chatcmpl-tool-aa0d514a557763e5-6", &recorded),
+            EvidenceCitation::Canonical(canonical.to_string())
+        );
+        // A hex character slipped.
+        assert_eq!(
+            repair_receipt_citation(
+                "tool-raw-chatcmpl-tool-aa0d514a557763e5-2c77431438342407",
+                &recorded
+            ),
+            EvidenceCitation::Canonical(canonical.to_string())
+        );
+        // A separator drifted between the call parts.
+        assert_eq!(
+            repair_receipt_citation(
+                "tool-raw-chatcmpl-tool_aa0d514a557763e5-2c77431438342406",
+                &recorded
+            ),
+            EvidenceCitation::Canonical(canonical.to_string())
+        );
+    }
+
+    /// A citation that matches more than one receipt is refused, not guessed:
+    /// the same content can be recorded under more than one canonical id, and
+    /// Runtime does not choose which one the model meant.
+    #[test]
+    fn an_ambiguous_citation_is_refused_rather_than_guessed() {
+        let recorded = vec![
+            "tool-raw-call-a-2c77431438342406".to_string(),
+            "tool-raw-call-a-2c77431438342406112233445566778899".to_string(),
+        ];
+        match repair_receipt_citation("tool-raw-call-a-2c77", &recorded) {
+            EvidenceCitation::Ambiguous(candidates) => assert_eq!(candidates.len(), 2),
+            other => panic!("a two-way match is ambiguous, not a choice: {other:?}"),
+        }
+    }
+
+    /// The legacy call-id form pins no content, so it is never repaired to a
+    /// receipt: repairing it would be choosing which receipt the model meant.
+    #[test]
+    fn the_legacy_call_id_form_is_never_repaired_to_a_receipt() {
+        let recorded = vec![
+            "tool-raw-chatcmpl-tool-aa0d514a557763e5-2c77431438342406".to_string(),
+        ];
+        assert_eq!(
+            repair_receipt_citation("tool-raw-chatcmpl-tool-aa0d514a557763e5", &recorded),
+            EvidenceCitation::Unrepairable
+        );
+    }
+
+    /// An invented suffix does not alias another receipt: the repair only moves
+    /// a citation to a receipt whose own call id and content suffix match.
+    #[test]
+    fn an_invented_suffix_does_not_alias_another_receipt() {
+        let recorded = vec![
+            "tool-raw-chatcmpl-tool-aa0d514a557763e5-2c77431438342406".to_string(),
+        ];
+        assert_eq!(
+            repair_receipt_citation(
+                "tool-raw-chatcmpl-tool-aa0d514a557763e5:8",
+                &recorded
+            ),
+            EvidenceCitation::Unrepairable
+        );
+        // A different call is a different receipt, however close the content.
+        assert_eq!(
+            repair_receipt_citation(
+                "tool-raw-chatcmpl-tool-bb0d514a557763e5-6",
+                &recorded
+            ),
+            EvidenceCitation::Unrepairable
+        );
     }
 
     #[tokio::test]
@@ -1647,19 +2089,14 @@ mod tests {
             evidence_refs: vec!["tool://tool-raw-chatcmpl-tool-aa0d514a557763e5-6".to_string()],
             unresolved: vec![],
         });
-        let error = services
+        // The content suffix was truncated: the receipt it names is recorded, so
+        // the server resolves the citation to that receipt instead of refusing
+        // a citation that was only mistyped. The content is still verified
+        // against the receipt, so nothing invented is accepted.
+        services
             .validate_agent_action_evidence(&actor, &action)
             .await
-            .expect_err("a corrupted content suffix must never resolve");
-        assert!(
-            error.contains("tool://tool-raw-chatcmpl-tool-aa0d514a557763e5-6"),
-            "{error}"
-        );
-        assert!(
-            error.contains(&format!("tool://{canonical}")),
-            "the refusal must name the canonical receipt: {error}"
-        );
-        assert!(error.contains("copy that exact reference"), "{error}");
+            .unwrap_or_else(|error| panic!("a truncated suffix is repaired: {error}"));
         let attempt_form = AgentAction::TaskSubmit(TaskSubmitInput {
             task_ref: "task:1".to_string(),
             deliverable: None,
@@ -1987,6 +2424,24 @@ mod tests {
                 "every candidate is named: {error}"
             );
         }
+        // S2 (G4): the ambiguity is typed, not only reported. Before this
+        // change the refusal carried prose alone, so a reader downstream
+        // could not tell it apart from any other unresolvable reference and
+        // could not parse the candidates without scraping them out of a
+        // sentence. The prose a model reads is unchanged; the typed payload
+        // rides with it.
+        assert!(
+            error.contains("\"code\":\"reference_ambiguous\""),
+            "the ambiguity refusal is typed: {error}"
+        );
+        assert!(
+            error.contains("\"candidate_count\":4"),
+            "the typed payload states how many receipts answer: {error}"
+        );
+        assert!(
+            error.contains("\"cited\""),
+            "the typed payload names the citation that was refused: {error}"
+        );
     }
 }
 

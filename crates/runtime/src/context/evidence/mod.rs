@@ -15,6 +15,14 @@ pub use projection::audit_projection;
 
 pub(crate) const READ_ACQUISITION_FIELD: &str = "read_acquisition_v1";
 pub(crate) const CHILD_READ_ACQUISITIONS_FIELD: &str = "child_read_acquisitions_v1";
+
+/// 033 S3: how many returned chunks one acquisition seal can carry.
+///
+/// The seal proves the returned body chunk by chunk (digest, byte count and
+/// byte range), so the capacity is a receipt-size budget. 256 chunks of
+/// 1500 bytes is about 384 KB of artifact body, and the seal metadata it
+/// costs stays inside the receipt budget the effect receipt already uses.
+pub(crate) const READ_CHUNK_SEAL_CAPACITY: usize = 256;
 pub(crate) fn native_read_candidate_tool(name: &str) -> bool {
     matches!(name, "read_file" | "read_ref" | "evidence_retrieve" | "tool_orchestrate" | "grep_search")
 }
@@ -413,7 +421,17 @@ pub(crate) fn read_body_seal(tool_name: &str, output: &str) -> Option<ReadBodySe
         }
         let total_chunks = value["total_chunks"].as_u64()?;
         let values = value["chunks"].as_array()?;
-        if values.len() > 16 {
+        // 033 S3 (seal capacity is a budget, not a proof): the per-chunk
+        // acquisition seal carries one digest per returned chunk, so the
+        // number of chunks it can carry is a receipt-size budget. Refusing to
+        // seal a read that returned more chunks than the budget left the
+        // receipt unsealed, and an unsealed read has no original physical
+        // extent: every later review of that read was refused with
+        // "proof_actual_input_extent_unsupported: actual read lacks an
+        // original physical extent" and the review turn could never reach a
+        // terminal answer. The budget is raised to the size the seal
+        // metadata can carry; every proof check below is unchanged.
+        if values.len() > READ_CHUNK_SEAL_CAPACITY {
             return None;
         }
         if total_chunks == 0 {
@@ -1608,6 +1626,41 @@ fn truncate_head_tail(
 
 #[cfg(test)]
 mod tests {
+
+    /// 033 S3: the acquisition seal is a receipt-size budget, not a proof
+    /// requirement. A delegated child that read an artifact in more chunks
+    /// than the old budget (the live runs read 28 and 34 chunk artifacts)
+    /// used to settle without a seal, and an unsealed read has no original
+    /// physical extent - every later review of it was refused.
+    #[test]
+    fn s3_b_a_read_beyond_the_old_chunk_budget_still_settles_with_a_seal() {
+        let chunks: Vec<serde_json::Value> = (0..34)
+            .map(|index| serde_json::json!({
+                "index": index,
+                "content": "x",
+                "byte_start": index * 1500,
+                "byte_end": index * 1500 + 1,
+            }))
+            .collect();
+        let output = serde_json::json!({
+            "kind": "evidence_retrieve",
+            "available": true,
+            "evidence_ref": "artifact://art-s3",
+            "sha256": format!("sha256:{}", "a".repeat(64)),
+            "bytes": 34 * 1500,
+            "total_chunks": 34,
+            "chunks": chunks,
+        });
+        let sealed = super::read_body_seal("read_ref", &output.to_string())
+            .expect("a read beyond the old chunk budget still proves its extent");
+        match sealed.extent {
+            super::ReadExtent::ArtifactChunks { total_chunks, chunks } => {
+                assert_eq!(total_chunks, 34);
+                assert_eq!(chunks.len(), 34, "every returned chunk is proven");
+            }
+            other => panic!("a chunked artifact read seals as chunk coverage: {other:?}"),
+        }
+    }
 
     #[test]
     fn original_child_coverage_rejects_duplicate_in_place_of_missing_window() {

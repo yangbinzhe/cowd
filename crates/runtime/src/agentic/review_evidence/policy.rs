@@ -11588,3 +11588,6 @@ mod read_auth_boundary_tests {
         assert!(!matches!(result, Ok(snapshot) if !snapshot.reads.is_empty()), "foreign primary accepted");
     }
 }
+
+#[cfg(test)]
+mod s1_fixture;

@@ -305,6 +305,15 @@ impl GatewayToolExecutor {
             .collect()
     }
 
+    /// The path the schema validator wrote into its refusal.
+    ///
+    /// The validator names the path it was at (`$.deliverable`), so the refusal
+    /// can show the legal form of that path instead of the whole call.
+    fn violated_path(error: &str) -> Option<&str> {
+        let head = error.split_once(':').map(|(head, _)| head.trim())?;
+        head.starts_with('$').then_some(head)
+    }
+
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
         let lease = self.tool_host.pin_snapshot();
         let definition = lease
@@ -338,16 +347,55 @@ impl GatewayToolExecutor {
         // same malformed frame again. codex and opencode both put a complete
         // literal example in the contract; this puts the same example in the
         // refusal, so the repair attempt has something to copy.
-        let message = match definition
-            .as_ref()
-            .and_then(|definition| {
-                harness_contract::tool_input_contract::input_example(&definition.input_schema)
-            }) {
-            Some(example) => format!(
-                "{error}. Send it shaped like this: {}",
-                serde_json::to_string(&example).unwrap_or_else(|_| example.to_string()
-                )
-            ),
+        //
+        // The shape shown is the shape of the field that was violated, not the
+        // shape of the whole call: a whole-call example never carries an
+        // optional or a chosen field, so it taught the model to send the same
+        // call again while naming the wrong thing. The whole call stays as
+        // background.
+        let error_text = error.to_string();
+        let violated_path = Self::violated_path(&error_text);
+        let message = match definition.as_ref() {
+            Some(definition) => {
+                let path_form = violated_path.as_deref().and_then(|path| {
+                    harness_contract::tool_input_contract::example_for_path(
+                        &definition.input_schema,
+                        path,
+                    )
+                });
+                match path_form {
+                    Some(form) => format!(
+                        "{error}. Send it shaped like this: {}",
+                        serde_json::to_string(&form).unwrap_or_else(|_| form.to_string())
+                    ),
+                    None => match harness_contract::tool_input_contract::input_example(
+                        &definition.input_schema,
+                    ) {
+                        Some(example) => {
+                            // A degraded example is not an instance; showing it
+                            // as one would hand the model something to copy that
+                            // the schema refuses.
+                            match harness_contract::tool_input_contract::degraded_example(
+                                &example,
+                            ) {
+                                Some(degraded) => format!(
+                                    "{error}. {}",
+                                    harness_contract::tool_input_contract::degraded_example_text(
+                                        &degraded
+                                    )
+                                ),
+                                None => format!(
+                                    "{error}. Send it shaped like this: {}",
+                                    serde_json::to_string(&example).unwrap_or_else(|_| {
+                                        example.to_string()
+                                    })
+                                ),
+                            }
+                        }
+                        None => error.to_string(),
+                    },
+                }
+            }
             None => error.to_string(),
         };
         ToolError::from_failure(

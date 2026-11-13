@@ -895,6 +895,17 @@ fn semantic_task_contract(task: &super::program::AgenticTaskProjection) -> serde
         "failed_attempts",
         "review_generation",
         "failed_review_attempts",
+        // 033 S7: the two accounts are bookkeeping, not work - the manifest
+        // pins semantic work only.
+        "structural_execution_stalls",
+        "structural_review_stalls",
+        // 033 S8 (R102 rework): the review duty is a workflow duty, not
+        // semantic work for the worker, so it stays out of both manifests -
+        // and so do the two review measures, which count verdicts rather
+        // than state work.
+        "review_obligation",
+        "reviews_applied",
+        "reviews_accepted",
         "last_failure",
         "cancel_requested_by",
         "cancel_reason_ref",
@@ -4551,6 +4562,11 @@ mod tests {
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -5064,6 +5080,11 @@ mod tests {
                     failed_attempts: 0,
                     review_generation: 1,
                     failed_review_attempts: 0,
+                    structural_execution_stalls: 0,
+                    structural_review_stalls: 0,
+                    reviews_applied: 0,
+                    review_obligation: None,
+                    reviews_accepted: 0,
                     last_failure: None,
                     replacement_task_refs: Vec::new(),
                     supersede_evidence_refs: Vec::new(),
@@ -5136,6 +5157,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 1,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),

@@ -10,6 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::refusal_codes::RefusalEnvelope;
+
 pub const STATE_INSPECT_TOOL_ID: &str = "state_inspect";
 pub const TEAM_CREATE_TOOL_ID: &str = "team_create";
 pub const AGENT_INVITE_TOOL_ID: &str = "agent_invite";
@@ -666,7 +668,81 @@ impl AgentAction {
         }
     }
 
+    /// Check the action against its own contract.
+    ///
+    /// The refusal that comes back carries its teaching: the code, the path it
+    /// violated, the legal form of that path, and - when the field is one of
+    /// the reference families - the sibling vocabulary hint. The judgement
+    /// itself is unchanged; only the refusal's payload grew.
     pub fn validate(&self) -> Result<(), AgentActionValidationError> {
+        self.validate_shape()
+            .map_err(|error| AgentActionValidationError::Enveloped(Box::new(
+                crate::refusal_codes::envelope_for(self, &error),
+            )))
+    }
+
+    /// The JSON schema of this action's input, derived from the same derive
+    /// the tool catalog uses.
+    ///
+    /// One source: the schema comes from the types themselves, so a refusal can
+    /// show the legal form of the field it refused without a second hand-written
+    /// table of shapes drifting away from the contract.
+    #[must_use]
+    pub fn input_schema(&self) -> Option<serde_json::Value> {
+        let schema = serde_json::to_value(schemars::schema_for!(AgentAction)).ok()?;
+        let definitions = schema.get("$defs").cloned();
+        // The derive may answer with a `$ref` into `$defs`; the variants live in
+        // the definition, so the search looks there too.
+        let root = if schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .is_some()
+        {
+            schema.clone()
+        } else {
+            schema
+                .get("$defs")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|defs| {
+                    defs.values().find(|value| {
+                        value.get("oneOf").or_else(|| value.get("anyOf")).is_some()
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| schema.clone())
+        };
+        let variants = root
+            .get("oneOf")
+            .or_else(|| root.get("anyOf"))
+            .and_then(serde_json::Value::as_array)?;
+        for variant in variants {
+            let Some(properties) = variant.get("properties").and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            let kind = properties
+                .get("kind")
+                .and_then(|kind| kind.get("const"))
+                .and_then(serde_json::Value::as_str);
+            if kind != Some(self.kind()) {
+                continue;
+            }
+            let mut input = properties
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| variant.clone());
+            // The variant's input is often a `$ref` into the definitions; the
+            // definitions travel with it so a reference inside the input still
+            // resolves.
+            if let (Some(defs), Some(map)) = (definitions.as_ref(), input.as_object_mut()) {
+                map.insert("$defs".to_string(), defs.clone());
+            }
+            return Some(input);
+        }
+        None
+    }
+
+    fn validate_shape(&self) -> Result<(), AgentActionValidationError> {
         match self {
             Self::StateInspect(input) => {
                 optional_nonempty("scope_ref", input.scope_ref.as_deref())?;
@@ -1093,6 +1169,41 @@ pub struct AgentActionErrorObservation {
     pub recoverable: bool,
 }
 
+/// The refusal a validation error carries, without the teaching around it.
+///
+/// A refusal keeps its judgement when the teaching is attached: the code, the
+/// legal form and the hint are added around the refusal, never in place of it.
+/// This is what a caller compares when it wants to know that two refusals are
+/// the same judgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentActionRefusal {
+    /// A required field was not sent.
+    Missing(&'static str),
+    /// A field the model sent carries nothing.
+    Empty(&'static str, &'static str),
+    /// A list field repeats a value.
+    Duplicate(&'static str),
+    /// A reference field does not carry its canonical form.
+    Invalid(&'static str),
+    /// A cross-field rule refused the call.
+    Rejected(&'static str),
+}
+
+impl AgentActionValidationError {
+    /// The refusal this error carries.
+    #[must_use]
+    pub fn refusal(&self) -> AgentActionRefusal {
+        match self {
+            Self::Missing(field) => AgentActionRefusal::Missing(field),
+            Self::Empty(field, rule) => AgentActionRefusal::Empty(field, rule),
+            Self::Duplicate(field) => AgentActionRefusal::Duplicate(field),
+            Self::Invalid(field) => AgentActionRefusal::Invalid(field),
+            Self::Rejected(rule) => AgentActionRefusal::Rejected(rule),
+            Self::Enveloped(envelope) => envelope.refusal.clone(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum AgentActionValidationError {
     #[error("agent action field `{0}` is required")]
@@ -1111,6 +1222,13 @@ pub enum AgentActionValidationError {
     /// field name, so the model sees what to change instead of a phantom field.
     #[error("{0}")]
     Rejected(&'static str),
+    /// A refusal that carries its teaching with it: the code, the path it
+    /// violated, the legal form of that path, and the sibling vocabulary hint.
+    ///
+    /// The envelope never changes what was refused - it only says more about
+    /// it, so the model has something to copy instead of something to guess.
+    #[error("{0}")]
+    Enveloped(Box<RefusalEnvelope>),
 }
 
 /// What a Task submit must carry, stated once.
@@ -1148,6 +1266,30 @@ pub const OBJECTIVE_REVIEW_SUPPORT_RULE: &str =
 /// one. Reporting an empty value as a missing field names a field the model did
 /// send, which is the same phantom as reporting an absent optional.
 pub const NON_EMPTY_VALUE_RULE: &str = "the fields you sent must carry real values; an empty string or empty list is treated as not provided";
+
+/// Which fields each teaching rule is about, so a refusal can name the path it
+/// violated instead of only the rule text.
+///
+/// The rules are the teaching texts (layer 2); the paths are the names the
+/// model wrote. Keeping them together means a rule can never be taught for
+/// one field and refused against another.
+const RULE_SUBJECTS: &[(&str, &[&str])] = &[
+    (TASK_SUBMIT_RESULT_RULE, &["artifact_refs", "deliverable"]),
+    (OBJECTIVE_ADD_RULE, &["statement_ref", "source_refs"]),
+    (OBJECTIVE_EVOLVE_RULE, &["criterion_ref", "source_refs", "reason_ref"]),
+    (OBJECTIVE_REVIEW_REASON_RULE, &["reason"]),
+    (OBJECTIVE_REVIEW_SUPPORT_RULE, &["result_refs", "evidence_refs"]),
+    (OBJECTIVE_COMPLETE_RESULT_RULE, &["result_refs"]),
+];
+
+/// The fields a rule is about, when it is one of the registered rules.
+#[must_use]
+pub fn rule_subjects(rule: &str) -> Option<&'static [&'static str]> {
+    RULE_SUBJECTS
+        .iter()
+        .find(|(known, _)| *known == rule)
+        .map(|(_, subjects)| *subjects)
+}
 
 fn required(field: &'static str, value: &str) -> Result<(), AgentActionValidationError> {
     if value.trim().is_empty() {
@@ -1250,7 +1392,7 @@ mod tests {
         assert!(
             matches!(
                 bare.validate(),
-                Err(AgentActionValidationError::Rejected(rule)) if rule == OBJECTIVE_REVIEW_REASON_RULE
+                Err(error) if error.refusal() == AgentActionRefusal::Rejected(OBJECTIVE_REVIEW_REASON_RULE)
             ),
             "an empty reason must be refused"
         );
@@ -1359,7 +1501,7 @@ mod tests {
         });
         let error = empty.validate().expect_err("an empty result is rejected");
         assert!(
-            matches!(error, AgentActionValidationError::Rejected(_)),
+            matches!(error.refusal(), AgentActionRefusal::Rejected(_)),
             "a field the schema calls optional must not be reported as missing: {error}"
         );
         assert!(
@@ -1380,7 +1522,7 @@ mod tests {
             .validate()
             .expect_err("an unsupported verdict is rejected");
         assert!(
-            matches!(error, AgentActionValidationError::Rejected(_)),
+            matches!(error.refusal(), AgentActionRefusal::Rejected(_)),
             "there is no field named `result_refs_or_evidence_refs` in any schema: {error}"
         );
     }
@@ -1399,8 +1541,8 @@ mod tests {
         .expect_err("an empty name is a field the model sent");
         assert!(
             matches!(
-                error,
-                AgentActionValidationError::Empty("name", NON_EMPTY_VALUE_RULE)
+                error.refusal(),
+                AgentActionRefusal::Empty("name", NON_EMPTY_VALUE_RULE)
             ),
             "the field the model sent must be named: {error}"
         );
@@ -1425,10 +1567,8 @@ mod tests {
             deliverable: None,
         });
         assert_eq!(
-            empty.validate(),
-            Err(AgentActionValidationError::Rejected(
-                TASK_SUBMIT_RESULT_RULE
-            ))
+            empty.validate().map_err(|error| error.refusal()),
+            Err(AgentActionRefusal::Rejected(TASK_SUBMIT_RESULT_RULE))
         );
         // A one-shot deliverable is an equally real Task result: Runtime
         // expands it into exactly the canonical artifact path.
@@ -1478,8 +1618,10 @@ mod tests {
             evidence_refs: vec!["tool://failure-receipt".to_string()],
         });
         assert_eq!(
-            missing_successor.validate(),
-            Err(AgentActionValidationError::Missing("replacement_task_refs"))
+            missing_successor
+                .validate()
+                .map_err(|error| error.refusal()),
+            Err(AgentActionRefusal::Missing("replacement_task_refs"))
         );
 
         let split = AgentAction::TaskSupersede(TaskSupersedeInput {
@@ -1506,13 +1648,17 @@ mod tests {
         // required by this operation, so neither may be reported as a missing
         // field: the instruction has to name what the operation needs.
         assert_eq!(
-            AgentAction::ObjectiveUpdate(replace.clone()).validate(),
-            Err(AgentActionValidationError::Rejected(OBJECTIVE_EVOLVE_RULE))
+            AgentAction::ObjectiveUpdate(replace.clone())
+                .validate()
+                .map_err(|error| error.refusal()),
+            Err(AgentActionRefusal::Rejected(OBJECTIVE_EVOLVE_RULE))
         );
         replace.source_refs = vec!["tool://scope-change-evidence".to_string()];
         assert_eq!(
-            AgentAction::ObjectiveUpdate(replace.clone()).validate(),
-            Err(AgentActionValidationError::Rejected(OBJECTIVE_EVOLVE_RULE))
+            AgentAction::ObjectiveUpdate(replace.clone())
+                .validate()
+                .map_err(|error| error.refusal()),
+            Err(AgentActionRefusal::Rejected(OBJECTIVE_EVOLVE_RULE))
         );
         replace.reason_ref = Some("artifact://scope-change-rationale".to_string());
         assert_eq!(AgentAction::ObjectiveUpdate(replace).validate(), Ok(()));

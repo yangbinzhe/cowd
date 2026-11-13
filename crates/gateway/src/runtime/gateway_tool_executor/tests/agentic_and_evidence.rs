@@ -1501,6 +1501,27 @@ async fn a_valid_artifact_selector_still_resolves() {
     assert!(value["bytes"].as_u64().unwrap() > 0, "{value}");
 }
 
+/// The fields a schema requires, across the variants of a tagged schema.
+fn required_field_names(schema: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut collect = |node: &serde_json::Value| {
+        if let Some(required) = node.get("required").and_then(serde_json::Value::as_array) {
+            for name in required.iter().filter_map(serde_json::Value::as_str) {
+                names.insert(name.to_string());
+            }
+        }
+    };
+    collect(schema);
+    for keyword in ["oneOf", "anyOf"] {
+        if let Some(variants) = schema.get(keyword).and_then(serde_json::Value::as_array) {
+            for variant in variants {
+                collect(variant);
+            }
+        }
+    }
+    names
+}
+
 /// Every structured-input tool must advertise an example that passes its own
 /// schema.
 ///
@@ -1516,6 +1537,7 @@ async fn every_structured_input_tool_advertises_an_example_that_validates() {
         .expect("runtime tools");
     let executor = GatewayToolExecutor::new(None, false, registry);
     let mut checked = 0_usize;
+    let mut degraded = 0_usize;
     let mut skipped = 0_usize;
     for definition in crate::runtime_bootstrap::runtime_capability_tool_definitions() {
         let Some(example) =
@@ -1525,6 +1547,37 @@ async fn every_structured_input_tool_advertises_an_example_that_validates() {
             skipped += 1;
             continue;
         };
+        let description = definition.description.unwrap_or_default();
+        // A degraded example is not an instance: it names the fields instead of
+        // showing one. It is accepted only when it names every required field
+        // and the description says so - a degradation passed off as an input
+        // would be the failure this whole contract exists to prevent.
+        if let Some(degradation) =
+            harness_contract::tool_input_contract::degraded_example(&example)
+        {
+            let named = degradation
+                .fields
+                .iter()
+                .filter(|field| field.required)
+                .map(|field| field.name.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let missing = required_field_names(&definition.input_schema)
+                .into_iter()
+                .filter(|name| !named.contains(name))
+                .collect::<Vec<_>>();
+            assert!(
+                missing.is_empty(),
+                "`{}` has a degraded example that does not name {missing:?}",
+                definition.name
+            );
+            assert!(
+                description.contains("Example degraded:"),
+                "`{}` has a degraded example but its description does not say so",
+                definition.name
+            );
+            degraded += 1;
+            continue;
+        }
         let rendered = serde_json::to_string(&example).expect("example renders");
         executor
             .validate_tool_input(&definition.name, &rendered)
@@ -1534,7 +1587,6 @@ async fn every_structured_input_tool_advertises_an_example_that_validates() {
                     definition.name
                 )
             });
-        let description = definition.description.unwrap_or_default();
         assert!(
             description.contains("Example input:"),
             "`{}` has an example but its description does not carry it",
@@ -1547,9 +1599,23 @@ async fn every_structured_input_tool_advertises_an_example_that_validates() {
         );
         checked += 1;
     }
+    // The window counts instances only: a tool whose example degraded is not
+    // covered by an instance, so it never widens the window. The degraded
+    // branch has its own bound.
+    let coverage = harness_contract::tool_input_contract::ExampleCoverage {
+        instances: checked,
+        degraded,
+    };
+    // The counts are printed so the relaxation window is measurable from the
+    // gate itself, not from a reading of the code.
+    println!("example coverage: {coverage:?}");
     assert!(
-        checked > 20,
-        "expected the runtime tool surface to be covered, checked {checked}"
+        coverage.instance_window_holds(),
+        "expected the runtime tool surface to be covered by real instances: {coverage:?}"
+    );
+    assert!(
+        coverage.degraded_branch_holds(),
+        "the degraded branch is a bounded side branch: {coverage:?}"
     );
     assert!(
         skipped > 0,

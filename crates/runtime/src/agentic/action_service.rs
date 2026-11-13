@@ -3592,7 +3592,15 @@ impl AgentActionService {
         if envelope.actor.kind == AgentActorKind::Supervisor && !internal_supervisor {
             return Err(AgentActionServiceError::Corrupt("Runtime supervisor owner required".into()));
         }
-        if envelope.actor.kind == AgentActorKind::Root && physical.is_none() && !internal_root_owner {
+        // 033 S3-D REVERTED (e2 audit: the predicate was action-name
+        // enumeration with an incomplete set, the ingress gate ahead of it
+        // made the change inert on the live path, and the promised positive
+        // pin was not delivered). The gate keeps its 032 semantics for ALL
+        // Root actions; the effect-class carrier is a named 034 item.
+        if envelope.actor.kind == AgentActorKind::Root
+            && physical.is_none()
+            && !internal_root_owner
+        {
             return Err(AgentActionServiceError::Corrupt("new root action requires original physical execution".into()));
         }
         if matches!(envelope.actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead) && physical.is_none() {
@@ -4167,6 +4175,31 @@ impl AgentActionService {
                 "objective_not_verifiable" | "objective_blocked_for_human_review"
             ) && matches!(envelope.action, AgentAction::ObjectiveCompleteRequest(_))
             {
+                // 033 S8: the terminal obligation list leaves with the
+                // verdict. A close-out that is refused must say which
+                // obligation is still open and which family blocked it -
+                // otherwise the root sees "not verifiable" and has to guess.
+                let obligations = projection
+                    .tasks
+                    .values()
+                    .map(super::work_market::terminal_obligation_list)
+                    .flatten()
+                    .collect::<Vec<_>>();
+                if !obligations.is_empty() {
+                    let message = format!(
+                        "{message}; terminal_obligations={}",
+                        serde_json::to_string(&obligations).unwrap_or_else(|_| "[]".into())
+                    );
+                    self.record_completion_rejection(
+                        &projection,
+                        envelope,
+                        code,
+                        &message,
+                        physical_source.as_ref(),
+                        member,
+                    );
+                    return Ok(rejected(envelope, projection.revision, code, &message));
+                }
                 // F2b: an authorization-time completion rejection never became a
                 // durable reopen, so record it durably to keep the completion
                 // loop bounded by the reopen count.

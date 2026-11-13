@@ -979,6 +979,9 @@ fn validate_task_review(
         // carries the prose - the old "no compiled record and no checks => skip
         // the anchor" path let a reviewer reject against standards nobody
         // declared, which is the hole the two live runs fell into.
+        // 033 S8: the review duty lives in its own projection slot, so the
+        // anchor reads only the acceptance obligations - a duty the Runtime
+        // owes is never a criterion a reviewer may reject against.
         let mut criteria: Vec<&str> = if task.obligations.is_empty() {
             task.acceptance_checks.iter().map(String::as_str).collect()
         } else {
@@ -1199,6 +1202,11 @@ mod reclaim_discipline_tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),

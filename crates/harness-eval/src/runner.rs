@@ -934,13 +934,36 @@ fn execution_token_usage(
 fn live_gateway_scenario_summary(details: &Value) -> Value {
     let mut summary = details.clone();
     if let Some(scenarios) = summary.get_mut("scenarios").and_then(Value::as_array_mut) {
-        for scenario in scenarios {
+        for (index, scenario) in scenarios.iter_mut().enumerate() {
+            // The recompute layer follows a reference; it never re-types a
+            // failure. The path says where the block lives in the artifact and
+            // the digest says what it hashes to, so a truncated copy can be
+            // caught instead of read as a fact.
+            let failure_reference = scenario
+                .get("failure_diagnostics")
+                .filter(|block| !block.is_null())
+                .map(|block| {
+                    let scenario_id = scenario
+                        .get("scenario_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unnamed");
+                    crate::machine_reference::reference_block(
+                        &format!(
+                            "live-scenarios/{}#/failure_diagnostics",
+                            crate::report_store::live_scenario_artifact_name(index, scenario_id)
+                        ),
+                        block,
+                    )
+                });
             if let Some(object) = scenario.as_object_mut() {
                 object.remove("trace");
                 object.insert(
                     "trace_artifact".to_string(),
                     Value::String("live-scenarios/<scenario>.json".to_string()),
                 );
+                if let Some(reference) = failure_reference {
+                    object.insert("failure_reference".to_string(), reference);
+                }
             }
         }
     }

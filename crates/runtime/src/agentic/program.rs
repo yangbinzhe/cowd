@@ -517,6 +517,37 @@ pub struct AgenticTaskProjection {
     pub failed_attempts: u8,
     pub review_generation: u64,
     pub failed_review_attempts: u8,
+    /// 033 S7 (causal accounting): physical stalls that are not the model's
+    /// doing - a delegated child's receipt that never settles, a read with no
+    /// original physical extent, a composite read whose child acquisitions
+    /// never completed. These are charged to the structural account, not to
+    /// the model's attempt budget, and they are counted here so the stall
+    /// itself stays bounded.
+    #[serde(default)]
+    pub structural_execution_stalls: u8,
+    /// 033 S7: the same structural account for the review path - the one the
+    /// B-family exhaustions run through.
+    #[serde(default)]
+    pub structural_review_stalls: u8,
+    /// 033 S8 (R102 rework): the review obligation a submitted Task owes.
+    ///
+    /// It lives in its own projection slot, not in `obligations`: the work
+    /// manifests carry the acceptance record, and a workflow duty is not
+    /// semantic work for the worker. Putting it in `obligations` changed the
+    /// manifest digest and broke the 032 invariant ("worker bookkeeping stays
+    /// out of both work manifests"); the terminal obligation list still
+    /// carries it, so the duty still leaves with the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_obligation: Option<AgenticTaskObligation>,
+    /// 033 S8: every applied review verdict on this Task (the old measure,
+    /// which counts verdicts and cannot tell an acceptance from a rework).
+    #[serde(default)]
+    pub reviews_applied: u8,
+    /// 033 S8: the applied verdicts that were an acceptance. The new measure
+    /// sits beside the old one instead of replacing it: the old count stays
+    /// what it always was, and the two are read together.
+    #[serde(default)]
+    pub reviews_accepted: u8,
     pub last_failure: Option<String>,
     #[serde(default)]
     pub replacement_task_refs: Vec<String>,

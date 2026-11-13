@@ -3812,6 +3812,11 @@ fn reopened_program_receipts_never_advertise_the_exit_action() {
         failed_attempts: 0,
         review_generation: 1,
         failed_review_attempts: 0,
+        structural_execution_stalls: 0,
+        structural_review_stalls: 0,
+        reviews_applied: 0,
+        review_obligation: None,
+        reviews_accepted: 0,
         last_failure: None,
         replacement_task_refs: Vec::new(),
         supersede_evidence_refs: Vec::new(),
@@ -4050,6 +4055,11 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
         failed_attempts: 0,
         review_generation: 1,
         failed_review_attempts: 0,
+        structural_execution_stalls: 0,
+        structural_review_stalls: 0,
+        reviews_applied: 0,
+        review_obligation: None,
+        reviews_accepted: 0,
         last_failure: None,
         replacement_task_refs: Vec::new(),
         supersede_evidence_refs: Vec::new(),
@@ -5130,4 +5140,101 @@ fn l1_existing_agent_ref_gate_rejects_definition_ref_with_durable_candidates() {
     // projection, so a later publish can never block on it as an effect.
     let projection = service.project_snapshot(&program).unwrap();
     assert!(!projection.agents.keys().any(|key| key.starts_with("builtin/")));
+}
+
+/// 033 F2 kernel control: which gate does a review-role action die at?
+///
+/// The B-family common death is claimed to be the durable path's
+/// physical-execution binding gate ("new root action requires original
+/// physical execution", action_service.rs:3596 / agentic/ingress.rs:723).
+/// This walks the three actor shapes one review action can have and names
+/// the gate each shape dies at.
+///
+/// (a) Root without the original physical execution dies exactly at the
+///     physical-execution gate.
+/// (b) Agent without it dies at a *different* gate (the agent-identity
+///     gate, action_service.rs:3600). The physical-execution gate never
+///     fires for a delegated actor.
+/// (c) Agent *with* its own physical binding - the shape a review turn
+///     really has, because the delegated invocation is issued with
+///     `original_execution: Some(..)` (agentic/action_invocation.rs:687)
+///     - passes both gates and reaches the physical graph binding stage.
+///
+/// So the physical-execution gate cannot be the common death cause of a
+/// review path whose final batch is bound to its own child execution.
+#[test]
+fn f2_the_physical_binding_gate_fires_only_for_root_without_physical() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(store);
+    let review = AgentAction::TaskReview(TaskReviewInput {
+        task_ref: "task".into(),
+        decision: TaskReviewDecision::Rework,
+        reason: "the answer does not cite the declared criterion".into(),
+        operator_requirement: None,
+        evidence_refs: Vec::new(),
+        gaps: Vec::new(),
+        directed_actions: Vec::new(),
+    });
+
+    // (a) The Root shape without the physical binding, performing the
+    // physical effect the gate fences. 033 S3 narrowed that gate to the
+    // actions that cause a physical effect (a Root action that only writes
+    // program state names the Program instead), so this arm uses the
+    // physical effect to reach the same gate.
+    let root_effect = root(
+        "f2-root-effect",
+        AgentAction::ArtifactCommit(ArtifactCommitInput {
+            content_ref: "artifact://art-f2".into(),
+            kind: "report".into(),
+            title: "report".into(),
+            relates_to: Vec::new(),
+        }),
+    );
+    let error = service.apply(&root_effect).unwrap_err().to_string();
+    assert!(
+        error.contains("new root action requires original physical execution"),
+        "the Root shape without the physical binding dies at the gate: {error}"
+    );
+
+    // (b) The delegated shape without the physical binding dies at the
+    // agent-identity gate, never at the physical-execution gate.
+    let child_review = managed(
+        "f2-child-review",
+        "team-f2",
+        "agent:worker",
+        review.clone(),
+    );
+    let error = service.apply(&child_review).unwrap_err().to_string();
+    assert!(
+        !error.contains("new root action requires original physical execution"),
+        "the delegated shape never dies at the physical-execution gate: {error}"
+    );
+    assert!(
+        error.contains("agent actor original execution required for new action"),
+        "the delegated shape without the physical binding dies at the agent-identity gate: {error}"
+    );
+
+    // (c) The delegated shape *with* its own physical binding: the review
+    // path's real shape. It clears the physical-execution gate and the
+    // agent-identity gate and reaches the physical graph binding stage.
+    let mut bound_review = child_review.clone();
+    bound_review.actor.original_execution =
+        Some(harness_contract::agent_action::OriginalAgentExecution {
+            graph_id: "graph-f2".into(),
+            node_id: "node-f2".into(),
+            attempt: 1,
+        });
+    let error = service.apply(&bound_review).unwrap_err().to_string();
+    assert!(
+        !error.contains("new root action requires original physical execution"),
+        "the child-bound review shape clears the physical-execution gate: {error}"
+    );
+    assert!(
+        !error.contains("agent actor original execution required for new action"),
+        "the child-bound review shape clears the agent-identity gate: {error}"
+    );
+    assert!(
+        error.contains("agent actor graph store unavailable"),
+        "the child-bound review shape reaches the physical graph binding stage: {error}"
+    );
 }

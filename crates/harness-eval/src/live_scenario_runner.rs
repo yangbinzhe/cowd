@@ -3506,8 +3506,20 @@ impl LiveScenarioRunner {
                         "health_observations": health_observations,
                         "scenario_count": 0,
                         "passed": 0,
-                        "failed": 1,
-                        "configuration_error": error,
+                        // No scenario ran: the failure happened while the list
+                        // was being built. The old `failed: 1` made a run that
+                        // never started look like a run that started and
+                        // failed, and the reason lived in a field nobody read.
+                        "failed": 0,
+                        "failure_diagnostics": component_failure_diagnostics(
+                            "scenario_spec_build_failed",
+                            &error,
+                            "not_started",
+                            false,
+                            0,
+                            0,
+                            Vec::new(),
+                        ),
                     });
                 }
             }
@@ -3625,9 +3637,68 @@ impl LiveScenarioRunner {
             LiveClaimScope::ReleaseCertification => "certification_failed",
         };
         let metrics = aggregate_scenario_metrics(&scenarios);
-        json!({
+        let failed_count = scenarios.len().saturating_sub(passed + usize::from(pending_outer));
+        // One status, one source: the report and the failure block below must
+        // never disagree about whether this component failed.
+        let component_status = if pending_outer {
+            "pending_outer_cleanup"
+        } else if health_passed
+            && selection_passed
+            && passed == scenarios.len()
+            && comparison_passed
+            && (claim_scope == LiveClaimScope::Focused || release_certified)
+        {
+            "passed"
+        } else {
+            "failed"
+        };
+        // Every failure the component reports is a *reference* to the block
+        // that holds it, never a copy of its text: a copy can be truncated,
+        // and a truncated copy reads like a fact. The scenario's own artifact
+        // keeps the payload exactly once.
+        let scenario_failures = scenarios
+            .iter()
+            .enumerate()
+            .filter(|(_, scenario)| scenario.get("status").and_then(Value::as_str) != Some("passed"))
+            .map(|(index, scenario)| {
+                let scenario_id = scenario
+                    .get("scenario_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unnamed");
+                let block = scenario
+                    .pointer("/failure_diagnostics")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({
+                    "scenario_id": scenario_id,
+                    "status": scenario.get("status").cloned().unwrap_or(Value::Null),
+                    "reference": crate::machine_reference::reference_block(
+                        &format!(
+                            "live-scenarios/{}#/failure_diagnostics",
+                            crate::report_store::live_scenario_artifact_name(index, scenario_id)
+                        ),
+                        &block,
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        let component_failure = (component_status == "failed").then(|| {
+            component_failure_diagnostics(
+                "scenario_run_failed",
+                &format!(
+                    "{failed_count} of {} live scenarios did not pass",
+                    scenarios.len()
+                ),
+                "completed",
+                true,
+                scenarios.len(),
+                failed_count,
+                scenario_failures,
+            )
+        });
+        let mut component = json!({
             "kind": "harness_eval.live_gateway_scenarios",
-            "status": if pending_outer { "pending_outer_cleanup" } else if health_passed && selection_passed && passed == scenarios.len() && comparison_passed && (claim_scope == LiveClaimScope::Focused || release_certified) { "passed" } else { "failed" },
+            "status": component_status,
             "claim_scope": claim_scope.as_str(),
             "claim_status": claim_status,
             "release_certified": release_certified,
@@ -3648,12 +3719,18 @@ impl LiveScenarioRunner {
             "selection_errors": selection_errors,
             "selection_status": if selection_passed { "passed" } else { "failed" },
             "passed": passed,
-            "failed": scenarios.len().saturating_sub(passed + usize::from(pending_outer)),
+            "failed": failed_count,
             "unknown_scenarios": unknown_count,
             "metrics": metrics,
             "scenarios": scenarios,
             "collaboration_comparison": collaboration_comparison,
-        })
+        });
+        if let Some(failure) = component_failure {
+            if let Some(object) = component.as_object_mut() {
+                object.insert("failure_diagnostics".to_string(), failure);
+            }
+        }
+        component
     }
 
     fn run_scenario(
@@ -4459,6 +4536,28 @@ impl LiveScenarioRunner {
             if let Some(object) = diagnostics.as_object_mut() {
                 object.insert("observation_integrity".to_string(), observation_integrity);
             }
+            // The wait says which class of stop it was; it does not say why
+            // the root failed, because the reason lives in the root's own
+            // durable terminal event and the wait never read it. A reader
+            // could therefore see that the root ended badly and never learn
+            // the cause - the complaint this answers. The cause is read here,
+            // from the timeline the report already carries, and carried out as
+            // a typed block with a reference to where it lives.
+            let failure = typed_wait_failure(
+                &terminal_error,
+                diagnostics.pointer("/timeline").unwrap_or(&Value::Null),
+                execution_id_ref,
+                spec.id,
+            );
+            if let Some(object) = diagnostics.as_object_mut() {
+                object.insert(
+                    "failure".to_string(),
+                    crate::machine_reference::with_reference(
+                        "#/failure_diagnostics/failure",
+                        failure,
+                    ),
+                );
+            }
             trace.extend(observation_trace);
             let cleanup = self.cancel_execution_lineage(execution_id_ref, actor, &mut trace);
             if let Some(object) = diagnostics.as_object_mut() {
@@ -5129,6 +5228,11 @@ impl LiveScenarioRunner {
         let mut submitted = 0;
         let mut reviewed = 0;
         let mut completion_requested = false;
+        // 033 S8 (BLOCK-2): the new review measure counts the applied
+        // verdicts that were an acceptance. The old measure (every applied
+        // verdict) keeps its meaning and its name - the two are read
+        // together, and neither replaces the other.
+        let mut reviewed_accepted = 0usize;
         for event in timeline
             .get("events")
             .and_then(Value::as_array)
@@ -5163,7 +5267,15 @@ impl LiveScenarioRunner {
                 Some("team_create") => teams += 1,
                 Some("task_publish") => published += 1,
                 Some("task_submit") => submitted += 1,
-                Some("task_review") => reviewed += 1,
+                Some("task_review") => {
+                    reviewed += 1;
+                    let decision = payload
+                        .pointer("/envelope/action/decision")
+                        .and_then(Value::as_str);
+                    if decision == Some("Accept") {
+                        reviewed_accepted += 1;
+                    }
+                }
                 Some("objective_complete_request") => completion_requested = true,
                 _ => {}
             }
@@ -5189,6 +5301,7 @@ impl LiveScenarioRunner {
             "tasks_published": published,
             "tasks_submitted": submitted,
             "tasks_reviewed": reviewed,
+            "tasks_reviewed_accepted": reviewed_accepted,
             "objective_complete_requested": completion_requested,
             "remaining": remaining,
         })
@@ -8971,6 +9084,68 @@ fn root_terminal_awaiting_review_reconstruction(
         .unwrap_or("unknown")
         .to_string();
     (class != "succeeded").then(|| (class, event.get("commit_cursor").and_then(Value::as_u64)))
+}
+
+/// The typed reason a wait stopped, with the root's durable outcome carried
+/// out verbatim.
+///
+/// The wait's prose names the class of the stop - a root that ended badly, a
+/// review that never came, an observation window that ran out. It does not
+/// carry the root's own reason, because the reason lives in the root's
+/// durable terminal event. A reader of the report could see that the root
+/// failed and never learn why, and a reader who wanted the why had to go and
+/// find it themselves, which is exactly the re-typing this ends.
+fn typed_wait_failure(
+    error: &str,
+    timeline: &Value,
+    execution_id: &str,
+    scenario_id: &str,
+) -> Value {
+    let code = if error.starts_with("root_terminal_awaiting_review_reconstruction") {
+        "root_terminal_awaiting_review_reconstruction"
+    } else if error.starts_with("observation limit reached") {
+        "observation_limit_reached"
+    } else {
+        "terminal_wait_failed"
+    };
+    crate::machine_reference::typed_failure(
+        code,
+        error,
+        json!({
+            "scenario_id": scenario_id,
+            "root_durable_outcome": root_business_observation(timeline, execution_id),
+        }),
+    )
+}
+
+/// The one shape a component failure takes on the way out.
+///
+/// Two failures used to leave this component by two doors: a scenario list
+/// that could not be built, and a run whose scenarios did not pass. The first
+/// carried its reason in a field nobody read and counted one failed scenario
+/// that never ran; the second carried no reason at all, so a reader of the
+/// report had nothing to read. One constructor now, so a reader can tell
+/// which door a failure came through and whether anything ran at all.
+fn component_failure_diagnostics(
+    code: &str,
+    reason: &str,
+    phase: &str,
+    started: bool,
+    scenarios_started: usize,
+    scenarios_failed: usize,
+    failures: Vec<Value>,
+) -> Value {
+    crate::machine_reference::typed_failure(
+        code,
+        reason,
+        json!({
+            "phase": phase,
+            "started": started,
+            "scenarios_started": scenarios_started,
+            "scenarios_failed": scenarios_failed,
+            "failures": failures,
+        }),
+    )
 }
 
 pub(crate) fn root_business_observation(timeline: &Value, root_execution_id: &str) -> Value {

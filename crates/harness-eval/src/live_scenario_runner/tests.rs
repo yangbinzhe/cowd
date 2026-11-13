@@ -2159,6 +2159,11 @@ fn agentic_progress_counts_unique_structured_action_events() {
             "tasks_published": 3,
             "tasks_submitted": 3,
             "tasks_reviewed": 3,
+            // 033 S8 (B1): the new review measure reads the applied verdicts
+            // that were an acceptance. This fixture's review events carry no
+            // decision, so the same method counts zero of them - the old
+            // measure (every applied verdict) keeps its own value.
+            "tasks_reviewed_accepted": 0,
             "objective_complete_requested": true,
             "remaining": []
         })
@@ -5703,4 +5708,99 @@ fn numeric_acceptance_does_not_regate_terminal_observation() {
     checks[6]["missing"] = json!(["goal_verified"]);
     checks.push(json!({"name":"agentic_program_verified", "passed":false}));
     assert!(!numeric_acceptance_checks_pass(&checks), "an explicit Program gate remains required");
+}
+
+// S2 (G4): a failure leaves the harness with its cause attached, and the cause
+// is the root's own durable outcome - not a sentence somebody re-typed.
+#[test]
+fn a_wait_failure_carries_the_root_durable_outcome_verbatim() {
+    let timeline = json!({
+        "events": [{
+            "kind": "runtime.outcome.recorded.v1",
+            "status": "failed",
+            "payload": {
+                "identity": {
+                    "execution_scope": "session",
+                    "execution_graph_ref": "root-1",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "terminal_generation": 7,
+                },
+                "terminal": {"class": "failed"},
+                "verified": {
+                    "verdict": "unsatisfied",
+                    "reason": "the delegated child receipt never settled",
+                },
+            },
+        }],
+    });
+    let failure = typed_wait_failure(
+        "root_terminal_awaiting_review_reconstruction: class=failed",
+        &timeline,
+        "root-1",
+        "live_one_team",
+    );
+    assert_eq!(
+        failure["code"],
+        "root_terminal_awaiting_review_reconstruction"
+    );
+    let outcome = &failure["payload"]["root_durable_outcome"];
+    assert_eq!(outcome["terminal_class"], "failed");
+    assert_eq!(outcome["verified_reason"], "the delegated child receipt never settled");
+    assert_eq!(outcome["verified_verdict"], "unsatisfied");
+    assert_eq!(outcome["execution_id"], "root-1");
+    assert_eq!(outcome["turn_id"], "turn-1");
+}
+
+// S2 (F3-a): "the run never started" and "the run started and failed" are
+// different facts, and one constructor has to say which one happened.
+#[test]
+fn a_component_failure_states_whether_the_run_started() {
+    let not_started = component_failure_diagnostics(
+        "scenario_spec_build_failed",
+        "the scenario list could not be built",
+        "not_started",
+        false,
+        0,
+        0,
+        Vec::new(),
+    );
+    assert_eq!(not_started["code"], "scenario_spec_build_failed");
+    assert_eq!(not_started["payload"]["phase"], "not_started");
+    assert_eq!(not_started["payload"]["started"], false);
+    assert_eq!(not_started["payload"]["scenarios_started"], 0);
+    assert_eq!(not_started["payload"]["scenarios_failed"], 0);
+    assert!(not_started["payload"]["failures"]
+        .as_array()
+        .expect("failures")
+        .is_empty());
+
+    let ran = component_failure_diagnostics(
+        "scenario_run_failed",
+        "2 of 3 live scenarios did not pass",
+        "completed",
+        true,
+        3,
+        2,
+        vec![json!({"scenario_id": "live_one_team"})],
+    );
+    assert_eq!(ran["code"], "scenario_run_failed");
+    assert_eq!(ran["payload"]["started"], true);
+    assert_eq!(ran["payload"]["scenarios_started"], 3);
+    assert_eq!(ran["payload"]["scenarios_failed"], 2);
+    assert_eq!(ran["payload"]["failures"][0]["scenario_id"], "live_one_team");
+}
+
+// S2 (G4): a reference has to name the file the writer actually wrote, or it
+// names nothing at all.
+#[test]
+fn a_scenario_reference_names_the_file_the_writer_writes() {
+    assert_eq!(
+        crate::report_store::live_scenario_artifact_name(0, "live_one_team"),
+        "001-live_one_team.json"
+    );
+    assert_eq!(
+        crate::report_store::live_scenario_artifact_name(11, "live_explicit_team/requirement"),
+        "012-live_explicit_team_requirement.json"
+    );
 }

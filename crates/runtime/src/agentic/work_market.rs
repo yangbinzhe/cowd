@@ -82,14 +82,184 @@ pub(crate) fn compile_task_obligations(
     obligations
 }
 
+/// 033 S8: the key of the review obligation a submitted Task owes.
+pub(crate) const REVIEW_PENDING_OBLIGATION_KEY: &str = "review_pending";
+
+/// 033 S8: the single source of the review obligation.
+///
+/// A submitted Task owes a review: the acceptance record compiled at publish
+/// is not judged until a reviewer says so. The obligation is compiled here,
+/// beside the acceptance obligations, so the Task's obligation record has one
+/// source - and it is not an operator criterion (`authoritative = false`): it
+/// is a duty the Runtime owes the Program, not a standard a reviewer may
+/// paraphrase.
+pub(crate) fn compile_review_pending_obligation(
+    criterion_source: harness_contract::agent_action::CriterionSource,
+) -> AgenticTaskObligation {
+    AgenticTaskObligation {
+        key: REVIEW_PENDING_OBLIGATION_KEY.to_string(),
+        text: "the submitted work must be reviewed against the compiled acceptance record"
+            .to_string(),
+        authoritative: false,
+        criterion_source,
+    }
+}
+
+/// 033 S8: the terminal obligation list of a Task, with each obligation's
+/// status, and the family that blocked it.
+///
+/// The status is derived, never stored twice: a Task whose review was
+/// accepted has satisfied its obligations; a Task that is blocked on a
+/// structural fault (a delegated child's receipt that never settled, a read
+/// with no original physical extent) has a *failed* obligation and the
+/// family's name travels with it - the review could not be judged because
+/// the evidence never settled, which is not the model's failure. A Task that
+/// is merely waiting keeps the obligation pending.
+pub(crate) fn terminal_obligation_list(task: &AgenticTaskProjection) -> Vec<serde_json::Value> {
+    let structural_family = task
+        .terminal_note
+        .as_deref()
+        .and_then(|note| note.split("failure_family=").nth(1))
+        .and_then(|rest| rest.split(';').next())
+        .map(str::trim)
+        .filter(|family| {
+            !family.is_empty() && *family != "unclassified" && *family != "model_refusal"
+        });
+    let accepted = task.status == AgenticTaskStatus::Accepted && task.reviews_accepted > 0;
+    // 033 S8 (R102 BLOCK-3): the structural failure is marked on the review
+    // duty alone. The acceptance obligations keep their own derivation - a
+    // structural stall says the review could not be judged, not that the
+    // operator's criteria went unsatisfied.
+    let mut entries = task
+        .obligations
+        .iter()
+        .map(|obligation| {
+            let status = if accepted { "satisfied" } else { "pending" };
+            serde_json::json!({
+                "key": obligation.key,
+                "text": obligation.text,
+                "authoritative": obligation.authoritative,
+                "criterion_source": obligation.criterion_source,
+                "status": status,
+                "failure_family": serde_json::Value::Null,
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(obligation) = &task.review_obligation {
+        let status = if accepted {
+            "satisfied"
+        } else if task.status == AgenticTaskStatus::Blocked
+            && structural_family.is_some()
+        {
+            "failed_structural"
+        } else {
+            "pending"
+        };
+        entries.push(serde_json::json!({
+            "key": obligation.key,
+            "text": obligation.text,
+            "authoritative": obligation.authoritative,
+            "criterion_source": obligation.criterion_source,
+            "status": status,
+            "failure_family": structural_family,
+        }));
+    }
+    entries
+}
+
+/// 033 S7: the family a failed attempt belongs to.
+///
+/// The families are the ones the live B-family runs actually produced, so the
+/// account a failure is charged to is a fact about the failure and not a
+/// guess: a delegated child's receipt that never settles, a read that has no
+/// original physical extent, and a composite read whose child acquisitions
+/// never completed are all structural - the model cannot fix them by trying
+/// again. A refusal the model could have avoided (a mis-cited receipt) is
+/// the model's own failure and stays charged to the model. An unclassified
+/// failure is charged to the model, the conservative side of the ledger.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AttemptFailureFamily {
+    /// The delegated child's receipt never settled ("original child receipt
+    /// remains unsettled", "original tool effect remains unknown").
+    ReceiptUnsettled,
+    /// The read has no original physical extent ("proof_actual_input_extent
+    /// _unsupported").
+    PhysicalExtentUnsupported,
+    /// The composite read's child acquisitions never completed.
+    CompositeAcquisitionsIncomplete,
+    /// A refusal the model could have avoided (a mis-cited receipt).
+    ModelRefusal,
+    /// Nothing in the failure names a known family.
+    Unclassified,
+}
+
+impl AttemptFailureFamily {
+    /// The name that goes into the exhaustion note.
+    pub(crate) const fn note_name(self) -> &'static str {
+        match self {
+            Self::ReceiptUnsettled => "receipt_unsettled",
+            Self::PhysicalExtentUnsupported => "physical_extent_unsupported",
+            Self::CompositeAcquisitionsIncomplete => "composite_acquisitions_incomplete",
+            Self::ModelRefusal => "model_refusal",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// A structural fault is not the model's output problem: it must not be
+    /// charged to the model's attempt budget.
+    pub(crate) const fn is_structural(self) -> bool {
+        matches!(
+            self,
+            Self::ReceiptUnsettled
+                | Self::PhysicalExtentUnsupported
+                | Self::CompositeAcquisitionsIncomplete
+        )
+    }
+}
+
+/// 033 S7: classify a failed attempt by the family its reason names.
+pub(crate) fn attempt_failure_family(reason: &str) -> AttemptFailureFamily {
+    if reason.contains("original composite child acquisitions incomplete") {
+        AttemptFailureFamily::CompositeAcquisitionsIncomplete
+    } else if reason.contains("proof_actual_input_extent_unsupported") {
+        AttemptFailureFamily::PhysicalExtentUnsupported
+    } else if reason.contains("original child receipt remains unsettled")
+        || reason.contains("original tool effect remains unknown")
+    {
+        AttemptFailureFamily::ReceiptUnsettled
+    } else if reason.contains("has no canonical durable receipt")
+        || reason.contains("one edit away from the cited one")
+    {
+        AttemptFailureFamily::ModelRefusal
+    } else {
+        AttemptFailureFamily::Unclassified
+    }
+}
+
 /// 032 K3 (B10): the one spelling of a Task's blocked-on-exhaustion note.
 /// Failure family only - a Blocked Task never carries a satisfied bit. The
 /// bound interpolates from the same constant the decision used, so a budget
 /// change cannot leave a stale literal behind (the T1b single-token lesson).
-fn blocked_exhaustion_note(dimension: &str, bound: u8, last_failure: Option<&str>) -> String {
+///
+/// 033 S7 (causal accounting): the note also names the family and the two
+/// accounts, so the root can see on its own face that the exhaustion was a
+/// structural fault rather than three model failures. The key=value pairs
+/// are the machine-readable part; the prose around them stays readable.
+fn blocked_exhaustion_note(
+    dimension: &str,
+    bound: u8,
+    last_failure: Option<&str>,
+    family: AttemptFailureFamily,
+    model_attempts_charged: u8,
+    structural_stalls: u8,
+) -> String {
     format!(
-        "task_blocked: {dimension} exhausted at bounded {bound}; last failure: {}; remaining: not accepted",
-        last_failure.unwrap_or("none recorded")
+        "task_blocked: {dimension} exhausted at bounded {bound}; failure_family={family}; \
+account={account}; model_attempts_charged={model_attempts_charged}; \
+structural_stalls={structural_stalls}; last failure: {last}; remaining: not accepted",
+        family = family.note_name(),
+        account = if family.is_structural() { "structural" } else { "model" },
+        last = last_failure.unwrap_or("none recorded"),
     )
 }
 
@@ -174,6 +344,11 @@ pub(crate) fn apply_task_publish(
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -431,8 +606,22 @@ pub(crate) fn apply_task_attempt_fail(
                 {
                     task.claim_generation = task.claim_generation.saturating_add(1);
                 }
-                task.failed_attempts = task.failed_attempts.saturating_add(1);
-                let attempts_exhausted = task.failed_attempts >= MAX_TASK_EXECUTION_ATTEMPTS;
+                // 033 S7 (causal accounting): a structural fault is charged
+                // to the structural account, not to the model's attempt
+                // budget. The bound still covers both accounts, so a stall
+                // can never run forever, but the model is no longer charged
+                // for a fault it cannot fix.
+                let family = attempt_failure_family(input.reason.as_str());
+                if family.is_structural() {
+                    task.structural_execution_stalls =
+                        task.structural_execution_stalls.saturating_add(1);
+                } else {
+                    task.failed_attempts = task.failed_attempts.saturating_add(1);
+                }
+                let attempts_exhausted = task
+                    .failed_attempts
+                    .saturating_add(task.structural_execution_stalls)
+                    >= MAX_TASK_EXECUTION_ATTEMPTS;
                 task.claimant = None;
                 task.claim_execution_id = None;
                 task.claimed_at_ms = None;
@@ -442,6 +631,9 @@ pub(crate) fn apply_task_attempt_fail(
                         "execution attempts",
                         MAX_TASK_EXECUTION_ATTEMPTS,
                         task.last_failure.as_deref(),
+                        family,
+                        task.failed_attempts,
+                        task.structural_execution_stalls,
                     ));
                     AgenticTaskStatus::Blocked
                 } else if input.retryable && !repeats_same_failure {
@@ -451,6 +643,9 @@ pub(crate) fn apply_task_attempt_fail(
                         "repeated identical failure",
                         1,
                         task.last_failure.as_deref(),
+                        family,
+                        task.failed_attempts,
+                        task.structural_execution_stalls,
                     ));
                     AgenticTaskStatus::Blocked
                 } else {
@@ -462,14 +657,31 @@ pub(crate) fn apply_task_attempt_fail(
                 };
             }
             AgentAttemptMode::Review => {
-                task.failed_review_attempts = task.failed_review_attempts.saturating_add(1);
+                // 033 S7 (causal accounting): the review path is where the
+                // B-family ran out - three "model failures" that were all
+                // structural. A structural stall is charged to the structural
+                // account; the model's review budget only pays for the
+                // failures the model caused.
+                let family = attempt_failure_family(input.reason.as_str());
+                if family.is_structural() {
+                    task.structural_review_stalls =
+                        task.structural_review_stalls.saturating_add(1);
+                } else {
+                    task.failed_review_attempts = task.failed_review_attempts.saturating_add(1);
+                }
                 task.review_generation = task.review_generation.saturating_add(1);
-                let reviews_exhausted = task.failed_review_attempts >= MAX_TASK_REVIEW_ATTEMPTS;
+                let reviews_exhausted = task
+                    .failed_review_attempts
+                    .saturating_add(task.structural_review_stalls)
+                    >= MAX_TASK_REVIEW_ATTEMPTS;
                 task.status = if reviews_exhausted {
                     task.terminal_note = Some(blocked_exhaustion_note(
                         "review attempts",
                         MAX_TASK_REVIEW_ATTEMPTS,
                         task.last_failure.as_deref(),
+                        family,
+                        task.failed_review_attempts,
+                        task.structural_review_stalls,
                     ));
                     AgenticTaskStatus::Blocked
                 } else if input.retryable && !repeats_same_failure {
@@ -479,6 +691,9 @@ pub(crate) fn apply_task_attempt_fail(
                         "repeated identical review failure",
                         1,
                         task.last_failure.as_deref(),
+                        family,
+                        task.failed_review_attempts,
+                        task.structural_review_stalls,
                     ));
                     AgenticTaskStatus::Blocked
                 } else {
@@ -719,6 +934,16 @@ pub(crate) fn apply_task_submit(
     // block as durable content, so the canonical Task artifact is synthesized
     // here through the same projection shape as `artifact_commit`. The id is a
     // pure function of (program, actor, action, kind), so replay is stable.
+    // 033 S8 (R102 rework): a submitted Task owes a review. The duty lives
+    // in its own projection slot, not in the acceptance obligation list: the
+    // work manifests carry the acceptance record, and a workflow duty is not
+    // semantic work for the worker.
+    if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        if task.review_obligation.is_none() {
+            task.review_obligation =
+                Some(compile_review_pending_obligation(task.criterion_source));
+        }
+    }
     let mut artifact_refs = input.artifact_refs.clone();
     if artifact_refs.is_empty() {
         if let Some(content_ref) = input
@@ -829,6 +1054,13 @@ pub(crate) fn apply_task_review(
             task.active_attempts.remove(execution_id);
         }
         task.reviewed_by = Some(envelope.actor.actor_id.clone());
+        // 033 S8: the two review measures sit side by side - every applied
+        // verdict (the old measure) and the applied verdicts that were an
+        // acceptance (the new one). The old count keeps its meaning.
+        task.reviews_applied = task.reviews_applied.saturating_add(1);
+        if matches!(input.decision, TaskReviewDecision::Accept) {
+            task.reviews_accepted = task.reviews_accepted.saturating_add(1);
+        }
         task.review_reason = Some(input.reason.clone());
         task.evidence_refs
             .extend(input.evidence_refs.iter().cloned());
@@ -881,6 +1113,9 @@ pub(crate) fn apply_task_review(
                         "review rounds",
                         MAX_TASK_REVIEW_ROUNDS,
                         Some(input.reason.as_str()),
+                        attempt_failure_family(input.reason.as_str()),
+                        task.failed_review_attempts,
+                        task.structural_review_stalls,
                     ));
                     AgenticTaskStatus::Blocked
                 } else {
@@ -969,6 +1204,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -1032,6 +1272,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -1127,6 +1372,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -1193,6 +1443,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -1262,6 +1517,11 @@ mod tests {
             failed_attempts: 1,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: Some("disproved".to_string()),
             replacement_task_refs: vec!["part-a".to_string(), "part-b".to_string()],
             supersede_evidence_refs: vec!["tool://failure".to_string()],
@@ -1333,6 +1593,11 @@ mod tests {
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -1459,6 +1724,11 @@ mod post_state_tests {
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -1947,6 +2217,11 @@ mod dispatch_fence_tests {
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -2389,6 +2664,211 @@ mod criterion_source_tests {
         let note = task.terminal_note.as_deref().expect("rounds exhaustion named");
         assert!(note.contains("review rounds exhausted at bounded 3"), "{note}");
         assert!(!note.contains("satisfied"), "failure family only (B10): {note}");
+    }
+
+    /// 033 S7 (causal accounting): a structural stall is charged to the
+    /// structural account, not to the model's attempt budget, and the
+    /// exhaustion note names the family and both accounts so the root can
+    /// read on its own face that the exhaustion was not three model
+    /// failures.
+    ///
+    /// The old shape (033 pre-S7) was:
+    ///   task_blocked: review attempts exhausted at bounded 3; last failure:
+    ///   <prose>; remaining: not accepted
+    /// - no family, no account, and every structural stall charged to the
+    /// model.
+    #[test]
+    fn s7_structural_review_stalls_are_charged_to_the_structural_account() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        let structural = "agent action event store failed: proof_actual_input_extent_unsupported: actual read lacks an original physical extent; original child receipt remains unsettled";
+        let fail = |attempt: u8, reason: String| TaskAttemptFailInput {
+            task_ref: "task".to_string(),
+            execution_id: format!("exec-{attempt}"),
+            mode: AgentAttemptMode::Review,
+            reason,
+            retryable: true,
+        };
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        for attempt in 1..=3 {
+            super::apply_task_attempt_fail(
+                &mut program,
+                &fail(attempt, format!("{structural} (attempt {attempt})")),
+            );
+        }
+        let task = &program.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Blocked);
+        assert_eq!(
+            task.failed_review_attempts, 0,
+            "a structural stall is not the model's review budget"
+        );
+        assert_eq!(
+            task.structural_review_stalls, 3,
+            "the structural account carries the stall"
+        );
+        let note = task.terminal_note.as_deref().expect("the exhaustion is named");
+        assert!(note.contains("review attempts exhausted at bounded 3"), "{note}");
+        assert!(
+            note.contains("failure_family=physical_extent_unsupported"),
+            "the note names the family: {note}"
+        );
+        assert!(note.contains("account=structural"), "{note}");
+        assert!(note.contains("model_attempts_charged=0"), "{note}");
+        assert!(note.contains("structural_stalls=3"), "{note}");
+
+        // The model's own failures stay on the model's account.
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        for attempt in 1..=3 {
+            super::apply_task_attempt_fail(
+                &mut program,
+                &fail(attempt, format!("distinct model failure {attempt}")),
+            );
+        }
+        let task = &program.tasks["task"];
+        assert_eq!(task.failed_review_attempts, 3, "the model's failures stay on the model account");
+        assert_eq!(task.structural_review_stalls, 0);
+        let note = task.terminal_note.as_deref().expect("the exhaustion is named");
+        assert!(note.contains("account=model"), "{note}");
+        assert!(note.contains("failure_family=unclassified"), "{note}");
+        assert!(note.contains("model_attempts_charged=3"), "{note}");
+    }
+
+    /// 033 S8: a submitted Task owes a review, the obligation enters the
+    /// compiled record, the two review measures sit side by side, and the
+    /// terminal obligation list names the family that blocked the Task.
+    ///
+    /// The old shape (033 pre-S8): a submission left the Task's obligation
+    /// record at the publish-time acceptance criteria only, the review left
+    /// no count the root could read, and a Task blocked by a structural fault
+    /// read as "not verifiable" with no obligation and no family.
+    #[test]
+    fn s8_a_submission_owes_a_review_and_the_terminal_list_names_the_family() {
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(
+            &mut program,
+            &envelope(),
+            &publish_input("source evidence"),
+            Some("task"),
+        );
+        let before = program.tasks["task"].obligations.len();
+        let submit = AgentAction::TaskSubmit(
+            serde_json::from_value(serde_json::json!({
+                "task_ref": "task",
+                "artifact_refs": [],
+                "evidence_refs": [],
+                "unresolved": []
+            }))
+            .unwrap(),
+        );
+        let mut env = envelope();
+        env.action = submit.clone();
+        env.action_id = "submit-1".to_string();
+        super::apply_task_submit(&mut program, &env, match &submit {
+            AgentAction::TaskSubmit(input) => input,
+            _ => unreachable!("submit action"),
+        });
+        let task = &program.tasks["task"];
+        assert_eq!(
+            task.obligations.len(),
+            before,
+            "the review duty is not part of the acceptance record: it is a duty, not a criterion"
+        );
+        assert!(
+            task.review_obligation.is_some(),
+            "the submission owes a review: {:?}",
+            task.review_obligation
+        );
+        assert_eq!(
+            task.review_obligation.as_ref().map(|o| o.key.clone()),
+            Some(super::REVIEW_PENDING_OBLIGATION_KEY.to_string()),
+            "the review duty is named"
+        );
+        // A second submission does not duplicate the duty.
+        let mut env = envelope();
+        env.action = submit.clone();
+        env.action_id = "submit-2".to_string();
+        super::apply_task_submit(&mut program, &env, match &submit {
+            AgentAction::TaskSubmit(input) => input,
+            _ => unreachable!("submit action"),
+        });
+        assert!(
+            program.tasks["task"]
+                .review_obligation
+                .as_ref()
+                .map(|o| o.key.clone())
+                == Some(super::REVIEW_PENDING_OBLIGATION_KEY.to_string()),
+            "the review duty is compiled once"
+        );
+
+        // The terminal list: pending while the review is open.
+        let list = super::terminal_obligation_list(&program.tasks["task"]);
+        assert!(!list.is_empty(), "the terminal obligation list is not empty");
+        let review = list
+            .iter()
+            .find(|entry| entry["key"] == super::REVIEW_PENDING_OBLIGATION_KEY)
+            .expect("the review duty is in the terminal list");
+        assert_eq!(review["status"], "pending", "{review}");
+
+        // A structural block names its family instead of reading as the
+        // model's failure.
+        let mut blocked = program.tasks["task"].clone();
+        blocked.status = AgenticTaskStatus::Blocked;
+        blocked.terminal_note = Some(
+            "task_blocked: review attempts exhausted at bounded 3; failure_family=receipt_unsettled; account=structural; model_attempts_charged=0; structural_stalls=3; last failure: none recorded; remaining: not accepted".into(),
+        );
+        let list = super::terminal_obligation_list(&blocked);
+        let review = list
+            .iter()
+            .find(|entry| entry["key"] == super::REVIEW_PENDING_OBLIGATION_KEY)
+            .expect("the review obligation is in the terminal list");
+        assert_eq!(review["status"], "failed_structural", "{review}");
+        assert_eq!(review["failure_family"], "receipt_unsettled", "{review}");
+        // 033 S8 (BLOCK-3): the structural failure is marked on the review
+        // duty alone. The acceptance obligations keep their own derivation -
+        // a stall that stopped the review from being judged says nothing about
+        // whether the operator's criteria were met.
+        for entry in list
+            .iter()
+            .filter(|entry| entry["key"] != super::REVIEW_PENDING_OBLIGATION_KEY)
+        {
+            assert_eq!(
+                entry["status"], "pending",
+                "an acceptance obligation keeps its own derivation: {entry}"
+            );
+            assert!(
+                entry["failure_family"].is_null(),
+                "the structural family is not projected onto an acceptance obligation: {entry}"
+            );
+        }
+    }
+
+    /// 033 S8: the two review measures sit side by side - every applied
+    /// verdict (the old measure) and the applied verdicts that were an
+    /// acceptance (the new one).
+    #[test]
+    fn s8_b_the_two_review_measures_are_reported_side_by_side() {
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(
+            &mut program,
+            &envelope(),
+            &publish_input("source evidence"),
+            Some("task"),
+        );
+        program.tasks.get_mut("task").unwrap().status = AgenticTaskStatus::Submitted;
+        let mut env = envelope();
+        env.action = AgentAction::TaskReview(k3_review("source evidence incomplete", &[], &[]));
+        env.action_id = "review-rework".to_string();
+        super::apply_task_review(&mut program, &env, match &env.action {
+            AgentAction::TaskReview(input) => input,
+            _ => unreachable!("review action"),
+        });
+        let task = &program.tasks["task"];
+        assert_eq!(task.reviews_applied, 1, "every applied verdict is counted");
+        assert_eq!(
+            task.reviews_accepted, 0,
+            "a rework is not an acceptance, and the old measure still counts it"
+        );
     }
 
     #[test]

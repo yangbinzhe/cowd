@@ -594,7 +594,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::TaskReviewInput>(
             action::TASK_REVIEW_TOOL_ID,
-            "Independently accept, challenge or request rework for one submitted Task using a concise reason and evidence references. For challenge or rework, operator_requirement must quote the exact relevant wording from the original operator objective shown by state_inspect's Goal (or the frozen Program objective if no Goal is recorded). Explain the missing required deliverable in reason; added Task acceptance standards alone are not grounds for rework. Accept needs no operator_requirement.",
+            "Independently accept, challenge or request rework for one submitted Task using a concise reason and evidence references. `evidence_refs` names the durable observations you read (tool:// receipts, artifact:// selectors); the artifacts under review are already bound to the Task, so this tool has no `result_refs` - that name belongs to objective_review and objective_complete_request, where it names the results under review. For challenge or rework, operator_requirement must quote the exact relevant wording from the original operator objective shown by state_inspect's Goal (or the frozen Program objective if no Goal is recorded). Explain the missing required deliverable in reason; added Task acceptance standards alone are not grounds for rework. Accept needs no operator_requirement.",
         ),
         agent_action_definition::<action::MessagePublishInput>(
             action::MESSAGE_PUBLISH_TOOL_ID,
@@ -610,7 +610,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ObjectiveReviewInput>(
             action::OBJECTIVE_REVIEW_TOOL_ID,
-            "Record an evidence-backed review of one Goal criterion or obligation as satisfied, gapped, or blocked. An independent verdict needs at least one result_refs or evidence_refs entry. Copy the criterion reference from state_inspect into criterion_ref and add a reason; Runtime binds the verdict to the current Objective generation and prevents stale review from finalizing a newer plan.",
+            "Record an evidence-backed review of one Goal criterion or obligation as satisfied, gapped, or blocked. An independent verdict needs at least one result_refs or evidence_refs entry. The two names are different roles: `result_refs` names the result artifacts this review covers (the artifact references an accepted Task returned), `evidence_refs` names the durable observations you actually read to reach the verdict. Copy the criterion reference from state_inspect into criterion_ref and add a reason; Runtime binds the verdict to the current Objective generation and prevents stale review from finalizing a newer plan.",
         ),
         agent_action_definition::<action::MembershipUpdateInput>(
             action::MEMBERSHIP_UPDATE_TOOL_ID,
@@ -622,7 +622,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ObjectiveCompleteRequestInput>(
             action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
-            "Request Objective verification using result_refs, evidence references and explicit Objective-level blockers. result_refs may name Program-committed artifact references, valid governed tool:// receipts, artifact:// content selectors, or original graph approval references. Each result remains subject to current Goal independent review, manifest validation and CAS; a supported reference shape alone does not prove satisfaction. file:// paths are not supported result_refs. Accepted Task limitations remain visible disclosures and are not repeated as blockers. The Supervisor verifies terminal invariants without re-litigating independent Task accept verdicts. For Root-authored results, first register the real file or response body using artifact_commit. A distinct Runtime-bound reviewer must read and review the current result; use an existing Team, or explicitly choose a minimal reviewer-only Team with a read-capable Agent and a purpose=exploration Task naming the criterion and result refs. Do not ask that Agent to reproduce the deliverable or invent a report. No Team, Task, review or acceptance is created automatically by completion.",
+            "Request Objective verification using result_refs, evidence references and explicit Objective-level blockers. `result_refs` names the results you are delivering; `evidence_refs` names the observations behind them. result_refs may name Program-committed artifact references, valid governed tool:// receipts, artifact:// content selectors, or original graph approval references. Each result remains subject to current Goal independent review, manifest validation and CAS; a supported reference shape alone does not prove satisfaction. file:// paths are not supported result_refs. Accepted Task limitations remain visible disclosures and are not repeated as blockers. The Supervisor verifies terminal invariants without re-litigating independent Task accept verdicts. For Root-authored results, first register the real file or response body using artifact_commit. A distinct Runtime-bound reviewer must read and review the current result; use an existing Team, or explicitly choose a minimal reviewer-only Team with a read-capable Agent and a purpose=exploration Task naming the criterion and result refs. Do not ask that Agent to reproduce the deliverable or invent a report. No Team, Task, review or acceptance is created automatically by completion.",
         ),
     ]
 }
@@ -809,6 +809,27 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// The fields a schema requires, across the variants of a tagged schema.
+    fn required_field_names(schema: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let mut collect = |node: &serde_json::Value| {
+            if let Some(required) = node.get("required").and_then(serde_json::Value::as_array) {
+                for name in required.iter().filter_map(serde_json::Value::as_str) {
+                    names.insert(name.to_string());
+                }
+            }
+        };
+        collect(schema);
+        for keyword in ["oneOf", "anyOf"] {
+            if let Some(variants) = schema.get(keyword).and_then(serde_json::Value::as_array) {
+                for variant in variants {
+                    collect(variant);
+                }
+            }
+        }
+        names
+    }
+
     #[test]
     fn advertised_examples_satisfy_the_pinned_syntactic_contract() {
         let mut definitions = runtime_capability_tool_definitions();
@@ -879,6 +900,30 @@ mod tests {
             .filter_map(|definition| {
                 let example =
                     harness_contract::tool_input_contract::input_example(&definition.input_schema)?;
+                // A degraded example is not an instance: it names the fields
+                // instead of showing one. It is accepted only when it names
+                // every required field, so a field the budget cost is never
+                // lost silently.
+                if let Some(degraded) =
+                    harness_contract::tool_input_contract::degraded_example(&example)
+                {
+                    let named = degraded
+                        .fields
+                        .iter()
+                        .filter(|field| field.required)
+                        .map(|field| field.name.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let missing = required_field_names(&definition.input_schema)
+                        .into_iter()
+                        .filter(|name| !named.contains(name))
+                        .collect::<Vec<_>>();
+                    return (!missing.is_empty()).then(|| {
+                        format!(
+                            "{}: the degraded example does not name {missing:?}",
+                            definition.name
+                        )
+                    });
+                }
                 lease
                     .validate_input(&definition.name, &example)
                     .err()

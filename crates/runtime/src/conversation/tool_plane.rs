@@ -442,6 +442,25 @@ pub(crate) use crate::conversation::turn_engine::{OriginalSingleCheckedInputs, O
 
 /// Sealed original root ticket and admitted call. Fields are private to this
 /// owner module, so coordinate DTOs cannot construct this proof.
+/// 033 S3 (settled vs unsettled): report a delegated child's outcome by
+/// what it actually is.
+///
+/// A delegated child that finished and was refused for a named reason
+/// produced a *settled* outcome: nothing is in flight and nothing will
+/// arrive later. Reporting that as an unsettled receipt marked the effect
+/// unknown, and an unknown member blocks the whole tool batch - the graph
+/// produced no terminal turn result, the review attempt was charged to the
+/// model, and three attempts later the task was blocked for a structural
+/// fault nobody could read. Only an effect that is still unknown may be
+/// reported as unsettled.
+fn delegated_child_outcome_error(error: &ToolError) -> ToolError {
+    if error.is_unknown() {
+        error.clone().with_unresolved_context("original child receipt remains unsettled", None)
+    } else {
+        error.clone()
+    }
+}
+
 pub(crate) struct VerifiedRootActionOwner {
     // The exact turn owner must survive until the single-action commit owner consumes it.
     shared_policy_owner: Option<Arc<crate::conversation::SharedPolicyOwner>>,
@@ -3575,9 +3594,16 @@ where
             && request.parent_execution.is_some()
             && harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())
         {
-            let output = execution.as_ref().map_err(|error| error.clone().with_unresolved_context(
-                "original child receipt remains unsettled", None,
-            ))?;
+            // 033 S3 (settled vs unsettled): a delegated child that finished
+            // and was refused for a named reason produced a *settled*
+            // outcome - nothing is in flight and nothing will arrive later.
+            // Reporting it as an unsettled receipt marked the effect unknown,
+            // and an unknown member blocks the whole tool batch: the graph
+            // produced no terminal turn result, the review attempt was
+            // charged to the model, and three attempts later the task was
+            // blocked for a structural fault nobody could read. Only an
+            // effect that is still unknown may be reported as unsettled.
+            let output = execution.as_ref().map_err(delegated_child_outcome_error)?;
             // A Read-family action's child settles a read receipt, never an
             // effect receipt; consuming the right durable pair is what keeps
             // the member's Read action terminal instead of unknown.
@@ -7750,5 +7776,45 @@ mod checkpoint_scope_366_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod s3_settled_child_outcome_tests {
+    use super::ToolError;
+    use super::delegated_child_outcome_error;
+
+    /// 033 S3: a delegated child's named refusal is a settled outcome and
+    /// stays a named failure; only an effect that is still unknown is
+    /// reported as an unsettled receipt.
+    #[test]
+    fn s3_a_settled_child_refusal_is_not_reported_as_an_unsettled_receipt() {
+        let refused = delegated_child_outcome_error(&ToolError::new(
+            "agent action event store failed: proof_actual_input_extent_unsupported: actual read lacks an original physical extent",
+        ));
+        assert!(
+            !refused.is_unknown(),
+            "a settled refusal must not poison the batch as an unknown effect: {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("proof_actual_input_extent_unsupported"),
+            "the named reason stays readable: {refused:?}"
+        );
+        assert!(
+            !refused.to_string().contains("original child receipt remains unsettled"),
+            "a settled refusal is not an unsettled receipt: {refused:?}"
+        );
+
+        let unknown = delegated_child_outcome_error(&ToolError::unknown(
+            "original tool effect remains unknown",
+        ));
+        assert!(
+            unknown.is_unknown(),
+            "an unknown effect stays unknown: {unknown:?}"
+        );
+        assert!(
+            unknown.to_string().contains("original child receipt remains unsettled"),
+            "an unknown effect is still reported as an unsettled receipt: {unknown:?}"
+        );
     }
 }
