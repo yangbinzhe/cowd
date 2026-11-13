@@ -95,6 +95,72 @@ impl EvidenceRefusalCode {
     }
 }
 
+/// 034 GB-1: the codes of the fact-admission gate - the one place that
+/// decides whether a fact may enter the evidence record.
+///
+/// A code is a name for the judgement, and it never replaces the refusal it
+/// names: every code here keeps the fragmented gate's original wording as
+/// its `original_code`, so the history stays readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactAdmissionCode {
+    /// The fact was admitted, and a proof strategy says so.
+    Admitted,
+    /// No proof strategy could establish the fact's extent.
+    Unproven,
+    /// The receipt's own scope does not cover the body it claims.
+    ScopeIncomplete,
+    /// The two receipts of one read disagree about its acquisition seal.
+    PairDisagrees,
+}
+
+impl FactAdmissionCode {
+    /// The stable name of this judgement class.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Admitted => "fact_admitted",
+            Self::Unproven => "fact_unproven",
+            Self::ScopeIncomplete => "fact_scope_incomplete",
+            Self::PairDisagrees => "fact_pair_disagrees",
+        }
+    }
+}
+
+/// 034 GB-1: the proof strategies the admission gate asks, in the fixed
+/// order. The gate records which one admitted the fact, so a refusal can say
+/// what each strategy was missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactAdmissionStrategy {
+    /// The composite read's own child acquisitions cover it.
+    Nested,
+    /// A discovery page proves the absence it claims.
+    Discovery,
+    /// The receipt's own body and scope prove it.
+    Immutable,
+}
+
+impl FactAdmissionStrategy {
+    /// The stable name of this strategy.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Nested => "nested",
+            Self::Discovery => "discovery",
+            Self::Immutable => "immutable",
+        }
+    }
+
+    /// The order the gate asks them in.
+    #[must_use]
+    pub const fn order(self) -> usize {
+        match self {
+            Self::Nested => 0,
+            Self::Discovery => 1,
+            Self::Immutable => 2,
+        }
+    }
+}
+
 /// A refusal that carries its teaching with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusalEnvelope {

@@ -3096,10 +3096,15 @@ fn complete_actual_file_windows(
             return Ok(window.dependency);
         }
     }
-    Err(
-        "proof_actual_input_extent_unsupported: actual File input lacks complete original windows"
-            .into(),
+    Err(crate::agentic::fact_admission::refusal(
+        harness_contract::refusal_codes::FactAdmissionCode::ScopeIncomplete,
+        "proof_actual_input_extent_unsupported: actual File input lacks complete original windows",
+        &[crate::agentic::fact_admission::StrategyGap {
+            strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
+            missing: "the composite's File window does not cover the original body".to_string(),
+        }],
     )
+    .into())
 }
 
 fn require_actual_materials(
@@ -3502,6 +3507,16 @@ fn collect_actual_acquisition(
         }
     }
     if seal_value.is_null() {
+        // 034 GB-1 (batch 1): the three proof strategies are asked in the
+        // fixed order, and the gate records which one answered. When none
+        // did, the refusal carries what each of them was missing - one
+        // refusal, a complete diagnosis - and keeps the fragmented gate's
+        // original wording verbatim at its head.
+        // The nested strategy answers first and, when it does, the fact is
+        // in: the gate records that answer and the read is admitted. (Losing
+        // this early return would let a nested acquisition fall through to
+        // the immutable judgment and be refused by a gate it already
+        // answered.)
         if collect_actual_nested_acquisitions(store, primary, index, original_input, session_events,
             boundary, readers, actual, windows)? {
             actual.canonical_facts.push(serde_json::json!({
@@ -3512,13 +3527,31 @@ fn collect_actual_acquisition(
             }));
             return Ok(());
         }
+        // Primary and index remain in the audited material set above. A
+        // discovery page proves neither file contents nor current absence.
         if original_glob_discovery(primary, &descriptor, original_input)?.is_some() {
-            // Primary and index remain in the audited material set above. A
-            // discovery page proves neither file contents nor current absence.
             return Ok(());
         }
         if !immutable_receipt_without_workspace_extent(primary, &descriptor, original_input)? {
-            return Err("proof_actual_input_extent_unsupported: actual read lacks an original physical extent".into());
+            let admission = crate::agentic::fact_admission::admit(
+                &[
+                    crate::agentic::fact_admission::StrategyOutcome::missing(
+                        harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
+                        "the composite's child acquisitions do not cover this read",
+                    ),
+                    crate::agentic::fact_admission::StrategyOutcome::missing(
+                        harness_contract::refusal_codes::FactAdmissionStrategy::Discovery,
+                        "the read is not a discovery page",
+                    ),
+                    crate::agentic::fact_admission::StrategyOutcome::missing(
+                        harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
+                        "the read named a workspace path and its receipt carries no acquisition seal",
+                    ),
+                ],
+                harness_contract::refusal_codes::FactAdmissionCode::Unproven,
+                "proof_actual_input_extent_unsupported: actual read lacks an original physical extent",
+            );
+            return Err(admission.refusal_message().into());
         }
         let output = primary.payload["outcome"]["output"]
             .as_str()
@@ -3589,17 +3622,29 @@ fn collect_actual_acquisition(
             source_omitted,
             ..
         } => {
-            let scope = scope
-                .as_ref()
-                .ok_or("actual File input lacks original scope v2")?;
+            let scope = scope.as_ref().ok_or_else(|| {
+                crate::agentic::fact_admission::refusal(
+                    harness_contract::refusal_codes::FactAdmissionCode::ScopeIncomplete,
+                    "actual File input lacks original scope v2",
+                    &[crate::agentic::fact_admission::StrategyGap {
+                        strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
+                        missing: "the receipt carries no scope for the body it claims".to_string(),
+                    }],
+                )
+            })?;
             if !scope.complete
                 || *start_line == 0
                 || *source_omitted && *start_line == 1 && line_count == total_lines
             {
-                return Err(
-                    "proof_actual_input_extent_unsupported: original File body is incomplete"
-                        .into(),
-                );
+                return Err(crate::agentic::fact_admission::refusal(
+                    harness_contract::refusal_codes::FactAdmissionCode::ScopeIncomplete,
+                    "proof_actual_input_extent_unsupported: original File body is incomplete",
+                    &[crate::agentic::fact_admission::StrategyGap {
+                        strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
+                        missing: "the File body the seal covers is incomplete".to_string(),
+                    }],
+                )
+                .into());
             }
             let targets = scope
                 .targets
@@ -3612,7 +3657,15 @@ fn collect_actual_acquisition(
                 })
                 .collect::<Vec<_>>();
             if targets.len() != 1 {
-                return Err("proof_actual_input_extent_unsupported: actual File has no unique original canonical target".into());
+                            return Err(crate::agentic::fact_admission::refusal(
+                                harness_contract::refusal_codes::FactAdmissionCode::ScopeIncomplete,
+                                "proof_actual_input_extent_unsupported: actual File has no unique original canonical target",
+                                &[crate::agentic::fact_admission::StrategyGap {
+                                    strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
+                                    missing: "the scope names no unique exact File target".to_string(),
+                                }],
+                            )
+                            .into());
             }
             let begin = start_line
                 .checked_sub(1)
@@ -4628,7 +4681,15 @@ pub(super) fn actual_input_snapshot_for_phase(
                 }
                 if event.payload["outcome"]["status"] != "executed" {
                     if event.payload["outcome"]["tool_name"] == "read_file" {
-                        return Err("proof_actual_input_extent_unsupported: failed File read is not an existence proof".into());
+                                    return Err(crate::agentic::fact_admission::refusal(
+                                        harness_contract::refusal_codes::FactAdmissionCode::Unproven,
+                                        "proof_actual_input_extent_unsupported: failed File read is not an existence proof",
+                                        &[crate::agentic::fact_admission::StrategyGap {
+                                            strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
+                                            missing: "the File read failed, so it proves no existence".to_string(),
+                                        }],
+                                    )
+                                    .into());
                     }
                     continue;
                 }
@@ -4664,10 +4725,12 @@ pub(super) fn actual_input_snapshot_for_phase(
                 let twin_sealed =
                     !event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null();
                 if primary_sealed != twin_sealed {
-                    return Err(
-                        "proof_actual_input_extent_unsupported: the read pair disagrees about its acquisition seal"
-                            .into(),
-                    );
+                    return Err(crate::agentic::fact_admission::refusal(
+                        harness_contract::refusal_codes::FactAdmissionCode::PairDisagrees,
+                        "proof_actual_input_extent_unsupported: the read pair disagrees about its acquisition seal",
+                        &[],
+                    )
+                    .into());
                 }
                 let original_input = if primary_sealed {
                     super::results::authenticate_read_input(
@@ -4730,7 +4793,15 @@ pub(super) fn actual_input_snapshot_for_phase(
                     continue;
                 }
                 if event.payload["is_error"] == true || event.payload["status"] != "completed" {
-                    return Err("proof_actual_input_extent_unsupported: failed root read has no input extent".into());
+                                return Err(crate::agentic::fact_admission::refusal(
+                                    harness_contract::refusal_codes::FactAdmissionCode::Unproven,
+                                    "proof_actual_input_extent_unsupported: failed root read has no input extent",
+                                    &[crate::agentic::fact_admission::StrategyGap {
+                                        strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
+                                        missing: "the root read failed, so it carries no input extent".to_string(),
+                                    }],
+                                )
+                                .into());
                 }
                 let task = super::results::result_tool_plan(&session_events, event)?
                     .ok_or("actual root input original plan missing")?;
@@ -9265,8 +9336,7 @@ mod tests {
             material_events: Vec::new(),
             canonical_facts: Vec::new(),
         };
-        assert_eq!(
-            collect_actual_acquisition(
+        let rejection = collect_actual_acquisition(
                 &store,
                 &program,
                 &primary,
@@ -9282,9 +9352,23 @@ mod tests {
                 &mut refused,
                 &mut windows,
             )
-            .unwrap_err(),
-            "proof_actual_input_extent_unsupported: actual read lacks an original physical extent"
+            .unwrap_err();
+        // 034 GB-1 (batch 1 acceptance): the fragmented gate's original
+        // wording stays verbatim inside the gate's envelope; the envelope adds
+        // the code and what each proof strategy was missing.
+        assert!(
+            rejection.starts_with(
+                "proof_actual_input_extent_unsupported: actual read lacks an original physical extent"
+            ),
+            "the original refusal wording stays verbatim at the head: {rejection}"
         );
+        assert!(rejection.contains("code=fact_unproven"), "{rejection}");
+        for strategy in ["nested", "discovery", "immutable"] {
+            assert!(
+                rejection.contains(&format!("{strategy}(missing=")),
+                "the diagnosis names every strategy: {rejection}"
+            );
+        }
         assert!(
             refused.canonical_facts.is_empty(),
             "a refused member read settles nothing"

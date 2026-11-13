@@ -26,16 +26,6 @@ mod tests {
     };
     use harness_contract::budget_ledger as ledger;
 
-    /// Projection fields that are not attempt-ledger counters: the binding
-    /// map, the verdict counters and the claim lease streak belong to other
-    /// books and are not charged to a failure at all.
-    const NOT_LEDGER_COUNTERS: &[&str] = &[
-        "active_attempts",
-        "reviews_applied",
-        "reviews_accepted",
-        "claim_renewal_streak",
-    ];
-
     /// The book the runtime charges a failure family to.
     ///
     /// The match is exhaustive without a wildcard arm on purpose: a new
@@ -63,6 +53,24 @@ mod tests {
             .expect("task projection properties")
             .keys()
             .cloned()
+            .collect()
+    }
+
+    /// The numeric counters the projection carries.
+    ///
+    /// The type decides what a counter is: a field that holds a *list* of
+    /// released attempts is the binding residual (the other half of GB-3),
+    /// not a count, and the map of active attempts is not a count either.
+    fn projection_numeric_counters() -> Vec<String> {
+        let schema = serde_json::to_value(schemars::schema_for!(AgenticTaskProjection))
+            .expect("task projection schema");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("task projection properties");
+        properties
+            .iter()
+            .filter(|(_, value)| value["type"] == "integer")
+            .map(|(name, _)| name.clone())
             .collect()
     }
 
@@ -99,11 +107,19 @@ mod tests {
 
     #[test]
     fn every_counter_the_runtime_carries_is_declared_by_the_contract_ledger() {
-        let mut runtime_counters: Vec<String> = projection_properties()
+        let mut runtime_counters: Vec<String> = projection_numeric_counters()
             .into_iter()
             .filter(|name| {
-                (name.ends_with("_attempts") || name.ends_with("_stalls") || name == "review_generation")
-                    && !NOT_LEDGER_COUNTERS.contains(&name.as_str())
+                // The shape of an attempt counter: a number that counts
+                // attempts or stalls. A verdict counter (`reviews_applied`,
+                // `reviews_accepted`) counts applied reviews, not failures,
+                // and does not carry that shape - it belongs to the review
+                // obligation book. A list of released attempts and the map
+                // of active attempts are not numbers at all and are already
+                // out of the surface by their type.
+                name.ends_with("_attempts")
+                    || name.ends_with("_stalls")
+                    || name == "review_generation"
             })
             .collect();
         runtime_counters.sort();

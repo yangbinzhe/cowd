@@ -288,10 +288,22 @@ fn s1_delegated_child_read_refuses_the_review_actual_input() {
         &mut refused_windows,
     )
     .expect_err("a workspace read without an acquisition seal cannot authenticate an actual input");
-    assert_eq!(
-        error,
-        "proof_actual_input_extent_unsupported: actual read lacks an original physical extent"
+    // 034 GB-1 (batch 1 acceptance): the fragmented gate's original wording
+    // stays verbatim inside the gate's envelope, and the envelope carries the
+    // code plus what each of the three proof strategies was missing - one
+    // refusal, a complete diagnosis.
+    let original = "proof_actual_input_extent_unsupported: actual read lacks an original physical extent";
+    assert!(
+        error.starts_with(original),
+        "the original refusal wording stays verbatim at the head: {error}"
     );
+    assert!(error.contains("code=fact_unproven"), "{error}");
+    for strategy in ["nested", "discovery", "immutable"] {
+        assert!(
+            error.contains(&format!("{strategy}(missing=")),
+            "the diagnosis names every strategy: {error}"
+        );
+    }
     assert!(
         refused.canonical_facts.is_empty(),
         "a refused actual input settles nothing: {:?}",

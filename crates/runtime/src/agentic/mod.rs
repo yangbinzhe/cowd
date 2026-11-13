@@ -6,6 +6,7 @@
 //! existing scheduler and ToolHost.
 
 mod action_service;
+pub(crate) mod fact_admission;
 pub mod action_invocation;
 pub(crate) mod continuation;
 pub(crate) mod coordination;
