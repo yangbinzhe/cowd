@@ -5734,12 +5734,14 @@ fn a_wait_failure_carries_the_root_durable_outcome_verbatim() {
             },
         }],
     });
-    let failure = typed_wait_failure(
-        "root_terminal_awaiting_review_reconstruction: class=failed",
-        &timeline,
-        "root-1",
-        "live_one_team",
-    );
+    let stop = WaitStop {
+        kind: ObservationStopKind::RegisteredTerminal,
+        code: "root_terminal_awaiting_review_reconstruction",
+        message: "root_terminal_awaiting_review_reconstruction: class=failed".to_string(),
+        class: Some("failed".to_string()),
+        commit_cursor: Some(42),
+    };
+    let failure = typed_wait_failure(&stop, &timeline, "root-1", "live_one_team");
     assert_eq!(
         failure["code"],
         "root_terminal_awaiting_review_reconstruction"
@@ -5750,6 +5752,67 @@ fn a_wait_failure_carries_the_root_durable_outcome_verbatim() {
     assert_eq!(outcome["verified_verdict"], "unsatisfied");
     assert_eq!(outcome["execution_id"], "root-1");
     assert_eq!(outcome["turn_id"], "turn-1");
+    // GB-5: the block says what the observer read, and that it may cancel
+    // because the work was already over.
+    assert_eq!(failure["payload"]["observation_stop"]["kind"], "registered_terminal");
+    assert_eq!(failure["payload"]["observation_stop"]["class"], "failed");
+    assert_eq!(failure["payload"]["observation_stop"]["commit_cursor"], 42);
+    assert_eq!(failure["payload"]["observation_stop"]["observer_may_cancel"], true);
+}
+
+// 033 GB-5: the observer may end its own look; it may not end the work.
+// A stop that read a registered terminal fact leaves nothing running, so the
+// cancel is a receipt for what happened. A stop that only says "I ran out of
+// ways to look" leaves the work running, and an observer that ends the work
+// it observes writes the verdict it was supposed to read.
+#[test]
+fn an_inferred_stop_does_not_kill_the_run_it_stopped_watching() {
+    let inferred = WaitStop {
+        kind: ObservationStopKind::Inferred,
+        code: "observation_limit_reached",
+        message: "observation limit reached (not a verdict on the work)".to_string(),
+        class: None,
+        commit_cursor: None,
+    };
+    assert!(
+        !observer_may_cancel(&inferred),
+        "an inferred stop may not cancel a running execution"
+    );
+    let registered = WaitStop {
+        kind: ObservationStopKind::RegisteredTerminal,
+        code: "root_terminal_awaiting_review_reconstruction",
+        message: "root_terminal_awaiting_review_reconstruction: class=failed".to_string(),
+        class: Some("failed".to_string()),
+        commit_cursor: Some(7),
+    };
+    assert!(
+        observer_may_cancel(&registered),
+        "a registered terminal leaves nothing running: the cancel is a receipt"
+    );
+}
+
+// GB-5: an inferred stop must not imply a verdict about the work. It says
+// what it did not know, and it says the observer did not kill anything.
+#[test]
+fn an_inferred_stop_says_it_knew_nothing_about_the_work() {
+    let stop = WaitStop {
+        kind: ObservationStopKind::Inferred,
+        code: "inactivity_window_elapsed",
+        message: "no durable execution progress for 1000ms after 2000ms".to_string(),
+        class: None,
+        commit_cursor: None,
+    };
+    let failure = typed_wait_failure(&stop, &json!({"events": []}), "root-1", "live_one_team");
+    assert_eq!(failure["code"], "inactivity_window_elapsed");
+    assert_eq!(failure["payload"]["observation_stop"]["kind"], "inferred");
+    assert_eq!(failure["payload"]["observation_stop"]["class"], Value::Null);
+    assert_eq!(failure["payload"]["observation_stop"]["commit_cursor"], Value::Null);
+    assert_eq!(failure["payload"]["observation_stop"]["observer_may_cancel"], false);
+    // The prose still says the work is not judged.
+    assert!(
+        !failure["reason"].as_str().unwrap_or_default().contains("failed"),
+        "an inferred stop carries no verdict about the work: {failure}"
+    );
 }
 
 // S2 (F3-a): "the run never started" and "the run started and failed" are

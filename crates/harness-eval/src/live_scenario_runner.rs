@@ -4524,7 +4524,14 @@ impl LiveScenarioRunner {
             started,
         );
         let Ok(terminal) = terminal else {
-            let terminal_error = terminal.err().unwrap_or_default();
+            let stop = terminal.err().unwrap_or_else(|| WaitStop {
+                kind: ObservationStopKind::Inferred,
+                code: "wait_stop_unknown",
+                message: String::new(),
+                class: None,
+                commit_cursor: None,
+            });
+            let terminal_error = stop.message.clone();
             let mut diagnostics = self.capture_diagnostics(
                 &session_id,
                 Some(execution_id_ref),
@@ -4544,7 +4551,7 @@ impl LiveScenarioRunner {
             // from the timeline the report already carries, and carried out as
             // a typed block with a reference to where it lives.
             let failure = typed_wait_failure(
-                &terminal_error,
+                &stop,
                 diagnostics.pointer("/timeline").unwrap_or(&Value::Null),
                 execution_id_ref,
                 spec.id,
@@ -4559,7 +4566,24 @@ impl LiveScenarioRunner {
                 );
             }
             trace.extend(observation_trace);
-            let cleanup = self.cancel_execution_lineage(execution_id_ref, actor, &mut trace);
+            // The observer may end its own look; it may not end the work.
+            // A stop that read a registered terminal fact leaves nothing
+            // running, so the cancel is a receipt for what happened. A stop
+            // that only says "I ran out of ways to look" leaves the work
+            // running, and an observer that ends the work it observes writes
+            // the verdict it was supposed to read: the lineage is left to the
+            // outer reclaim instead.
+            let cleanup = if observer_may_cancel(&stop) {
+                self.cancel_execution_lineage(execution_id_ref, actor, &mut trace)
+            } else {
+                json!({
+                    "status": "not_attempted",
+                    "attempted": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "reason": "the observer stopped observing; it does not kill a running execution - the outer reclaim closes the lineage",
+                })
+            };
             if let Some(object) = diagnostics.as_object_mut() {
                 object.insert("cancellation".to_string(), cleanup);
             }
@@ -4797,7 +4821,7 @@ impl LiveScenarioRunner {
         observer: &mut LiveScenarioObserver,
         actor: &mut SessionActor<'_>,
         scenario_started: Instant,
-    ) -> Result<TerminalWait, String> {
+    ) -> Result<TerminalWait, WaitStop> {
         let started = Instant::now();
         let mut next_message_probe = started;
         let mut next_root_probe = started;
@@ -4872,7 +4896,15 @@ impl LiveScenarioRunner {
                         );
                         root_terminal = observation.terminal;
                         if let RootExecutionTerminal::Failed(reason) = &root_terminal {
-                            return Err(reason.clone());
+                            // The execution's own durable projection says it
+                            // failed: a registered fact, read and named.
+                            return Err(WaitStop {
+                                kind: ObservationStopKind::RegisteredTerminal,
+                                code: "root_projection_failed",
+                                message: reason.clone(),
+                                class: Some(reason.clone()),
+                                commit_cursor: None,
+                            });
                         }
                     }
                     Err(error) => {
@@ -4957,7 +4989,7 @@ impl LiveScenarioRunner {
                 finalized_non_success.as_deref(),
                 &root_terminal,
             ) {
-                return Err(format!(
+                let message = format!(
                     "root_terminal_awaiting_review_reconstruction: class={} commit_cursor={} phase={} last_active_phase={} progress_observations={} message_cursor={} timeline_cursor={}; the root outcome is durably recorded and the wait stopped at that receipt rather than at an observation window",
                     class,
                     commit_cursor.map_or_else(|| "unknown".to_string(), |cursor| cursor.to_string()),
@@ -4966,7 +4998,17 @@ impl LiveScenarioRunner {
                     observer.progress_observations(),
                     observer.next_message_sequence(),
                     observer.timeline_cursor().unwrap_or("-"),
-                ));
+                );
+                // The root's durable outcome receipt is registered, and this
+                // stop read it. Nothing is inferred here: the class and the
+                // cursor come from the receipt itself.
+                return Err(WaitStop {
+                    kind: ObservationStopKind::RegisteredTerminal,
+                    code: "root_terminal_awaiting_review_reconstruction",
+                    message,
+                    class: Some(class),
+                    commit_cursor,
+                });
             }
             let elapsed = started.elapsed();
             let elapsed_ms = elapsed.as_millis() as u64;
@@ -4989,7 +5031,13 @@ impl LiveScenarioRunner {
                     u128::from(observer.since_last_progress_ms(elapsed.as_millis() as u64)),
                     observer.progress_observations() as usize,
                 );
-                return Err(format!(
+                // The window closed. Nothing is known about the work: the
+                // observer stopped looking, so this stop carries no claim
+                // about how the work ended.
+                return Err(WaitStop {
+                    kind: ObservationStopKind::Inferred,
+                    code: "observation_limit_reached",
+                    message: format!(
                     "observation limit reached (not a verdict on the work): {}; diagnostics: waiting_for=durable_assistant_message phase={} last_active_phase={} progress_observations={} message_cursor={} timeline_cursor={}",
                     report,
                     observer.phase(),
@@ -4997,13 +5045,21 @@ impl LiveScenarioRunner {
                     observer.progress_observations(),
                     observer.next_message_sequence(),
                     observer.timeline_cursor().unwrap_or("-"),
-                ));
+                    ),
+                    class: None,
+                    commit_cursor: None,
+                });
             }
             if timeout
                 .should_abort_for_no_progress(elapsed, observer.progress_observations() as usize)
             {
                 observer.mark_stalled();
-                return Err(format!(
+                // Nothing moved before the nominal wait: still the observer's
+                // fact about itself, not about the work.
+                return Err(WaitStop {
+                    kind: ObservationStopKind::Inferred,
+                    code: "no_progress_before_nominal_wait",
+                    message: format!(
                     "no durable execution progress before the nominal scenario wait elapsed after {}ms; nominal wait={}ms, absolute safety wait={}ms, phase={}, last_active_phase={}, message_cursor={}, timeline_cursor={}",
                     elapsed.as_millis(),
                     timeout.nominal_wait.as_millis(),
@@ -5015,7 +5071,10 @@ impl LiveScenarioRunner {
                     observer.last_active_phase(),
                     observer.next_message_sequence(),
                     observer.timeline_cursor().unwrap_or("-"),
-                ));
+                    ),
+                    class: None,
+                    commit_cursor: None,
+                });
             }
             if timeout.should_abort_for_inactivity(
                 elapsed,
@@ -5023,7 +5082,12 @@ impl LiveScenarioRunner {
                 observer.progress_observations() as usize,
             ) {
                 observer.mark_stalled();
-                return Err(format!(
+                // The inactivity window closed. The work may still be running;
+                // the observer is not the thing that may end it.
+                return Err(WaitStop {
+                    kind: ObservationStopKind::Inferred,
+                    code: "inactivity_window_elapsed",
+                    message: format!(
                     "no durable execution progress for {}ms after {}ms; inactivity window={}ms, nominal wait={}ms, absolute safety wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
                     since_progress.as_millis(),
                     elapsed.as_millis(),
@@ -5038,7 +5102,10 @@ impl LiveScenarioRunner {
                     observer.progress_observations(),
                     observer.next_message_sequence(),
                     observer.timeline_cursor().unwrap_or("-"),
-                ));
+                    ),
+                    class: None,
+                    commit_cursor: None,
+                });
             }
             thread::sleep(self.observation_poll_delay());
         }
@@ -6905,6 +6972,42 @@ impl LiveScenarioTimeout {
             && elapsed >= self.initial_wait
             && since_progress >= self.inactivity_wait
     }
+}
+
+/// Whether the observer stopped because a terminal fact was already recorded,
+/// or because it simply ran out of ways to look.
+///
+/// The first is a fact about the work: the execution's own durable
+/// projection or its durable outcome receipt says how it ended. The second is
+/// a fact about the observer: the window closed, or nothing moved for a
+/// while. Only the second kind may not touch the work - an observation that
+/// ends is not a statement about what the work did, and an observer that
+/// ends the work it is observing writes the verdict it was supposed to read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservationStopKind {
+    /// A terminal fact was already registered; the work is over.
+    RegisteredTerminal,
+    /// The observer stopped looking; nothing is known about the work.
+    Inferred,
+}
+
+/// One stop of the wait, with what the observer actually read.
+pub(crate) struct WaitStop {
+    pub(crate) kind: ObservationStopKind,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) class: Option<String>,
+    pub(crate) commit_cursor: Option<u64>,
+}
+
+/// Whether the observer may cancel the lineage after this stop.
+///
+/// A registered terminal means the work is already over, so the cancel is a
+/// receipt for what happened. An inferred stop means the work may still be
+/// running, and the observer has no standing to end it: the lineage is left
+/// to the outer reclaim.
+pub(crate) fn observer_may_cancel(stop: &WaitStop) -> bool {
+    matches!(stop.kind, ObservationStopKind::RegisteredTerminal)
 }
 
 struct TerminalWait {
@@ -9096,24 +9199,30 @@ fn root_terminal_awaiting_review_reconstruction(
 /// failed and never learn why, and a reader who wanted the why had to go and
 /// find it themselves, which is exactly the re-typing this ends.
 fn typed_wait_failure(
-    error: &str,
+    stop: &WaitStop,
     timeline: &Value,
     execution_id: &str,
     scenario_id: &str,
 ) -> Value {
-    let code = if error.starts_with("root_terminal_awaiting_review_reconstruction") {
-        "root_terminal_awaiting_review_reconstruction"
-    } else if error.starts_with("observation limit reached") {
-        "observation_limit_reached"
-    } else {
-        "terminal_wait_failed"
-    };
+    let code = stop.code;
     crate::machine_reference::typed_failure(
         code,
-        error,
+        &stop.message,
         json!({
             "scenario_id": scenario_id,
             "root_durable_outcome": root_business_observation(timeline, execution_id),
+            // What the observer read, and what it did not know: a stop that
+            // named a registered terminal fact says which one, and a stop that
+            // did not says so instead of implying a verdict.
+            "observation_stop": {
+                "kind": match stop.kind {
+                    ObservationStopKind::RegisteredTerminal => "registered_terminal",
+                    ObservationStopKind::Inferred => "inferred",
+                },
+                "class": stop.class.clone().map(Value::String).unwrap_or(Value::Null),
+                "commit_cursor": stop.commit_cursor.map(|cursor| json!(cursor)).unwrap_or(Value::Null),
+                "observer_may_cancel": observer_may_cancel(stop),
+            },
         }),
     )
 }

@@ -657,8 +657,17 @@ impl AgentAction {
     /// service - never two dialects).
     #[must_use]
     pub const fn requires_original_physical_execution(&self) -> bool {
-        matches!(self, Self::ArtifactCommit(_) | Self::TaskSubmit(_))
+        // 034 GB-4b (e1 verdict, hub adjudicated): TaskSubmit INHERITS its
+        // physical backing - both deliverable paths persist through the
+        // artifact_commit path and the model cannot author a bare
+        // content_ref (resolved_content_ref is Runtime-set; refs are bound
+        // to the claim). Demanding a fresh binding from it produced a
+        // refusal no durable state could repair (the S3-D dead-end shape
+        // at one action removed). ArtifactCommit remains the only action
+        // that CREATES physical backing.
+        matches!(self, Self::ArtifactCommit(_))
     }
+}
 
 impl AgentAction {
     #[must_use]
