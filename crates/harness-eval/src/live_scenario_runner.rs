@@ -5336,10 +5336,17 @@ impl LiveScenarioRunner {
                 Some("task_submit") => submitted += 1,
                 Some("task_review") => {
                     reviewed += 1;
+                    // 034 R1 fix (hub): AgentAction is adjacently tagged
+                    // (tag="kind", content="input"), so the decision lives
+                    // under /input, not at the action root; and
+                    // TaskReviewDecision serializes snake_case ("accept"),
+                    // not the variant name ("Accept"). Both errors made
+                    // tasks_reviewed_accepted read 0 forever, structurally
+                    // blocking the S8/S9 review-landing criterion.
                     let decision = payload
-                        .pointer("/envelope/action/decision")
+                        .pointer("/envelope/action/input/decision")
                         .and_then(Value::as_str);
-                    if decision == Some("Accept") {
+                    if decision == Some("accept") {
                         reviewed_accepted += 1;
                     }
                 }

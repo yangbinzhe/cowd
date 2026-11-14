@@ -2170,6 +2170,34 @@ fn agentic_progress_counts_unique_structured_action_events() {
     );
 }
 
+#[test]
+fn agentic_progress_counts_accepted_reviews_via_adjacent_input_tag() {
+    // 034 R1 red-first control: AgentAction is adjacently tagged (kind +
+    // input) and TaskReviewDecision serializes snake_case. The decision must
+    // be read from /envelope/action/input/decision and matched as "accept";
+    // the pre-fix path (missing /input) and case ("Accept") read 0 forever,
+    // structurally blocking the S8/S9 review-landing criterion.
+    let review = |cursor, decision| {
+        json!({
+            "kind": "agentic.action_applied",
+            "commit_cursor": cursor,
+            "payload": {"envelope": {"action": {
+                "kind": "task_review",
+                "input": {"decision": decision}
+            }}}
+        })
+    };
+    let timeline = json!({"events": [
+        review(1, "accept"),
+        review(2, "accept"),
+        review(3, "rework"),
+        review(4, "challenge")
+    ]});
+    let progress = LiveScenarioRunner::agentic_progress_from_timeline(&timeline);
+    assert_eq!(progress["tasks_reviewed"], 4);
+    assert_eq!(progress["tasks_reviewed_accepted"], 2);
+}
+
 fn successful_root_outcome_timeline(mut timeline: Value) -> Value {
     let event = json!({
         "kind": "runtime.outcome.recorded.v1",
