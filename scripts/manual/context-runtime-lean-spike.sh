@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/cowd-context-runtime-lean-spike-target}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/media/yi/Datas/workspace/.cowd-build/cowd-context-runtime-lean-spike-target}"
 
 cd "$ROOT"
 

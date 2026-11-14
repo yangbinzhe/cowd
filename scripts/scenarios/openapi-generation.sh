@@ -13,7 +13,8 @@ BIN="${COWD_BIN:-${TARGET_ROOT}/debug/cowd}"
 : "${COWD_OPENAPI_PRIVATE_ROOT:?set a private plan candidate root; this scenario builds and uses isolated PostgreSQL}"
 mkdir -p "${COWD_OPENAPI_PRIVATE_ROOT}"
 SCENARIO_ROOT="$(mktemp -d "${COWD_OPENAPI_PRIVATE_ROOT}/cowd-openapi-generation.XXXXXX")"
-export TMPDIR="${SCENARIO_ROOT}"
+COMPILE_TMP="$(mktemp -d /media/yi/Datas/workspace/.cowd-build/openapi-compile.XXXXXX)"
+export TMPDIR="${COMPILE_TMP}"
 export COWD_GENERATED_SPEC_ROOT="${SCENARIO_ROOT}/spec"
 export COWD_GENERATED_STAGE_ROOT="${COWD_OPENAPI_STAGE_ROOT:-${SCENARIO_ROOT}}"
 : "${COWD_GENERATION_FROZEN_SOURCESET:?generation requires the frozen R1 source manifest}"
@@ -36,6 +37,7 @@ case "${MODE}" in
 esac
 
 cleanup() {
+  rm -rf -- "${COMPILE_TMP}"
   set +e
   if [[ -n "${GATEWAY_PID}" ]] && kill -0 "${GATEWAY_PID}" 2>/dev/null; then
     kill "${GATEWAY_PID}" 2>/dev/null || true
