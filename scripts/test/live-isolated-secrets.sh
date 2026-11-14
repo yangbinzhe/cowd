@@ -123,7 +123,7 @@ SOURCE_ROOT="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 SELF="$(realpath -- "${BASH_SOURCE[0]}")"
 SOURCE_ROOT="$(realpath -- "$SOURCE_ROOT")"
 [[ -f "$SOURCE_ROOT/scripts/scenarios/run-live-isolated.sh" ]] || exit 2
-SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/cowd-live-secret-test.XXXXXX")"
+SANDBOX="$(mktemp -d "/media/yi/Datas/workspace/.cowd-build/cowd-live-secret-test.XXXXXX")"
 trap 'command rm -rf -- "$SANDBOX"' EXIT
 FIXTURE="$SANDBOX/fixture"
 mkdir -p "$FIXTURE/scripts/scenarios"
