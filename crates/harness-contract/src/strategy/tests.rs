@@ -1606,7 +1606,28 @@ fn failed_positive_claim_can_import_only_a_negative_veto() {
     assert!(store.import_paired_evaluation_report(&report).is_err());
     assert_eq!(store.import_negative_benefit_report(&report), Ok(1));
     assert!(store.records.is_empty());
-    assert_eq!(store.negative_benefit_observations.len(), 1);
+    let observations = &store.negative_benefit_observations;
+    assert_eq!(observations.len(), 1);
+    let observation = &observations[0];
+    assert!(is_sha256(&observation.report_sha256));
+    assert_eq!(observation.workload_fingerprint_sha256, fingerprint);
+    assert_eq!(observation.provider_profile_fingerprint, "a".repeat(64));
+    assert_eq!(observation.baseline_candidate, ExecutionCandidateKind::Direct);
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.workload_fingerprint_sha256.clone())
+            .collect::<Vec<_>>(),
+        vec![fingerprint.clone()],
+        "exactly one negative veto for this workload fingerprint must be recorded"
+    );
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.provenance_ref.as_str())
+            .collect::<Vec<_>>(),
+        vec!["harness_eval.auto_strategy_paired.v1:test"]
+    );
     assert!(store.negative_benefit_observations.iter().all(|observation|
         is_sha256(&observation.report_sha256)
             && observation.workload_fingerprint_sha256 == fingerprint

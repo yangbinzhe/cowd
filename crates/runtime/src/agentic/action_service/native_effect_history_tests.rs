@@ -522,12 +522,17 @@ async fn r1_475_native_history_real_cancel_commits_same_ticket_receipt() {
     committed_nodes.sort_unstable();
     assert!(!committed_nodes.is_empty());
     assert_eq!(committed_nodes, entered.iter().cloned().collect::<Vec<_>>(), "each original callback runs exactly once");
+    assert!(commit_log.iter().all(|id| committed.insert(id.clone())), "each original callback runs exactly once");
+    assert!(!committed.is_empty());
+    assert_eq!(committed, entered);
     drop(commit_log);
     assert!(executor.aborts.lock().unwrap().is_empty());
     let polls = executor.polls.lock().unwrap();
     let mut polled_nodes = polls.clone();
     polled_nodes.sort_unstable();
     assert_eq!(polled_nodes, entered.iter().cloned().collect::<Vec<_>>());
+    assert!(polls.iter().all(|id| polled.insert(id.clone())));
+    assert_eq!(polled, entered);
     drop(polls);
     let cursor = service.store.durable_commit_cursor().unwrap();
     let pinned = validate(&service, &commits, &cancelled, BTreeSet::new()).unwrap();
@@ -538,6 +543,8 @@ async fn r1_475_native_history_real_cancel_commits_same_ticket_receipt() {
     }).collect::<Vec<_>>();
     expected_streams.sort_unstable();
     assert_eq!(pinned.keys().cloned().collect::<Vec<_>>(), expected_streams);
+    }).collect();
+    assert!(!expected_streams.is_empty());
     assert!(pinned.values().all(|head| *head == 2));
     let mut original_transaction = None;
     for node in &cancelled.nodes {
@@ -643,4 +650,6 @@ async fn r1_475_native_history_poll_error_does_not_prove_cancelled_outcome() {
     let mut polled_nodes = polls.clone();
     polled_nodes.sort_unstable();
     assert_eq!(polled_nodes, entered.iter().cloned().collect::<Vec<_>>());
+    assert!(polls.iter().all(|id| polled.insert(id.clone())));
+    assert_eq!(polled, entered);
 }

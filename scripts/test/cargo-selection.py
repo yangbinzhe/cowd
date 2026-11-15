@@ -535,6 +535,13 @@ def discover(root, plan, data, log_dir):
         if out_dirs:
             item["out_dir"] = out_dirs.pop()
         item["executables"] = executables
+        out_dirs = {artifact["out_dir"] for artifact in artifacts
+                    if artifact.get("reason") == "build-script-executed"
+                    and artifact.get("package_id") == item["package_id"]}
+        if len(out_dirs) > 1:
+            raise NotStarted("ambiguous build-script OUT_DIR for target")
+        if out_dirs:
+            item["out_dir"] = out_dirs.pop()
         admission = log_dir / f"{index}-launch-admission.json"
         launch_plan = {**plan, "targets": [item], "executables": item["executables"]}
         admission.write_text(json.dumps(launch_plan))
@@ -665,6 +672,7 @@ def main():
                 if not Path(out_dir).is_dir():
                     raise NotStarted("build-script output directory missing")
                 os.environ["OUT_DIR"] = out_dir
+                    raise NotStarted("build-script OUT_DIR is missing")
             os.execv(binary, [binary, *sys.argv[4:]])
         except (NotStarted, OSError, ValueError, KeyError, TypeError) as error:
             print(json.dumps({"status": "NotStarted", "reason": str(error) if isinstance(error, NotStarted) else type(error).__name__}))
@@ -699,16 +707,27 @@ def main():
     elif any(value is not None and value is not False for value in request.values()):
         parser.error("narrow arguments require --package")
     root = Path(__file__).resolve().parents[2]
+    def external_report():
+        result = subprocess.run(["bash", str(root / "scripts/test/unblock.sh"), "evidence-path", str(root)],
+                                text=True, capture_output=True, check=True)
+        path = Path(result.stdout.strip()).resolve()
+        if path.is_relative_to(root) or path.exists():
+            raise NotStarted("unblock returned an unsafe or existing evidence path")
+        return path
     if args.mode == "report":
         directory = Path(os.environ.get("COWD_TEST_EVIDENCE_ROOT", str(root.parent / ".cowd-test-evidence"))).resolve()
         if directory.is_relative_to(root):
-            parser.error("evidence root must be outside the source tree")
+            print(external_report())
+            return 0
         print(directory / f"selection-{time.time_ns()}-{os.getpid()}.json")
         return 0
     plan = {"status": "NotStarted", "business_acceptance": "NotAssessed"}
     status = 0
     try:
-        if args.output and (args.output.resolve().is_relative_to(root) or args.output.exists()):
+        if args.output and args.output.resolve().is_relative_to(root):
+            args.output = external_report()
+            print(f"warning: report redirected outside source tree: {args.output}", file=sys.stderr)
+        if args.output and args.output.exists():
             args.output = None
             raise NotStarted("report must be a new file outside the source tree")
         data = metadata(root)

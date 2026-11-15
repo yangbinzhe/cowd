@@ -419,15 +419,50 @@ async fn maintenance_scan_uses_stable_keyset_pages() {
         .scan_entries_page(second.next.clone().expect("next cursor"), 2)
         .await
         .unwrap();
-    let ids = first
+    let page_ids = first
         .entries
         .iter()
-        .chain(&second.entries)
-        .chain(&third.entries)
+        .chain(second.entries.iter())
+        .chain(third.entries.iter())
         .map(|entry| entry.id)
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<Vec<_>>();
+    let mut unique_page_ids = page_ids.clone();
+    unique_page_ids.sort();
+    unique_page_ids.dedup();
+    assert_eq!(
+        unique_page_ids.len(),
+        page_ids.len(),
+        "the three keyset pages must not repeat an entry id"
+    );
+    let mut expected_ids = (0..5)
+        .map(|index| uid(&format!("scan-{index}")))
+        .collect::<Vec<_>>();
+    expected_ids.sort();
+    let mut sorted_page_ids = page_ids.clone();
+    sorted_page_ids.sort();
+    assert_eq!(
+        sorted_page_ids, expected_ids,
+        "the three pages must cover every stored entry exactly once"
+    );
 
     assert_eq!(first.entries.len(), 2);
+    let first_page_ids = first
+        .entries
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    let mut first_page_unique = first_page_ids.clone();
+    first_page_unique.sort();
+    first_page_unique.dedup();
+    assert_eq!(
+        first_page_unique.len(),
+        first_page_ids.len(),
+        "the first page must not repeat an entry id"
+    );
+    assert!(
+        first_page_ids.iter().all(|id| expected_ids.contains(id)),
+        "every paged entry must be one of the stored entries"
+    );
     let [second_left, second_right] = second.entries.as_slice() else { panic!("second page must contain two entries"); };
     assert_ne!(second_left.id, second_right.id);
     let [last] = third.entries.as_slice() else { panic!("last page must contain one entry"); };

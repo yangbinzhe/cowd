@@ -2930,6 +2930,15 @@ fn r6_saved_control_requests_obey_original_parser_without_business_progress() ->
         let parsed = harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(answer["content"].as_str().unwrap(),1).map_err(anyhow::Error::msg)?;
         assert_eq!(parsed.decisions.len(), 1);
         assert_eq!(parsed.decisions[0].input_slots, vec![0]);
+        assert_eq!(
+            parsed
+                .decisions
+                .iter()
+                .map(|decision| decision.input_slots.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0]],
+            "the disposition batch must hold exactly one decision covering slot 0"
+        );
         assert_eq!((driver.root, driver.producer, driver.reviewer), (0, 0, 0));
     }
     Ok(())
@@ -2959,6 +2968,11 @@ fn r356_response_bound_records_metadata_and_cannot_mask_http_refusal() -> anyhow
     assert_eq!(oversized.position(), 262_145);
     let files = std::fs::read_dir(root.path())?.collect::<Result<Vec<_>, _>>()?;
     assert_eq!(files.len(), 1);
+    let refusal_name = files[0].file_name().to_string_lossy().into_owned();
+    assert!(
+        refusal_name.starts_with("r6-api-read-refused-") && refusal_name.ends_with(".json"),
+        "the oversized read must leave exactly one refusal record: {refusal_name}"
+    );
     let stored: Value = serde_json::from_slice(&std::fs::read(files[0].path())?)?;
     assert_eq!(stored["path_and_query"], path);
     assert_eq!(stored["status"], 200);
@@ -3018,6 +3032,13 @@ fn r356_pages_shrink_at_same_cursor_and_preserve_the_original_cut() -> anyhow::R
     )?;
     assert_eq!(calls, vec![(0, 100), (0, 50), (50, 50)]);
     assert_eq!(rows.len(), 56);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["sequence"].as_u64().expect("sequence"))
+            .collect::<Vec<_>>(),
+        (0..56).collect::<Vec<_>>(),
+        "the paginated read must return every sequence exactly once and in order"
+    );
     for (n, row) in rows.iter().enumerate() {
         assert_eq!(row["id"], format!("event-{n}"));
         assert_eq!(row["sequence"], n as u64);
@@ -3144,6 +3165,16 @@ fn r357_retained_request9_cut_replays_under_the_unchanged_byte_limit() -> anyhow
     )?;
     assert_eq!(calls, vec![(0, 100), (0, 50), (50, 50)]);
     assert_eq!(rows.len(), 56);
+    let mut sequences = rows
+        .iter()
+        .map(|row| row["sequence"].as_u64().expect("sequence"))
+        .collect::<Vec<_>>();
+    sequences.sort();
+    assert_eq!(
+        sequences,
+        (0..56).collect::<Vec<_>>(),
+        "every sequence must be delivered exactly once across the pages"
+    );
     assert_eq!(rows.last().unwrap()["sequence"], 55);
     assert_eq!(
         rows.last().unwrap()["payload"]["body_sha256"],
@@ -3217,6 +3248,11 @@ fn r6_refused_api_preserves_actual_path_status_and_body_before_return() -> anyho
     assert!(error.to_string().contains("404 Not Found"));
     let paths: Vec<_> = std::fs::read_dir(root.path())?.collect::<Result<_, _>>()?;
     assert_eq!(paths.len(), 1);
+    let refusal_name = paths[0].file_name().to_string_lossy().into_owned();
+    assert!(
+        refusal_name.starts_with("r6-api-read-refused-") && refusal_name.ends_with(".json"),
+        "the refused program lookup must leave exactly one refusal record: {refusal_name}"
+    );
     assert_eq!(paths[0].metadata()?.permissions().mode() & 0o777, 0o600);
     let stored: Value = serde_json::from_slice(&std::fs::read(paths[0].path())?)?;
     assert_eq!(
@@ -4504,8 +4540,10 @@ fn r365_write_result_requires_successful_original_output_and_physical_bytes() ->
         b"recovery-effect-once\n"
     );
     assert_eq!(b"recovery-effect-once\n".len(), 21);
+    assert_eq!(&b"recovery-effect-once\n"[..20], b"recovery-effect-once");
     assert_eq!(&b"recovery-effect-once\n"[19..], &[0x65, 0x0a]);
     assert_eq!(b"recovery-effect-once\\n".len(), 22);
+    assert_eq!(&b"recovery-effect-once\\n"[..20], b"recovery-effect-once");
     assert_eq!(&b"recovery-effect-once\\n"[20..], &[0x5c, 0x6e]);
     let mut literal_slash = request.clone();
     let mut slash_output = serde_json::to_value(&written)?;
@@ -4815,6 +4853,17 @@ fn r385_original_memory_extractor_uses_typed_empty_result_without_business_autho
     let entries = futures::executor::block_on(typed.llm_extract(&messages))?;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].title, "Independent literal");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.title.clone())
+            .collect::<Vec<_>>(),
+        vec!["Independent literal".to_string()],
+        "the extractor must not emit a duplicate or an extra typed entry"
+    );
+    assert_eq!(entries[0].category, memory::MemoryCategory::UserPreference);
+    assert_eq!(entries[0].layer, memory::MemoryLayer::L1);
+    assert_eq!(entries[0].priority, memory::Priority::High);
     Ok(())
 }
 

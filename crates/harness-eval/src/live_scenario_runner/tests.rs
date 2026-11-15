@@ -350,7 +350,13 @@ fn r202_session_reader_retains_actual_payload_and_rejects_foreign_or_truncated_p
         } else {
             assert!(result.is_err(), "{fault}");
         }
-        assert_eq!(fixture.finish().len(), 1);
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].0,
+            "GET /api/sessions/session-a/events?from_seq=0&limit=100&include_payload=true",
+            "the reader must issue exactly one session-events read: {fault}"
+        );
     }
 }
 
@@ -368,14 +374,25 @@ fn k05_session_reader_retries_concurrent_append_without_accepting_bad_page() {
     ]);
     let runner = u5_fixture_runner(&fixture.url);
     assert_eq!(runner.read_u5_session_events("session-a", Instant::now() + Duration::from_secs(2)).unwrap(), original);
-    assert_eq!(fixture.finish().len(), 2);
+    let requests = fixture.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests.iter().map(|request| request.0.as_str()).collect::<Vec<_>>(),
+        vec![path, path],
+        "the raced page must be re-read once at the very same cursor: {requests:?}"
+    );
 
     // Persistent mismatch still fails closed within the same three-page cap.
     raced["total"] = json!(1);
     let mut fixture = U5SingleCaseHttpFixture::start_wire((0..3).map(|_| (path.into(), raced.clone(), false, Duration::ZERO)).collect());
     let runner = u5_fixture_runner(&fixture.url);
     assert!(runner.read_u5_session_events("session-a", Instant::now() + Duration::from_secs(2)).is_err());
-    assert_eq!(fixture.finish().len(), 3);
+    let requests = fixture.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests.iter().all(|request| request.0 == path),
+        "the reader must stop at the three-page cap of the same cursor: {requests:?}"
+    );
 }
 
 #[test]
@@ -999,7 +1016,16 @@ fn u5_resource_reader_real_manager_writer_store_selected_witnesses_and_symmetric
         let evidence = runner
             .read_u5_resource_witnesses(&owner, &sessions, Instant::now() + Duration::from_secs(2))
             .unwrap();
-        assert_eq!(fixture.finish().len(), 2);
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests.iter().map(|request| request.0.as_str()).collect::<Vec<_>>(),
+            sessions
+                .iter()
+                .map(|session| u5_resource_path(session, None, 100))
+                .collect::<Vec<_>>(),
+            "every session timeline must be read exactly once: {requests:?}"
+        );
         assert!(evidence.selected_witnesses_complete);
         for (observation, source) in evidence.observations.iter().zip(&evidence.source_refs) {
             assert!(
@@ -1166,11 +1192,39 @@ fn u5_resource_reader_loopback_binding_cursor_and_page_counterexamples() {
                 let evidence = result.unwrap();
                 assert!(u5_capacity_witness(&evidence, &sessions).is_some());
                 assert_eq!(requests.len(), 2);
+                let mut request_lines = requests
+                    .iter()
+                    .map(|request| request.0.clone())
+                    .collect::<Vec<_>>();
+                request_lines.sort();
+                let mut expected_lines = sessions
+                    .iter()
+                    .map(|session| u5_resource_path(session, None, 100))
+                    .collect::<Vec<_>>();
+                expected_lines.sort();
+                assert_eq!(
+                    request_lines, expected_lines,
+                    "each session timeline must be read exactly once"
+                );
             }
             "missing-grant" => assert!(u5_capacity_witness(&result.unwrap(), &sessions).is_none()),
             "replay-conflict" | "same-position-kind" | "replay-position" => {
                 let error = result.err().expect("immutable source conflict must reject");
                 assert_eq!(requests.len(), 2, "must reach the replay page: {fault}");
+                let mut request_lines = requests
+                    .iter()
+                    .map(|request| request.0.clone())
+                    .collect::<Vec<_>>();
+                request_lines.sort();
+                let mut expected_lines = vec![
+                    u5_resource_path(&sessions[0], None, 100),
+                    u5_resource_path(&sessions[0], Some("v2:0:1:0"), 100),
+                ];
+                expected_lines.sort();
+                assert_eq!(
+                    request_lines, expected_lines,
+                    "the replay page of the first session must be the second read: {fault}"
+                );
                 assert!(
                     error.contains("immutable source")
                         || error
@@ -1327,6 +1381,14 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
             }
             "events" => {
                 assert_eq!(requests.len(), 6);
+                assert!(
+                    requests.iter().all(|request| sessions.iter().any(|session| request
+                        .0
+                        .starts_with(&format!(
+                            "GET /api/runtime/timeline?session_id={session}&"
+                        )))),
+                    "every request must read one of the two session timelines: {requests:?}"
+                );
                 assert!(error.contains("event budget"), "{error}");
             }
             "exact512-before-IO-more" | "exact512-before-IO-second-session" => {
@@ -1335,10 +1397,36 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
                     6,
                     "no seventh HTTP after 512 events: {fault}"
                 );
+                assert!(
+                    requests.iter().all(|request| sessions.iter().any(|session| request
+                        .0
+                        .starts_with(&format!(
+                            "GET /api/runtime/timeline?session_id={session}&"
+                        )))),
+                    "every request must read one of the two session timelines: {requests:?}"
+                );
                 assert!(error.contains("before IO"), "{error}");
             }
             "pages" => {
                 assert_eq!(requests.len(), 32);
+                let request_lines = requests
+                    .iter()
+                    .map(|request| request.0.as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    request_lines.iter().all(|request| sessions.iter().any(|session| request
+                        .starts_with(&format!(
+                            "GET /api/runtime/timeline?session_id={session}&"
+                        )))),
+                    "every request must read one of the two session timelines: {request_lines:?}"
+                );
+                let mut distinct = request_lines.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                assert!(
+                    distinct.len() > 1,
+                    "the page budget must stop a paginated read, not a single request"
+                );
                 assert!(error.contains("before IO"), "{error}");
             }
             "known-bytes" | "cumulative-bytes" => assert!(error.contains("byte budget"), "{error}"),
@@ -2367,6 +2455,10 @@ fn autonomous_deepseek_template_is_frozen_and_complete() {
         .prompt_template
         .contains("objective_complete_request"));
     assert!(!template.prompt_template.contains("Team A"));
+    assert!(
+        !template.prompt_template.contains("恰好"),
+        "the frozen template must not contain the scaled-down wording"
+    );
     let spec = autonomous_deepseek_spec().expect("autonomous collaboration spec");
     assert!(matches!(spec.acceptance, LiveAcceptance::AutonomousCollaboration {
         minimum_teams: 1.., minimum_agents: 1.., minimum_tasks: 1.., ..
@@ -2488,6 +2580,14 @@ fn unknown_or_unscheduled_explicit_scenarios_fail_before_dispatch() {
     let unregistered = BTreeSet::new();
     let errors = live_scenario_selection_errors(Some(&selected), &unregistered);
     assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| error["scenario_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec![GROUP_THEORY_SCENARIO_ID],
+        "exactly the unregistered scenario must be named"
+    );
     assert_eq!(errors[0]["scenario_id"], GROUP_THEORY_SCENARIO_ID);
     assert!(!live_scenario_selection_passed(Some(&selected), &errors, 0));
 
@@ -2630,6 +2730,19 @@ fn http_success_with_non_ready_control_plane_fails_closed() {
 
     assert_eq!(observation["status"], "failed");
     assert_eq!(observation["failed_checks"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        observation["failed_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| check["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec![
+            "runtime_control_plane.production_ready",
+            "runtime_control_plane.required_blocked",
+        ],
+        "the not-ready control plane must fail exactly the readiness checks"
+    );
     assert_eq!(
         observation["reason"],
         "HTTP transport succeeded but the endpoint semantic health contract failed"
@@ -3042,7 +3155,15 @@ fn large_scale_presentation_gate_accepts_complete_synthesized_terminal() {
 #[test]
 fn scale_recommendation_requires_subject_and_decision_in_the_same_semantic_block() {
     assert!(!has_scale_recommendation("## 扩大规模结论\n结论完整。"));
+    assert!(
+        has_scale_recommendation("## 扩大规模结论\n建议扩容。"),
+        "the same heading with a decision must be accepted"
+    );
     assert!(!has_scale_recommendation("- 扩容建议"));
+    assert!(
+        has_scale_recommendation("- 扩容建议\n必须先完成持久层分片。"),
+        "the same subject with a decision must be accepted"
+    );
     assert!(!has_scale_recommendation(
         "当前系统需要扩容。\n\n建议先完成持久层分片。"
     ));
@@ -3116,6 +3237,11 @@ fn complete_source_receipt_gate_requires_attested_exact_content_for_every_target
         .map(|(index, path)| receipt(path, index as u64 + 1))
         .collect::<Vec<_>>();
     let expected: BTreeSet<String> = LARGE_SCALE_SOURCE_PATHS.iter().map(|path| (*path).to_string()).collect();
+    assert_eq!(
+        expected.len(),
+        LARGE_SCALE_SOURCE_PATHS.len(),
+        "the frozen source path list must not repeat a path"
+    );
     assert!(!expected.is_empty());
     assert_eq!(complete_exact_source_receipt_paths(
         &json!({"observed_acceptance": {"observed_evidence": complete}}), &[],
@@ -4114,6 +4240,14 @@ fn an_unresolved_agent_activity_is_named_in_the_evidence() {
     assert!(no_active_agent_waits(std::slice::from_ref(&projection)) == false);
     let unresolved = unresolved_agent_activities(std::slice::from_ref(&projection));
     assert_eq!(unresolved.len(), 1);
+    assert_eq!(
+        unresolved
+            .iter()
+            .map(|activity| activity["activity_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["a2"],
+        "only the still-running activity must be named"
+    );
     assert_eq!(unresolved[0]["activity_id"], "a2");
     assert_eq!(unresolved[0]["execution_id"], "exec-2");
     assert_eq!(unresolved[0]["status"], "running");
@@ -4391,7 +4525,21 @@ fn per_task_reports_without_a_synthesis_fail() {
     let (present, unsynthesized) = synthesized_final_artifact_findings(Some(&program));
     assert!(!present, "per-Task reports are not a synthesis");
     assert!(!program.tasks.is_empty());
-    assert_eq!(unsynthesized.iter().cloned().collect::<BTreeSet<_>>(),
+    let mut unsynthesized_ids = unsynthesized.iter().cloned().collect::<Vec<_>>();
+    unsynthesized_ids.sort();
+    let mut distinct_unsynthesized = unsynthesized_ids.clone();
+    distinct_unsynthesized.dedup();
+    assert_eq!(
+        distinct_unsynthesized.len(),
+        unsynthesized_ids.len(),
+        "a task without a synthesis must be named exactly once: {unsynthesized_ids:?}"
+    );
+    let mut task_ids = program.tasks.keys().cloned().collect::<Vec<_>>();
+    task_ids.sort();
+    assert_eq!(
+        unsynthesized_ids, task_ids,
+        "every task without a synthesis must be named: {unsynthesized_ids:?}"
+    );
         program.tasks.keys().cloned().collect(), "{unsynthesized:?}");
 }
 
@@ -4858,9 +5006,22 @@ fn u7_lifecycle_oracles_keep_correction_absence_and_original_terminal_hard() {
     };
     assert!(u7_contains_any_secret("仓库代号WH-literal-527", &old, &new));
     assert!(u7_contains_any_secret("out-new-337", &old, &new));
+    assert!(
+        u7_contains_any_secret("原口令OUT-literal-893仍在。", &old, &new),
+        "the original passphrase must be detected as well"
+    );
     assert!(!u7_contains_any_secret("该项目记忆不存在。", &old, &new));
+    assert!(
+        u7_contains_any_secret("该项目记忆不存在，但旧仓库代号WH-literal-527 仍在。", &old, &new),
+        "an absence statement that still carries the original value must be detected"
+    );
     assert!(u7_explicit_absence("未找到相关项目记忆，两个值均缺失。"));
+    assert!(u7_explicit_absence("两个值均缺失。"));
     assert!(!u7_explicit_absence("已有项目记录，稍后提供口令。"));
+    assert!(
+        !u7_explicit_absence("请稍后提供口令。"),
+        "a pending request is not an explicit absence"
+    );
     let absent = json!({"enabled":true,"layer":"L3","include_archived":false,"entries":[]});
     assert!(u7_active_memory_absent(&absent, "original-id"));
     for defect in [
@@ -5037,8 +5198,13 @@ fn u7_correction_producer_patches_the_original_id_before_any_model_request() {
         &old.content
     ));
     assert_eq!(
-        task.join().unwrap().len(),
-        4,
+        task.join().unwrap(),
+        vec![
+            "POST /api/memory/L3 HTTP/1.1".to_string(),
+            "GET /api/memory/L3 HTTP/1.1".to_string(),
+            "PATCH /api/memory/entry/00000000-0000-0000-0000-000000000007 HTTP/1.1".to_string(),
+            "GET /api/memory/L3 HTTP/1.1".to_string(),
+        ],
         "no Provider request or baseline recall is permitted"
     );
 }
@@ -5048,6 +5214,23 @@ fn u7_correction_producer_patches_the_original_id_before_any_model_request() {
 fn u8_fixed_order_preserves_revision_order_and_independent_integer_oracle() {
     let input = U8OrderInput::fixed();
     assert_eq!(input.rows.len(), 64);
+    assert_eq!(
+        input
+            .rows
+            .iter()
+            .map(|(id, quantity, price)| (id.clone(), *quantity, *price))
+            .collect::<Vec<_>>(),
+        (1..=64u64)
+            .map(|index| {
+                (
+                    format!("PO447-{index:03}"),
+                    (index * 7 + 447) % 9 + 1,
+                    ((index * 11 + 447) % 23 + 1) * 100,
+                )
+            })
+            .collect::<Vec<_>>(),
+        "every frozen row must keep its original id, quantity and price exactly once"
+    );
     assert_eq!(input.total(false), 389_400);
     assert_eq!(input.total(true), 387_900);
     assert_eq!(input.revisions[0], ("PO447-003".into(), Some(12)));
@@ -5157,6 +5340,30 @@ fn u8_body_and_label_are_separate_without_relaxing_body_or_amount() {
 fn u8_long_input_uses_original_history_compiler_with_fixed_bounded_scale() {
     let input = U8OrderInput::long_history();
     assert_eq!(input.rows.len(), 4096);
+    assert_eq!(
+        input
+            .rows
+            .first()
+            .map(|(id, quantity, price)| (id.clone(), *quantity, *price)),
+        Some((
+            "PO447-001".to_string(),
+            (1 * 7 + 447) % 9 + 1,
+            ((1 * 11 + 447) % 23 + 1) * 100
+        )),
+        "the long history must start at the original first row"
+    );
+    assert_eq!(
+        input
+            .rows
+            .last()
+            .map(|(id, quantity, price)| (id.clone(), *quantity, *price)),
+        Some((
+            "PO447-4096".to_string(),
+            (4096 * 7 + 447) % 9 + 1,
+            ((4096 * 11 + 447) % 23 + 1) * 100
+        )),
+        "the long history must end at the original last row"
+    );
     assert_eq!(input.total(false), 24_581_400);
     assert_eq!(input.total(true), 24_579_900);
     let offset = input.prompts[0].find(U8_CLAUSE_BODY).unwrap();
@@ -5232,6 +5439,18 @@ fn u8_original447_case_is_body_correct_under_separate_label_observation() {
     assert_eq!(case["status"], "failed", "oldfrozenreportnotrewritten");
     let phases = case["u8_history"]["phase_results"].as_array().unwrap();
     assert_eq!(phases.len(), 3);
+    let phase_sessions = phases
+        .iter()
+        .map(|phase| phase["session_id"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    let mut distinct_phase_sessions = phase_sessions.clone();
+    distinct_phase_sessions.sort();
+    distinct_phase_sessions.dedup();
+    assert_eq!(
+        distinct_phase_sessions.len(),
+        phase_sessions.len(),
+        "every phase must be a distinct session: {phase_sessions:?}"
+    );
     for p in phases {
         assert!(u8_turn_passed(p, p["session_id"].as_str().unwrap()));
         assert_eq!(p["u8_original_user_sources_present"], true);
@@ -5629,6 +5848,12 @@ fn v2_direct_numeric_answer_distinguishes_correct_wrong_and_unknown() {
         assert_eq!(v2_direct_decision(answer), Some(false), "{answer}");
     }
     assert_eq!(v2_direct_decision("也许是56"), None);
+    assert_eq!(v2_direct_decision("56 大概吧"), None);
+    assert_eq!(
+        v2_direct_decision("56 不正确"),
+        Some(false),
+        "a decided wrong answer must stay decided, not unknown"
+    );
 }
 
 #[test]
@@ -5637,8 +5862,21 @@ fn v2_workspace_version_answer_does_not_accept_a_different_version() {
     assert_eq!(v2_version_decision("Cargo.toml workspace.package.version: 0.0.37", expected), Some(true));
     assert_eq!(v2_version_decision("Cargo.toml version: 0.0.99", expected), Some(false));
     assert_eq!(v2_version_decision("Cargo.toml version 0.0.37 或 0.0.99", expected), Some(false));
-    assert_ne!(v2_version_decision("Cargo.toml 没有 0.0.37", expected), Some(true));
-    assert_ne!(v2_version_decision("版本无法确认", expected), Some(true));
+    assert_eq!(
+        v2_version_decision("Cargo.toml version 0.0.37 或 0.0.99", "0.0.99"),
+        Some(false),
+        "an ambiguous version list must be rejected whichever version is expected"
+    );
+    assert_eq!(
+        v2_version_decision("Cargo.toml 没有 0.0.37", expected),
+        Some(false),
+        "a missing version must be decided as a mismatch, never accepted"
+    );
+    assert_eq!(
+        v2_version_decision("版本无法确认", expected),
+        None,
+        "an undecidable version must stay unknown, never accepted"
+    );
 }
 
 #[test]

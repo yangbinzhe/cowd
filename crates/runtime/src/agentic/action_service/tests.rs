@@ -954,6 +954,7 @@ fn action_id_replay_requires_the_same_actor_and_payload_after_restart() {
     actual_refs.sort_unstable();
     expected_refs.sort_unstable();
     assert_eq!(actual_refs, expected_refs);
+    assert!(!expected.is_empty());
 }
 
 #[test]
@@ -1002,6 +1003,7 @@ fn program_cache_uses_shared_hot_state_budget_without_evicting_foreign_pins_or_j
     names.sort_unstable();
     expected_names.sort_unstable();
     assert_eq!(names, expected_names);
+    assert!(!committed.is_empty());
     assert_eq!(
         cache.len(),
         0,
@@ -1340,6 +1342,7 @@ fn shared_read_model_tracks_durable_head_across_service_handles() {
     after_names.sort_unstable();
     assert_eq!(after_names, ["Research", "Review"]);
     assert_eq!(before.teams.values().map(|team| team.name.as_str()).collect::<Vec<_>>(), ["Research"], "a published snapshot is immutable");
+    assert!(!first_refs.is_empty());
     assert!(!Arc::ptr_eq(&before, &after));
     assert!(Arc::ptr_eq(
         &after,
@@ -2933,6 +2936,8 @@ fn concurrent_actions_serialize_without_stale_revision_loss() {
     expected.sort_unstable();
     assert_eq!(names, expected);
     assert_eq!(projection.revision, 25);
+    assert!(!committed.is_empty());
+    assert_eq!(projection.revision, 1 + committed.len() as u64);
 }
 
 #[test]

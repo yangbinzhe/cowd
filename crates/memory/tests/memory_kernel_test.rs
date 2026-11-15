@@ -359,6 +359,7 @@ async fn memory_kernel_layer_views_project_atoms_read_only() {
     for layer in [MemoryLayer::L0, MemoryLayer::L1, MemoryLayer::L2, MemoryLayer::L3, MemoryLayer::L4] {
         assert_eq!(all.iter().filter(|view| view.layer == layer).count(), 1);
     }
+    assert!(l2.atoms[0].is_explainable_orientation());
     assert_eq!(
         all.iter()
             .find(|view| view.layer == MemoryLayer::L2)

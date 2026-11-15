@@ -6991,6 +6991,7 @@ async fn generalized_coalesced_coordination_wake() {
         .await
         .unwrap();
     assert!(matches!(next.as_slice(), [work] if work.graph_id != fixture.packet.graph_id()), "a coalesced wake dispatches exactly once");
+    assert!(next.iter().all(|work| work.graph_id != fixture.packet.graph_id()));
 }
 
 #[tokio::test]
