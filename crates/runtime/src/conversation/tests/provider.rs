@@ -3768,6 +3768,7 @@ async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_tur
         &original_bytes,
         "initial raw window remains byte-exact after three compressions"
     );
+    assert_eq!(raw_windows.len(), 3, "three compressions must expose three raw windows");
     // A missing raw owner must not fall back to positional references.
     runtime.artifact_store = None;
     runtime

@@ -923,6 +923,7 @@ async fn policy_transition_waits_for_the_active_turn_and_never_cancels_it() {
 fn policy_update_lock_hot_set_does_not_grow_with_session_history() {
     let service = test_runtime_service(Arc::new(ActiveSessionDirectory::default()), None);
     let original_stripes = service.policy_transition_stripes.len();
+    assert_eq!(original_stripes, 64);
     assert!(original_stripes > 0);
     for index in 0..10_000 {
         let lock = service.session_policy_update_lock(&format!("historical-{index}"));
