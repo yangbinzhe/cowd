@@ -673,7 +673,13 @@ mod tests {
         });
         let reached_pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let snapshot = services.graph_state_store().load(&graph_id).unwrap();
+                // The graph is registered by the spawned driver. Until it
+                // exists the original binding cannot be observed yet, so the
+                // wait is deterministic instead of a registration race.
+                let Ok(snapshot) = services.graph_state_store().load(&graph_id) else {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                };
                 if snapshot.node_statuses.get(&node_id) == Some(&ExecutionNodeStatus::Running) {
                     let starts = services
                         .graph_state_store()

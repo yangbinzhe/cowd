@@ -954,7 +954,7 @@ fn action_id_replay_requires_the_same_actor_and_payload_after_restart() {
     actual_refs.sort_unstable();
     expected_refs.sort_unstable();
     assert_eq!(actual_refs, expected_refs);
-    assert!(!expected.is_empty());
+    assert!(!expected_refs.is_empty());
 }
 
 #[test]
@@ -1342,7 +1342,7 @@ fn shared_read_model_tracks_durable_head_across_service_handles() {
     after_names.sort_unstable();
     assert_eq!(after_names, ["Research", "Review"]);
     assert_eq!(before.teams.values().map(|team| team.name.as_str()).collect::<Vec<_>>(), ["Research"], "a published snapshot is immutable");
-    assert!(!first_refs.is_empty());
+    assert!(!first_mutation.changed_refs.is_empty());
     assert!(!Arc::ptr_eq(&before, &after));
     assert!(Arc::ptr_eq(
         &after,

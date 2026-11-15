@@ -522,6 +522,7 @@ async fn r1_475_native_history_real_cancel_commits_same_ticket_receipt() {
     committed_nodes.sort_unstable();
     assert!(!committed_nodes.is_empty());
     assert_eq!(committed_nodes, entered.iter().cloned().collect::<Vec<_>>(), "each original callback runs exactly once");
+    let mut committed = BTreeSet::new();
     assert!(commit_log.iter().all(|id| committed.insert(id.clone())), "each original callback runs exactly once");
     assert!(!committed.is_empty());
     assert_eq!(committed, entered);
@@ -531,6 +532,7 @@ async fn r1_475_native_history_real_cancel_commits_same_ticket_receipt() {
     let mut polled_nodes = polls.clone();
     polled_nodes.sort_unstable();
     assert_eq!(polled_nodes, entered.iter().cloned().collect::<Vec<_>>());
+    let mut polled = BTreeSet::new();
     assert!(polls.iter().all(|id| polled.insert(id.clone())));
     assert_eq!(polled, entered);
     drop(polls);
@@ -650,6 +652,7 @@ async fn r1_475_native_history_poll_error_does_not_prove_cancelled_outcome() {
     let mut polled_nodes = polls.clone();
     polled_nodes.sort_unstable();
     assert_eq!(polled_nodes, entered.iter().cloned().collect::<Vec<_>>());
+    let mut polled = BTreeSet::new();
     assert!(polls.iter().all(|id| polled.insert(id.clone())));
     assert_eq!(polled, entered);
 }
