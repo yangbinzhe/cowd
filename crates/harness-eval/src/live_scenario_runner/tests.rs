@@ -1432,7 +1432,14 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
             "known-bytes" | "cumulative-bytes" => assert!(error.contains("byte budget"), "{error}"),
             "unknown-bytes" => assert!(error.contains("byte budget"), "{error}"),
             "body-timeout" => {
-                assert_eq!(requests.len(), 1);
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|request| request.0.clone())
+                        .collect::<Vec<_>>(),
+                    vec![u5_resource_path(&sessions[0], None, 100)],
+                    "the deadline must abandon the first page read: that request line exactly once, no retry and no halved reissue"
+                );
                 assert!(started.elapsed() < Duration::from_secs(1));
             }
             "transport-abort" => {
@@ -6133,4 +6140,96 @@ fn a_scenario_reference_names_the_file_the_writer_writes() {
         crate::report_store::live_scenario_artifact_name(11, "live_explicit_team/requirement"),
         "012-live_explicit_team_requirement.json"
     );
+}
+
+// 034-5(a): the wedge read durably off cert-d's retained volume - a first
+// refusal at the lease stage, an expired original lease closure, then the same
+// "original call custody remains unknown" block every reconciliation round.
+// Three rounds in a row judge the scenario and release it; waiting for the
+// state machine to produce a terminal that never comes burned 33 more minutes.
+fn unknown_custody_round(commit_cursor: u64) -> Value {
+    json!({
+        "kind": "execution_graph.recovered",
+        "commit_cursor": commit_cursor,
+        "payload": {
+            "cause": "execution_graph.recovered",
+            "reason": "binding lease reconciliation blocked: original call custody remains unknown",
+        },
+    })
+}
+
+#[test]
+fn three_consecutive_unknown_custody_rounds_end_the_watch() {
+    let timeline = json!({"events": [
+        unknown_custody_round(7),
+        unknown_custody_round(8),
+        unknown_custody_round(9),
+    ]});
+    assert_eq!(
+        lease_custody_unknown_streak(&timeline),
+        LEASE_CUSTODY_UNKNOWN_STREAK,
+        "three identical blocked rounds reach the threshold"
+    );
+}
+
+#[test]
+fn two_unknown_custody_rounds_keep_watching() {
+    let timeline = json!({"events": [unknown_custody_round(8), unknown_custody_round(9)]});
+    let streak = lease_custody_unknown_streak(&timeline);
+    assert_eq!(streak, 2);
+    assert!(
+        streak < LEASE_CUSTODY_UNKNOWN_STREAK,
+        "a block that has not repeated three times is not yet a verdict"
+    );
+}
+
+#[test]
+fn any_other_receipt_breaks_the_unknown_custody_streak() {
+    let events = vec![
+        unknown_custody_round(8),
+        unknown_custody_round(9),
+        json!({"kind": "runtime.outcome.recorded.v1", "status": "succeeded", "commit_cursor": 10}),
+        unknown_custody_round(11),
+    ];
+    assert_eq!(
+        lease_custody_unknown_streak(&json!({"events": events})),
+        1,
+        "a settled receipt in between is progress, so the streak restarts"
+    );
+}
+
+#[test]
+fn a_tool_result_quoting_the_marker_is_not_a_blocked_lease() {
+    let timeline = json!({"events": [
+        {"kind": "node.result.updated", "payload": {"delta": {"node_result_updates": {
+            "agent-tool:1": {"result_ref": "agent-tool-outcome:{\"output\":\"binding lease reconciliation blocked: original call custody remains unknown\"}"},
+        }}}},
+        {"kind": "assistant.message.observed", "payload": {"report": {"observations": [
+            {"model_summary": "original call custody remains unknown"},
+        ]}}},
+    ]});
+    assert_eq!(
+        lease_custody_unknown_streak(&timeline),
+        0,
+        "quoted work text is data about a file, not the runtime reporting a block"
+    );
+}
+
+#[test]
+fn the_unknown_custody_streak_still_releases_the_lineage() {
+    let stop = WaitStop {
+        kind: ObservationStopKind::RegisteredTerminal,
+        code: "lease_custody_unknown_streak",
+        message: "lease custody unknown for 3 consecutive reconciliation rounds".to_string(),
+        class: Some("lease_custody_unknown".to_string()),
+        commit_cursor: None,
+    };
+    assert!(
+        observer_may_cancel(&stop),
+        "a registered blocked-lease receipt leaves nothing to wait for: the lineage is released"
+    );
+    let failure = typed_wait_failure(&stop, &json!({"events": []}), "root-1", "live_one_team");
+    assert_eq!(failure["code"], "lease_custody_unknown_streak");
+    assert_eq!(failure["payload"]["observation_stop"]["kind"], "registered_terminal");
+    assert_eq!(failure["payload"]["observation_stop"]["class"], "lease_custody_unknown");
 }

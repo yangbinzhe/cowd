@@ -5010,6 +5010,36 @@ impl LiveScenarioRunner {
                     commit_cursor,
                 });
             }
+            // 034-5(a): a binding lease whose original call custody is unknown
+            // never terminalizes from here. Each reconciliation round only
+            // re-reports the same block, and the watch used to keep reading
+            // them until the absolute window closed (46.2 min for one turn, 8
+            // failed turns before the scenario was judged). Three blocked
+            // receipts in a row is the durable fact that this turn cannot end,
+            // so stop now and release the lineage instead of burning the rest
+            // of the window. The state machine is not touched: 035-3 owns the
+            // absent terminal for unknown custody.
+            let unknown_custody_rounds = lease_custody_unknown_streak(&observer.timeline());
+            if unknown_custody_rounds >= LEASE_CUSTODY_UNKNOWN_STREAK
+                && finalized_non_success.is_none()
+                && root_terminal != RootExecutionTerminal::Completed
+            {
+                observer.mark_stalled();
+                let threshold = LEASE_CUSTODY_UNKNOWN_STREAK;
+                return Err(WaitStop {
+                    kind: ObservationStopKind::RegisteredTerminal,
+                    code: "lease_custody_unknown_streak",
+                    message: format!(
+                        "lease custody unknown for {unknown_custody_rounds} consecutive reconciliation rounds (threshold {threshold}): the original call outcome is durably unknown, so this turn cannot reach a terminal here; failing the scenario and releasing its lineage instead of waiting out the observation window. phase={phase} last_active_phase={last_active_phase} progress_observations={progress_observations} timeline_cursor={timeline_cursor}",
+                        phase = observer.phase(),
+                        last_active_phase = observer.last_active_phase(),
+                        progress_observations = observer.progress_observations(),
+                        timeline_cursor = observer.timeline_cursor().unwrap_or("-"),
+                    ),
+                    class: Some("lease_custody_unknown".to_string()),
+                    commit_cursor: None,
+                });
+            }
             let elapsed = started.elapsed();
             let elapsed_ms = elapsed.as_millis() as u64;
             let since_progress = Duration::from_millis(observer.since_last_progress_ms(elapsed_ms));
@@ -9214,6 +9244,71 @@ fn root_terminal_awaiting_review_reconstruction(
         .unwrap_or("unknown")
         .to_string();
     (class != "succeeded").then(|| (class, event.get("commit_cursor").and_then(Value::as_u64)))
+}
+
+/// 034-5(a): how many consecutive reconciliation rounds must report an unknown
+/// original-call custody before the observer stops watching the turn. Three is
+/// the smallest count that separates a wedged lease from one round of lag.
+const LEASE_CUSTODY_UNKNOWN_STREAK: usize = 3;
+
+/// The durable strings that say a binding lease cannot reach a terminal for the
+/// original call: the closure deadline passed, and every reconciliation round
+/// since says the custody is still unknown.
+const LEASE_CUSTODY_UNKNOWN_MARKERS: [&str; 3] = [
+    "original call custody remains unknown",
+    "binding lease reconciliation blocked",
+    "original lease closure deadline expired",
+];
+
+/// Event fields that carry quoted work rather than what the runtime reported.
+/// A `read_file` of the source above puts those markers inside a tool result;
+/// that is data about text, not a blocked lease, so these fields never count.
+const UNKNOWN_CUSTODY_QUOTED_TEXT_FIELDS: [&str; 7] = [
+    "result_ref",
+    "model_summary",
+    "output",
+    "content",
+    "text",
+    "prompt",
+    "answer",
+];
+
+fn event_reports_unknown_custody(event: &Value) -> bool {
+    let reports = |text: &str| {
+        LEASE_CUSTODY_UNKNOWN_MARKERS
+            .iter()
+            .any(|marker| text.contains(marker))
+    };
+    event
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter(|(field, _)| !UNKNOWN_CUSTODY_QUOTED_TEXT_FIELDS.contains(&field.as_str()))
+        .flat_map(|(_, value)| match value {
+            Value::String(text) => vec![text.as_str()],
+            Value::Object(nested) => nested
+                .iter()
+                .filter(|(field, _)| !UNKNOWN_CUSTODY_QUOTED_TEXT_FIELDS.contains(&field.as_str()))
+                .filter_map(|(_, value)| value.as_str())
+                .collect(),
+            _ => Vec::new(),
+        })
+        .any(reports)
+}
+
+/// How many trailing timeline events in a row report the unknown-custody block.
+/// Any other event - a progress delta, a receipt, a terminal - breaks the run,
+/// so a scenario that is actually working cannot reach the threshold.
+fn lease_custody_unknown_streak(timeline: &Value) -> usize {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(event_reports_unknown_custody)
+        .take_while(|reported| *reported)
+        .count()
 }
 
 /// The typed reason a wait stopped, with the root's durable outcome carried

@@ -49,6 +49,13 @@ def snap(**overrides):
         "task_submits": 0,
         "elapsed_s": 0,
         "last_event_age_s": 0,
+        # 034-5(b): the durable terminal and the vocabulary census. A run with
+        # no `agentic.*` event cannot be judged by its completion requests.
+        "agentic_events": 0,
+        "outcome_records": 0,
+        "outcome_terminal_records": 0,
+        "admissions_granted": 0,
+        "outcome": {},
     }
     base.update(overrides)
     return base
@@ -183,6 +190,77 @@ def _():
         inv(),
     )
     assert conclusion["state"] == "SPINNING", conclusion
+    # 034-5(b): what was observed is the silence, not a completion request this
+    # scenario shape can never raise. The closure counter may only be used as
+    # the cause where the agentic vocabulary exists.
+    causes = [f["root_cause"] for f in conclusion["findings"]]
+    assert causes == ["no substantive event: the run stopped emitting"], causes
+
+
+@case("the completion-request cause needs the agentic vocabulary")
+def _():
+    conclusion = Monitor("").conclude(
+        snap(
+            model_steps=210,
+            completion_requests=0,
+            last_event_age_s=840,
+            agentic_events=26,
+        ),
+        inv(recent_actions=["task_review"]),
+    )
+    causes = [f["root_cause"] for f in conclusion["findings"]]
+    assert "objective never requested: work phase never converges to a completion request" in causes, causes
+
+
+@case("a live loop that records a failed outcome every round is not silence")
+def _():
+    # 034-5(b) mislabel: eight rounds of a working loop, each one writing a
+    # durable `failed` outcome and re-acquiring admission, was reported as
+    # "silent for 140 steps" because neither kind counted as substantive and
+    # completion_requests==0 was vacuously true.
+    conclusion = Monitor("").conclude(
+        snap(
+            model_steps=140,
+            last_event_age_s=40,
+            admissions_granted=8,
+            outcome_records=8,
+            outcome_terminal_records=8,
+            outcome={
+                "status": "failed",
+                "terminal_class": "failed",
+                "terminal_reason": "verification gate not satisfied",
+                "gates": {"evidence_completeness": "partial", "verification_blocked": "true"},
+            },
+        ),
+        inv(),
+    )
+    causes = [f["root_cause"] for f in conclusion["findings"]]
+    assert causes == [
+        "durable outcome terminal repeats as failed: every round records a non-success terminal"
+    ], causes
+    assert any("terminal_reason=verification gate not satisfied" in e
+               for e in conclusion["findings"][0]["evidence"]), conclusion["findings"][0]
+
+
+@case("one durable terminal record is a fact, not a finding")
+def _():
+    conclusion = Monitor("").conclude(
+        snap(
+            last_event_age_s=12,
+            outcome_records=1,
+            outcome_terminal_records=1,
+            outcome={"status": "blocked", "terminal_class": "blocked", "gates": {}},
+        ),
+        inv(),
+    )
+    assert conclusion["state"] == "WORKING", conclusion
+
+
+@case("the substantive kinds include the durable outcome and admission")
+def _():
+    kinds = _module.SUBSTANTIVE_EVENT_KINDS
+    assert "runtime.outcome.recorded.v1" in kinds and "resource.admission.granted" in kinds, kinds
+    assert "evolution.signal" not in kinds, "background projection writes stay excluded"
 
 
 @case("a satisfied verdict is terminal")
