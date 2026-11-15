@@ -4540,7 +4540,6 @@ fn per_task_reports_without_a_synthesis_fail() {
         unsynthesized_ids, task_ids,
         "every task without a synthesis must be named: {unsynthesized_ids:?}"
     );
-        program.tasks.keys().cloned().collect(), "{unsynthesized:?}");
 }
 
 /// A "synthesis" written by the author of a Task it covers is a fourth report,
