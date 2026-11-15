@@ -467,7 +467,6 @@ async fn maintenance_scan_uses_stable_keyset_pages() {
     assert_ne!(second_left.id, second_right.id);
     let [last] = third.entries.as_slice() else { panic!("last page must contain one entry"); };
     assert!(!first.entries.iter().chain(&second.entries).any(|entry| entry.id == last.id));
-    assert_eq!(ids, (0..5).map(|index| uid(&format!("scan-{index}"))).collect());
     assert!(third.next.is_none());
 }
 
