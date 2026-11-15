@@ -273,8 +273,12 @@ impl ExecutionCommitService {
     )
         })();
         fixture.payload.as_object_mut().unwrap().remove("_fixture_issuer_record");
+        let primary_revision = self.event_store.stream_revision(&fixture.stream_id)?;
         self.event_store.append_transaction(AppendTransactionRequest {
-            transaction_id:fixture.transaction_id.clone(),expected_streams:vec![],
+            transaction_id:fixture.transaction_id.clone(),
+            expected_streams:vec![crate::ExpectedStreamRevision {
+                stream_id:fixture.stream_id.clone(), expected_revision:primary_revision,
+            }],
             events:vec![RuntimeTransactionEventInput {event:RuntimeEventInput {
                 stream_id:fixture.stream_id.clone(),scope:fixture.scope,kind:fixture.kind.clone(),status:Some("completed".into()),
                 actor:fixture.actor.clone(),refs:fixture.refs.clone(),payload:fixture.payload.clone(),

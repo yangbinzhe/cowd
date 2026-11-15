@@ -338,8 +338,30 @@ fn verified_context_maps_every_legacy_request_fact_without_payload_inference() {
     assert_eq!(mapped.profile_revision, 7);
     assert_eq!(mapped.credential_epoch, 11);
     assert_eq!(mapped.expires_at_ms, Some(4_000_000_000_000));
-    assert_eq!(mapped.granted_capabilities.len(), 3);
-    assert_eq!(mapped.granted_scopes.len(), 2);
+    assert_eq!(mapped.granted_capabilities.len(), mapped.granted_capabilities.iter().collect::<std::collections::BTreeSet<_>>().len());
+    assert_eq!(mapped.granted_scopes.len(), mapped.granted_scopes.iter().collect::<std::collections::BTreeSet<_>>().len());
+    assert_eq!(
+        mapped
+            .granted_capabilities
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "approval.respond",
+            "reference-app.read",
+            "reference-app.write"
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(
+        mapped
+            .granted_scopes
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["workspace:read", "workspace:write"].into_iter().collect()
+    );
 }
 
 #[test]

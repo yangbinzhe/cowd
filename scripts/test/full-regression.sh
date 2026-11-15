@@ -2,10 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$ROOT/scripts/test/build-env.sh"
 cd "$ROOT"
 
-TEST_TMP_ROOT="${COWD_TEST_TMP_ROOT:-/tmp/cowd-test-$$}"
-mkdir -p "$TEST_TMP_ROOT"
+TEST_TMP_ROOT="$(mktemp -d "${COWD_TEST_PRIVATE_PARENT}/cowd-test-XXXXXXXX")"
 export TMPDIR="$TEST_TMP_ROOT"
 
 cleanup() {

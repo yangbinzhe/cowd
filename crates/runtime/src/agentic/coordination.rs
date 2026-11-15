@@ -42,6 +42,7 @@ pub(crate) mod tests {
         pub task_ref: String,
         pub wake_ref: String,
         pub workspace: tempfile::TempDir,
+        pub primary_execution: String,
     }
 
     impl Fixture {
@@ -278,17 +279,21 @@ pub(crate) mod tests {
         missing_graph: bool,
         process: Option<crate::ProcessJsonlSpec>,
     ) -> Fixture {
-        fixture_with_options(missing_graph, process, None, false, false, None).await
+        fixture_with_options(missing_graph, process, None, false, false, None, false).await
     }
 
     /// A TaskExecute-scoped process fixture. An ordinary write needs an active
     /// Task execution claim, which a Coordination focus does not provide.
     pub(crate) async fn fixture_with_process_task(process: crate::ProcessJsonlSpec) -> Fixture {
-        fixture_with_options(false, Some(process), None, true, true, None).await
+        fixture_with_options(false, Some(process), None, true, true, None, false).await
     }
 
     pub(crate) async fn fixture_with_provider(provider: Arc<crate::ProviderRegistry>) -> Fixture {
-        fixture_with_options(false, None, Some(provider), false, false, None).await
+        fixture_with_options(false, None, Some(provider), false, false, None, false).await
+    }
+
+    pub(crate) async fn fixture_with_original_session() -> Fixture {
+        fixture_with_options(false, None, None, false, false, None, true).await
     }
 
     async fn fixture_with_options(
@@ -298,6 +303,7 @@ pub(crate) mod tests {
         write: bool,
         task_execute: bool,
         runtime_backend: Option<Arc<dyn crate::AgentRuntimeBackend>>,
+        original_session: bool,
     ) -> Fixture {
         let workspace = tempfile::tempdir().unwrap();
         let (permission_ceiling, resource_scopes, required_capabilities) = if write {
@@ -415,14 +421,62 @@ pub(crate) mod tests {
                 ),
             ),
         );
+        let turn_id = format!("coord-turn-{}", workspace.path().display());
+        let (root_execution_id, _session_bus) = if original_session {
+            let store = Arc::new(crate::test_support::session_store());
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            store.create_session(&session::SessionRecord {
+                session_id: "coord-session".into(), platform: "test".into(), chat_id: "coord".into(),
+                user_id: None, model: None, created_at: timestamp.clone(), last_activity: timestamp,
+                message_count: 0, reset_policy: "manual".into(), metadata_json: None,
+                input_tokens: 0, output_tokens: 0, status: "active".into(),
+            }).await.unwrap();
+            let router = services.install_test_session_store(Arc::clone(&store)).unwrap();
+            let admission = store.get_session_input_admission("coord-session").await.unwrap().unwrap();
+            let now = chrono::Utc::now().timestamp_millis() as u64;
+            let request = crate::RuntimeSessionIngressCommand {
+                input_id: "coord-input".into(), request_id: "coord-request".into(), turn_id: turn_id.clone(),
+                message_id: "coord-message".into(), session_generation: admission.generation,
+                decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                target_turn_id: None, classification_json: None, task_route_hint: None,
+                created_at_ms: now, runtime_options_json: None,
+            };
+            router.persist_input("coord-session", "coordinate evidence", &request).await.unwrap();
+            let claimed = store.claim_session_runtime_outbox("coord-worker", now, 120_000, 1, &[])
+                .await.unwrap().pop().expect("original Session claim");
+            let running = store.mark_session_runtime_outbox_running(&claimed.request_id, "coord-worker",
+                claimed.session_generation, claimed.claim_token.as_deref().unwrap(), claimed.revision, now)
+                .await.unwrap();
+            let ingress = crate::TurnIngressRef {
+                request_id: running.request_id.clone(), turn_id: running.turn_id.clone(),
+                message_id: running.message_id.clone(), session_id: running.session_id.clone(),
+                primary_task_id: "coord-task".into(), root_task_id: "coord-task".into(),
+                session_generation: running.session_generation, input_sequence: running.sequence as u64,
+                claim_owner: running.claim_owner.clone().unwrap(), claim_token: running.claim_token.clone().unwrap(),
+                claim_revision: running.claim_fence_epoch.unwrap(), handoff_id: None,
+            };
+            let execution_id = crate::session_ingress_graph_id(&ingress.session_id, &ingress.request_id, &ingress.turn_id);
+            let control = services.create_turn_cancellation_control(&execution_id, &ingress).unwrap();
+            services.record_live_execution(&ingress.session_id, execution_id.clone(), ingress.turn_id.clone());
+            let lease = services.bind_active_execution_bus(execution_id.clone(), crate::CowdEventBus::new()).unwrap();
+            let fence = crate::SessionExecutionFence::from_claim(services.session_query_port().unwrap(),
+                ingress.request_id.clone(), ingress.session_id.clone(), ingress.session_generation,
+                ingress.input_sequence as usize, ingress.claim_owner.clone(), ingress.claim_token.clone()).unwrap();
+            let input = crate::SessionInputStream::new(ingress.session_id.clone());
+            input.set_active_turn(Some(harness_contract::turn::TurnId::from_string(&ingress.turn_id)));
+            lease.install_session_fence(&ingress, fence, control, input,
+                Arc::new(crate::conversation::OriginalTurnInputControl::default()),
+                crate::permissions::PermissionPolicy::new(crate::permissions::PermissionMode::ReadOnly)).unwrap();
+            (Some(execution_id), Some(lease))
+        } else { (None, None) };
         let actions = services.agent_action_service();
         let root = AgentActorBinding {
             original_execution: None,
             objective_id: "coord-objective".into(),
             program_id: "coord-program".into(),
             session_id: "coord-session".into(),
-            turn_id: format!("coord-turn-{}", workspace.path().display()),
-            root_execution_id: None,
+            turn_id,
+            root_execution_id,
             required_team_count: 0,
             exact_team_count: None,
             objective_summary: "coordinate evidence".into(),
@@ -502,44 +556,52 @@ pub(crate) mod tests {
                 task_ref,
                 wake_ref: String::new(),
                 workspace,
+                primary_execution: receipts[0].graph_id.clone(),
             };
         }
-        let mut author = root.clone();
-        author.actor_id = owner.clone();
-        author.agent_id = Some(owner);
-        author.team_id = Some(team.clone());
-        author.kind = AgentActorKind::Agent;
-        author.execution_id = Some("primary-execution".into());
-        let mut primary =
-            harness_contract::execution_graph::ExecutionGraph::new("active primary fixture");
-        primary.id = "primary-execution".into();
-        primary.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
-            session_id: root.session_id.clone(),
-            turn_id: root.turn_id.clone(),
-            root_task_id: task_ref.clone(),
-            task_id: task_ref.clone(),
-            generation: 1,
-        });
-        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
-            harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
-            "inline_model",
-            "held primary",
-        );
-        node.id = "primary-node".into();
-        primary.node_statuses.insert(
-            node.id.clone(),
-            harness_contract::execution_graph::ExecutionNodeStatus::Planned,
-        );
-        primary.nodes.push(node);
-        services.commit_service().register_graph(primary).unwrap();
-        apply(
-            "primary-claim",
-            &author,
-            AgentAction::TaskClaim(TaskClaimInput {
-                task_ref: task_ref.clone(),
-                reason: Some("own the original work".into()),
-            }),
-        );
+        // The primary is a real production dispatch: the physical-identity gate
+        // authenticates the running graph, its binding and start ticket, so the
+        // author is resolved from the dispatched attempt, not a bare synthetic claim.
+        let primary_receipts = services
+            .dispatch_ready_agentic_work("coord-program")
+            .await
+            .unwrap();
+        assert_eq!(primary_receipts.len(), 1, "{primary_receipts:?}");
+        assert_eq!(primary_receipts[0].mode, "execute");
+        let primary_execution = primary_receipts[0].graph_id.clone();
+        let primary_graph = services
+            .graph_state_store()
+            .load(&primary_execution)
+            .unwrap();
+        let primary_node = primary_graph.nodes[0].id.clone();
+        let primary_attempt = primary_graph.recovery_cursor.node_attempts[&primary_node];
+        let author = services
+            .resolve_agent_action_actor_for_attempt(
+                &harness_contract::execution_graph::ExecutionParentBinding {
+                    execution_id: primary_execution.clone(),
+                    node_id: primary_node,
+                },
+                primary_attempt,
+                Some(root.clone()),
+            )
+            .await
+            .unwrap();
+        if actions
+            .project("coord-program")
+            .unwrap()
+            .tasks[&task_ref]
+            .claim_execution_id
+            .is_none()
+        {
+            apply(
+                "primary-claim",
+                &author,
+                AgentAction::TaskClaim(TaskClaimInput {
+                    task_ref: task_ref.clone(),
+                    reason: Some("own the original work".into()),
+                }),
+            );
+        }
         let request = AgentActionEnvelope {action_id:"help-request".into(),actor:author,expected_revision:None,
             action:AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
                 "topic_ref":format!("topic:{team}"),"summary":"Check the boundary condition in source A","recipients":[helper],
@@ -566,18 +628,22 @@ pub(crate) mod tests {
             supervisor.actor_id = "runtime.program-supervisor".into();
             supervisor.kind = AgentActorKind::Supervisor;
             supervisor.execution_id = Some(graph_id.clone());
-            apply(
-                "registered-before-crash",
-                &supervisor,
-                AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
-                    task_ref: task_ref.clone(),
-                    execution_id: graph_id.clone(),
-                    agent_ref: helper.clone(),
-                    membership_id: AgenticProgramProjection::membership_id(&helper, &team),
-                    mode: AgentAttemptMode::Coordination,
-                    generation: wake.revision,
-                }),
-            );
+            let registered = actions
+                .apply_runtime_supervisor(&AgentActionEnvelope {
+                    action_id: "registered-before-crash".into(),
+                    actor: supervisor,
+                    expected_revision: None,
+                    action: AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                        task_ref: task_ref.clone(),
+                        execution_id: graph_id.clone(),
+                        agent_ref: helper.clone(),
+                        membership_id: AgenticProgramProjection::membership_id(&helper, &team),
+                        mode: AgentAttemptMode::Coordination,
+                        generation: wake.revision,
+                    }),
+                })
+                .unwrap();
+            assert_eq!(registered.status, AgentActionStatus::Applied, "{registered:?}");
             Some(graph_id)
         } else {
             None
@@ -622,17 +688,26 @@ pub(crate) mod tests {
             task_ref,
             wake_ref,
             workspace,
+            primary_execution,
         }
     }
 
     pub(crate) async fn actor(fixture: &Fixture) -> AgentActorBinding {
+        let graph = fixture
+            .services
+            .graph_state_store()
+            .load(fixture.packet.graph_id())
+            .unwrap();
+        let node_id = fixture.packet.node_id();
+        let attempt = graph.recovery_cursor.node_attempts[node_id];
         fixture
             .services
-            .resolve_agent_action_actor(
+            .resolve_agent_action_actor_for_attempt(
                 &harness_contract::execution_graph::ExecutionParentBinding {
                     execution_id: fixture.packet.graph_id().into(),
                     node_id: fixture.packet.node_id().into(),
                 },
+                attempt,
                 None,
             )
             .await
@@ -649,211 +724,187 @@ pub(crate) mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn coordination_visibility_respects_active_teams_recipients_and_program_topic() {
-        let fixture = fixture(false).await;
-        let actions = fixture.services.agent_action_service();
-        let mut root = fixture.request.actor.clone();
-        root.kind = AgentActorKind::Root;
-        root.actor_id = "root:coord-session".into();
-        root.agent_id = None;
-        root.team_id = None;
-        root.execution_id = None;
-        let create = |id: &str, action| {
-            let out = actions
-                .apply(&AgentActionEnvelope {
-                    action_id: id.into(),
-                    actor: root.clone(),
-                    expected_revision: None,
-                    action,
-                })
-                .unwrap();
-            assert_eq!(out.status, AgentActionStatus::Applied, "{out:?}");
-            out.changed_refs[0].clone()
+    // Migration (034 judgment-chain closure): the four original coordination
+    // real-PG topologies were moved out of this runtime module into explicit
+    // ignored Gateway real-PG tests (same frozen base 2dcd87f1):
+    //   crates/gateway/src/runtime/tests/coordination_original_pg.rs
+    //   runtime_service::tests::coordination_original_pg::{
+    //     coordination_visibility_respects_active_teams_recipients_and_program_topic,
+    //     coordination_failure_and_epoch_change_do_not_punish_primary_work,
+    //     coordination_missing_graph_recovers_same_registered_attempt,
+    //     coordination_request_coalesces_and_preserves_scope}
+    // The three default controls below exercise only the Program reducer and
+    // visibility queries; they do not prove real Session, dispatch, or actor
+    // admission. missing-graph startup recovery is an integration contract with
+    // no pure equivalent. Mapping: plan/2026-11/1113-cowd-judgment-chain-closure/
+    // coordination-fixture-pg-migration.md.
+    // These tests exercise only the Program reducer and visibility queries;
+    // Session/physical admission is covered by the separate PG tests below.
+    fn business_case() -> (AgenticProgramProjection, AgentActionEnvelope, String, String, String, String) {
+        let actions = crate::AgentActionService::new(Arc::new(crate::RuntimeEventStore::for_test()));
+        let root = AgentActorBinding {
+            original_execution: None, objective_id: "business-objective".into(), program_id: "business-program".into(),
+            session_id: "business-session".into(), turn_id: "business-turn".into(), root_execution_id: None,
+            required_team_count: 0, exact_team_count: None, objective_summary: "coordinate".into(),
+            model_lease: "test".into(), permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: vec!["read:.".into()], actor_id: "root:business-session".into(), kind: AgentActorKind::Root,
+            execution_id: None, team_id: None, agent_id: None,
         };
-        let foreign_team = create(
-            "foreign-team",
-            AgentAction::TeamCreate(TeamCreateInput {
-                name: "Other".into(),
-                mission: "other evidence".into(),
-                objective: None,
-            }),
-        );
-        let foreign_member = create("foreign-member", AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
-            "team_ref":foreign_team,"role":"Reader","mission":"read public evidence","required_capabilities":["read"]
+        let apply_root = |id: &str, action| actions.apply(&AgentActionEnvelope {
+            action_id: id.into(), actor: root.clone(), expected_revision: None, action,
+        }).unwrap().changed_refs[0].clone();
+        let team = apply_root("business-team", AgentAction::TeamCreate(TeamCreateInput {
+            name: "Evidence".into(), mission: "check".into(), objective: None,
+        }));
+        let foreign_team = apply_root("business-foreign-team", AgentAction::TeamCreate(TeamCreateInput {
+            name: "Other".into(), mission: "check".into(), objective: None,
+        }));
+        let invite = |id: &str, target: &str| apply_root(id, AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
+            "team_ref":target,"role":"Reader","mission":"check","required_capabilities":["read"]
         })).unwrap()));
-        let private = actions.project("coord-program").unwrap();
-        let revision = private.coordination_requests()[0].1.revision;
-        assert!(private.agent_is_active_in(&foreign_member, &foreign_team));
-        assert!(private
-            .coordination_team_id_for(&foreign_member, revision)
-            .is_none());
-        // Even an explicit recipient cannot read a different private Team's Topic.
-        let mut request = fixture.request.clone();
-        request.action_id = "private-cross-team-recipient".into();
+        let owner = invite("business-owner", &team);
+        let helper = invite("business-helper", &team);
+        let foreign = invite("business-foreign", &foreign_team);
+        let task = apply_root("business-task", AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
+            "team_ref":team,"title":"Evidence","objective":"verify","acceptance":"checked","required_capabilities":["read"]
+        })).unwrap()));
+        let mut projection = actions.project("business-program").unwrap();
+        let mut supervisor = root.clone();
+        supervisor.kind = AgentActorKind::Supervisor;
+        supervisor.actor_id = "runtime.program-supervisor".into();
+        supervisor.execution_id = Some("business-primary".into());
+        let dispatch = AgentActionEnvelope { action_id: "business-dispatch".into(), actor: supervisor,
+            expected_revision: None, action: AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                task_ref: task.clone(), execution_id: "business-primary".into(), agent_ref: owner.clone(),
+                membership_id: AgenticProgramProjection::membership_id(&owner, &team),
+                mode: AgentAttemptMode::Execute, generation: 0,
+            }) };
+        let next = projection.revision + 1;
+        projection.apply(&dispatch, None, next, 1);
+        let mut author = root;
+        author.kind = AgentActorKind::Agent;
+        author.actor_id = owner.clone(); author.agent_id = Some(owner);
+        author.team_id = Some(team.clone()); author.execution_id = Some("business-primary".into());
+        let claim = AgentActionEnvelope {
+            action_id: "business-primary-claim".into(), actor: author.clone(), expected_revision: None,
+            action: AgentAction::TaskClaim(TaskClaimInput { task_ref: task.clone(), reason: None }),
+        };
+        let next = projection.revision + 1;
+        projection.apply(&claim, None, next, 2);
+        assert_eq!(projection.tasks[&task].claim_execution_id.as_deref(), Some("business-primary"));
+        let request = AgentActionEnvelope { action_id: "business-help".into(), actor: author, expected_revision: None,
+            action: AgentAction::MessagePublish(serde_json::from_value(serde_json::json!({
+                "topic_ref":format!("topic:{team}"),"summary":"Check source A", "recipients":[helper],
+                "intent":{"kind":"request_help","task_ref":task}
+            })).unwrap()) };
+        let next = projection.revision + 1;
+        projection.apply(&request, Some("message:business-help"), next, 2);
+        (projection, request, team, task, foreign_team, foreign)
+    }
+
+    #[test]
+    fn coordination_business_visibility_uses_team_and_program_scope() {
+        let (mut projection, mut request, _team, _task, foreign_team, foreign) = business_case();
+        let revision = projection.coordination_requests()[0].1.revision;
+        assert!(projection.agent_is_active_in(&foreign, &foreign_team));
+        assert!(projection.coordination_team_id_for(&foreign, revision).is_none());
+        if let AgentAction::MessagePublish(input) = &mut request.action { input.recipients = vec![foreign.clone()]; }
+        request.action_id = "business-private-recipient".into();
+        let next = projection.revision + 1;
+        projection.apply(&request, Some("message:business-private"), next, 3);
+        assert!(projection.coordination_team_id_for(&foreign, next).is_none());
         if let AgentAction::MessagePublish(input) = &mut request.action {
-            input.recipients = vec![foreign_member.clone()];
+            input.topic_ref = format!("topic:{}", projection.program_id);
+            input.recipients = vec![foreign.clone()];
         }
-        let observation = actions.apply(&request).unwrap();
-        if observation.status == AgentActionStatus::Applied {
-            let projection = actions.project("coord-program").unwrap();
-            assert!(projection
-                .coordination_team_id_for(&foreign_member, projection.revision)
-                .is_none());
-        }
-        let program_topic = format!("topic:{}", private.program_id);
-        request.action_id = "public-cross-team-request".into();
-        if let AgentAction::MessagePublish(input) = &mut request.action {
-            input.topic_ref = program_topic;
-        }
-        assert_eq!(
-            actions.apply(&request).unwrap().status,
-            AgentActionStatus::Applied
-        );
-        let projection = actions.project("coord-program").unwrap();
-        assert_eq!(
-            projection.coordination_team_id_for(&foreign_member, projection.revision),
-            Some(foreign_team.as_str())
-        );
-        assert!(projection
-            .coordination_team_id_for(
-                &fixture.packet.agentic_binding.as_ref().unwrap().agent_id,
-                projection.revision
-            )
-            .is_none());
+        request.action_id = "business-public".into();
+        let next = projection.revision + 1;
+        projection.apply(&request, Some("message:business-public"), next, 3);
+        assert_eq!(projection.coordination_team_id_for(&foreign, next), Some(foreign_team.as_str()));
+        assert!(projection.coordination_team_id_for(&request.actor.actor_id, next).is_none());
     }
 
-    #[tokio::test]
-    async fn coordination_failure_and_epoch_change_do_not_punish_primary_work() {
-        let fixture = fixture(false).await;
-        fixture
-            .services
-            .settle_abandoned_agentic_attempt(
-                &fixture.packet,
-                "fixture backend failed before replying",
-            )
-            .await
-            .unwrap();
-        let actions = fixture.services.agent_action_service();
-        let failed = actions.project("coord-program").unwrap();
-        assert_eq!(
-            failed.tasks[&fixture.task_ref]
-                .claim_execution_id
-                .as_deref(),
-            Some("primary-execution")
-        );
-        assert_eq!(failed.tasks[&fixture.task_ref].failed_attempts, 0);
-        assert!(failed.coordination_requests()[0]
-            .1
-            .coordination
-            .as_ref()
-            .unwrap()
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("failed before replying"));
-        assert!(fixture
-            .services
-            .dispatch_ready_agentic_work("coord-program")
-            .await
-            .unwrap()
-            .is_empty());
-        // A fresh Task epoch invalidates an otherwise unhandled old request.
-        let mut release = fixture.request.clone();
-        release.action_id = "primary-release".into();
-        release.action = AgentAction::TaskRelease(TaskReleaseInput {
-            task_ref: fixture.task_ref.clone(),
-            reason: "replan the source".into(),
-            expected_claim_generation: Some(actions.project("coord-program").unwrap().tasks[&fixture.task_ref].claim_generation),
+    #[test]
+    fn coordination_business_failure_and_epoch_keep_primary_work() {
+        let (mut projection, request, team, task, _, _) = business_case();
+        let wake = projection.coordination_requests()[0].1.revision;
+        let helper = projection.active_team_ids_for(&request.actor.actor_id);
+        assert!(helper.contains(&team.as_str()));
+        let primary = projection.tasks[&task].claim_execution_id.clone();
+        assert_eq!(primary.as_deref(), Some("business-primary"));
+        let mut supervisor = request.clone();
+        supervisor.actor.kind = AgentActorKind::Supervisor;
+        let helper_id = match &request.action { AgentAction::MessagePublish(input) => input.recipients[0].clone(), _ => unreachable!() };
+        supervisor.action = AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+            task_ref: task.clone(), execution_id: "business-coordination".into(), agent_ref: helper_id.clone(),
+            membership_id: AgenticProgramProjection::membership_id(&helper_id, &team),
+            mode: AgentAttemptMode::Coordination, generation: wake,
         });
-        assert_eq!(
-            actions.apply(&release).unwrap().status,
-            AgentActionStatus::Applied
-        );
-        let mut claim = fixture.request.clone();
-        claim.action_id = "primary-next-epoch".into();
-        claim.action = AgentAction::TaskClaim(TaskClaimInput {
-            task_ref: fixture.task_ref.clone(),
-            reason: None,
+        let next = projection.revision + 1;
+        projection.apply(&supervisor, None, next, 3);
+        supervisor.action = AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+            task_ref: task.clone(), execution_id: "business-coordination".into(), mode: AgentAttemptMode::Coordination,
+            reason: "failed before replying".into(), retryable: false,
         });
-        assert_eq!(
-            actions.apply(&claim).unwrap().status,
-            AgentActionStatus::Applied
-        );
-        let after = actions.project("coord-program").unwrap();
-        assert!(!after.coordination_request_current(after.coordination_requests()[0].1));
+        let next = projection.revision + 1;
+        projection.apply(&supervisor, None, next, 3);
+        assert_eq!(projection.tasks[&task].claim_execution_id, primary);
+        assert_eq!(projection.tasks[&task].failed_attempts, 0);
+        assert!(projection.coordination_wake(wake).unwrap().1.coordination.as_ref().unwrap().reason.as_deref().unwrap().contains("failed before replying"));
+        let mut release = request.clone();
+        release.action = AgentAction::TaskRelease(TaskReleaseInput { task_ref: task.clone(), reason: "replan".into(),
+            expected_claim_generation: Some(projection.tasks[&task].claim_generation) });
+        let next = projection.revision + 1;
+        projection.apply(&release, None, next, 4);
+        assert_eq!(projection.tasks[&task].claim_execution_id, None);
+        assert!(!projection.tasks[&task].active_attempts.contains_key("business-primary"));
+        let next_execution = "business-next-execution";
+        let next_generation = projection.tasks[&task].claim_generation;
+        supervisor.action = AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+            task_ref: task.clone(), execution_id: next_execution.into(), agent_ref: request.actor.actor_id.clone(),
+            membership_id: AgenticProgramProjection::membership_id(&request.actor.actor_id, &team),
+            mode: AgentAttemptMode::Execute, generation: next_generation,
+        });
+        let next = projection.revision + 1;
+        projection.apply(&supervisor, None, next, 5);
+        assert!(projection.tasks[&task].active_attempts.contains_key(next_execution));
+        assert_ne!(Some(next_execution), primary.as_deref());
+        let mut claim = request;
+        claim.actor.execution_id = Some(next_execution.into());
+        claim.action = AgentAction::TaskClaim(TaskClaimInput { task_ref: task.clone(), reason: None });
+        let next = projection.revision + 1;
+        projection.apply(&claim, None, next, 6);
+        assert_eq!(projection.tasks[&task].claim_execution_id.as_deref(), Some(next_execution));
+        assert!(!projection.coordination_request_current(projection.coordination_wake(wake).unwrap().1));
     }
 
-    #[tokio::test]
-    async fn coordination_missing_graph_recovers_same_registered_attempt() {
-        let fixture = fixture(true).await;
-        assert!(fixture
-            .services
-            .recover_agentic_programs_on_startup()
-            .await
-            .unwrap()
-            .is_empty());
-        let projection = fixture
-            .services
-            .agent_action_service()
-            .project("coord-program")
-            .unwrap();
-        assert_eq!(projection.tasks[&fixture.task_ref].failed_attempts, 0);
-        assert_eq!(projection.tasks[&fixture.task_ref].active_attempts.len(), 1);
-        actor(&fixture).await;
-    }
-
-    #[tokio::test]
-    async fn coordination_request_coalesces_and_preserves_scope() {
-        let fixture = fixture(false).await;
-        let actions = fixture.services.agent_action_service();
+    #[test]
+    fn coordination_business_coalesces_identical_requests() {
+        let (mut projection, mut request, _, _, _, foreign) = business_case();
         for index in 0..128 {
-            let mut duplicate = fixture.request.clone();
-            duplicate.action_id = format!("duplicate-{index}");
-            assert_eq!(
-                actions.apply(&duplicate).unwrap().status,
-                AgentActionStatus::Applied
-            );
+            request.action_id = format!("business-repeat-{index}");
+            let next = projection.revision + 1;
+            projection.apply(&request, Some(&format!("message:repeat-{index}")), next, next);
         }
-        let projection = actions.project("coord-program").unwrap();
-        assert_eq!(projection.coordination_requests().len(), 1);
-        assert!(fixture
-            .services
-            .dispatch_ready_agentic_work("coord-program")
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(projection
-            .coordination_team_id_for(
-                &fixture.request.actor.actor_id,
-                projection.coordination_requests()[0].1.revision
-            )
-            .is_none());
-        assert!(projection
-            .coordination_team_id_for(
-                "foreign-agent",
-                projection.coordination_requests()[0].1.revision
-            )
-            .is_none());
-        let mut changed = fixture.request.clone();
-        changed.action_id = "new-evidence".into();
-        if let AgentAction::MessagePublish(input) = &mut changed.action {
-            input.summary = Some("New source B contradicts A".into());
+        let mut canonical = std::collections::BTreeSet::new();
+        for (_, entry) in projection.coordination_requests() {
+            assert!(canonical.insert(entry.entry_id.clone()));
         }
-        assert_eq!(
-            actions.apply(&changed).unwrap().status,
-            AgentActionStatus::Applied
-        );
-        assert_eq!(
-            actions
-                .project("coord-program")
-                .unwrap()
-                .coordination_requests()
-                .len(),
-            2
-        );
+        assert_eq!(canonical, std::collections::BTreeSet::from(["message:business-help".to_string()]));
+        let revision = projection.coordination_requests()[0].1.revision;
+        assert!(projection.coordination_team_id_for(&request.actor.actor_id, revision).is_none());
+        assert!(projection.coordination_team_id_for(&foreign, revision).is_none());
+        if let AgentAction::MessagePublish(input) = &mut request.action { input.summary = Some("New source B".into()); }
+        let next = projection.revision + 1;
+        projection.apply(&request, Some("message:business-changed"), next, next);
+        let mut expected = canonical;
+        assert!(expected.insert("message:business-changed".to_string()));
+        let mut actual = std::collections::BTreeSet::new();
+        for (_, entry) in projection.coordination_requests() {
+            assert!(actual.insert(entry.entry_id.clone()));
+        }
+        assert_eq!(actual, expected);
     }
-
 
 }
 
@@ -988,5 +1039,28 @@ impl AgenticProgramProjection {
             .values()
             .find_map(|task| task.active_attempts.get(execution_id))
             .filter(|attempt| attempt.mode == AgentAttemptMode::Coordination)
+    }
+}
+
+/// Narrow read-only observation surface for the Gateway real-PG coordination
+/// tests. These expose the canonical Program projection queries (no rebuilt
+/// projection) under the test-fixtures feature only; production visibility is
+/// unchanged.
+#[cfg(feature = "test-fixtures")]
+impl AgenticProgramProjection {
+    pub fn coordination_requests_for_test(&self) -> Vec<(String, AgenticTopicEntryProjection)> {
+        self.coordination_requests()
+            .into_iter()
+            .map(|(topic, entry)| (topic.to_string(), entry.clone()))
+            .collect()
+    }
+
+    pub fn coordination_team_id_for_test(&self, agent_id: &str, revision: u64) -> Option<String> {
+        self.coordination_team_id_for(agent_id, revision)
+            .map(|team| team.to_string())
+    }
+
+    pub fn coordination_request_current_for_test(&self, entry: &AgenticTopicEntryProjection) -> bool {
+        self.coordination_request_current(entry)
     }
 }

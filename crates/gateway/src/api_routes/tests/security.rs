@@ -356,7 +356,9 @@
             .lifecycle_snapshot_value(Some("session-a"))
             .await;
         let attachments = lifecycle["snapshot"]["attachments"].as_array().unwrap();
-        assert_eq!(attachments.len(), 2);
+        let mut actor_ids = attachments.iter().map(|attachment| attachment["actor"]["actor_id"].as_str().unwrap()).collect::<Vec<_>>();
+        actor_ids.sort_unstable();
+        assert_eq!(actor_ids, ["principal:local-human:surface:tui:other-writer", "principal:local-human:surface:tui:test"]);
         assert!(attachments.iter().all(|attachment| {
             attachment["actor"]["actor_id"] != "principal:local-human:surface:tui:reader"
         }));
@@ -1492,8 +1494,9 @@ providers:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_id"], session_id);
         assert_eq!(json["total"], 2);
-        assert_eq!(json["envelopes"].as_array().unwrap().len(), 2);
-        assert_eq!(json["summaries"].as_array().unwrap().len(), 2);
+        for field in ["envelopes", "summaries"] {
+            assert_eq!(json[field].as_array().unwrap().iter().map(|item| item["envelope_id"].as_str().unwrap()).collect::<Vec<_>>(), ["env-1", "env-2"]);
+        }
         assert_eq!(json["envelopes"][0]["sequence"], 1);
         assert_eq!(json["envelopes"][0]["envelope_id"], "env-1");
         assert_eq!(json["envelopes"][0]["run_id"], "run-env-1");
@@ -1545,8 +1548,8 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["include_envelopes"], false);
-        assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
-        assert_eq!(json["summaries"].as_array().unwrap().len(), 1);
+        assert!(json["envelopes"].as_array().unwrap().is_empty());
+        assert!(matches!(json["summaries"].as_array().unwrap().as_slice(), [summary] if summary["envelope_id"] == "env-summary"));
         assert_eq!(json["summaries"][0]["envelope_id"], "env-summary");
         assert_eq!(json["summaries"][0]["intent"], "summary");
     }
@@ -1599,8 +1602,8 @@ providers:
         assert_eq!(json["total"], 3);
         assert_eq!(json["has_more"], true);
         assert_eq!(json["next_seq"], 4);
-        assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
-        assert_eq!(json["summaries"].as_array().unwrap().len(), 2);
+        assert!(json["envelopes"].as_array().unwrap().is_empty());
+        assert_eq!(json["summaries"].as_array().unwrap().iter().map(|summary| summary["envelope_id"].as_str().unwrap()).collect::<Vec<_>>(), ["env-page-1", "env-page-3"]);
         assert_eq!(json["summaries"][0]["envelope_id"], "env-page-1");
         assert_eq!(json["summaries"][1]["envelope_id"], "env-page-3");
     }
@@ -1658,7 +1661,7 @@ providers:
         assert_eq!(history_json["session_id"], session_id);
         assert_eq!(history_json["include_envelopes"], false);
         assert_eq!(history_json["total"], 1);
-        assert_eq!(history_json["summaries"].as_array().unwrap().len(), 1);
+        assert!(matches!(history_json["summaries"].as_array().unwrap().as_slice(), [summary] if summary["envelope_id"] == "env-log-1"));
 
         let detail_response = app
             .oneshot(
@@ -1781,9 +1784,9 @@ providers:
 
         assert_eq!(response.status(), StatusCode::OK);
         let events = store.get_events(session_id, 0).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, session::SESSION_DOMAIN_EVENT_TYPE);
-        let event = session::SessionDomainEvent::from_session_event(&events[0]).unwrap();
+        let [event] = events.as_slice() else { panic!("expected one original recommendation event") };
+        assert_eq!(event.event_type, session::SESSION_DOMAIN_EVENT_TYPE);
+        let event = session::SessionDomainEvent::from_session_event(event).unwrap();
         assert_eq!(event.kind, "context.recommendation_action");
         let payload = event.payload;
         assert_eq!(payload["envelope_id"], "env-1");

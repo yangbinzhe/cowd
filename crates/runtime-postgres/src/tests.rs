@@ -27,7 +27,8 @@ async fn own865_checkpoint_metadata_does_not_fetch_body_and_tracks_row_replaceme
     assert!(metadata.compact_body.is_none());
     assert_eq!(repository.body_query_count.load(std::sync::atomic::Ordering::Relaxed), before);
     let body = repository.object(&artifact.sha256).unwrap().unwrap();
-    assert_eq!(body.compact_body.unwrap().len(), 242788);
+    let compact_body = body.compact_body.unwrap();
+    assert_eq!(compact_body.len(), metadata.bytes as usize);
     assert_eq!(repository.body_query_count.load(std::sync::atomic::Ordering::Relaxed), before + 1);
     let executor = fixture.reconnect();
     let mut connection = executor.checkout_critical().unwrap();
@@ -708,6 +709,7 @@ fn r1_content_gc_prepared_inventory_resumes_after_retained_prefix() {
     }
     let high = repository.prepared_high_water().unwrap().unwrap();
     let page = repository.prepared_page(None, &high, 100).unwrap();
+    assert_eq!(page.candidates.iter().map(|candidate| candidate.record.sha256.clone()).collect::<std::collections::BTreeSet<_>>().len(), 100);
     assert_eq!(page.candidates.len(), 100);
     assert!(!page.complete);
     let view = events.quiesced_content_roots();
@@ -1057,7 +1059,7 @@ fn r1_content_gc_postgres_graph_goal_business_source_cas_and_reopen() {
 
 #[test]
 fn runtime_event_clean_baseline_has_current_fences_and_discovery_index() {
-    assert_eq!(RUNTIME_EVENT_MIGRATIONS.len(), 1);
+    assert_eq!(RUNTIME_EVENT_MIGRATIONS.iter().map(|migration| migration.id).collect::<Vec<_>>(), vec!["runtime_event.current-baseline"]);
     assert_eq!(
         RUNTIME_EVENT_MIGRATIONS[0].id,
         "runtime_event.current-baseline"
@@ -1248,7 +1250,7 @@ fn r1_bounded_history_mission_metadata_precedes_payload_and_limits_driver_bytes(
                 1024 * 1024,
             )
             .unwrap();
-        assert_eq!(old_lines.len(), 1);
+        assert_eq!(old_lines.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![old.event_id.as_str()]);
         assert_eq!(old_lines[0].event_id, old.event_id);
         assert!(store
             .recent_event_lines("mission:empty", &[], 0, 50, 1024 * 1024)
@@ -1309,7 +1311,8 @@ fn r1_bounded_history_mission_metadata_precedes_payload_and_limits_driver_bytes(
             let batches = store
                 .events_after_cursor(receipt.commit_cursor - 1, 1)
                 .unwrap();
-            assert_eq!(batches.len(), 1);
+            let expected_transaction = format!("recent-cohort-{first}");
+            assert_eq!(batches.iter().map(|batch| batch.transaction_id.as_str()).collect::<Vec<_>>(), vec![expected_transaction.as_str()]);
             for event in &batches[0].events {
                 if !event
                     .refs
@@ -1526,11 +1529,11 @@ fn r1_bounded_history_backend_enforces_bytes_before_hydration() {
     let first = store
         .list_stream_after("metadata-budget", 0, head, 100, 1024 * 1024)
         .unwrap();
-    assert_eq!(first.len(), 1);
+    assert_eq!(first.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![1]);
     let second = store
         .list_stream_after("metadata-budget", first[0].sequence, head, 100, 1024 * 1024)
         .unwrap();
-    assert_eq!(second.len(), 1);
+    assert_eq!(second.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![2]);
     assert_eq!(second[0].sequence, 2);
     fixture
         .reconnect()
@@ -1627,20 +1630,20 @@ fn r1_bounded_history_backend_enforces_bytes_before_hydration() {
     let error = store.position_page(RuntimeEventScope::Session, stream, None, position, through, 100, target_bytes - 1).unwrap_err();
     assert!(error.contains(&target.event_id));
     let exact = store.list_stream_after(stream, small.sequence, head, 100, target_bytes).unwrap();
-    assert_eq!(exact.len(), 1);
+    assert_eq!(exact.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
     assert_eq!(exact[0].event_id, target.event_id);
     let exact_position = store.position_page(RuntimeEventScope::Session, stream, None, position, through, 100, target_bytes).unwrap();
-    assert_eq!(exact_position.len(), 1);
+    assert_eq!(exact_position.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
     assert_eq!(exact_position[0].event_id, target.event_id);
     let short = store.list_stream_after(stream, 0, head, 100, small_bytes).unwrap();
     assert_eq!(short.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![small.event_id.as_str()]);
     let resumed = store.list_stream_after(stream, short[0].sequence, head, 100, target_bytes).unwrap();
     assert_eq!(resumed.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
     let short_position = store.position_page(RuntimeEventScope::Session, stream, None, None, through, 100, small_bytes).unwrap();
-    assert_eq!(short_position.len(), 1);
+    assert_eq!(short_position.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![small.event_id.as_str()]);
     assert_eq!(short_position[0].event_id, small.event_id);
     let resumed_position = store.position_page(RuntimeEventScope::Session, stream, None, Some((short_position[0].commit_cursor, short_position[0].transaction_index)), through, 100, target_bytes).unwrap();
-    assert_eq!(resumed_position.len(), 1);
+    assert_eq!(resumed_position.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
     assert_eq!(resumed_position[0].event_id, target.event_id);
     assert!(store.position_page(RuntimeEventScope::Session, "foreign-session", None, None, through, 100, target_bytes).unwrap().is_empty());
     let mut oversized = input("r662-absolute-budget", RuntimeEventScope::Session, "budget.absolute");
@@ -1884,7 +1887,13 @@ fn r1_clean_schema_initialization_is_atomic_and_rejects_old_catalog() {
         (ARTIFACT_DOMAIN, ARTIFACT_MIGRATIONS, "artifact_objects"),
         (TASK_DOMAIN, TASK_MIGRATIONS, "runtime_tasks"),
     ] {
-        assert_eq!(specs.len(), 1);
+        let expected_migration = match table {
+            "runtime_events" => "runtime_event.current-baseline",
+            "artifact_objects" => "runtime_artifact.current-baseline",
+            "runtime_tasks" => "runtime_task.current-baseline",
+            _ => unreachable!(),
+        };
+        assert_eq!(specs.iter().map(|migration| migration.id).collect::<Vec<_>>(), vec![expected_migration]);
         let fixture = PostgresTestScope::new();
         let executor = fixture.reconnect();
         executor.checkout_critical().unwrap().batch_execute(&format!("CREATE TABLE {table}(sentinel TEXT NOT NULL); INSERT INTO {table} VALUES('never rewrite old data')")).unwrap();
@@ -2258,7 +2267,8 @@ fn postgres_sequence_pages_freeze_the_head_during_independent_concurrent_appends
         .map(|event| event.event_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(read_ids, written_ids);
-    assert_eq!(read_ids.len(), 64);
+    assert_eq!(written_ids.len(), 64);
+    assert_eq!(read_ids.len(), written_ids.len());
     let reopened = PostgresRuntimeEventStore::new(fixture.reconnect())
         .unwrap()
         .into_runtime_event_store();
@@ -2338,7 +2348,7 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
     let prefix_events = store
         .replay_scope_stream_prefix(RuntimeEventScope::Evolution, "evolution:signal:")
         .expect("prefix replay must be independent of database collation");
-    assert_eq!(prefix_events.len(), 1);
+    assert_eq!(prefix_events.iter().map(|event| event.stream_id.as_str()).collect::<Vec<_>>(), vec!["evolution:signal:prefix-contract"]);
     assert_eq!(
         prefix_events[0].stream_id,
         "evolution:signal:prefix-contract"
@@ -2494,7 +2504,7 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
         .map(|worker| worker.join().expect("worker thread").expect("claim"))
         .collect::<Vec<_>>();
     let claimed = claims.into_iter().flatten().collect::<Vec<_>>();
-    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed.iter().map(|claim| claim.request_id.as_deref()).collect::<Vec<_>>(), vec![Some("request-real")]);
     let claim = &claimed[0];
     assert_eq!(claim.request_id.as_deref(), Some("request-real"));
     assert_eq!(claim.session_generation, Some(1));
@@ -3076,7 +3086,7 @@ async fn postgres_artifact_catalog_excludes_inflight_and_later_receipts() {
         .discover_page(&scopes, "art_inflight", None, 7)
         .await
         .unwrap();
-    assert_eq!(fresh.records.len(), 1);
+    assert_eq!(fresh.records.iter().map(|record| record.content_reference().selector.to_string()).collect::<Vec<_>>(), vec!["artifact://art_inflight".to_string()]);
     assert_eq!(
         fresh.records[0].content_reference().selector,
         "artifact://art_inflight"

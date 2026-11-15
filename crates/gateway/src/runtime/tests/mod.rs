@@ -2,6 +2,7 @@ use super::*;
 
 mod policy_transition;
 mod r1_terminal_recovery;
+mod coordination_original_pg;
 
 #[test]
 fn execution_policy_default_equality_includes_sandbox_posture() {
@@ -921,11 +922,13 @@ async fn policy_transition_waits_for_the_active_turn_and_never_cancels_it() {
 #[test]
 fn policy_update_lock_hot_set_does_not_grow_with_session_history() {
     let service = test_runtime_service(Arc::new(ActiveSessionDirectory::default()), None);
+    let original_stripes = service.policy_transition_stripes.len();
+    assert!(original_stripes > 0);
     for index in 0..10_000 {
         let lock = service.session_policy_update_lock(&format!("historical-{index}"));
         drop(lock);
     }
-    assert_eq!(service.policy_transition_stripes.len(), 64);
+    assert_eq!(service.policy_transition_stripes.len(), original_stripes);
 }
 
 #[tokio::test]
@@ -1880,8 +1883,8 @@ async fn runtime_service_records_durable_turn_journal() {
         .get_events_by_type_limited("journal-session", "TurnJournal", 0, 10)
         .await
         .unwrap();
-    assert_eq!(events.len(), 1);
-    let payload: serde_json::Value = serde_json::from_str(&events[0].event_json).unwrap();
+    let [unique_events_1883] = events.as_slice() else { panic!("expected the original events exactly once") };
+    let payload: serde_json::Value = serde_json::from_str(&unique_events_1883.event_json).unwrap();
     assert_eq!(payload["event_type"], "turn.submitted");
     assert_eq!(payload["phase"], "submitted");
     assert_eq!(payload["payload"]["prompt"], "persist this turn");
@@ -2065,9 +2068,8 @@ fn runtime_service_records_executing_turn_lifecycle() {
     let completed = service.finish_turn(&running.turn_id, TurnStatus::Completed, None);
     assert_eq!(completed.status, TurnStatus::Completed);
     assert!(completed.completed_at.is_some());
-    assert_eq!(completed.events.len(), 2);
-    assert_eq!(completed.events[0].status, TurnStatus::Running);
-    assert_eq!(completed.events[1].status, TurnStatus::Completed);
+    assert!(matches!(completed.events.as_slice(), [start, finish]
+        if start.status == TurnStatus::Running && finish.status == TurnStatus::Completed));
 
     let snapshot = service.turns_value();
     assert_eq!(snapshot["turns"], serde_json::json!([]));
@@ -2346,7 +2348,7 @@ fn session_execution_index_exposes_running_only_and_retains_terminal_reference()
     );
     assert_eq!(index.latest_status, Some(ExecutionLiveStatus::Complete));
     assert_eq!(index.terminal_ref.as_deref(), Some("terminal-finished"));
-    assert_eq!(index.executions.len(), 2);
+    assert_eq!(index.executions.iter().map(|execution| execution.execution_id.as_str()).collect::<Vec<_>>(), ["execution-running", "execution-finished"]);
     assert_eq!(index.executions[0].turn_id.as_deref(), Some("turn-running"));
     assert_eq!(
         index.executions[1].graph_id.as_deref(),
@@ -2686,7 +2688,7 @@ fn durable_ingress_index_recovers_execution_identity_without_mixing_cursors() {
         },
     ];
     let index = session_execution_index_from_outbox("session-recovery", &records);
-    assert_eq!(index.active_execution_ids.len(), 1);
+    assert_eq!(index.active_execution_ids, vec![runtime::session_ingress_graph_id("session-recovery", "request-pending", "turn-pending")]);
     assert_eq!(index.latest_status, Some(ExecutionLiveStatus::Queued));
     assert_eq!(index.latest_live_revision, None);
     assert_eq!(index.last_progress_at_ms, Some(30));

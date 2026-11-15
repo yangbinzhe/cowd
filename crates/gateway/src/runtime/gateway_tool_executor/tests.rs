@@ -19,7 +19,7 @@ mod tests {
                 input_schema: definition.input_schema,
             })
             .collect::<Vec<_>>();
-        assert_eq!(advertised.len(), 1);
+        assert!(matches!(advertised.as_slice(), [definition] if definition.name == request.tool_name));
         let step = runtime::step_snapshot::BoundStep::bind(
             harness_contract::step::StepIdentity {
                 step_id: uuid::Uuid::new_v4().to_string(),

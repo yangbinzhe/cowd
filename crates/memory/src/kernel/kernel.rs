@@ -278,24 +278,59 @@ impl MemoryPacketUse {
                     .is_some_and(|count| {
                         !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
                     });
-            if read.fence.source_ref != source_ref
-                || read.fence.retired
-                || read.origin_retired
-                || read.revision.as_ref() != Some(&item.source_revision)
-                || access.scope != item.source_scope
-                || atom != &item.atom
-                || role != item.role
-                || !reason_valid
-                || access.layer != item.atom.layer
-                || !access.visible_to_ctx(ctx)
-                || read.packet_content_digest.as_deref()
-                    != Some(packet_content_digest(&item.atom.title, &item.content_preview).as_str())
-            {
+            if let Some((first_failed_predicate, actual)) = packet_source_failure(
+                read, &source_ref, access, atom, &role, reason_valid, item, ctx,
+            ) {
+                tracing::warn!(first_failed_predicate, actual, "memory packet source rejected");
                 return Err(MemoryError::StaleSource);
             }
         }
         Ok(())
     }
+}
+
+fn packet_source_failure(
+    read: &crate::store::MemorySourceRevisionRead,
+    source_ref: &str,
+    access: &crate::store::MemorySourceAccess,
+    atom: &MemoryAtomView,
+    role: &MemoryPacketRole,
+    reason_valid: bool,
+    item: &MemoryPacketItem,
+    ctx: &MemoryTurnContext,
+) -> Option<(&'static str, bool)> {
+    macro_rules! check {
+        ($condition:expr, $name:literal, $actual:expr) => {
+            if $condition {
+                return Some(($name, $actual));
+            }
+        };
+    }
+    check!(
+        read.fence.source_ref != source_ref,
+        "source_ref_matches",
+        false
+    );
+    check!(read.fence.retired, "source_retired", true);
+    check!(read.origin_retired, "origin_retired", true);
+    check!(
+        read.revision.as_ref() != Some(&item.source_revision),
+        "revision_matches",
+        false
+    );
+    check!(access.scope != item.source_scope, "scope_matches", false);
+    check!(atom != &item.atom, "atom_matches", false);
+    check!(role != &item.role, "role_matches", false);
+    check!(!reason_valid, "reason_valid", false);
+    check!(access.layer != item.atom.layer, "layer_matches", false);
+    check!(!access.visible_to_ctx(ctx), "visible_to_context", false);
+    check!(
+        read.packet_content_digest.as_deref()
+            != Some(packet_content_digest(&item.atom.title, &item.content_preview).as_str()),
+        "content_digest_matches",
+        false
+    );
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -800,6 +835,7 @@ impl MemoryKernel {
         // Reuse only those timestamps, then compare the entire actual body and
         // ownership before entering any duplicate/conflict policy side effects.
         if let Some(original) = self.manager.orchestrator().recall(&entry.id).await? {
+            crate::store::MemoryExtractionOrigin::for_turn_entry(ctx, &mut entry)?;
             entry.created_at = original.created_at;
             entry.updated_at = original.updated_at;
             if crate::store::MemoryEntryRevision::of(&entry)?
@@ -810,6 +846,7 @@ impl MemoryKernel {
                 )
                 .into());
             }
+            return Ok(entry.id);
         }
         let id = entry.id;
         self.remember(ctx, entry).await?;
@@ -2606,6 +2643,163 @@ mod tests {
     }
 
     #[test]
+    fn packet_source_first_failure_preserves_stale_refusal() {
+        let entry = memory_entry("title", "content", 0.0, 1.0, 0);
+        let source = format!("memory:{}", entry.id);
+        let read =
+            crate::store::live_source_revision(&source, &entry, None, None, 100_000).unwrap();
+        let atom = read.packet_atom.as_ref().unwrap().clone();
+        let (role, reason) = packet_role_and_reason(&atom);
+        let item = MemoryPacketItem {
+            atom,
+            role,
+            reason,
+            content_preview: entry.content.clone(),
+            source_revision: read.revision.clone().unwrap(),
+            source_scope: entry.scope.clone(),
+        };
+        let ctx = MemoryTurnContext::new("s1", "kernel-test")
+            .with_project_id(Some("cowd".into()))
+            .with_cognitive_read_scopes(vec![harness_contract::agent::CognitiveReadScope::Project]);
+        let classify = |read: &crate::store::MemorySourceRevisionRead,
+                        item: &MemoryPacketItem,
+                        ctx: &MemoryTurnContext,
+                        reason_valid: bool| {
+            let atom = read.packet_atom.as_ref().unwrap();
+            let (role, _) = packet_role_and_reason(atom);
+            packet_source_failure(
+                read,
+                &source,
+                read.access.as_ref().unwrap(),
+                atom,
+                &role,
+                reason_valid,
+                item,
+                ctx,
+            )
+        };
+        assert_eq!(classify(&read, &item, &ctx, true), None);
+        let mut cases = Vec::new();
+        let mut bad = read.clone();
+        bad.fence.source_ref = "foreign".into();
+        bad.fence.retired = true;
+        cases.push((
+            bad,
+            item.clone(),
+            ctx.clone(),
+            true,
+            "source_ref_matches",
+            false,
+        ));
+        let mut bad = read.clone();
+        bad.fence.retired = true;
+        cases.push((bad, item.clone(), ctx.clone(), true, "source_retired", true));
+        let mut bad = read.clone();
+        bad.origin_retired = true;
+        cases.push((bad, item.clone(), ctx.clone(), true, "origin_retired", true));
+        let mut bad = read.clone();
+        bad.revision = None;
+        cases.push((
+            bad,
+            item.clone(),
+            ctx.clone(),
+            true,
+            "revision_matches",
+            false,
+        ));
+        let mut bad = read.clone();
+        bad.access.as_mut().unwrap().scope = MemoryScope::Global;
+        cases.push((bad, item.clone(), ctx.clone(), true, "scope_matches", false));
+        let mut changed = item.clone();
+        changed.atom.title = "other".into();
+        cases.push((
+            read.clone(),
+            changed,
+            ctx.clone(),
+            true,
+            "atom_matches",
+            false,
+        ));
+        let mut changed = item.clone();
+        changed.role = MemoryPacketRole::Conflict;
+        cases.push((
+            read.clone(),
+            changed,
+            ctx.clone(),
+            true,
+            "role_matches",
+            false,
+        ));
+        cases.push((
+            read.clone(),
+            item.clone(),
+            ctx.clone(),
+            false,
+            "reason_valid",
+            false,
+        ));
+        let mut bad = read.clone();
+        bad.access.as_mut().unwrap().layer = MemoryLayer::L0;
+        cases.push((bad, item.clone(), ctx.clone(), true, "layer_matches", false));
+        let foreign = MemoryTurnContext::new("other", "other");
+        cases.push((
+            read.clone(),
+            item.clone(),
+            foreign,
+            true,
+            "visible_to_context",
+            false,
+        ));
+        let mut bad = read.clone();
+        bad.packet_content_digest = Some("foreign".into());
+        cases.push((
+            bad,
+            item.clone(),
+            ctx.clone(),
+            true,
+            "content_digest_matches",
+            false,
+        ));
+        for (read, item, ctx, valid, name, actual) in cases {
+            assert_eq!(classify(&read, &item, &ctx, valid), Some((name, actual)));
+        }
+
+        struct Reader(crate::store::MemorySourceRevisionRead);
+        impl crate::store::MemorySourceFenceReader for Reader {
+            fn read_source_fence(
+                &self,
+                _: &str,
+            ) -> crate::store::Result<Option<crate::store::MemorySourceFence>> {
+                Ok(Some(self.0.fence.clone()))
+            }
+            fn read_source_revision(
+                &self,
+                _: &str,
+                _: usize,
+            ) -> crate::store::Result<Option<crate::store::MemorySourceRevisionRead>> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+        let packet = MemoryContextPacket {
+            selected: vec![item],
+            omitted: vec![],
+            token_estimate: 0,
+            truncated: false,
+            recall_report: RecallReport::default(),
+        };
+        assert!(MemoryPacketUse::new(ctx.clone(), 100_000)
+            .validate(&packet, &Reader(read.clone()))
+            .is_ok());
+        let mut stale = read;
+        stale.fence.retired = true;
+        let error = MemoryPacketUse::new(ctx, 100_000)
+            .validate(&packet, &Reader(stale))
+            .unwrap_err();
+        assert!(matches!(error, MemoryError::StaleSource));
+        assert_eq!(error.to_string(), "Memory source cut is stale or foreign");
+    }
+
+    #[test]
     fn stale_memory_becomes_warning_at_threshold() {
         let entry = memory_entry("Old decision", "Use the previous API", 0.86, 1.0, 0);
 
@@ -3031,6 +3225,11 @@ mod tests {
         changed.content = "foreign changed checkpoint payload".into();
         assert!(kernel
             .remember_checkpoint_fact(&context, &checkpoint.checkpoint_id, 0, changed)
+            .await
+            .is_err());
+        let foreign = MemoryTurnContext::new("session-idempotent", "other-agent");
+        assert!(kernel
+            .remember_checkpoint_fact(&foreign, &checkpoint.checkpoint_id, 0, checkpoint.facts[0].clone())
             .await
             .is_err());
         assert_eq!(

@@ -50,7 +50,9 @@ mod tests {
             vec![vec!["model"], vec!["verify"], vec!["synthesize"]]
         );
         let projection = project_execution_graph(&graph);
-        assert_eq!(projection.edges.len(), 2);
+        assert!(!graph.edges.is_empty());
+        assert_eq!(projection.edges.iter().map(|edge| (&edge.from, &edge.to, edge.kind)).collect::<Vec<_>>(),
+            graph.edges.iter().map(|edge| (&edge.from, &edge.to, edge.kind)).collect::<Vec<_>>());
         assert_eq!(projection.edges[0].from, "model");
         assert_eq!(projection.edges[1].to, "synthesize");
     }

@@ -817,7 +817,7 @@ async fn session_history_index_is_bounded_typed_and_body_free() {
         serde_json::from_slice(&body).unwrap();
     assert_eq!(projection.session_id, session_id);
     assert_eq!(projection.total_messages, 3);
-    assert_eq!(projection.recent_metadata.len(), 2);
+    assert_eq!(projection.recent_metadata.iter().map(|item| item.message_id.as_str()).collect::<Vec<_>>(), ["message-1", "message-2"]);
     assert!(projection.projection_generation > 0);
     assert!(
         !String::from_utf8_lossy(&body).contains("secret body"),
@@ -1029,7 +1029,8 @@ async fn session_evidence_projection_preserves_durable_order_for_large_history()
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let turns = value["turns"].as_array().expect("turn projections");
-    assert_eq!(turns.len(), 100);
+    assert_eq!(turns.iter().map(|turn| turn["turn_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>(),
+        (0..100).map(|index| format!("ordered-turn-{index:03}")).collect::<Vec<_>>());
     for (index, turn) in turns.iter().enumerate() {
         assert_eq!(
             turn["turn_id"],
@@ -1066,7 +1067,8 @@ async fn evidence_batch_resolver_preserves_order_and_isolates_unavailable_items(
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let items = value["items"].as_array().expect("evidence items");
-    assert_eq!(items.len(), 100);
+    assert_eq!(items.iter().map(|item| item["ref"].as_str().unwrap().to_owned()).collect::<Vec<_>>(),
+        (0..100).map(|index| format!("unsupported://ordered-{index:03}")).collect::<Vec<_>>());
     for (index, item) in items.iter().enumerate() {
         assert_eq!(item["ref"], format!("unsupported://ordered-{index:03}"));
         assert_eq!(item["status"], "unavailable");
@@ -1727,8 +1729,8 @@ async fn branch_session_copies_stored_messages_into_new_session() {
         .expect("branch id should be returned")
         .to_string();
     let copied = store.get_messages(&branch_id, 0, 10).await.unwrap();
-    assert_eq!(copied.len(), 2);
-    assert_eq!(copied[0].session_id, branch_id);
+    let [_first_copied_1730, _second_copied_1730] = copied.as_slice() else { panic!("expected both original copied exactly once") };
+    assert_eq!(_first_copied_1730.session_id, branch_id);
     assert_ne!(copied[0].stable_message_id, format!("branch:{source_id}:0"));
     assert!(copied[0]
         .stable_message_id

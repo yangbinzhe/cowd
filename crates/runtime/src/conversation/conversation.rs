@@ -2233,19 +2233,19 @@ async fn consume_owned_provider_stream(
     use futures::FutureExt;
     let completion_bus = reducer.bus.clone();
     let model_step_id = reducer.model_step_id.clone();
-    let consumer = consume_provider_stream_inner(
+    let consumer = Box::pin(consume_provider_stream_inner(
         stream,
         cancellation,
         timeout_policy,
         reducer,
         early_dispatcher,
         transport_activity,
-    );
+    ));
     let (consumed, producer_result) = match execution {
-        Some(execution) => execution.drive(consumer).await,
+        Some(execution) => Box::pin(execution.drive(consumer)).await,
         None => (
-            std::panic::AssertUnwindSafe(consumer)
-                .catch_unwind()
+            Box::pin(std::panic::AssertUnwindSafe(consumer)
+                .catch_unwind())
                 .await
                 .map_err(|_| ()),
             Ok(ProviderLocalExit::Completed),
@@ -4703,9 +4703,9 @@ pub struct RuntimeError {
     repeated_tool_frame_refusal: bool,
     authenticated_provider_cancellation: Option<Box<crate::provider_runtime_client::AuthenticatedProviderCancellation>>,
     authenticated_graph_cancellation: bool,
-    tool_effect_unknown: Option<ToolError>,
-    original_packet_scope_error: Option<ToolError>,
-    original_bounded_acquisition_error: Option<ToolError>,
+    tool_effect_unknown: Option<Box<ToolError>>,
+    original_packet_scope_error: Option<Box<ToolError>>,
+    original_bounded_acquisition_error: Option<Box<ToolError>>,
     partial_tool_batch: Option<PartialToolBatch>,
 }
 
@@ -4728,22 +4728,22 @@ impl RuntimeError {
 
     pub(crate) fn from_original_bounded_acquisition_error(error: ToolError) -> Self {
         let mut result = Self::new(error.to_string());
-        result.original_bounded_acquisition_error = Some(error);
+        result.original_bounded_acquisition_error = Some(Box::new(error));
         result
     }
     pub(crate) fn original_bounded_acquisition_error(&self) -> Option<&ToolError> {
-        self.original_bounded_acquisition_error.as_ref()
+        self.original_bounded_acquisition_error.as_deref()
     }
 
     pub(crate) fn from_original_packet_scope_error(error: ToolError) -> Self {
         let mut result = Self::new(error.to_string());
-        result.original_packet_scope_error = Some(error);
+        result.original_packet_scope_error = Some(Box::new(error));
         result
     }
-    pub(crate) fn original_packet_scope_error(&self) -> Option<&ToolError> { self.original_packet_scope_error.as_ref() }
+    pub(crate) fn original_packet_scope_error(&self) -> Option<&ToolError> { self.original_packet_scope_error.as_deref() }
     pub(crate) fn from_tool_effect_unknown(error: ToolError) -> Self {
         let mut runtime_error = Self::new(error.to_string());
-        runtime_error.tool_effect_unknown = Some(error);
+        runtime_error.tool_effect_unknown = Some(Box::new(error));
         runtime_error
     }
     pub(crate) fn with_partial_tool_batch(mut self, partial: PartialToolBatch) -> Self {
@@ -4754,7 +4754,7 @@ impl RuntimeError {
         self.partial_tool_batch.as_ref()
     }
     pub(crate) fn tool_effect_unknown(&self) -> Option<&ToolError> {
-        self.tool_effect_unknown.as_ref()
+        self.tool_effect_unknown.as_deref()
     }
     #[must_use]
     pub fn preparation(

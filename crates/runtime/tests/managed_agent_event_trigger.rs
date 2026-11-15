@@ -78,7 +78,7 @@ fn event_trigger_requires_source_capability_filter_and_monotonic_sequence() {
     let first = dispatcher
         .accept_event(event("new", 8), 101)
         .expect("first event");
-    assert_eq!(first.accepted.len(), 1);
+    assert!(matches!(first.accepted.as_slice(), [invocation] if invocation.definition_id == "workspace/cowd/source-watch"));
     let duplicate = dispatcher
         .accept_event(event("new", 8), 102)
         .expect("duplicate event");
@@ -91,7 +91,7 @@ fn event_trigger_requires_source_capability_filter_and_monotonic_sequence() {
         .accept_event(event("old", 7), 103)
         .expect("stale event report");
     assert!(stale.accepted.is_empty());
-    assert_eq!(stale.rejected.len(), 1);
+    assert!(matches!(stale.rejected.as_slice(), [reason] if reason.contains("source event sequence is older")));
 
     let mut untrusted = event("untrusted", 9);
     untrusted.source_capabilities.clear();
@@ -100,5 +100,5 @@ fn event_trigger_requires_source_capability_filter_and_monotonic_sequence() {
         .expect("ignored report");
     assert!(ignored.accepted.is_empty());
     assert!(ignored.rejected.is_empty());
-    assert_eq!(dispatcher.invocations().expect("invocations").len(), 1);
+    assert!(matches!(dispatcher.invocations().expect("invocations").as_slice(), [invocation] if invocation.invocation_id == first.accepted[0].invocation_id));
 }

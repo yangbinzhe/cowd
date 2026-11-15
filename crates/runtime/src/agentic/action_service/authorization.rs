@@ -414,44 +414,6 @@ fn validate_task_claim(
     let Some(task) = projection.tasks.get(&input.task_ref) else {
         return Some(("task_not_found", input.task_ref.clone()));
     };
-    let expired_claim = task.status == AgenticTaskStatus::Claimed
-        && task
-            .lease_expires_at_ms
-            .is_some_and(|expires| expires <= now_ms);
-    let same_execution_renewal = task.status == AgenticTaskStatus::Claimed
-        && task.claimant.as_deref() == actor_agent_id(envelope)
-        && task.claim_execution_id == envelope.actor.execution_id;
-    if expired_claim && !same_execution_renewal {
-        return Some(("task_physical_closure_unconfirmed", input.task_ref.clone()));
-    }
-    if !matches!(
-        task.status,
-        AgenticTaskStatus::Published | AgenticTaskStatus::Rework
-    ) && !same_execution_renewal
-    {
-        return Some(("task_not_claimable", format!("{:?}", task.status)));
-    }
-    // A renewal is free today, so a Task that never advances can be re-claimed
-    // forever: run mon7's final task burned fourteen minutes that way. Past the
-    // bound the claim is refused with the two actions that actually move it.
-    if expired_claim || same_execution_renewal {
-        if let Some(bound) = crate::agentic::work_market::claim_renewal_bound() {
-            if task.claim_renewal_streak >= bound {
-                return Some((
-                    "task_reclaim_without_progress",
-                    format!(
-                        "task {} has been claimed {} times in a row with no new deliverable and no \
-                         status change; the artifacts already committed for it are [{}]. Submit a \
-                         NEW deliverable, or release the task with task_release so the work can \
-                         move - re-claiming it again cannot advance the objective.",
-                        input.task_ref,
-                        task.claim_renewal_streak,
-                        task.artifact_refs.join(", ")
-                    ),
-                ));
-            }
-        }
-    }
     if !matches!(
         envelope.actor.kind,
         AgentActorKind::Agent | AgentActorKind::TeamLead
@@ -479,6 +441,55 @@ fn validate_task_claim(
                 input.task_ref
             ),
         ));
+    }
+    let expired_claim = task.status == AgenticTaskStatus::Claimed
+        && task
+            .lease_expires_at_ms
+            .is_some_and(|expires| expires <= now_ms);
+    let same_execution_renewal = task.status == AgenticTaskStatus::Claimed
+        && task.claimant.as_deref() == actor_agent_id(envelope)
+        && task.claim_execution_id == envelope.actor.execution_id;
+    let expired_original_renewal = actor_agent_id(envelope)
+        .zip(envelope.actor.execution_id.as_deref())
+        .and_then(|(agent, execution)| {
+            projection.membership_for(agent, &task.team_id).map(|membership| {
+                projection.agent_is_active_in(agent, &task.team_id)
+                    && crate::agentic::work_market::expired_original_claim(
+                        task, agent, execution, &membership.membership_id, now_ms,
+                    )
+            })
+        })
+        .unwrap_or(false);
+    if expired_claim && !same_execution_renewal {
+        return Some(("task_physical_closure_unconfirmed", input.task_ref.clone()));
+    }
+    if !matches!(
+        task.status,
+        AgenticTaskStatus::Published | AgenticTaskStatus::Rework
+    ) && !same_execution_renewal
+    {
+        return Some(("task_not_claimable", format!("{:?}", task.status)));
+    }
+    // A renewal is free today, so a Task that never advances can be re-claimed
+    // forever: run mon7's final task burned fourteen minutes that way. Past the
+    // bound the claim is refused with the two actions that actually move it.
+    if (expired_claim || same_execution_renewal) && !expired_original_renewal {
+        if let Some(bound) = crate::agentic::work_market::claim_renewal_bound() {
+            if task.claim_renewal_streak >= bound {
+                return Some((
+                    "task_reclaim_without_progress",
+                    format!(
+                        "task {} has been claimed {} times in a row with no new deliverable and no \
+                         status change; the artifacts already committed for it are [{}]. Submit a \
+                         NEW deliverable, or release the task with task_release so the work can \
+                         move - re-claiming it again cannot advance the objective.",
+                        input.task_ref,
+                        task.claim_renewal_streak,
+                        task.artifact_refs.join(", ")
+                    ),
+                ));
+            }
+        }
     }
     if let Some(waiting) = task.depends_on.iter().find(|dependency| {
         !crate::agentic::work_market::task_dependency_satisfied(projection, dependency)
@@ -1296,6 +1307,30 @@ mod reclaim_discipline_tests {
         projection.program_id = "foreign".into();
         assert!(!context.covers(&projection, &request));
     }
+    #[test]
+    fn expired_original_claim_recovers_past_streak_without_foreign_takeover() {
+        use crate::agentic::program::{AgenticMembershipProjection, AgenticTaskAttemptProjection, AgenticTeamProjection};
+        let mut projection = projection_with_streak(3);
+        let membership_id = AgenticProgramProjection::membership_id("agent", "team");
+        projection.teams.insert("team".into(), AgenticTeamProjection {
+            team_id: "team".into(), name: "team".into(), mission: String::new(),
+            objective: None, topic_ref: String::new(), created_by: "root".into(),
+            member_ids: vec!["agent".into()], task_ids: vec!["task".into()], lifecycle: Default::default(),
+        });
+        projection.memberships.insert(membership_id.clone(), AgenticMembershipProjection {
+            membership_id: membership_id.clone(), agent_id: "agent".into(), team_id: "team".into(),
+            lifecycle: Default::default(), delegation_ref: None, reason_ref: None, created_by: "root".into(),
+        });
+        projection.tasks.get_mut("task").unwrap().active_attempts.insert("exec-1".into(), AgenticTaskAttemptProjection {
+            execution_id: "exec-1".into(), agent_id: "agent".into(), membership_id,
+            mode: harness_contract::agent_action::AgentAttemptMode::Execute, generation: 0,
+        });
+        assert!(validate_task_claim(&projection, &envelope("exec-1"), &claim_input(), 10_000).is_none());
+        assert_eq!(validate_task_claim(&projection, &envelope("foreign"), &claim_input(), 10_000).unwrap().0, "task_physical_closure_unconfirmed");
+        projection.tasks.get_mut("task").unwrap().active_attempts.get_mut("exec-1").unwrap().generation = 1;
+        assert_eq!(validate_task_claim(&projection, &envelope("exec-1"), &claim_input(), 10_000).unwrap().0, "task_reclaim_without_progress");
+    }
+
     #[test]
     fn a_reclaim_without_progress_is_refused_past_the_bound() {
         let projection = projection_with_streak(3);

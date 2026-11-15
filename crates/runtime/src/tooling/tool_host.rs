@@ -350,7 +350,9 @@ impl OriginalBatchMemberStop {
             }
             _ => reason,
         };
-        Self::publish_owned(coordinate, reason, Some(reservation), Some(effect_fence))
+        let publication = Self::publish_owned(coordinate, reason, Some(reservation), Some(effect_fence));
+        publication.current().reconcile_original();
+        publication
     }
     fn publish_owned(coordinate: OriginalBatchMemberCoordinate, reason: OriginalBatchMemberStopReason,
         reservation: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>>,
@@ -364,10 +366,21 @@ impl OriginalBatchMemberStop {
     }
     pub fn coordinate(&self) -> &OriginalBatchMemberCoordinate { &self.coordinate }
     pub fn reason(&self) -> &OriginalBatchMemberStopReason { self.resolution.get().unwrap_or(&self.reason) }
+    pub(crate) fn rejected_observation(&self) -> Option<&harness_contract::agent_action::AgentActionObservation> {
+        match (&self.reason, self.resolution.get()) {
+            (OriginalBatchMemberStopReason::UnknownNoReceipt(observation),
+             Some(OriginalBatchMemberStopReason::ConfirmedNoncommit(_)))
+                if observation.status == harness_contract::agent_action::AgentActionStatus::Rejected => Some(observation),
+            _ => None,
+        }
+    }
     pub(crate) fn reconcile_original(&self) {
         if self.resolution.get().is_some() || !matches!(&self.reason,
             OriginalBatchMemberStopReason::BeforeOutcomeUnknown(_) | OriginalBatchMemberStopReason::BeforeOutcomeError(_)
-            | OriginalBatchMemberStopReason::BeforeOutcomeStoreError(_)) { return; }
+            | OriginalBatchMemberStopReason::BeforeOutcomeStoreError(_)
+            | OriginalBatchMemberStopReason::UnknownNoReceipt(harness_contract::agent_action::AgentActionObservation {
+                status: harness_contract::agent_action::AgentActionStatus::Rejected, ..
+            })) { return; }
         let Some(reservation) = &self.reservation else { return; };
         if self.original_effect_fence().is_none() {
             if let Ok(Some(fence)) = reservation.recover_effect_fence() { let _ = self.recovered_effect_fence.set(fence); }
@@ -2117,6 +2130,28 @@ pub(crate) fn discover_delegated_tool(
 #[cfg(test)]
 mod resource_projection_tests {
     use super::*;
+
+    #[test]
+    fn rejected_member_without_owner_stays_unknown() {
+        let sink: std::sync::Arc<dyn OriginalStopSink> = std::sync::Arc::new(OriginalStopChannel::default());
+        let ticket = crate::execution_core::NodeExecutionTicket {
+            graph_id: "graph".into(), node_id: "node".into(), executor_kind: "tool".into(),
+            service_class: Default::default(), attempt: 1, idempotency_key: "attempt".into(), payload_ref: "payload".into(),
+        };
+        let observation: harness_contract::agent_action::AgentActionObservation = serde_json::from_value(serde_json::json!({
+            "receipt_id":"receipt", "action_id":"action", "action":"agent_invite", "program_id":"program",
+            "revision":4, "status":"rejected", "changed_refs":[], "actionable":[],
+            "error":{"code":"unknown_existing_agent_ref", "message":"invalid reference", "recoverable":true}
+        })).unwrap();
+        let coordinate = OriginalBatchMemberCoordinate {
+            outer_key:"outer".into(), call_id:"call".into(), ticket, step:None,
+            sink:std::sync::Arc::downgrade(&sink), index:0,
+        };
+        let publication = OriginalBatchMemberStop::publish(coordinate, OriginalBatchMemberStopReason::UnknownNoReceipt(observation));
+        publication.current().reconcile_original();
+        assert!(matches!(publication.current().reason(), OriginalBatchMemberStopReason::UnknownNoReceipt(_)));
+        assert!(publication.current().rejected_observation().is_none());
+    }
 
     #[test]
     fn child_read_overflow_stays_unknown_on_same_channel() {

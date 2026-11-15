@@ -9,12 +9,15 @@ use crate::skill_manifest::{
     get_related_skills, get_skill_description, get_skill_name, get_tags, matches_platform,
     parse_skill_file_header, ParsedSkill,
 };
-use crate::{default_managed_skill_store_root, list_managed_skill_entries};
+use crate::{default_managed_skill_store_root, list_managed_skill_entries, ManagedSkillStore};
+use harness_contract::skill::SkillActivePointer;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +97,13 @@ pub struct SkillInfo {
 #[derive(Debug, Clone)]
 pub struct SkillRegistry {
     roots: Vec<SkillRegistryRoot>,
+    managed_approval: Option<Arc<dyn ManagedSkillApproval>>,
+}
+
+/// Trusted reader of the original governance pointer and installation scope.
+pub trait ManagedSkillApproval: std::fmt::Debug + Send + Sync {
+    fn scope(&self) -> std::io::Result<String>;
+    fn active_pointer(&self, skill_id: &str) -> std::io::Result<Option<SkillActivePointer>>;
 }
 
 impl SkillRegistry {
@@ -101,12 +111,24 @@ impl SkillRegistry {
     pub fn discover(cwd: &Path) -> Self {
         Self {
             roots: discover_skill_registry_roots(cwd),
+            managed_approval: None,
         }
     }
 
     #[must_use]
     pub fn with_roots(roots: Vec<SkillRegistryRoot>) -> Self {
-        Self { roots }
+        Self {
+            roots,
+            managed_approval: None,
+        }
+    }
+
+    /// Restrict managed discovery to the supplied original approval source.
+    /// Without a source, discovery retains the installed inventory semantics.
+    #[must_use]
+    pub fn with_managed_approval(mut self, approval: Arc<dyn ManagedSkillApproval>) -> Self {
+        self.managed_approval = Some(approval);
+        self
     }
 
     #[must_use]
@@ -119,7 +141,7 @@ impl SkillRegistry {
         let mut active_sources = BTreeMap::<String, SkillRegistrySource>::new();
 
         for root in &self.roots {
-            let mut root_skills = match list_root_skills(root) {
+            let mut root_skills = match list_root_skills(root, self.managed_approval.as_deref()) {
                 Ok(skills) => skills,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                 Err(error) => return Err(error),
@@ -328,15 +350,87 @@ fn push_root(
     }
 }
 
-fn list_root_skills(root: &SkillRegistryRoot) -> std::io::Result<Vec<SkillInfo>> {
+fn list_root_skills(
+    root: &SkillRegistryRoot,
+    approval: Option<&dyn ManagedSkillApproval>,
+) -> std::io::Result<Vec<SkillInfo>> {
     if root.kind == SkillRegistryRootKind::ManagedStore {
-        return list_managed_skill_entries(&root.path)
-            .map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-            })?
-            .into_iter()
-            .map(|entry| skill_info_from_path(root, &entry.prompt_path, || entry.receipt.skill_id))
-            .collect();
+        let Some(approval) = approval else {
+            return list_managed_skill_entries(&root.path)
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                })?
+                .into_iter()
+                .map(|entry| {
+                    skill_info_from_path(root, &entry.prompt_path, || entry.receipt.skill_id)
+                })
+                .collect();
+        };
+        let scope = approval.scope()?;
+        let store = ManagedSkillStore::new(&root.path);
+        let invalid = |error: String| std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+        let mut skills = Vec::new();
+        for id in store
+            .installed_skill_ids()
+            .map_err(|e| invalid(e.to_string()))?
+        {
+            let Some(pointer) = approval.active_pointer(&id)? else {
+                continue;
+            };
+            if pointer.revoked != Some(false) || pointer.revocation_generation.is_none() {
+                continue;
+            }
+            let evidence = pointer
+                .installation
+                .as_ref()
+                .ok_or_else(|| invalid("missing installation evidence".into()))?;
+            let failure = if pointer.skill_id != id {
+                Some(("pointer_skill_id_matches", "false".to_string()))
+            } else if pointer.generation == 0 {
+                Some(("pointer_generation_nonzero", pointer.generation.to_string()))
+            } else if pointer.approval_ref.is_empty() {
+                Some(("approval_ref_nonempty", "0".to_string()))
+            } else if evidence.skill_id != id {
+                Some(("evidence_skill_id_matches", "false".to_string()))
+            } else if evidence.revision != pointer.active_revision {
+                Some(("evidence_revision_matches", "false".to_string()))
+            } else if evidence.scope_ref != scope {
+                Some(("evidence_scope_matches", "false".to_string()))
+            } else if scope.is_empty() {
+                Some(("scope_nonempty", "0".to_string()))
+            } else {
+                None
+            };
+            if let Some((predicate, actual)) = failure {
+                return Err(invalid(format!("managed skill approval identity mismatch; first_failed_predicate={predicate} actual={actual}")));
+            }
+            let installed = store
+                .resolve_installed(&id, &pointer.active_revision, &evidence.receipt_id)
+                .map_err(|e| invalid(e.to_string()))?;
+            let receipt_digest = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&installed.receipt)?)
+            );
+            let failure = if evidence.receipt_digest != receipt_digest {
+                Some("receipt_digest_matches")
+            } else if evidence.inspection_fingerprint != installed.inspection_fingerprint {
+                Some("inspection_fingerprint_matches")
+            } else {
+                None
+            };
+            if let Some(predicate) = failure {
+                return Err(invalid(format!("managed skill installation evidence mismatch; first_failed_predicate={predicate} actual=false")));
+            }
+            let parsed = crate::parse_skill_content(&installed.prompt)
+                .map_err(|e| invalid(e.to_string()))?;
+            skills.push(skill_info_from_parsed(
+                root,
+                &installed.package_root.join("SKILL.md"),
+                &parsed,
+                id,
+            ));
+        }
+        return Ok(skills);
     }
     let mut skills = Vec::new();
     for entry in fs::read_dir(&root.path)? {
@@ -550,7 +644,7 @@ mod tests {
             "---\nname: managed-demo\ndescription: Managed demo\nlicense: MIT\nversion: 2.0.0\n---\nSecond\n",
         );
         let second = lifecycle.plan(&source_value, &root).unwrap();
-        lifecycle
+        let receipt = lifecycle
             .commit(&source_value, &root, &second.package_digest, false, "test")
             .unwrap();
 
@@ -559,12 +653,159 @@ mod tests {
             path: store.root().to_path_buf(),
             kind: SkillRegistryRootKind::ManagedStore,
         }]);
-        let skills = registry.list().unwrap();
+        assert_eq!(registry.list().unwrap().len(), 2);
+        assert!(registry.resolve("managed-demo").is_ok());
+        #[derive(Debug)]
+        struct Approval(Option<SkillActivePointer>);
+        impl ManagedSkillApproval for Approval {
+            fn scope(&self) -> std::io::Result<String> {
+                Ok("test-scope".into())
+            }
+            fn active_pointer(&self, _: &str) -> std::io::Result<Option<SkillActivePointer>> {
+                Ok(self.0.clone())
+            }
+        }
+        assert!(registry
+            .clone()
+            .with_managed_approval(Arc::new(Approval(None)))
+            .list()
+            .unwrap()
+            .is_empty());
+        assert!(registry
+            .clone()
+            .with_managed_approval(Arc::new(Approval(None)))
+            .resolve("managed-demo")
+            .is_err());
+        let mut pointer = SkillActivePointer {
+            skill_id: receipt.skill_id.clone(),
+            active_revision: receipt.revision.clone(),
+            previous_revision: Some(first.package_digest),
+            generation: 2,
+            source_draft_id: Some("draft".into()),
+            approval_ref: "approval".into(),
+            activated_at_ms: 1,
+            installation: Some(harness_contract::skill::SkillInstallationEvidence {
+                scope_ref: "test-scope".into(),
+                skill_id: receipt.skill_id.clone(),
+                revision: receipt.revision.clone(),
+                receipt_id: receipt.install_id.clone(),
+                receipt_digest: format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&receipt).unwrap())
+                ),
+                inspection_fingerprint: receipt.plan_digest.clone(),
+            }),
+            revoked: Some(false),
+            revocation_generation: Some(0),
+        };
+        let approved = registry
+            .clone()
+            .with_managed_approval(Arc::new(Approval(Some(pointer.clone()))));
+        let skills = approved.list().unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].version.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            approved.resolve("managed-demo").unwrap().path,
+            skills[0].path
+        );
         assert!(skills[0]
             .path
             .to_string_lossy()
             .contains(second.package_digest.trim_start_matches("sha256:")));
+        let mut cases = Vec::new();
+        let mut invalid = pointer.clone();
+        invalid.skill_id = "foreign".into();
+        invalid.generation = 0;
+        cases.push((invalid, "pointer_skill_id_matches"));
+        let mut invalid = pointer.clone();
+        invalid.generation = 0;
+        cases.push((invalid, "pointer_generation_nonzero"));
+        let mut invalid = pointer.clone();
+        invalid.approval_ref.clear();
+        cases.push((invalid, "approval_ref_nonempty"));
+        let mut invalid = pointer.clone();
+        invalid.installation.as_mut().unwrap().skill_id = "foreign".into();
+        cases.push((invalid, "evidence_skill_id_matches"));
+        let mut invalid = pointer.clone();
+        invalid.installation.as_mut().unwrap().revision = "foreign".into();
+        cases.push((invalid, "evidence_revision_matches"));
+        let mut invalid = pointer.clone();
+        invalid.installation.as_mut().unwrap().scope_ref = "foreign".into();
+        cases.push((invalid, "evidence_scope_matches"));
+        let mut invalid = pointer.clone();
+        invalid.installation.as_mut().unwrap().receipt_digest = "foreign".into();
+        invalid
+            .installation
+            .as_mut()
+            .unwrap()
+            .inspection_fingerprint = "foreign".into();
+        cases.push((invalid, "receipt_digest_matches"));
+        let mut invalid = pointer.clone();
+        invalid
+            .installation
+            .as_mut()
+            .unwrap()
+            .inspection_fingerprint = "foreign".into();
+        cases.push((invalid, "inspection_fingerprint_matches"));
+        for (invalid, predicate) in cases {
+            let error = registry
+                .clone()
+                .with_managed_approval(Arc::new(Approval(Some(invalid))))
+                .resolve("managed-demo")
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            let original = if predicate == "receipt_digest_matches"
+                || predicate == "inspection_fingerprint_matches"
+            {
+                "managed skill installation evidence mismatch; "
+            } else {
+                "managed skill approval identity mismatch; "
+            };
+            assert!(error.to_string().starts_with(original));
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("first_failed_predicate={predicate} actual=")),
+                "{error}"
+            );
+        }
+        #[derive(Debug)]
+        struct EmptyScope(SkillActivePointer);
+        impl ManagedSkillApproval for EmptyScope {
+            fn scope(&self) -> std::io::Result<String> {
+                Ok(String::new())
+            }
+            fn active_pointer(&self, _: &str) -> std::io::Result<Option<SkillActivePointer>> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+        let mut empty_scope = pointer.clone();
+        empty_scope.installation.as_mut().unwrap().scope_ref.clear();
+        let error = registry
+            .clone()
+            .with_managed_approval(Arc::new(EmptyScope(empty_scope)))
+            .resolve("managed-demo")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("first_failed_predicate=scope_nonempty actual=0"));
+        pointer.revoked = Some(true);
+        assert!(registry
+            .clone()
+            .with_managed_approval(Arc::new(Approval(Some(pointer.clone()))))
+            .list()
+            .unwrap()
+            .is_empty());
+        assert!(registry
+            .clone()
+            .with_managed_approval(Arc::new(Approval(Some(pointer.clone()))))
+            .resolve("managed-demo")
+            .is_err());
+        pointer.revoked = Some(false);
+        pointer.installation.as_mut().unwrap().receipt_digest = "sha256:foreign".into();
+        assert!(registry
+            .with_managed_approval(Arc::new(Approval(Some(pointer))))
+            .resolve("managed-demo")
+            .is_err());
     }
 }

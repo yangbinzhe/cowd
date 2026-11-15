@@ -3479,12 +3479,16 @@ mod readiness_tests {
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<RuntimeServices>) {
-        let plan = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .map(|ancestor| ancestor.join("plan/2026-10/1016-cowd-future-kernel"))
-            .find(|candidate| candidate.join("design-contract.json").is_file())
-            .expect("readiness fixture requires the execution plan tree");
-        let fixtures = plan.join("evidence/execution/kernel-terminal-20261016/R1-03/fixtures");
+        let fixtures = std::env::var_os("COWD_TEST_FIXTURE_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let plan = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .ancestors()
+                    .map(|ancestor| ancestor.join("plan/2026-10/1016-cowd-future-kernel"))
+                    .find(|candidate| candidate.join("design-contract.json").is_file())
+                    .expect("readiness fixture requires the execution plan tree");
+                plan.join("evidence/execution/kernel-terminal-20261016/R1-03/fixtures")
+            });
         std::fs::create_dir_all(&fixtures).unwrap();
         let root = tempfile::Builder::new()
             .prefix("readiness-")
@@ -3544,7 +3548,8 @@ mod readiness_tests {
                 .node_attempts
                 .get(&node.id)
                 .copied()
-                .unwrap_or(1),
+                .unwrap_or(1)
+                .max(1),
             idempotency_key: node.idempotency_key.clone(),
             payload_ref: node.payload_ref.clone(),
         }
@@ -3892,6 +3897,107 @@ mod readiness_tests {
             .graph
     }
 
+    struct OriginalPredecessor {
+        calls: AtomicUsize,
+        callback_entered: tokio::sync::Notify,
+        release_callback: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ScopedNodeBackend for OriginalPredecessor {
+        async fn execute(&self, ticket: &NodeExecutionTicket) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(NodeExecutionOutcome::new(completed_result(&ticket.node_id)))
+        }
+
+        async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+            self.callback_entered.notify_one();
+            self.release_callback.notified().await;
+            Ok(())
+        }
+    }
+
+    struct OriginalPredecessorResolver {
+        ticket: NodeExecutionTicket,
+        backend: Weak<OriginalPredecessor>,
+    }
+
+    impl ScopedNodeBackendResolver for OriginalPredecessorResolver {
+        fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+            if ticket != &self.ticket { return None; }
+            self.backend.upgrade().map(|backend| backend as Arc<dyn ScopedNodeBackend>)
+        }
+    }
+
+    async fn persist_original_owner_ready_synthesize(
+        services: &Arc<RuntimeServices>,
+        session: &str,
+    ) -> ExecutionGraph {
+        use crate::execution_core::graph::ExecutionGraphRunner;
+
+        let mut graph = ExecutionGraph::new("terminal predecessor and recovered synthesize");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.lineage.as_mut().unwrap().session_id = session.to_string();
+        graph.nodes = vec![node("tool_batch", "predecessor"), node("synthesize", "answer")];
+        graph.nodes[0].payload_ref = crate::step_snapshot::encode_persisted_tool_batch(
+            &serde_json::json!({"session_id": session, "calls": [], "step_snapshots": {}, "continue_with_tool_batch": false}),
+        ).unwrap();
+        for node in &mut graph.nodes {
+            node.idempotency_key = format!("{}:{}", graph.id, node.id);
+        }
+        graph.edges.push(ExecutionEdge {
+            from: "predecessor".into(), to: "answer".into(), kind: ExecutionEdgeKind::DependsOn,
+        });
+        let runner = ExecutionGraphRunner::new(
+            services.executor_registry().clone(), services.graph_state_store().clone(),
+            services.commit_service().clone(), services.resource_manager().clone(),
+            services.scope_locks().clone(), services.worktree_leases().clone(),
+            services.workspace_key(), services.workspace_root(),
+        );
+        let graph = runner.register(graph).await.unwrap();
+        let original_ticket = ticket_for(&graph, 0);
+        let backend = Arc::new(OriginalPredecessor {
+            calls: AtomicUsize::new(0), callback_entered: tokio::sync::Notify::new(),
+            release_callback: tokio::sync::Notify::new(),
+        });
+        services.tool_batch_executor().install_resolver(Arc::new(OriginalPredecessorResolver {
+            ticket: original_ticket.clone(), backend: Arc::downgrade(&backend),
+        }));
+        let snapshot = runner.pump_snapshot(&graph.id, &Default::default()).await.unwrap();
+        let mut prepared = runner.prepare_ready_wave(&graph.id, snapshot.ready).await.unwrap();
+        assert_eq!(prepared.len(), 1, "only the original predecessor may be prepared");
+        let binding = prepared[0].binding.as_ref().expect("original binding");
+        assert_eq!(binding.attempt, original_ticket.attempt);
+        assert_eq!(binding.ticket_idempotency_key, original_ticket.idempotency_key);
+        let driver_runner = runner.clone();
+        let graph_id = graph.id.clone();
+        let work = prepared.remove(0);
+        let driver = tokio::spawn(async move {
+            driver_runner.execute_prepared_pump_node(&graph_id, work, Arc::new(tokio::sync::Notify::new())).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), backend.callback_entered.notified()).await
+            .expect("original callback was not entered");
+        let pending = services.graph_state_store().load(&graph.id).unwrap();
+        assert_eq!(pending.node_statuses["predecessor"], ExecutionNodeStatus::Completed);
+        let starts = services.graph_state_store().binding_starts_page(&graph.id, 0, pending.revision).unwrap().1;
+        let (_, binding, position) = starts.iter().find(|(id, _, _)| id == "predecessor").unwrap();
+        assert!(!services.graph_state_store().binding_lease_closure(&pending, "predecessor", binding, *position).unwrap());
+        let snapshot = runner.pump_snapshot(&graph.id, &Default::default()).await.unwrap();
+        assert!(snapshot.ready.iter().all(|node| node.id != "answer"), "unclosed predecessor must block successor");
+        let answer = graph.nodes.iter().find(|node| node.id == "answer").unwrap().clone();
+        assert!(runner.prepare_ready_wave(&graph.id, vec![answer]).await.unwrap().is_empty(),
+            "caller-supplied successor must not bypass the original closure");
+        backend.release_callback.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+        let closed = services.graph_state_store().load(&graph.id).unwrap();
+        assert!(services.graph_state_store().binding_lease_closure(&closed, "predecessor", binding, *position).unwrap());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        runner.pump_snapshot(&graph.id, &Default::default()).await.unwrap();
+        let ready = services.graph_state_store().load(&graph.id).unwrap();
+        assert_eq!(ready.node_statuses["answer"], ExecutionNodeStatus::Ready);
+        ready
+    }
+
     async fn assert_original_graph_completed(
         services: &RuntimeServices,
         before: &ExecutionGraph,
@@ -3976,7 +4082,7 @@ mod readiness_tests {
         }
         let (_root, services) = fixture();
         let healthy =
-            persist_ready_synthesize_for_session(&services, Some("healthy-recovery-session"));
+            persist_original_owner_ready_synthesize(&services, "healthy-recovery-session").await;
         let failed =
             persist_ready_synthesize_for_session(&services, Some("failed-recovery-session"));
         let healthy_backend = ReadinessBackend::new();

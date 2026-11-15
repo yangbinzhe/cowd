@@ -171,10 +171,19 @@ impl GatewayToolExecutor {
         tool_name: &str,
         value: &mut serde_json::Value,
     ) -> Vec<CoercedField> {
+        let lease = self.tool_host.pin_snapshot();
+        self.coerce_string_typed_structured_fields_with_lease(tool_name, value, &lease)
+    }
+
+    fn coerce_string_typed_structured_fields_with_lease(
+        &self,
+        tool_name: &str,
+        value: &mut serde_json::Value,
+        lease: &tools::ToolHostLease,
+    ) -> Vec<CoercedField> {
         let Some(object) = value.as_object_mut() else {
             return Vec::new();
         };
-        let lease = self.tool_host.pin_snapshot();
         let Some(definition) = lease
             .snapshot()
             .catalog
@@ -360,6 +369,16 @@ impl GatewayToolExecutor {
 
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
         let lease = self.tool_host.pin_snapshot();
+        self.input_contract_error_with_lease(tool_name, error, &lease, None)
+    }
+
+    fn input_contract_error_with_lease(
+        &self,
+        tool_name: &str,
+        error: impl std::fmt::Display,
+        lease: &tools::ToolHostLease,
+        schema_reason: Option<&str>,
+    ) -> ToolError {
         let definition = lease
             .snapshot()
             .catalog
@@ -453,6 +472,21 @@ impl GatewayToolExecutor {
             Some(hint) => format!("{message}. sibling_vocab_hint: {hint}"),
             None => message,
         };
+        let correction = schema_reason.and_then(|reason| {
+            definition.as_ref().and_then(|definition| {
+                harness_contract::tool_input_contract::input_shape_correction(
+                    tool_name, reason, &definition.input_schema,
+                )
+            })
+        });
+        let mut message = correction.map_or(message.clone(), |hint| format!("{message}. {hint}"));
+        if tool_name == "tool_orchestrate" && correction.is_some() {
+            let example = serde_json::json!({"steps":[{"id":"read","op":"call","tool":"read_file",
+                "input":{"path":"<workspace path>"}}],"return":"$read"});
+            if lease.validate_input(tool_name, &example).is_ok() {
+                message.push_str(&format!(". Schema-valid structural example (replace the path with a real workspace path): {example}"));
+            }
+        }
         ToolError::from_failure(
             harness_contract::tool::ToolExecutionFailure::input_contract(
                 tool_name,
@@ -871,7 +905,7 @@ impl GatewayToolExecutor {
     async fn execute_runtime_tool_with_member(
         &self, tool_name: &str, mut value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
-        mut member: Option<&mut Option<runtime::step_snapshot::OriginalPreparedMemberCapability>>,
+        member: Option<&mut Option<runtime::step_snapshot::OriginalPreparedMemberCapability>>,
         member_results: Option<(&runtime::ToolProgressSink, usize)>,
     ) -> Result<String, ToolError> {
         if member.is_some() && !is_agent_action_tool(tool_name) {
@@ -889,290 +923,7 @@ impl GatewayToolExecutor {
                 .await;
         }
         if is_agent_action_tool(tool_name) {
-            let original_action_input = value.clone();
-            let services = self.upgrade_runtime_services().ok_or_else(|| {
-                ToolError::new("Agent action requires the workspace RuntimeServices")
-            })?;
-            let original_root = binding.action_invocation.and_then(|capability| capability.root_physical_owner());
-            let root_parent = original_root.as_ref().map(|physical| harness_contract::execution_graph::ExecutionParentBinding {
-                execution_id: physical.graph_id.clone(), node_id: physical.node_id.clone(),
-            });
-            let actor = match root_parent.as_ref().or(binding.parent_execution) {
-                Some(parent) => {
-                    let trusted_root = binding
-                        .execution_decision
-                        .and_then(|decision| {
-                            (decision.execution_graph_ref.as_deref()
-                                == Some(parent.execution_id.as_str())
-                                && decision.session_ref.as_deref() == binding.session_id
-                                && decision
-                                    .turn_ref
-                                    .as_deref()
-                                    .is_some_and(|turn| !turn.is_empty()))
-                            .then(|| root_agent_action_actor(binding))
-                        })
-                        .transpose()
-                        .map_err(|error| {
-                            ToolError::new(error)
-                        })?;
-                    services
-                        .resolve_agent_action_actor_for_attempt(
-                            parent,
-                            original_root.as_ref().map(|p| p.attempt).or(binding.parent_execution_attempt).ok_or_else(|| {
-                                ToolError::new("Agent actions require the original node attempt")
-                            })?,
-                            trusted_root,
-                        )
-                        .await
-                        .map_err(|error| {
-                            ToolError::new(error)
-                        })?
-                }
-                None => {
-                    return Err(ToolError::new(
-                        "Agent actions require an admitted execution graph and its authenticated parent binding",
-                    ));
-                }
-            };
-            let expected_revision = match value
-                .as_object_mut()
-                .and_then(|object| object.remove("expected_revision"))
-            {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::Number(number)) => {
-                    Some(number.as_u64().ok_or_else(|| {
-                        self.input_contract_error(
-                            tool_name,
-                            "expected_revision must be a non-negative integer".to_string(),
-                        )
-                    })?)
-                }
-                Some(_) => {
-                    return Err(self.input_contract_error(
-                        tool_name,
-                        "expected_revision must be a non-negative integer".to_string(),
-                    ));
-                }
-            };
-            // An exact Program reference and a search/page cursor are mutually
-            // exclusive. When a weak model supplies both, honour the exact
-            // reference instead of rejecting the whole action.
-            if tool_name == "state_inspect" {
-                if let Some(object) = value.as_object_mut() {
-                    if object.contains_key("entry_ref") || object.contains_key("scope_ref") {
-                        object.remove("page_cursor");
-                        object.remove("query");
-                    }
-                }
-            }
-            let action = parse_agent_action(tool_name, value)
-                .map_err(|error| {
-                    self.input_contract_error(tool_name, error)
-                })?;
-            let resolved_content_ref = match &action {
-                harness_contract::agent_action::AgentAction::ArtifactCommit(input) => {
-                    Some(input.content_ref.clone())
-                }
-                _ => None,
-            };
-            let envelope = harness_contract::agent_action::AgentActionEnvelope {
-                action_id: binding
-                    .action_id
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::new("Agent action requires a durable Runtime invocation id; payload hashes are not action identities")
-                    })?
-                    .to_string(),
-                actor,
-                expected_revision,
-                action,
-            };
-            let mut observation = match member.as_deref_mut() {
-                Some(candidate) => {
-                    let (sink, index) = member_results.ok_or_else(|| {
-                        ToolError::unknown("original member result carrier unavailable")
-                    })?;
-                    let capability = candidate.take().ok_or_else(|| {
-                        ToolError::unknown("original member candidate unavailable")
-                    })?;
-                    match services.submit_agent_action_member(&envelope, capability).await {
-                        runtime::tool_host::PreparedMemberSubmitOutcome::Committed(committed) => {
-                            let observation = match committed.observation() {
-                                runtime::tool_host::OriginalMemberObservation::Available(observation) => Some(observation.clone()),
-                                runtime::tool_host::OriginalMemberObservation::Unavailable => None,
-                            };
-                            sink.record_original_member(index, std::sync::Arc::new(
-                                runtime::tool_host::OriginalMemberSubmitOutcome::Committed(committed)));
-                            observation.ok_or_else(|| ToolError::unknown("original member committed; observation unavailable"))?
-                        }
-                        runtime::tool_host::PreparedMemberSubmitOutcome::Stopped(publication) => {
-                            return Err(original_member_stop_error(
-                                sink, publication, "original member checked outcome unresolved",
-                            ));
-                        },
-                    }
-                },
-                None => {
-                    let capability = binding.action_invocation.ok_or_else(||
-                        single_call_capability_refusal(tool_name))?;
-                    services.submit_delegated_tool_action(capability, &envelope, tool_name, &original_action_input)
-                        .await.map_err(|error| match error {
-                            runtime::AgentActionServiceError::MemberUnknown(_) => ToolError::unknown(error.to_string()),
-                            other => ToolError::new(other.to_string()),
-                        })?
-                }
-            };
-            // `objective_complete_request` only commits the model-authored
-            // request here. The durable Program projection lane is the sole
-            // live reconciliation trigger: it asks ObjectiveSupervisor for a
-            // verdict and wakes the root graph. Running the same reconciliation
-            // synchronously in this foreground tool path raced that lane on the
-            // Goal stream, producing a false failed tool receipt even when the
-            // Objective terminal had already committed successfully.
-            let should_dispatch = observation.status
-                == harness_contract::agent_action::AgentActionStatus::Applied
-                && !matches!(
-                    envelope.action,
-                    harness_contract::agent_action::AgentAction::StateInspect(_)
-                );
-            // Reconcile duplicate mutations too. The semantic write may have
-            // survived a crash while its physical follow-up graph did not;
-            // dispatch is deterministic and therefore safe to replay.
-            if should_dispatch {
-                let dispatch_context = runtime::AgenticDispatchContext {
-                    session_id: envelope.actor.session_id.clone(),
-                    turn_id: envelope.actor.turn_id.clone(),
-                    model_lease: binding.model_lease.unwrap_or("default").to_string(),
-                    permission_ceiling: binding.permission_ceiling,
-                    resource_scopes: envelope.actor.resource_scopes.clone(),
-                };
-                if !matches!(
-                    &envelope.action,
-                    harness_contract::agent_action::AgentAction::TaskWithdraw(_)
-                        | harness_contract::agent_action::AgentAction::TaskSupersede(_)
-                ) {
-                    reconcile_program_barrier(&services, &envelope.actor.program_id).await;
-                }
-                match services
-                    .dispatch_agentic_followups(&envelope, dispatch_context.clone())
-                    .await
-                {
-                    Ok(dispatches) if !dispatches.is_empty() => {
-                        observation.actionable.push(format!(
-                            "Runtime admitted {} real Agent execution graph(s)",
-                            dispatches.len()
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        // The Agent Action is already durable. Reporting the
-                        // entire tool call as failed lies to the model and may
-                        // cause duplicate semantic work. Preserve the applied
-                        // receipt and expose physical dispatch as a retryable,
-                        // independently observable follow-up state.
-                        tracing::warn!(
-                            action_id = %envelope.action_id,
-                            program_id = %envelope.actor.program_id,
-                            %error,
-                            "Agent action committed while physical dispatch was deferred"
-                        );
-                        observation.actionable.push(format!(
-                            "Semantic action committed; physical Agent dispatch is deferred and remains recoverable: {error}"
-                        ));
-                    }
-                }
-            }
-            // A refused action must reach the model as a failed tool call.
-            //
-            // It used to arrive as a *successful* result carrying
-            // `"status": "rejected"` somewhere inside a pretty-printed receipt. The
-            // model read a completed tool call and re-sent the same bytes: one live
-            // run emitted the identical string-typed `agent_action_batch` frame three
-            // times, was refused twice on the durable log, and was told nothing on
-            // either occasion.
-            //
-            // The model-step path already answers a refused frame in-step through
-            // `preflight_tool_results` (P41/U2). This is the tool path, and it owed
-            // the same obligation - the refusal is only useful if the thing that
-            // emitted the frame can read it.
-            if matches!(
-                observation.status,
-                harness_contract::agent_action::AgentActionStatus::Rejected
-                    | harness_contract::agent_action::AgentActionStatus::Blocked
-            ) {
-                let error = observation.error.as_ref();
-                let code = error
-                    .map(|error| error.code.as_str())
-                    .unwrap_or("action_refused");
-                let message = error
-                    .map(|error| error.message.as_str())
-                    .unwrap_or("Runtime refused this action");
-                let guidance = if observation.actionable.is_empty() {
-                    String::new()
-                } else {
-                    format!("\nRuntime guidance: {}", observation.actionable.join("; "))
-                };
-                // The structured receipt stays inside the failure, verbatim, so a
-                // caller that wants to deserialize the observation still can. What
-                // changes is that the call is now marked failed, which is the part
-                // the model reads.
-                let receipt = serialize_agent_action_receipt(
-                    &observation,
-                    resolved_content_ref.as_deref(),
-                )
-                .unwrap_or_else(|_: serde_json::Error| String::new());
-                return Err(ToolError::new(format!(
-                    "Runtime did not execute `{}`: {code}: {message}. \
-                     Nothing from it ran and no state changed. \
-                     Re-emit the same intended action with the corrected arguments.{guidance}\n\
-                     Structured receipt: {receipt}",
-                    envelope.action.kind()
-                )));
-            }
-            // A model that declares itself blocked by a missing tool is usually
-            // wrong, and nothing in the framework ever checked.
-            //
-            // One live run reached its terminal with `blocked_reason`: "Artifact
-            // creation and issue classification tools are not available" - while the
-            // Gateway log for that same request shows `artifact_commit` and
-            // `message_publish` sitting in the exposed set. It gave up over tools it
-            // was holding, which is the one19 shape returning at the most expensive
-            // possible moment.
-            //
-            // Runtime knows the exposed set. When the model says it cannot act, the
-            // answer travels in the same result, so the claim is checkable at the
-            // moment it is made rather than discovered in a post-mortem.
-            let declares_blocked = matches!(
-                envelope.action,
-                harness_contract::agent_action::AgentAction::ObjectiveCompleteRequest(ref input)
-                    if input.blocked
-            ) || matches!(
-                envelope.action,
-                harness_contract::agent_action::AgentAction::ObjectiveReview(ref input)
-                    if input.decision
-                        == harness_contract::agent_action::ObjectiveReviewDecision::Blocked
-            );
-            if declares_blocked {
-                let mut names = self
-                    .tool_host
-                    .pin_snapshot()
-                    .snapshot()
-                    .catalog
-                    .definitions(None)
-                    .into_iter()
-                    .map(|definition| definition.name)
-                    .collect::<Vec<_>>();
-                names.sort();
-                observation.actionable.push(format!(
-                    "You reported being blocked. These tools ARE exposed in this request: \
-                     [{}]. If your reason names one of them as unavailable, that is not \
-                     correct - use it. If the real obstacle is a missing fact rather than a \
-                     missing tool, name the fact.",
-                    names.join(", ")
-                ));
-            }
-            return serialize_agent_action_receipt(&observation, resolved_content_ref.as_deref())
-                .map_err(|error| ToolError::new(error.to_string()));
+            return Box::pin(self.execute_agent_action_tool(tool_name, value, binding, member, member_results)).await;
         }
         if tool_name == "runtime_capabilities" {
             tracing::debug!(
@@ -1417,6 +1168,312 @@ impl GatewayToolExecutor {
     /// evidence refs and the input/output edges around the node. Phase B of the
     /// unified read design, so a collaborator can inspect one node in a single
     /// read instead of stitching several tools together.
+    // Keep the action-specific state machine out of the general dispatch future.
+    async fn execute_agent_action_tool(
+        &self,
+        tool_name: &str,
+        mut value: serde_json::Value,
+        binding: RuntimeToolExecutionBinding<'_>,
+        mut member: Option<&mut Option<runtime::step_snapshot::OriginalPreparedMemberCapability>>,
+        member_results: Option<(&runtime::ToolProgressSink, usize)>,
+    ) -> Result<String, ToolError> {
+        // Keep the whole agent-action state machine off the caller's stack: the
+        // actor resolution, member submit and dispatch futures are large and were
+        // inlined into this frame. Boxing the body moves them to the heap; the
+        // ownership, fences and receipt semantics are unchanged.
+        Box::pin(async move {
+            let original_action_input = value.clone();
+            let services = self.upgrade_runtime_services().ok_or_else(|| {
+                ToolError::new("Agent action requires the workspace RuntimeServices")
+            })?;
+            let original_root = binding.action_invocation.and_then(|capability| capability.root_physical_owner());
+            let root_parent = original_root.as_ref().map(|physical| harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: physical.graph_id.clone(), node_id: physical.node_id.clone(),
+            });
+            let actor = match root_parent.as_ref().or(binding.parent_execution) {
+                Some(parent) => {
+                    let trusted_root = binding
+                        .execution_decision
+                        .and_then(|decision| {
+                            (decision.execution_graph_ref.as_deref()
+                                == Some(parent.execution_id.as_str())
+                                && decision.session_ref.as_deref() == binding.session_id
+                                && decision
+                                    .turn_ref
+                                    .as_deref()
+                                    .is_some_and(|turn| !turn.is_empty()))
+                            .then(|| root_agent_action_actor(binding))
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            ToolError::new(error)
+                        })?;
+                    services
+                        .resolve_agent_action_actor_for_attempt(
+                            parent,
+                            original_root.as_ref().map(|p| p.attempt).or(binding.parent_execution_attempt).ok_or_else(|| {
+                                ToolError::new("Agent actions require the original node attempt")
+                            })?,
+                            trusted_root,
+                        )
+                        .await
+                        .map_err(|error| {
+                            ToolError::new(error)
+                        })?
+                }
+                None => {
+                    return Err(ToolError::new(
+                        "Agent actions require an admitted execution graph and its authenticated parent binding",
+                    ));
+                }
+            };
+            let expected_revision = match value
+                .as_object_mut()
+                .and_then(|object| object.remove("expected_revision"))
+            {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Number(number)) => {
+                    Some(number.as_u64().ok_or_else(|| {
+                        self.input_contract_error(
+                            tool_name,
+                            "expected_revision must be a non-negative integer".to_string(),
+                        )
+                    })?)
+                }
+                Some(_) => {
+                    return Err(self.input_contract_error(
+                        tool_name,
+                        "expected_revision must be a non-negative integer".to_string(),
+                    ));
+                }
+            };
+            // An exact Program reference and a search/page cursor are mutually
+            // exclusive. When a weak model supplies both, honour the exact
+            // reference instead of rejecting the whole action.
+            if tool_name == "state_inspect" {
+                if let Some(object) = value.as_object_mut() {
+                    if object.contains_key("entry_ref") || object.contains_key("scope_ref") {
+                        object.remove("page_cursor");
+                        object.remove("query");
+                    }
+                }
+            }
+            let action = parse_agent_action(tool_name, value)
+                .map_err(|error| {
+                    self.input_contract_error(tool_name, error)
+                })?;
+            let resolved_content_ref = match &action {
+                harness_contract::agent_action::AgentAction::ArtifactCommit(input) => {
+                    Some(input.content_ref.clone())
+                }
+                _ => None,
+            };
+            let envelope = harness_contract::agent_action::AgentActionEnvelope {
+                action_id: binding
+                    .action_id
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        ToolError::new("Agent action requires a durable Runtime invocation id; payload hashes are not action identities")
+                    })?
+                    .to_string(),
+                actor,
+                expected_revision,
+                action,
+            };
+            let mut observation = match member.as_deref_mut() {
+                Some(candidate) => {
+                    let (sink, index) = member_results.ok_or_else(|| {
+                        ToolError::unknown("original member result carrier unavailable")
+                    })?;
+                    let capability = candidate.take().ok_or_else(|| {
+                        ToolError::unknown("original member candidate unavailable")
+                    })?;
+                    match services.submit_agent_action_member(&envelope, capability).await {
+                        runtime::tool_host::PreparedMemberSubmitOutcome::Committed(committed) => {
+                            let observation = match committed.observation() {
+                                runtime::tool_host::OriginalMemberObservation::Available(observation) => Some(observation.clone()),
+                                runtime::tool_host::OriginalMemberObservation::Unavailable => None,
+                            };
+                            sink.record_original_member(index, std::sync::Arc::new(
+                                runtime::tool_host::OriginalMemberSubmitOutcome::Committed(committed)));
+                            observation.ok_or_else(|| ToolError::unknown("original member committed; observation unavailable"))?
+                        }
+                        runtime::tool_host::PreparedMemberSubmitOutcome::Stopped(publication) => {
+                            return Err(original_member_stop_error(
+                                sink, publication, "original member checked outcome unresolved",
+                            ));
+                        },
+                    }
+                },
+                None => {
+                    let capability = binding.action_invocation.ok_or_else(||
+                        single_call_capability_refusal(tool_name))?;
+                    services.submit_delegated_tool_action(capability, &envelope, tool_name, &original_action_input)
+                        .await.map_err(|error| match error {
+                            runtime::AgentActionServiceError::MemberUnknown(_) => ToolError::unknown(error.to_string()),
+                            other => ToolError::new(other.to_string()),
+                        })?
+                }
+            };
+            drop(original_action_input);
+            drop(member);
+            let _ = member_results;
+            Box::pin(async move {
+            // `objective_complete_request` only commits the model-authored
+            // request here. The durable Program projection lane is the sole
+            // live reconciliation trigger: it asks ObjectiveSupervisor for a
+            // verdict and wakes the root graph. Running the same reconciliation
+            // synchronously in this foreground tool path raced that lane on the
+            // Goal stream, producing a false failed tool receipt even when the
+            // Objective terminal had already committed successfully.
+            let should_dispatch = observation.status
+                == harness_contract::agent_action::AgentActionStatus::Applied
+                && !matches!(
+                    envelope.action,
+                    harness_contract::agent_action::AgentAction::StateInspect(_)
+                );
+            // Reconcile duplicate mutations too. The semantic write may have
+            // survived a crash while its physical follow-up graph did not;
+            // dispatch is deterministic and therefore safe to replay.
+            if should_dispatch {
+                let dispatch_context = runtime::AgenticDispatchContext {
+                    session_id: envelope.actor.session_id.clone(),
+                    turn_id: envelope.actor.turn_id.clone(),
+                    model_lease: binding.model_lease.unwrap_or("default").to_string(),
+                    permission_ceiling: binding.permission_ceiling,
+                    resource_scopes: envelope.actor.resource_scopes.clone(),
+                };
+                if !matches!(
+                    &envelope.action,
+                    harness_contract::agent_action::AgentAction::TaskWithdraw(_)
+                        | harness_contract::agent_action::AgentAction::TaskSupersede(_)
+                ) {
+                    reconcile_program_barrier(&services, &envelope.actor.program_id).await;
+                }
+                match services
+                    .dispatch_agentic_followups(&envelope, dispatch_context.clone())
+                    .await
+                {
+                    Ok(dispatches) if !dispatches.is_empty() => {
+                        observation.actionable.push(format!(
+                            "Runtime admitted {} real Agent execution graph(s)",
+                            dispatches.len()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        // The Agent Action is already durable. Reporting the
+                        // entire tool call as failed lies to the model and may
+                        // cause duplicate semantic work. Preserve the applied
+                        // receipt and expose physical dispatch as a retryable,
+                        // independently observable follow-up state.
+                        tracing::warn!(
+                            action_id = %envelope.action_id,
+                            program_id = %envelope.actor.program_id,
+                            %error,
+                            "Agent action committed while physical dispatch was deferred"
+                        );
+                        observation.actionable.push(format!(
+                            "Semantic action committed; physical Agent dispatch is deferred and remains recoverable: {error}"
+                        ));
+                    }
+                }
+            }
+            // A refused action must reach the model as a failed tool call.
+            //
+            // It used to arrive as a *successful* result carrying
+            // `"status": "rejected"` somewhere inside a pretty-printed receipt. The
+            // model read a completed tool call and re-sent the same bytes: one live
+            // run emitted the identical string-typed `agent_action_batch` frame three
+            // times, was refused twice on the durable log, and was told nothing on
+            // either occasion.
+            //
+            // The model-step path already answers a refused frame in-step through
+            // `preflight_tool_results` (P41/U2). This is the tool path, and it owed
+            // the same obligation - the refusal is only useful if the thing that
+            // emitted the frame can read it.
+            if matches!(
+                observation.status,
+                harness_contract::agent_action::AgentActionStatus::Rejected
+                    | harness_contract::agent_action::AgentActionStatus::Blocked
+            ) {
+                let error = observation.error.as_ref();
+                let code = error
+                    .map(|error| error.code.as_str())
+                    .unwrap_or("action_refused");
+                let message = error
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("Runtime refused this action");
+                let guidance = if observation.actionable.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nRuntime guidance: {}", observation.actionable.join("; "))
+                };
+                // The structured receipt stays inside the failure, verbatim, so a
+                // caller that wants to deserialize the observation still can. What
+                // changes is that the call is now marked failed, which is the part
+                // the model reads.
+                let receipt = serialize_agent_action_receipt(
+                    &observation,
+                    resolved_content_ref.as_deref(),
+                )
+                .unwrap_or_else(|_: serde_json::Error| String::new());
+                return Err(ToolError::new(format!(
+                    "Runtime did not execute `{}`: {code}: {message}. \
+                     Nothing from it ran and no state changed. \
+                     Re-emit the same intended action with the corrected arguments.{guidance}\n\
+                     Structured receipt: {receipt}",
+                    envelope.action.kind()
+                )));
+            }
+            // A model that declares itself blocked by a missing tool is usually
+            // wrong, and nothing in the framework ever checked.
+            //
+            // One live run reached its terminal with `blocked_reason`: "Artifact
+            // creation and issue classification tools are not available" - while the
+            // Gateway log for that same request shows `artifact_commit` and
+            // `message_publish` sitting in the exposed set. It gave up over tools it
+            // was holding, which is the one19 shape returning at the most expensive
+            // possible moment.
+            //
+            // Runtime knows the exposed set. When the model says it cannot act, the
+            // answer travels in the same result, so the claim is checkable at the
+            // moment it is made rather than discovered in a post-mortem.
+            let declares_blocked = matches!(
+                envelope.action,
+                harness_contract::agent_action::AgentAction::ObjectiveCompleteRequest(ref input)
+                    if input.blocked
+            ) || matches!(
+                envelope.action,
+                harness_contract::agent_action::AgentAction::ObjectiveReview(ref input)
+                    if input.decision
+                        == harness_contract::agent_action::ObjectiveReviewDecision::Blocked
+            );
+            if declares_blocked {
+                let mut names = self
+                    .tool_host
+                    .pin_snapshot()
+                    .snapshot()
+                    .catalog
+                    .definitions(None)
+                    .into_iter()
+                    .map(|definition| definition.name)
+                    .collect::<Vec<_>>();
+                names.sort();
+                observation.actionable.push(format!(
+                    "You reported being blocked. These tools ARE exposed in this request: \
+                     [{}]. If your reason names one of them as unavailable, that is not \
+                     correct - use it. If the real obstacle is a missing fact rather than a \
+                     missing tool, name the fact.",
+                    names.join(", ")
+                ));
+            }
+            return serialize_agent_action_receipt(&observation, resolved_content_ref.as_deref())
+                .map_err(|error| ToolError::new(error.to_string()));
+            }).await
+        }).await
+    }
+
     async fn read_graph_node(&self, graph_id: &str, node_id: &str) -> Result<String, ToolError> {
         let services = self.upgrade_runtime_services().ok_or_else(|| {
             ToolError::new("`read_ref` node:// requires the workspace RuntimeServices")

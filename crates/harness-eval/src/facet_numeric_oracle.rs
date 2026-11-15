@@ -826,7 +826,10 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", root.join("escape.rs")).unwrap();
         let before = Snapshot::capture(&root).unwrap();
-        assert_eq!(before.files.len(), 8);
+        let expected: BTreeSet<_> = SOURCES.iter().copied().chain(["Cargo.toml", "crates/runtime/Cargo.toml"]).collect();
+        let mut observed = BTreeSet::new();
+        assert!(before.files.iter().all(|(path, _)| observed.insert(path.as_str())));
+        assert_eq!(observed, expected);
         assert_eq!(before.total_lines, 12);
         assert_eq!(before.top.get("runtime"), Some(&1));
         assert_eq!(before.facts[0], 1);

@@ -1363,6 +1363,87 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
             })?,
         })
     }
+    fn original_checked_terminal_winner(
+        &self,
+        request: &CheckedAppendRequest,
+        terminal: &SessionTerminalInput,
+        validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if validator.frame_digest() != request.frame_digest {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "source frame mismatch".into(),
+            ));
+        }
+        let exists = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeEventStoreError::Corrupt("event store lock poisoned".into()))?
+            .transactions
+            .contains_key(&request.transaction.transaction_id);
+        if !exists {
+            return Ok(None);
+        }
+        let (commit, validation) = self.append_inner_checked(
+            request.transaction.clone(),
+            Some(terminal.clone()),
+            Some((request, validator)),
+        )?;
+        if !commit.duplicate {
+            return Err(RuntimeEventStoreError::Corrupt(
+                "terminal winner was not duplicate".into(),
+            ));
+        }
+        Ok(Some(CheckedAppendReceipt {
+            commit,
+            validation: validation.ok_or_else(|| {
+                RuntimeEventStoreError::Corrupt("checked terminal evidence missing".into())
+            })?,
+        }))
+    }
+    fn append_checked_terminal_cancellable(
+        &self,
+        request: CheckedAppendRequest,
+        terminal: SessionTerminalInput,
+        validator: &dyn CheckedSourceValidator,
+        control: &dyn RuntimeTransactionCommitControl,
+        _claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if !control
+            .begin()
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?
+        {
+            return Ok(None);
+        }
+        control.before_commit();
+        if !control
+            .commit_wins()
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?
+        {
+            control.finish(RuntimeTransactionOutcome::RolledBack);
+            return Ok(None);
+        }
+        match self.append_inner_checked(
+            request.transaction.clone(),
+            Some(terminal),
+            Some((&request, validator)),
+        ) {
+            Ok((commit, validation)) => {
+                control.finish(RuntimeTransactionOutcome::Committed);
+                Ok(Some(CheckedAppendReceipt {
+                    commit,
+                    validation: validation.ok_or_else(|| {
+                        RuntimeEventStoreError::Corrupt(
+                            "checked terminal evidence missing".into(),
+                        )
+                    })?,
+                }))
+            }
+            Err(error) => {
+                control.finish(RuntimeTransactionOutcome::RolledBack);
+                Err(error)
+            }
+        }
+    }
     fn append_transaction_with_terminal(
         &self,
         request: AppendTransactionRequest,

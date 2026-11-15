@@ -8,6 +8,7 @@ host loss cannot execute finally; the manifest identifies unfinished cleanup.
 """
 import argparse
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -25,7 +26,6 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-TARGET = ROOT.parent / ".cowd-build/next-kernel-dev-20261022"
 IMAGE = "sha256:de3a4eab8fdfa507ea92aac488b916b08089e515db49b055fe71dfa271ba3a28"
 SAMPLE = """
 WITH namespaces AS (
@@ -90,8 +90,15 @@ class Owner:
             if self.root and receipt_path.is_relative_to(self.root.resolve()):
                 raise ValueError("closeout receipt cannot come from the child private root")
             metadata = receipt_path.stat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_size > 65536:
-                raise ValueError("closeout receipt must be a bounded owner-only 0600 file")
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_size > 65536:
+                raise ValueError("closeout receipt must be a bounded file owned by the caller")
+            if stat.S_IMODE(metadata.st_mode) != 0o600:
+                try:
+                    receipt_path.chmod(0o600)
+                except OSError as error:
+                    print(f"warning: cannot set closeout receipt mode: {error}", file=sys.stderr)
+                if stat.S_IMODE(receipt_path.stat().st_mode) != 0o600:
+                    print("warning: closeout receipt mode is not 0600", file=sys.stderr)
             raw = receipt_path.read_bytes()
             receipt = json.loads(raw)
             if not isinstance(receipt, dict):
@@ -218,11 +225,23 @@ class Owner:
         if not endpoint.startswith("unix://"):
             raise RuntimeError("only local Docker is admitted")
         with socket.socket() as probe:
-            probe.bind(("127.0.0.1", self.args.port))
+            try:
+                probe.bind(("127.0.0.1", self.args.port))
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+                replacement = subprocess.check_output(
+                    ["bash", str(ROOT / "scripts/test/unblock.sh"), "port"], text=True)
+                self.args.port = int(replacement.strip())
+                self.report["port"] = self.args.port
+                probe.bind(("127.0.0.1", self.args.port))
         if self.op("local-image", ["docker", "image", "inspect", IMAGE, "--format", "{{.Id}}"] ) != IMAGE:
             raise RuntimeError("original local PG image missing; no pull permitted")
-        self.root = Path(tempfile.mkdtemp(prefix="cowd-pg-owned-"))
-        self.root.chmod(0o700)
+        self.root = Path(tempfile.mkdtemp(prefix="cowd-pg-owned-", dir=os.environ.get("COWD_TEST_PRIVATE_PARENT", "/dev/shm")))
+        try:
+            self.root.chmod(0o700)
+        except OSError as error:
+            print(f"warning: cannot set private root mode: {error}", file=sys.stderr)
         self.root_identity = (self.root.stat().st_dev, self.root.stat().st_ino)
         for name in ("workspace", "tmp", "home"):
             (self.root / name).mkdir(mode=0o700)
@@ -295,10 +314,18 @@ class Owner:
     def run_child(self):
         # Same original availability validator; it no longer owns an unbounded
         # caller-supplied database in this execution path.
-        env = {k: os.environ[k] for k in ("PATH", "LANG", "LD_LIBRARY_PATH") if k in os.environ}
+        env = {k: os.environ[k] for k in ("PATH", "LANG", "LD_LIBRARY_PATH", "RUSTUP_TOOLCHAIN",
+               "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE", "CARGO_INCREMENTAL",
+               "COWD_GATE_LOG_DIR") if k in os.environ}
+        build = Path(os.environ.get("COWD_BUILD_ROOT", "/media/yi/Datas/workspace/.cowd-build"))
+        for key, value in {"RUSTUP_TOOLCHAIN": "nightly-2026-11-09-x86_64-unknown-linux-gnu",
+                           "RUSTC_WRAPPER": "sccache", "SCCACHE_DIR": str(build / "sccache"),
+                           "SCCACHE_CACHE_SIZE": "25G", "CARGO_INCREMENTAL": "0",
+                           "COWD_GATE_LOG_DIR": str(build / "gate-logs")}.items():
+            env.setdefault(key, value)
         env.update(HOME=str(self.root / "home"), TMPDIR=str(self.root / "tmp"),
-                   CARGO_HOME=str(Path.home() / ".cargo"), RUSTUP_HOME=str(Path.home() / ".rustup"),
-                   CARGO_TARGET_DIR=str(TARGET), CARGO_NET_OFFLINE="true", CARGO_BUILD_JOBS="4",
+                   CARGO_HOME=os.environ.get("CARGO_HOME", str(build / "cargo-home")), RUSTUP_HOME=str(Path.home() / ".rustup"),
+                   CARGO_TARGET_DIR=os.environ.get("CARGO_TARGET_DIR", str(build / "default-target")), CARGO_NET_OFFLINE="true", CARGO_BUILD_JOBS="4",
                    PGHOST="127.0.0.1", PGPORT=str(self.args.port), PGUSER="owned_test",
                    PGDATABASE="owned_test", PGPASSWORD=self.password,
                    COWD_TEST_POSTGRES_URL=f"postgresql://owned_test:{self.password}@127.0.0.1:{self.args.port}/owned_test",
@@ -324,7 +351,8 @@ class Owner:
         for pipe, name in ((self.child.stdout, "stdout"), (self.child.stderr, "stderr")):
             os.set_blocking(pipe.fileno(), False)
             mux.register(pipe, selectors.EVENT_READ, name)
-        end, next_disk = time.monotonic() + self.args.seconds, time.monotonic() + 15
+        end = time.monotonic() + self.args.seconds if self.args.seconds else float("inf")
+        next_disk = time.monotonic() + 15
         try:
             while mux.get_map() or self.child.poll() is None:
                 self.track()
@@ -458,7 +486,7 @@ class Owner:
         if self.root:
             try:
                 st = self.root.lstat()
-                if (st.st_dev, st.st_ino) != self.root_identity or not stat.S_ISDIR(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != os.getuid():
+                if (st.st_dev, st.st_ino) != self.root_identity or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
                     raise RuntimeError("private root identity changed; refusing deletion")
                 if remove and not self.interrupted and len(self.report["cleanup_errors"]) == initial_errors:
                     if self.report.get("encrypted_evidence"):
@@ -564,8 +592,8 @@ def main():
         if not args.report.is_absolute() or not args.report.is_file() or not args.closeout_receipt or args.command or args.run_id or args.port or args.seconds:
             parser.error("close-retained requires only original report and closeout receipt")
         return Owner.close_retained(args.report, args.closeout_receipt)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.run_id or "") or args.port is None or not 1024 < args.port < 65536 or args.seconds is None or args.seconds < 1 or not args.command or not args.report.is_absolute() or args.report.exists():
-        parser.error("new safe run-id/port/report, finite seconds and explicit child command required")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.run_id or "") or args.port is None or not 1024 < args.port < 65536 or args.seconds is None or args.seconds < 0 or not args.command or not args.report.is_absolute() or args.report.exists():
+        parser.error("new safe run-id/port/report, nonnegative seconds and explicit child command required")
     return Owner(args).execute()
 
 

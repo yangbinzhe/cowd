@@ -7,28 +7,14 @@
 //! never moves: every turn returns its runtime, so the panic path is unreachable
 //! in practice.
 
-use std::pin::Pin;
-use futures::Stream;
+#[path = "support/controlled_empty_api.rs"]
+mod controlled_empty_api;
+use controlled_empty_api::ControlledEmptyApi;
+
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, PermissionMode, PermissionPolicy,
-    RuntimeError, RuntimeServices, Session, SharedPrompter, StaticToolExecutor,
+    ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeServices, Session, SharedPrompter, StaticToolExecutor,
     execution_core::performance, submit_owned_conversation_turn,
 };
-
-#[derive(Clone)]
-struct EmptyApi;
-
-impl ApiClient for EmptyApi {
-    fn stream(
-        &mut self,
-        _request: ApiRequest,
-    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-        Box::pin(futures::stream::iter(vec![
-            Ok(AssistantEvent::TextDelta("reclaimed turn".to_string())),
-            Ok(AssistantEvent::MessageStop),
-        ]))
-    }
-}
 
 #[tokio::test]
 async fn conversation_runtime_is_reclaimed_every_turn() {
@@ -47,7 +33,7 @@ async fn conversation_runtime_is_reclaimed_every_turn() {
         let bus = runtime::CowdEventBus::new();
         let mut runtime = ConversationRuntime::new(
             session,
-            EmptyApi,
+            ControlledEmptyApi::new(Some("reclaimed turn")),
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["You are a test runtime.".to_string()],
@@ -108,7 +94,7 @@ async fn conversation_runtime_is_reclaimed_every_turn() {
         .await
         .expect("turn result is reclaimable");
         let summary = result.expect("a real terminal, not a reclaimed admission error");
-        assert!(summary.final_answer.contains("reclaimed turn"));
+        assert!(summary.final_answer.contains("reclaimed turn"), "{:?}", summary.final_answer);
         let events = services
             .event_reader()
             .all_events(10_000)

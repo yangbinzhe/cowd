@@ -233,7 +233,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         return Ok(Vec::new());
     }
 
-    let mut decode_table = [0xFFu8; 128];
+    let mut decode_table = [0xFFu8; 256];
     for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
         .iter()
         .enumerate()
@@ -409,6 +409,13 @@ mod tests {
     #[test]
     fn base64_decode_invalid() {
         assert!(base64_decode("!!!invalid!!!").is_err());
+    }
+
+    #[test]
+    fn base64_decode_non_ascii_is_rejected_without_panicking() {
+        for input in ["éAAA", "AéAA", "AAéA", "AAAé"] {
+            assert_eq!(base64_decode(input), Err("invalid base64 character".into()));
+        }
     }
 
     #[test]

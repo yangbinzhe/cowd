@@ -2367,7 +2367,10 @@ fn autonomous_deepseek_template_is_frozen_and_complete() {
         .prompt_template
         .contains("objective_complete_request"));
     assert!(!template.prompt_template.contains("Team A"));
-    assert!(!template.prompt_template.contains("恰好"));
+    let spec = autonomous_deepseek_spec().expect("autonomous collaboration spec");
+    assert!(matches!(spec.acceptance, LiveAcceptance::AutonomousCollaboration {
+        minimum_teams: 1.., minimum_agents: 1.., minimum_tasks: 1.., ..
+    }));
 }
 
 fn agentic_program_projection(
@@ -3112,30 +3115,27 @@ fn complete_source_receipt_gate_requires_attested_exact_content_for_every_target
         .enumerate()
         .map(|(index, path)| receipt(path, index as u64 + 1))
         .collect::<Vec<_>>();
-    assert_eq!(
-        complete_exact_source_receipt_paths(
-            &json!({"observed_acceptance": {"observed_evidence": complete}}),
-            &[],
-        )
-        .len(),
-        LARGE_SCALE_SOURCE_PATHS.len()
-    );
+    let expected: BTreeSet<String> = LARGE_SCALE_SOURCE_PATHS.iter().map(|path| (*path).to_string()).collect();
+    assert!(!expected.is_empty());
+    assert_eq!(complete_exact_source_receipt_paths(
+        &json!({"observed_acceptance": {"observed_evidence": complete}}), &[],
+    ), expected);
 
-    let mut incomplete = LARGE_SCALE_SOURCE_PATHS
+    let (last, earlier) = LARGE_SCALE_SOURCE_PATHS.split_last().expect("source paths");
+    let mut incomplete = earlier
         .iter()
-        .take(11)
         .enumerate()
         .map(|(index, path)| receipt(path, index as u64 + 1))
         .collect::<Vec<_>>();
-    let mut bounded = receipt(LARGE_SCALE_SOURCE_PATHS[11], 12);
+    let mut bounded = receipt(last, earlier.len() as u64 + 1);
     bounded["target"]["scope"]["coverage"] = json!("scoped_content");
     incomplete.push(bounded);
     let observed = complete_exact_source_receipt_paths(
         &json!({"observed_acceptance": {"observed_evidence": incomplete}}),
         &[],
     );
-    assert_eq!(observed.len(), 11);
-    assert!(!observed.contains(LARGE_SCALE_SOURCE_PATHS[11]));
+    assert_eq!(observed, earlier.iter().map(|path| (*path).to_string()).collect());
+    assert!(!observed.contains(*last));
 }
 
 #[test]
@@ -4390,7 +4390,9 @@ fn per_task_reports_without_a_synthesis_fail() {
     let program = program_with_tasks(3, None);
     let (present, unsynthesized) = synthesized_final_artifact_findings(Some(&program));
     assert!(!present, "per-Task reports are not a synthesis");
-    assert_eq!(unsynthesized.len(), 3, "{unsynthesized:?}");
+    assert!(!program.tasks.is_empty());
+    assert_eq!(unsynthesized.iter().cloned().collect::<BTreeSet<_>>(),
+        program.tasks.keys().cloned().collect(), "{unsynthesized:?}");
 }
 
 /// A "synthesis" written by the author of a Task it covers is a fourth report,

@@ -452,7 +452,7 @@ impl RealReceiptScenario {
                                 let attachment = attachments.iter().find(|attachment|attachment["client_id"] == incoming_client).unwrap();
                                 *scenario.selected.lock().await = Some((attachment["actor"]["id"].as_str().unwrap().into(),incoming_client.into()));
                                 let rows = observed["receipts"].as_array().unwrap().iter().filter(|receipt|receipt["client_id"] == incoming_client).collect::<Vec<_>>();
-                                assert_eq!(rows.len(),1);
+                                assert_eq!(rows.len(), 1); assert_eq!(rows[0]["client_id"], incoming_client);
                                 let mut old = scenario.old_receipt.lock().await;
                                 if let Some(old) = old.as_ref() {
                                     if old["client_id"] == incoming_client { assert_eq!(rows[0],old); }
@@ -726,7 +726,7 @@ pub(super) async fn receipt_http_fixture(
                     let body: serde_json::Value =
                         serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
                     assert_eq!(body["runtime_commit_cursor"], "9007199254740993");
-                    assert_eq!(body.as_object().unwrap().len(), 2);
+                    assert_eq!(body.as_object().unwrap().keys().map(|key| key.as_str()).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from(["message_sequence", "runtime_commit_cursor"]));
                     let saved = std::fs::read_dir(&save_root)
                         .unwrap()
                         .filter_map(Result::ok)

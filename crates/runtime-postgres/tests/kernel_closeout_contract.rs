@@ -241,6 +241,7 @@ fn postgres_conclusion_rolls_back_all_streams_when_the_second_event_insert_fails
         .batch_execute("ALTER TABLE runtime_events DROP CONSTRAINT kernel_reject_verdict")
         .unwrap();
     let receipt = store.append_transaction(conclusion()).unwrap();
+    assert_eq!(receipt.event_ids.iter().collect::<std::collections::BTreeSet<_>>().len(), 2);
     assert_eq!(receipt.event_ids.len(), 2);
     assert!(!receipt.duplicate);
     drop(store);
@@ -249,7 +250,8 @@ fn postgres_conclusion_rolls_back_all_streams_when_the_second_event_insert_fails
     assert!(duplicate.duplicate);
     assert_eq!(duplicate.commit_cursor, receipt.commit_cursor);
     assert_eq!(duplicate.event_ids, receipt.event_ids);
-    assert_eq!(reopened.events_after_cursor(0, 10).unwrap().len(), 1);
+    let conclusion_batches = reopened.events_after_cursor(0, 10).unwrap();
+    assert_eq!(conclusion_batches.iter().map(|batch| batch.transaction_id.as_str()).collect::<Vec<_>>(), vec!["program-conclusion:kernel:1"]);
 }
 
 #[test]
@@ -315,11 +317,12 @@ fn postgres_graph_failure_keeps_the_committed_verdict_and_rolls_back_its_outbox(
     let graph = store
         .append_transaction_with_terminal(transaction.clone(), terminal.clone())
         .unwrap();
+    assert_eq!(graph.event_ids.iter().collect::<std::collections::BTreeSet<_>>().len(), 2);
     assert_eq!(graph.event_ids.len(), 2);
     for stream in ["execution-graph:kernel", "session-terminal:kernel"] {
         assert_eq!(store.stream_revision(stream).unwrap(), 1);
         let events = store.list_stream(stream).unwrap();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.iter().map(|event| event.commit_cursor).collect::<Vec<_>>(), vec![graph.commit_cursor]);
         assert_eq!(events[0].commit_cursor, graph.commit_cursor);
     }
     drop(store);
@@ -353,7 +356,9 @@ fn postgres_graph_failure_keeps_the_committed_verdict_and_rolls_back_its_outbox(
     assert_eq!(outbox.message_id, terminal.message_id);
     assert_eq!(outbox.payload_ref, terminal.payload_ref);
     assert_eq!(outbox.status, "pending");
-    assert_eq!(reopened.events_after_cursor(0, 10).unwrap().len(), 2);
+    let closeout_batches = reopened.events_after_cursor(0, 10).unwrap();
+    assert_eq!(closeout_batches.iter().map(|batch| batch.transaction_id.clone()).collect::<std::collections::BTreeSet<_>>().len(), 2);
+    assert_eq!(closeout_batches.len(), 2);
 }
 
 #[test]
@@ -494,11 +499,12 @@ fn postgres_concurrent_publication_keeps_every_committed_event_recoverable() {
         .flat_map(|worker| worker.join().unwrap())
         .collect::<Vec<_>>();
     let elapsed = started.elapsed();
+    assert_eq!(samples.iter().map(|sample| sample.0).collect::<std::collections::BTreeSet<_>>().len(), 100);
     assert_eq!(samples.len(), 100);
     samples.sort_unstable();
     assert!(samples.windows(2).all(|pair| pair[0].0 < pair[1].0));
     let recovered = reader.events_after_cursor(0, 128).unwrap();
-    assert_eq!(recovered.len(), 100);
+    assert_eq!(recovered.len(), samples.len());
     assert_eq!(
         recovered
             .iter()
@@ -655,7 +661,7 @@ fn postgres_visible_commit_order_cannot_skip_an_earlier_inflight_cursor() {
     );
     assert!(first.commit_cursor < second.commit_cursor);
     let batches = reader.events_after_cursor(0, 10).unwrap();
-    assert_eq!(batches.len(), 2);
+    assert_eq!(batches.iter().map(|batch| batch.transaction_id.as_str()).collect::<Vec<_>>(), vec!["kernel-publication:slow", "kernel-publication:fast"]);
     assert_eq!(batches[0].transaction_id, "kernel-publication:slow");
     assert_eq!(batches[1].transaction_id, "kernel-publication:fast");
 }

@@ -3243,14 +3243,15 @@ fn r6_failed_foreground_preserves_first_error_and_cancels_before_finish() -> any
         listener.set_nonblocking(true)?;
         let base = format!("http://{}", listener.local_addr()?);
         let report_root = root.path().to_owned();
+        let expected_paths = [
+            "/api/sessions/session-1/cancel",
+            "/api/runtime/session-leases/release",
+            "/api/sessions/session-1/detach",
+        ];
         let server = std::thread::spawn(move || -> anyhow::Result<Vec<String>> {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut paths = Vec::new();
-            for expected in [
-                "/api/sessions/session-1/cancel",
-                "/api/runtime/session-leases/release",
-                "/api/sessions/session-1/detach",
-            ] {
+            for expected in expected_paths {
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((s, _)) => break s,
@@ -3353,7 +3354,7 @@ fn r6_failed_foreground_preserves_first_error_and_cancels_before_finish() -> any
         let paths = server
             .join()
             .map_err(|_| anyhow::anyhow!("cleanup endpoint panicked"))??;
-        assert_eq!(paths.len(), 3);
+        assert_eq!(paths, expected_paths.iter().map(|path| (*path).to_string()).collect::<Vec<_>>());
         let secondary: Value = serde_json::from_slice(&std::fs::read(
             root.path().join("r6-session-cleanup-results.json"),
         )?)?;

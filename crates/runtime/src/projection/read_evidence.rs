@@ -545,6 +545,7 @@ pub async fn read_evidence(
         ) {
             Ok(snapshot) => snapshot,
             Err(message) => {
+                let message = message.to_string();
                 #[cfg(test)]
                 eprintln!("read-evidence original core refused: {message}");
                 let reason = reader.failure.unwrap_or_else(|| {

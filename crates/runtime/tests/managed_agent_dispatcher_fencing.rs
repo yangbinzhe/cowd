@@ -57,7 +57,7 @@ fn recovered_claim_can_only_be_started_by_newer_dispatcher_fence() {
     // A process crash before executor start returns only the reservation to
     // pending. It does not create a second invocation.
     let recovered_events = dispatcher.recover(4).expect("recovery");
-    assert_eq!(recovered_events.len(), 1);
+    assert!(matches!(recovered_events.as_slice(), [item] if item.invocation_id == invocation.invocation_id));
     assert_eq!(recovered_events[0].invocation_id, invocation.invocation_id);
     let recovered = dispatcher.invocations().expect("projection");
     assert_eq!(recovered[0].status, ManagedAgentInvocationStatus::Pending);
@@ -126,5 +126,5 @@ fn recovered_claim_can_only_be_started_by_newer_dispatcher_fence() {
         )
         .expect("fresh completion");
     assert_eq!(completed.status, ManagedAgentInvocationStatus::Completed);
-    assert_eq!(dispatcher.invocations().expect("projection").len(), 1);
+    assert!(matches!(dispatcher.invocations().expect("projection").as_slice(), [actual] if actual.invocation_id == invocation.invocation_id && actual.status == ManagedAgentInvocationStatus::Completed));
 }

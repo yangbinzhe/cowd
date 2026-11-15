@@ -286,11 +286,8 @@ pub(crate) fn rebind_current_review_effect_key(
             }
         }
     }
-    match rebound.len() {
-        0 => Ok(None),
-        1 => Ok(rebound.pop_first()),
-        _ => Err("current review call is ambiguous".into()),
-    }
+    // Both insert paths admit only the exact carried key; the set has at most one value.
+    Ok(rebound.pop_first())
 }
 
 /// Resolve the ONE review control call that is currently executing.
@@ -852,7 +849,9 @@ fn authenticate_closed_node_review_member(
             return Err("original member parent/child tickets differ".into());
         }
         let lineage = crate::execution_core::graph::execution_lineage_stream_id(&parent.graph_id);
-        let lineage_head = super::results::pin_result_source(store, &lineage, sources)?;
+        // Historical applied-review verification is a display-only boundary;
+        // it cannot grant the live review builder a rebuild ticket.
+        let lineage_head = super::results::pin_result_source(store, &lineage, sources).map_err(|error| error.to_string())?;
         let key = format!("{}:child:{}", parent.graph_id, ticket.graph_id);
         let registration = store.event_by_idempotency_key(&lineage, &key).map_err(|e| e.to_string())?
             .ok_or("original member child registration missing")?;
@@ -891,7 +890,7 @@ fn authenticate_closed_node_review_member(
         return Err("original committed member result is unavailable or mismatched".into());
     }
     let node_source = format!("{}:node:{}", ticket.graph_id, ticket.node_id);
-    let node_revision = super::results::pin_result_source(store, &node_source, sources)?;
+    let node_revision = super::results::pin_result_source(store, &node_source, sources).map_err(|error| error.to_string())?;
     let key = format!("{}:batch:{}:{}:{}", ticket.idempotency_key, outer.len(), outer, position);
     let member_event = store.event_by_idempotency_key(&node_source, &key).map_err(|e| e.to_string())?
         .ok_or("original committed member event missing")?;
@@ -944,7 +943,7 @@ pub(crate) fn authenticate_completed_process_review(
     let request = &witness.request;
     let mut fences = std::collections::BTreeMap::new();
     let program_source = format!("agentic-program:{}", program.program_id);
-    let head = super::results::pin_result_source(store, &program_source, &mut fences)?;
+    let head = super::results::pin_result_source(store, &program_source, &mut fences).map_err(|error| error.to_string())?;
     if head != program.revision { return Err("completed review Program changed while authenticating".into()); }
     let action = store.event_by_idempotency_key(&program_source,
         &crate::agentic::action_service::action_key(context.action_id))
@@ -980,7 +979,7 @@ pub(crate) fn authenticate_completed_process_review(
         return Err("completed review Program prior cut differs from action transaction".into());
     }
     let index_source = reviewer_receipt_stream(packet);
-    let index_head = super::results::pin_result_source(store, &index_source, &mut fences)?;
+    let index_head = super::results::pin_result_source(store, &index_source, &mut fences).map_err(|error| error.to_string())?;
     let intent = store.event_by_idempotency_key(&index_source, &format!("agent-tool-intent:{}", request.idempotency_key))
         .map_err(|error| error.to_string())?.ok_or("completed review original intent missing")?;
     let receipt = store.event_by_idempotency_key(&index_source, &format!("agent-tool-receipt:{}", request.idempotency_key))
@@ -990,7 +989,7 @@ pub(crate) fn authenticate_completed_process_review(
         || (request.tool_name != "agent_action_batch" && receipt.payload["outcome"]["status"] != "executed") {
         return Err("completed review original intent/action/receipt ordering differs".into());
     }
-    let effect = super::policy::authenticate_settled_effect(store, &intent, &receipt, &mut fences)?;
+    let effect = super::policy::authenticate_settled_effect(store, &intent, &receipt, &mut fences).map_err(|error| error.to_string())?;
     if request.compiled_invocation.as_ref().is_none_or(|invocation| invocation.effect != effect) {
         return Err("completed review receipt effect differs from original call".into());
     }
@@ -1090,7 +1089,7 @@ fn original_node_review_index(
         || plan.status.as_deref() != Some("planned") || plan.actor.as_deref() != Some("conversation_runtime") {
         return Err("original Node plan owner or uniqueness differs".into());
     }
-    let (selected, index) = super::results::original_tool_primary_and_index(store, owner, task, cuts)?;
+    let (selected, index) = super::results::original_tool_primary_and_index(store, owner, task, cuts).map_err(|error| error.to_string())?;
     if selected.event_id != physical.event_id || selected.transaction_id != physical.transaction_id
         || selected.commit_cursor != physical.commit_cursor {
         return Err("original Node selected primary differs".into());
@@ -1209,7 +1208,7 @@ pub(crate) fn authenticate_original_single_review(
     let index = if request.parent_execution.is_some() {
         original_node_review_index(store, &request, &ticket, &intent, &physical, &mut sources)?
     } else {
-        super::results::authenticate_root_receipt_owner(store, &physical, &mut sources)?;
+        super::results::authenticate_root_receipt_owner(store, &physical, &mut sources).map_err(|error| error.to_string())?;
         let (owner, original_attempt, _) = super::results::original_root_effect_owner(&physical)?;
         let node = owner.node_id.as_deref().ok_or("single review original activity node missing")?;
         if owner.session_id != context.actor.session_id || owner.turn_id != context.actor.turn_id
@@ -1515,7 +1514,7 @@ pub(crate) fn authenticate_original_root_member_review(
     let index = if request.parent_execution.is_some() {
         original_node_review_index(store, &request, &ticket, &intent, &primary, &mut physical_cuts)?
     } else {
-        super::results::authenticate_root_receipt_owner(store, &primary, &mut physical_cuts)?;
+        super::results::authenticate_root_receipt_owner(store, &primary, &mut physical_cuts).map_err(|error| error.to_string())?;
         let (owner, attempt, _) = super::results::original_root_effect_owner(&primary)?;
         let node = owner.node_id.as_deref().ok_or("Root member physical node missing")?;
         if owner.root_execution_id != ticket.graph_id || node != ticket.node_id || attempt != ticket.attempt
@@ -2752,6 +2751,75 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn duplicate_pinned_review_plan_keeps_live_ambiguity_and_applied_binding() {
+        let packet = packet();
+        let task = review_task("call-a");
+        let key = effect_key(&task);
+        let workspace = tempfile::tempdir().unwrap();
+        let catalog = tools::ToolCatalog::builtin()
+            .with_runtime_tools(vec![tools::RuntimeToolDefinition {
+                name: TASK_REVIEW_TOOL_ID.into(),
+                description: None,
+                input_schema: serde_json::to_value(schemars::schema_for!(TaskReviewInput)).unwrap(),
+                required_permission: tools::permissions::PermissionMode::ReadOnly,
+                effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+                    resolver_id: "runtime.agent_action".into(),
+                    resolver_version: 2,
+                },
+            }]).unwrap();
+        let host = tools::ToolHost::new(
+            "q1-review-plan",
+            workspace.path(),
+            tools::ToolHostSnapshot::new(
+                std::sync::Arc::new(catalog),
+                std::sync::Arc::new(tools::lsp_client::LspRegistry::new()),
+                None,
+            ),
+        );
+        let lease = host.pin_snapshot();
+        let request = crate::tool_dispatch::ToolRequest {
+            tool_use_id: "call-a".into(),
+            tool_name: "task_review".into(),
+            input: task["normalized_input"].to_string(),
+            depends_on: vec![],
+        };
+        let mut plan = crate::GovernedToolCompiler
+            .compile(lease.workspace_root(), &[request], |name, input| {
+                Some((lease.describe_effect(name, input), lease.revision(),
+                    lease.snapshot().descriptor_set_hash.clone()))
+            })
+            .unwrap();
+        plan.tasks[0].step_binding = Some(serde_json::from_value(step_binding("call-a")).unwrap());
+        let store = crate::RuntimeEventStore::for_test();
+        for _ in 0..2 {
+            crate::conversation::tool_plane::persist_governed_tool_plan_event(
+                &store, SESSION, None, &plan,
+            ).unwrap();
+        }
+        let events = store.list_stream(&format!("session:{SESSION}")).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_ne!(events[0].event_id, events[1].event_id);
+        let action = review_action();
+        let reviewer = actor();
+        let context = CurrentReviewContext { action_id: &key, action: &action, actor: &reviewer };
+        assert_eq!(
+            rebind_current_review_effect_key(&events, &packet, Some(&key), Some(&key)).unwrap(),
+            Some(key.clone()),
+            "applied rebinding retains its existing set-based duplicate behavior"
+        );
+        assert_eq!(
+            resolve_current_review_effect_key(&events, &packet, &context).unwrap_err(),
+            "current review call is ambiguous",
+            "live resolution must still reject multiple matching calls"
+        );
+        assert_eq!(
+            rebind_current_review_effect_key(&events, &packet, Some(&key), Some("other-action")).unwrap(),
+            None,
+            "a foreign applied action grants no exemption"
+        );
+    }
+
     /// Two review calls in the SAME run, with the SAME tool: only the one the
     /// submitted action names may be exempt. The other one is a second
     /// unfinished review and must keep blocking.

@@ -330,17 +330,17 @@ async fn publication_creation_identity_gateway_case() {
             .collect::<Vec<_>>()
     };
     let message_facts = facts();
-    assert_eq!(message_facts.len(), 1);
+    let [message_fact] = message_facts.as_slice() else { panic!("expected the original artifact fact exactly once") };
     assert_eq!(
-        message_facts[0].payload["artifact"]["selector"],
+        message_fact.payload["artifact"]["selector"],
         published["content_ref"]
     );
     assert_eq!(
-        message_facts[0].payload["precreation_head"]
+        message_fact.payload["precreation_head"]
             .as_u64()
             .unwrap()
             + 1,
-        message_facts[0].sequence
+        message_fact.sequence
     );
     let file_host = Arc::new(ToolHost::new(
         "fresh-file",
@@ -392,7 +392,9 @@ async fn publication_creation_identity_gateway_case() {
     .unwrap();
     assert_eq!(passthrough["content_ref"], published["content_ref"]);
     assert_eq!(runtime_journal.stream_revision(&stream).unwrap(), before);
-    assert_eq!(facts().len(), 3);
+    let mut actual_selectors = facts().iter().map(|fact| fact.payload["artifact"]["selector"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    actual_selectors.sort_unstable();
+    assert_eq!(actual_selectors, selectors.iter().cloned().collect::<Vec<_>>());
     assert_eq!(facts()[0], message_facts[0]);
     let legacy_passthrough: serde_json::Value = serde_json::from_str(
         &executor
@@ -409,7 +411,9 @@ async fn publication_creation_identity_gateway_case() {
     .unwrap();
     assert_eq!(legacy_passthrough["content_ref"], artifact.selector);
     assert_eq!(runtime_journal.stream_revision(&stream).unwrap(), before);
-    assert_eq!(facts().len(), 3);
+    let mut actual_selectors = facts().iter().map(|fact| fact.payload["artifact"]["selector"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    actual_selectors.sort_unstable();
+    assert_eq!(actual_selectors, selectors.iter().cloned().collect::<Vec<_>>());
     let mut other_session = binding;
     other_session.session_id = Some("unrelated-session");
     assert!(executor
@@ -582,7 +586,7 @@ fn successful_gateway_file_fact_has_typed_identity_and_digest() {
         &output,
         "gateway-tool:test:7:typed-receipt",
     );
-    assert_eq!(observed.len(), 1);
+    assert!(matches!(observed.as_slice(), [fact] if fact.observed_at_sequence == 7));
     assert_eq!(observed[0].observed_at_sequence, 7);
     assert!(matches!(
         &observed[0].target,
@@ -803,13 +807,10 @@ fn compact_write_receipt_keeps_typed_workspace_evidence_after_body_elision() {
     let observed =
         gateway_observed_evidence(&executor, &request, &output.to_string(), "compact-create");
 
-    assert_eq!(observed.len(), 1);
-    assert!(matches!(
-        &observed[0].target,
-        harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+    assert!(matches!(observed.as_slice(), [fact]
+        if matches!(&fact.target, harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
             if scope.access_mode == harness_contract::context::WorkspaceAccessMode::Write
-                && scope.path.workspace_relative_path == "compact-created.txt"
-    ));
+                && scope.path.workspace_relative_path == "compact-created.txt")));
     assert_eq!(
         observed[0].workspace_prior_state,
         Some(harness_contract::context::WorkspacePriorState::Absent)
@@ -1336,7 +1337,7 @@ async fn a_salvaged_frame_reports_how_many_entries_were_dropped() {
     let cut_off = serde_json::json!({"actions": inner}).to_string();
 
     let coercions = executor.tool_input_coercions("agent_action_batch", &cut_off);
-    assert_eq!(coercions.len(), 1, "{coercions:?}");
+    assert!(matches!(coercions.as_slice(), [coercion] if coercion.field == "actions" && coercion.truncated), "{coercions:?}");
     assert_eq!(coercions[0].field, "actions");
     assert!(
         coercions[0].truncated,
@@ -1370,8 +1371,7 @@ async fn entries_that_omit_the_tool_field_do_not_discard_the_valid_ones() {
         .expect("the one well-formed entry must survive");
     let value: serde_json::Value = serde_json::from_str(&dispatched).expect("dispatched JSON");
     let actions = value["actions"].as_array().expect("salvaged array");
-    assert_eq!(actions.len(), 1, "{dispatched}");
-    assert_eq!(actions[0]["tool"], "team_create");
+    assert!(matches!(actions.as_slice(), [action] if action["tool"] == "team_create"), "{dispatched}");
 
     let coercions = executor.tool_input_coercions("agent_action_batch", &frame);
     assert_eq!(coercions[0].dropped_items, 2, "{coercions:?}");
@@ -2296,7 +2296,7 @@ fn k02_default_batch_original_preview_survives_provider_wire() {
     let body: serde_json::Value = serde_json::from_str(&receipt.summary[receipt.summary.find('{').unwrap()..]).unwrap();
     assert_eq!(body["kind"], "orchestration_partial_receipt");
     assert_eq!(body["complete"], false);
-    assert_eq!(body["result"].as_object().unwrap().len(), 6);
+    assert_eq!(body["result"].as_object().unwrap().keys().cloned().collect::<Vec<_>>(), (0..6).map(|i| format!("read_file[{i}]")).collect::<Vec<_>>());
     for i in 0..6 {
         let key = format!("read_file[{i}]");
         let child = &body["result"][&key];
@@ -2333,4 +2333,68 @@ fn k02_default_batch_original_preview_survives_provider_wire() {
     let rejected = runtime::context_evidence::k02_fixture_orchestration_receipt(&raw, "tool-raw-k02-default", 12000, true, Some(&wrong));
     assert!(rejected.truncated && rejected.summary.contains("Partial orchestration output omitted"));
     assert!(!rejected.summary.contains("orchestration_partial_receipt"));
+}
+
+#[test]
+fn gb2_reason_ref_refusal_teaches_the_real_required_field() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let invalid = json!({"task_ref":"task-1", "decision":"accept", "reason":"done", "reason_ref":"artifact://other"});
+    let lease = executor.tool_host.pin_snapshot();
+    let original = lease.validate_input("task_review", &invalid).expect_err("unknown field must refuse");
+    let old = executor.input_contract_error("task_review", original.to_string());
+    let old_failure = old.failure().expect("old structured failure");
+    let error = executor.validate_tool_input("task_review", &invalid.to_string()).expect_err("no field may be silently dropped");
+    let failure = error.failure().expect("structured failure");
+    assert_eq!(failure.class, old_failure.class);
+    assert_eq!(failure.schema_hash, old_failure.schema_hash);
+    assert_eq!(failure.allowed_fields, old_failure.allowed_fields);
+    assert!(failure.message.starts_with(&old_failure.message), "{}", failure.message);
+    assert!(failure.message.contains("task_review requires a string `reason`"), "{}", failure.message);
+    assert!(failure.message.contains("`reason_ref` is not a task_review field"), "{}", failure.message);
+    let fixed = json!({"task_ref":"task-1", "decision":"accept", "reason":"done"});
+    assert!(executor.validate_tool_input("task_review", &fixed.to_string()).is_ok());
+    let missing = json!({"task_ref":"task-1", "decision":"accept", "reason_ref":"artifact://other"});
+    let missing_error = executor.validate_tool_input("task_review", &missing.to_string()).expect_err("missing reason must be refused").to_string();
+    assert!(missing_error.contains("missing required field `reason`"), "{missing_error}");
+    assert!(missing_error.contains("task_review requires a string `reason`"), "{missing_error}");
+    let repeated = executor.validate_tool_input("task_review", &invalid.to_string()).expect_err("repeat remains refused");
+    assert_eq!(error.failure().unwrap().message, repeated.failure().unwrap().message);
+}
+
+#[test]
+fn gb2_orchestrate_top_level_id_refuses_and_names_the_step_path() {
+    let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+    let invalid = json!({"id":"wrong", "steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]});
+    let error = executor.validate_tool_input("tool_orchestrate", &invalid.to_string()).expect_err("extra field must be refused");
+    let message = &error.failure().unwrap().message;
+    assert!(message.contains("unexpected field `id`"), "{message}");
+    assert!(message.contains("each step requires its own string `id`"), "{message}");
+    assert!(message.contains("Schema-valid structural example"), "{message}");
+    for extra in [json!({"id":"wrong", "op":"batch", "steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]}),
+                  json!({"id":"wrong", "op":"call", "item":{}, "steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]})] {
+        let err = executor.validate_tool_input("tool_orchestrate", &extra.to_string()).unwrap_err();
+        let msg = &err.failure().unwrap().message;
+        assert!(msg.contains("unexpected field `id`"), "{msg}");
+        assert!(msg.contains("`op`"), "{msg}");
+        if extra.get("item").is_some() { assert!(msg.contains("`item`"), "{msg}"); }
+    }
+    let corrected = json!({"steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]});
+    assert!(executor.validate_tool_input("tool_orchestrate", &corrected.to_string()).is_ok());
+}
+
+#[test]
+fn gb2_membership_reason_refusal_preserves_the_original_field() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions()).unwrap();
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let invalid = json!({"agent_ref":"agent:test", "team_ref":"team:test", "operation":"join", "reason":"why"});
+    let error = executor.validate_tool_input("membership_update", &invalid.to_string()).unwrap_err();
+    let message = &error.failure().unwrap().message;
+    assert!(message.contains("unexpected field `reason`"), "{message}");
+    assert!(message.contains("Do not automatically convert reason text"), "{message}");
+    let corrected = json!({"agent_ref":"agent:test", "team_ref":"team:test", "operation":"join"});
+    assert!(executor.validate_tool_input("membership_update", &corrected.to_string()).is_ok());
 }

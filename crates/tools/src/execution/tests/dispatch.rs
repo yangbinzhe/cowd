@@ -591,9 +591,8 @@ fn web_search_extracts_and_filters_results() {
         .find(|item| item.get("content").is_some())
         .expect("search result block present");
     let content = search_result["content"].as_array().expect("content array");
-    assert_eq!(content.len(), 1);
-    assert_eq!(content[0]["title"], "Reqwest docs");
-    assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+    assert_eq!(content.iter().map(|item| (&item["title"], &item["url"])).collect::<Vec<_>>(),
+        vec![(&json!("Reqwest docs"), &json!("https://docs.rs/reqwest"))]);
 }
 
 #[test]
@@ -637,10 +636,8 @@ fn web_search_handles_generic_links_and_invalid_base_url() {
         .find(|item| item.get("content").is_some())
         .expect("search result block present");
     let content = search_result["content"].as_array().expect("content array");
-    assert_eq!(content.len(), 3);
-    assert_eq!(content[0]["url"], "https://example.com/one");
-    assert_eq!(content[1]["url"], "https://docs.rs/tokio");
-    assert_eq!(content[2]["url"], "https://openai.com/codex");
+    assert_eq!(content.iter().map(|item| &item["url"]).collect::<Vec<_>>(),
+        vec![&json!("https://example.com/one"), &json!("https://docs.rs/tokio"), &json!("https://openai.com/codex")]);
 
     std::env::set_var("COWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
     let error = execute_tool("web_search", &json!({ "query": "generic links" }))
@@ -699,7 +696,7 @@ fn todo_write_persists_and_returns_previous_state() {
     )
     .expect("TodoWrite should succeed");
     let first_output: serde_json::Value = serde_json::from_str(&first).expect("valid json");
-    assert_eq!(first_output["oldTodos"].as_array().expect("array").len(), 0);
+    assert!(first_output["oldTodos"].as_array().expect("array").is_empty());
 
     let second = execute_tool(
         "todo_write",
@@ -802,9 +799,10 @@ fn tool_search_supports_keyword_and_select_queries() {
     let selected_matches = selected_output["activation_candidates"]
         .as_array()
         .expect("activation candidates");
-    assert_eq!(selected_matches.len(), 2);
-    assert!(selected_matches.iter().any(|value| value == "web_search"));
-    assert!(selected_matches.iter().any(|value| value == "tool_search"));
+    assert_eq!(selected_matches.iter().filter_map(|value| value.as_str()).collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["web_search", "tool_search"]));
+    assert!(selected_matches.iter().all(|value| value.as_str().is_some()));
+    assert_eq!(selected_matches.len(), selected_matches.iter().filter_map(|value| value.as_str()).collect::<std::collections::BTreeSet<_>>().len());
 
     let source_search = execute_tool(
         "tool_search",
@@ -967,11 +965,11 @@ fn notebook_edit_replaces_inserts_and_deletes_cells() {
         serde_json::from_str(&std::fs::read_to_string(&path).expect("read notebook"))
             .expect("valid notebook json");
     let cells = final_notebook["cells"].as_array().expect("cells array");
-    assert_eq!(cells.len(), 2);
-    assert_eq!(cells[0]["cell_type"], "markdown");
-    assert!(cells[0].get("outputs").is_none());
-    assert_eq!(cells[1]["cell_type"], "code");
-    assert_eq!(cells[1]["source"][0], "print(3)\n");
+    let [markdown, code] = cells.as_slice() else { panic!("unexpected notebook cells: {cells:?}"); };
+    assert_eq!(markdown["cell_type"], "markdown");
+    assert!(markdown.get("outputs").is_none());
+    assert_eq!(code["cell_type"], "code");
+    assert_eq!(code["source"][0], "print(3)\n");
     let _ = std::fs::remove_file(path);
 }
 
@@ -1853,7 +1851,11 @@ fn workspace_snapshot_discovers_real_roots_and_every_continuation_is_executable(
             .map(String::from)
             .collect()
     );
-    assert_eq!(files.len(), 8);
+    let expected_files = ["MFG/README.md", "MFG/docs/index.md", "MFG/Cargo.toml",
+        "cowd-edge/README.md", "cowd-edge/docs/index.md", "cowd-edge/package.json",
+        "nested/README.md", "nested/docs/index.md"]
+        .into_iter().map(|path| root.join(path).to_string_lossy().into_owned()).collect();
+    assert_eq!(files, expected_files);
     assert!(crate::executor::execute_with_lease(
         &lease,
         "workspace_snapshot",
@@ -1961,13 +1963,11 @@ fn tool_orchestrate_maps_and_aggregates_readonly_queries_in_one_call() {
         2
     );
     let trace = parsed["calls"].as_array().expect("calls trace");
-    assert_eq!(trace.len(), 3);
-    assert_eq!(trace[0]["op"], "call");
+    assert_eq!(trace.iter().map(|entry| &entry["op"]).collect::<Vec<_>>(),
+        vec![&json!("call"), &json!("map"), &json!("collect")]);
     assert_eq!(trace[0]["tool"], "glob_search");
     assert_eq!(trace[0]["status"], "ok");
-    assert_eq!(trace[1]["op"], "map");
     assert_eq!(trace[1]["calls"], 2);
-    assert_eq!(trace[2]["op"], "collect");
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -2223,9 +2223,10 @@ fn orchestrate_collect_returns_per_item_receipts() {
     let items = parsed["result"]["b"]
         .as_object()
         .expect("per-item receipts");
-    assert_eq!(items.len(), 2, "{parsed}");
-    assert!(items.values().any(|item| item["ok"] == json!(true)));
-    assert!(items.values().any(|item| item["ok"] == json!(false)));
+    assert_eq!(items.keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["glob_search[0]", "read_file[1]"]));
+    assert_eq!(items["glob_search[0]"]["ok"], json!(true));
+    assert_eq!(items["read_file[1]"]["ok"], json!(false));
 }
 
 /// One deterministic artifact answering "is every execution mode complete?".

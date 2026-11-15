@@ -29,7 +29,8 @@ fn one_definition_compiles_eight_isolated_instances_with_a_shared_revision_diges
                 .snapshot
         })
         .collect::<Vec<_>>();
-    assert_eq!(snapshots.len(), 8);
+    assert_eq!(snapshots.iter().map(|binding| binding.instance.instance_id.clone()).collect::<Vec<_>>(),
+        (1..=8).map(|slot| format!("instance:researcher:{slot}")).collect::<Vec<_>>());
     assert_eq!(
         snapshots
             .iter()

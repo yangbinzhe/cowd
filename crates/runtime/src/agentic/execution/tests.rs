@@ -461,7 +461,7 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         .dispatch_agentic_followups(&offer, context.clone())
         .await
         .unwrap();
-    assert_eq!(first.len(), 1);
+    assert!(matches!(first.as_slice(), [receipt] if receipt.agent_ref == volunteer));
     assert_eq!(
         first[0].agent_ref, volunteer,
         "an eligible volunteer precedes deterministic ranking"
@@ -470,9 +470,9 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         .dispatch_agentic_followups(&publications[1], context.clone())
         .await
         .unwrap();
-    assert_eq!(second.len(), 1);
+    let [unique_second_473] = second.as_slice() else { panic!("expected the original second exactly once") };
     assert_ne!(
-        second[0].agent_ref, volunteer,
+        unique_second_473.agent_ref, volunteer,
         "an admitted but unclaimed opportunity is busy"
     );
     assert!(services
@@ -523,9 +523,8 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         .dispatch_ready_agentic_work("program-dispatch")
         .await
         .unwrap();
-    assert_eq!(resumed.len(), 1);
-    assert_eq!(resumed[0].task_ref, tasks[2]);
-    assert_eq!(resumed[0].agent_ref, volunteer);
+    assert!(matches!(resumed.as_slice(), [receipt]
+        if receipt.task_ref == tasks[2] && receipt.agent_ref == volunteer));
     assert!(services
         .dispatch_ready_agentic_work("program-dispatch")
         .await
@@ -590,7 +589,7 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
         .dispatch_agentic_followups(&publish, context.clone())
         .await
         .unwrap();
-    assert_eq!(first.len(), 1);
+    assert!(matches!(first.as_slice(), [receipt] if receipt.task_ref == task));
     let mut receipt = first[0].clone();
     let mut visited = BTreeSet::new();
     for index in 0..2 {
@@ -774,8 +773,7 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
         )
         .await
         .unwrap();
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].agent_ref, valid);
+    assert!(matches!(receipts.as_slice(), [receipt] if receipt.agent_ref == valid));
     assert!(services
         .dispatch_agentic_task(
             &projection,
@@ -1300,8 +1298,9 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
         attempts[0].execution_id.clone()
     } else {
         let first = first.expect("first recovery");
-        assert_eq!(first.len(), 1);
-        first[0].graph_id.clone()
+        let [receipt] = first.as_slice() else { panic!("expected one recovered original graph") };
+        assert!(!receipt.graph_id.is_empty());
+        receipt.graph_id.clone()
     };
     let task_ref = actions
         .project("program-dispatch")
@@ -1331,8 +1330,7 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
             .values()
             .flat_map(|task| task.active_attempts.values())
             .collect::<Vec<_>>();
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].execution_id, graph_id);
+        assert!(matches!(attempts.as_slice(), [attempt] if attempt.execution_id == graph_id));
         assert_eq!(
             services
                 .event_store()
@@ -1798,8 +1796,8 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
         .recover_agentic_programs_on_startup()
         .await
         .expect("recovery");
-    assert_eq!(recovered.len(), 1);
-    assert_ne!(recovered[0].graph_id, missing_execution);
+    let [unique_recovered_1801] = recovered.as_slice() else { panic!("expected the original recovered exactly once") };
+    assert_ne!(unique_recovered_1801.graph_id, missing_execution);
     let projection = actions.project("program-dispatch").expect("projection");
     assert_eq!(projection.tasks[&task].status, AgenticTaskStatus::Published);
     assert_eq!(projection.tasks[&task].claim_execution_id, None);
@@ -1942,10 +1940,10 @@ async fn tool_contract_milestone_persists_once_and_reports_conflicting_writes() 
         .into_iter()
         .filter(|event| event.kind == "agentic.tool_contract")
         .collect::<Vec<_>>();
-    assert_eq!(milestones.len(), 1);
-    assert_eq!(milestones[0].payload["program_id"], "program-dispatch");
-    assert_eq!(milestones[0].payload["task_ref"], task_ref);
-    assert_eq!(milestones[0].payload["missing_capabilities"][0], "network");
+    let [milestone] = milestones.as_slice() else { panic!("expected one original tool contract") };
+    assert_eq!(milestone.payload["program_id"], "program-dispatch");
+    assert_eq!(milestone.payload["task_ref"], task_ref);
+    assert_eq!(milestone.payload["missing_capabilities"][0], "network");
 
     admission.missing_capabilities.push("write".to_string());
     let error = super::dispatch::record_tool_contract_milestone(

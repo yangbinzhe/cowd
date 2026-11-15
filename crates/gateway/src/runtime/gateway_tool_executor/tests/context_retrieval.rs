@@ -909,7 +909,7 @@ async fn context_fact_directory_and_exact_evidence_use_runtime_data_lease_and_re
         }
         request = page["next_request"].clone();
     }
-    assert_eq!(seen.len(), 35);
+    assert_eq!(seen, (0..35).map(|i| format!("fact:fact-{i:03}")).collect::<std::collections::BTreeSet<_>>());
     assert!(!seen.contains("fact:private"));
     for (request, binding) in [
         (json!({"source":"fact","entry_ref":"fact:private"}), binding),
@@ -1184,7 +1184,9 @@ async fn context_matrix_directory_reads_complete_scoped_json_and_rejects_changed
         }
         request = page["next_request"].clone();
     }
-    assert_eq!(seen.len(), 36);
+    let mut expected = (0..35).map(|i| format!("matrix:fact:fact-{i:03}")).collect::<std::collections::BTreeSet<_>>();
+    expected.insert("matrix:source_snapshot:allowed".to_string());
+    assert_eq!(seen, expected);
     assert!(seen.contains("matrix:source_snapshot:allowed"));
     assert!(!seen.contains("matrix:fact:hidden"));
     let mut changed_grant = lease.clone();
@@ -1454,7 +1456,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         }
         request = page["next_request"].clone();
     }
-    assert_eq!(seen.len(), 600);
+    assert_eq!(seen, (0..600).map(|i| format!("session-{i:03}")).collect::<std::collections::BTreeSet<_>>());
     assert!(seen.contains("session-599"));
     assert!(!seen.contains("private"));
     assert!(!seen.contains("future"));
@@ -1497,7 +1499,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         }
         request = page["next_request"].clone();
     }
-    assert_eq!(ids.len(), 130);
+    assert_eq!(ids, (0..130).map(|i| format!("session-000-m{i}")).collect::<std::collections::BTreeSet<_>>());
     assert!(!ids.contains("session-000-m200"));
     for (request, binding) in [
         (

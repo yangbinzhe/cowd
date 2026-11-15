@@ -325,12 +325,10 @@ async fn r1_475_native_history_wait_then_real_cancel_preserves_original_receipts
         .values()
         .all(|status| *status == ExecutionNodeStatus::Cancelled));
     let cursor = service.store.durable_commit_cursor().unwrap();
-    assert_eq!(
-        validate(&service, &commits, &cancelled, BTreeSet::new())
-            .unwrap()
-            .len(),
-        2
-    );
+    let expected_streams: BTreeSet<_> = receipts.iter().map(|receipt| receipt.stream_id.clone()).collect();
+    assert!(!expected_streams.is_empty());
+    assert_eq!(validate(&service, &commits, &cancelled, BTreeSet::new()).unwrap()
+        .keys().cloned().collect::<BTreeSet<_>>(), expected_streams);
     for receipt in receipts {
         let current = service
             .store
@@ -520,17 +518,26 @@ async fn r1_475_native_history_real_cancel_commits_same_ticket_receipt() {
         .values()
         .all(|status| *status == ExecutionNodeStatus::Cancelled));
     let commit_log = executor.commits.lock().unwrap();
-    assert_eq!(commit_log.len(), 2, "each original callback runs exactly once");
-    assert_eq!(commit_log.iter().cloned().collect::<BTreeSet<_>>(), entered);
+    let mut committed_nodes = commit_log.clone();
+    committed_nodes.sort_unstable();
+    assert!(!committed_nodes.is_empty());
+    assert_eq!(committed_nodes, entered.iter().cloned().collect::<Vec<_>>(), "each original callback runs exactly once");
     drop(commit_log);
     assert!(executor.aborts.lock().unwrap().is_empty());
     let polls = executor.polls.lock().unwrap();
-    assert_eq!(polls.len(), 2);
-    assert_eq!(polls.iter().cloned().collect::<BTreeSet<_>>(), entered);
+    let mut polled_nodes = polls.clone();
+    polled_nodes.sort_unstable();
+    assert_eq!(polled_nodes, entered.iter().cloned().collect::<Vec<_>>());
     drop(polls);
     let cursor = service.store.durable_commit_cursor().unwrap();
     let pinned = validate(&service, &commits, &cancelled, BTreeSet::new()).unwrap();
-    assert_eq!(pinned.len(), 2);
+    let mut expected_streams = cancelled.nodes.iter().map(|node| {
+        let binding = state.current_binding(&cancelled, &node.id, 1).unwrap();
+        let (ticket, _) = state.binding_start_ticket(&cancelled, &node.id, &binding).unwrap();
+        ExecutionNodeBinding::effect_stream_id(&ticket)
+    }).collect::<Vec<_>>();
+    expected_streams.sort_unstable();
+    assert_eq!(pinned.keys().cloned().collect::<Vec<_>>(), expected_streams);
     assert!(pinned.values().all(|head| *head == 2));
     let mut original_transaction = None;
     for node in &cancelled.nodes {
@@ -633,6 +640,7 @@ async fn r1_475_native_history_poll_error_does_not_prove_cancelled_outcome() {
         }
     }
     let polls = executor.polls.lock().unwrap();
-    assert_eq!(polls.len(), 2);
-    assert_eq!(polls.iter().cloned().collect::<BTreeSet<_>>(), entered);
+    let mut polled_nodes = polls.clone();
+    polled_nodes.sort_unstable();
+    assert_eq!(polled_nodes, entered.iter().cloned().collect::<Vec<_>>());
 }

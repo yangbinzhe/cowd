@@ -282,12 +282,14 @@ mod tests {
     #[test]
     fn fixture_evidence_enforces_class_and_global_event_budgets() {
         let store = RuntimeEventStore::from_backend(Arc::new(EphemeralRuntimeEventStore::new()));
+        let mut original_first_stream = Vec::new();
         for stream in ["agent:owned", "goal:owned", "agentic-program:owned"] {
             for _ in 0..101 {
-                store.append(RuntimeEventInput {
+                let event = store.append(RuntimeEventInput {
                     stream_id:stream.into(), scope:RuntimeEventScope::Agent,
                     kind:"fixture.record".into(), status:None, actor:None, refs:vec![], payload:json!({}),
                 }).unwrap();
+                if stream == "agent:owned" { original_first_stream.push(event); }
             }
         }
         let sources = ["agent:owned", "goal:owned", "agentic-program:owned"].map(|stream_id| FailureEvidenceSource {
@@ -295,7 +297,13 @@ mod tests {
         });
         let report = collect_failure_evidence(&store, &sources, "original");
         assert_eq!(report["events_read"], 200);
-        assert_eq!(report["sources"][0]["records"].as_array().unwrap().len(), 100);
+        assert_eq!(
+            report["sources"][0]["records"].as_array().unwrap().iter()
+                .map(|record| record["event_id"].as_str().unwrap()).collect::<Vec<_>>(),
+            original_first_stream.iter().take(100).map(|event| event.event_id.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(report["sources"][0]["status"], "Truncated");
+        assert_eq!(report["sources"][0]["reason"], "events");
         assert_eq!(report["remaining_sources"], 1);
         assert!(report.to_string().len() <= 512 * 1024);
     }
@@ -324,7 +332,13 @@ mod tests {
             stream_id:"empty", after_sequence:0, through_sequence:u64::MAX,
         }).collect::<Vec<_>>();
         let report = collect_failure_evidence(&store, &sources, "original");
-        assert_eq!(report["sources"].as_array().unwrap().len(), 32);
+        assert_eq!(
+            report["sources"].as_array().unwrap().iter()
+                .map(|source| (source["stream_id"].as_str().unwrap(), source["requested_after"].as_u64().unwrap(), source["requested_through"].as_u64().unwrap()))
+                .collect::<Vec<_>>(),
+            sources.iter().take(32).map(|source| (source.stream_id, source.after_sequence, source.through_sequence)).collect::<Vec<_>>()
+        );
         assert_eq!(report["remaining_sources"], 1);
+        assert_eq!(report["stop"], "total_budget");
     }
 }

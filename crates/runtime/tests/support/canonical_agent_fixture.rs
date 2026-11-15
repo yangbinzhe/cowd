@@ -15,6 +15,9 @@ use runtime::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[path = "canonical_session_port.rs"]
+mod canonical_session_port;
+
 pub struct CanonicalProviderServer {
     task: tokio::task::JoinHandle<()>,
 }
@@ -27,10 +30,31 @@ impl Drop for CanonicalProviderServer {
 
 struct CanonicalReadHost {
     resolver: runtime::path_identity::WorkspacePathIdentityResolver,
+    tools: tools::ToolHost,
 }
 
 #[async_trait]
 impl RuntimeExecutionHost for CanonicalReadHost {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.tools.pin_snapshot())
+    }
+
+    fn delegated_tool_definitions(&self, names: &[String]) -> Vec<runtime::ProviderToolDefinition> {
+        let requested = names.iter().cloned().collect();
+        self.tools
+            .pin_snapshot()
+            .snapshot()
+            .catalog
+            .definitions(Some(&requested))
+            .into_iter()
+            .map(|definition| runtime::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect()
+    }
+
     async fn execute_runtime_tool(
         &self,
         request: &RuntimeToolExecutionRequest,
@@ -139,15 +163,21 @@ pub async fn services_with_canonical_agent(
     let host = Arc::new(CanonicalReadHost {
         resolver: runtime::path_identity::WorkspacePathIdentityResolver::discover(&workspace)
             .expect("workspace identity resolver"),
+        tools: tools::ToolHost::builtin("canonical-agent-fixture", &workspace),
     });
+    let session_port = canonical_session_port::create_session_port(session_id).await;
     let services = RuntimeServices::builder(&root, &workspace)
         .non_durable_backends_for_testing(&root)
         .provider_registry(Arc::new(
             runtime::ProviderRegistry::new(providers).expect("provider registry"),
         ))
         .tool_execution_host(host)
+        .session_ports(session_port.clone(), session_port.clone(), session_port.clone(), session_port)
         .build()
         .expect("runtime services");
+    let recovery = services.recover_execution_graphs_on_startup().await.expect("original startup recovery");
+    assert!(recovery.errors.is_empty(), "startup recovery: {:?}", recovery.errors);
+    services.release_recovered_producers().await.expect("release recovered producers");
     services.publish_session_execution_policy(
         session_id,
         runtime::permissions::SessionExecutionPolicyControl::from_policy(

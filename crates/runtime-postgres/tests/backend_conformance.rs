@@ -43,7 +43,7 @@ fn postgres_runtime_events_survive_adapter_reconstruction() {
     let events = reopened
         .replay_scope_stream_prefix(RuntimeEventScope::Recovery, "conformance:runtime")
         .expect("replay persisted stream");
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), vec!["runtime.pg_conformance"]);
     assert_eq!(events[0].kind, "runtime.pg_conformance");
     drop(reopened);
 }

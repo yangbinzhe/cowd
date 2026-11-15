@@ -228,7 +228,9 @@ fn background_evolution_configuration_controls_real_registration_without_removin
                     )
                     .await
                     .unwrap();
-                assert_eq!(reports.len(), 2);
+                let mut projection_ids = reports.iter().map(|report| report.projection_id.as_str()).collect::<Vec<_>>();
+                projection_ids.sort_unstable();
+                assert_eq!(projection_ids, [crate::evolution::collaboration_experience::PROJECTOR_ID, crate::evolution::projector::PROJECTOR_ID]);
                 assert!(reports.iter().all(|report| report.last_error.is_none()));
                 let remaining = services
                     .event_reactor
@@ -961,8 +963,8 @@ async fn episode_set_pair(real_skill: bool) {
     let packets = captured_packets
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(packets.len(), 2);
-    assert_ne!(packets[0].session_id(), packets[1].session_id());
+    let [_first_packets_964, _second_packets_964] = packets.as_slice() else { panic!("expected both original packets exactly once") };
+    assert_ne!(_first_packets_964.session_id(), packets[1].session_id());
     let isolated_output = |packet: &AgentTaskPacket| {
         packet
             .resource_scopes
@@ -2706,8 +2708,9 @@ async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it(
         .dispatch_due_mission_schedules(due_at_ms)
         .await
         .unwrap();
-    assert_eq!(first.tick.claimed.len(), 1);
-    assert_eq!(first.submitted.len(), 1);
+    assert!(matches!(first.tick.claimed.as_slice(), [fire] if fire.mission_id == "schedule-mission" && fire.target_session_id == "scheduled-target" && fire.due_at_ms == due_at_ms));
+    assert!(matches!(first.submitted.as_slice(), [submission]
+        if submission.target_policy_binding.as_ref().is_some_and(|binding| binding.policy_revision == 7)));
     assert!(first.failed.is_empty());
     let binding = first.submitted[0]
         .target_policy_binding
@@ -2747,7 +2750,7 @@ async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it(
         )
         .await
         .unwrap();
-    assert_eq!(target_outbox.len(), 1);
+    assert!(matches!(target_outbox.as_slice(), [item] if item.session_id == "scheduled-target"));
     assert_eq!(target_outbox[0].session_id, "scheduled-target");
 
     services
@@ -3265,9 +3268,8 @@ async fn startup_recovery_rejects_missing_lineage_before_any_durable_mutation() 
         .await
         .expect("invalid lineage is reported, not executed");
 
-    assert_eq!(report.errors.len(), 1);
-    assert_eq!(report.records.len(), 1);
-    assert_eq!(report.records[0].action, "invalid_lineage");
+    assert!(matches!(report.errors.as_slice(), [error] if error.graph_id == "missing-lineage-recovery"));
+    assert!(matches!(report.records.as_slice(), [record] if record.action == "invalid_lineage"));
     assert_eq!(report.notified_graphs, 0);
     assert_eq!(
         services
@@ -3322,7 +3324,6 @@ async fn startup_recovery_does_not_resolve_handoff_for_an_excluded_session() {
     source.id = "excluded-handoff-source".to_string();
     crate::test_support::attach_execution_graph_lineage(&mut source);
     source.lineage.as_mut().unwrap().session_id = "failed-session".to_string();
-    source.revision = 1;
     let mut node = ExecutionNodeSpec::new(
         ExecutionNodeKind::SessionDispatch,
         crate::SESSION_DISPATCH_EXECUTOR,
@@ -3332,23 +3333,20 @@ async fn startup_recovery_does_not_resolve_handoff_for_an_excluded_session() {
         ),
     );
     node.id = "excluded-handoff-node".to_string();
+    node.idempotency_key = "excluded-handoff-node".to_string();
     source.nodes.push(node);
-    source.node_statuses.insert(
-        "excluded-handoff-node".to_string(),
+    let mut source = services.commit_service().register_graph(source).unwrap().graph;
+    for status in [
+        ExecutionNodeStatus::Ready,
+        ExecutionNodeStatus::Running,
         ExecutionNodeStatus::WaitingExternal,
-    );
-    services
-        .event_store()
-        .append(crate::RuntimeEventInput {
-            stream_id: source.id.clone(),
-            scope: crate::RuntimeEventScope::ExecutionGraph,
-            kind: "execution_graph.planned".to_string(),
-            status: Some("waiting".to_string()),
-            actor: Some("handoff-recovery-fixture".to_string()),
-            refs: Vec::new(),
-            payload: serde_json::json!({"event": "planned", "graph": source}),
-        })
-        .unwrap();
+    ] {
+        source = services
+            .commit_service()
+            .transition_node(&source, "excluded-handoff-node", status, None, Vec::new())
+            .unwrap()
+            .graph;
+    }
     services
         .event_store()
         .append(crate::RuntimeEventInput {
@@ -3559,7 +3557,9 @@ async fn canonical_agent_task_flows_through_runner_and_commits_once() {
     );
     assert_eq!(binding.data_lease.session_id, packet.session_id());
     assert_eq!(binding.data_lease.task_id, packet.task_id());
-    assert_eq!(services.agent_runtime().events(packet.agent_id()).len(), 3);
+    let events = services.agent_runtime().events(packet.agent_id());
+    assert_eq!(events.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), ["agent.prepared", "agent.running", "agent.terminal"]);
+    assert!(events.iter().all(|event| event.agent_id == packet.agent_id()));
 }
 
 #[tokio::test]
@@ -3742,15 +3742,15 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
         "terminal Agent projections must leave bounded hot state"
     );
     let snapshots = agent_ids
-        .into_iter()
+        .iter()
         .map(|agent_id| {
             services
                 .agent_runtime()
-                .get(&agent_id)
+                .get(agent_id)
                 .expect("durable terminal Agent projection")
         })
         .collect::<Vec<_>>();
-    assert_eq!(snapshots.len(), 8);
+    assert_eq!(snapshots.iter().map(|snapshot| &snapshot.agent_id).collect::<Vec<_>>(), agent_ids.iter().collect::<Vec<_>>());
     let bindings = snapshots
         .iter()
         .map(|snapshot| snapshot.binding.as_ref().expect("durable binding"))
@@ -3764,7 +3764,7 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
         .iter()
         .map(|binding| binding.instance.instance_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(instances.len(), 8);
+    assert_eq!(instances.len(), bindings.len(), "each original agent must have a distinct instance");
     assert!(max_active.load(Ordering::SeqCst) >= 2);
 }
 
@@ -4052,7 +4052,7 @@ fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
     let first = reader
         .session_timeline_events("timeline-session", None, 1)
         .expect("first page").events;
-    assert_eq!(first.len(), 1);
+    assert!(matches!(first.as_slice(), [item] if item.transaction_index == 0));
     assert_eq!(first[0].transaction_index, 0);
     let second = reader
         .session_timeline_events(
@@ -4061,7 +4061,7 @@ fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
             1,
         )
         .expect("second page").events;
-    assert_eq!(second.len(), 1);
+    assert!(matches!(second.as_slice(), [item] if item.transaction_index == 1));
     assert_eq!(second[0].transaction_index, 1);
     assert_eq!(second[0].kind, "timeline.second");
     assert!(reader
@@ -5018,9 +5018,8 @@ async fn r453_timeline_expanded_bodies_continue_without_loss_or_foreign_records(
             Some((last.commit_cursor, last.transaction_index)),
             100,
         )?;
-        assert_eq!(second.events.len(), 1);
+        assert!(matches!(second.events.as_slice(), [event] if event.event_id == expected[1]));
         assert!(!second.has_more);
-        assert_eq!(second.events[0].event_id, expected[1]);
         assert_eq!(
             second.events[0].payload["graph"]["nodes"][0]["payload_ref"],
             body
@@ -5093,9 +5092,8 @@ fn r453_timeline_byte_short_transaction_resumes_by_exact_position_and_rejects_si
     let first = reader
         .session_timeline_events("r453-tied", None, 100)
         .unwrap();
-    assert_eq!(first.events.len(), 1);
+    assert!(matches!(first.events.as_slice(), [event] if event.event_id == receipt.event_ids[0]));
     assert!(first.has_more);
-    assert_eq!(first.events[0].event_id, receipt.event_ids[0]);
     assert_eq!(
         first.complete_through_cursor,
         receipt.commit_cursor - 1,
@@ -5104,9 +5102,8 @@ fn r453_timeline_byte_short_transaction_resumes_by_exact_position_and_rejects_si
     let second = reader
         .session_timeline_events("r453-tied", Some((receipt.commit_cursor, 0)), 100)
         .unwrap();
-    assert_eq!(second.events.len(), 1);
+    assert!(matches!(second.events.as_slice(), [event] if event.event_id == receipt.event_ids[1]));
     assert!(!second.has_more);
-    assert_eq!(second.events[0].event_id, receipt.event_ids[1]);
     assert_eq!(second.complete_through_cursor, receipt.commit_cursor);
     store
         .append(crate::RuntimeEventInput {

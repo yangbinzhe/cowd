@@ -426,7 +426,10 @@ async fn obsolete_open_candidates_leave_the_human_review_queue() {
         })
         .unwrap()
         .is_empty());
-    assert_eq!(manager.list_all_entries().await.unwrap().len(), 2);
+    let retained = manager.list_all_entries().await.unwrap();
+    let ids = retained.iter().map(|entry| entry.id).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids, std::collections::BTreeSet::from([first.id, duplicate.id]));
+    assert_eq!(retained.len(), ids.len());
 }
 
 #[tokio::test]
@@ -451,7 +454,8 @@ async fn actionable_knowledge_conflicts_are_counted_as_human_review() {
             ),
         )
         .unwrap();
-    assert_eq!(receipt.conflicts.len(), 1);
+    let [conflict] = receipt.conflicts.as_slice() else { panic!("expected one conflict"); };
+    assert_eq!(conflict.conflict_type, "direct_contradiction");
 
     let report = run_automatic_governance(
         manager,

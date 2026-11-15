@@ -426,7 +426,7 @@ mod runtime_binding_lifetime {
                 .expect("real executor reached controlled effect");
             let claimed = dispatcher.outbox().expect("claimed effect");
             if managed {
-                assert_eq!(claimed.len(), 1);
+                assert!(matches!(claimed.as_slice(), [item] if item.status == runtime::FencedEffectStatus::Claimed));
                 assert_eq!(claimed[0].status, runtime::FencedEffectStatus::Claimed);
             } else {
                 assert!(claimed.is_empty());
@@ -474,10 +474,10 @@ mod runtime_binding_lifetime {
             };
             assert_eq!(outcome.status, expected_status, "{outcome:?}");
             if managed {
-                assert_eq!(settled.len(), 1);
+                let [unique_settled_477] = settled.as_slice() else { panic!("expected the original settled exactly once") };
                 if fail_after_effect {
                     assert_eq!(
-                        settled[0].status,
+                        unique_settled_477.status,
                         runtime::FencedEffectStatus::ReconciliationRequired
                     );
                     assert!(settled[0].receipt_ref.is_none());

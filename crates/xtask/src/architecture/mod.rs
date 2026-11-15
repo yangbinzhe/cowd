@@ -35,8 +35,9 @@ impl Roots {
             index += 1;
         }
         let core = core.unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?);
-        let edge =
-            edge.unwrap_or_else(|| core.parent().unwrap_or(Path::new(".")).join("cowd-edge"));
+        let edge = edge
+            .or_else(|| std::env::var_os("COWD_FRONTEND_REPO").map(PathBuf::from))
+            .unwrap_or_else(|| core.parent().unwrap_or(Path::new(".")).join("cowd-edge"));
         if !core.join("Cargo.toml").is_file() {
             return Err(format!(
                 "Core root is not a Cargo workspace: {}",

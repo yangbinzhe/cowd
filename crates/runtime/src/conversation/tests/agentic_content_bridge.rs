@@ -41,7 +41,7 @@ async fn current_program_evidence_survives_allocator_and_reaches_provider_reques
     program.revision = 1;
     let finding = "CURRENT_AGENT_FINDING: gateway consumes the leaf contract";
     retain_agentic_program_checkpoint(&mut persistent, &program, finding.into());
-    assert_eq!(persistent.len(), 1);
+    assert!(matches!(persistent.as_slice(), [item] if item.id == "agentic-program-checkpoint:program:continuity" && item.content == finding && item.source_version.as_deref() == Some("1")));
 
 }
 
@@ -681,7 +681,7 @@ async fn a_submitted_task_with_no_reviewer_is_named_with_its_action() {
     let awaiting = checkpoint["awaiting_independent_review"]
         .as_array()
         .unwrap();
-    assert_eq!(awaiting.len(), 1, "{awaiting:?}");
+    assert!(matches!(awaiting.as_slice(), [item] if item["task_ref"] == "task:delivered" && item["claimant"] == "agent:author"), "{awaiting:?}");
     assert_eq!(awaiting[0]["task_ref"], "task:delivered");
     assert_eq!(awaiting[0]["claimant"], "agent:author");
     let action = &checkpoint["awaiting_review_action"]["instruction"];

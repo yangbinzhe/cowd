@@ -654,6 +654,31 @@ pub(crate) struct ExecutionGraphRunner {
 
 type MutationGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+fn normalize_start_failure(
+    expected_node_id: &str,
+    admitted: bool,
+    error: ExecutionRunnerError,
+) -> ExecutionRunnerError {
+    match error {
+        ExecutionRunnerError::Executor(error @ NodeExecutorError::Start { .. }) => {
+            if admitted {
+                NodeExecutorError::OriginalCustodyUnknown {
+                    node_id: expected_node_id.into(),
+                    reason: format!("Start reported after canonical admission: {error}"),
+                }.into()
+            } else if executor_error_node_id(&error) != expected_node_id {
+                NodeExecutorError::Invalid {
+                    node_id: expected_node_id.into(),
+                    reason: format!("start failure belongs to another node: {error}"),
+                }.into()
+            } else {
+                error.into()
+            }
+        }
+        error => error,
+    }
+}
+
 struct CommandIntentOwner {
     graph_id: String,
     intent: Arc<Notify>,
@@ -1186,10 +1211,9 @@ impl ExecutionGraphRunner {
         self.ensure_mutation_allowed()?;
         validate_execution_graph(&graph)?;
         self.registry.validate_graph(&graph)?;
-        match self
-            .commit_service
-            .register_continuation_graph_async(graph, actor, source_goal_cut, original_owner)
-            .await
+        match Box::pin(self.commit_service.register_continuation_graph_async(
+            graph, actor, source_goal_cut, original_owner,
+        )).await
         {
             Ok(receipt) => Ok(receipt.graph),
             Err(ExecutionCommitError::AlreadyAppliedSame { graph_id }) => self
@@ -1560,6 +1584,17 @@ impl ExecutionGraphRunner {
                         resource_started,
                         crate::execution_core::graph::ResourceResultClass::Failed,
                     );
+                    if matches!(&error, NodeExecutorError::Start { node_id, .. } if node_id == &node.id) {
+                        // No ticket or binding was admitted. Keep the other
+                        // prepared siblings and isolate this node through the
+                        // same startup-error path as other preparation failures.
+                        output.push(ExecutionPreparedPumpNode {
+                            binding: None,
+                            node,
+                            startup_error: Some(error.into()),
+                        });
+                        continue;
+                    }
                     self.discard_unpolled_wave(&prepared);
                     return Err(error.into());
                 }
@@ -1913,6 +1948,11 @@ impl ExecutionGraphRunner {
                     .await
             }
         };
+        // Normalize before publishing the original handoff. An admitted
+        // Start is unknown custody, never a finished preparation failure.
+        let result = result.map_err(|error| normalize_start_failure(
+            &node_id, expected_binding.is_some(), error,
+        ));
         #[cfg(feature = "test-fixtures")]
         if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "start_and_execute_return", None, Some(result.is_ok())); }
         #[cfg(feature = "test-fixtures")]
@@ -1956,11 +1996,23 @@ impl ExecutionGraphRunner {
         // Keep the large terminal-transition future out of its caller's
         // async frame. Its ownership, cancellation and fences are unchanged.
         let result = Box::pin(self.finish_pump_node(
-            graph_id, result, durable_progress, expected_binding, handoff,
+            graph_id, &node_id, result, durable_progress, expected_binding, handoff,
         )).await;
         #[cfg(feature = "test-fixtures")]
         if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "finish_pump_return", None, Some(result.is_ok())); }
         result
+    }
+
+    #[cfg(test)]
+    pub(super) async fn original_pump_outcome_for_test(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Option<(bool, Option<Result<NodeExecutionOutcome, Arc<ExecutionRunnerError>>>, bool)> {
+        let active = self.active.lock().await;
+        let owner = active.get(&(graph_id.to_string(), node_id.to_string()))?;
+        let state = owner.cancel_outcome.state.lock().unwrap();
+        Some((state.finished, state.outcome.clone(), state.original_binding_closed))
     }
 
     #[cfg(test)]
@@ -3935,6 +3987,7 @@ impl ExecutionGraphRunner {
     async fn finish_pump_node(
         &self,
         graph_id: &str,
+        expected_node_id: &str,
         result: Result<(String, NodeExecutionOutcome), ExecutionRunnerError>,
         durable_progress: Arc<Notify>,
         expected_binding: Option<ExecutionNodeBinding>,
@@ -3943,6 +3996,7 @@ impl ExecutionGraphRunner {
         let Some((node_id, mut outcome)) = self
             .resolve_pump_result(
                 graph_id,
+                expected_node_id,
                 result,
                 &durable_progress,
                 expected_binding.as_ref(),
@@ -4613,11 +4667,12 @@ impl ExecutionGraphRunner {
     async fn resolve_pump_result(
         &self,
         graph_id: &str,
+        expected_node_id: &str,
         result: Result<(String, NodeExecutionOutcome), ExecutionRunnerError>,
         durable_progress: &Notify,
         expected_binding: Option<&ExecutionNodeBinding>,
     ) -> Result<Option<(String, NodeExecutionOutcome)>, ExecutionRunnerError> {
-        match result {
+        match result.map_err(|error| normalize_start_failure(expected_node_id, expected_binding.is_some(), error)) {
             Err(ExecutionRunnerError::CommandSuperseded { node_id }) => {
                 let running = self
                     .active
@@ -6529,9 +6584,13 @@ mod goal_revalidation_fence_tests {
             reason: "terminal commit failed".into(), phase: "original owner", cleanup: Box::new(cleanup),
         };
         assert!(error.to_string().contains("terminal commit failed"));
-        let source = std::error::Error::source(&error).unwrap()
-            .downcast_ref::<ExecutionRunnerError>().unwrap();
-        assert!(matches!(source, ExecutionRunnerError::Executor(NodeExecutorError::Cancel { .. })));
+        let source = std::error::Error::source(&error).expect("original cleanup source");
+        let source = source.downcast_ref::<ExecutionRunnerError>().or_else(|| {
+            source.downcast_ref::<Box<ExecutionRunnerError>>().map(|boxed| boxed.as_ref())
+        }).expect("the source retains the typed original Runner error");
+        assert!(matches!(source, ExecutionRunnerError::Executor(NodeExecutorError::Cancel {
+            node_id, reason,
+        }) if node_id == "node" && reason == "physical close pending"));
     }
 
     #[test]
@@ -8224,7 +8283,7 @@ mod nodispatch_duration_617_tests {
             let task_graph = graph_id.clone();
             let task_node = node_id.clone();
             let task = tokio::spawn(async move {
-                task_runner.finish_pump_node(&task_graph, Ok((task_node, outcome)), Arc::new(Notify::new()), Some(binding), None).await
+                task_runner.finish_pump_node(&task_graph, &task_node, Ok((task_node.clone(), outcome)), Arc::new(Notify::new()), Some(binding), None).await
             });
             tokio::time::timeout(Duration::from_secs(5), probe.entered.notified()).await.unwrap();
             // A competing graph operation must be able to acquire the actual
@@ -8365,7 +8424,7 @@ mod nodispatch_duration_617_tests {
         }).await;
         assert!(stale.is_err());
         assert!(runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
-        let error = runner.finish_pump_node(&graph_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(binding.clone()), None).await.unwrap_err();
+        let error = runner.finish_pump_node(&graph_id, &node_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(binding.clone()), None).await.unwrap_err();
         assert!(error.to_string().contains("observation source conflicts with causal read-set"), "{error}");
         assert!(matches!(error, ExecutionRunnerError::Executor(
             NodeExecutorError::OriginalCustodyUnknown { .. }
@@ -8449,14 +8508,14 @@ mod nodispatch_duration_617_tests {
         let before = services.graph_state_store().load(&graph_id).unwrap();
         let mut foreign = binding.clone();
         foreign.attempt += 1;
-        runner.finish_pump_node(&graph_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(foreign), None).await.unwrap();
+        runner.finish_pump_node(&graph_id, &node_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(foreign), None).await.unwrap();
         let after = services.graph_state_store().load(&graph_id).unwrap();
         assert_eq!(after, before);
         assert!(runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
         assert!(services.graph_state_store().binding_retirement_record(&after, &node_id, &binding).unwrap().is_none());
         // The actual original outcome was already produced; let its original
         // owner commit it instead of inventing a cancelled result for cleanup.
-        runner.finish_pump_node(&graph_id, Ok((node_id.clone(), original_outcome.clone())),
+        runner.finish_pump_node(&graph_id, &node_id, Ok((node_id.clone(), original_outcome.clone())),
             Arc::new(Notify::new()), Some(binding.clone()), None).await.unwrap();
         let completed = services.graph_state_store().load(&graph_id).unwrap();
         assert_eq!(completed.node_results[&node_id], original_outcome.result);

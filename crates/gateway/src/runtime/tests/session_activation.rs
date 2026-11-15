@@ -749,7 +749,7 @@ fn terminal_annotation_preserves_causality_on_non_tool_blocks() {
     let blocks =
         serde_json::from_str::<Vec<serde_json::Value>>(transcript[0].content_json.as_str())
             .unwrap();
-    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks.iter().map(|block| block["type"].as_str().unwrap()).collect::<Vec<_>>(), ["thinking", "text"]);
     for block in blocks {
         assert_eq!(
             block
@@ -1129,7 +1129,7 @@ async fn corrupt_terminal_is_poisoned_and_visible_to_operations() {
     .await
     .is_err());
     let poison = event_store.blocked(10).unwrap();
-    assert_eq!(poison.len(), 1);
+    assert!(matches!(poison.as_slice(), [item] if item.terminal_id == "poison"));
     assert_eq!(poison[0].terminal_id, "poison");
     assert_eq!(poison[0].failure_class.as_deref(), Some("corrupt_payload"));
     assert!(_store
@@ -1215,7 +1215,7 @@ async fn missing_completion_cannot_materialize_or_restore_a_successful_terminal(
     .await
     .is_err());
     let blocked = outbox.blocked(10).unwrap();
-    assert_eq!(blocked.len(), 1);
+    assert!(matches!(blocked.as_slice(), [item] if item.terminal_id == "missing-completion"));
     assert_eq!(blocked[0].terminal_id, "missing-completion");
     assert_eq!(blocked[0].failure_class.as_deref(), Some("corrupt_payload"));
     assert!(store

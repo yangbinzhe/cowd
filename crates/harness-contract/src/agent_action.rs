@@ -643,30 +643,37 @@ pub enum AgentAction {
     ObjectiveCompleteRequest(ObjectiveCompleteRequestInput),
 }
 
+/// Describes the effect of an action; this is not an authorization grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectClass {
+    DurableEffect,
+    ReadEvidence,
+    ProgramState,
+}
+
 impl AgentAction {
-    /// 034 GB-4: the effect class the physical-binding gates consult.
-    ///
-    /// A Root action needs to name an original physical execution only when
-    /// it PERSISTS a physical artifact body: `ArtifactCommit` and
-    /// `TaskSubmit` (whose deliverable is persisted through exactly the same
-    /// artifact path - see the deliverable docs above). Program-state actions
-    /// (team/task/message/review verdicts) name the Program instead, and
-    /// refusing them with a physical-execution requirement produced a dead
-    /// end no durable state could repair (the 033 S3-D lesson: the gate was
-    /// right, the CLASS was missing; and the class must be one predicate,
-    /// consulted identically at both gate positions - ingress and the action
-    /// service - never two dialects).
+    #[must_use]
+    pub const fn effect_class(&self) -> EffectClass {
+        match self {
+            Self::StateInspect(_) => EffectClass::ReadEvidence,
+            Self::TaskSubmit(_) | Self::ArtifactCommit(_) => EffectClass::DurableEffect,
+            Self::TeamCreate(_) | Self::AgentInvite(_) | Self::TaskPublish(_)
+            | Self::TaskClaim(_) | Self::TaskRelease(_) | Self::TaskSupersede(_)
+            | Self::TaskWithdraw(_) | Self::TaskAttemptDispatch(_) | Self::TaskAttemptFail(_)
+            | Self::TaskReview(_) | Self::MessagePublish(_) | Self::ObjectiveUpdate(_)
+            | Self::ObjectiveReview(_) | Self::MembershipUpdate(_) | Self::TeamUpdate(_)
+            | Self::ObjectiveCompleteRequest(_) => EffectClass::ProgramState,
+        }
+    }
+
+    /// A submitted Task inherits its already authenticated artifact backing;
+    /// registering an artifact is the durable effect needing a new root owner.
     #[must_use]
     pub const fn requires_original_physical_execution(&self) -> bool {
-        // 034 GB-4b (e1 verdict, hub adjudicated): TaskSubmit INHERITS its
-        // physical backing - both deliverable paths persist through the
-        // artifact_commit path and the model cannot author a bare
-        // content_ref (resolved_content_ref is Runtime-set; refs are bound
-        // to the claim). Demanding a fresh binding from it produced a
-        // refusal no durable state could repair (the S3-D dead-end shape
-        // at one action removed). ArtifactCommit remains the only action
-        // that CREATES physical backing.
-        matches!(self, Self::ArtifactCommit(_))
+        match self.effect_class() {
+            EffectClass::DurableEffect => matches!(self, Self::ArtifactCommit(_)),
+            EffectClass::ReadEvidence | EffectClass::ProgramState => false,
+        }
     }
 }
 
@@ -1173,6 +1180,8 @@ pub struct AgentActionObservation {
     pub action_id: String,
     pub action: String,
     pub program_id: String,
+    /// Program revision of this observation's read view. For a duplicate this
+    /// may have advanced since the original action was committed.
     pub revision: u64,
     pub status: AgentActionStatus,
     /// True when Runtime returned the receipt of an already committed action.
@@ -1365,6 +1374,31 @@ fn unique_nonempty(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effect_class_preserves_submit_backing_and_artifact_owner_requirement() {
+        use super::*;
+        let inspect = AgentAction::StateInspect(StateInspectInput::default());
+        let team = AgentAction::TeamCreate(TeamCreateInput {
+            name: "team".into(), mission: "mission".into(), objective: None,
+        });
+        let submit = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task".into(), artifact_refs: vec!["artifact:result".into()],
+            evidence_refs: vec!["tool://receipt".into()], unresolved: vec![], deliverable: None,
+        });
+        let artifact = AgentAction::ArtifactCommit(ArtifactCommitInput {
+            content_ref: "artifact://result".into(), kind: "report".into(),
+            title: "result".into(), relates_to: vec!["task".into()],
+        });
+        assert_eq!(inspect.effect_class(), EffectClass::ReadEvidence);
+        assert_eq!(team.effect_class(), EffectClass::ProgramState);
+        assert_eq!(submit.effect_class(), EffectClass::DurableEffect);
+        assert_eq!(artifact.effect_class(), EffectClass::DurableEffect);
+        assert!(!inspect.requires_original_physical_execution());
+        assert!(!team.requires_original_physical_execution());
+        assert!(!submit.requires_original_physical_execution());
+        assert!(artifact.requires_original_physical_execution());
+    }
+
     use super::*;
 
     fn objective_review(decision: ObjectiveReviewDecision, reason: &str) -> AgentAction {

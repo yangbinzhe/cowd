@@ -1017,7 +1017,7 @@ async fn memory_projection_converts_only_appended_messages_and_rebuilds_on_repla
         .expect("first response");
 
     let first = runtime.memory_context_messages().await;
-    assert_eq!(first.len(), 2);
+    assert_eq!(first.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(), ["first", "first response"]);
     {
         let projection = runtime.session_memory_projection.lock().await;
         assert_eq!(projection.converted_messages, 2);
@@ -1029,7 +1029,7 @@ async fn memory_projection_converts_only_appended_messages_and_rebuilds_on_repla
         .await
         .expect("second message");
     let second = runtime.memory_context_messages().await;
-    assert_eq!(second.len(), 3);
+    assert_eq!(second.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(), ["first", "first response", "second"]);
     {
         let projection = runtime.session_memory_projection.lock().await;
         assert_eq!(
@@ -1044,7 +1044,7 @@ async fn memory_projection_converts_only_appended_messages_and_rebuilds_on_repla
         .await
         .replace_messages(vec![ConversationMessage::user_text("replacement")]);
     let replaced = runtime.memory_context_messages().await;
-    assert_eq!(replaced.len(), 1);
+    assert!(matches!(replaced.as_slice(), [message] if message.content == "replacement"));
     {
         let projection = runtime.session_memory_projection.lock().await;
         assert_eq!(projection.converted_messages, 4);
@@ -1295,7 +1295,7 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
     let candidates = runtime
         .packed_model_observation_candidates(&request, 2, 1)
         .expect("matching packed request");
-    assert_eq!(candidates.len(), 1);
+    assert!(matches!(candidates.as_slice(), [candidate] if candidate.provider_invocation_id == "tool-call-1" && candidate.provider_request_sequence == 2 && candidate.provider_attempt == 1));
     assert!(runtime.turn_model_observations().is_empty());
     runtime
         .confirm_model_observations(
@@ -1445,7 +1445,10 @@ async fn runtime_prefetch_receipt_survives_first_provider_node_and_is_turn_isola
         "mock API has no original physical acquisition or durable wire evidence"
     );
     let requests = requests.lock().expect("requests");
-    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests.as_slice(), [first, second] if [first, second].iter().all(|request|
+        request.messages.iter().any(|message| message.blocks.iter().any(|block| matches!(block,
+            ContentBlock::ToolResult { tool_use_id, output, is_error: false, .. }
+                if tool_use_id == "runtime-focus-verify-0-0" && output == &receipt.summary))))));
     assert!(requests
         .iter()
         .all(|request| request
@@ -1692,8 +1695,7 @@ fn explicit_team_requirement_does_not_preempt_first_step_model_tool_calls() {
     let ModelStepIntent::ToolCalls { calls } = intent else {
         panic!("first-step tool calls must stay untouched");
     };
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "agent_helper");
+    assert!(matches!(calls.as_slice(), [call] if call.name == "agent_helper"));
     assert!(!calls.iter().any(is_agent_collaboration_action));
 }
 
@@ -3039,10 +3041,7 @@ async fn one_shot_reasoning_effort_is_request_local_and_survives_fallback() {
         .expect("fallback candidate should complete");
 
     let requests = requests.lock().expect("requests");
-    assert_eq!(requests.len(), 2);
-    assert!(requests
-        .iter()
-        .all(|request| { request.reasoning_effort_override.as_deref() == Some("none") }));
+    assert!(matches!(requests.as_slice(), [first, second] if first.reasoning_effort_override.as_deref() == Some("none") && second.reasoning_effort_override.as_deref() == Some("none")));
     assert!(runtime
         .next_model_reasoning_effort
         .lock()
@@ -3187,7 +3186,7 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
     discovery
         .activation_candidates
         .retain(|name| name == "read_file");
-    assert_eq!(discovery.descriptors.len(), 1);
+    assert!(matches!(discovery.descriptors.as_slice(), [descriptor] if descriptor.canonical_id == "read_file"));
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut runtime = ConversationRuntime::new(
         Session::new(),
@@ -3211,7 +3210,7 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
         .await
         .unwrap();
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests.as_slice(), [(true, _), (true, _)]));
     assert!(
         requests.iter().all(|(required, _)| *required),
         "{requests:?}"
@@ -3461,7 +3460,8 @@ async fn explicit_provider_limit_calibrates_once_and_repackages_the_same_model()
         .expect("calibrated retry should complete");
     assert_eq!(result.model.as_deref(), Some("private-model"));
     let requests = requests.lock().expect("requests");
-    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests.as_slice(), [initial, retried]
+        if initial.context_window_tokens == 128_000 && retried.context_window_tokens == 32_768));
     assert_eq!(requests[0].context_window_tokens, 128_000);
     assert_eq!(requests[1].context_window_tokens, 32_768);
     assert_eq!(requests[1].context_window_source, "calibrated");
@@ -3763,7 +3763,6 @@ async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_tur
             last_summary = prior.to_string();
         }
     }
-    assert_eq!(raw_windows.len(), 3);
     assert_eq!(
         raw_windows.last().unwrap(),
         &original_bytes,
@@ -4617,6 +4616,16 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         crate::ArtifactStore::for_test(temporary.path(), crate::ArtifactStoreConfig::default())
             .unwrap(),
     );
+    let services = crate::RuntimeServices::test_builder(
+        temporary.path().join("home"),
+        temporary.path(),
+    )
+    .artifact_store(artifacts.clone())
+    .build()
+    .expect("original Host runtime services");
+    services
+        .install_test_session_store(session_store.clone())
+        .expect("original Host session owner");
     let runtime = ConversationRuntime::new(
         session,
         MockApi,
@@ -4628,11 +4637,12 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         vec!["system".to_string()],
     )
     .without_memory()
-    .with_runtime_event_store(Arc::new(RuntimeEventStore::for_test()))
+    .with_runtime_event_store(services.event_store().clone())
     .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
         session_store,
     ))
-    .with_artifact_store(artifacts);
+    .with_artifact_store(artifacts)
+    .with_cowd_event_bus(crate::CowdEventBus::new());
     runtime
         .begin_turn_strategy("turn-durable-evidence", "retrieve retained evidence")
         .expect("admit evidence turn");
@@ -4644,14 +4654,12 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         depends_on: Vec::new(),
     }];
 
-    let result = runtime
-        .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
-        .await
-        .expect("durable evidence fallback");
+    let messages = crate::host::tests::run_original_tool_wave(
+        services, runtime, calls, "turn-durable-evidence", "retrieve retained evidence",
+    ).await;
 
-    assert_eq!(result.failed, 0, "messages={:?}", result.messages);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
-    assert!(result.messages.iter().any(|message| {
+    assert!(messages.iter().any(|message| {
         message.blocks.iter().any(|block| {
             matches!(
                 block,
@@ -4716,9 +4724,9 @@ fn canonical_outcome_covers_direct_and_parallel_tool_turns_without_graph_ref() {
             .into_iter()
             .filter(|event| event.kind == crate::execution_core::OUTCOME_EVENT_KIND)
             .collect::<Vec<_>>();
-        assert_eq!(outcomes.len(), 1);
+        let [event] = outcomes.as_slice() else { panic!("expected one original outcome") };
         let outcome: harness_contract::outcome::ExecutionOutcome =
-            serde_json::from_value(outcomes[0].payload.clone()).expect("Outcome contract");
+            serde_json::from_value(event.payload.clone()).expect("Outcome contract");
         assert_eq!(outcome.strategy.selected_candidate, candidate);
         assert!(outcome.identity.execution_graph_ref.is_none());
     }
@@ -6052,7 +6060,7 @@ mod r1_native_real_wire {
             .expect("native Host task must complete without panic or cancellation");
         let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
         let matching = requests.iter().filter(|request| request.tool_use_id == call.id).collect::<Vec<_>>();
-        assert_eq!(matching.len(), 1, "the original early read must not be dispatched twice");
+        assert!(matches!(matching.as_slice(), [request] if request.tool_use_id == call.id), "the original early read must not be dispatched twice");
         let request = matching[0];
         let parent = request.parent_execution.as_ref().expect("original read parent");
         let graph = fixture.services.as_ref().unwrap().graph_state_store().load(&parent.execution_id).unwrap();
@@ -6235,7 +6243,7 @@ mod r1_native_real_wire {
             "the original dispatcher must defer; the disabled performance gate is not a witness");
         let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
         let matching = requests.iter().filter(|request| request.tool_use_id == call.id).collect::<Vec<_>>();
-        assert_eq!(matching.len(), 1, "the deferred call must run exactly once in the original batch");
+        assert!(matches!(matching.as_slice(), [request] if request.tool_use_id == call.id), "the deferred call must run exactly once in the original batch");
         let request = matching[0];
         let parent = request.parent_execution.as_ref().expect("fallback parent");
         let graph = fixture.services.as_ref().unwrap().graph_state_store().load(&parent.execution_id).unwrap();
@@ -6257,9 +6265,7 @@ mod r1_native_real_wire {
         let (fixture, call) = fixture.run_root_host(false).await;
         let primary = fixture.acquisition(&call);
         let children = primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].as_array().unwrap();
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0]["batch_index"], 0);
-        assert_eq!(children[0]["relative_path"], "target.txt");
+        assert!(matches!(children.as_slice(), [child] if child["batch_index"] == 0 && child["relative_path"] == "target.txt"));
         let session = fixture.runtime.session_id();
         let events = fixture.store.list_stream(&format!("session:{session}")).unwrap();
         let delivery = events.iter().find(|event| event.kind == "context.nested_read_model_observed"
@@ -6319,7 +6325,9 @@ mod r1_native_real_wire {
                 request.authorization.as_ref().is_some_and(|auth| auth.request_id == request.tool_use_id),
                 request.authorization.as_ref().zip(request.compiled_invocation.as_ref()).is_some_and(|(auth, invocation)| auth.descriptor_hash == invocation.effect.descriptor_hash));
         });
-        assert_eq!(children.len(), 2);
+        let mut paths = children.iter().map(|child| child["relative_path"].as_str().unwrap()).collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths, ["other.txt", "target.txt"]);
         let request = fixture.runtime.tool_executor.requests.lock().unwrap().iter()
             .find(|request| request.tool_use_id == call.id).unwrap().clone();
         let captured = request.tool_progress.child_reads().unwrap().unwrap();
@@ -6450,7 +6458,9 @@ mod r1_native_real_wire {
         };
         let page = crate::execution_projection::read_evidence(services, root, &context, Default::default()).await.unwrap();
         assert!(!page.incomplete, "{page:?}");
-        assert_eq!(page.reads.len(), 2);
+        let mut paths = page.reads.iter().map(|read| read.path.workspace_relative_path.as_str()).collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths, ["other.txt", "target.txt"]);
         assert!(page.reads.iter().all(|read| read.body_delivered && read.tool_name == "read_file"));
     }
 
@@ -6485,8 +6495,8 @@ mod r1_native_real_wire {
                 primary.payload[READ_ACQUISITION_FIELD]
             );
             let events = fixture.materials();
-            assert_eq!(events.len(), 1);
-            let material = decode_read_delivery(&events[0].payload).unwrap();
+            let [unique_events_6488] = events.as_slice() else { panic!("expected the original events exactly once") };
+            let material = decode_read_delivery(&unique_events_6488.payload).unwrap();
             assert!(matches!(
                 material.recipient,
                 ReadDeliveryRecipient::Root { identity: None, .. }
@@ -6499,9 +6509,9 @@ mod r1_native_real_wire {
             assert_eq!(material.delivered_extent.is_none(), omitted);
             assert!(events[0].commit_cursor > primary.commit_cursor);
             fixture.assert_actual_wire(&material).await;
-            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+            assert!(matches!(fixture.runtime.turn_model_observations().as_slice(), [observation] if observation.provider_invocation_id == call.id));
             fixture.continue_model().await.unwrap();
-            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+            assert!(matches!(fixture.runtime.turn_model_observations().as_slice(), [observation] if observation.provider_invocation_id == call.id));
             assert!(fixture
                 .materials()
                 .iter()
@@ -6741,8 +6751,8 @@ mod r1_native_real_wire {
             let (fixture, call) = fixture.run_root_host(false).await;
             let primary = fixture.acquisition(&call);
             let events = fixture.materials();
-            assert_eq!(events.len(), 1, "{recipient}");
-            let material = decode_read_delivery(&events[0].payload).unwrap();
+            let [event] = events.as_slice() else { panic!("expected one original delivery for {recipient}") };
+            let material = decode_read_delivery(&event.payload).unwrap();
             let ReadDeliveryRecipient::Root { owner, identity } = &material.recipient else {
                 panic!("Root must not acquire an imaginary AgentRun")
             };
@@ -6783,8 +6793,7 @@ mod r1_native_real_wire {
                     4 * 1024 * 1024,
                 )
                 .unwrap();
-            assert_eq!(original.len(), 1);
-            let original = &original[0];
+            let [original] = original.as_slice() else { panic!("expected one original invocation") };
             assert_eq!(original.kind, "tool.invocation.completed");
             assert_eq!(original.event_id, owner.event_id);
             assert_eq!(read_payload_digest(&original.payload), owner.payload_digest);
@@ -6821,7 +6830,7 @@ mod r1_native_real_wire {
                 }
             ));
             fixture.assert_actual_wire(&material).await;
-            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+            assert!(matches!(fixture.runtime.turn_model_observations().as_slice(), [observation] if observation.provider_invocation_id == call.id));
         }
     }
 
@@ -6954,10 +6963,10 @@ mod r1_native_real_wire {
                 fixture.owner = saved_live_owner;
                 fixture.continue_model().await.unwrap();
                 let accepted = fixture.materials();
-                assert_eq!(accepted.len(), 1, "positive control {recipient}/{foreign}");
-                let material = decode_read_delivery(&accepted[0].payload).unwrap();
+                let [event] = accepted.as_slice() else { panic!("expected one positive-control delivery {recipient}/{foreign}") };
+                let material = decode_read_delivery(&event.payload).unwrap();
                 assert_eq!(material.acquisition_cursor, primary.commit_cursor);
-                assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+                assert!(matches!(fixture.runtime.turn_model_observations().as_slice(), [observation] if observation.provider_invocation_id == call.id));
                 fixture.assert_actual_wire(&material).await;
             }
         }

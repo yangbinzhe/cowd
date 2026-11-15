@@ -22,6 +22,73 @@ fn cold_start_failure_replan_covers_the_root_turn() {
 }
 
 include!("attestation.rs");
+
+pub(crate) async fn run_original_tool_wave<C, T>(
+    services: Arc<crate::RuntimeServices>,
+    mut runtime: crate::ConversationRuntime<C, T>,
+    calls: Vec<ModelToolCall>,
+    turn: &str,
+    objective: &str,
+) -> Vec<ConversationMessage>
+where
+    C: ApiClient + Clone + Send + Sync + 'static,
+    T: ToolExecutor + 'static,
+{
+    use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus};
+    let session_id = runtime.session_id().to_owned();
+    let mut graph = ExecutionGraph::new(objective);
+    graph.lineage = Some(ExecutionGraphLineage {
+        session_id: session_id.clone(), turn_id: turn.into(), root_task_id: format!("{turn}:task"),
+        task_id: format!("{turn}:task"), generation: 1,
+    });
+    let goal_id = format!("{turn}:goal");
+    let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
+        "id":goal_id, "session_id":session_id, "objective":objective,
+        "criteria":[{"id":"checked","statement":objective,"status":"open"}],
+        "phase":"execution", "spec_revision":1, "spec_digest":"original-host-test",
+        "scope":"internal", "completion":"open", "revision":1, "user_sequence":1
+    })).unwrap();
+    services.goal_store().create(goal).unwrap();
+    let strategy = runtime.bind_turn_strategy_execution(turn, &graph.id).unwrap();
+    let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch",
+        encode_tool_calls_with_continuation(&session_id, &calls, false).unwrap());
+    node.id = format!("{}:original-tools", graph.id);
+    node.idempotency_key = format!("{}:original", node.id);
+    graph.nodes.push(node.clone());
+    let mut state = r1_branch_state(&session_id, &goal_id);
+    state.turn_id = turn.into();
+    state.content = objective.into();
+    state.task_understanding = Some(strategy.decision.strategy.understanding.clone());
+    state.collaboration_obligation = strategy.decision.collaboration_obligation.clone();
+    let bus = runtime.cowd_bus().unwrap().clone();
+    let runtime = Arc::new(tokio::sync::Mutex::new(Box::new(runtime)));
+    let state = Arc::new(tokio::sync::Mutex::new(state));
+    services.tool_batch_executor().install_resolver(Arc::new(TurnToolResolver {
+        session_id: session_id.clone(), graph_id: graph.id.clone(), runtime: Arc::downgrade(&runtime),
+        state: Arc::downgrade(&state), services: Arc::downgrade(&services),
+    }));
+    let runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        services.executor_registry().clone(), services.graph_state_store().clone(), services.commit_service().clone(),
+        services.resource_manager().clone(), services.scope_locks().clone(), services.worktree_leases().clone(),
+        services.workspace_key(), services.workspace_root());
+    let registered = runner.register(graph).await.unwrap();
+    let snapshot = runner.pump_snapshot(&registered.id, &BTreeSet::new()).await.unwrap();
+    let mut wave = runner.prepare_ready_wave(&registered.id, snapshot.ready).await.unwrap();
+    assert_eq!(wave.len(), 1);
+    let activity = services.event_store().latest_for_stream(&format!("{}:node:{}", registered.id, node.id))
+        .unwrap().unwrap().activity_binding().unwrap();
+    let _scope = bus.enter_execution_with_activity(crate::CowdExecutionContext {
+        execution_id: registered.id.clone(), session_id, turn_id: turn.into(),
+    }, Some(activity));
+    runner.execute_prepared_pump_node(&registered.id, wave.remove(0), Arc::new(tokio::sync::Notify::new()))
+        .await.unwrap();
+    let result = services.graph_state_store().load(&registered.id).unwrap();
+    assert_eq!(result.node_statuses[&node.id], ExecutionNodeStatus::Completed,
+        "{:?}", result.node_results.get(&node.id));
+    let messages = runtime.lock().await.session_snapshot().await.materialize_messages();
+    messages
+}
+
 include!("agentic_content_bridge.rs");
 include!("agentic_protocol_state.rs");
 include!("agency_economy.rs");

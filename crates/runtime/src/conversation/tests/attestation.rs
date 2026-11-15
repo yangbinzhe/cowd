@@ -18,7 +18,7 @@ mod r1_root_scope_v2_original_owner {
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["read_file".into(), "edit".into()]
+            vec!["read_file".into(), "edit".into(), "checkpoint".into()]
         }
 
         fn registered_tool_effect(
@@ -73,8 +73,14 @@ mod r1_root_scope_v2_original_owner {
             "original complete input\n",
         )
         .unwrap();
-        let store = Arc::new(crate::RuntimeEventStore::for_test());
-        let commits = crate::ExecutionCommitService::new(store.clone());
+        let services = crate::RuntimeServices::test_builder(
+            workspace.path().join("home"),
+            workspace.path(),
+        )
+        .build()
+        .expect("original Host runtime services");
+        let store = services.event_store().clone();
+        let commits = services.commit_service().clone();
         let session = Session::new().with_workspace_root(workspace.path());
         let session_id = session.session_id.clone();
         let turn_id = "scope-v2-root-turn";
@@ -99,26 +105,7 @@ mod r1_root_scope_v2_original_owner {
             "not the caller",
         );
         decoy.id = "scope-v2-running-model-decoy".into();
-        graph.nodes.extend([decoy, original_node]);
-        let mut graph = commits.register_graph(graph).unwrap().graph;
-        for node_id in [
-            "scope-v2-running-model-decoy",
-            "scope-v2-original-tool-owner",
-        ] {
-            for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
-                graph = commits
-                    .transition_node(&graph, node_id, status, None, vec![])
-                    .unwrap()
-                    .graph;
-            }
-        }
-        let original = store
-            .latest_for_stream(&format!("{}:node:scope-v2-original-tool-owner", graph.id))
-            .unwrap()
-            .unwrap()
-            .activity_binding()
-            .unwrap();
-        let attempt = graph.recovery_cursor.node_attempts["scope-v2-original-tool-owner"];
+        graph.nodes.extend([decoy, original_node.clone()]);
         let execution = crate::CowdExecutionContext {
             execution_id: graph.id.clone(),
             session_id: session_id.clone(),
@@ -143,6 +130,9 @@ mod r1_root_scope_v2_original_owner {
             })
             .await
             .unwrap();
+        services
+            .install_test_session_store(sessions.clone())
+            .expect("original Host session owner");
         let host = tools::ToolHost::builtin("root-scope-v2", workspace.path())
             .with_authorization_lease_verifier(Arc::new(
                 crate::AuthorizationNegotiator::verify_lease_signature,
@@ -193,9 +183,7 @@ mod r1_root_scope_v2_original_owner {
         )
         .without_memory()
         .with_runtime_event_store(store.clone())
-        .with_artifact_store(Arc::new(crate::ArtifactStore::for_test_default(
-            workspace.path().join("artifacts"),
-        )))
+        .with_artifact_store(services.artifact_store().clone())
         .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
             sessions,
         ))
@@ -206,6 +194,18 @@ mod r1_root_scope_v2_original_owner {
         runtime
             .begin_turn_strategy(turn_id, "Read input.txt completely and write output.txt")
             .unwrap();
+        runtime.bind_turn_strategy_execution(turn_id, &graph.id).unwrap();
+        let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
+            "id":"scope-v2-goal", "session_id":session_id,
+            "objective":"Read input.txt completely and write output.txt",
+            "criteria":[{"id":"checked","statement":"read and write","status":"open"}],
+            "phase":"execution", "spec_revision":1, "spec_digest":"scope-v2-spec",
+            "scope":"internal", "completion":"open", "revision":1, "user_sequence":1
+        })).unwrap();
+        services.goal_store().create(goal).unwrap();
+        let mut turn_state = r1_branch_state(&session_id, "scope-v2-goal");
+        turn_state.turn_id = turn_id.into();
+        let turn_state = Arc::new(tokio::sync::Mutex::new(turn_state));
         let make_call = |call_id: &str, name: &str, input: serde_json::Value| ModelToolCall {
             binding: Some(crate::step_snapshot::StepCallBinding::provider(
                 step.clone(),
@@ -226,17 +226,56 @@ mod r1_root_scope_v2_original_owner {
             "edit",
             serde_json::json!({"action":"write","path":"output.txt","content":"physical result\n"}),
         );
+        let failed_for_payload = make_call(
+            "root-v2-missing-read", "read_file",
+            serde_json::json!({"path":"missing.txt","complete":true}),
+        );
+        original_node.payload_ref = encode_tool_calls_with_continuation(
+            &session_id, &[read.clone(), write.clone(), failed_for_payload], false,
+        ).unwrap();
+        *graph.nodes.iter_mut().find(|node| node.id == original_node.id).unwrap() = original_node.clone();
+        let runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+            services.executor_registry().clone(), services.graph_state_store().clone(),
+            commits.clone(), services.resource_manager().clone(), services.scope_locks().clone(),
+            services.worktree_leases().clone(), services.workspace_key(), services.workspace_root(),
+        );
+        let mut graph = runner.register(graph).await.unwrap();
+        for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
+            graph = commits.transition_node(&graph, "scope-v2-running-model-decoy", status, None, vec![])
+                .unwrap().graph;
+        }
+        let snapshot = runner.pump_snapshot(&graph.id, &BTreeSet::new()).await.unwrap();
+        let mut wave = runner.prepare_ready_wave(&graph.id, snapshot.ready).await.unwrap();
+        assert_eq!(wave.len(), 1);
+        let binding = wave[0].binding.as_ref().unwrap();
+        let ticket = crate::execution_core::NodeExecutionTicket {
+            graph_id: graph.id.clone(), node_id: original_node.id.clone(),
+            executor_kind: original_node.executor_kind.clone(), service_class: graph.service_class,
+            attempt: binding.attempt, idempotency_key: original_node.idempotency_key.clone(),
+            payload_ref: original_node.payload_ref.clone(),
+        };
+        let graph = services.graph_state_store().load(&graph.id).unwrap();
+        let original = store
+            .latest_for_stream(&format!("{}:node:scope-v2-original-tool-owner", graph.id))
+            .unwrap()
+            .unwrap()
+            .activity_binding()
+            .unwrap();
+        let attempt = graph.recovery_cursor.node_attempts["scope-v2-original-tool-owner"];
         let _scope = bus.enter_execution_with_activity(execution.clone(), Some(original.clone()));
         assert_eq!(
             runtime.root_effect_owner().unwrap(),
             (original.clone(), attempt)
         );
         for call in [&read, &write] {
-            let result = runtime
-                .execute_tool_batch_step(
+            let (result, _) = runtime
+                .execute_tool_batch_step_with_owner(
                     std::slice::from_ref(call),
                     &crate::SharedPrompter::none(),
                     4,
+                    &BTreeMap::new(), &BTreeMap::new(),
+                    Some(&(original.clone(), attempt)), Some(&ticket), Some(&turn_state),
+                    Some(services.as_ref()), Some(&commits),
                 )
                 .await
                 .unwrap();
@@ -359,7 +398,7 @@ mod r1_root_scope_v2_original_owner {
             assert_eq!(calls.lock().unwrap().len(), before);
             assert!(!workspace.path().join("denied.txt").exists());
         }
-        let _restored = bus.enter_execution_with_activity(execution, Some(original));
+        let _restored = bus.enter_execution_with_activity(execution, Some(original.clone()));
         let mut expired_snapshot = step.snapshot().clone();
         expired_snapshot.expires_at_ms = chrono::Utc::now().timestamp_millis() - 1;
         let expired = Arc::new(
@@ -377,8 +416,10 @@ mod r1_root_scope_v2_original_owner {
             depends_on: vec![],
         };
         let before = calls.lock().unwrap().len();
-        let refused = runtime
-            .execute_tool_batch_step(&[expired_call], &crate::SharedPrompter::none(), 4)
+        let (refused, _) = runtime
+            .execute_tool_batch_step_with_owner(&[expired_call], &crate::SharedPrompter::none(), 4,
+                &BTreeMap::new(), &BTreeMap::new(), Some(&(original.clone(), attempt)),
+                Some(&ticket), Some(&turn_state), Some(services.as_ref()), Some(&commits))
             .await
             .unwrap();
         assert_eq!(refused.failed, 1);
@@ -394,11 +435,13 @@ mod r1_root_scope_v2_original_owner {
             "read_file",
             serde_json::json!({"path":"missing.txt","complete":true}),
         );
-        let result = runtime
-            .execute_tool_batch_step(
+        let (result, _) = runtime
+            .execute_tool_batch_step_with_owner(
                 std::slice::from_ref(&failed),
                 &crate::SharedPrompter::none(),
                 4,
+                &BTreeMap::new(), &BTreeMap::new(), Some(&(original.clone(), attempt)),
+                Some(&ticket), Some(&turn_state), Some(services.as_ref()), Some(&commits),
             )
             .await
             .unwrap();
@@ -421,6 +464,23 @@ mod r1_root_scope_v2_original_owner {
                 .count(),
             1
         );
+        // Replay the same prepared ticket through the real Host resolver; the
+        // original read and write must remain once-only across that path.
+        let runtime = Arc::new(tokio::sync::Mutex::new(Box::new(runtime)));
+        services.tool_batch_executor().install_resolver(Arc::new(TurnToolResolver {
+            session_id: session_id.clone(), graph_id: graph.id.clone(),
+            runtime: Arc::downgrade(&runtime), state: Arc::downgrade(&turn_state),
+            services: Arc::downgrade(&services),
+        }));
+        runner.execute_prepared_pump_node(
+            &graph.id, wave.remove(0), Arc::new(tokio::sync::Notify::new()),
+        ).await.unwrap();
+        let replayed = services.graph_state_store().load(&graph.id).unwrap();
+        assert_eq!(replayed.node_statuses[&original_node.id], ExecutionNodeStatus::Completed,
+            "{:?}", replayed.node_results.get(&original_node.id));
+        for call_id in ["root-v2-read", "root-v2-write"] {
+            assert_eq!(calls.lock().unwrap().iter().filter(|call| call.as_str() == call_id).count(), 1);
+        }
         assert_eq!(
             calls
                 .lock()
@@ -443,137 +503,150 @@ async fn delegated_leaf_does_not_double_acquire_the_single_tool_slot() {
     };
     struct DelegatedTool {
         plane: Arc<crate::ToolExecutionPlane>,
-        inner: RecordingToolExecutor,
+        host: tools::ToolHost,
+        executed: Arc<AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl ToolExecutor for DelegatedTool {
-        fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
-            self.inner.tool_discovery_receipt()
-        }
-        async fn execute_output(
-            &self,
-            name: &str,
-            input: &str,
-        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-            let (output, admission) = self
-                .plane
-                .execute_async_classified_retained(
-                    &harness_contract::tool::ResourceDemand::default(),
-                    None,
-                    Default::default(),
-                    None,
-                    Some("single-slot"),
-                    self.inner.execute_output(name, input),
-                )
-                .await;
-            drop(admission);
-            output.map_err(|error| ToolError::new(error.to_string()))?
+        fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+            Some(self.host.pin_snapshot())
         }
         fn available_tool_names(&self) -> Vec<String> {
-            self.inner.available_tool_names()
+            vec!["read_file".into()]
         }
-        fn registered_tool_effect(
+        fn registered_tool_effect(&self, name: &str, input: &serde_json::Value) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            Some(self.host.pin_snapshot().describe_effect(name, input))
+        }
+        fn owns_tool_resource_admission(&self, _: &str) -> bool { true }
+        async fn execute_step_authorized_invocation_output(
             &self,
-            name: &str,
-            input: &serde_json::Value,
-        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-            self.inner.registered_tool_effect(name, input)
-        }
-        fn owns_tool_resource_admission(&self, _: &str) -> bool {
-            true
-        }
-        async fn execute_authorized_output(
-            &self,
-            _: &harness_contract::tool::ToolExecutionAuthorization,
+            binding: Option<&crate::step_snapshot::StepCallBinding>,
+            invocation_id: &str,
+            authorization: &harness_contract::tool::ToolExecutionAuthorization,
             name: &str,
             input: &str,
         ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-            self.execute_output(name, input).await
+            let binding = binding.expect("original provider step");
+            assert_eq!(binding.origin.call_id, invocation_id);
+            let step = binding.resolve(Some(self.host.pin_snapshot()))
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            let input: serde_json::Value = serde_json::from_str(input).unwrap();
+            let (output, admission) = self.plane.execute_async_classified_retained(
+                &harness_contract::tool::ResourceDemand::default(), None, Default::default(),
+                None, Some("single-slot"), step.lease().execute_async(authorization, name, &input),
+            ).await;
+            drop(admission);
+            let output = output.map_err(|error| ToolError::new(error.to_string()))?
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            Ok(harness_contract::context::ToolOutputDraft::bounded_inline(output))
+        }
+        async fn execute_output(&self, _: &str, _: &str) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+            Err(ToolError::new("unbound execution is forbidden"))
         }
     }
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("README.md"), "single slot evidence\n").unwrap();
     let plane = Arc::new(crate::ToolExecutionPlane::new(
         Arc::new(ExecutionResourceManager::new([
-            (
-                ExecutionResourceKind::Tool,
-                ResourceQuota::new(1, 1, 1).unwrap(),
-            ),
-            (
-                ExecutionResourceKind::Custom("tool.cpu".into()),
-                ResourceQuota::new(1, 1, 1).unwrap(),
-            ),
-        ])),
-        Arc::new(ScopeLockManager::new()),
+            (ExecutionResourceKind::Tool, ResourceQuota::new(1, 1, 1).unwrap()),
+            (ExecutionResourceKind::Custom("tool.cpu".into()), ResourceQuota::new(1, 1, 1).unwrap()),
+        ])), Arc::new(ScopeLockManager::new()),
     ));
     let executed = Arc::new(AtomicUsize::new(0));
-    let services = crate::RuntimeServices::in_memory().unwrap();
-    let session = Session::new();
+    let services = crate::RuntimeServices::test_builder(workspace.path().join("home"), workspace.path())
+        .build().unwrap();
+    let session = Session::new().with_workspace_root(workspace.path());
+    let session_id = session.session_id.clone();
+    let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
+        "id":"single-slot-goal", "session_id":session_id, "objective":"read current file",
+        "criteria":[{"id":"read","statement":"read current file","status":"open"}],
+        "phase":"execution", "spec_revision":1, "spec_digest":"single-slot-spec",
+        "scope":"internal", "completion":"open", "revision":1, "user_sequence":1
+    })).unwrap();
+    services.goal_store().create(goal).unwrap();
     let store = Arc::new(crate::test_support::session_store());
-    store
-        .create_session(&session::SessionRecord {
-            session_id: session.session_id.clone(),
-            platform: "test".into(),
-            chat_id: "single-slot".into(),
-            user_id: None,
-            model: None,
-            created_at: "2026-09-09T00:00:00Z".into(),
-            last_activity: "2026-09-09T00:00:00Z".into(),
-            message_count: 0,
-            reset_policy: "manual".into(),
-            metadata_json: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            status: "active".into(),
-        })
-        .await
-        .unwrap();
-    let runtime = crate::ConversationRuntime::new(
-        session,
-        FinalAnswerClient,
-        DelegatedTool {
-            plane: plane.clone(),
-            inner: RecordingToolExecutor {
-                executed: executed.clone(),
-                order: Arc::new(Mutex::new(vec![])),
-            },
-        },
-        PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
-        vec!["bounded read".into()],
-    )
-    .without_memory()
-    .with_runtime_event_store(services.event_store().clone())
-    .with_tool_execution_plane(plane.clone())
-    .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
-        store,
-    ))
-    .with_artifact_store(services.artifact_store().clone());
-    runtime
-        .begin_turn_strategy("single-slot", "read current file")
-        .unwrap();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        runtime.execute_tool_batch_step(
-            &[ModelToolCall {
-                binding: None,
-                id: "read".into(),
-                name: "read_file".into(),
-                input: "{\"path\":\"README.md\"}".into(),
-                depends_on: vec![],
-            }],
-            &crate::SharedPrompter::none(),
-            1,
-        ),
-    )
-    .await
-    .expect("outer conversation cannot hold the slot needed by its delegated leaf")
-    .unwrap();
-    assert_eq!(result.failed, 0, "{:?}", result.messages);
+    store.create_session(&session::SessionRecord {
+        session_id: session_id.clone(), platform: "test".into(), chat_id: "single-slot".into(),
+        user_id: None, model: None, created_at: "2026-09-09T00:00:00Z".into(),
+        last_activity: "2026-09-09T00:00:00Z".into(), message_count: 0,
+        reset_policy: "manual".into(), metadata_json: None, input_tokens: 0, output_tokens: 0,
+        status: "active".into(),
+    }).await.unwrap();
+    services.install_test_session_store(store.clone()).unwrap();
+    let host = tools::ToolHost::builtin("single-slot", workspace.path())
+        .with_authorization_lease_verifier(Arc::new(crate::AuthorizationNegotiator::verify_lease_signature));
+    let lease = host.pin_snapshot();
+    let definitions = lease.snapshot().catalog.definitions(None).into_iter()
+        .filter(|definition| definition.name == "read_file")
+        .map(|definition| crate::ProviderToolDefinition {
+            name: definition.name, description: definition.description, input_schema: definition.input_schema,
+        }).collect::<Vec<_>>();
+    let mut graph = harness_contract::execution_graph::ExecutionGraph::new("read current file");
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: session_id.clone(), turn_id: "single-slot".into(), root_task_id: "single-slot-task".into(),
+        task_id: "single-slot-task".into(), generation: 1,
+    });
+    let policy = PermissionPolicy::new(crate::PermissionMode::DangerFullAccess);
+    let revision = policy.execution_policy_control().snapshot().revision;
+    let bus = crate::CowdEventBus::new();
+    let mut runtime = crate::ConversationRuntime::new(session, FinalAnswerClient,
+        DelegatedTool { plane: plane.clone(), host, executed: executed.clone() },
+        policy, vec!["bounded read".into()])
+        .without_memory().with_runtime_event_store(services.event_store().clone())
+        .with_tool_execution_plane(plane.clone())
+        .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(store))
+        .with_artifact_store(services.artifact_store().clone())
+        .with_cowd_event_bus(bus.clone());
+    runtime.begin_turn_strategy("single-slot", "read current file").unwrap();
+    let strategy = runtime.bind_turn_strategy_execution("single-slot", &graph.id).unwrap();
+    let step = Arc::new(crate::step_snapshot::BoundStep::bind(
+        serde_json::from_value(serde_json::json!({"step_id":"single-slot-step","session_id":session_id,
+            "turn_id":"single-slot","execution_id":graph.id,"build_ref":"isolated-fixture"})).unwrap(),
+        lease, &definitions, &serde_json::json!({}), &serde_json::json!({}),
+        BTreeMap::from([("policy".into(), revision.to_string())]), chrono::Utc::now().timestamp_millis()+60_000,
+    ).unwrap());
+    let calls = vec![ModelToolCall { binding: Some(crate::step_snapshot::StepCallBinding::provider(step, "read")),
+        id: "read".into(), name: "read_file".into(), input: r#"{"path":"README.md","complete":true}"#.into(), depends_on: vec![] }];
+    let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+        harness_contract::execution_graph::ExecutionNodeKind::ToolBatch, "tool_batch",
+        encode_tool_calls_with_continuation(&session_id, &calls, false).unwrap());
+    node.id = format!("{}:original-tools", graph.id);
+    node.idempotency_key = format!("{}:original", node.id);
+    graph.nodes.push(node.clone());
+    let mut state = r1_branch_state(&session_id, "single-slot-goal");
+    state.turn_id = "single-slot".into();
+    state.task_understanding = Some(strategy.decision.strategy.understanding.clone());
+    state.collaboration_obligation = strategy.decision.collaboration_obligation.clone();
+    let runtime = Arc::new(tokio::sync::Mutex::new(Box::new(runtime)));
+    let state = Arc::new(tokio::sync::Mutex::new(state));
+    services.tool_batch_executor().install_resolver(Arc::new(TurnToolResolver {
+        session_id: session_id.clone(), graph_id: graph.id.clone(), runtime: Arc::downgrade(&runtime),
+        state: Arc::downgrade(&state), services: Arc::downgrade(&services),
+    }));
+    let runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        services.executor_registry().clone(), services.graph_state_store().clone(), services.commit_service().clone(),
+        services.resource_manager().clone(), services.scope_locks().clone(), services.worktree_leases().clone(),
+        services.workspace_key(), services.workspace_root());
+    let registered = runner.register(graph).await.unwrap();
+    let snapshot = runner.pump_snapshot(&registered.id, &BTreeSet::new()).await.unwrap();
+    let mut wave = runner.prepare_ready_wave(&registered.id, snapshot.ready).await.unwrap();
+    assert_eq!(wave.len(), 1);
+    let activity = services.event_store()
+        .latest_for_stream(&format!("{}:node:{}", registered.id, node.id)).unwrap().unwrap()
+        .activity_binding().unwrap();
+    let _scope = bus.enter_execution_with_activity(crate::CowdExecutionContext {
+        execution_id: registered.id.clone(), session_id, turn_id: "single-slot".into(),
+    }, Some(activity));
+    tokio::time::timeout(std::time::Duration::from_secs(2),
+        runner.execute_prepared_pump_node(&registered.id, wave.remove(0), Arc::new(tokio::sync::Notify::new())))
+        .await.expect("outer conversation cannot hold the slot needed by its delegated leaf").unwrap();
+    let graph = services.graph_state_store().load(&registered.id).unwrap();
+    assert_eq!(graph.node_statuses[&node.id], harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+        "{:?}", graph.node_results.get(&node.id));
     assert_eq!(executed.load(Ordering::SeqCst), 1);
     assert_eq!(plane.stats().active, 0);
-    assert_eq!(
-        plane.stats().submitted,
-        1,
-        "one invocation must acquire one Tool admission"
-    );
+    assert_eq!(plane.stats().submitted, 1, "one invocation must acquire one Tool admission");
 }
 
 #[tokio::test]
@@ -977,7 +1050,7 @@ fn focus_verification_compiles_exact_required_reads_and_post_write_reads() {
         workspace.path(),
     )
     .expect("exact verification calls");
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(), ["runtime-focus-verify-7-0", "runtime-focus-verify-7-1", "runtime-focus-verify-7-2"]);
     assert!(calls.iter().all(|call| call.name == "read_file"));
     assert_eq!(calls[0].id, "runtime-focus-verify-7-0");
     assert_eq!(
@@ -1059,7 +1132,7 @@ fn runtime_followup_verification_uses_a_fresh_node_namespace() {
     )
     .expect("verification nodes");
 
-    assert_eq!(nodes.len(), 1);
+    assert!(matches!(nodes.as_slice(), [item] if item.id == "graph:4:tools-1"));
     assert_eq!(nodes[0].id, "graph:4:tools-1");
     assert_ne!(nodes[0].id, ticket.node_id);
 }

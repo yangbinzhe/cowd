@@ -77,7 +77,7 @@ fn concurrent_publications_never_expose_partial_or_duplicate_generation() {
     for thread in threads {
         thread.join().unwrap();
     }
-    assert_eq!(sessions.list().len(), 256);
+    assert_eq!(sessions.list(), (0..256).map(|index| format!("session-{index:03}")).collect::<Vec<_>>());
     assert_eq!(sessions.observations().registered, 256);
 }
 

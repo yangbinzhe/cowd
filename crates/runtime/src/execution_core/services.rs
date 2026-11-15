@@ -4076,30 +4076,32 @@ impl RuntimeServices {
         if attempt == 0 {
             return Err("agent_actor_attempt_missing".into());
         }
-        let graph = self.graph_state_store.load_async(&parent.execution_id).await
-            .map_err(|e| format!("agent_actor_graph_load_failed:{e}"))?;
-        if graph.id != parent.execution_id
-            || graph.node_statuses.get(&parent.node_id) != Some(&ExecutionNodeStatus::Running)
-            || graph.recovery_cursor.node_attempts.get(&parent.node_id) != Some(&attempt)
         {
-            return Err("agent_actor_attempt_not_running".into());
+            let graph = self.graph_state_store.load_async(&parent.execution_id).await
+                .map_err(|e| format!("agent_actor_graph_load_failed:{e}"))?;
+            if graph.id != parent.execution_id
+                || graph.node_statuses.get(&parent.node_id) != Some(&ExecutionNodeStatus::Running)
+                || graph.recovery_cursor.node_attempts.get(&parent.node_id) != Some(&attempt)
+            {
+                return Err("agent_actor_attempt_not_running".into());
+            }
+            let binding = self.graph_state_store.current_binding(&graph, &parent.node_id, attempt)
+                .map_err(|e| format!("agent_actor_original_binding_invalid:{e}"))?;
+            let (ticket, original_node) = self.graph_state_store
+                .binding_start_ticket(&graph, &parent.node_id, &binding)
+                .map_err(|e| format!("agent_actor_original_ticket_invalid:{e}"))?;
+            let start = crate::execution_core::graph::validate_node_ticket_start(
+                &self.event_store, &ticket, None,
+            ).map_err(|e| format!("agent_actor_original_start_invalid:{e}"))?;
+            if ticket.graph_id != parent.execution_id || ticket.node_id != parent.node_id
+                || ticket.attempt != attempt
+                || start.nodes.iter().find(|n| n.id == parent.node_id) != Some(&original_node)
+                || graph.nodes.iter().find(|n| n.id == parent.node_id) != Some(&original_node)
+            {
+                return Err("agent_actor_original_ticket_mismatch".into());
+            }
         }
-        let binding = self.graph_state_store.current_binding(&graph, &parent.node_id, attempt)
-            .map_err(|e| format!("agent_actor_original_binding_invalid:{e}"))?;
-        let (ticket, original_node) = self.graph_state_store
-            .binding_start_ticket(&graph, &parent.node_id, &binding)
-            .map_err(|e| format!("agent_actor_original_ticket_invalid:{e}"))?;
-        let start = crate::execution_core::graph::validate_node_ticket_start(
-            &self.event_store, &ticket, None,
-        ).map_err(|e| format!("agent_actor_original_start_invalid:{e}"))?;
-        if ticket.graph_id != parent.execution_id || ticket.node_id != parent.node_id
-            || ticket.attempt != attempt
-            || start.nodes.iter().find(|n| n.id == parent.node_id) != Some(&original_node)
-            || graph.nodes.iter().find(|n| n.id == parent.node_id) != Some(&original_node)
-        {
-            return Err("agent_actor_original_ticket_mismatch".into());
-        }
-        let mut actor = self.resolve_agent_action_actor(parent, trusted_root).await?;
+        let mut actor = Box::pin(self.resolve_agent_action_actor(parent, trusted_root)).await?;
         if actor.original_execution.is_some() {
             return Err("agent_actor_unexpected_original_execution".into());
         }

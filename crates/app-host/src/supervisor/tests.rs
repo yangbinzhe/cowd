@@ -391,7 +391,13 @@ async fn optional_resident_failure_is_isolated_but_required_failure_fails_startu
             .state,
         AppLifecycleStateV1::Ready
     );
-    assert_eq!(identities.len(), 3);
+    assert!(!identities.is_empty());
+    assert!(identities
+        .iter()
+        .all(|(id, _)| apps.iter().any(|app| app.id == id.0)));
+    assert!(apps
+        .iter()
+        .all(|app| identities.iter().any(|(id, _)| id.0 == app.id)));
     supervisor.shutdown().await.expect("shutdown");
 }
 

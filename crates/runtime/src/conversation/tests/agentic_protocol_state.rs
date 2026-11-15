@@ -1208,14 +1208,14 @@ fn topic_transport_preserves_unacknowledged_pages_and_rechecks_private_scope() {
             packet.graph_id()
         ))
         .unwrap();
-    assert_eq!(cursor_events.len(), 1);
+    assert!(matches!(cursor_events.as_slice(), [event] if event.payload["observation_kind"] == "worker_transport"));
     assert_eq!(
         cursor_events[0].payload["observation_kind"],
         "worker_transport"
     );
 
     let second = transport.issue(&actions, &packet).unwrap().unwrap();
-    assert_eq!(second["context"]["entries"].as_array().unwrap().len(), 1);
+    assert!(matches!(second["context"]["entries"].as_array().unwrap().as_slice(), [item] if item["entry"]["summary"] == "second-peer-evidence"));
     assert_eq!(
         second["context"]["entries"][0]["entry"]["summary"],
         "second-peer-evidence"
@@ -1792,7 +1792,7 @@ async fn actual_delegated_model_safe_point_receives_delta_and_only_success_ackno
         if fail_first {
             assert!(cursor_events.is_empty());
         } else {
-            assert_eq!(cursor_events.len(), 1);
+            assert!(matches!(cursor_events.as_slice(), [event] if event.payload["observation_kind"] == "provider_model"));
             assert_eq!(
                 cursor_events[0].payload["observation_kind"],
                 "provider_model"

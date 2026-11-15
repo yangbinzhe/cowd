@@ -521,7 +521,7 @@ mod b { #[test] #[ignore="COWD_AI_HARNESS_LIVE=1"] fn database() {} }
         self.add_package("sandbox-launcher")
         self.data["packages"][1]["dependencies"].append({"path": str(self.root / "crates/sandbox-launcher")})
         launcher = self.evidence / "launcher"
-        launcher.write_text("#!/bin/sh\nprintf 'sandbox-launcher/1.2.3/kernel-v2\\n'\n")
+        launcher.write_text("#!/bin/sh\nprintf 'sandbox-launcher/1.2.3/kernel-v3-controlled-host\\n'\n")
         launcher.chmod(0o700)
         receipt = self.evidence / "launcher.json"
         config = self.root / ".cargo/config.toml"
@@ -679,7 +679,7 @@ time.sleep(60)
         self.data["packages"][1]["dependencies"].append({"path": str(self.root / "crates/sandbox-launcher")})
         plan = self.plan()
         launcher = self.evidence / "launcher"
-        launcher.write_text("#!/bin/sh\nprintf 'sandbox-launcher/1.2.3/kernel-v2\\n'\n")
+        launcher.write_text("#!/bin/sh\nprintf 'sandbox-launcher/1.2.3/kernel-v3-controlled-host\\n'\n")
         launcher.chmod(0o700)
         identity = {"source": plan["source"], "version": "1.2.3", "path": str(launcher),
                     "sha256": selection.digest(launcher.read_bytes())}
@@ -696,6 +696,45 @@ time.sleep(60)
         receipt.write_text(json.dumps({**identity, "sha256": selection.digest(launcher.read_bytes())}))
         with self.assertRaisesRegex(selection.NotStarted, "protocol"):
             selection.check_resources(self.root, plan, self.data)
+
+    def test_original_launcher_is_built_and_bound_to_source(self):
+        self.add_package("cli")
+        self.add_package("sandbox-launcher")
+        plan = self.plan()
+        plan["targets"][0]["needs_process"] = True
+        launcher = self.evidence / "cowd"
+        launcher.write_text("#!/bin/sh\nprintf 'sandbox-launcher/1.2.3/kernel-v3-controlled-host\\n'\n")
+        launcher.chmod(0o700)
+        artifact = {"reason": "compiler-artifact", "package_id": "cli", "executable": str(launcher),
+                    "target": {"name": "cowd", "kind": ["bin"]}}
+        output = subprocess.CompletedProcess([], 0, (json.dumps(artifact) + "\n").encode(), b"")
+        logs = self.evidence / "launcher-logs"
+        logs.mkdir()
+        with patch.object(selection, "run_process", return_value=output):
+            selection.prepare_original_launcher(self.root, plan, self.data, logs)
+        selection.check_resources(self.root, plan, self.data)
+        identity = json.loads((logs / "launcher-identity.json").read_text())
+        self.assertEqual(identity["source"], plan["source"])
+        self.assertEqual(identity["sha256"], selection.digest(launcher.read_bytes()))
+        self.assertEqual(os.environ["CARGO_TARGET_DIR"], str(self.root / "target-gatefix"))
+
+    def test_original_launcher_rejects_source_change_during_build(self):
+        self.add_package("cli")
+        self.add_package("sandbox-launcher")
+        plan = self.plan()
+        plan["targets"][0]["needs_process"] = True
+        logs = self.evidence / "launcher-logs"
+        logs.mkdir()
+
+        def changed(*args, **kwargs):
+            (self.root / "Cargo.toml").write_text("[workspace]\n# changed during build\n")
+            return subprocess.CompletedProcess([], 0, b"", b"")
+
+        with patch.object(selection, "run_process", side_effect=changed):
+            with self.assertRaisesRegex(selection.NotStarted, "source changed"):
+                selection.prepare_original_launcher(self.root, plan, self.data, logs)
+        self.assertFalse((logs / "launcher-identity.json").exists())
+        self.assertNotIn("COWD_SANDBOX_LAUNCHER_BINARY", os.environ)
 
     def test_real_disposable_cargo_workspace_and_stale_plan(self):
         helper_dir = self.root / "scripts/test"

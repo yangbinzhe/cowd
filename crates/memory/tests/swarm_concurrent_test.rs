@@ -330,7 +330,11 @@ async fn test_swarm_scope_isolation() {
 
     // All entries should be persisted (8 total)
     let all = orch.list_layer(MemoryLayer::L3).await.unwrap();
-    assert_eq!(all.len(), 8, "Expected 8 total entries across scopes");
+    let titles = all.iter().map(|entry| entry.title.clone()).collect::<std::collections::BTreeSet<_>>();
+    let expected = (0..5).map(|i| format!("alpha-entry-{i}"))
+        .chain((0..3).map(|i| format!("beta-entry-{i}"))).collect();
+    assert_eq!(titles, expected);
+    assert_eq!(all.len(), titles.len());
 
     // Verify scope isolation: recall entries and verify their scope values
     let mut alpha_entries = 0usize;

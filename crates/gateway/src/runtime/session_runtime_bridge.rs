@@ -28,6 +28,13 @@ use crate::{
 mod terminal_codec;
 use terminal_codec::annotate_terminal_tool_instances;
 #[cfg(test)]
+pub(crate) fn fixture_annotate_terminal_tool_instances(
+    transcript: &mut [DecodedTerminalTranscriptMessage], execution_id: Option<&str>,
+    turn_id: Option<&str>, ingress_message_id: Option<&str>,
+) {
+    annotate_terminal_tool_instances(transcript, execution_id, turn_id, ingress_message_id);
+}
+#[cfg(test)]
 pub(crate) use terminal_codec::decode_terminal_payload;
 pub(crate) use terminal_codec::{
     load_terminal_payload, DecodedTerminalPayload, DecodedTerminalTranscriptMessage,

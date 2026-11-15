@@ -360,7 +360,8 @@ pub(crate) fn completion_admission_context(
                     .is_some_and(|inputs| inputs.version == 2)
             })
             .ok_or_else(|| format!("completion context requires latest v2 proof:{condition}"))?;
-        super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)?;
+        super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)
+            .map_err(|error| error.to_string())?;
         let snapshot = validate_applied_proof_inputs(store, program, Some(&goal), proof, readers)?;
         super::validate_review_coverage(
             &goal, program, review, &results, &review.evidence_refs, &snapshot,
@@ -742,7 +743,7 @@ fn validate_proof_inputs_for_action_with_tail(
         readers,
         current_review,
         pre_tail,
-    )?;
+    ).map_err(|error| error.to_string())?;
     if let Some(projection) = &current_goal {
         if !snapshot.sources.iter().any(|source| {
             source.stream_id == format!("goal:{}", projection.goal.id)
@@ -1420,7 +1421,7 @@ pub(crate) fn review_delivery_snapshot(
     program: &AgenticProgramProjection,
     packet: Option<&harness_contract::agent::AgentTaskPacket>,
     selected: Option<&[harness_contract::goal::ProofInputEvent]>,
-) -> Result<ReviewDeliverySnapshot, String> {
+) -> Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError> {
     let stream = format!("session:{}", program.session_id);
     let mut sources = std::collections::BTreeMap::new();
     let events = match selected {
@@ -1452,7 +1453,7 @@ pub(crate) fn review_delivery_snapshot_from_events(
     packet: Option<&harness_contract::agent::AgentTaskPacket>,
     events: Vec<crate::DurableRuntimeEvent>,
     sources: std::collections::BTreeMap<String, u64>,
-) -> Result<ReviewDeliverySnapshot, String> {
+) -> Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError> {
     read_delivery_snapshot_for_scope(
         reader,
         &program.session_id,
@@ -1474,7 +1475,7 @@ pub(crate) fn read_delivery_snapshot_for_scope(
     packet: Option<&harness_contract::agent::AgentTaskPacket>,
     events: Vec<crate::DurableRuntimeEvent>,
     mut sources: std::collections::BTreeMap<String, u64>,
-) -> Result<ReviewDeliverySnapshot, String> {
+) -> Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError> {
     use crate::context_evidence::{
         ReadDeliveryGrade, ReadDeliveryTransport, NATIVE_DELIVERY_KIND, PROCESS_DELIVERY_KIND,
         READ_ACQUISITION_FIELD,
@@ -1791,7 +1792,7 @@ impl crate::RuntimeServices {
         let accepted = run(event.clone(), primary.clone(), index.clone(), packet).unwrap();
         assert_eq!(accepted.reads.len(), 1);
         assert_eq!(accepted.reads[0].material, material);
-        let refused = |label: &str, result: Result<ReviewDeliverySnapshot, String>| {
+        let refused = |label: &str, result: Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError>| {
             assert!(
                 result.is_err()
                     || result
@@ -1800,7 +1801,7 @@ impl crate::RuntimeServices {
                 "{label}: a foreign delivery entered the consumer read set"
             );
         };
-        let physical_error = |label: &str, result: Result<ReviewDeliverySnapshot, String>| {
+        let physical_error = |label: &str, result: Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError>| {
             let error = result
                 .err()
                 .unwrap_or_else(|| panic!("{label}: receipt forgery accepted"));
@@ -2121,7 +2122,7 @@ pub(crate) fn root_file_acquisition(
     store: &RuntimeEventStore,
     owner: &crate::DurableRuntimeEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(crate::DurableRuntimeEvent, crate::DurableRuntimeEvent), String> {
+) -> Result<(crate::DurableRuntimeEvent, crate::DurableRuntimeEvent), super::results::ReviewEvidenceError> {
     use crate::context_evidence::{RootReadOwner, READ_ACQUISITION_FIELD};
     let binding = owner
         .activity_binding()
@@ -2686,7 +2687,7 @@ impl ActualImmutableInput {
         packet: Option<&harness_contract::agent::AgentTaskPacket>,
         readers: super::ResultContentReaders<'_>,
         actual: &mut ActualInputSnapshot,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, super::results::ReviewEvidenceError> {
         let acquisition = crate::context_evidence::decode_read_acquisition(
             &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
         )
@@ -2864,7 +2865,7 @@ impl ActualImmutableInput {
                     original.event_id == primary.event_id,
                     acquisition.step.execution_id.as_deref() == Some(acquisition.graph_id.as_str()),
                     acquisition.step.run_ref.is_some(),
-                ));
+                ).into());
             }
         }
         for original in super::results::process_ticket_start(store, &acquisition.graph_id,
@@ -3468,6 +3469,13 @@ pub(super) fn verify_actual_read_pair(
     Ok(descriptor)
 }
 
+// These candidates describe only what the original verifier established.
+// Verification errors remain hard errors and cannot become missing strategies.
+enum AcquisitionCandidate {
+    Proven(harness_contract::refusal_codes::FactAdmissionStrategy),
+    Missing(Vec<crate::agentic::fact_admission::StrategyOutcome>),
+}
+
 fn collect_actual_acquisition(
     store: &std::sync::Arc<RuntimeEventStore>,
     program: &AgenticProgramProjection,
@@ -3479,7 +3487,47 @@ fn collect_actual_acquisition(
     readers: super::ResultContentReaders<'_>,
     actual: &mut ActualInputSnapshot,
     windows: &mut std::collections::BTreeMap<String, Vec<ActualFileWindow>>,
-) -> Result<(), String> {
+) -> Result<(), super::results::ReviewEvidenceError> {
+    // Both production callers propagate any failure and discard their entire
+    // local snapshot. Until this decision succeeds it cannot become a proof.
+    let result = (|| {
+        let candidate = collect_actual_acquisition_candidate(
+            store, program, primary, index, original_input, session_events, boundary,
+            readers, actual, windows,
+        )?;
+        let outcomes = match candidate {
+            AcquisitionCandidate::Proven(strategy) => vec![crate::agentic::fact_admission::StrategyOutcome::admitted(strategy)],
+            AcquisitionCandidate::Missing(outcomes) => outcomes,
+        };
+        crate::agentic::fact_admission::require(
+            &outcomes,
+            harness_contract::refusal_codes::FactAdmissionCode::Unproven,
+            "proof_actual_input_extent_unsupported: actual read lacks an original physical extent",
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        tracing::warn!(sources = actual.sources.len(), material_events = actual.material_events.len(),
+            canonical_facts = actual.canonical_facts.len(), window_groups = windows.len(),
+            disposition = "incomplete_snapshot_not_published",
+            frame_cleanup = if readers.process_inputs.is_some() { "owned_by_frame" } else { "no_frame" },
+            "review acquisition rejected before snapshot publication");
+    }
+    result
+}
+
+fn collect_actual_acquisition_candidate(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    primary: &crate::DurableRuntimeEvent,
+    index: &crate::DurableRuntimeEvent,
+    original_input: Option<&serde_json::Value>,
+    session_events: &[crate::DurableRuntimeEvent],
+    boundary: &super::results::ResultInputBoundary,
+    readers: super::ResultContentReaders<'_>,
+    actual: &mut ActualInputSnapshot,
+    windows: &mut std::collections::BTreeMap<String, Vec<ActualFileWindow>>,
+) -> Result<AcquisitionCandidate, super::results::ReviewEvidenceError> {
     use crate::context_evidence::{ReadExtent, READ_ACQUISITION_FIELD};
     let descriptor = verify_actual_read_pair(primary, index)?;
     if primary.commit_cursor >= boundary.cursor {
@@ -3502,7 +3550,7 @@ fn collect_actual_acquisition(
                     return Err("directory metadata has an unexpected acquisition seal".into());
                 }
                 // Directory state is metadata, not immutable artifact material.
-                return Ok(());
+                return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Directory));
             }
         }
     }
@@ -3525,16 +3573,15 @@ fn collect_actual_acquisition(
                 "acquisition_cursor":primary.commit_cursor, "source":primary.event_id,
                 "index":index.event_id,
             }));
-            return Ok(());
+            return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Nested));
         }
         // Primary and index remain in the audited material set above. A
         // discovery page proves neither file contents nor current absence.
         if original_glob_discovery(primary, &descriptor, original_input)?.is_some() {
-            return Ok(());
+            return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Discovery));
         }
         if !immutable_receipt_without_workspace_extent(primary, &descriptor, original_input)? {
-            let admission = crate::agentic::fact_admission::admit(
-                &[
+            return Ok(AcquisitionCandidate::Missing(vec![
                     crate::agentic::fact_admission::StrategyOutcome::missing(
                         harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
                         "the composite's child acquisitions do not cover this read",
@@ -3547,11 +3594,7 @@ fn collect_actual_acquisition(
                         harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
                         "the read named a workspace path and its receipt carries no acquisition seal",
                     ),
-                ],
-                harness_contract::refusal_codes::FactAdmissionCode::Unproven,
-                "proof_actual_input_extent_unsupported: actual read lacks an original physical extent",
-            );
-            return Err(admission.refusal_message().into());
+                ]));
         }
         let output = primary.payload["outcome"]["output"]
             .as_str()
@@ -3569,7 +3612,7 @@ fn collect_actual_acquisition(
             "scope":primary.payload["resolved_effect_scope"],
             "sha256":crate::context_evidence::read_sha256(output.as_bytes()), "bytes":output.len(),
         }));
-        return Ok(());
+        return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Immutable));
     }
     let seal =
         crate::context_evidence::decode_read_acquisition(seal_value).map_err(str::to_string)?;
@@ -3703,9 +3746,9 @@ fn collect_actual_acquisition(
                 store, program, primary, index, session_events,
                 boundary.packet.as_ref(), readers, actual,
             ).map_err(|error| {
-                if error.starts_with("immutable acquisition has no authenticated root producer") {
-                    format!("{error}; caller=actual_boundary producer={:?} packet_present={}",
-                        boundary.producer, boundary.packet.is_some())
+                if error.to_string().starts_with("immutable acquisition has no authenticated root producer") {
+                    super::results::ReviewEvidenceError::from(format!("{error}; caller=actual_boundary producer={:?} packet_present={}",
+                        boundary.producer, boundary.packet.is_some()))
                 } else { error }
             })?;
             if !actual.immutable_inputs.contains(&input) {
@@ -3713,7 +3756,9 @@ fn collect_actual_acquisition(
             }
         }
     }
-    Ok(())
+    // This admits only the original authenticated acquisition (a window for
+    // FileLines); complete_actual_file_windows still decides full coverage.
+    Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Sealed))
 }
 
 pub(super) fn authenticate_unsealed_delegated_input(
@@ -3722,7 +3767,7 @@ pub(super) fn authenticate_unsealed_delegated_input(
     index: &crate::DurableRuntimeEvent,
     packet: &harness_contract::agent::AgentTaskPacket,
     actual: &mut ActualInputSnapshot,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, super::results::ReviewEvidenceError> {
     use harness_contract::step::CallSource;
     let key = primary.payload["idempotency_key"]
         .as_str()
@@ -4013,65 +4058,6 @@ fn authenticate_actual_consumer(
     Ok(())
 }
 
-#[cfg(test)]
-tokio::task_local! {
-    static ACTUAL_READ_SOURCE_FAULT: &'static str;
-}
-
-#[cfg(test)]
-fn actual_read_source_fault(primary: &mut crate::DurableRuntimeEvent) {
-    if primary.payload["tool_name"] == "evidence_retrieve" {
-        let _ = ACTUAL_READ_SOURCE_FAULT.try_with(|fault| match *fault {
-            "artifact-body" => {
-                primary.payload["outcome"]["output"] = serde_json::json!("changed original body")
-            }
-            "artifact-hash" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["body"]
-                    ["source_sha256"] = serde_json::json!("sha256:foreign")
-            }
-            "artifact-chunk" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["body"]["extent"]
-                    ["chunks"][0]["body_sha256"] = serde_json::json!("sha256:foreign")
-            }
-            "artifact-source" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["body"]
-                    ["source_ref"] = serde_json::json!("artifact://foreign")
-            }
-            "artifact-producer" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["step"]
-                    ["run_ref"] = serde_json::json!("foreign-run")
-            }
-            "artifact-attempt" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["attempt"] =
-                    serde_json::json!(99)
-            }
-            _ => {}
-        });
-        return;
-    }
-    if primary.payload["tool_name"] != "tool_search" {
-        return;
-    }
-    let _ = ACTUAL_READ_SOURCE_FAULT.try_with(|fault| match *fault {
-        "session" => primary.payload["replay"]["session_id"] = serde_json::json!("foreign-session"),
-        "run" => {
-            primary.payload["replay"]["origin"]["source"] =
-                serde_json::json!({"kind":"process","worker_id":"foreign-run","sequence":1})
-        }
-        "step" => {
-            primary.payload["replay"]["origin"]["origin_step_id"] =
-                serde_json::json!("foreign-step")
-        }
-        "call" => primary.payload["replay"]["call_id"] = serde_json::json!("foreign-call"),
-        "input" => primary.payload["input_sha256"] = serde_json::json!("sha256:foreign-input"),
-        "compiled" => {
-            primary.payload["replay"]["invocation"]["invocation_id"] =
-                serde_json::json!("foreign-compiled-call")
-        }
-        _ => {}
-    });
-}
-
 fn remember_primary_content(
     contents: &mut std::collections::BTreeMap<String, harness_contract::context::ArtifactRef>,
     identity: &str,
@@ -4103,7 +4089,7 @@ pub(super) fn primary_producer_immutable_inputs(
     producers: &[super::results::ResultProducer],
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
-) -> Result<ActualInputSnapshot, String> {
+) -> Result<ActualInputSnapshot, super::results::ReviewEvidenceError> {
     primary_producer_immutable_inputs_with_tail(store, program, producers, readers, expected_cuts, None)
 }
 
@@ -4114,7 +4100,7 @@ fn primary_producer_immutable_inputs_with_tail(
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
     session_tail: Option<&HistoricalSessionCut>,
-) -> Result<ActualInputSnapshot, String> {
+) -> Result<ActualInputSnapshot, super::results::ReviewEvidenceError> {
     let mut actual = ActualInputSnapshot {
         file_dependencies: Vec::new(),
         immutable_inputs: Vec::new(),
@@ -4211,9 +4197,9 @@ fn primary_producer_immutable_inputs_with_tail(
                 readers,
                 &mut actual,
             ).map_err(|error| {
-                if error.starts_with("immutable acquisition has no authenticated root producer") {
-                    format!("{error}; caller=primary_producer producer={:?} packet_present={}",
-                        producer.execution, producer.packet.is_some())
+                if error.to_string().starts_with("immutable acquisition has no authenticated root producer") {
+                    super::results::ReviewEvidenceError::from(format!("{error}; caller=primary_producer producer={:?} packet_present={}",
+                        producer.execution, producer.packet.is_some()))
                 } else { error }
             })?;
             if !actual.immutable_inputs.contains(&content) {
@@ -4247,9 +4233,12 @@ mod primary_material_621_tests {
         let mut contents = std::collections::BTreeMap::new();
         remember_primary_content(&mut contents, "artifact:summary", &first).unwrap();
         remember_primary_content(&mut contents, "artifact:file", &second).unwrap();
-        assert_eq!(contents.len(), 2);
+        let expected = std::collections::BTreeMap::from([
+            ("artifact:summary".to_string(), first.clone()), ("artifact:file".to_string(), second.clone()),
+        ]);
+        assert_eq!(contents, expected);
         remember_primary_content(&mut contents, "artifact:summary", &first).unwrap();
-        assert_eq!(contents.len(), 2);
+        assert_eq!(contents, expected);
         assert!(remember_primary_content(&mut contents, "artifact:summary", &second).is_err());
         let mut changed = first.clone();
         changed.sha256 = "sha256:changed".into();
@@ -4595,7 +4584,7 @@ pub(super) fn actual_input_snapshot(
     boundaries: &[super::results::ResultInputBoundary],
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
-) -> Result<ActualInputSnapshot, String> {
+) -> Result<ActualInputSnapshot, super::results::ReviewEvidenceError> {
     actual_input_snapshot_for_phase(store, program, boundaries, readers, expected_cuts, false, None)
 }
 
@@ -4607,7 +4596,7 @@ pub(super) fn actual_input_snapshot_for_phase(
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
     allow_history_growth: bool,
     session_tail: Option<&HistoricalSessionCut>,
-) -> Result<ActualInputSnapshot, String> {
+) -> Result<ActualInputSnapshot, super::results::ReviewEvidenceError> {
     let mut actual = ActualInputSnapshot {
         file_dependencies: Vec::new(),
         immutable_inputs: Vec::new(),
@@ -4708,12 +4697,6 @@ pub(super) fn actual_input_snapshot_for_phase(
                     .event_by_idempotency_key(&primary_source, &format!("{key}:read-receipt"))
                     .map_err(|error| error.to_string())?
                     .ok_or("actual input original primary disappeared")?;
-                #[cfg(test)]
-                let primary = {
-                    let mut original = primary;
-                    actual_read_source_fault(&mut original);
-                    original
-                };
                 // 033 S8 (one owner for the seal decision): the effect
                 // receipt (the primary) owns the acquisition - it carries the
                 // body and the outcome. The observation twin must agree with
@@ -4818,7 +4801,7 @@ pub(super) fn actual_input_snapshot_for_phase(
                         &seal.index_stream,
                         &mut actual.sources,
                     )
-                    .map_err(|rejection| rejection.reason())?;
+                    .map_err(super::results::ReviewEvidenceError::from_repin)?;
                     store
                         .event_by_idempotency_key(&seal.index_stream, &seal.index_key)
                         .map_err(|error| error.to_string())?
@@ -4840,7 +4823,7 @@ pub(super) fn actual_input_snapshot_for_phase(
                         &source,
                         &mut actual.sources,
                     )
-                    .map_err(|rejection| rejection.reason())?;
+                    .map_err(super::results::ReviewEvidenceError::from_repin)?;
                     let key = primary.payload["idempotency_key"]
                         .as_str()
                         .ok_or("actual root read identity missing")?;
@@ -4914,7 +4897,7 @@ pub(super) fn actual_input_snapshot_for_phase(
             return Err(format!(
                 "actual input source cut is missing or changed; rebuild the complete review: source={source:?}, expected={:?}, observed={revision}, allow_history_growth={allow_history_growth}",
                 expected_cuts.and_then(|cuts| cuts.get(source).copied()),
-            ));
+            ).into());
         }
         let current = store
             .stream_revision(source)
@@ -4922,7 +4905,7 @@ pub(super) fn actual_input_snapshot_for_phase(
         if current != *revision {
             return Err(format!(
                 "actual input source cut is missing or changed; rebuild the complete review: source={source:?}, observed={revision}, current={current}",
-            ));
+            ).into());
         }
     }
     Ok(actual)
@@ -5066,7 +5049,7 @@ fn authenticated_process_for_key(
     store: &std::sync::Arc<RuntimeEventStore>,
     key: &str,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Option<super::results::AuthenticatedProcessExecution>, String> {
+) -> Result<Option<super::results::AuthenticatedProcessExecution>, super::results::ReviewEvidenceError> {
     let source = format!("execution-effect:{key}");
     let Some(intent) = store
         .event_by_idempotency_key(&source, &format!("{key}:intent"))
@@ -5091,7 +5074,7 @@ fn admitted_intent_scope(
     store: &RuntimeEventStore,
     event: &crate::DurableRuntimeEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<harness_contract::goal::ProofEffectScope, String> {
+) -> Result<harness_contract::goal::ProofEffectScope, super::results::ReviewEvidenceError> {
     let key = event.payload["idempotency_key"]
         .as_str()
         .ok_or("effect intent lacks original identity")?;
@@ -5131,6 +5114,7 @@ fn admitted_intent_scope(
         &intent.payload["resolved_effect_scope"],
         &descriptor,
     )
+    .map_err(Into::into)
 }
 
 pub(super) fn authenticate_settled_effect(
@@ -5138,7 +5122,7 @@ pub(super) fn authenticate_settled_effect(
     intent: &crate::DurableRuntimeEvent,
     receipt: &crate::DurableRuntimeEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<ToolEffectDescriptor, String> {
+) -> Result<ToolEffectDescriptor, super::results::ReviewEvidenceError> {
     let key = intent.payload["idempotency_key"]
         .as_str()
         .ok_or("effect identity missing")?;
@@ -5270,7 +5254,7 @@ pub(super) fn original_material_scope(
     store: &std::sync::Arc<RuntimeEventStore>,
     event: &crate::DurableRuntimeEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Option<harness_contract::goal::ProofEffectScope>, String> {
+) -> Result<Option<harness_contract::goal::ProofEffectScope>, super::results::ReviewEvidenceError> {
     if event.kind == "tool.invocation.completed" {
         let session = event.stream_id.clone();
         let events = super::results::result_source_events(store, &session, sources)?;
@@ -5290,7 +5274,7 @@ pub(super) fn original_material_scope(
                 &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
             )
             .map_err(str::to_string)?;
-            return read_original_scope(&primary, &descriptor, &seal);
+            return Ok(read_original_scope(&primary, &descriptor, &seal)?);
         }
         if primary.payload["resolved_effect_scope"].is_null()
             && descriptor.effect_kind == ToolEffectKind::Read
@@ -5309,7 +5293,8 @@ pub(super) fn original_material_scope(
             &primary.payload["resolved_effect_scope"],
             &descriptor,
         )
-        .map(Some);
+        .map(Some)
+        .map_err(Into::into);
     }
     let key = event.payload["idempotency_key"]
         .as_str()
@@ -5341,13 +5326,14 @@ pub(super) fn original_material_scope(
             &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
         )
         .map_err(str::to_string)?;
-        return read_original_scope(&primary, &descriptor, &seal);
+        return Ok(read_original_scope(&primary, &descriptor, &seal)?);
     }
     super::results::require_original_effect_scope(
         &primary.payload["resolved_effect_scope"],
         &descriptor,
     )
     .map(Some)
+    .map_err(Into::into)
 }
 
 fn require_discovered_graph_genesis(
@@ -5372,6 +5358,7 @@ pub(crate) fn proof_input_snapshot(
     readers: super::ResultContentReaders<'_>,
 ) -> Result<ProofInputSnapshot, String> {
     proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, None, None)
+        .map_err(|error| error.to_string())
 }
 
 /// Build a proof snapshot against the LIVE action being applied.
@@ -5382,7 +5369,7 @@ pub(crate) fn proof_input_snapshot_for_action(
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
-) -> Result<ProofInputSnapshot, String> {
+) -> Result<ProofInputSnapshot, super::results::ReviewEvidenceError> {
     proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, current_review, None)
 }
 
@@ -5426,7 +5413,7 @@ fn refused_call_is_settled(
     store: &std::sync::Arc<RuntimeEventStore>,
     key: &str,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<TerminalFactRead, String> {
+) -> Result<TerminalFactRead, super::results::ReviewEvidenceError> {
     let mut candidates = vec![(key.to_string(), format!("agentic-single:{key}"))];
     if let Some((outer, index)) = member_outer_and_index(key) {
         candidates.push((outer, format!("agentic-member:{index}")));
@@ -5434,7 +5421,7 @@ fn refused_call_is_settled(
     for (stream_key, idempotency_key) in candidates {
         let stream = format!("execution-effect:{}", stream_key);
         super::results::pin_result_source(store, &stream, sources)
-            .map_err(|error| format!("refusal twin source read failed: {error}"))?;
+            .map_err(|error| error.with_prefix("refusal twin source read failed: "))?;
         // A read that fails is not a miss: it is named, and the caller keeps
         // the call pending. Only a stream that holds no twin is a miss.
         let Some(twin) = store
@@ -5602,7 +5589,41 @@ fn required_write_settlement(
     receipt: Option<(&serde_json::Value, u64)>,
     terminally_failed: bool,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<RequiredWriteSettlement, String> {
+) -> Result<RequiredWriteSettlement, super::results::ReviewEvidenceError> {
+    let candidate = required_write_settlement_candidate(
+        store, identity, intent_payload, receipt, terminally_failed, sources,
+    )?;
+    use crate::agentic::fact_admission::StrategyOutcome;
+    use harness_contract::refusal_codes::{FactAdmissionCode, FactAdmissionStrategy};
+    let outcome = match &candidate {
+        RequiredWriteSettlement::Refused { .. } => StrategyOutcome::admitted(FactAdmissionStrategy::SettledRefusal),
+        RequiredWriteSettlement::Pending => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "no original refusal twin"),
+        RequiredWriteSettlement::Failed { .. } => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "the original call failed"),
+        RequiredWriteSettlement::UnreadableRefusal { .. } => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "the refusal twin is unreadable"),
+        RequiredWriteSettlement::Contradiction { .. } => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "terminal facts contradict"),
+        RequiredWriteSettlement::MissingReceipt => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "the failed call has no receipt"),
+    };
+    let decision = crate::agentic::fact_admission::admit(
+        &[outcome], FactAdmissionCode::Unproven, "original required write refusal is unproven",
+    );
+    match (&candidate, decision.code) {
+        (RequiredWriteSettlement::Refused { .. }, FactAdmissionCode::Admitted) => Ok(candidate),
+        (RequiredWriteSettlement::Refused { .. }, _) => Err(decision.refusal_message().into()),
+        (_, FactAdmissionCode::Admitted) => Err("non-refusal write was incorrectly admitted as a refusal".into()),
+        // Missing refusal is not an error by itself: preserve the original
+        // pending, failed, unreadable and contradictory settlement states.
+        _ => Ok(candidate),
+    }
+}
+
+fn required_write_settlement_candidate(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    identity: &str,
+    intent_payload: &serde_json::Value,
+    receipt: Option<(&serde_json::Value, u64)>,
+    terminally_failed: bool,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<RequiredWriteSettlement, super::results::ReviewEvidenceError> {
     let refusal_cursor = match refused_call_is_settled(store, identity, sources)? {
         TerminalFactRead::Found { cursor } => Some(cursor),
         // Nothing here: this family does not speak for the call. The call
@@ -5661,7 +5682,7 @@ fn proof_input_snapshot_for_phase(
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
     pre_tail: Option<&HistoricalSessionCut>,
-) -> Result<ProofInputSnapshot, String> {
+) -> Result<ProofInputSnapshot, super::results::ReviewEvidenceError> {
     // The named failures this review settles: each required write that ran
     // and failed, with the facts that name it. They are carried to the
     // review's conclusion; they are never a satisfied requirement and never
@@ -5746,7 +5767,7 @@ fn proof_input_snapshot_for_phase(
             return Err(format!(
                 "proof Program source changed; retry current inputs; {}",
                 super::describe_source_advance(store, &program_source, pinned)
-            ));
+            ).into());
         }
     }
     sources.insert(program_source, program_revision);
@@ -6623,7 +6644,7 @@ fn proof_input_snapshot_for_phase(
                 return Err(format!(
                     "proof foreign graph work changed; {}",
                     super::describe_source_advance(store, source, *pinned)
-                ));
+                ).into());
             }
             // Parent model/ToolBatch continuations are execution trace. Their
             // real effects and immutable material are checked below; a raw
@@ -6650,7 +6671,7 @@ fn proof_input_snapshot_for_phase(
             return Err(format!(
                 "proof graph source changed outside its own review retirement; {}",
                 super::describe_source_advance(store, source, *pinned)
-            ));
+            ).into());
         }
         absorbed_graph_sources.insert(source.clone(), *pinned);
     }
@@ -7054,7 +7075,7 @@ fn proof_input_snapshot_for_phase(
         }
     }
     if !physical_unknown.is_empty() {
-        return Err(format!("effect_review_pending: opaque Process history may intersect required work: {physical_unknown:?}"));
+        return Err(format!("effect_review_pending: opaque Process history may intersect required work: {physical_unknown:?}").into());
     }
     let mut required_effects = std::collections::BTreeMap::new();
     required_effects.insert(
@@ -7205,7 +7226,7 @@ fn proof_input_snapshot_for_phase(
                 Err(reason) => {
                     return Err(format!(
                         "effect_review_pending: required write outcome status is not one this review can read; source={source} identity={identity} reason={reason}",
-                    ));
+                    ).into());
                 }
             };
             // The exemption is the reviewer's OWN admitted call: the intent
@@ -7273,7 +7294,7 @@ fn proof_input_snapshot_for_phase(
                         RequiredWriteSettlement::UnreadableRefusal { reason } => {
                             return Err(format!(
                                 "effect_review_pending: required write refusal fact is not readable; source={source} identity={identity} reason={reason}",
-                            ));
+                            ).into());
                         }
                         RequiredWriteSettlement::Contradiction {
                             refusal_cursor,
@@ -7284,12 +7305,12 @@ fn proof_input_snapshot_for_phase(
                                 intent.transaction_id,
                                 refusal_cursor,
                                 receipt_cursor,
-                            ));
+                            ).into());
                         }
                         RequiredWriteSettlement::MissingReceipt => {
                             return Err(format!(
                                 "effect_review_pending: required write failure has no receipt to name; source={source} identity={identity}",
-                            ));
+                            ).into());
                         }
                         RequiredWriteSettlement::Pending => {
                             return Err(format!(
@@ -7297,7 +7318,7 @@ fn proof_input_snapshot_for_phase(
                                 intent.payload["tool_name"].as_str().unwrap_or("unknown"),
                                 receipts.contains_key(identity),
                                 current_review_effect_key,
-                            ));
+                            ).into());
                         }
                     }
                 }
@@ -7485,7 +7506,7 @@ fn proof_input_snapshot_for_phase(
         if !pending.is_empty() {
             return Err(format!(
                 "effect_review_pending: root writes must settle before acceptance; pending={pending:?}; terminal={completed:?}",
-            ));
+            ).into());
         }
     }
     #[cfg(test)]
@@ -7548,13 +7569,13 @@ fn proof_input_snapshot_for_phase(
                 return Err(format!(
                     "proof_actual_input_stale_before_use: {} acquisition={} consumer={} write={cursor}",
                     target.path.workspace_relative_path, dependency.acquisition_cursor, dependency.consumer_cursor,
-                ));
+                ).into());
             }
             if *cursor >= dependency.acquisition_cursor && *cursor >= read_cursor {
                 return Err(format!(
                     "review_requires_effect_observation: {} original_acquisition={} complete_reviewer_read={read_cursor} write={cursor}",
                     target.path.workspace_relative_path, dependency.acquisition_cursor,
-                ));
+                ).into());
             }
         }
     }
@@ -7576,7 +7597,7 @@ fn proof_input_snapshot_for_phase(
             return Err(format!(
                 "review_requires_effect_observation: business output {} needs a complete later independent File read",
                 target.path.workspace_relative_path,
-            ));
+            ).into());
         }
     }
     strip_authenticated_runtime_control_effects(
@@ -7603,7 +7624,7 @@ fn proof_input_snapshot_for_phase(
             return Err(format!(
                 "proof source changed during validation; retry current inputs; source={source} expected={revision} actual={actual_revision} phase=final_source_fence; {}",
                 super::describe_source_advance(store, source, *revision)
-            ));
+            ).into());
         }
     }
     let session_revision = *sources
@@ -7663,7 +7684,7 @@ fn authenticated_delegated_plan_settled(
     events: &[crate::DurableRuntimeEvent],
     packet: &harness_contract::agent::AgentTaskPacket,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Option<std::collections::BTreeMap<String, serde_json::Value>>, String> {
+) -> Result<Option<std::collections::BTreeMap<String, serde_json::Value>>, super::results::ReviewEvidenceError> {
     if plan.actor.as_deref() != Some("conversation_runtime")
         || plan.schema_version != 1
         || plan.scope != RuntimeEventScope::Tool
@@ -8017,7 +8038,7 @@ pub(crate) fn effect_review_snapshot(
     program: &AgenticProgramProjection,
     goal: Option<&GoalContract>,
     effect_sources: &[String],
-) -> Result<RootReviewPolicySnapshot, String> {
+) -> Result<RootReviewPolicySnapshot, super::results::ReviewEvidenceError> {
     let stream_id = format!("session:{}", program.session_id);
     // A review that cites delegated effect sources is scoped to those streams.
     // The root Session stream is written by active coordinators and is not part
@@ -8755,7 +8776,7 @@ mod tests {
         // 032 K4b (A2): identity is the code, not the wording; the facts the
         // old verbatim assertion pinned are still asserted individually.
         assert_eq!(
-            super::super::reason_code::reason_code_of(&drift),
+            super::super::reason_code::reason_code_of(&drift.to_string()),
             Some(super::super::reason_code::ReviewRefusalCode::ResultSourceChangedDuringResolution),
             "the drift refusal is named by its own code: {drift}"
         );
@@ -9284,6 +9305,7 @@ mod tests {
             },
         };
         let mut windows = std::collections::BTreeMap::new();
+        crate::agentic::fact_admission::take_test_admissions();
         let settled = super::actual_input_snapshot_for_phase(
             &store,
             &program,
@@ -9298,6 +9320,9 @@ mod tests {
             None,
         )
         .expect("a member read of a durable record has no workspace extent");
+        assert!(crate::agentic::fact_admission::take_test_admissions().contains(
+            &harness_contract::refusal_codes::FactAdmissionStrategy::Immutable),
+            "the original immutable read must pass the admission gate");
         assert!(
             settled
                 .canonical_facts
@@ -9336,7 +9361,9 @@ mod tests {
             material_events: Vec::new(),
             canonical_facts: Vec::new(),
         };
-        let rejection = collect_actual_acquisition(
+        let capture = super::super::t1_frame_cleanup_tests::EventCapture::default();
+        let trace_events = std::sync::Arc::clone(&capture.0);
+        let rejection = tracing::subscriber::with_default(capture, || collect_actual_acquisition(
                 &store,
                 &program,
                 &primary,
@@ -9351,8 +9378,37 @@ mod tests {
                 },
                 &mut refused,
                 &mut windows,
-            )
+            ))
             .unwrap_err();
+        let trace = trace_events.lock().unwrap().join("\n");
+        assert!(trace.contains("incomplete_snapshot_not_published") && trace.contains("no_frame"));
+        assert!(!trace.contains("file://workspace/report.txt"));
+
+        // The same rejected acquisition with an original frame must remain
+        // an error; the frame, not a published snapshot, owns its cleanup.
+        let before_events = store.all_events(10_000).unwrap();
+        let frame = super::super::ProcessInputFrame::without_process_verifier();
+        let capture = super::super::t1_frame_cleanup_tests::EventCapture::default();
+        let frame_trace = std::sync::Arc::clone(&capture.0);
+        let mut with_frame = ActualInputSnapshot {
+            file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+        };
+        let mut frame_windows = std::collections::BTreeMap::new();
+        let frame_error = tracing::subscriber::with_default(capture, || collect_actual_acquisition(
+            &store, &program, &primary, &index,
+            Some(&serde_json::json!({"reference": "file://workspace/report.txt"})), &[], &boundary,
+            super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: Some(&frame) },
+            &mut with_frame, &mut frame_windows,
+        )).unwrap_err();
+        assert_eq!(frame_error.to_string(), rejection.to_string());
+        assert!(frame_error.review_ticket("t1-control", 1).is_none());
+        assert!(rejection.review_ticket("t1-control", 1).is_none());
+        assert!(with_frame.canonical_facts.is_empty() && frame_windows.is_empty());
+        assert_eq!(store.all_events(10_000).unwrap().len(), before_events.len(), "a refused local snapshot publishes no event");
+        let frame_trace = frame_trace.lock().unwrap().join("\n");
+        assert!(frame_trace.contains("incomplete_snapshot_not_published") && frame_trace.contains("owned_by_frame"));
+        assert!(!frame_trace.contains("file://workspace/report.txt"));
         // 034 GB-1 (batch 1 acceptance): the fragmented gate's original
         // wording stays verbatim inside the gate's envelope; the envelope adds
         // the code and what each proof strategy was missing.
@@ -9413,10 +9469,13 @@ mod tests {
         };
         let mut discovery_windows = std::collections::BTreeMap::new();
         let discovery_input = serde_json::json!({"pattern":"*.rs"});
+        crate::agentic::fact_admission::take_test_admissions();
         collect_actual_acquisition(&store, &program, &glob_primary, &glob_index,
             Some(&discovery_input), &[], &boundary,
             super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
             &mut discovery_actual, &mut discovery_windows).expect("original discovery is authenticated");
+        assert!(crate::agentic::fact_admission::take_test_admissions().iter().any(|strategy| strategy.code() == "discovery"),
+            "authenticated discovery must pass the admission gate");
         assert!(discovery_actual.canonical_facts.is_empty());
         assert_eq!(discovery_actual.material_events.len(), 2);
         assert!(discovery_windows.is_empty());
@@ -9766,6 +9825,7 @@ mod tests {
             "tool_use_id": "f24-consume-call",
             "tool_name": "task_review",
         });
+        crate::agentic::fact_admission::take_test_admissions();
         let settlement = super::required_write_settlement(
             &store,
             key,
@@ -9775,6 +9835,8 @@ mod tests {
             &mut std::collections::BTreeMap::new(),
         )
         .expect("the settlement decision");
+        assert!(crate::agentic::fact_admission::take_test_admissions().iter().any(|strategy| strategy.code() == "settled_refusal"),
+            "the authenticated refusal must pass the admission gate");
         assert!(
             matches!(settlement, super::RequiredWriteSettlement::Refused { .. }),
             "a required write that carries its own refusal twin is settled by it"
@@ -9846,6 +9908,47 @@ mod tests {
             plain.contains("the objective requirement was not met"),
             "the named failure carries the error text"
         );
+    }
+
+    #[test]
+    fn f24_a_settlement_unreadable_contradictory_and_missing_receipt_remain_distinct() {
+        let intent = serde_json::json!({"tool_use_id":"f24-control", "tool_name":"task_review"});
+        let receipt = serde_json::json!({"outcome":{"status":"failed", "error":"original failure"}});
+        let check = |store: &std::sync::Arc<RuntimeEventStore>, key: &str, supplied, failed| {
+            super::required_write_settlement(store, key, &intent, supplied, failed,
+                &mut std::collections::BTreeMap::new()).expect("original settlement decision")
+        };
+        let missing = std::sync::Arc::new(RuntimeEventStore::for_test());
+        crate::agentic::fact_admission::take_test_admissions();
+        assert!(matches!(check(&missing, "f24-missing-receipt", None, true),
+            super::RequiredWriteSettlement::MissingReceipt));
+        assert!(crate::agentic::fact_admission::take_test_admissions().is_empty());
+
+        let unreadable = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let foreign = "f24-foreign";
+        f24_write_refusal_twin(&unreadable, foreign, &format!("agentic-single:{foreign}"),
+            "different-owner", serde_json::Value::Null, serde_json::Value::Null);
+        crate::agentic::fact_admission::take_test_admissions();
+        match check(&unreadable, foreign, None, false) {
+            super::RequiredWriteSettlement::UnreadableRefusal { reason } =>
+                assert!(reason.contains("does not have the refusal shape")),
+            _ => panic!("foreign refusal twin must remain unreadable"),
+        }
+        assert!(crate::agentic::fact_admission::take_test_admissions().is_empty());
+
+        let contradictory = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let own = "f24-contradiction";
+        f24_write_refusal_twin(&contradictory, own, &format!("agentic-single:{own}"),
+            own, serde_json::Value::Null, serde_json::Value::Null);
+        crate::agentic::fact_admission::take_test_admissions();
+        match check(&contradictory, own, Some((&receipt, 42)), true) {
+            super::RequiredWriteSettlement::Contradiction { refusal_cursor, receipt_cursor } => {
+                assert!(refusal_cursor.is_some());
+                assert_eq!(receipt_cursor, Some(42));
+            }
+            _ => panic!("contradictory terminal facts must remain contradictory"),
+        }
+        assert!(crate::agentic::fact_admission::take_test_admissions().is_empty());
     }
 
     /// A node effect is not a call's terminal fact: it carries no outcome.
@@ -11355,7 +11458,7 @@ mod read_auth_boundary_tests {
                 &intent,
                 &mut BTreeMap::new()
             )
-            .unwrap_err(),
+            .unwrap_err().to_string(),
             "root effect does not authenticate its original Running owner/admission fence"
         );
         let mut wrong = reader.clone();
@@ -11366,7 +11469,7 @@ mod read_auth_boundary_tests {
                 &intent,
                 &mut BTreeMap::new()
             )
-            .unwrap_err(),
+            .unwrap_err().to_string(),
             "original root start graph content is invalid"
         );
         for op in ["revision", "key", "fence", "page", "body"] {
@@ -11378,7 +11481,7 @@ mod read_auth_boundary_tests {
                     &intent,
                     &mut BTreeMap::new()
                 )
-                .unwrap_err(),
+                .unwrap_err().to_string(),
                 format!("reader:{op}")
             );
             assert_eq!(wrong.calls.last(), Some(&op));
@@ -11391,7 +11494,7 @@ mod read_auth_boundary_tests {
                 &intent,
                 &mut BTreeMap::new()
             )
-            .unwrap_err(),
+            .unwrap_err().to_string(),
             "original root Running transition missing"
         );
     }
@@ -11465,7 +11568,7 @@ mod read_auth_boundary_tests {
                 &primary,
                 &mut BTreeMap::new()
             )
-            .unwrap_err(),
+            .unwrap_err().to_string(),
             "root receipt original real-node index missing"
         );
     }
@@ -11639,26 +11742,26 @@ mod read_auth_boundary_tests {
             r.payload["response"]["output"] = json!("wrong");
         }
         assert_eq!(
-            run(&mut wrong, &packet).err().unwrap(),
+            run(&mut wrong, &packet).err().unwrap().to_string(),
             "Process delivered body does not match its actual response"
         );
         let mut missing = reader.clone();
         missing.keys.remove(&("primary".into(), "read".into()));
         assert_eq!(
-            run(&mut missing, &packet).err().unwrap(),
+            run(&mut missing, &packet).err().unwrap().to_string(),
             "delivered read has no original primary receipt"
         );
         let mut changed = reader.clone();
         changed.moved = true;
         assert_eq!(
-            run(&mut changed, &packet).err().unwrap(),
+            run(&mut changed, &packet).err().unwrap().to_string(),
             "read delivery source moved during validation"
         );
         for op in ["key", "revision"] {
             let mut bad = reader.clone();
             bad.fault = Some(op);
             assert_eq!(
-                run(&mut bad, &packet).err().unwrap(),
+                run(&mut bad, &packet).err().unwrap().to_string(),
                 format!("reader:{op}")
             );
         }

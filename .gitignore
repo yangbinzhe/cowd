@@ -56,3 +56,7 @@ plan/
 /group_theory_c4_d4/
 /symmetry-group-eval/
 /gtai-eval/
+
+# python bytecode caches are not part of the candidate
+__pycache__/
+*.pyc

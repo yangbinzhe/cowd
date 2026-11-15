@@ -275,7 +275,10 @@ mod tests {
         ));
         let surface_b = host.lifecycle_lock_for("surface-b").await;
         assert!(!Arc::ptr_eq(&surface_a, &surface_b));
-        assert_eq!(host.lifecycle_locks.lock().await.len(), 2);
+        let locks = host.lifecycle_locks.lock().await;
+        assert_eq!(locks.keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["surface-a", "surface-b"]));
+        drop(locks);
 
         let surface_a_guard = surface_a.lock().await;
         {

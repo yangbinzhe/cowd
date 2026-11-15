@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use cowd_app_protocol::{
     app_tui_view_patch_schema_digest_v1, AppComponentKindV1, AppComponentV1, AppStreamFrameV1,
@@ -52,15 +52,24 @@ fn digest(text: &str) -> String {
 #[test]
 fn public_renderer_is_reachable_and_fixtures_cover_every_component_kind() {
     let document = fixture("complex");
-    let mut kinds = BTreeSet::new();
-    fn collect(component: &AppComponentV1, output: &mut BTreeSet<String>) {
-        output.insert(format!("{:?}", component.kind));
+    let mut kinds = Vec::new();
+    fn collect(component: &AppComponentV1, output: &mut Vec<AppComponentKindV1>) {
+        output.push(component.kind);
         for child in &component.children {
             collect(child, output);
         }
     }
     collect(&document.root, &mut kinds);
-    assert_eq!(kinds.len(), 18);
+    let expected = [
+        AppComponentKindV1::Stack, AppComponentKindV1::Split, AppComponentKindV1::Tabs,
+        AppComponentKindV1::Status, AppComponentKindV1::Metric, AppComponentKindV1::Table,
+        AppComponentKindV1::List, AppComponentKindV1::Tree, AppComponentKindV1::Graph,
+        AppComponentKindV1::Timeline, AppComponentKindV1::Markdown, AppComponentKindV1::Code,
+        AppComponentKindV1::Form, AppComponentKindV1::Progress, AppComponentKindV1::Detail,
+        AppComponentKindV1::Empty, AppComponentKindV1::Error, AppComponentKindV1::ActionBar,
+    ];
+    assert!(!kinds.is_empty());
+    assert!(expected.iter().all(|kind| kinds.contains(kind)));
 
     let output = render(fixture("reference"), 80, 24);
     assert!(output.contains("Protocol fixture is active"));

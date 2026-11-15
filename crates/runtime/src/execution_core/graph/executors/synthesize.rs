@@ -578,8 +578,141 @@ mod tests {
             crate::execution_core::graph::ExecutionEffectState::Completed(outcome)
                 if outcome.result.status == ExecutionNodeStatus::Cancelled)
             );
+            // Custody closure positive: once the original retirement receipt is
+            // durably committed, the callback disposition is the canonical Abort,
+            // so `complete_callback_observed_until` can release. The fence is
+            // unchanged: an unconfirmed original still projects Pending below.
+            assert_eq!(
+                services
+                    .commit_service()
+                    .binding_callback_disposition(&graph, node_id.as_str(), binding)
+                    .unwrap(),
+                CallbackDisposition::Abort
+            );
             services.shutdown_maintenance().await;
         }
+    }
+
+    struct PendingSynthesisBackend {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SynthesizeBackend for PendingSynthesisBackend {
+        async fn synthesize(
+            &self,
+            _ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, String> {
+            self.release.notified().await;
+            Err("terminal_presentation_cancelled".into())
+        }
+        async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), String> {
+            Ok(())
+        }
+        async fn after_abort(
+            &self,
+            _ticket: &NodeExecutionTicket,
+            _reason: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct PendingSynthesisResolver {
+        expected: NodeExecutionTicket,
+        backend: Arc<PendingSynthesisBackend>,
+    }
+
+    impl SynthesizeBackendResolver for PendingSynthesisResolver {
+        fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn SynthesizeBackend>> {
+            (ticket == &self.expected).then(|| self.backend.clone() as Arc<dyn SynthesizeBackend>)
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_synthesize_unconfirmed_original_still_refuses_release() {
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage, ExecutionNodeKind,
+        };
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let mut graph = ExecutionGraph::new("Unconfirmed synthesis custody");
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: "pending-session".into(),
+            turn_id: "pending-turn".into(),
+            root_task_id: "pending-task".into(),
+            task_id: "pending-task".into(),
+            generation: 1,
+        });
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Synthesize,
+            "synthesize",
+            "pending-original",
+        );
+        let expected = NodeExecutionTicket {
+            graph_id: graph.id.clone(),
+            node_id: node.id.clone(),
+            executor_kind: "synthesize".into(),
+            service_class: graph.service_class,
+            attempt: 1,
+            idempotency_key: node.idempotency_key.clone(),
+            payload_ref: node.payload_ref.clone(),
+        };
+        graph.nodes.push(node);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(PendingSynthesisBackend { release: release.clone() });
+        services.synthesize_executor().install_resolver(Arc::new(
+            PendingSynthesisResolver { expected: expected.clone(), backend },
+        ));
+        let graph_id = graph.id.clone();
+        let node_id = expected.node_id.clone();
+        let supervisor = Arc::clone(services.execution_supervisor());
+        let driver = tokio::spawn(async move {
+            supervisor
+                .submit_and_wait_terminal(graph, ExecutionGraphCommand::Start { expected_revision: 0 })
+                .await
+        });
+        let reached_pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = services.graph_state_store().load(&graph_id).unwrap();
+                if snapshot.node_statuses.get(&node_id) == Some(&ExecutionNodeStatus::Running) {
+                    let starts = services
+                        .graph_state_store()
+                        .binding_starts_page(&graph_id, 0, snapshot.revision)
+                        .unwrap()
+                        .1;
+                    if let Some((_, binding, _)) = starts.first() {
+                        if services
+                            .commit_service()
+                            .binding_callback_disposition(&snapshot, &node_id, binding)
+                            .unwrap()
+                            == CallbackDisposition::Pending
+                        {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(reached_pending.is_ok(), "original binding never reached started-but-unconfirmed Pending");
+        let snapshot = services.graph_state_store().load(&graph_id).unwrap();
+        let starts = services
+            .graph_state_store()
+            .binding_starts_page(&graph_id, 0, snapshot.revision)
+            .unwrap()
+            .1;
+        let (_, binding, _) = starts.first().unwrap();
+        assert_eq!(
+            services
+                .commit_service()
+                .binding_callback_disposition(&snapshot, &node_id, binding)
+                .unwrap(),
+            CallbackDisposition::Pending
+        );
+        release.notify_waiters();
+        driver.abort();
+        services.shutdown_maintenance().await;
     }
 
     #[async_trait::async_trait]

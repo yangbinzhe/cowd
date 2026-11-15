@@ -573,7 +573,8 @@ impl ExecutionCommitService {
                 attempt.execution_id == packet.graph_id()
                     && attempt.agent_id == scope.agent_id
                     && attempt.membership_id == scope.membership_id
-                    && task_control_phase_allows(task, scope, attempt, &request.tool_name, &request.input)
+                    && (task_control_phase_allows(task, scope, attempt, &request.tool_name, &request.input)
+                        || expired_task_claim_phase_allows(task, scope, packet.graph_id(), &request.tool_name, &request.input, now_ms))
             })
         {
             sources.push(ExpectedStreamRevision {
@@ -833,6 +834,23 @@ fn registered_collaboration_control_allows(
         }
         _ => false,
     }
+}
+
+fn expired_task_claim_phase_allows(
+    task: &crate::agentic::AgenticTaskProjection,
+    scope: &harness_contract::agent::AgenticExecutionBinding,
+    execution_id: &str,
+    tool_name: &str,
+    input: &str,
+    now_ms: u64,
+) -> bool {
+    tool_name == "task_claim"
+        && matches!(&scope.focus, AgenticExecutionFocus::TaskExecute { task_ref } if task_ref == &task.task_id)
+        && agent_control_input(input)
+            .and_then(|value| serde_json::from_value::<harness_contract::agent_action::TaskClaimInput>(value).ok())
+            .is_some_and(|claim| claim.task_ref == task.task_id)
+        && crate::agentic::work_market::expired_original_claim(
+            task, &scope.agent_id, execution_id, &scope.membership_id, now_ms)
 }
 
 fn task_control_phase_allows(
@@ -1145,6 +1163,38 @@ mod task_control_700_tests {
     }
 
     #[test]
+    fn expired_original_claim_recovery_keeps_the_owner_and_action_fences() {
+        let (mut task, scope, attempt) = fixture(false);
+        task.status = AgenticTaskStatus::Claimed;
+        task.claimant = Some("worker".into());
+        task.claim_execution_id = Some("execution".into());
+        task.claim_generation = 5;
+        task.lease_expires_at_ms = Some(100);
+        task.active_attempts.insert("execution".into(), attempt);
+        let allowed = |task: &AgenticTaskProjection, execution, tool, input, now| {
+            expired_task_claim_phase_allows(task, &scope, execution, tool, input, now)
+        };
+        let input = r#"{"task_ref":"task"}"#;
+        assert!(allowed(&task, "execution", "task_claim", input, 100));
+        assert!(!allowed(&task, "execution", "task_claim", input, 99));
+        assert!(!allowed(&task, "other", "task_claim", input, 100));
+        assert!(!allowed(&task, "execution", "task_submit", input, 100));
+        assert!(!allowed(&task, "execution", "task_claim", r#"{"task_ref":"other"}"#, 100));
+        let mut changed = task.clone();
+        changed.active_attempts.get_mut("execution").unwrap().membership_id = "other".into();
+        assert!(!allowed(&changed, "execution", "task_claim", input, 100));
+        changed = task.clone();
+        changed.claim_generation += 1;
+        assert!(!allowed(&changed, "execution", "task_claim", input, 100));
+        changed = task.clone();
+        changed.cancel_requested_by = Some("root".into());
+        assert!(!allowed(&changed, "execution", "task_claim", input, 100));
+        changed = task.clone();
+        changed.pending_retirement = Some(crate::agentic::AgenticTaskRetirement::Withdrawn);
+        assert!(!allowed(&changed, "execution", "task_claim", input, 100));
+    }
+
+    #[test]
     fn r1_700_preclaim_control_does_not_authorize_ordinary_writes_or_foreign_tasks() {
         let (mut task, scope, mut attempt) = fixture(false);
         let input = r#"{"task_ref":"task","reason":"ready"}"#;
@@ -1238,7 +1288,7 @@ mod task_control_700_tests {
 
     #[tokio::test]
     async fn r1_711_preclaim_and_review_collaboration_do_not_grant_ordinary_writes() {
-        let existing = crate::agentic::coordination::tests::fixture(false).await;
+        let existing = crate::agentic::coordination::tests::fixture_with_original_session().await;
         let mut program = existing.services.agent_action_service().project("coord-program").unwrap();
         for review in [false, true] {
             let (mut task, scope, attempt) = fixture(review);

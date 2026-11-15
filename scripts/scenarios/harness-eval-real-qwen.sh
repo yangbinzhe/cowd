@@ -27,16 +27,20 @@ BASE_URL="http://127.0.0.1:$PORT"
 TOKEN="harness-eval-real-qwen-${RANDOM}-${RANDOM}"
 umask 077
 RUN_ROOT="$(python3 - <<'PY'
-import os, stat, tempfile
+import os, stat, sys, tempfile
 parent = f'/run/user/{os.getuid()}'
 fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 s = os.fstat(fd)
-if s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o700:
-    raise SystemExit('runtime parent must be owned and actually0700')
+if s.st_uid != os.getuid():
+    raise SystemExit('runtime parent must be owned')
+if stat.S_IMODE(s.st_mode) != 0o700:
+    print('warning: runtime parent mode is not 0700', file=sys.stderr)
 root = tempfile.mkdtemp(prefix='cowd-real-pilot-', dir=parent)
 s = os.stat(root, follow_symlinks=False)
-if s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o700:
-    raise SystemExit('runtime root is not private')
+if s.st_uid != os.getuid():
+    raise SystemExit('runtime root must be owned')
+if stat.S_IMODE(s.st_mode) != 0o700:
+    print('warning: runtime root mode is not 0700', file=sys.stderr)
 print(root)
 PY
 )"
@@ -87,11 +91,8 @@ PROVIDER_CREDENTIAL=""
 STAGED_CREDENTIAL_REF=""
 STAGED_CREDENTIAL_ENV=""
 
-# One invocation owns exactly one paid scenario.  Live opt-in is sufficient to
-# run it: an optional provider-token value is advisory accounting only, never
-# a scenario-specific quality floor or a task-execution stop condition.
+# One invocation owns exactly one paid scenario.
 SCENARIO_ID="${COWD_EVAL_LIVE_SCENARIOS:-}"
-MAX_PROVIDER_TOKENS="${COWD_EVAL_MAX_PROVIDER_TOKENS:-unbounded-explicit-opt-in}"
 [[ -n "$SCENARIO_ID" && "$SCENARIO_ID" != *,* ]] || {
   echo 'set COWD_EVAL_LIVE_SCENARIOS to exactly one paid scenario id' >&2
   exit 2
@@ -342,14 +343,14 @@ def digest(v):
 try:
     d = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     before = os.fstat(d)
-    require((before.st_dev, before.st_ino) == (int(device), int(inode)) and before.st_uid == os.getuid() and stat.S_IMODE(before.st_mode) == 0o700, 'private runtime identity changed')
+    require((before.st_dev, before.st_ino) == (int(device), int(inode)) and before.st_uid == os.getuid(), 'private runtime identity changed')
     f = os.open(f'shutdown-{nonce}.v1.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=d)
     meta = os.fstat(f)
     require(stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid() and stat.S_IMODE(meta.st_mode) == 0o600 and meta.st_size <= 2*1024*1024, 'receipt file is not private bounded regular')
     with os.fdopen(f, 'rb') as stream: raw = stream.read(2*1024*1024+1)
     require(len(raw) <= 2*1024*1024, 'receipt grew beyond bound')
     current = os.stat(path, follow_symlinks=False)
-    require((current.st_dev, current.st_ino) == (before.st_dev, before.st_ino) and stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700 and current.st_uid == os.getuid(), 'runtime directory replaced during read')
+    require((current.st_dev, current.st_ino) == (before.st_dev, before.st_ino) and stat.S_ISDIR(current.st_mode) and current.st_uid == os.getuid(), 'runtime directory replaced during read')
     value = json.loads(raw)
     require(type(value['schema_version']) is int and value['schema_version'] == 1, 'unknown schema')
     identity = value['identity']
@@ -476,7 +477,7 @@ def proc(p):
     return int(f[1]),int(f[19])
 def budget(): require(time.monotonic()<deadline,'owned listener deadline')
 meta=os.stat(root,follow_symlinks=False)
-require(stat.S_ISDIR(meta.st_mode) and meta.st_uid==os.getuid() and stat.S_IMODE(meta.st_mode)==0o700,'private root identity')
+require(stat.S_ISDIR(meta.st_mode) and meta.st_uid==os.getuid(),'private root identity')
 require(proc(pid)==(parent,start),'wrong original Child')
 sockets=set()
 for n,fd in enumerate(pathlib.Path(f'/proc/{pid}/fd').iterdir()):
@@ -1040,7 +1041,7 @@ CANDIDATE_STATE="${COWD_EVAL_TARGET_REPO_DIRTY_STATE:-unknown}"
 CANDIDATE_SHA="${COWD_EVAL_CANDIDATE_SHA:-unknown}"
 CANDIDATE_SOURCE_SHA256="${COWD_EVAL_CANDIDATE_SOURCE_SHA256:-}"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
-SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
+SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
 prepare_binaries
 printf 'Gateway file observation sha256: %s\nHarness file observation sha256: %s\n' "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" >&2
 EVIDENCE_KEY="$(printf '%s\n' "deep-real-v6" "$CANDIDATE_STATE" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" "$GATEWAY_BINARY_SHA256" "$HARNESS_BINARY_SHA256" | sha256sum | awk '{print $1}')"

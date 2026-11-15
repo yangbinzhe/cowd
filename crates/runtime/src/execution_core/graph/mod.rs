@@ -71,3 +71,6 @@ pub use state_store::{graph_id_for_lookup, ExecutionGraphStateStore, ExecutionSt
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use commit_service::{TerminalAppendFailureClass, TerminalAppendFailureObservation};

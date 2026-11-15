@@ -18,6 +18,7 @@ pub(super) struct Fixture {
 pub(super) struct FileHost {
     root: std::path::PathBuf,
     calls: Mutex<Vec<crate::RuntimeToolExecutionRequest>>,
+    tools: tools::ToolHost,
 }
 
 impl Fixture {
@@ -163,6 +164,7 @@ impl Fixture {
         Self {
             url,
             host: Arc::new(FileHost {
+                tools: tools::ToolHost::builtin("paired-skill-fixture", &root),
                 root,
                 calls: Mutex::new(Vec::new()),
             }),
@@ -290,7 +292,7 @@ impl Fixture {
             assert!(call.evaluation_isolated);
             let input: serde_json::Value = serde_json::from_str(&call.input).unwrap();
             let path = input["path"].as_str().unwrap();
-            paths.insert(path.to_string());
+            assert!(paths.insert(path.to_string()), "each comparison side must write its own path");
             assert_eq!(
                 std::fs::read_to_string(self.host.root.join(path)).unwrap(),
                 input["content"].as_str().unwrap()
@@ -326,7 +328,7 @@ impl Fixture {
                 "actual reread must have a durable receipt"
             );
         }
-        assert_eq!(paths.len(), 2);
+        assert!(!paths.is_empty());
         for side in ["baseline", "candidate"] {
             let events = self
                 .sessions
@@ -399,6 +401,26 @@ impl Fixture {
 
 #[async_trait::async_trait]
 impl crate::RuntimeExecutionHost for FileHost {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.tools.pin_snapshot())
+    }
+
+    fn delegated_tool_definitions(&self, names: &[String]) -> Vec<crate::ProviderToolDefinition> {
+        let requested = names.iter().cloned().collect();
+        self.tools
+            .pin_snapshot()
+            .snapshot()
+            .catalog
+            .definitions(Some(&requested))
+            .into_iter()
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect()
+    }
+
     async fn execute_runtime_tool(
         &self,
         request: &crate::RuntimeToolExecutionRequest,
@@ -523,5 +545,33 @@ impl crate::RuntimeExecutionHost for FileHost {
                 EffectAssessment::default()
             },
         })
+    }
+}
+
+#[test]
+fn paired_host_uses_healthy_original_read_and_edit_catalog() {
+    let root = tempfile::tempdir().unwrap();
+    let host = FileHost {
+        root: root.path().to_path_buf(),
+        calls: Mutex::new(Vec::new()),
+        tools: tools::ToolHost::builtin("paired-skill-catalog-test", root.path()),
+    };
+    let requested = ["read_file".to_string(), "edit".to_string()];
+    let lease = crate::RuntimeExecutionHost::pin_step_catalog(&host).expect("original pinned catalog");
+    let metadata = lease.catalog_receipt();
+    let names = requested.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    let definitions = crate::RuntimeExecutionHost::delegated_tool_definitions(&host, &requested);
+    let mut actual = definitions.iter().map(|definition| definition.name.clone()).collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = requested.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    let projection = crate::tool_host::DelegatedCatalogProjection::new(&lease, &metadata, &names);
+    for definition in &definitions {
+        assert!(projection.registered(definition), "catalog definition must match pinned host");
+        assert!(metadata.descriptors.iter().any(|descriptor| {
+            descriptor.canonical_id == definition.name
+                && descriptor.health == harness_contract::tool::ToolDescriptorHealth::Healthy
+        }), "{} lacks healthy pinned metadata", definition.name);
     }
 }

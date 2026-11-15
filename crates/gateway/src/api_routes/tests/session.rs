@@ -1485,7 +1485,7 @@ async fn matrix_foundation_ingests_fact_and_builds_evidence_packet() {
     assert_eq!(hot.status(), StatusCode::OK);
     let body = to_bytes(hot.into_body(), usize::MAX).await.unwrap();
     let hot_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(hot_json["items"].as_array().unwrap().len(), 1);
+    assert!(matches!(hot_json["items"].as_array().unwrap().as_slice(), [item] if item["attention_id"] == attention_id));
 
     let evidence = app
         .clone()
@@ -1917,7 +1917,7 @@ async fn matrix_fact_and_evidence_append_execution_summaries_to_runtime_timeline
         .iter()
         .filter(|event| event["kind"] == "application.execution_summary")
         .collect::<Vec<_>>();
-    assert_eq!(outcome_events.len(), 2);
+    assert!(matches!(outcome_events.as_slice(), [first, second] if first["kind"] == "application.execution_summary" && second["kind"] == "application.execution_summary"));
     assert!(outcome_events.iter().any(|event| {
         event["refs"].as_array().is_some_and(|refs| {
             refs.iter().any(|reference| {
@@ -2024,7 +2024,7 @@ async fn matrix_metric_recompute_projects_changes_and_attention() {
     assert_eq!(changes.status(), StatusCode::OK);
     let body = to_bytes(changes.into_body(), usize::MAX).await.unwrap();
     let changes_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(changes_json["changes"].as_array().unwrap().len(), 1);
+    assert!(matches!(changes_json["changes"].as_array().unwrap().as_slice(), [change] if change["metric_id"] == "plan_bom_delta"));
 
     let hot = app
         .oneshot(
@@ -2099,7 +2099,7 @@ async fn task_execution_graph_is_runtime_owned_and_surface_read_only() {
     let body = to_bytes(runs.into_body(), usize::MAX).await.unwrap();
     let runs_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(runs_json["kind"], "execution_graphs");
-    assert_eq!(runs_json["graphs"].as_array().unwrap().len(), 0);
+    assert!(runs_json["graphs"].as_array().unwrap().is_empty());
 
     let upsert = app
             .clone()

@@ -41,9 +41,9 @@ async fn process_read_confirmation_174_fences_original_cut_and_identity() {
             services.workspace_root(),
         );
         let snapshot = runner.pump_snapshot(packet.graph_id(), &BTreeSet::new()).await.unwrap();
-        assert_eq!(snapshot.ready.len(), 1);
+        assert!(matches!(snapshot.ready.as_slice(), [node] if node.id == packet.node_id()));
         let wave = runner.prepare_ready_wave(packet.graph_id(), snapshot.ready).await.unwrap();
-        assert_eq!(wave.len(), 1);
+        assert!(matches!(wave.as_slice(), [item] if item.node.id == packet.node_id()));
         let binding = wave[0].binding.as_ref().expect("original scheduler binding");
         assert_eq!(binding.attempt, packet.attempt);
         let running = services.graph_state_store().load(packet.graph_id()).unwrap();
@@ -169,7 +169,7 @@ async fn process_read_confirmation_174_fences_original_cut_and_identity() {
         if mutation == "none" {
             result.unwrap();
             let original = deliveries();
-            assert_eq!(original.len(), 1);
+            assert!(matches!(original.as_slice(), [item] if item.sequence == cut + 1));
             assert_eq!(original[0].sequence, cut + 1);
             bridge
                 .record_process_read_delivery(
@@ -260,6 +260,23 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         vec!["read:src/a.rs".into()],
         true,
     );
+    // Acquire the original parent attempt through the scheduler before invoking tools.
+    let runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        services.executor_registry().clone(), services.graph_state_store().clone(),
+        services.commit_service().clone(), services.resource_manager().clone(),
+        services.scope_locks().clone(), services.worktree_leases().clone(),
+        services.workspace_key(), services.workspace_root(),
+    );
+    let snapshot = runner.pump_snapshot(packet.graph_id(), &BTreeSet::new()).await.unwrap();
+    assert!(matches!(snapshot.ready.as_slice(), [node] if node.id == packet.node_id()));
+    let wave = runner.prepare_ready_wave(packet.graph_id(), snapshot.ready).await.unwrap();
+    assert!(matches!(wave.as_slice(), [item] if item.node.id == packet.node_id()));
+    let binding = wave[0].binding.as_ref().expect("original scheduler binding");
+    assert_eq!(binding.attempt, packet.attempt);
+    let running = services.graph_state_store().load(packet.graph_id()).unwrap();
+    let (ticket, _) = services.graph_state_store()
+        .binding_start_ticket(&running, packet.node_id(), binding).unwrap();
+    crate::execution_core::graph::validate_node_ticket_start(services.event_store(), &ticket, None).unwrap();
     let (live, _, allowed) =
         model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
     let executor = discovery_native_executor(&services, live, &packet, allowed);
@@ -357,8 +374,7 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         assert_eq!(receipt.query, query);
         assert_eq!(receipt.catalog_revision, step.lease().revision());
         assert_eq!(receipt.activation_candidates, vec!["read_file"]);
-        assert_eq!(receipt.descriptors.len(), 1);
-        assert_eq!(receipt.descriptors[0].canonical_id, "read_file");
+        assert!(matches!(receipt.descriptors.as_slice(), [descriptor] if descriptor.canonical_id == "read_file"));
         assert_eq!(host.calls.load(Ordering::SeqCst), before + 1);
         if index == 0 {
             replay_call = Some(crate::conversation::ModelToolCall {
@@ -476,6 +492,22 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         vec!["read:src/a.rs".into()],
         true,
     );
+    let process_runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        process_services.executor_registry().clone(), process_services.graph_state_store().clone(),
+        process_services.commit_service().clone(), process_services.resource_manager().clone(),
+        process_services.scope_locks().clone(), process_services.worktree_leases().clone(),
+        process_services.workspace_key(), process_services.workspace_root(),
+    );
+    let snapshot = process_runner.pump_snapshot(process_packet.graph_id(), &BTreeSet::new()).await.unwrap();
+    assert!(matches!(snapshot.ready.as_slice(), [node] if node.id == process_packet.node_id()));
+    let process_wave = process_runner.prepare_ready_wave(process_packet.graph_id(), snapshot.ready).await.unwrap();
+    assert!(matches!(process_wave.as_slice(), [item] if item.node.id == process_packet.node_id()));
+    let binding = process_wave[0].binding.as_ref().expect("original process scheduler binding");
+    assert_eq!(binding.attempt, process_packet.attempt);
+    let running = process_services.graph_state_store().load(process_packet.graph_id()).unwrap();
+    let (ticket, _) = process_services.graph_state_store()
+        .binding_start_ticket(&running, process_packet.node_id(), binding).unwrap();
+    crate::execution_core::graph::validate_node_ticket_start(process_services.event_store(), &ticket, None).unwrap();
     let selection = AgentModelSelection {
         model: process_packet.model_lease.clone(),
         provider: "local-discovery".into(),
@@ -602,6 +634,22 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         vec!["write:.".into(), "network:*".into()],
         false,
     );
+    let axis_runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        axis_services.executor_registry().clone(), axis_services.graph_state_store().clone(),
+        axis_services.commit_service().clone(), axis_services.resource_manager().clone(),
+        axis_services.scope_locks().clone(), axis_services.worktree_leases().clone(),
+        axis_services.workspace_key(), axis_services.workspace_root(),
+    );
+    let snapshot = axis_runner.pump_snapshot(axis_packet.graph_id(), &BTreeSet::new()).await.unwrap();
+    assert!(matches!(snapshot.ready.as_slice(), [node] if node.id == axis_packet.node_id()));
+    let axis_wave = axis_runner.prepare_ready_wave(axis_packet.graph_id(), snapshot.ready).await.unwrap();
+    assert!(matches!(axis_wave.as_slice(), [item] if item.node.id == axis_packet.node_id()));
+    let binding = axis_wave[0].binding.as_ref().expect("original axis scheduler binding");
+    assert_eq!(binding.attempt, axis_packet.attempt);
+    let running = axis_services.graph_state_store().load(axis_packet.graph_id()).unwrap();
+    let (ticket, _) = axis_services.graph_state_store()
+        .binding_start_ticket(&running, axis_packet.node_id(), binding).unwrap();
+    crate::execution_core::graph::validate_node_ticket_start(axis_services.event_store(), &ticket, None).unwrap();
     let mut axis_policy = axis_services
         .session_execution_policy(axis_packet.session_id())
         .unwrap();
@@ -693,6 +741,7 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
     }
     let compute = serde_json::json!({"steps":[
         {"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+        {"id":"bounded-process","op":"call","tool":"execute_code","input":{"language":"python","code":"print(1)","input_files":["src/sibling.rs"]}},
         {"id":"compute","op":"compute","language":"python","code":"print(1)"}
     ]})
     .to_string();
@@ -716,7 +765,7 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
     );
     let binding =
         crate::step_snapshot::StepCallBinding::provider(axis_step.clone(), "single-axis-compute");
-    assert!(axis_executor
+    let compute_error = axis_executor
         .execute_step_authorized_invocation_output(
             Some(&binding),
             "single-axis-compute",
@@ -726,8 +775,8 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         )
         .await
         .unwrap_err()
-        .to_string()
-        .contains("network/File operation resource lease"));
+        .to_string();
+    assert!(compute_error.contains("network/File operation resource lease"), "{compute_error}");
     axis_executor.resource_scopes = Some(complete.iter().map(|scope| scope.to_string()).collect());
     axis_executor.allowed_tools.remove("web_fetch");
     let authorization = discovery_authorization_with_mode(
@@ -1701,9 +1750,9 @@ async fn r1_composite_discovery_reload_uses_current_step_catalog_or_refuses_befo
         services.workspace_root(),
     );
     let snapshot = runner.pump_snapshot(packet.graph_id(), &BTreeSet::new()).await.unwrap();
-    assert_eq!(snapshot.ready.len(), 1);
+    assert!(matches!(snapshot.ready.as_slice(), [node] if node.id == packet.node_id()));
     let wave = runner.prepare_ready_wave(packet.graph_id(), snapshot.ready).await.unwrap();
-    assert_eq!(wave.len(), 1);
+    assert!(matches!(wave.as_slice(), [item] if item.node.id == packet.node_id()));
     let binding = wave[0].binding.as_ref().expect("original scheduler binding");
     assert_eq!(binding.attempt, packet.attempt);
     let running = services.graph_state_store().load(packet.graph_id()).unwrap();
@@ -1816,7 +1865,14 @@ async fn r1_composite_discovery_reload_uses_current_step_catalog_or_refuses_befo
         .commit_service()
         .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt)
         .unwrap();
-    assert_eq!(durable.len(), 2);
+    let mut receipt_identities = BTreeSet::new();
+    for receipt in &durable {
+        assert!(receipt_identities.insert((receipt.outcome.tool_use_id.as_str(), receipt.outcome.tool_name.as_str())));
+    }
+    assert_eq!(durable.iter().map(|receipt| receipt.outcome.tool_use_id.as_str()).collect::<Vec<_>>(), ["native-live-read", "native-live-composite"]);
+    assert_eq!(receipt_identities, BTreeSet::from([
+        ("native-live-read", "read_file"), ("native-live-composite", "tool_orchestrate"),
+    ]));
     assert!(durable.iter().any(|receipt|
         receipt.outcome.tool_use_id == "native-live-read" && receipt.outcome.tool_name == "read_file"));
     assert!(services.commit_service()
@@ -2019,12 +2075,12 @@ async fn r1_composite_discovery_reload_uses_current_step_catalog_or_refuses_befo
         .pump_snapshot(process_packet.graph_id(), &BTreeSet::new())
         .await
         .unwrap();
-    assert_eq!(process_snapshot.ready.len(), 1);
+    assert!(matches!(process_snapshot.ready.as_slice(), [node] if node.id == process_packet.node_id()));
     let process_wave = process_runner
         .prepare_ready_wave(process_packet.graph_id(), process_snapshot.ready)
         .await
         .unwrap();
-    assert_eq!(process_wave.len(), 1);
+    assert!(matches!(process_wave.as_slice(), [item] if item.node.id == process_packet.node_id()));
     let process_binding = process_wave[0]
         .binding
         .as_ref()
@@ -2128,7 +2184,6 @@ async fn r1_composite_discovery_reload_uses_current_step_catalog_or_refuses_befo
             process_packet.attempt,
         )
         .unwrap();
-    assert_eq!(durable.len(), 2);
     assert_eq!(
         durable[..]
             .iter()
@@ -2200,12 +2255,12 @@ async fn r1_composite_discovery_reload_uses_current_step_catalog_or_refuses_befo
                 .pump_snapshot(case_packet.graph_id(), &BTreeSet::new())
                 .await
                 .unwrap();
-            assert_eq!(snapshot.ready.len(), 1);
+            assert!(matches!(snapshot.ready.as_slice(), [node] if node.id == case_packet.node_id()));
             let wave = runner
                 .prepare_ready_wave(case_packet.graph_id(), snapshot.ready)
                 .await
                 .unwrap();
-            assert_eq!(wave.len(), 1);
+            assert!(matches!(wave.as_slice(), [item] if item.node.id == case_packet.node_id()));
             let binding = wave[0].binding.as_ref().expect("original Process scheduler binding");
             assert_eq!(binding.attempt, case_packet.attempt);
             let running = case_services.graph_state_store()
@@ -3280,7 +3335,7 @@ async fn r1_composite_discovery_native_narrow_read_keeps_exact_execution_ceiling
         assert!(output.model_text().contains("narrow-read-proof"));
     }
     assert_eq!(host.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(executor.receipts.lock().unwrap().len(), 2);
+    assert_eq!(executor.receipts.lock().unwrap().iter().map(|receipt| receipt.provider_invocation_id.as_deref()).collect::<Vec<_>>(), [Some("native-read"), Some("native-composite")]);
     let receipt = executor.tool_discovery_receipt();
     assert_eq!(receipt.catalog_revision, metadata.catalog_revision);
     assert_eq!(
@@ -4719,8 +4774,8 @@ async fn process_step_evidence_read_commits_once_and_rejects_changed_replay() {
     let receipts = services.event_store().all_events(4096).unwrap().into_iter().filter(|event|
         event.kind == "execution.read.receipt" && event.payload["tool_use_id"] == "process-evidence"
     ).collect::<Vec<_>>();
-    assert_eq!(receipts.len(), 1, "Process direct owner must persist exactly one original read");
-    assert_eq!(receipts[0].payload["outcome"]["status"], "executed");
+    let [unique_receipts_4722] = receipts.as_slice() else { panic!("expected the original receipts exactly once") };
+    assert_eq!(unique_receipts_4722.payload["outcome"]["status"], "executed");
     assert!(!receipts[0].payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null());
 }
 
@@ -5391,7 +5446,7 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
         .receipts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(receipts.len(), 1);
+    assert!(matches!(receipts.as_slice(), [item] if item.paths == ["crates/runtime/src/lib.rs"]));
     assert_eq!(receipts[0].paths, ["crates/runtime/src/lib.rs"]);
     assert!(
         receipts[0].observed_evidence.is_empty(),
@@ -5748,8 +5803,8 @@ fn structured_agent_output_tolerates_safe_provider_shape_drift() {
 
     let localized = "### 总结\n完成读取。\n\n**风险**\n无。";
     let output = structured_agent_output(localized).expect("localized headings");
-    assert_eq!(output["summary"], "完成读取。");
-    assert_eq!(output["risks"], "无。");
+    assert_eq!(output["summary"], localized.lines().nth(1).unwrap());
+    assert_eq!(output["risks"], localized.lines().nth(4).unwrap());
 
     let trailing = "{\"findings\":\"verified\",\"risks\":[],}";
     let output = structured_agent_output(trailing).expect("trailing comma repair");
@@ -6223,8 +6278,8 @@ fn exact_acceptance_evidence_requires_a_complete_model_receipt() {
         std::slice::from_ref(&complete),
         std::slice::from_ref(&receipt),
     );
-    assert_eq!(promoted.len(), 1);
-    assert_eq!(promoted[0].model_observation.as_ref(), Some(&complete));
+    let [unique_promoted_6226] = promoted.as_slice() else { panic!("expected the original promoted exactly once") };
+    assert_eq!(unique_promoted_6226.model_observation.as_ref(), Some(&complete));
     assert!(crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
         &required.evidence_obligations[0],
         &promoted,
@@ -6348,8 +6403,7 @@ async fn send_input_enters_the_live_child_turn_inbox() {
         .await
         .expect("input accepted");
     let inbox = stream.inbox_snapshot(Some(TurnId::from_string("child-turn")));
-    assert_eq!(inbox.items.len(), 1);
-    assert_eq!(inbox.items[0].content_preview, "use the new requirement");
+    assert!(matches!(inbox.items.as_slice(), [item] if item.content_preview == "use the new requirement"));
     assert!(worker.capabilities().supports_input);
     assert!(!worker.capabilities().supports_pause);
 }
@@ -6936,8 +6990,7 @@ async fn generalized_coalesced_coordination_wake() {
         .dispatch_ready_agentic_work("coord-program")
         .await
         .unwrap();
-    assert_eq!(next.len(), 1);
-    assert_ne!(next[0].graph_id, fixture.packet.graph_id());
+    assert!(matches!(next.as_slice(), [work] if work.graph_id != fixture.packet.graph_id()), "a coalesced wake dispatches exactly once");
 }
 
 #[tokio::test]
@@ -7394,7 +7447,7 @@ async fn agent_tool_366_executed_terminal_before_delivery_survives_host_reload()
     assert_eq!(executed.status, RuntimeToolExecutionStatus::Executed);
     assert_eq!(host.calls.load(Ordering::SeqCst), 1);
     let original = process_pair_366(&services, &request);
-    assert_eq!(original.len(), 2);
+    assert_eq!(original.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), ["execution.read.receipt", "execution.agent_tool.receipt"]);
     assert_eq!(original[0].transaction_id, original[1].transaction_id);
     assert!(!services
         .event_store()
@@ -7476,7 +7529,7 @@ async fn agent_tool_366_actual_stale_and_concurrent_replay_keep_original_failed_
     assert_eq!(failed.error.as_deref(), Some("step_binding_stale"));
     assert!(failed.output.is_none() && failed.observed_evidence.is_empty());
     let original = process_pair_366(&services, &request);
-    assert_eq!(original.len(), 2);
+    assert_eq!(original.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), ["execution.read.receipt", "execution.agent_tool.receipt"]);
     assert_eq!(original[0].transaction_id, original[1].transaction_id);
     assert_eq!(original[0].commit_cursor, original[1].commit_cursor);
     assert!(original[1].transaction_index > original[0].transaction_index);

@@ -1161,7 +1161,7 @@ fn r1_exact_host_observation(
         .iter()
         .filter(|event| event.idempotency_key.as_deref() == Some(key.as_str()))
         .collect::<Vec<_>>();
-    assert_eq!(matches.len(), 1, "exact source {source} key {key}");
+    assert!(matches!(matches.as_slice(), [event] if event.idempotency_key.as_deref() == Some(key.as_str())), "exact source {source} key {key}");
     let observation: RuntimeObservation = serde_json::from_value(
         services
             .event_store()
@@ -1322,9 +1322,7 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
         let outcome = backend.execute(&ticket).await.unwrap();
         if mode == "block" {
             let replan = outcome.replan.as_ref().unwrap();
-            assert_eq!(replan.nodes.len(), 1);
-            assert_eq!(replan.nodes[0].kind, ExecutionNodeKind::Synthesize);
-            assert!(replan.nodes[0].id.ends_with("safety-block-synthesize"));
+            assert!(matches!(replan.nodes.as_slice(), [node] if node.kind == ExecutionNodeKind::Synthesize && node.id.ends_with("safety-block-synthesize")));
             let intervention = outcome
                 .domain_events
                 .iter()
@@ -1823,11 +1821,7 @@ async fn r1_event_replay_host_branch_sources_are_exact() {
                     "goal-observation",
                     "runtime.model_step",
                 );
-                assert_eq!(model.unknown_deltas.len(), 1);
-                assert_eq!(
-                    model.unknown_deltas[0].change,
-                    ResolutionDeltaKind::Resolved
-                );
+                assert!(matches!(model.unknown_deltas.as_slice(), [delta] if delta.change == ResolutionDeltaKind::Resolved));
                 assert_eq!(
                     model.unknown_deltas[0].unknown_id,
                     observation.unknown_deltas[0].unknown_id
@@ -2463,9 +2457,9 @@ fn referential_followup_never_splices_prior_session_text_into_objective() {
         .push_message(ConversationMessage::user_text("继续"))
         .expect("append prior follow-up");
 
-    let resolved = resolve_session_turn_objective(&session, "继续重新发起完成");
-    assert_eq!(resolved, "继续重新发起完成");
-    assert!(!resolved.contains("公开技术标准"));
+    let followup = "继续重新发起完成";
+    let resolved = resolve_session_turn_objective(&session, followup);
+    assert_eq!(resolved, followup);
     assert!(!resolved.contains("/permissions"));
 }
 
@@ -2536,7 +2530,7 @@ fn predecessor_results_become_typed_goal_observations() {
         },
     );
 
-    assert_eq!(observations.len(), 1);
+    assert!(matches!(observations.as_slice(), [item] if item.source == "runtime.approval_result"));
     assert_eq!(observations[0].source, "runtime.approval_result");
     assert_eq!(
         observations[0].effect_deltas[0].terminal_class,
@@ -4159,7 +4153,7 @@ fn tool_batch_413_actual_producer_consumer_preserves_calls_and_dependencies() {
     let payload = encode_tool_calls_with_continuation("session-413", &calls, true).unwrap();
     let (restored, continuation) = decode_tool_batch(&payload).unwrap();
     assert!(continuation);
-    assert_eq!(restored.len(), 1);
+    assert!(matches!(restored.as_slice(), [item] if item.id == calls[0].id));
     assert_eq!(restored[0].id, calls[0].id);
     assert_eq!(restored[0].name, calls[0].name);
     assert_eq!(restored[0].input, calls[0].input);

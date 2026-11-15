@@ -83,7 +83,12 @@ fn paired_definition_workload_executes_contract_samples_and_returns_runtime_owne
     assert!(report.is_eligible());
     assert_eq!(report.dimensions[0].sample_count, 10);
     assert!(report.dimensions[0].candidate > report.dimensions[0].baseline);
+    assert_eq!(report.source_run_refs.iter().collect::<std::collections::BTreeSet<_>>().len(), 20);
     assert_eq!(report.source_run_refs.len(), 20);
+    let mut evidence_ref_ids = std::collections::HashSet::new();
+    assert!(report.evidence_refs.iter().all(|reference| evidence_ref_ids.insert(reference.id.clone())),
+        "each evidence reference is distinct");
+    assert_eq!(evidence_ref_ids.len(), 20);
     assert_eq!(report.evidence_refs.len(), 20);
 
     fs::remove_dir_all(root).expect("cleanup scenario root");

@@ -368,7 +368,7 @@
         request.observation_wave_sequence = 11;
 
         let facts = gateway_observed_evidence(&executor, &request, &output, "actual-patch-receipt");
-        assert_eq!(facts.len(), 1);
+        assert!(matches!(facts.as_slice(), [fact] if fact.observed_at_sequence == 11));
         assert_eq!(
             facts[0].workspace_prior_state,
             Some(harness_contract::context::WorkspacePriorState::Existing {
@@ -408,7 +408,7 @@
             "error": null
         });
         let facts = gateway_observed_evidence(&executor, &request, &output.to_string(), "notebook");
-        assert_eq!(facts.len(), 1);
+        assert!(matches!(facts.as_slice(), [fact] if fact.observed_at_sequence == 5));
         let expected = format!("{:x}", Sha256::digest(content.as_bytes()));
         assert!(matches!(
             &facts[0].target,

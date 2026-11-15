@@ -46,6 +46,24 @@ pub(super) enum CallbackDisposition {
     Abort,
 }
 
+#[cfg(test)]
+mod original_rejection_feedback_tests {
+    use super::ExecutionCommitService;
+
+    #[test]
+    fn rejected_member_feedback_leads_with_actionable_reason_and_keeps_observation() {
+        let observation: harness_contract::agent_action::AgentActionObservation = serde_json::from_value(serde_json::json!({
+            "receipt_id": "r".repeat(700), "action_id": "action", "action": "agent_invite", "program_id": "program",
+            "revision": 4, "status": "rejected", "changed_refs": [], "actionable": [],
+            "error": {"code": "unknown_existing_agent_ref", "message": "omit existing_agent_ref for a new agent", "recoverable": true}
+        })).unwrap();
+        let feedback = ExecutionCommitService::original_rejection_message(0, &observation).unwrap();
+        assert!(feedback.find("unknown_existing_agent_ref").unwrap() < 400);
+        assert!(feedback.find("omit existing_agent_ref").unwrap() < 400);
+        assert!(feedback.contains(&serde_json::to_string(&observation).unwrap()));
+    }
+}
+
 
 impl CallbackDisposition {
     pub(super) fn from_result(node_id: &str, result: &ExecutionNodeResult) -> Self {
@@ -570,28 +588,34 @@ fn host_transcript_reference(
 }
 
 fn validate_host_transcript_document(document: &HostTranscriptPublication) -> Result<(), String> {
-    if document.schema_version != 1
-        || document.ticket.attempt == 0
-        || !matches!(
-            document.ticket.executor_kind.as_str(),
-            "inline_model" | "tool_batch" | "synthesize"
-        )
-        || document.session_id.is_empty()
-        || document.turn_id.is_empty()
-        || document.prefix_count > 16384
-        || document.messages.len() > 256
-        || document.prefix_sha256.len() != 71
-        || !document.prefix_sha256.starts_with("sha256:")
-        || !document.prefix_sha256[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || serde_json::to_vec(document)
-            .map_err(|error| error.to_string())?
-            .len()
-            > HOST_TRANSCRIPT_MAX_BYTES
-    {
-        return Err("Host transcript document identity/size invalid".into());
+    validate_host_transcript_document_inner(document, true)
+}
+
+fn validate_host_transcript_document_inner(document: &HostTranscriptPublication, enforce_stored_size: bool) -> Result<(), String> {
+    const ORIGINAL: &str = "Host transcript document identity/size invalid";
+    macro_rules! reject_if {
+        ($condition:expr, $predicate:literal, $actual:expr) => {
+            if $condition {
+                return Err(harness_contract::refusal_codes::RefusalEnvelope::for_predicate(
+                    ORIGINAL, $predicate, $actual.to_string(),
+                ).to_string());
+            }
+        };
     }
+    reject_if!(document.schema_version != 1, "schema_version", document.schema_version);
+    reject_if!(document.ticket.attempt == 0, "ticket_attempt", document.ticket.attempt);
+    reject_if!(!matches!(document.ticket.executor_kind.as_str(),
+        "inline_model" | "tool_batch" | "synthesize"), "executor_kind", document.ticket.executor_kind);
+    reject_if!(document.session_id.is_empty(), "session_id_empty", true);
+    reject_if!(document.turn_id.is_empty(), "turn_id_empty", true);
+    reject_if!(document.prefix_count > 16384, "prefix_count", document.prefix_count);
+    reject_if!(document.messages.len() > 256, "messages_len", document.messages.len());
+    reject_if!(document.prefix_sha256.len() != 71, "prefix_sha256_len", document.prefix_sha256.len());
+    reject_if!(!document.prefix_sha256.starts_with("sha256:"), "prefix_sha256_marker", false);
+    reject_if!(!document.prefix_sha256[7..].bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()), "prefix_sha256_hex", false);
+    let bytes = serde_json::to_vec(document).map_err(|error| error.to_string())?.len();
+    reject_if!(enforce_stored_size && bytes > HOST_TRANSCRIPT_MAX_BYTES, "serialized_bytes", bytes);
     if document.ticket.executor_kind == "synthesize" {
         if document.root_control_team_count.is_some() {
             return Err("Synthesize transcript cannot carry root-control obligation".into());
@@ -651,6 +675,107 @@ fn validate_host_transcript_document(document: &HostTranscriptPublication) -> Re
         }
     }
     Ok(())
+}
+
+// These are the content-bearing string fields of the typed message blocks.
+// Identifiers and signatures remain inline and are never treated as bodies.
+fn host_transcript_body_slot(block: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
+    let (kind, field) = if block.get("ToolResult").is_some() { ("ToolResult", "output") }
+        else if block.get("Text").is_some() { ("Text", "text") }
+        else if block.get("ReasoningSummary").is_some() { ("ReasoningSummary", "text") }
+        else if block.get("Thinking").is_some() { ("Thinking", "thinking") }
+        else if block.get("Image").is_some() { ("Image", "data") }
+        else if block.get("ToolUse").is_some() { ("ToolUse", "input") }
+        else { return None; };
+    block.get_mut(kind)?.get_mut(field)
+}
+
+fn hydrate_host_transcript_document(
+    store: &RuntimeEventStore,
+    payload: &serde_json::Value,
+    origin: &crate::PreparedArtifactOrigin,
+    mut document: HostTranscriptPublication,
+) -> Result<HostTranscriptPublication, String> {
+    let session = document.session_id.clone();
+    let references = RuntimeEventStore::host_transcript_attachment_refs(payload, &session)?;
+    let Some(entries) = payload.get("attachments").and_then(|v| v.as_array()) else {
+        return Ok(document);
+    };
+    for (entry, artifact) in entries.iter().zip(references) {
+        let message = entry["message_index"].as_u64().ok_or("attachment message index")? as usize;
+        let block = entry["block_index"].as_u64().ok_or("attachment block index")? as usize;
+        let output = document.messages.get_mut(message)
+            .and_then(|value| value.get_mut("blocks"))
+            .and_then(|value| value.as_array_mut())
+            .and_then(|blocks| blocks.get_mut(block))
+            .and_then(host_transcript_body_slot)
+            .ok_or("Host transcript attachment location mismatch")?;
+        if output.as_str() != Some(format!("cowd:host-transcript-body:{}", artifact.sha256).as_str()) {
+            return Err("Host transcript attachment placeholder mismatch".into());
+        }
+        let envelope = json!({"content_schema":2, "sha256":artifact.sha256, "bytes":artifact.bytes,
+            "body":{"kind":"artifact_ref", "artifact":artifact}});
+        let restored = store.resolve_content(&format!("session:{session}"), &envelope, origin)?;
+        if !restored.is_string() { return Err("Host transcript attachment body invalid".into()); }
+        *output = restored;
+    }
+    validate_host_transcript_document_inner(&document, false)?;
+    Ok(document)
+}
+
+#[cfg(test)]
+mod transcript_refusal_predicate_tests {
+    use super::*;
+
+    fn document() -> HostTranscriptPublication {
+        HostTranscriptPublication {
+            schema_version: 1,
+            ticket: super::super::registry::NodeExecutionTicket {
+                graph_id: "graph".into(), node_id: "node".into(), executor_kind: "tool_batch".into(),
+                service_class: Default::default(), attempt: 1,
+                idempotency_key: "ticket".into(), payload_ref: "payload".into(),
+            },
+            session_id: "session".into(), turn_id: "turn".into(), prefix_count: 0,
+            prefix_sha256: format!("sha256:{}", "0".repeat(64)), messages: vec![],
+            root_control_team_count: None, terminal_completion: None,
+        }
+    }
+
+    #[test]
+    fn transcript_refusal_preserves_original_and_reports_first_actual_predicate() {
+        let mut d = document();
+        assert!(validate_host_transcript_document(&d).is_ok());
+        d.schema_version = 2;
+        d.ticket.attempt = 0;
+        let error = validate_host_transcript_document(&d).unwrap_err();
+        assert_eq!(error, "Host transcript document identity/size invalid; first_failed_predicate=schema_version actual=2");
+        d.schema_version = 1;
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=ticket_attempt actual=0"));
+        d.ticket.attempt = 1;
+        d.ticket.executor_kind = "foreign".into();
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=executor_kind actual=foreign"));
+        d.ticket.executor_kind = "tool_batch".into();
+        d.session_id.clear();
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=session_id_empty actual=true"));
+        d.session_id = "session".into();
+        d.turn_id.clear();
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=turn_id_empty actual=true"));
+        d.turn_id = "turn".into();
+        d.prefix_count = 16385;
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=prefix_count actual=16385"));
+        d.prefix_count = 0;
+        d.prefix_sha256 = "short".into();
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=prefix_sha256_len actual=5"));
+        d.prefix_sha256 = format!("broken:{}", "0".repeat(64));
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=prefix_sha256_marker actual=false"));
+        d.prefix_sha256 = format!("sha256:{}", "A".repeat(64));
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=prefix_sha256_hex actual=false"));
+        d.prefix_sha256 = format!("sha256:{}", "0".repeat(64));
+        d.messages = vec![serde_json::Value::Null; 257];
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=messages_len actual=257"));
+        d.messages = vec![serde_json::Value::String("x".repeat(HOST_TRANSCRIPT_MAX_BYTES))];
+        assert!(validate_host_transcript_document(&d).unwrap_err().contains("first_failed_predicate=serialized_bytes actual="));
+    }
 }
 
 const MAX_TOOL_EFFECT_RECEIPT_CHARS: usize = 16 * 1024;
@@ -3431,11 +3556,22 @@ pub struct ExecutionCommitService {
     fail_next_bound_outcome_450: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "test-fixtures"))]
     terminal_append_failures:
-        Arc<std::sync::Mutex<BTreeMap<String, tokio::sync::oneshot::Sender<String>>>>,
+        Arc<std::sync::Mutex<BTreeMap<String, tokio::sync::oneshot::Sender<TerminalAppendFailureObservation>>>>,
     #[cfg(any(test, feature = "test-fixtures"))]
     terminal_append_observers: Arc<std::sync::Mutex<BTreeMap<String, TerminalAppendObservation>>>,
     #[cfg(any(test, feature = "test-fixtures"))]
     receipt_commit_probes: ReceiptCommitProbes,
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAppendFailureClass { Storage, Other }
+
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug)]
+pub struct TerminalAppendFailureObservation {
+    pub class: TerminalAppendFailureClass,
+    pub message: String,
 }
 
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -4738,7 +4874,7 @@ impl ExecutionCommitService {
     pub fn observe_terminal_append_failure_for_test(
         &self,
         terminal_id: &str,
-    ) -> Result<tokio::sync::oneshot::Receiver<String>, String> {
+    ) -> Result<tokio::sync::oneshot::Receiver<TerminalAppendFailureObservation>, String> {
         if terminal_id.is_empty() {
             return Err("append observer requires exact terminal".into());
         }
@@ -8246,6 +8382,15 @@ impl ExecutionCommitService {
         Ok(())
     }
 
+    fn original_rejection_message(
+        index: usize,
+        observation: &harness_contract::agent_action::AgentActionObservation,
+    ) -> Result<String, serde_json::Error> {
+        let lead = observation.error.as_ref().map_or_else(String::new, |error|
+            format!("member {index}: {}: {}; ", error.code, error.message));
+        Ok(format!("{lead}member {index}: rejected; {}", serde_json::to_string(observation)?))
+    }
+
     /// Authenticate the original sequential batch boundary before settling its outer effect.
     /// This does not authenticate node commit or physical close.
     pub(crate) fn original_terminal_batch_message(
@@ -8297,6 +8442,9 @@ impl ExecutionCommitService {
         let event = terminal.transaction.events.first().ok_or_else(invalid)?;
         let reason = event.event.payload["noncommit_error_kind"].as_str().ok_or_else(invalid)?;
         parts.push(format!("member {}: confirmed noncommit ({reason})", boundary.index));
+        if let Some(observation) = stop.rejected_observation() {
+            parts.push(Self::original_rejection_message(boundary.index, observation)?);
+        }
         parts.push(format!("members {}..{} were not executed", boundary.index + 1, boundary.total));
         Ok(Some(parts.join("; ")))
     }
@@ -9266,7 +9414,7 @@ impl ExecutionCommitService {
             ));
         }
         let original_start = validate_node_ticket_start(&self.event_store, ticket, None)?;
-        let document = HostTranscriptPublication {
+        let mut document = HostTranscriptPublication {
             schema_version: 1,
             ticket: ticket.clone(),
             session_id: session_id.into(),
@@ -9277,7 +9425,7 @@ impl ExecutionCommitService {
             root_control_team_count,
             terminal_completion,
         };
-        validate_host_transcript_document(&document)
+        validate_host_transcript_document_inner(&document, false)
             .map_err(ExecutionCommitError::InvalidCommand)?;
         let key = host_transcript_key(ticket)?;
         let stream = node_stream_id(&ticket.graph_id, &ticket.node_id);
@@ -9286,6 +9434,35 @@ impl ExecutionCommitService {
             idempotency_key: key.clone(),
             kind: HOST_TRANSCRIPT_KIND.into(),
         };
+        let mut attachments = Vec::new();
+        let mut bytes_to_remove = serde_json::to_vec(&document)?.len().saturating_sub(HOST_TRANSCRIPT_MAX_BYTES);
+        if bytes_to_remove > 0 {
+            let artifacts = self.proof_artifacts.as_ref().ok_or_else(||
+                ExecutionCommitError::InvalidCommand("Host transcript content store missing".into()))?;
+            for (message_index, message) in document.messages.iter_mut().enumerate() {
+                let blocks = message["blocks"].as_array_mut().ok_or_else(||
+                    ExecutionCommitError::InvalidCommand("Host transcript blocks missing".into()))?;
+                for (block_index, block) in blocks.iter_mut().enumerate() {
+                    if bytes_to_remove == 0 { break; }
+                    let Some(output) = host_transcript_body_slot(block) else { continue; };
+                    let Some(text) = output.as_str() else { continue; };
+                    if text.len() < 128 { continue; }
+                    if attachments.len() == 64 {
+                        return Err(ExecutionCommitError::InvalidCommand("Host transcript attachment count exceeded".into()));
+                    }
+                    let body = serde_json::to_vec(text)?;
+                    let attachment = artifacts.write_pre_pinned_with_media_blocking(
+                        &format!("session:{session_id}"), &key,
+                        "application/vnd.cowd.host-transcript-body+json", &body, &origin,
+                    ).map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+                    let placeholder = serde_json::Value::String(format!("cowd:host-transcript-body:{}", attachment.sha256));
+                    bytes_to_remove = bytes_to_remove.saturating_sub(body.len().saturating_sub(serde_json::to_vec(&placeholder)?.len()));
+                    *output = placeholder;
+                    attachments.push(json!({"message_index":message_index, "block_index":block_index, "artifact":attachment}));
+                }
+            }
+        }
+        validate_host_transcript_document(&document).map_err(ExecutionCommitError::InvalidCommand)?;
         let bytes = serde_json::to_vec(&document)?;
         let artifact = self
             .proof_artifacts
@@ -9301,18 +9478,20 @@ impl ExecutionCommitService {
                 &origin,
             )
             .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
+        let mut payload = json!({
+            "host_transcript_schema":1,"graph_id":ticket.graph_id,"node_id":ticket.node_id,"attempt":ticket.attempt,
+            "session_id":session_id,"turn_id":turn_id,"ticket_digest":key.strip_prefix("host-transcript:").unwrap(),
+            "body":{"content_schema":2,"sha256":artifact.sha256,"bytes":artifact.bytes,
+                "body":{"kind":"artifact_ref","artifact":artifact}},
+        });
+        if !attachments.is_empty() { payload["attachments"] = json!(attachments); }
         Ok(RuntimeTransactionEventInput {
             event:RuntimeEventInput {
                 stream_id:stream,scope:RuntimeEventScope::ExecutionNode,kind:HOST_TRANSCRIPT_KIND.into(),
                 status:Some("prepared".into()),actor:Some(ticket.executor_kind.clone()),
                 refs:vec![RuntimeEventRef { kind:"execution_graph".into(),id:ticket.graph_id.clone() },
                     RuntimeEventRef { kind:"execution_node".into(),id:ticket.node_id.clone() }],
-                payload:json!({
-                    "host_transcript_schema":1,"graph_id":ticket.graph_id,"node_id":ticket.node_id,"attempt":ticket.attempt,
-                    "session_id":session_id,"turn_id":turn_id,"ticket_digest":key.strip_prefix("host-transcript:").unwrap(),
-                    "body":{"content_schema":2,"sha256":artifact.sha256,"bytes":artifact.bytes,
-                        "body":{"kind":"artifact_ref","artifact":artifact}},
-                }),
+                payload,
             }.with_activity_binding(node_activity_binding(&original_start,&ticket.node_id)?)?,
             idempotency_key:Some(key),schema_version:2,
         })
@@ -10085,7 +10264,7 @@ impl ExecutionCommitService {
             || event.scope != RuntimeEventScope::ExecutionNode
             || input.schema_version != 2
             || event.status.as_deref() != Some("prepared")
-            || payload.len() != 9
+            || !(payload.len() == 9 || (payload.len() == 10 && payload.contains_key("attachments")))
             || ![
                 "host_transcript_schema",
                 "graph_id",
@@ -10139,6 +10318,8 @@ impl ExecutionCommitService {
                 "Host transcript body is not the exact typed producer document",
             ));
         }
+        let document = hydrate_host_transcript_document(store, &event.payload, &origin, document)
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?;
         let ticket = &document.ticket;
         let expected_key =
             host_transcript_key(ticket).map_err(|error| invalid(&error.to_string()))?;
@@ -10571,20 +10752,15 @@ impl ExecutionCommitService {
             idempotency_key: key,
             kind: HOST_TRANSCRIPT_KIND.into(),
         };
-        Ok(serde_json::from_value(
-            self.event_store
-                .resolve_host_transcript_content(
-                    &format!(
-                        "session:{}",
-                        publication.payload["session_id"]
-                            .as_str()
-                            .ok_or_else(|| invalid("Host transcript Session missing"))?
-                    ),
-                    &publication.payload["body"],
-                    &origin,
-                )
-                .map_err(ExecutionCommitError::InvalidCommand)?,
-        )?)
+        let document = serde_json::from_value(
+            self.event_store.resolve_host_transcript_content(
+                &format!("session:{}", publication.payload["session_id"].as_str()
+                    .ok_or_else(|| invalid("Host transcript Session missing"))?),
+                &publication.payload["body"], &origin,
+            ).map_err(ExecutionCommitError::InvalidCommand)?,
+        )?;
+        hydrate_host_transcript_document(&self.event_store, &publication.payload, &origin, document)
+            .map_err(ExecutionCommitError::InvalidCommand)
     }
 
     pub(crate) fn validate_unadmitted_binding_start(
@@ -16656,7 +16832,11 @@ impl ExecutionCommitService {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&terminal.terminal_id)
                 {
-                    let _ = observer.send(error.to_string());
+                    let class = match error {
+                        RuntimeEventStoreError::Storage(_) => TerminalAppendFailureClass::Storage,
+                        _ => TerminalAppendFailureClass::Other,
+                    };
+                    let _ = observer.send(TerminalAppendFailureObservation { class, message: error.to_string() });
                 }
             }
             match result {

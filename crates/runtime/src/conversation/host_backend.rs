@@ -8104,6 +8104,60 @@ fn original_applied_effect(
     Some((effect, kind))
 }
 
+// Optional private fixture diagnostic: original carrier metadata only, never authority.
+#[cfg(all(feature = "test-fixtures", target_os = "linux"))]
+fn a9_goal_carrier_diagnostic(
+    ticket: &NodeExecutionTicket, before_goal: &str, program_stream: &str,
+    handles: &[OriginalPostActionCommit], effects: &[(String, String)],
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::io::Write;
+    if std::env::var_os("COWD_A9_GOAL_CARRIER_DIAG").is_none() { return Ok(()); }
+    if handles.len() > 32 || effects.len() > 32 { return Err("carrier count exceeds diagnostic budget".into()); }
+    let directory = std::path::PathBuf::from(std::env::var_os("COWD_FIXTURE_EVIDENCE_DIR")
+        .ok_or("private evidence directory missing")?);
+    let metadata = std::fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
+    let own_uid = std::fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
+    let on_tmpfs = std::process::Command::new("stat").args(["-f", "-c", "%T"]).arg(&directory)
+        .output().is_ok_and(|output| output.status.success() && output.stdout == b"tmpfs\n");
+    if !directory.is_absolute() || directory.canonicalize().map_err(|e| e.to_string())? != directory
+        || !directory.starts_with("/dev/shm") || !metadata.is_dir() || metadata.file_type().is_symlink()
+        || metadata.uid() != own_uid || metadata.permissions().mode() & 0o777 != 0o700 || !on_tmpfs {
+        return Err("private current-owner tmpfs directory required".into());
+    }
+    let carriers = handles.iter().map(|handle| {
+        let receipt = handle.receipt();
+        let events = handle.request().map(|request| request.transaction.events.iter().enumerate().take(32).map(|(index, event)| {
+            serde_json::json!({"index":index,"stream":event.event.stream_id,"kind":event.event.kind,
+                "action_kind":event.event.payload.pointer("/envelope/action/kind"),
+                "entity_ref":event.event.payload.get("entity_ref"),
+                "action_entity_ref":event.event.payload.get("action_entity_ref"),
+                "receipt_event_id":receipt.event_ids.get(index)})
+        }).collect::<Vec<_>>());
+        let variant = match handle { OriginalPostActionCommit::Single(_) => "single", OriginalPostActionCommit::Member(_) => "member",
+            OriginalPostActionCommit::Conclusion(_) => "conclusion", OriginalPostActionCommit::Replay(_) => "replay" };
+        let replay_goal = match handle { OriginalPostActionCommit::Replay(replay) => replay.goal_event().map(|event| serde_json::json!({
+            "stream":event.stream_id,"kind":event.kind,"event_id":event.event_id,"transaction_id":event.transaction_id,
+            "index":event.transaction_index,"cursor":event.commit_cursor })), _ => None };
+        serde_json::json!({"variant":variant,"transaction_id":receipt.transaction_id,
+            "cursor":receipt.commit_cursor,"event_ids":receipt.event_ids,"stream_revisions":receipt.stream_revisions,
+            "observation":handle.observation().map(|observation| format!("{:?}", observation.status)),
+            "request_txn":handle.request().map(|request| &request.transaction.transaction_id),
+            "request_event_count":handle.request().map(|request| request.transaction.events.len()),
+            "request_events":events,"replay_goal":replay_goal})
+    }).collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&serde_json::json!({"graph":ticket.graph_id,"node":ticket.node_id,
+        "attempt":ticket.attempt,"before_goal":before_goal,"program_stream":program_stream,
+        "effects":effects,"carriers":carriers})).map_err(|e| e.to_string())?;
+    if bytes.len() > 256 * 1024 { return Err("carrier diagnostic byte budget exceeded".into()); }
+    let path = directory.join(format!("a9-goal-carrier-{}-{}.json", std::process::id(), uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open(&path).map_err(|e| e.to_string())?;
+    file.write_all(&bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+    eprintln!("A9_GOAL_CARRIER_PRIVATE path={} bytes={}", path.display(), bytes.len());
+    Ok(())
+}
+
 /// The Program facts the visibility check needs, read from the certified
 /// projection. Kept as plain data so the judgment itself is testable without
 /// a Program behind it.
@@ -8629,6 +8683,12 @@ fn original_committed_goal<C: ApiClient, T: ToolExecutor>(
             }
         }
         program_effects.retain(|(effect, kind)| !(kind == "objective_review" && authenticated_goal_reviews.contains_key(effect)));
+        #[cfg(all(feature = "test-fixtures", target_os = "linux"))]
+        if program_effects.iter().any(|(_, kind)| kind == "objective_review") {
+            if let Err(error) = a9_goal_carrier_diagnostic(ticket, &before.goal.id, stream, &committed, &program_effects) {
+                eprintln!("A9_GOAL_CARRIER_PRIVATE unavailable={error}");
+            }
+        }
         certify_original_program_head(&services, program_id, certified_cut, head, &program_effects)?;
         program_source = Some((stream.clone(), head));
     }
@@ -10159,7 +10219,7 @@ where
                 event_store: Arc::clone(services.event_store()),
                 action_service: services.agent_action_service(),
             });
-            let governed = ROOT_SINGLE_CAPTURES.scope(Arc::clone(&single_captures), ROOT_ACTION_ISSUER.scope(action_issuer, ROOT_BATCH_POLICY_OWNER.scope(owner, execute_governed_runtime_tool_batch(
+            let governed = ROOT_SINGLE_CAPTURES.scope(Arc::clone(&single_captures), ROOT_ACTION_ISSUER.scope(action_issuer, ROOT_BATCH_POLICY_OWNER.scope(owner, Box::pin(execute_governed_runtime_tool_batch(
                 Arc::clone(host),
                 event_bus,
                 &calls,
@@ -10191,7 +10251,7 @@ where
                 Some(&prepared_effects),
                 Some(&prepared_requests),
                 Some(&strategy_gate),
-            )))).await;
+            ))))).await;
             if policy_owner.take_control_requested() {
                 self.runtime.lock().await.consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::AfterToolResult);
             }
@@ -10228,7 +10288,10 @@ where
             // Semantic Action progress must be read from the complete
             // Runtime receipt. The model-facing evidence compactor may
             // legitimately truncate a large projection after this point.
-            let agentic_progress_refs = agentic_action_progress_refs(&governed_messages);
+            let mut agentic_progress_refs = agentic_action_progress_refs(&governed_messages);
+            let batch_ids = calls.iter().filter(|call| call.name == "agent_action_batch")
+                .map(|call| call.id.clone()).collect();
+            agentic_progress_refs.extend(agentic_batch_action_progress_refs(&governed_messages, &batch_ids));
             // Graph scheduling executes outside the legacy adapter. Before
             // the next model node sees the result, route its raw output
             // through the same durable evidence and context-ledger path used
@@ -10358,7 +10421,7 @@ where
             let transcript_len = runtime.session_head().await.message_count;
             let policy_owner = Arc::new(runtime.shared_policy_owner());
             let member_parent = runtime.tool_executor().durable_tool_effect_parent();
-            let work = runtime.execute_tool_batch_step_with_owner(
+            let work = Box::pin(runtime.execute_tool_batch_step_with_owner(
                     &calls,
                     &prompter,
                     iteration,
@@ -10369,7 +10432,7 @@ where
                     Some(&self.state),
                     Some(services.as_ref()),
                     Some(services.commit_service()),
-                );
+                ));
             let outcome = if delegated_agent_role {
                 if let Some((parent, attempt)) = member_parent {
                     let owner: Arc<dyn crate::tool_host::AgentBatchPolicyOwner> = Arc::new(OriginalBatchPolicyOwner {
@@ -10443,7 +10506,10 @@ where
                 .collect::<std::collections::HashMap<_, _>>();
             original_member_batches = result.member_batches.clone();
             let orchestration_terminal_summary: Option<String> = None;
-            let agentic_progress_refs = agentic_action_progress_refs(&result.messages);
+            let mut agentic_progress_refs = agentic_action_progress_refs(&result.messages);
+            let batch_ids = calls.iter().filter(|call| call.name == "agent_action_batch")
+                .map(|call| call.id.clone()).collect();
+            agentic_progress_refs.extend(agentic_batch_action_progress_refs(&result.messages, &batch_ids));
             let orchestrated_search_coverage = result.orchestrated_search_coverage.clone();
             (
                 result,
@@ -10988,7 +11054,7 @@ where
                     .event_store()
                     .repetition_scope(&session_id, &turn_id),
             ),
-            false,
+            !agentic_progress_refs.is_empty(),
         );
         let mut current_objective_milestones = objective_milestones(
             services.as_ref(),

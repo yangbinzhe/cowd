@@ -28,6 +28,29 @@ pub(crate) fn claim_lease_ms() -> u64 {
         .saturating_mul(1_000)
 }
 
+/// An expired lease may only be renewed by its still-active original attempt.
+pub(crate) fn expired_original_claim(
+    task: &AgenticTaskProjection,
+    agent_id: &str,
+    execution_id: &str,
+    membership_id: &str,
+    now_ms: u64,
+) -> bool {
+    task.status == AgenticTaskStatus::Claimed
+        && task.claimant.as_deref() == Some(agent_id)
+        && task.claim_execution_id.as_deref() == Some(execution_id)
+        && task.lease_expires_at_ms.is_some_and(|expires| expires <= now_ms)
+        && task.cancel_requested_by.is_none()
+        && task.pending_retirement.is_none()
+        && task.active_attempts.get(execution_id).is_some_and(|attempt| {
+            attempt.execution_id == execution_id
+                && attempt.agent_id == agent_id
+                && attempt.membership_id == membership_id
+                && attempt.mode == AgentAttemptMode::Execute
+                && attempt.generation.checked_add(1) == Some(task.claim_generation)
+        })
+}
+
 /// Consecutive claims of one Task with no progress in between.
 ///
 /// Run mon7's final task expired its lease and the model re-claimed it four
@@ -182,6 +205,8 @@ pub(crate) enum AttemptFailureFamily {
     /// The delegated child's receipt never settled ("original child receipt
     /// remains unsettled", "original tool effect remains unknown").
     ReceiptUnsettled,
+    /// The original review owner exhausted its pinned-source rebuild budget.
+    ReviewCutExhausted,
     /// The read has no original physical extent ("proof_actual_input_extent
     /// _unsupported").
     PhysicalExtentUnsupported,
@@ -198,6 +223,7 @@ impl AttemptFailureFamily {
     pub(crate) const fn note_name(self) -> &'static str {
         match self {
             Self::ReceiptUnsettled => "receipt_unsettled",
+            Self::ReviewCutExhausted => "review_cut_exhausted",
             Self::PhysicalExtentUnsupported => "physical_extent_unsupported",
             Self::CompositeAcquisitionsIncomplete => "composite_acquisitions_incomplete",
             Self::ModelRefusal => "model_refusal",
@@ -211,6 +237,7 @@ impl AttemptFailureFamily {
         matches!(
             self,
             Self::ReceiptUnsettled
+                | Self::ReviewCutExhausted
                 | Self::PhysicalExtentUnsupported
                 | Self::CompositeAcquisitionsIncomplete
         )
@@ -360,6 +387,9 @@ pub(crate) fn apply_task_publish(
             pending_retirement: None,
         },
     );
+    if let Some(rounds) = projection.applied_rework_rounds.as_mut() {
+        rounds.insert(task_id.to_string(), 0);
+    }
     if let Some(team) = projection.teams.get_mut(&input.team_ref) {
         team.task_ids.push(task_id.to_string());
     }
@@ -562,6 +592,14 @@ pub(crate) fn apply_task_attempt_fail(
     projection: &mut AgenticProgramProjection,
     input: &TaskAttemptFailInput,
 ) {
+    apply_task_attempt_fail_with_origin(projection, input, false);
+}
+
+pub(crate) fn apply_task_attempt_fail_with_origin(
+    projection: &mut AgenticProgramProjection,
+    input: &TaskAttemptFailInput,
+    trusted_review_cut: bool,
+) {
     if input.mode == AgentAttemptMode::Coordination {
         projection.settle_coordination(&input.execution_id, Some(input.reason.clone()));
     }
@@ -662,7 +700,11 @@ pub(crate) fn apply_task_attempt_fail(
                 // structural. A structural stall is charged to the structural
                 // account; the model's review budget only pays for the
                 // failures the model caused.
-                let family = attempt_failure_family(input.reason.as_str());
+                let family = if trusted_review_cut {
+                    AttemptFailureFamily::ReviewCutExhausted
+                } else {
+                    attempt_failure_family(input.reason.as_str())
+                };
                 if family.is_structural() {
                     task.structural_review_stalls =
                         task.structural_review_stalls.saturating_add(1);
@@ -1047,6 +1089,32 @@ pub(crate) fn apply_task_review(
     envelope: &AgentActionEnvelope,
     input: &TaskReviewInput,
 ) {
+    // The durable event owner chooses the versioned path; direct reducer
+    // callers without a recovered count retain the historical rule.
+    let verdict_rule = projection.applied_rework_rounds.as_ref()
+        .is_some_and(|rounds| rounds.contains_key(&input.task_ref));
+    apply_task_review_with_round_rule(projection, envelope, input, verdict_rule)
+        .expect("known verdict round count");
+}
+
+pub(crate) fn apply_task_review_with_round_rule(
+    projection: &mut AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
+    input: &TaskReviewInput,
+    verdict_rule: bool,
+) -> Result<(), &'static str> {
+    let is_rework = matches!(input.decision, TaskReviewDecision::Challenge | TaskReviewDecision::Rework);
+    if verdict_rule && is_rework && projection.tasks.contains_key(&input.task_ref)
+        && projection.applied_rework_rounds.as_ref().and_then(|rounds| rounds.get(&input.task_ref)).is_none()
+    {
+        return Err("review_rework_history_unknown");
+    }
+    let rework_round = if is_rework && projection.tasks.contains_key(&input.task_ref) {
+        projection.applied_rework_rounds.as_mut().and_then(|rounds| rounds.get_mut(&input.task_ref)).map(|rounds| {
+            *rounds = rounds.saturating_add(1).min(MAX_TASK_REVIEW_ROUNDS);
+            *rounds
+        })
+    } else { None };
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
         // A review is the task moving forward; the renewal streak resets.
         task.claim_renewal_streak = 0;
@@ -1108,7 +1176,12 @@ pub(crate) fn apply_task_review(
                 // the barrier "already treats Blocked as a release condition",
                 // which the supervision gate contradicts - ledger finding H2.)
                 task.review_generation = task.review_generation.saturating_add(1);
-                task.status = if task.review_generation >= u64::from(MAX_TASK_REVIEW_ROUNDS) {
+                let rounds_exhausted = if verdict_rule {
+                    rework_round.is_some_and(|round| round >= MAX_TASK_REVIEW_ROUNDS)
+                } else {
+                    task.review_generation >= u64::from(MAX_TASK_REVIEW_ROUNDS)
+                };
+                task.status = if rounds_exhausted {
                     task.terminal_note = Some(blocked_exhaustion_note(
                         "review rounds",
                         MAX_TASK_REVIEW_ROUNDS,
@@ -1124,6 +1197,7 @@ pub(crate) fn apply_task_review(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2572,7 +2646,14 @@ mod criterion_source_tests {
         env.action = AgentAction::TaskPublish(input.clone());
         super::apply_task_publish(&mut program, &env, &input, Some("task"));
         let task = &program.tasks["task"];
-        assert_eq!(task.obligations.len(), 2, "prose plus its checks compile once, together (B1/B2)");
+        let expected: std::collections::BTreeSet<_> = std::iter::once("acceptance".to_string())
+            .chain(input.acceptance_checks.iter().enumerate().map(|(index, _)| format!("check:{index}")))
+            .collect();
+        let mut actual = std::collections::BTreeSet::new();
+        for obligation in &task.obligations {
+            assert!(actual.insert(obligation.key.clone()), "each criterion is compiled once");
+        }
+        assert_eq!(actual, expected);
         assert_eq!(task.obligations[0].key, "acceptance");
         assert!(task.obligations[0].authoritative, "the prose stays the authoritative criterion");
         assert_eq!(task.obligations[1].key, "check:0");
@@ -2664,6 +2745,104 @@ mod criterion_source_tests {
         let note = task.terminal_note.as_deref().expect("rounds exhaustion named");
         assert!(note.contains("review rounds exhausted at bounded 3"), "{note}");
         assert!(!note.contains("satisfied"), "failure family only (B10): {note}");
+    }
+
+    #[test]
+    fn gb3_p2_only_applied_rework_counts_as_business_round() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        for attempt in 1..=2 {
+            super::apply_task_attempt_fail(&mut program, &TaskAttemptFailInput {
+                task_ref: "task".into(), execution_id: format!("exec-{attempt}"), mode: AgentAttemptMode::Review,
+                reason: format!("proof_actual_input_extent_unsupported: distinct {attempt}"), retryable: true,
+            });
+        }
+        assert_eq!(program.tasks["task"].review_generation, 2);
+        assert_eq!(program.tasks["task"].structural_review_stalls, 2);
+        for round in 1..=3 {
+            let review = k3_review("source evidence incomplete", &[], &[]);
+            let mut env = envelope();
+            env.action = AgentAction::TaskReview(review.clone());
+            env.action_id = format!("gb3-rework-{round}");
+            program.tasks.get_mut("task").unwrap().status = AgenticTaskStatus::Submitted;
+            super::apply_task_review(&mut program, &env, &review);
+            let task = &program.tasks["task"];
+            assert_eq!(task.review_generation, 2 + round);
+            assert_eq!(task.status, if round == 3 { AgenticTaskStatus::Blocked } else { AgenticTaskStatus::Rework });
+            assert_eq!(task.failed_review_attempts, 0);
+            assert_eq!(task.structural_review_stalls, 2);
+        }
+    }
+
+    #[test]
+    fn gb3_p2_unavailable_history_cannot_apply_new_rework() {
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        program.applied_rework_rounds = None;
+        let before = program.clone();
+        let review = k3_review("source evidence incomplete", &[], &[]);
+        let mut env = envelope();
+        env.action = AgentAction::TaskReview(review.clone());
+        assert_eq!(super::apply_task_review_with_round_rule(&mut program, &env, &review, true), Err("review_rework_history_unknown"));
+        assert_eq!(program, before);
+        program.applied_rework_rounds = Some(std::collections::BTreeMap::new());
+        let before_missing_task = program.clone();
+        assert_eq!(super::apply_task_review_with_round_rule(&mut program, &env, &review, true), Err("review_rework_history_unknown"));
+        assert_eq!(program, before_missing_task);
+    }
+
+    #[test]
+    fn gb3_p1_typed_cut_origin_not_reason_controls_real_failure_reducer() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        for trusted in [false, true] {
+            let mut program = program_with_objective("Read source");
+            super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+            let fail = TaskAttemptFailInput { task_ref: "task".into(), execution_id: "graph".into(),
+                mode: AgentAttemptMode::Review, reason: "review_window_unknown: review cut rebuild exhausted".into(), retryable: true };
+            super::apply_task_attempt_fail_with_origin(&mut program, &fail, trusted);
+            let task = &program.tasks["task"];
+            assert_eq!((task.failed_review_attempts, task.structural_review_stalls), if trusted { (0, 1) } else { (1, 0) });
+            assert_eq!(task.review_generation, 1);
+        }
+    }
+
+    #[test]
+    fn gb3_real_attempt_owner_classifies_and_bounds_both_modes() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        let cases = [
+            ("original composite child acquisitions incomplete", "composite_acquisitions_incomplete", true),
+            ("proof_actual_input_extent_unsupported", "physical_extent_unsupported", true),
+            ("original child receipt remains unsettled", "receipt_unsettled", true),
+            ("has no canonical durable receipt", "model_refusal", false),
+            ("ordinary model failure", "unclassified", false),
+        ];
+        for mode in [AgentAttemptMode::Execute, AgentAttemptMode::Review] {
+            for (reason, family, structural) in cases {
+                let mut program = program_with_objective("Read source");
+                super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+                for attempt in 1..=3 {
+                    let fail = TaskAttemptFailInput {
+                        task_ref: "task".into(), execution_id: format!("exec-{attempt}"), mode,
+                        reason: format!("{reason} (attempt {attempt})"), retryable: true,
+                    };
+                    super::apply_task_attempt_fail(&mut program, &fail);
+                    let task = &program.tasks["task"];
+                    let (model, stall) = match mode {
+                        AgentAttemptMode::Execute => (task.failed_attempts, task.structural_execution_stalls),
+                        AgentAttemptMode::Review => (task.failed_review_attempts, task.structural_review_stalls),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!((model, stall), if structural { (0, attempt) } else { (attempt, 0) });
+                    assert_eq!(task.status == AgenticTaskStatus::Blocked, attempt == 3);
+                }
+                let note = program.tasks["task"].terminal_note.as_deref().expect("exhaustion note");
+                assert!(note.contains(&format!("failure_family={family}")), "{note}");
+                assert!(note.contains(if structural { "account=structural" } else { "account=model" }), "{note}");
+                assert!(note.contains(if structural { "model_attempts_charged=0" } else { "model_attempts_charged=3" }), "{note}");
+                assert!(note.contains(if structural { "structural_stalls=3" } else { "structural_stalls=0" }), "{note}");
+            }
+        }
     }
 
     /// 033 S7 (causal accounting): a structural stall is charged to the

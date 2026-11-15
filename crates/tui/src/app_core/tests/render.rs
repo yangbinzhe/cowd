@@ -43,12 +43,14 @@ fn gateway_skill_projection_maps_canonical_identity_without_fallback() {
     }))
     .expect("valid Gateway projection");
 
-    assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0].id, "local:release");
-    assert_eq!(skills[0].category, "delivery");
-    assert_eq!(skills[0].status, "ready");
-    assert_eq!(skills[0].risk, "operator_review");
-    assert!(skills[0].installed);
+    let [skill] = skills.as_slice() else { panic!("expected one skill projection"); };
+    {
+        assert_eq!(skill.id, "local:release");
+        assert_eq!(skill.category, "delivery");
+        assert_eq!(skill.status, "ready");
+        assert_eq!(skill.risk, "operator_review");
+        assert!(skill.installed);
+    }
     assert!(skill_summaries_from_catalog(&serde_json::json!({
         "items": [{ "name": "invented" }]
     }))

@@ -208,7 +208,7 @@ fn cowd_exposes_the_versioned_sandbox_process_protocol() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        format!("sandbox-launcher/{}/kernel-v1", env!("CARGO_PKG_VERSION"))
+        format!("sandbox-launcher/{}/kernel-v3-controlled-host", env!("CARGO_PKG_VERSION"))
     );
 }
 

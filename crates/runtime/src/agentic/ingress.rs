@@ -48,7 +48,78 @@ impl OriginalIngressResult {
     }
 }
 
+/// Created only by the original review-cut owner after its bound is exhausted.
+pub(super) struct ReviewCutSettlement {
+    program_id: String,
+    task_ref: String,
+    execution_id: String,
+    node_id: String,
+    attempt: u32,
+    used: u32,
+    ticket: super::review_evidence::ReviewRepinTicket,
+}
+
+impl ReviewCutSettlement {
+    pub(super) fn graph_id(&self) -> &str { &self.execution_id }
+    pub(super) fn node_id(&self) -> &str { &self.node_id }
+    pub(super) fn attempt(&self) -> u32 { self.attempt }
+
+    pub(super) fn validate_active(&self, program: &crate::AgenticProgramProjection) -> Result<(), &'static str> {
+        let task = program.tasks.get(&self.task_ref).ok_or("review_cut_settlement_task_missing")?;
+        let attempt = task.active_attempts.get(&self.execution_id).ok_or("review_cut_settlement_attempt_missing")?;
+        if program.program_id != self.program_id
+            || task.status != super::AgenticTaskStatus::Submitted
+            || attempt.execution_id != self.execution_id || attempt.mode != AgentAttemptMode::Review
+            || attempt.generation != task.review_generation
+        {
+            return Err("review_cut_settlement_attempt_changed");
+        }
+        Ok(())
+    }
+
+    pub(super) fn event_metadata(&self, fail: &AgentActionEnvelope) -> Result<serde_json::Value, &'static str> {
+        let AgentAction::TaskAttemptFail(input) = &fail.action else { return Err("review_cut_settlement_wrong_action"); };
+        if fail.actor.kind != AgentActorKind::Supervisor
+            || fail.actor.actor_id != "runtime.program-supervisor"
+            || fail.actor.program_id != self.program_id
+            || fail.actor.execution_id.as_deref() != Some(self.execution_id.as_str())
+            || input.execution_id != self.execution_id || input.task_ref != self.task_ref
+            || input.mode != AgentAttemptMode::Review || self.node_id.is_empty() || self.attempt == 0
+            || self.used <= MAX_REVIEW_CUT_REBUILDS || !self.ticket.movement().rebuildable()
+            || self.ticket.attempt() != self.attempt
+            || self.ticket.review_ref() != super::review_evidence::node_review_ref(&self.execution_id, &self.node_id)
+        {
+            return Err("review_cut_settlement_owner_mismatch");
+        }
+        Ok(serde_json::json!({"kind":"review_cut_exhausted_v1", "program_id":self.program_id,
+            "task_ref":self.task_ref, "execution_id":self.execution_id, "node_id":self.node_id, "attempt":self.attempt,
+            "rebuilds_used":self.used, "rebuild_bound":MAX_REVIEW_CUT_REBUILDS}))
+    }
+}
+
 const MAX_REVIEW_PROGRAM_REBUILDS: u32 = 3;
+
+// Test-only bridge for the graph owner's original pause/recovery/resume fixture.
+#[cfg(test)]
+pub(crate) fn gb3_settle_synthetic_old_cut_for_graph_test(
+    store: std::sync::Arc<crate::RuntimeEventStore>, graph_id: &str, node_id: &str, attempt: u32,
+) -> Result<AgentActionObservation, crate::AgentActionServiceError> {
+    let service = crate::AgentActionService::new(std::sync::Arc::clone(&store))
+        .with_graph_store(crate::ExecutionGraphStateStore::new(store));
+    let mut program = crate::AgenticProgramProjection::empty("gb3-graph-test", "objective");
+    program.session_id = "session".into();
+    program.turn_id = "turn".into();
+    let actor = runtime_supervisor_actor(&program, Some(graph_id.into()));
+    let reason = "result metadata source changed during resolution; rebuild the review; source=stream expected=4 actual=5 phase=result_source_pin";
+    let ticket = review_repin_ticket_for(graph_id, node_id, attempt, reason)
+        .expect("synthetic review ticket fixture");
+    let origin = ReviewCutSettlement { program_id:program.program_id, task_ref:"task".into(),
+        execution_id:graph_id.into(), node_id:node_id.into(), attempt, used:3, ticket };
+    let fail = AgentActionEnvelope { action_id:"gb3-old-attempt".into(), actor, expected_revision:None,
+        action:AgentAction::TaskAttemptFail(TaskAttemptFailInput { task_ref:"task".into(),
+            execution_id:graph_id.into(), mode:AgentAttemptMode::Review, reason:"window".into(), retryable:true }) };
+    service.apply_runtime_supervisor_review_cut(&fail, &origin)
+}
 
 /// T8 bounds: how far an evidence refusal hint may read into the Session
 /// journal to name a repair, and how many candidate receipts one
@@ -71,7 +142,7 @@ const MAX_EVIDENCE_HINT_CANDIDATES: usize = 8;
 /// reported) and re-reads at that head. Two is the bound the plan sets: one
 /// rebuild proves the window can be reached, a second proves it is moving, and a
 /// third is the loop the ledger used to call an unexplained wedge.
-const MAX_REVIEW_CUT_REBUILDS: u32 = 2;
+pub(super) const MAX_REVIEW_CUT_REBUILDS: u32 = 2;
 /// Process-local rebuild bookkeeping keyed by the dispatching node's own
 /// lineage `{graph}/{node}/{attempt}`: after the merge of 032 K3 (A6/A7/A8)
 /// this is the one review-rebuild budget authority in the dispatch lane. The
@@ -82,16 +153,8 @@ const MAX_REVIEW_CUT_REBUILDS: u32 = 2;
 static REVIEW_CUT_REBUILDS: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn is_review_program_advanced(error: &str) -> bool {
-    // 032 K4b (A2): classification asks the named code table first; the
-    // sentence survives only as its text projection. The enumeration-fence
-    // shape is ResultMetadataChangedAfterEnumeration. The Program-changed
-    // shape belongs to the producer-resolution family, has no code yet, and
-    // keeps its named prefix until that family is registered (B6 wordlist).
-    matches!(
-        crate::agentic::review_evidence::reason_code::reason_code_of(error),
-        Some(crate::agentic::review_evidence::reason_code::ReviewRefusalCode::ResultMetadataChangedAfterEnumeration)
-    ) || error.starts_with("result Program changed during original producer resolution:")
+fn is_review_program_advanced(error: &super::review_evidence::ReviewEvidenceError) -> bool {
+    error.is_program_advanced()
 }
 
 fn bump_review_rebuild(key: &str) -> u32 {
@@ -135,6 +198,7 @@ fn review_rebuild_key(envelope: &AgentActionEnvelope) -> Option<String> {
 /// occurrence of the sentence so a refusal is not silently demoted to today's
 /// settle path. If T1a later exposes a search entry, this is the one place that
 /// changes.
+#[cfg(test)]
 fn review_repin_ticket_for(
     graph_id: &str,
     node_id: &str,
@@ -160,14 +224,15 @@ fn review_repin_ticket_for(
 
 fn review_repin_ticket(
     envelope: &AgentActionEnvelope,
-    reason: &str,
+    error: &super::review_evidence::ReviewEvidenceError,
 ) -> Option<super::review_evidence::ReviewRepinTicket> {
     let physical = envelope.actor.original_execution.as_ref()?;
-    review_repin_ticket_for(&physical.graph_id, &physical.node_id, physical.attempt, reason)
+    error.review_ticket(&super::review_evidence::node_review_ref(&physical.graph_id, &physical.node_id), physical.attempt)
 }
 
 /// Slice out the pin sentence a wrapped refusal still carries verbatim. Anything
 /// that is not one of the two shapes yields `None`.
+#[cfg(test)]
 fn own_pin_sentence(reason: &str) -> Option<String> {
     // 032 K4b (A2): the two pin shapes are recognised by their own codes; the
     // slice is taken from whatever sentence projection carries them. Every
@@ -645,7 +710,7 @@ impl RuntimeServices {
         capability.validate_envelope(envelope, tool, original_input)
             .map_err(|error| crate::AgentActionServiceError::EventStore(error.to_string()))?;
         // Preserve checked-transaction uncertainty across the original caller.
-        self.submit_agent_action_from_owner(envelope, false, false, Some((capability, tool, original_input)), None)
+        self.submit_agent_action_from_owner(envelope, false, false, Some((capability, tool, original_input)), None, None)
             .await.map_err(crate::AgentActionServiceError::EventStore)?.into_single_typed()
     }
 
@@ -694,6 +759,12 @@ impl RuntimeServices {
             .unwrap_or_default();
         match repair_receipt_citation(cited, &recorded) {
             EvidenceCitation::Canonical(canonical) => {
+                if canonical != cited {
+                    let hint = self.canonical_tool_evidence_hint(session_id, cited).await;
+                    return ToolEvidenceResolution::Refused(unrepaired_evidence_refusal(
+                        kind, cited, session_id, hint,
+                    ));
+                }
                 match self.session_evidence_access(session_id, &canonical).await {
                     Ok(Some(access)) => ToolEvidenceResolution::Resolved(access),
                     _ => {
@@ -751,7 +822,7 @@ impl RuntimeServices {
             return Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeUnknown(error.to_string())));
         }
         let result = match self.submit_agent_action_from_owner(envelope, false, false, None,
-            Some(OriginalIngressMember::Prepared(capability))).await {
+            Some(OriginalIngressMember::Prepared(capability)), None).await {
             Ok(result) => result,
             Err(error) => return Outcome::Stopped(make_stop(coordinate, Stop::BeforeOutcomeUnknown(error))),
         };
@@ -795,7 +866,7 @@ impl RuntimeServices {
         if envelope.actor.kind != AgentActorKind::Supervisor || envelope.actor.original_execution.is_some() {
             return Err("invalid Runtime supervisor action".into());
         }
-        self.submit_agent_action_from_owner(envelope, false, true, None, None).await?.into_single()
+        self.submit_agent_action_from_owner(envelope, false, true, None, None, None).await?.into_single()
     }
 
     // Only the Runtime completion owner below can select the internal path;
@@ -807,6 +878,7 @@ impl RuntimeServices {
         internal_supervisor: bool,
         owner_call: Option<(&super::action_invocation::VerifiedActionInvocation, &str, &serde_json::Value)>,
         member_call: Option<OriginalIngressMember>,
+        review_cut: Option<&ReviewCutSettlement>,
     ) -> Result<OriginalIngressResult, String> {
         envelope.validate().map_err(|error| error.to_string())?;
         if !internal_completion && !internal_supervisor && member_call.is_none() {
@@ -826,13 +898,6 @@ impl RuntimeServices {
             {
                 return Ok(OriginalIngressResult::Single(replay));
             }
-        }
-        if envelope.actor.kind == AgentActorKind::Root
-            && envelope.actor.original_execution.is_none()
-            && envelope.action.requires_original_physical_execution()
-            && !(internal_completion && matches!(&envelope.action, AgentAction::ObjectiveCompleteRequest(_)))
-        {
-            return Err("new root action requires original physical execution".to_string());
         }
         self.validate_agent_action_evidence(&envelope.actor, &envelope.action)
             .await?;
@@ -947,9 +1012,11 @@ impl RuntimeServices {
                                         envelope,
                                         &program,
                                         &review_rebuild_settlement_reason(&ticket),
+                                        &ticket,
+                                        used,
                                     )
                                     .await;
-                                let unknown = review_rebuild_unknown_reason(&ticket, used, &error);
+                                let unknown = review_rebuild_unknown_reason(&ticket, used, &error.to_string());
                                 return Err(match settlement {
                                     Ok(()) => unknown,
                                     Err(settle_error) => format!(
@@ -968,7 +1035,7 @@ impl RuntimeServices {
                         // (A4, pending K4) returns unchanged here; the
                         // caller's existing typed settlement closes the
                         // attempt, and `failed_review_attempts` bounds it.
-                        return Err(error);
+                        return Err(error.to_string());
                     }
                 }
             }
@@ -1185,7 +1252,10 @@ impl RuntimeServices {
                     .map_err(|error| error.to_string())
             })
         } else if internal_supervisor {
-            actions.apply_runtime_supervisor(envelope).map_err(|error| error.to_string())
+            match review_cut {
+                Some(origin) => actions.apply_runtime_supervisor_review_cut(envelope, origin),
+                None => actions.apply_runtime_supervisor(envelope),
+            }.map_err(|error| error.to_string())
         } else {
             actions.apply(envelope).map_err(|error| error.to_string())
         }.map(OriginalIngressResult::Single)
@@ -1298,7 +1368,7 @@ impl RuntimeServices {
             expected_revision: None,
             action: AgentAction::ObjectiveCompleteRequest(input),
         };
-        let observation = self.submit_agent_action_from_owner(&envelope, true, false, None, None).await?.into_single()?;
+        let observation = self.submit_agent_action_from_owner(&envelope, true, false, None, None, None).await?.into_single()?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Ok(false);
         }
@@ -1317,6 +1387,8 @@ impl RuntimeServices {
         envelope: &AgentActionEnvelope,
         program: &crate::AgenticProgramProjection,
         reason: &str,
+        ticket: &super::review_evidence::ReviewRepinTicket,
+        used: u32,
     ) -> Result<(), String> {
         let AgentAction::TaskReview(input) = &envelope.action else {
             return Ok(());
@@ -1326,6 +1398,19 @@ impl RuntimeServices {
             .execution_id
             .clone()
             .ok_or("review attempt settlement requires the reviewing execution id")?;
+        let physical = envelope.actor.original_execution.as_ref().ok_or("review cut settlement physical owner missing")?;
+        if used <= MAX_REVIEW_CUT_REBUILDS || !ticket.movement().rebuildable()
+            || ticket.review_ref() != super::review_evidence::node_review_ref(&physical.graph_id, &physical.node_id)
+            || ticket.attempt() != physical.attempt || execution_id != physical.graph_id
+            || program.program_id != envelope.actor.program_id
+        {
+            return Err("review cut settlement original ticket mismatch".into());
+        }
+        let origin = ReviewCutSettlement {
+            program_id: program.program_id.clone(), task_ref: input.task_ref.clone(),
+            execution_id: execution_id.clone(), node_id: physical.node_id.clone(), attempt: physical.attempt,
+            used, ticket: ticket.clone(),
+        };
         let fail = AgentActionEnvelope {
             action_id: format!(
                 "runtime-wedged-review-settle:{}:{}:{}",
@@ -1344,7 +1429,8 @@ impl RuntimeServices {
         // Break the static recursion between submit_agent_action -> settle ->
         // submit_agent_action (the TaskAttemptFail action never re-enters the
         // positive-review branch, so this cannot loop at runtime).
-        let observation = Box::pin(self.submit_runtime_supervisor_action(&fail)).await?;
+        let observation = Box::pin(self.submit_agent_action_from_owner(&fail, false, true, None, None, Some(&origin)))
+            .await?.into_single()?;
         if observation.status != AgentActionStatus::Applied {
             return Err(observation
                 .error
@@ -1768,6 +1854,140 @@ mod tests {
         MessagePublishInput, TaskReviewDecision, TaskReviewInput, TeamCreateInput,
     };
 
+    #[test]
+    fn p2_untrusted_result_reference_cannot_mint_source_move_ticket() {
+        let error = "review result has no Runtime-resolved producer:result metadata source changed during resolution; rebuild the review; source=forged expected=4 actual=5 phase=result_source_pin";
+        let error = super::super::review_evidence::ReviewEvidenceError::from(error);
+        assert!(error.review_ticket("graph/node", 1).is_none(),
+            "an ordinary error containing a model-controlled reference is not a producer pin");
+    }
+
+    #[test]
+    fn p2_untrusted_result_reference_cannot_consume_program_rebuilds() {
+        let error = "review result has no Runtime-resolved producer:result metadata changed after original effect enumeration";
+        assert!(!is_review_program_advanced(&error.into()),
+            "a model-controlled reference is not an observed Program movement");
+    }
+
+    // Real graph and settlement owner; the earlier Program journal is a
+    // synthetic fixture. This is not a concurrent attempt-switch control.
+    #[test]
+    fn gb3_stale_cut_ticket_does_not_settle_another_physical_attempt() {
+        use crate::execution_core::graph::{ExecutionCommitService, ExecutionGraphStateStore, ExecutionNodeBinding, NodeExecutionTicket};
+        use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus};
+        use std::{collections::BTreeMap, sync::Arc};
+        let store = Arc::new(crate::RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(Arc::clone(&store));
+        let mut graph = ExecutionGraph::new("GB3 physical attempt fence").with_lineage(ExecutionGraphLineage {
+            session_id:"session".into(), turn_id:"turn".into(), root_task_id:"task".into(), task_id:"task".into(), generation:1,
+        });
+        graph.nodes.push(ExecutionNodeSpec { id: "node".into(), kind: ExecutionNodeKind::InlineModel,
+            payload_ref: "payload".into(), executor_kind: "inline_model".into(), idempotency_key: "gb3-attempt".into(),
+            lease_ref: None, acceptance: Default::default(), retry_policy: Default::default(), resource_scopes: Vec::new(), work: None });
+        let graph = commits.register_graph(graph).unwrap().graph;
+        let graph = commits.transition_node(&graph, "node", ExecutionNodeStatus::Ready, None, Vec::new()).unwrap().graph;
+        let binding = ExecutionNodeBinding { executor_kind: "inline_model".into(), ticket_idempotency_key: "gb3-attempt".into(),
+            attempt: 1, resource_lease_refs: Vec::new(), scope_lease_ref: None, worktree_lease_ref: None };
+        let ticket = NodeExecutionTicket { graph_id: graph.id.clone(), node_id: "node".into(), executor_kind: "inline_model".into(),
+            service_class: graph.service_class, attempt: 1, idempotency_key: "gb3-attempt".into(), payload_ref: "payload".into() };
+        let graph = commits.bind_and_start_nodes(&graph, BTreeMap::from([("node".into(), binding)]), vec![ticket]).unwrap().graph;
+        let service = crate::AgentActionService::new(Arc::clone(&store)).with_graph_store(ExecutionGraphStateStore::new(Arc::clone(&store)));
+        // Retained Program journal is a synthetic fixture; graph ownership and
+        // the settlement call below use their production owners.
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        program.session_id = "session".into();
+        program.turn_id = "turn".into();
+        let actor = runtime_supervisor_actor(&program, Some(graph.id.clone()));
+        let publish: harness_contract::agent_action::TaskPublishInput = serde_json::from_value(serde_json::json!({
+            "team_ref":"team", "title":"task", "objective":"read", "acceptance":"cite", "required_capabilities":[]
+        })).unwrap();
+        let actions = [
+            AgentAction::TaskPublish(publish),
+            AgentAction::TaskSubmit(harness_contract::agent_action::TaskSubmitInput {
+                task_ref:"task".into(), artifact_refs:Vec::new(), evidence_refs:Vec::new(), unresolved:Vec::new(), deliverable:None,
+            }),
+            AgentAction::TaskAttemptDispatch(harness_contract::agent_action::TaskAttemptDispatchInput {
+                task_ref:"task".into(), execution_id:graph.id.clone(), agent_ref:"reviewer".into(), membership_id:"member".into(),
+                mode:AgentAttemptMode::Review, generation:0,
+            }),
+        ];
+        let stream = "agentic-program:program";
+        let mut events = vec![crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput { stream_id:stream.into(), scope:crate::RuntimeEventScope::Program,
+                kind:"agentic.program_opened".into(), status:Some("open".into()), actor:Some("test".into()), refs:Vec::new(),
+                payload:serde_json::json!({"program_id":"program", "objective_id":"objective", "session_id":"session", "turn_id":"turn"}) },
+            idempotency_key:Some("gb3-program-open".into()), schema_version:1,
+        }];
+        for (index, action) in actions.into_iter().enumerate() {
+            let envelope = AgentActionEnvelope { action_id:format!("gb3-seed-{index}"), actor:actor.clone(), expected_revision:None, action };
+            events.push(crate::RuntimeTransactionEventInput { event:crate::RuntimeEventInput {
+                stream_id:stream.into(), scope:crate::RuntimeEventScope::Program, kind:"agentic.action_applied".into(),
+                status:Some("applied".into()), actor:Some("test".into()), refs:Vec::new(),
+                payload:serde_json::json!({"envelope":envelope, "entity_ref":"task"}) },
+                idempotency_key:Some(format!("gb3-seed-{index}")), schema_version:1 });
+        }
+        store.append_transaction(crate::AppendTransactionRequest { transaction_id:"gb3-seed-program".into(),
+            expected_streams:vec![crate::ExpectedStreamRevision { stream_id:stream.into(), expected_revision:0 }], events }).unwrap();
+        let reason = "result metadata source changed during resolution; rebuild the review; source=stream expected=4 actual=5 phase=result_source_pin";
+        let ticket = review_repin_ticket_for(&graph.id, "node", 2, reason).unwrap();
+        let origin = ReviewCutSettlement { program_id: "program".into(), task_ref: "task".into(), execution_id: graph.id.clone(),
+            node_id: "node".into(), attempt: 2, used: 3, ticket };
+        let fail = AgentActionEnvelope { action_id: "gb3-stale".into(), actor, expected_revision: None,
+            action: AgentAction::TaskAttemptFail(TaskAttemptFailInput { task_ref: "task".into(), execution_id: graph.id.clone(),
+                mode: AgentAttemptMode::Review, reason: "window".into(), retryable: true }) };
+        let program_stream = "agentic-program:program";
+        let before = store.stream_revision(program_stream).unwrap();
+        let error = service.apply_runtime_supervisor_review_cut(&fail, &origin).unwrap_err();
+        assert!(error.to_string().contains("review_cut_original_attempt_changed"), "{error}");
+        assert_eq!(store.stream_revision(program_stream).unwrap(), before);
+        assert_eq!(store.stream_revision(&graph.id).unwrap(), graph.revision);
+        let ticket = review_repin_ticket_for(&graph.id, "node", 1, reason).unwrap();
+        let origin = ReviewCutSettlement { attempt:1, ticket, ..origin };
+        let applied = service.apply_runtime_supervisor_review_cut(&fail, &origin).unwrap();
+        assert_eq!(applied.status, harness_contract::agent_action::AgentActionStatus::Applied);
+        let committed_revision = store.stream_revision(program_stream).unwrap();
+        assert_eq!(committed_revision, before + 1);
+        let replay = service.apply_runtime_supervisor_review_cut(&fail, &origin).unwrap();
+        assert!(replay.duplicate);
+        assert_eq!(store.stream_revision(program_stream).unwrap(), committed_revision);
+        let projected = service.project("program").unwrap();
+        assert_eq!(projected.tasks["task"].structural_review_stalls, 1);
+        assert_eq!(projected.tasks["task"].failed_review_attempts, 0);
+    }
+
+    #[test]
+    fn gb3_cut_origin_requires_active_original_review_and_exhausted_ticket() {
+        let mut program = crate::AgenticProgramProjection::empty("program", "objective");
+        let actor = runtime_supervisor_actor(&program, Some("graph".into()));
+        let publish: harness_contract::agent_action::TaskPublishInput = serde_json::from_value(serde_json::json!({
+            "team_ref":"team", "title":"task", "objective":"read", "acceptance":"cite", "required_capabilities":[]
+        })).unwrap();
+        let env = AgentActionEnvelope { action_id:"publish".into(), actor:actor.clone(), expected_revision:None, action:AgentAction::TaskPublish(publish.clone()) };
+        super::super::work_market::apply_task_publish(&mut program, &env, &publish, Some("task"));
+        let task = program.tasks.get_mut("task").unwrap();
+        task.status = super::super::AgenticTaskStatus::Submitted;
+        task.review_generation = 4;
+        task.active_attempts.insert("graph".into(), super::super::AgenticTaskAttemptProjection {
+            execution_id:"graph".into(), agent_id:"agent".into(), membership_id:"member".into(), mode:AgentAttemptMode::Review, generation:4,
+        });
+        let reason = "result metadata source changed during resolution; rebuild the review; source=stream expected=4 actual=5 phase=result_source_pin";
+        let ticket = review_repin_ticket_for("graph", "node", 1, reason).unwrap();
+        let mut origin = ReviewCutSettlement { program_id:"program".into(), task_ref:"task".into(), execution_id:"graph".into(), node_id:"node".into(), attempt:1, used:3, ticket };
+        let mut fail = AgentActionEnvelope { action_id:"settle".into(), actor, expected_revision:None,
+            action:AgentAction::TaskAttemptFail(TaskAttemptFailInput { task_ref:"task".into(), execution_id:"graph".into(), mode:AgentAttemptMode::Review, reason:"window".into(), retryable:true }) };
+        assert!(origin.event_metadata(&fail).is_ok());
+        assert!(origin.validate_active(&program).is_ok());
+        origin.used = 2;
+        assert!(origin.event_metadata(&fail).is_err());
+        origin.used = 3;
+        fail.actor.kind = AgentActorKind::Agent;
+        assert!(origin.event_metadata(&fail).is_err());
+        program.tasks.get_mut("task").unwrap().review_generation = 5;
+        assert!(origin.validate_active(&program).is_err());
+        program.tasks.get_mut("task").unwrap().active_attempts.clear();
+        assert!(origin.validate_active(&program).is_err());
+    }
+
     /// 033 S7 (supplementary pin): the 032 invariant - a Root actor without
     /// an original physical receipt is refused at the ingress gate - holds
     /// for every program-state action shape, not only for the ones the
@@ -1855,7 +2075,7 @@ mod tests {
                 action,
             };
             let message = match services
-                .submit_agent_action_from_owner(&envelope, false, false, None, None)
+                .submit_agent_action_from_owner(&envelope, false, false, None, None, None)
                 .await
             {
                 Ok(_) => panic!("{shape}: a Root action without an original physical receipt must be refused at the ingress gate"),
@@ -1883,19 +2103,17 @@ mod tests {
 
     #[test]
     fn t_removal_program_move_classification_still_holds() {
-        // 032 K3 kept exactly this classifier while deleting the retry-class
-        // streak family (A6/A7/A9); the old fixture that covered both lives on
-        // here in the surviving half.
-        assert!(is_review_program_advanced(
-            "result metadata changed after original effect enumeration: result=artifact:one source=session:one expected=1 observed=2; rebuild the review"
-        ));
-        assert!(is_review_program_advanced(
-            "result Program changed during original producer resolution: source agentic-program:one is at revision 2 but the reviewed Program projection is at 1"
-        ));
-        assert!(!is_review_program_advanced(
-            "result metadata source changed during resolution; rebuild the review; source=session:one expected=1 actual=2 phase=result_source_pin"
-        ));
-        assert!(!is_review_program_advanced("task_not_found"));
+        // Display code recognition remains compatible, but ordinary text no
+        // longer grants a Program-rebuild budget without the producer's type.
+        let enumeration = "result metadata changed after original effect enumeration: result=artifact:one source=session:one expected=1 observed=2; rebuild the review";
+        assert_eq!(crate::agentic::review_evidence::reason_code::reason_code_of(enumeration),
+            Some(crate::agentic::review_evidence::reason_code::ReviewRefusalCode::ResultMetadataChangedAfterEnumeration));
+        for message in [enumeration,
+            "result Program changed during original producer resolution: source agentic-program:one is at revision 2 but the reviewed Program projection is at 1",
+            "result metadata source changed during resolution; rebuild the review; source=session:one expected=1 actual=2 phase=result_source_pin",
+            "task_not_found"] {
+            assert!(!is_review_program_advanced(&message.into()));
+        }
     }
 
     /// The three transcription shapes a server repairs are repaired to the one
@@ -1942,7 +2160,7 @@ mod tests {
             "tool-raw-call-a-2c77431438342406112233445566778899".to_string(),
         ];
         match repair_receipt_citation("tool-raw-call-a-2c77", &recorded) {
-            EvidenceCitation::Ambiguous(candidates) => assert_eq!(candidates.len(), 2),
+            EvidenceCitation::Ambiguous(candidates) => assert_eq!(candidates, recorded),
             other => panic!("a two-way match is ambiguous, not a choice: {other:?}"),
         }
     }

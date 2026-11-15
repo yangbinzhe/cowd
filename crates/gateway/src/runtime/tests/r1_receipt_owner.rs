@@ -179,8 +179,8 @@ mod tests {
             .unwrap()
             .is_empty());
         let receipts = original_receipts(&store, &call()).unwrap();
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].payload["outcome"]["status"], "executed");
+        let [unique_receipts_182] = receipts.as_slice() else { panic!("expected the original receipts exactly once") };
+        assert_eq!(unique_receipts_182.payload["outcome"]["status"], "executed");
         let mut foreign = call();
         foreign.attempt = Some(2);
         assert!(original_receipts(&store, &foreign).unwrap().is_empty());

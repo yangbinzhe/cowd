@@ -5,9 +5,10 @@
     clippy::unreachable
 )]
 
-use std::pin::Pin;
+#[path = "support/controlled_empty_api.rs"]
+mod controlled_empty_api;
+use controlled_empty_api::ControlledEmptyApi;
 
-use futures::Stream;
 use harness_contract::core::{ExecutionPattern, TaskComplexity, TaskRisk};
 use harness_contract::growth::{
     GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthSeverity, GrowthSignal,
@@ -21,8 +22,8 @@ use runtime::eval_gate::{
     ScenarioCheck, ScenarioCheckKind, ScenarioObservation, ScenarioSpec, ScenarioSuite,
 };
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationRuntime, PermissionMode,
-    PermissionPolicy, RuntimeAiKernel, RuntimeAiKernelTrace, RuntimeError, Session, SharedPrompter,
+    ContentBlock, ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeAiKernel,
+    RuntimeAiKernelTrace, Session, SharedPrompter,
     StaticToolExecutor, TurnSummary,
 };
 
@@ -146,7 +147,7 @@ fn simple_question_stays_direct_and_clean() {
     let report = ScenarioSuite::new(vec![spec]).evaluate(&[observation]);
 
     assert!(report.verdicts[0].passed, "{:?}", report.verdicts[0]);
-    assert_eq!(trace.growth_event.memory_candidates.len(), 0);
+    assert!(trace.growth_event.memory_candidates.is_empty());
 }
 
 #[test]
@@ -238,7 +239,7 @@ async fn empty_answer_is_blocked_by_finalization_gate() {
     let session_id = session.session_id.clone();
     let mut runtime = ConversationRuntime::new(
         session,
-        EmptyApi,
+        ControlledEmptyApi::new(None),
         StaticToolExecutor::new(),
         PermissionPolicy::new(PermissionMode::WorkspaceWrite),
         vec!["system prompt".to_string()],
@@ -485,16 +486,4 @@ fn underspecified_complex_trace_exposes_improvement_signal() {
         .next_strategy_hints
         .iter()
         .any(|hint| hint.contains("execute")));
-}
-
-#[derive(Clone)]
-struct EmptyApi;
-
-impl ApiClient for EmptyApi {
-    fn stream(
-        &mut self,
-        _request: ApiRequest,
-    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-        Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
-    }
 }

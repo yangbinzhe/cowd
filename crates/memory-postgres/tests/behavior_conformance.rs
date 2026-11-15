@@ -193,10 +193,11 @@ async fn search_by_layer_filters_correctly() {
         .unwrap();
 
     let l1 = store.search_by_layer(MemoryLayer::L1).await.unwrap();
-    assert_eq!(l1.len(), 2);
+    assert_eq!(l1.iter().map(|entry| entry.id).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from([uid("a"), uid("c")]));
+    assert_eq!(l1.len(), l1.iter().map(|entry| entry.id).collect::<std::collections::BTreeSet<_>>().len());
 
     let l2 = store.search_by_layer(MemoryLayer::L2).await.unwrap();
-    assert_eq!(l2.len(), 1);
+    assert_eq!(l2.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![uid("b")]);
 }
 
 #[tokio::test]
@@ -252,8 +253,7 @@ async fn search_by_category_returns_matching() {
         .search_by_category(MemoryCategory::Decision)
         .await
         .unwrap();
-    assert_eq!(decisions.len(), 1);
-    assert_eq!(decisions[0].id, e1_id);
+    assert_eq!(decisions.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![e1_id]);
 }
 
 #[tokio::test]
@@ -279,8 +279,7 @@ async fn search_fts_finds_by_content() {
         .unwrap();
 
     let results = store.search_fts("Rust", 10).await.unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, e1_id);
+    assert_eq!(results.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![e1_id]);
 }
 
 #[tokio::test]
@@ -326,7 +325,8 @@ async fn list_metas_all_layers() {
         .unwrap();
 
     let metas = store.list_metas(None).await.unwrap();
-    assert_eq!(metas.len(), 2);
+    assert_eq!(metas.iter().map(|entry| entry.id).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from([uid("meta2"), uid("meta3")]));
+    assert_eq!(metas.len(), metas.iter().map(|entry| entry.id).collect::<std::collections::BTreeSet<_>>().len());
 }
 
 #[tokio::test]
@@ -343,7 +343,8 @@ async fn list_all_returns_all_entries() {
         .unwrap();
 
     let all = store.list_all().await.unwrap();
-    assert_eq!(all.len(), 2);
+    assert_eq!(all.iter().map(|entry| entry.id).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from([uid("all1"), uid("all2")]));
+    assert_eq!(all.len(), all.iter().map(|entry| entry.id).collect::<std::collections::BTreeSet<_>>().len());
 }
 
 #[tokio::test]
@@ -387,8 +388,7 @@ async fn tagged_lookup_is_scoped_bounded_and_source_aware() {
         .await
         .unwrap();
 
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].title, "selected");
+    assert_eq!(candidates.iter().map(|entry| entry.title.as_str()).collect::<Vec<_>>(), vec!["selected"]);
 }
 
 #[tokio::test]
@@ -428,9 +428,11 @@ async fn maintenance_scan_uses_stable_keyset_pages() {
         .collect::<std::collections::BTreeSet<_>>();
 
     assert_eq!(first.entries.len(), 2);
-    assert_eq!(second.entries.len(), 2);
-    assert_eq!(third.entries.len(), 1);
-    assert_eq!(ids.len(), 5);
+    let [second_left, second_right] = second.entries.as_slice() else { panic!("second page must contain two entries"); };
+    assert_ne!(second_left.id, second_right.id);
+    let [last] = third.entries.as_slice() else { panic!("last page must contain one entry"); };
+    assert!(!first.entries.iter().chain(&second.entries).any(|entry| entry.id == last.id));
+    assert_eq!(ids, (0..5).map(|index| uid(&format!("scan-{index}"))).collect());
     assert!(third.next.is_none());
 }
 
@@ -591,11 +593,9 @@ async fn test_symbol_full_text_search() {
         .unwrap();
 
     let results = store.search_symbols("alpha_func", 10).await.unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].name, "alpha_func");
+    assert_eq!(results.iter().map(|symbol| symbol.name.as_str()).collect::<Vec<_>>(), vec!["alpha_func"]);
     let results = store.search_symbols("bravoClass", 10).await.unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].name, "bravoClass");
+    assert_eq!(results.iter().map(|symbol| symbol.name.as_str()).collect::<Vec<_>>(), vec!["bravoClass"]);
 
     // Verify no match returns empty
     let empty = store.search_symbols("zzznonexistent", 1).await.unwrap();
@@ -618,8 +618,7 @@ async fn test_get_callers() {
     store.insert_edge(&edge).await.unwrap();
 
     let callers = store.get_callers("b:callee:1").await.unwrap();
-    assert_eq!(callers.len(), 1, "should find one caller");
-    assert_eq!(callers[0].name, "caller_fn");
+    assert_eq!(callers.iter().map(|symbol| symbol.name.as_str()).collect::<Vec<_>>(), vec!["caller_fn"]);
 }
 
 #[tokio::test]
@@ -645,9 +644,9 @@ async fn test_get_callees() {
     }
 
     let callees = store.get_callees("a:call_main:1").await.unwrap();
-    assert_eq!(callees.len(), 2, "main should call foo and bar");
-    assert!(callees.iter().any(|s| s.name == "foo"));
-    assert!(callees.iter().any(|s| s.name == "bar"));
+    let names = callees.iter().map(|symbol| symbol.name.as_str()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(names, std::collections::BTreeSet::from(["foo", "bar"]));
+    assert_eq!(callees.len(), names.len());
 }
 
 // -------------------------------------------------------------------

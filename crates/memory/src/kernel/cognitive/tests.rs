@@ -96,7 +96,8 @@ async fn index_persistence_failure_keeps_embedding_checkpoint_for_restart() {
             .await
             .is_err()
     );
-    assert_eq!(store.list_key_values().await.unwrap().len(), 1);
+    let checkpoints = store.list_key_values().await.unwrap();
+    assert!(matches!(checkpoints.as_slice(), [checkpoint] if checkpoint.key.starts_with("embedding-progress:v1:")));
     let restored = RwLock::new(VectorIndex::new(temp.path().join("recovered.json"), 2).unwrap());
     let capability = EmbeddingCapability::Remote {
         client: crate::embedding::EmbeddingClient::new(config).with_progress_store(store.clone()),
@@ -161,7 +162,13 @@ fn background_extraction_coalesces_retries_but_keeps_distinct_turns() {
         },
     ));
 
-    assert_eq!(batches.len(), 3);
+    let identities = batches.values().map(|(request, _)|
+        (request.turn.session_id.as_str(), request.messages[0].content.as_str())
+    ).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(identities, std::collections::BTreeSet::from([
+        ("session-a", "first"), ("session-a", "latest"), ("session-b", "other session")
+    ]));
+    assert_eq!(batches.len(), identities.len());
     let first = batches
         .get(&background_extraction_key(&first))
         .expect("coalesced first turn");
@@ -265,10 +272,8 @@ fn semantic_extraction_refines_same_turn_heuristic_without_hiding_other_atoms() 
         &heuristic,
     );
 
-    assert_eq!(refinements.len(), 1);
-    assert_eq!(refinements[0].0.id, heuristic[0].id);
-    assert_eq!(inserts.len(), 1);
-    assert_eq!(inserts[0].id, semantic_reference.id);
+    assert_eq!(refinements.iter().map(|entry| entry.0.id).collect::<Vec<_>>(), vec![heuristic[0].id]);
+    assert_eq!(inserts.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![semantic_reference.id]);
 }
 
 fn semantic_entry(
@@ -458,6 +463,7 @@ async fn corrupt_vector_artifact_degrades_to_fts_without_false_empty() {
         "quartz-harbor-needle remains searchable through FTS",
         &["fallback"],
     );
+    let entry_id = entry.id;
     mgr.remember(entry).await.unwrap();
     let result = mgr
         .search_memories(SearchMemoriesRequest {
@@ -467,7 +473,7 @@ async fn corrupt_vector_artifact_degrades_to_fts_without_false_empty() {
         })
         .await
         .unwrap();
-    assert_eq!(result.entries.len(), 1);
+    assert_eq!(result.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![entry_id]);
     let health = mgr.background_extraction_health();
     assert!(health.degraded_to_fts);
     assert!(health.last_index_error.is_some());
@@ -623,7 +629,7 @@ async fn test_auto_inject_on_code_query() {
 
     // code_context may be None (no code indexer in test config) or Some
     // This test primarily validates the pipeline doesn't crash
-    assert_eq!(ctx.entries.len(), 0); // empty project has no entries
+    assert!(ctx.entries.is_empty()); // empty project has no entries
 }
 
 #[tokio::test]

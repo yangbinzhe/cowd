@@ -256,7 +256,7 @@ async fn completed_ingress_483(
     assert!(record.claim_expires_at_ms.is_none());
     assert!(record.terminal_at_ms.is_some());
     let claims = claims_483(&services.topology, std::slice::from_ref(&record.request_id));
-    assert_eq!(claims.len(), 1);
+    assert!(matches!(claims.as_slice(), [claim] if claim.3 == 1 && claim.1 == record.claim_owner.as_deref().unwrap() && claim.2 == record.claim_token.as_deref().unwrap()));
     assert_eq!(claims[0].3, 1);
     assert_eq!(record.claim_owner.as_deref(), Some(claims[0].1.as_str()));
     assert_eq!(record.claim_token.as_deref(), Some(claims[0].2.as_str()));
@@ -429,7 +429,7 @@ async fn r1_gateway_startup_local_corruption_keeps_healthy_ingress_before_and_af
         }
         completed_ingress_483(services, &before).await;
         completed_ingress_483(services, &after).await;
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen, BTreeSet::from(["HEALTHY_BEFORE_483", "HEALTHY_AFTER_483"]));
         assert_eq!(
             ingress_snapshot_483(&services.topology, &ids[1]),
             frozen_ingress
