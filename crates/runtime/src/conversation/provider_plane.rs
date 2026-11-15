@@ -1363,7 +1363,7 @@ where
                     source_turn,
                     source_readset,
                 );
-                let stream_run = consume_owned_provider_stream(
+                let stream_run = Box::pin(consume_owned_provider_stream(
                     events,
                     cancellation,
                     Some(ProviderStreamTimeoutPolicy {
@@ -1374,7 +1374,7 @@ where
                     None,
                     transport_activity,
                     execution,
-                )
+                ))
                 .await;
                 tracing::info!(
                     target: "cowd::terminal_provider",
@@ -2705,7 +2705,7 @@ where
                 source_turn,
                 source_readset,
             );
-            let stream_run = consume_owned_provider_stream(
+            let stream_run = Box::pin(consume_owned_provider_stream(
                 events,
                 cancellation,
                 Some(ProviderStreamTimeoutPolicy {
@@ -2716,7 +2716,7 @@ where
                 early_dispatcher.clone(),
                 transport_activity,
                 execution,
-            )
+            ))
             .await;
             // Construct the result phase only after the original stream and
             // producer/consumer finish have returned in this same task.

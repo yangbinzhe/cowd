@@ -2949,15 +2949,12 @@ where
         if final_answer.trim().is_empty() {
             return Err(RuntimeError::new("model produced an empty final answer"));
         }
-        if self.active_turn_strategy().is_none() {
-            return Err(RuntimeError::new(
-                "turn finalization requires the Host-admitted turn strategy owner",
-            ));
-        }
         let decision = self
             .active_turn_strategy()
             .map(|state| state.decision)
-            .ok_or_else(|| RuntimeError::new("turn finalization has no strategy owner"))?;
+            .ok_or_else(|| RuntimeError::new(
+                "turn finalization requires the Host-admitted turn strategy owner",
+            ))?;
         let mut kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
             self.session_id().to_string(),
             user_input.to_string(),

@@ -10,9 +10,12 @@ pub(crate) mod fact_admission;
 pub mod action_invocation;
 pub(crate) mod continuation;
 pub(crate) mod coordination;
-pub(crate) mod budget_ledger_mirror;
+#[cfg(feature = "test-fixtures")]
+mod coordination_test_fixtures;
 pub(crate) mod execution;
 mod ingress;
+#[cfg(test)]
+pub(crate) use ingress::gb3_settle_synthetic_old_cut_for_graph_test;
 pub(crate) mod issues;
 pub(crate) mod order_contract;
 mod program;

@@ -16,7 +16,7 @@ mod pre_effect_admission_555 {
     #[async_trait::async_trait]
     impl ToolExecutor for PinnedTools555 {
         fn available_tool_names(&self) -> Vec<String> {
-            let mut names = vec!["workspace_snapshot".into(), "read_file".into()];
+            let mut names = vec!["workspace_snapshot".into(), "read_file".into(), "checkpoint".into()];
             if self.preflight.is_some() || self.root_closed {
                 names.push("edit".into());
             }
@@ -51,6 +51,12 @@ mod pre_effect_admission_555 {
             name: &str,
             input: &str,
         ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
+            if name == "checkpoint" {
+                let input = serde_json::from_str(input).map_err(|error| crate::ToolError::new(error.to_string()))?;
+                return self.lease.execute_async(authorization, name, &input).await
+                    .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+                    .map_err(|error| crate::ToolError::new(error.to_string()));
+            }
             let (commit, parent, attempt) = self
                 .preflight
                 .as_ref()
@@ -391,7 +397,26 @@ mod pre_effect_admission_555 {
                     }),
             )
         } else {
-            None
+            let objective = harness_contract::agent_action::root_objective_id(
+                &fixture.session.session_id,
+                "471-turn",
+            );
+            let goal: GoalContract = serde_json::from_value(serde_json::json!({
+                "id":format!("goal:{}",graph.id),"session_id":fixture.session.session_id,
+                "objective":"Read workspace files and report the observed result.",
+                "criteria":[{"id":"checked","statement":"answer checked","status":"satisfied"}],
+                "phase":"execution","spec_revision":1,"spec_digest":"555-original",
+                "scope":"internal","completion":"open","revision":1,"user_sequence":1,
+                "execution_binding":{"objective_id":objective,"session_id":fixture.session.session_id,
+                    "turn_id":"471-turn","root_execution_id":graph.id,
+                    "agentic_program_id":harness_contract::agent_action::program_id_for_objective(&objective)}
+            })).unwrap();
+            services.goal_store().create(goal).unwrap();
+            Some(runtime.cowd_bus().unwrap().enter_execution(crate::CowdExecutionContext {
+                execution_id: graph.id.clone(),
+                session_id: fixture.session.session_id.clone(),
+                turn_id: "471-turn".into(),
+            }))
         };
         let lease = host.host.pin_snapshot();
         let advertised = lease
@@ -551,7 +576,7 @@ mod pre_effect_admission_555 {
         node.id = format!("{}:original-tools", graph.id);
         node.idempotency_key = format!("{}:original", node.id);
         graph.nodes.push(node.clone());
-        let mut state = publication_state(&fixture.session.session_id, &fixture.goal_id);
+        let mut state = publication_state(&fixture.session.session_id, &format!("goal:{}", graph.id));
         state.content = "Read workspace files and report the observed result.".into();
         state.task_understanding = Some(strategy.decision.strategy.understanding.clone());
         state.collaboration_obligation = strategy.decision.collaboration_obligation.clone();
@@ -1524,7 +1549,7 @@ async fn real_host_471_foreign_pending_terminal_pin_cannot_be_promoted() {
         return;
     }
     let fixture = PublicationFixture::new();
-    let (host, _store, _ingress) = claimed_ingress_host(&fixture, false).await;
+    let (host, _store, _ingress, _lease) = claimed_ingress_host(&fixture, false).await;
     let outcome = host.synthesize(&fixture.ticket).await.unwrap();
     fixture.commit(&outcome);
     host.state
@@ -1621,6 +1646,7 @@ async fn claimed_ingress_host(
     PublicationHost,
     Arc<session::UnifiedSessionStore>,
     TurnIngressRef,
+    crate::execution_core::services::ActiveExecutionBusLease,
 ) {
     claimed_ingress_host_with_prompt(fixture, stale, "answer directly").await
 }
@@ -1633,6 +1659,7 @@ async fn claimed_ingress_host_with_prompt(
     PublicationHost,
     Arc<session::UnifiedSessionStore>,
     TurnIngressRef,
+    crate::execution_core::services::ActiveExecutionBusLease,
 ) {
     let store = Arc::new(crate::test_support::session_store());
     let session_id = &fixture.session.session_id;
@@ -1655,7 +1682,7 @@ async fn claimed_ingress_host_with_prompt(
         .await
         .unwrap();
     let now = crate::tool_invocation::now_ms();
-    let request_id = format!("471-request-{}", uuid::Uuid::new_v4());
+    let request_id = fixture.request_id.clone();
     let message_id = format!("471-message-{}", uuid::Uuid::new_v4());
     let request = session::SessionRuntimeOutboxRequest {
         input_id: format!("471-input-{request_id}"),
@@ -1729,7 +1756,7 @@ async fn claimed_ingress_host_with_prompt(
             .await
             .unwrap();
     }
-    let runtime = PublicationRuntime::new(
+    let mut runtime = PublicationRuntime::new(
         fixture.session.clone(),
         NoReplayClient(fixture.calls.clone()),
         NoReplayTools,
@@ -1739,13 +1766,53 @@ async fn claimed_ingress_host_with_prompt(
     .without_memory()
     .with_runtime_event_store(fixture.services.event_store().clone())
     .with_artifact_store(fixture.artifacts.clone())
-    .with_session_execution_fence(fence);
+    .with_session_execution_fence(fence.clone());
     runtime
         .begin_turn_strategy("471-turn", "answer directly")
         .unwrap();
     runtime
         .bind_turn_strategy_execution("471-turn", &fixture.graph.id)
         .unwrap();
+    let execution_id = crate::session_ingress_graph_id(session_id, &request_id, "471-turn");
+    assert_eq!(execution_id, fixture.graph.id);
+    let control = fixture
+        .services
+        .create_turn_cancellation_control(&execution_id, &ingress)
+        .unwrap();
+    runtime
+        .install_provider_cancellation_control(Some(control.clone()))
+        .unwrap();
+    let bus = runtime
+        .cowd_bus()
+        .cloned()
+        .unwrap_or_else(crate::CowdEventBus::new);
+    fixture
+        .services
+        .record_live_execution(session_id, execution_id.clone(), "471-turn".into());
+    let lease = fixture
+        .services
+        .bind_active_execution_bus(execution_id.clone(), bus)
+        .unwrap();
+    let (input, requested) = runtime.original_policy_input_context("471-turn");
+    input.set_active_turn(Some(harness_contract::turn::TurnId::from_string("471-turn")));
+    let claim = lease
+        .install_session_fence(
+            &ingress,
+            fence,
+            control,
+            input,
+            requested,
+            runtime.permission_policy().clone(),
+        )
+        .unwrap();
+    runtime.set_original_session_claim(Some(claim));
+    lease
+        .install_session_policy_owner(Arc::new(runtime.shared_policy_owner()))
+        .unwrap();
+    fixture.services.publish_session_execution_policy(
+        session_id.clone(),
+        runtime.permission_policy().execution_policy_control(),
+    );
     let mut state = publication_state(session_id, &fixture.goal_id);
     state.terminal_override = Some((GoalCompletion::Satisfied, ORIGINAL_ANSWER.into()));
     state.ingress = Some(ingress.clone());
@@ -1757,6 +1824,7 @@ async fn claimed_ingress_host_with_prompt(
         },
         store,
         ingress,
+        lease,
     )
 }
 
@@ -1767,7 +1835,7 @@ async fn real_host_471_stale_ingress_generation_does_not_publish_or_forge_claim(
         return;
     }
     let fixture = PublicationFixture::new();
-    let (host, _store, ingress) = claimed_ingress_host(&fixture, true).await;
+    let (host, _store, ingress, _lease) = claimed_ingress_host(&fixture, true).await;
     let before = messages(&host).await;
     let cursor = fixture
         .services
@@ -1809,6 +1877,13 @@ const ORIGINAL_ANSWER: &str = "Original terminal answer 471: the verified result
 struct NoReplayClient(Arc<AtomicUsize>);
 
 impl ApiClient for NoReplayClient {
+    fn configure_turn_cancellation(
+        &mut self,
+        _control: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+    ) -> Result<(), RuntimeError> {
+        // This fixture rejects every provider replay and owns no producer.
+        Ok(())
+    }
     fn stream(
         &mut self,
         _request: crate::ApiRequest,
@@ -1845,6 +1920,7 @@ struct PublicationFixture {
     services: Arc<crate::RuntimeServices>,
     session: Session,
     goal_id: String,
+    request_id: String,
     graph: ExecutionGraph,
     ticket: NodeExecutionTicket,
     calls: Arc<AtomicUsize>,
@@ -1865,16 +1941,9 @@ impl PublicationFixture {
         let services = Self::services_at(&root, backend.clone(), artifacts.clone());
         let mut session = Session::new();
         session.extend_messages([ConversationMessage::user_text("answer directly")]);
-        let goal_id = format!("471-goal-{}", uuid::Uuid::new_v4());
-        let goal: GoalContract = serde_json::from_value(serde_json::json!({
-            "id":goal_id,"session_id":session.session_id,"objective":"answer directly",
-            "criteria":[{"id":"checked","statement":"answer checked","status":"satisfied"}],
-            "phase":"execution","spec_revision":1,"spec_digest":"471-spec",
-            "scope":"internal","completion":"open","revision":1,"user_sequence":1
-        }))
-        .unwrap();
-        services.goal_store().create(goal).unwrap();
+        let request_id = format!("471-request-{}", uuid::Uuid::new_v4());
         let mut graph = ExecutionGraph::new("answer directly");
+        graph.id = crate::session_ingress_graph_id(&session.session_id, &request_id, "471-turn");
         graph.lineage = Some(ExecutionGraphLineage {
             session_id: session.session_id.clone(),
             turn_id: "471-turn".into(),
@@ -1882,6 +1951,19 @@ impl PublicationFixture {
             task_id: "471-task".into(),
             generation: 1,
         });
+        let objective = harness_contract::agent_action::root_objective_id(&session.session_id, "471-turn");
+        let program = harness_contract::agent_action::program_id_for_objective(&objective);
+        let goal_id = format!("471-goal-{}", uuid::Uuid::new_v4());
+        let goal: GoalContract = serde_json::from_value(serde_json::json!({
+            "id":goal_id,"session_id":session.session_id,"objective":"answer directly",
+            "criteria":[{"id":"checked","statement":"answer checked","status":"satisfied"}],
+            "phase":"execution","spec_revision":1,"spec_digest":"471-spec",
+            "scope":"internal","completion":"open","revision":1,"user_sequence":1,
+            "execution_binding":{"objective_id":objective,"session_id":session.session_id,
+                "turn_id":"471-turn","root_execution_id":graph.id,"agentic_program_id":program}
+        }))
+        .unwrap();
+        services.goal_store().create(goal).unwrap();
         let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::Synthesize, "synthesize", "{}");
         node.id = format!("{}:synthesize", graph.id);
         node.idempotency_key = format!("{}:original", node.id);
@@ -1937,6 +2019,7 @@ impl PublicationFixture {
             services,
             session,
             goal_id,
+            request_id,
             graph,
             ticket,
             calls: Arc::new(AtomicUsize::new(0)),
@@ -1955,6 +2038,7 @@ impl PublicationFixture {
         let services = Self::services_at(&root, backend.clone(), artifacts.clone());
         let mut session = Session::new();
         session.extend_messages([ConversationMessage::user_text("answer directly")]);
+        let request_id = format!("rb-request-{}", uuid::Uuid::new_v4());
         let goal_id = format!("rb-goal-{}", uuid::Uuid::new_v4());
         let mut graph = ExecutionGraph::new("answer directly");
         graph.lineage = Some(ExecutionGraphLineage {
@@ -2011,7 +2095,7 @@ impl PublicationFixture {
             executor_kind:ticket.executor_kind.clone(), ticket_idempotency_key:ticket.idempotency_key.clone(),
             attempt:1, resource_lease_refs:vec![], scope_lease_ref:None, worktree_lease_ref:None,
         })]), vec![ticket.clone()]).unwrap().graph;
-        Self { root, backend, artifacts, services, session, goal_id, graph, ticket, calls:Arc::new(AtomicUsize::new(0)) }
+        Self { root, backend, artifacts, services, session, goal_id, request_id, graph, ticket, calls:Arc::new(AtomicUsize::new(0)) }
     }
 
     fn services_at(
@@ -2033,7 +2117,7 @@ impl PublicationFixture {
         session: Session,
         hot: bool,
     ) -> PublicationHost {
-        let runtime = PublicationRuntime::new(
+        let mut runtime = PublicationRuntime::new(
             session,
             NoReplayClient(self.calls.clone()),
             NoReplayTools,
@@ -2048,6 +2132,15 @@ impl PublicationFixture {
             .unwrap();
         runtime
             .bind_turn_strategy_execution("471-turn", &self.graph.id)
+            .unwrap();
+        let control = crate::execution_core::services::TurnCancellationControl::operational_with_token(
+            &self.session.session_id,
+            "471-turn",
+            &self.graph.id,
+            runtime.cancellation_token(),
+        );
+        runtime
+            .install_provider_cancellation_control(Some(control))
             .unwrap();
         let mut state = publication_state(&self.session.session_id, &self.goal_id);
         if hot {
@@ -2244,9 +2337,8 @@ async fn rb_actual_api_request_recovery_visibility_and_once() {
             Box::pin(stream::iter(vec![Ok(crate::AssistantEvent::TextDelta("ok".into())), Ok(crate::AssistantEvent::MessageStop)]))
         }
     }
-    async fn capture_once(feedback_item: Option<ContextItem>) -> Vec<crate::ApiRequest> {
+    async fn capture_once(feedback_item: Option<ContextItem>, original: &str) -> Vec<crate::ApiRequest> {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let original = "请只返回 JSON 对象，summary 字段使用中文。";
         let old_feedback = "Runtime terminal contract recovery: the previous presentation was rejected.";
         let content = if feedback_item.is_some() { original.to_string() } else { format!("{original}\n\n{old_feedback}") };
         let mut session = Session::new();
@@ -2289,11 +2381,12 @@ async fn rb_actual_api_request_recovery_visibility_and_once() {
     assert!(item.content.contains("summary"));
     assert!(!item.content.contains(&fixture.ticket.idempotency_key));
     assert!(!item.content.contains(&fixture.session.session_id));
-    let original = capture_once(None).await;
-    let once = capture_once(Some(item)).await;
+    let original_prompt = "请只返回 JSON 对象，summary 字段使用中文。";
+    let original = capture_once(None, original_prompt).await;
+    let once = capture_once(Some(item), original_prompt).await;
     assert_eq!(original.len(), 2);
     assert_eq!(once.len(), 2);
-    assert!(once.iter().all(|request| wire_text(request).contains("summary 字段使用中文")),
+    assert!(once.iter().all(|request| wire_text(request).contains(original_prompt)),
         "the original user contract must remain in the captured request");
     let original_counts = original.iter().map(|r| wire_text(r).matches("Runtime terminal contract recovery: the previous presentation was rejected.").count()).collect::<Vec<_>>();
     let once_counts = once.iter().map(|r| wire_text(r).matches("explicit language requirement for field(s) summary").count()).collect::<Vec<_>>();

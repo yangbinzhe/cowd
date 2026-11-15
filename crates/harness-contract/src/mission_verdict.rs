@@ -557,15 +557,17 @@ mod tests {
             digest: format!("sha256:{name}"),
             bytes,
         };
+        let expected_items = vec![item("one", 100), item("two", 100)];
         let ready = build_review_input_pack(
             vec!["one".to_string()],
-            vec![item("one", 100), item("two", 100)],
+            expected_items.clone(),
             1_000,
             500,
         );
         match ready {
             ReviewInputPackOutcome::Ready(pack) => {
-                assert_eq!(pack.items.len(), 2);
+                assert!(!expected_items.is_empty());
+                assert_eq!(pack.items, expected_items);
                 assert_eq!(pack.total_bytes, 200);
                 assert_eq!(pack.ceiling_bytes, 1_000);
             }

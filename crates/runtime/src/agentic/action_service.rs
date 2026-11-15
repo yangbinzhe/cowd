@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness_contract::agent_action::{
     AgentAction, AgentActionEnvelope, AgentActionErrorObservation, AgentActionObservation,
-    AgentActionStatus, AgentActorBinding, AgentActorKind,
+    AgentActionStatus, AgentActorKind,
 };
 use harness_contract::goal::ObjectiveReviewVerification;
 use serde_json::json;
@@ -509,25 +509,6 @@ fn retirement_execute_claim_matches(
             }
             _ => false,
         }
-}
-
-fn physical_actor_matches_running_graph(
-    actor: &AgentActorBinding,
-    physical: &harness_contract::agent_action::OriginalAgentExecution,
-    graph: &harness_contract::execution_graph::ExecutionGraph,
-) -> bool {
-    physical.attempt != 0
-        && graph.id == physical.graph_id
-        && match actor.kind {
-            AgentActorKind::Agent | AgentActorKind::TeamLead => actor.execution_id.as_deref() == Some(physical.graph_id.as_str()),
-            AgentActorKind::Root => actor.execution_id.is_none() && actor.root_execution_id.as_deref() == Some(physical.graph_id.as_str()),
-            _ => false,
-        }
-        && graph.node_statuses.get(&physical.node_id)
-            == Some(&harness_contract::execution_graph::ExecutionNodeStatus::Running)
-        && graph.recovery_cursor.node_attempts.get(&physical.node_id) == Some(&physical.attempt)
-        && graph.lineage.as_ref().is_some_and(|lineage|
-            lineage.session_id == actor.session_id && lineage.turn_id == actor.turn_id)
 }
 
 const ACTION_EVENT_KIND: &str = "agentic.action_applied";
@@ -2913,7 +2894,7 @@ impl AgentActionService {
         context: &OriginalActionCommit<'_>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         self.apply_locked(envelope, &program_stream(&envelope.actor.program_id), goal, verification,
-            required_write_failures, context.sources, false, false, Some(context))
+            required_write_failures, context.sources, false, false, Some(context), None)
     }
 
     /// Locate a committed member from its original outer effect and ordinal.
@@ -3116,7 +3097,7 @@ impl AgentActionService {
         &self,
         envelope: &AgentActionEnvelope,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
-        self.apply_with_root_owner(envelope, false, false)
+        self.apply_with_root_owner(envelope, false, false, None)
     }
 
     pub(super) fn apply_runtime_root_completion(
@@ -3128,7 +3109,7 @@ impl AgentActionService {
         {
             return Err(AgentActionServiceError::Corrupt("invalid Runtime root completion".into()));
         }
-        self.apply_with_root_owner(envelope, true, false)
+        self.apply_with_root_owner(envelope, true, false, None)
     }
 
     pub(super) fn apply_runtime_root_completion_owned(
@@ -3149,7 +3130,7 @@ impl AgentActionService {
                 let context = OriginalActionCommit { sources: &[], locks, control, claim,
                     consumed_input_sequence: consumed, single_call_facts: None, member_call_facts: None,
                     authority: None, reservation: None, effect_fence: None, committed_capture: None };
-                self.apply_locked(envelope, &stream, None, None, &[], context.sources, true, false, Some(&context))
+                self.apply_locked(envelope, &stream, None, None, &[], context.sources, true, false, Some(&context), None)
             }))
         }).map_err(AgentActionServiceError::EventStore)?
     }
@@ -3161,7 +3142,16 @@ impl AgentActionService {
         if envelope.actor.kind != AgentActorKind::Supervisor || envelope.actor.original_execution.is_some() {
             return Err(AgentActionServiceError::Corrupt("invalid Runtime supervisor action".into()));
         }
-        self.apply_with_root_owner(envelope, false, true)
+        self.apply_with_root_owner(envelope, false, true, None)
+    }
+
+    pub(super) fn apply_runtime_supervisor_review_cut(
+        &self,
+        envelope: &AgentActionEnvelope,
+        origin: &super::ingress::ReviewCutSettlement,
+    ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        origin.event_metadata(envelope).map_err(|error| AgentActionServiceError::Corrupt(error.into()))?;
+        self.apply_with_root_owner(envelope, false, true, Some(origin))
     }
 
     /// Commit a new supervisor dispatch under the original Session owner.
@@ -3191,7 +3181,7 @@ impl AgentActionService {
                 single_call_facts: None, member_call_facts: None, authority: None,
                 reservation: None, effect_fence: None, committed_capture: None,
             };
-            self.apply_locked(envelope, &stream_id, None, None, &[], context.sources, false, true, Some(&context))
+            self.apply_locked(envelope, &stream_id, None, None, &[], context.sources, false, true, Some(&context), None)
         })
     }
 
@@ -3200,6 +3190,7 @@ impl AgentActionService {
         envelope: &AgentActionEnvelope,
         internal_root_owner: bool,
         internal_supervisor: bool,
+        review_cut: Option<&super::ingress::ReviewCutSettlement>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         if let Err(error) = envelope.validate() {
             return Ok(rejected(envelope, 0, "invalid_action", &error.to_string()));
@@ -3213,12 +3204,15 @@ impl AgentActionService {
                 streams.push(format!("goal:goal:{root}"));
             }
         }
-        // Lock the claimed graph before authenticating its physical owner.
+        // Gather the original graph with the Program before taking ordered locks.
         if let Some(physical) = envelope.actor.original_execution.as_ref() {
             streams.push(physical.graph_id.clone());
         }
+        if let Some(origin) = review_cut {
+            streams.push(origin.graph_id().to_string());
+        }
         self.store.with_stream_locks(&streams, || {
-            self.apply_locked(envelope, &stream_id, None, None, &[], &[], internal_root_owner, internal_supervisor, None)
+            self.apply_locked(envelope, &stream_id, None, None, &[], &[], internal_root_owner, internal_supervisor, None, review_cut)
         })
     }
 
@@ -3321,6 +3315,7 @@ impl AgentActionService {
                 internal_root_owner,
                 false,
                 None,
+                None,
             )
         })
     }
@@ -3356,22 +3351,67 @@ impl AgentActionService {
             if receipt.transaction_id != existing.transaction_id
                 || receipt.commit_cursor != existing.commit_cursor
                 || receipt.event_ids.get(existing.transaction_index as usize) != Some(&existing.event_id)
+                || receipt.stream_revisions.iter().filter(|source| source.stream_id == stream_id
+                    && source.expected_revision < existing.sequence
+                    && existing.sequence <= source.committed_revision).count() != 1
             {
                 return Err(AgentActionServiceError::Corrupt("applied action original transaction receipt mismatch".into()));
             }
             if original != *envelope {
                 return Err(AgentActionServiceError::Corrupt("action_id conflicts with original action".into()));
             }
-            let value = existing.payload.get("original_action_observation").cloned()
-                .ok_or_else(|| AgentActionServiceError::MemberUnknown("original action observation was not committed".into()))?;
-            let observation: AgentActionObservation = serde_json::from_value(value)
-                .map_err(|error| AgentActionServiceError::MemberUnknown(format!("invalid original action observation: {error}")))?;
-            if observation.action_id != envelope.action_id || observation.program_id != envelope.actor.program_id
-                || observation.action != envelope.action.kind()
-                || observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
-                return Err(AgentActionServiceError::MemberUnknown("original action observation identity mismatch".into()));
+            let entity = match existing.payload.get("entity_ref") {
+                Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(value)) => Some(value.clone()),
+                _ => return Err(AgentActionServiceError::MemberUnknown("original action entity unavailable".into())),
+            };
+            if let Some(value) = existing.payload.get("original_action_observation") {
+                let observation: AgentActionObservation = serde_json::from_value(value.clone())
+                    .map_err(|error| AgentActionServiceError::MemberUnknown(format!("invalid original action observation: {error}")))?;
+                if observation.action_id != envelope.action_id || observation.program_id != envelope.actor.program_id
+                    || observation.action != envelope.action.kind() || observation.status != AgentActionStatus::Applied
+                    || observation.receipt_id != format!("receipt:{}:{}", envelope.actor.program_id, envelope.action_id)
+                    || observation.changed_refs != entity.iter().cloned().collect::<Vec<_>>()
+                {
+                    return Err(AgentActionServiceError::MemberUnknown("original action observation receipt mismatch".into()));
+                }
             }
-            return Ok(Some(observation));
+            let derived = entity_ref(envelope);
+            if derived.is_none() {
+                let goal_stream = envelope.actor.root_execution_id.as_deref().map(|root| format!("goal:goal:{root}"));
+                let sources: Vec<_> = receipt.stream_revisions.iter().filter(|source|
+                    Some(&source.stream_id) == goal_stream.as_ref() && source.committed_revision > source.expected_revision).collect();
+                if sources.len() > 1 || (sources.is_empty() && entity.is_some()) {
+                    return Err(AgentActionServiceError::MemberUnknown("original Goal receipt unavailable".into()));
+                }
+                if let Some(source) = sources.first() {
+                if source.expected_revision.checked_add(1) != Some(source.committed_revision) {
+                    return Err(AgentActionServiceError::MemberUnknown("original Goal transaction is ambiguous".into()));
+                }
+                let goal = self.store.list_stream_before(&source.stream_id, source.committed_revision, 1, 4 * 1024 * 1024)
+                    .map_err(AgentActionServiceError::EventStore)?
+                    .pop().ok_or_else(|| AgentActionServiceError::MemberUnknown("original Goal event unavailable".into()))?;
+                let goal_entity = match goal.payload.get("action_entity_ref") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(value)) => Some(value.as_str()),
+                    _ => return Err(AgentActionServiceError::MemberUnknown("original Goal entity invalid".into())),
+                };
+                if goal.sequence != source.committed_revision || goal.transaction_id != existing.transaction_id
+                    || goal.commit_cursor != existing.commit_cursor || goal.scope != RuntimeEventScope::Goal
+                    || receipt.event_ids.get(goal.transaction_index as usize) != Some(&goal.event_id)
+                    || goal_entity != entity.as_deref()
+                {
+                    return Err(AgentActionServiceError::MemberUnknown("original Goal event mismatch".into()));
+                }
+                }
+            }
+            if derived.is_some_and(|expected| Some(expected) != entity)
+                || existing.refs != action_refs(envelope, entity.as_deref())
+            {
+                return Err(AgentActionServiceError::MemberUnknown("original action receipt core mismatch".into()));
+            }
+            let projection = self.project_snapshot(&envelope.actor.program_id)?;
+            return applied_observation(&self.store, envelope, &projection, entity, true).map(Some);
         }
 
         Ok(None)
@@ -3393,7 +3433,7 @@ impl AgentActionService {
             verification,
             explicit,
         )
-        .map_err(AgentActionServiceError::Corrupt)?;
+        .map_err(|error| AgentActionServiceError::Corrupt(error.to_string()))?;
         let stream_id = program_stream(&envelope.actor.program_id);
         let mut streams = vec![stream_id.clone()];
         streams.extend(
@@ -3412,25 +3452,71 @@ impl AgentActionService {
             streams.push(physical.graph_id.clone());
         }
         self.store.with_stream_locks(&streams, || {
-            self.apply_locked(envelope, &stream_id, None, Some(verification), required_write_failures, &[], false, false, None)
+            self.apply_locked(envelope, &stream_id, None, Some(verification), required_write_failures, &[], false, false, None, None)
         })
     }
 
-    // Verify the owner from the original packet and the registered business
-    // dispatch, independently of the actor resolver. No node attempt is derived
-    // from the business generation.
+    // Authenticate the running graph and its original owner under the same
+    // ordered locks; the returned revision fences the action transaction.
     fn validate_physical_action_owner(
         &self,
         envelope: &AgentActionEnvelope,
-        graph: &harness_contract::execution_graph::ExecutionGraph,
-        node: &harness_contract::execution_graph::ExecutionNodeSpec,
-        binding: &crate::execution_core::graph::ExecutionNodeBinding,
-    ) -> Result<(), AgentActionServiceError> {
+        internal_root_owner: bool,
+        internal_supervisor: bool,
+    ) -> Result<Option<ExpectedStreamRevision>, AgentActionServiceError> {
+        let actor = &envelope.actor;
+        let physical = actor.original_execution.as_ref();
+        if actor.kind == AgentActorKind::Supervisor && !internal_supervisor {
+            return Err(AgentActionServiceError::Corrupt("Runtime supervisor owner required".into()));
+        }
+        if actor.kind == AgentActorKind::Root && physical.is_none()
+            && envelope.action.requires_original_physical_execution() && !internal_root_owner
+        {
+            return Err(AgentActionServiceError::Corrupt("new root action requires original physical execution".into()));
+        }
+        if matches!(actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead) && physical.is_none() {
+            return Err(AgentActionServiceError::Corrupt("agent actor original execution required for new action".into()));
+        }
+        if actor.kind == AgentActorKind::Supervisor && physical.is_some() {
+            return Err(AgentActionServiceError::Corrupt("supervisor cannot borrow physical agent identity".into()));
+        }
+        let Some(physical) = physical else { return Ok(None); };
+        let invalid = |message: String| AgentActionServiceError::Corrupt(message);
+        let graphs = self.graphs.as_ref().ok_or_else(|| invalid("agent actor graph store unavailable".into()))?;
+        let graph = graphs.load(&physical.graph_id).map_err(|e| invalid(e.to_string()))?;
+        let matches_running = physical.attempt != 0
+            && graph.id == physical.graph_id
+            && match actor.kind {
+                AgentActorKind::Agent | AgentActorKind::TeamLead => actor.execution_id.as_deref() == Some(physical.graph_id.as_str()),
+                AgentActorKind::Root => actor.execution_id.is_none() && actor.root_execution_id.as_deref() == Some(physical.graph_id.as_str()),
+                _ => false,
+            }
+            && graph.node_statuses.get(&physical.node_id)
+                == Some(&harness_contract::execution_graph::ExecutionNodeStatus::Running)
+            && graph.recovery_cursor.node_attempts.get(&physical.node_id) == Some(&physical.attempt)
+            && graph.lineage.as_ref().is_some_and(|lineage|
+                lineage.session_id == actor.session_id && lineage.turn_id == actor.turn_id);
+        if !matches_running {
+            return Err(invalid("agent actor physical execution no longer active".into()));
+        }
+        let binding = graphs.current_binding(&graph, &physical.node_id, physical.attempt)
+            .map_err(|e| invalid(e.to_string()))?;
+        let (ticket, original) = graphs.binding_start_ticket(&graph, &physical.node_id, &binding)
+            .map_err(|e| invalid(e.to_string()))?;
+        let start = crate::execution_core::graph::validate_node_ticket_start(&self.store, &ticket, None)
+            .map_err(|e| invalid(e.to_string()))?;
+        if ticket.graph_id != physical.graph_id || ticket.node_id != physical.node_id
+            || ticket.attempt != physical.attempt
+            || start.nodes.iter().find(|node| node.id == physical.node_id) != Some(&original)
+            || graph.nodes.iter().find(|node| node.id == physical.node_id) != Some(&original)
+        {
+            return Err(invalid("agent actor original execution ticket mismatch".into()));
+        }
+        let node = &original;
         use harness_contract::agent::{AgentTaskPacket, AgenticExecutionFocus};
         use harness_contract::agent_action::AgentAttemptMode;
         use harness_contract::execution_graph::ExecutionNodeKind;
         let bad = |message: &str| AgentActionServiceError::Corrupt(message.into());
-        let actor = &envelope.actor;
         let lineage = graph.lineage.as_ref().ok_or_else(|| bad("actor graph lineage missing"))?;
         if node.kind != ExecutionNodeKind::AgentTask {
             let objective = harness_contract::agent_action::root_objective_id(&lineage.session_id, &lineage.turn_id);
@@ -3443,7 +3529,7 @@ impl AgentActionService {
             {
                 return Err(bad("root actor physical owner mismatch"));
             }
-            return Ok(());
+            return Ok(Some(ExpectedStreamRevision { stream_id: graph.id, expected_revision: graph.revision }));
         }
         let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
             .map_err(|_| bad("actor original packet invalid"))?;
@@ -3512,7 +3598,7 @@ impl AgentActionService {
             return Err(bad("agent actor registered business owner mismatch"));
         }
         let graphs = self.graphs.as_ref().ok_or_else(|| bad("actor graph store missing"))?;
-        let start = graphs.binding_start_position(graph, &node.id, binding)
+        let start = graphs.binding_start_position(&graph, &node.id, &binding)
             .map_err(|_| bad("actor original start unavailable"))?
             .ok_or_else(|| bad("actor original start missing"))?;
         let mut matches = 0;
@@ -3542,7 +3628,7 @@ impl AgentActionService {
             }
         }
         if matches != 1 { return Err(bad("agent actor original business dispatch missing or ambiguous")); }
-        Ok(())
+        Ok(Some(ExpectedStreamRevision { stream_id: graph.id, expected_revision: graph.revision }))
     }
 
     fn apply_locked(
@@ -3556,6 +3642,7 @@ impl AgentActionService {
         internal_root_owner: bool,
         internal_supervisor: bool,
         member: Option<&OriginalActionCommit<'_>>,
+        review_cut: Option<&super::ingress::ReviewCutSettlement>,
     ) -> Result<AgentActionObservation, AgentActionServiceError> {
         self.ensure_recovery_session_admitted(&envelope.actor.session_id).map_err(|error| {
             error
@@ -3586,70 +3673,37 @@ impl AgentActionService {
             }
         }
 
-        // Fence the live physical graph in the action publication transaction.
-        // Replays above remain readable after the producer finishes.
-        let physical = envelope.actor.original_execution.as_ref();
-        if envelope.actor.kind == AgentActorKind::Supervisor && !internal_supervisor {
-            return Err(AgentActionServiceError::Corrupt("Runtime supervisor owner required".into()));
-        }
-        // 033 S3-D was reverted (032 semantics kept) because it was an
-        // incomplete action-name enumeration; 034 GB-4 re-does the split
-        // PROPERLY: one effect-class predicate in harness-contract, consulted
-        // identically here and at the ingress gate position, with ArtifactCommit
-        // AND TaskSubmit's deliverable path both classified as physical.
-        // 034 GB-4: the SAME effect-class predicate the ingress gate consults
-        // - two gate positions, one judgment, one exit reason.
-        if envelope.actor.kind == AgentActorKind::Root
-            && physical.is_none()
-            && envelope.action.requires_original_physical_execution()
-            && !internal_root_owner
-        {
-            return Err(AgentActionServiceError::Corrupt("new root action requires original physical execution".into()));
-        }
-        if matches!(envelope.actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead) && physical.is_none() {
-            return Err(AgentActionServiceError::Corrupt("agent actor original execution required for new action".into()));
-        }
-        if envelope.actor.kind == AgentActorKind::Supervisor && physical.is_some() {
-            return Err(AgentActionServiceError::Corrupt("supervisor cannot borrow physical agent identity".into()));
-        }
-        let physical_source = if let Some(physical) = physical {
-            let invalid = |message: String| AgentActionServiceError::Corrupt(message);
-            let graphs = self.graphs.as_ref().ok_or_else(|| {
-                invalid("agent actor graph store unavailable".into())
-            })?;
-            let graph = graphs.load(&physical.graph_id).map_err(|e| {
-                invalid(e.to_string())
-            })?;
-            if !physical_actor_matches_running_graph(&envelope.actor, physical, &graph)
+        // Replays above remain readable after the producer finishes. The
+        // source revision returned here is checked by the action append.
+        let physical_source = self.validate_physical_action_owner(
+            envelope, internal_root_owner, internal_supervisor,
+        )?;
+
+        let review_cut_source = if let Some(origin) = review_cut {
+            let bad = |message: &str| AgentActionServiceError::Corrupt(message.into());
+            let graphs = self.graphs.as_ref().ok_or_else(|| bad("review_cut_original_graph_unavailable"))?;
+            let graph = graphs.load(origin.graph_id()).map_err(|_| bad("review_cut_original_graph_unavailable"))?;
+            if graph.id != origin.graph_id()
+                || graph.node_statuses.get(origin.node_id()) != Some(&harness_contract::execution_graph::ExecutionNodeStatus::Running)
+                || graph.recovery_cursor.node_attempts.get(origin.node_id()) != Some(&origin.attempt())
             {
-                return Err(invalid("agent actor physical execution no longer active".into()));
+                return Err(bad("review_cut_original_attempt_changed"));
             }
-            let binding = graphs.current_binding(&graph, &physical.node_id, physical.attempt)
-                .map_err(|e| {
-                    invalid(e.to_string())
-                })?;
-            let (ticket, original) = graphs.binding_start_ticket(&graph, &physical.node_id, &binding)
-                .map_err(|e| {
-                    invalid(e.to_string())
-                })?;
+            let binding = graphs.current_binding(&graph, origin.node_id(), origin.attempt())
+                .map_err(|_| bad("review_cut_original_binding_unavailable"))?;
+            let (ticket, original) = graphs.binding_start_ticket(&graph, origin.node_id(), &binding)
+                .map_err(|_| bad("review_cut_original_start_unavailable"))?;
             let start = crate::execution_core::graph::validate_node_ticket_start(&self.store, &ticket, None)
-                .map_err(|e| {
-                    invalid(e.to_string())
-                })?;
-            if ticket.graph_id != physical.graph_id || ticket.node_id != physical.node_id
-                || ticket.attempt != physical.attempt
-                || start.nodes.iter().find(|node| node.id == physical.node_id) != Some(&original)
-                || graph.nodes.iter().find(|node| node.id == physical.node_id) != Some(&original)
+                .map_err(|_| bad("review_cut_original_start_unavailable"))?;
+            if ticket.graph_id != origin.graph_id() || ticket.node_id != origin.node_id()
+                || ticket.attempt != origin.attempt()
+                || start.nodes.iter().find(|node| node.id == origin.node_id()) != Some(&original)
+                || graph.nodes.iter().find(|node| node.id == origin.node_id()) != Some(&original)
             {
-                return Err(invalid("agent actor original execution ticket mismatch".into()));
+                return Err(bad("review_cut_original_binding_changed"));
             }
-            self.validate_physical_action_owner(envelope, &graph, &original, &binding).map_err(|error| {
-                error
-            })?;
             Some(ExpectedStreamRevision { stream_id: graph.id, expected_revision: graph.revision })
-        } else {
-            None
-        };
+        } else { None };
 
         let history = self
             .proof_session_queries
@@ -4349,6 +4403,24 @@ impl AgentActionService {
                     .map(str::to_owned)
             })
         });
+        let mut rework_history_rebuilt = false;
+        if let Some(origin) = review_cut {
+            origin.validate_active(&projection)
+                .map_err(|error| AgentActionServiceError::Corrupt(error.into()))?;
+        }
+        if let AgentAction::TaskReview(input) = &envelope.action {
+            if matches!(input.decision, harness_contract::agent_action::TaskReviewDecision::Challenge | harness_contract::agent_action::TaskReviewDecision::Rework)
+                && projection.tasks.contains_key(&input.task_ref)
+                && projection.applied_rework_rounds.as_ref().and_then(|rounds| rounds.get(&input.task_ref)).is_none()
+            {
+                let rebuilt = rebuild_rework_rounds(&self.store, &projection.program_id, projection.revision, &mut Vec::new())?;
+                Arc::make_mut(&mut projection).applied_rework_rounds = Some(rebuilt);
+                rework_history_rebuilt = true;
+                if projection.applied_rework_rounds.as_ref().and_then(|rounds| rounds.get(&input.task_ref)).is_none() {
+                    return Err(AgentActionServiceError::MemberUnknown(format!("review_rework_history_unknown before commit: task {} at Program revision {}", input.task_ref, projection.revision)));
+                }
+            }
+        }
         let mut events = Vec::with_capacity(if projection.revision == 0 { 2 } else { 1 });
         if projection.revision == 0 {
             events.push(RuntimeTransactionEventInput {
@@ -4421,6 +4493,19 @@ impl AgentActionService {
             "entity_ref": entity_ref,
             "review_verification": verification,
         });
+        if let Some(origin) = review_cut {
+            if !internal_supervisor {
+                return Err(AgentActionServiceError::Corrupt("review_cut_settlement_owner_required".into()));
+            }
+            action_payload["review_cut_settlement"] = origin.event_metadata(envelope)
+                .map_err(|error| AgentActionServiceError::Corrupt(error.into()))?;
+        }
+        // The journal owner fixes the new review-round rule in the same
+        // transaction as the original applied verdict, never in model input.
+        if matches!(&envelope.action, AgentAction::TaskReview(input)
+            if matches!(input.decision, harness_contract::agent_action::TaskReviewDecision::Challenge | harness_contract::agent_action::TaskReviewDecision::Rework)) {
+            action_payload["review_round_rule"] = json!("verdict_v1");
+        }
         // The named failures of the required writes this review settled as
         // failed. They are written only when there are any, beside the
         // review's own verification.
@@ -4468,6 +4553,7 @@ impl AgentActionService {
         }];
         expected_streams.extend(extra_sources.iter().cloned());
         expected_streams.extend(physical_source);
+        expected_streams.extend(review_cut_source);
         expected_streams.extend(quantity_source);
         expected_streams.extend(policy_sources);
         expected_streams.extend(
@@ -4549,8 +4635,42 @@ impl AgentActionService {
                 }
             }
         }
-        projection = self.project_snapshot(&envelope.actor.program_id)?;
-        applied_observation(&self.store, envelope, &projection, entity_ref, false)
+        if rework_history_rebuilt {
+            // Keep the source-verified original projection through this commit:
+            // an older cache must not force a second read of legacy sources.
+            let key = action_key(&envelope.action_id);
+            let committed = self.store.event_by_idempotency_key(stream_id, &key)
+                .map_err(|error| AgentActionServiceError::MemberUnknown(format!("review committed; original event unavailable: {error}")))?
+                .ok_or_else(|| AgentActionServiceError::MemberUnknown("review committed; original event unavailable".into()))?;
+            let expected_envelope = serde_json::to_value(envelope)
+                .map_err(|error| AgentActionServiceError::MemberUnknown(format!("review committed; original envelope unavailable: {error}")))?;
+            if committed.sequence != projection.revision.saturating_add(1)
+                || committed.stream_id != stream_id || committed.kind != ACTION_EVENT_KIND
+                || committed.status.as_deref() != Some("applied")
+                || committed.transaction_id != format!("agent-action:{}:{}", envelope.actor.program_id, envelope.action_id)
+                || committed.payload.get("envelope") != Some(&expected_envelope)
+            {
+                return Err(AgentActionServiceError::MemberUnknown("review committed; original event identity unavailable".into()));
+            }
+            apply_projection_events(&self.store, Arc::make_mut(&mut projection), vec![committed])
+                .map_err(|error| AgentActionServiceError::MemberUnknown(format!("review committed; Program observation unavailable: {error}")))?;
+            let head = self.store.stream_revision(stream_id)
+                .map_err(|error| AgentActionServiceError::MemberUnknown(format!("review committed; Program head unavailable: {error}")))?;
+            if head < projection.revision {
+                return Err(AgentActionServiceError::MemberUnknown("review committed; Program head regressed".into()));
+            }
+            self.catch_up_projection(Arc::make_mut(&mut projection), stream_id, head)
+                .map_err(|error| AgentActionServiceError::MemberUnknown(format!("review committed; Program tail unavailable: {error}")))?;
+            self.remember_projection(&projection);
+        } else {
+            projection = self.project_snapshot(&envelope.actor.program_id)?;
+        }
+        let observation = applied_observation(&self.store, envelope, &projection, entity_ref, false);
+        if rework_history_rebuilt {
+            observation.map_err(|error| AgentActionServiceError::MemberUnknown(format!("review committed; observation unavailable: {error}")))
+        } else {
+            observation
+        }
     }
 
     /// Durable head revision of one Program's journal, without folding it.
@@ -4609,7 +4729,7 @@ impl AgentActionService {
         // durable applied events, in the order they were applied. The read
         // happens before the events are moved into the projection.
         merge_required_write_failures(&mut projection, &events);
-        apply_projection_events(&mut projection, events)?;
+        apply_projection_events(&self.store, &mut projection, events)?;
         self.catch_up_projection(&mut projection, &stream_id, durable_revision)?;
         let projection = Arc::new(projection);
         self.remember_projection(&projection);
@@ -4644,7 +4764,7 @@ impl AgentActionService {
             _ => {
                 let mut projection =
                     projection_from_opened(program_id, opened).map_err(&map_error)?;
-                apply_projection_events(&mut projection, vec![opened.clone()])
+                apply_projection_events(&self.store, &mut projection, vec![opened.clone()])
                     .map_err(&map_error)?;
                 Arc::new(projection)
             }
@@ -4674,7 +4794,7 @@ impl AgentActionService {
                     )));
                 }
             }
-            apply_projection_events(Arc::make_mut(&mut snapshot), page).map_err(&map_error)?;
+            apply_projection_events(&self.store, Arc::make_mut(&mut snapshot), page).map_err(&map_error)?;
             if snapshot.revision != expected {
                 return Err(map_error(AgentActionServiceError::Corrupt(
                     "bounded Program reducer coverage".into(),
@@ -4743,7 +4863,7 @@ impl AgentActionService {
                     ));
                 }
             }
-            apply_projection_events(projection, page)?;
+            apply_projection_events(&self.store, projection, page)?;
             if projection.revision != expected {
                 return Err(AgentActionServiceError::Corrupt(
                     "Program reducer did not consume tail".into(),
@@ -6510,7 +6630,71 @@ fn merge_required_write_failures(
     }
 }
 
+// Reuse the Program reducer at the original source revision to reconstruct
+// only the missing derived field from legacy checkpoints/continuation seeds.
+fn rebuild_rework_rounds(
+    store: &RuntimeEventStore,
+    program_id: &str,
+    through: u64,
+    stack: &mut Vec<String>,
+) -> Result<std::collections::BTreeMap<String, u8>, AgentActionServiceError> {
+    if through == 0 || stack.iter().any(|id| id == program_id) {
+        return Err(AgentActionServiceError::Corrupt("invalid review history source or continuation cycle".into()));
+    }
+    stack.push(program_id.to_string());
+    let result = (|| {
+        let stream = program_stream(program_id);
+        let mut after = 0u64;
+        let mut rebuilt: Option<AgenticProgramProjection> = None;
+        while after < through {
+            let mut page = store.list_stream_after(&stream, after, through, 100, 1024 * 1024)
+                .map_err(AgentActionServiceError::EventStore)?;
+            if page.is_empty() {
+                return Err(AgentActionServiceError::MemberUnknown(format!("review_rework_history_unknown: missing {stream} after {after} through {through}")));
+            }
+            for event in &mut page {
+                after = after.checked_add(1).ok_or_else(|| AgentActionServiceError::Corrupt("review history sequence overflow".into()))?;
+                if event.stream_id != stream || event.sequence != after || event.schema_version != 1 || after > through {
+                    return Err(AgentActionServiceError::Corrupt(format!("invalid review history {stream} sequence {after}")));
+                }
+                if rebuilt.is_none() {
+                    if after != 1 || event.kind != PROGRAM_OPENED_EVENT_KIND {
+                        return Err(AgentActionServiceError::Corrupt(format!("review history missing opening for {stream}")));
+                    }
+                    if let Some(seed) = event.payload.get_mut("continuation_seed") {
+                        let inherited: AgenticProgramProjection = serde_json::from_value(seed.clone())
+                            .map_err(|error| AgentActionServiceError::Corrupt(format!("invalid continuation seed: {error}")))?;
+                        if inherited.applied_rework_rounds.is_none() {
+                            let source = inherited.continuation.as_ref().ok_or_else(|| AgentActionServiceError::Corrupt("review history continuation source missing".into()))?;
+                            let rounds = rebuild_rework_rounds(store, &source.source_program_id, source.source_revision, stack)?;
+                            if inherited.tasks.keys().any(|task| !rounds.contains_key(task)) {
+                                return Err(AgentActionServiceError::Corrupt("review history continuation task missing".into()));
+                            }
+                            // This changes only the in-memory replay copy; the
+                            // original persisted continuation event is untouched.
+                            seed["applied_rework_rounds"] = serde_json::to_value(rounds)
+                                .map_err(|error| AgentActionServiceError::Corrupt(format!("cannot rebuild continuation count: {error}")))?;
+                        }
+                    }
+                    rebuilt = Some(projection_from_opened(program_id, event)
+                        .map_err(|error| AgentActionServiceError::Corrupt(format!("invalid Program opening: {error}")))?);
+                }
+            }
+            let projection = rebuilt.as_mut().ok_or_else(|| AgentActionServiceError::Corrupt("review history opening unavailable".into()))?;
+            apply_projection_events(store, projection, page)?;
+            if projection.revision != after {
+                return Err(AgentActionServiceError::Corrupt("incomplete review history fold".into()));
+            }
+        }
+        rebuilt.and_then(|projection| projection.applied_rework_rounds)
+            .ok_or_else(|| AgentActionServiceError::MemberUnknown("review_rework_history_unknown: derived count missing".into()))
+    })();
+    stack.pop();
+    result
+}
+
 fn apply_projection_events(
+    store: &RuntimeEventStore,
     projection: &mut AgenticProgramProjection,
     events: Vec<crate::DurableRuntimeEvent>,
 ) -> Result<(), AgentActionServiceError> {
@@ -6654,7 +6838,44 @@ fn apply_projection_events(
             .payload
             .get("entity_ref")
             .and_then(serde_json::Value::as_str);
-        projection.apply(&envelope, entity_ref, event.sequence, event.created_at_ms);
+        let verdict_rule = match event.payload.get("review_round_rule") {
+            None => false,
+            Some(value) if value.as_str() == Some("verdict_v1")
+                && matches!(&envelope.action, AgentAction::TaskReview(input)
+                    if matches!(input.decision, harness_contract::agent_action::TaskReviewDecision::Challenge | harness_contract::agent_action::TaskReviewDecision::Rework)) => true,
+            Some(_) => return Err(AgentActionServiceError::Corrupt("invalid_review_round_rule".into())),
+        };
+        if verdict_rule && matches!(&envelope.action, AgentAction::TaskReview(input)
+            if projection.applied_rework_rounds.as_ref().and_then(|rounds| rounds.get(&input.task_ref)).is_none()) {
+            projection.applied_rework_rounds = Some(rebuild_rework_rounds(store, &projection.program_id, projection.revision, &mut Vec::new())?);
+        }
+        let trusted_review_cut = match event.payload.get("review_cut_settlement") {
+            None => false,
+            Some(origin) => {
+                let AgentAction::TaskAttemptFail(input) = &envelope.action else {
+                    return Err(AgentActionServiceError::Corrupt("invalid_review_cut_settlement".into()));
+                };
+                if origin["kind"] != "review_cut_exhausted_v1"
+                    || origin["program_id"] != envelope.actor.program_id
+                    || origin["task_ref"] != input.task_ref
+                    || origin["execution_id"] != input.execution_id
+                    || origin["node_id"].as_str().is_none_or(str::is_empty)
+                    || origin["attempt"].as_u64().is_none_or(|value| value == 0 || value > u64::from(u32::MAX))
+                    || origin["rebuild_bound"].as_u64().is_none_or(|value| value == 0 || value > u64::from(u32::MAX))
+                    || origin["rebuilds_used"].as_u64().is_none_or(|value| value > u64::from(u32::MAX)
+                        || value <= origin["rebuild_bound"].as_u64().unwrap_or(u64::MAX))
+                    || envelope.actor.kind != AgentActorKind::Supervisor
+                    || envelope.actor.actor_id != "runtime.program-supervisor"
+                    || envelope.actor.execution_id.as_deref() != Some(input.execution_id.as_str())
+                    || input.mode != harness_contract::agent_action::AgentAttemptMode::Review
+                {
+                    return Err(AgentActionServiceError::Corrupt("invalid_review_cut_settlement".into()));
+                }
+                true
+            }
+        };
+        projection.apply_with_round_rule(&envelope, entity_ref, event.sequence, event.created_at_ms, verdict_rule, trusted_review_cut)
+            .map_err(|error| AgentActionServiceError::MemberUnknown(error.into()))?;
         match &envelope.action {
             AgentAction::TaskClaim(input) => {
                 if let Some(lease_ms) = recorded_claim_lease_ms(&event.payload)? {

@@ -12,7 +12,7 @@ mod results;
 // rebuild loop (T1b) consumes them through this module rather than reaching
 // into `results`.
 pub(crate) use results::{
-    node_review_ref, pin_result_source_ticketed, ReviewRepinTicket,
+    node_review_ref, pin_result_source_ticketed, ReviewEvidenceError, ReviewRepinTicket,
 };
 // The rebuild entry and its two refusal shapes are consumed only by tests until
 // T1b wires them into dispatch. Keeping them unconditional trips
@@ -113,8 +113,15 @@ struct ReviewArtifactPin {
 
 impl Drop for ReviewArtifactPin {
     fn drop(&mut self) {
-        if let Err(error) = self.store.unpin(&self.artifact, &self.owner) {
-            tracing::warn!(%error, "review artifact pin release failed; pin retained");
+        let selector_hash = format!("{:x}", Sha256::digest(self.artifact.selector.as_bytes()));
+        let owner_hash = format!("{:x}", Sha256::digest(self.owner.as_bytes()));
+        match self.store.unpin(&self.artifact, &self.owner) {
+            Ok(()) => tracing::info!(%selector_hash, %owner_hash,
+                cleanup = "unpin_returned_ok", record_class = "not_rolled_back",
+                "review artifact pin cleanup"),
+            Err(_) => tracing::warn!(%selector_hash, %owner_hash,
+                cleanup = "unpin_unconfirmed", record_class = "not_rolled_back",
+                "review artifact pin cleanup failed"),
         }
     }
 }
@@ -165,8 +172,14 @@ impl ProcessInputFrame {
             }
             return Ok(());
         }
-        store.pin(artifact, &self.artifact_owner, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = store.pin(artifact, &self.artifact_owner, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS) {
+            let selector_hash = format!("{:x}", Sha256::digest(artifact.selector.as_bytes()));
+            let owner_hash = format!("{:x}", Sha256::digest(self.artifact_owner.as_bytes()));
+            tracing::warn!(%selector_hash, %owner_hash, pin_result = "error_unclassified",
+                cleanup = "not_attempted", record_class = "may_have_become_live",
+                "review artifact pin was not confirmed");
+            return Err(error.to_string());
+        }
         pins.insert(artifact.selector.clone(), ReviewArtifactPin {
             store: store.clone(), artifact: artifact.clone(), owner: self.artifact_owner.clone(),
         });
@@ -704,7 +717,7 @@ fn selected_work(
     goal: Option<&harness_contract::goal::GoalContract>,
     references: &[String],
     publication_sources: &mut BTreeMap<String, u64>,
-) -> Result<(Vec<String>, Vec<String>, String), String> {
+) -> Result<(Vec<String>, Vec<String>, String), results::ReviewEvidenceError> {
     let required = goal
         .into_iter()
         .flat_map(|goal| &goal.obligations)
@@ -1238,7 +1251,7 @@ pub(crate) fn validate_explicit_process_evidence(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     verification: &harness_contract::goal::ObjectiveReviewVerification,
     explicit_evidence_refs: &[String],
-) -> Result<(), String> {
+) -> Result<(), results::ReviewEvidenceError> {
     let claims = verification
         .reads
         .iter()
@@ -1367,7 +1380,7 @@ pub(crate) fn validate_bounded_process_retirement(
     primary: &crate::DurableRuntimeEvent,
     artifacts: Option<&crate::ArtifactStore>,
 ) -> Result<Vec<crate::ExpectedStreamRevision>, String> {
-    let run = results::authenticate_bounded_process(store, primary)?;
+    let run = results::authenticate_bounded_process(store, primary).map_err(|error| error.to_string())?;
     results::process_has_no_external_effects(&run)?;
     results::validate_process_archives(
         &run,
@@ -1378,7 +1391,7 @@ pub(crate) fn validate_bounded_process_retirement(
         },
     )?;
     let mut cuts = BTreeMap::new();
-    results::retain_process_execution(store, &run, &mut cuts)?;
+    results::retain_process_execution(store, &run, &mut cuts).map_err(|error| error.to_string())?;
     Ok(cuts
         .into_iter()
         .map(
@@ -1460,7 +1473,7 @@ fn validate_process_claims(
     runs: &[results::AuthenticatedProcessExecution],
     claimed: &[String],
     deliveries: &policy::ReviewDeliverySnapshot,
-) -> Result<Vec<results::AuthenticatedProcessExecution>, String> {
+) -> Result<Vec<results::AuthenticatedProcessExecution>, results::ReviewEvidenceError> {
     let claims = claimed
         .iter()
         .filter(|reference| is_process_body_receipt(reference))
@@ -1533,7 +1546,7 @@ fn select_process_witnesses(
     >,
     explicit_evidence_refs: &[String],
     deliveries: &policy::ReviewDeliverySnapshot,
-) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, results::ReviewEvidenceError> {
     let mut selected: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (result, runs) in runs_by_result {
         let mut refs = BTreeSet::new();
@@ -1961,6 +1974,7 @@ impl RuntimeServices {
             None,
         )
         .await
+        .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn independent_result_review_with_evidence(
@@ -1971,7 +1985,7 @@ impl RuntimeServices {
         condition_ref: Option<&str>,
         explicit_evidence_refs: &[String],
         current_review: Option<&CurrentReviewContext<'_>>,
-    ) -> Result<IndependentReview, String> {
+    ) -> Result<IndependentReview, results::ReviewEvidenceError> {
         let process_verifier = ProcessInputVerifier::new(std::sync::Arc::clone(self.scope_locks()));
         let process_frame = process_verifier.frame();
         // A review names the delivered results it covers, and a model routinely
@@ -2251,7 +2265,7 @@ impl RuntimeServices {
                 // all four requirements, so a model whose Task had the right
                 // capability but the wrong definition was told both were wrong
                 // and had no way to tell which.
-                return Err(unmet_obligation_error(&obligation.obligation_id, required));
+                return Err(unmet_obligation_error(&obligation.obligation_id, required).into());
             }
         }
         if coverage.is_empty() {
@@ -2261,7 +2275,7 @@ impl RuntimeServices {
             // what Runtime considered current and no spelling to try.
             let current =
                 crate::agentic::supervision::completion_ready_result_artifact_refs(program);
-            return Err(no_current_results_error(&current));
+            return Err(no_current_results_error(&current).into());
         }
         let reviewer_packet = packet.clone();
         let delivery_snapshot = policy::review_delivery_snapshot(
@@ -2322,7 +2336,7 @@ impl RuntimeServices {
                  (evidence_retrieve or read_ref, following every next_request to the end). \
                  A read by another Agent or by the root does not count for a delegated reviewer.",
                 missing.join(",")
-            ));
+            ).into());
         }
         let mut verification = ObjectiveReviewVerification {
             input_set: None,
@@ -2961,7 +2975,7 @@ impl RuntimeServices {
             if material_revision != current_revision {
                 return Err(format!(
                     "recursive material enumeration cut changed: source={source} expected={material_revision} observed={current_revision} discovery_cursor={material_discovery_cursor}; rebuild the whole review"
-                ));
+                ).into());
             }
             let mut offset = 0;
             loop {
@@ -3228,7 +3242,7 @@ impl RuntimeServices {
                                             &original.stream_id,
                                             &mut acquisition.sources,
                                         )
-                                        .map_err(|rejection| rejection.reason())?;
+                                        .map_err(results::ReviewEvidenceError::from_repin)?;
                                         acquisition.material_events.push(
                                             harness_contract::goal::ProofInputEvent {
                                                 stream_id: original.stream_id.clone(),
@@ -3411,7 +3425,7 @@ impl RuntimeServices {
                             &primary_stream,
                             &mut authenticated.sources,
                         )
-                        .map_err(|rejection| rejection.reason())?;
+                        .map_err(results::ReviewEvidenceError::from_repin)?;
                         let original = self.event_store().event_by_idempotency_key(&primary_stream, &format!("{key}:read-receipt"))
                             .map_err(|error| error.to_string())?.ok_or("directory read original primary missing")?;
                         if original.commit_cursor > material_discovery_cursor {
@@ -3543,7 +3557,7 @@ impl RuntimeServices {
                     return Err(format!(
                         "actual input source moved after material discovery: source {source} \
                          moved from revision {previous} to {revision}"
-                    ));
+                    ).into());
                 }
             }
         }
@@ -5341,4 +5355,113 @@ mod tests {
         }
     }
     include!("review_evidence/work_contract_tests.rs");
+}
+
+#[cfg(test)]
+pub(super) mod t1_frame_cleanup_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber, span::{Attributes, Id, Record}};
+
+    #[derive(Clone, Default)]
+    pub(super) struct EventCapture(pub(super) Arc<Mutex<Vec<String>>>);
+    struct Fields(String);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?};", field.name()));
+        }
+    }
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+        fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn t1_cleanup_does_not_reverse_original_artifact_adoption() {
+        use crate::ArtifactMetadataRepository as _;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(crate::EphemeralArtifactRepository::default());
+        let store = crate::ArtifactStore::new(temp.path(), repo.clone(), crate::ArtifactStoreConfig::default()).unwrap();
+        let origin = crate::PreparedArtifactOrigin::EventBody {
+            stream_id: "graph:t1".into(), idempotency_key: "original".into(), kind: "execution_graph.planned".into(),
+        };
+        let artifact = store.write_pre_pinned_blocking("session:t1", "original", b"body", &origin).unwrap();
+        let id = artifact.selector.strip_prefix("artifact://").unwrap();
+        assert_eq!(repo.record(id).unwrap().unwrap().record_class, crate::ArtifactRecordClass::PrivatePrepared);
+        let frame = ProcessInputFrame::without_process_verifier();
+        let owner = frame.artifact_owner.clone();
+        frame.retain_artifact(&store, &artifact).unwrap();
+        assert_eq!(repo.record(id).unwrap().unwrap().record_class, crate::ArtifactRecordClass::Live);
+        let captured = EventCapture::default();
+        let events = Arc::clone(&captured.0);
+        tracing::subscriber::with_default(captured, || drop(frame));
+        assert!(!repo.fixture_review_exact_pin(id, &owner));
+        assert!(repo.fixture_review_exact_pin(id, crate::ARTIFACT_PREPARED_PIN_OWNER));
+        assert_eq!(repo.record(id).unwrap().unwrap().record_class, crate::ArtifactRecordClass::Live,
+            "removing the review pin does not reverse adoption");
+        assert!(events.lock().unwrap().join("\n").contains("not_rolled_back"));
+    }
+
+    #[tokio::test]
+    async fn t1_frame_pin_failure_and_cleanup_report_exact_private_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(crate::EphemeralArtifactRepository::default());
+        let store = crate::ArtifactStore::new(temp.path(), repo.clone(), crate::ArtifactStoreConfig::default()).unwrap();
+        let artifact = store.write_bytes(harness_contract::context::ArtifactWriteDescriptor {
+            media_type: "text/plain".into(), visibility_scope: "session:t1".into(),
+            expected_bytes: None, original_name: None,
+        }, b"original").await.unwrap();
+        let id = artifact.selector.strip_prefix("artifact://").unwrap();
+        let other = "another-original-owner";
+        store.pin(&artifact, other, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS).unwrap();
+        let captured = EventCapture::default();
+        let events = Arc::clone(&captured.0);
+        let selector_hash = format!("{:x}", Sha256::digest(artifact.selector.as_bytes()));
+
+        let frame = ProcessInputFrame::without_process_verifier();
+        let unknown_owner = frame.artifact_owner.clone();
+        repo.fixture_review_pin_response_loss();
+        tracing::subscriber::with_default(captured.clone(), || {
+            let error = frame.retain_artifact(&store, &artifact).unwrap_err();
+            assert!(error.contains("injected committed pin response loss"));
+            assert!(!frame.retains_exact_artifact(&artifact));
+            drop(frame);
+        });
+        assert!(repo.fixture_review_exact_pin(id, &unknown_owner), "a committed pin response loss must not be guessed away");
+        assert!(repo.fixture_review_exact_pin(id, other));
+        let unknown_hash = format!("{:x}", Sha256::digest(unknown_owner.as_bytes()));
+        let logs = events.lock().unwrap().join("\n");
+        assert!(logs.contains("error_unclassified") && logs.contains("not_attempted") && logs.contains("may_have_become_live"));
+        assert!(logs.contains(&selector_hash) && logs.contains(&unknown_hash));
+        assert!(!logs.contains(&artifact.selector) && !logs.contains(&unknown_owner) && !logs.contains("injected committed"));
+
+        let frame = ProcessInputFrame::without_process_verifier();
+        let failed_owner = frame.artifact_owner.clone();
+        frame.retain_artifact(&store, &artifact).unwrap();
+        repo.fixture_review_unpin_failure();
+        tracing::subscriber::with_default(captured.clone(), || drop(frame));
+        assert!(repo.fixture_review_exact_pin(id, &failed_owner), "failed unpin retains the original tuple");
+        assert!(repo.fixture_review_exact_pin(id, other));
+        let failed_hash = format!("{:x}", Sha256::digest(failed_owner.as_bytes()));
+        let logs = events.lock().unwrap().join("\n");
+        assert!(logs.contains("unpin_unconfirmed") && logs.contains("not_rolled_back") && logs.contains(&failed_hash));
+        assert!(!logs.contains(&failed_owner) && !logs.contains("injected unpin failure"));
+
+        let frame = ProcessInputFrame::without_process_verifier();
+        let released_owner = frame.artifact_owner.clone();
+        frame.retain_artifact(&store, &artifact).unwrap();
+        tracing::subscriber::with_default(captured, || drop(frame));
+        assert!(!repo.fixture_review_exact_pin(id, &released_owner));
+        assert!(repo.fixture_review_exact_pin(id, other), "cleanup must not remove another owner");
+        assert!(events.lock().unwrap().join("\n").contains("unpin_returned_ok"));
+    }
 }

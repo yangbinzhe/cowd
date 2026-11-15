@@ -312,6 +312,75 @@ async fn r1_bounded_history_first_start_binding_and_effect_identity_are_checked(
             let before = state.load(&registered.id).unwrap();
             let cursor = events.durable_commit_cursor().unwrap();
             let result = runner.prepare_ready_wave(&registered.id, ready).await;
+            if fault == 8 {
+                // A Start error for this node is an unadmitted node-local
+                // failure. Drive the same completion path used by the pump;
+                // do not mistake the prepared wave for a successful node.
+                let prepared = result.expect("node-local Start remains in the prepared wave");
+                assert_eq!(prepared.len(), width);
+                let mut bad_prepared = None;
+                let mut good_prepared = None;
+                for item in prepared {
+                    if item.node.id == "bad" {
+                        assert!(item.has_startup_error());
+                        assert!(item.binding.is_none());
+                        bad_prepared = Some(item);
+                    } else {
+                        assert_eq!(item.node.id, "a-good");
+                        assert!(!item.has_startup_error());
+                        assert!(item.binding.is_some());
+                        good_prepared = Some(item);
+                    }
+                }
+                assert_eq!(executor.hits.load(Ordering::SeqCst), 1);
+                assert_eq!(executor.starts.load(Ordering::SeqCst), width);
+                assert_eq!(executor.polls.load(Ordering::SeqCst), 0);
+                assert_eq!(executor.cancels.load(Ordering::SeqCst), 0);
+                let during = state.load(&registered.id).unwrap();
+                assert_eq!(during.node_statuses["bad"], ExecutionNodeStatus::Ready);
+                assert_eq!(during.recovery_cursor.node_attempts.get("bad").copied().unwrap_or(0), 0);
+                if width == 1 {
+                    assert_eq!(during, before);
+                    assert_eq!(events.durable_commit_cursor().unwrap(), cursor);
+                } else {
+                    assert_eq!(during.node_statuses["a-good"], ExecutionNodeStatus::Running);
+                }
+                let bad_node = registered.nodes.iter().find(|node| node.id == "bad").unwrap();
+                let bad_ticket = NodeExecutionTicket {
+                    graph_id: registered.id.clone(), node_id: bad_node.id.clone(),
+                    executor_kind: bad_node.executor_kind.clone(), service_class: registered.service_class,
+                    attempt: 1, idempotency_key: bad_node.idempotency_key.clone(),
+                    payload_ref: bad_node.payload_ref.clone(),
+                };
+                runner.execute_prepared_pump_node(
+                    &registered.id, bad_prepared.expect("bad node retained"), Arc::new(Notify::new()),
+                ).await.expect("isolate node-local start failure");
+                if let Some(good) = good_prepared {
+                    runner.execute_prepared_pump_node(
+                        &registered.id, good, Arc::new(Notify::new()),
+                    ).await.expect("independent sibling completes");
+                }
+                let settled = state.load(&registered.id).unwrap();
+                assert_eq!(settled.node_statuses["bad"], ExecutionNodeStatus::Failed);
+                let failure = settled.node_results["bad"].failure.as_ref().expect("typed failure");
+                assert_eq!(failure.kind, "node_execution_isolated_failure");
+                assert!(failure.message.contains("start fault-hit"), "original error must survive: {failure:?}");
+                assert!(!failure.retryable);
+                assert_eq!(settled.recovery_cursor.node_attempts.get("bad").copied().unwrap_or(0), 0);
+                assert_eq!(events.stream_revision(&ExecutionNodeBinding::effect_stream_id(&bad_ticket)).unwrap(), 0);
+                let starts = state.binding_starts_page(&registered.id, 0, settled.revision).unwrap().1;
+                assert_eq!(starts.len(), width - 1, "only the healthy sibling may have a start binding");
+                if width == 2 {
+                    assert_eq!(settled.node_statuses["a-good"], ExecutionNodeStatus::Completed);
+                    assert_eq!(executor.calls.lock().unwrap().as_slice(), &["a-good".to_string()]);
+                }
+                assert_eq!(executor.polls.load(Ordering::SeqCst), width - 1);
+                assert_eq!(executor.cancels.load(Ordering::SeqCst), 0);
+                let counts = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+                assert_eq!(counts.active_leases, 0);
+                assert_eq!(counts.queued_waiters, 0);
+                continue;
+            }
             assert!(
                 result.is_err(),
                 "first-start fault-hit {fault}, width {width}"
@@ -2142,6 +2211,385 @@ async fn executor_start_failure_never_persists_running_or_binding() {
         persisted.node_statuses["start-failure"],
         ExecutionNodeStatus::Failed
     );
+    assert_eq!(
+        persisted
+            .recovery_cursor
+            .node_attempts
+            .get("start-failure")
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+    assert!(state
+        .binding_starts_page(&graph_id, 0, persisted.revision)
+        .unwrap()
+        .1
+        .is_empty());
+}
+
+#[tokio::test]
+async fn executor_start_failure_preserves_siblings_and_releases_unadmitted_resources() {
+    for fail_first in [true, false] {
+        for supervised in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("failed-worktree")).unwrap();
+            let events = Arc::new(RuntimeEventStore::for_test());
+            let state = ExecutionGraphStateStore::new(events.clone());
+            let commits = ExecutionCommitService::new(events.clone());
+            let registry = Arc::new(NodeExecutorRegistry::new());
+            registry.register(Arc::new(StartFailExecutor)).unwrap();
+            let healthy = Arc::new(TestExecutor::new(Vec::new(), Duration::ZERO));
+            registry.register(healthy.clone()).unwrap();
+            let resources = Arc::new(ExecutionResourceManager::new([(
+                ExecutionResourceKind::Tool,
+                ResourceQuota::new(1, 4, 4).unwrap(),
+            )]));
+            let locks = Arc::new(ScopeLockManager::persistent(temp.path().join("locks")).unwrap());
+            let worktrees =
+                Arc::new(WorktreeLeaseManager::open(temp.path().join("leases.json")).unwrap());
+            let runner = ExecutionGraphRunner::new(
+                registry,
+                state.clone(),
+                commits.clone(),
+                resources.clone(),
+                locks.clone(),
+                worktrees.clone(),
+                "start-failure-workspace",
+                temp.path(),
+            );
+            let mut graph = test_graph("start failure preserves independent siblings");
+            let mut failing = node("start-failure");
+            failing.kind = ExecutionNodeKind::Materialize;
+            failing.executor_kind = "start_fail".into();
+            failing.resource_scopes =
+                vec!["write:failed.txt".into(), "worktree:failed-worktree".into()];
+            let mut sibling = node("healthy");
+            sibling.kind = ExecutionNodeKind::Materialize;
+            sibling.resource_scopes = vec!["write:healthy.txt".into()];
+            graph.nodes = if fail_first {
+                vec![failing.clone(), sibling]
+            } else {
+                vec![sibling, failing.clone()]
+            };
+            graph.nodes.push(node("dependent"));
+            graph.edges.push(ExecutionEdge {
+                from: failing.id.clone(),
+                to: "dependent".into(),
+                kind: ExecutionEdgeKind::DependsOn,
+            });
+            let graph_id = graph.id.clone();
+            let service_class = graph.service_class;
+            let supervisor = supervised.then(|| {
+                crate::RuntimeExecutionSupervisor::with_limits(
+                    Arc::new(runner.clone()),
+                    8,
+                    2,
+                    Duration::from_secs(2),
+                )
+            });
+            let report = if let Some(supervisor) = &supervisor {
+                let report = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    supervisor.submit_and_wait(
+                        graph,
+                        ExecutionGraphCommand::Start {
+                            expected_revision: 0,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                report.1
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), runner.start(graph))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(report.failed, 1);
+            assert_eq!(report.completed, 1);
+            assert_eq!(report.blocked, 1);
+            let settled = state.load(&graph_id).unwrap();
+            assert_eq!(
+                settled.node_statuses["start-failure"],
+                ExecutionNodeStatus::Failed
+            );
+            assert_eq!(
+                settled.node_statuses["healthy"],
+                ExecutionNodeStatus::Completed
+            );
+            assert_eq!(
+                settled.node_statuses["dependent"],
+                ExecutionNodeStatus::Blocked
+            );
+            assert_eq!(
+                settled
+                    .recovery_cursor
+                    .node_attempts
+                    .get("start-failure")
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+            let starts = state
+                .binding_starts_page(&graph_id, 0, settled.revision)
+                .unwrap()
+                .1;
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0].0, "healthy");
+            assert_eq!(healthy.calls.lock().unwrap().as_slice(), &["healthy"]);
+            let ticket = NodeExecutionTicket {
+                graph_id: graph_id.clone(),
+                node_id: failing.id.clone(),
+                executor_kind: failing.executor_kind.clone(),
+                service_class,
+                attempt: 1,
+                idempotency_key: failing.idempotency_key.clone(),
+                payload_ref: failing.payload_ref.clone(),
+            };
+            assert!(matches!(
+                commits.inspect_execution_effect(&ticket).unwrap(),
+                ExecutionEffectState::Fresh
+            ));
+            let transitions = events
+                .list_stream(&format!("{graph_id}:node:start-failure"))
+                .unwrap();
+            assert!(transitions
+                .iter()
+                .all(|event| event.payload["to"] != "running"));
+            assert_eq!(
+                resources
+                    .snapshot(&ExecutionResourceKind::Tool)
+                    .unwrap()
+                    .active_leases,
+                0
+            );
+            assert_eq!(
+                resources
+                    .snapshot(&ExecutionResourceKind::Tool)
+                    .unwrap()
+                    .queued_waiters,
+                0
+            );
+            assert_eq!(locks.active_lease_count().unwrap(), 0);
+            assert!(worktrees.active_records().unwrap().is_empty());
+            let mut retry = test_graph("reuse resources after unadmitted failure");
+            let mut retry_node = node("reuse");
+            retry_node.kind = ExecutionNodeKind::Materialize;
+            retry_node.resource_scopes = failing.resource_scopes;
+            retry.nodes.push(retry_node);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), runner.start(retry))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .completed,
+                1
+            );
+            if let Some(supervisor) = supervisor {
+                supervisor.shutdown().await;
+            }
+        }
+    }
+}
+
+enum StartFailureProbeMode {
+    Foreign,
+    Unknown,
+    AfterAdmission,
+    AdmittedForeign,
+}
+
+struct StartFailureProbe(StartFailureProbeMode);
+
+#[async_trait]
+impl NodeExecutor for StartFailureProbe {
+    fn kind(&self) -> &str {
+        "start_failure_probe"
+    }
+    fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
+    async fn start(
+        &self,
+        context: NodeExecutionContext,
+    ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+        match self.0 {
+            StartFailureProbeMode::Foreign => Err(NodeExecutorError::Start {
+                node_id: "foreign-node".into(),
+                reason: "wrong error owner".into(),
+            }),
+            StartFailureProbeMode::Unknown => Err(NodeExecutorError::OriginalCustodyUnknown {
+                node_id: context.node.id,
+                reason: "preparation did not establish an absent effect".into(),
+            }),
+            StartFailureProbeMode::AfterAdmission | StartFailureProbeMode::AdmittedForeign => {
+                Ok(NodeExecutionTicket {
+                    graph_id: context.graph.id.clone(),
+                    node_id: context.node.id,
+                    executor_kind: self.kind().into(),
+                    service_class: context.graph.service_class,
+                    attempt: context.attempt,
+                    idempotency_key: context.node.idempotency_key,
+                    payload_ref: context.node.payload_ref,
+                })
+            }
+        }
+    }
+    async fn poll_or_await(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        assert!(matches!(
+            self.0,
+            StartFailureProbeMode::AfterAdmission | StartFailureProbeMode::AdmittedForeign
+        ));
+        Err(NodeExecutorError::Start {
+            node_id: if matches!(self.0, StartFailureProbeMode::AdmittedForeign) {
+                "foreign-node".into()
+            } else {
+                ticket.node_id.clone()
+            },
+            reason: "misclassified admitted failure".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn executor_start_failure_does_not_isolate_foreign_or_unknown_errors() {
+    for mode in [
+        StartFailureProbeMode::Foreign,
+        StartFailureProbeMode::Unknown,
+    ] {
+        let (registry, state, commits) = harness();
+        registry
+            .register(Arc::new(StartFailureProbe(mode)))
+            .unwrap();
+        let runner = test_runner(registry, state.clone(), commits);
+        let mut graph = test_graph("untrusted preparation error");
+        let mut probe = node("actual-node");
+        probe.executor_kind = "start_failure_probe".into();
+        graph.nodes.push(probe);
+        let graph = runner.register(graph).await.unwrap();
+        let ready = runner
+            .pump_snapshot(&graph.id, &Default::default())
+            .await
+            .unwrap()
+            .ready;
+        assert!(matches!(
+            runner.prepare_ready_wave(&graph.id, ready).await,
+            Err(ExecutionRunnerError::Executor(
+                NodeExecutorError::Start { .. } | NodeExecutorError::OriginalCustodyUnknown { .. }
+            ))
+        ));
+        let current = state.load(&graph.id).unwrap();
+        assert_eq!(
+            current.node_statuses["actual-node"],
+            ExecutionNodeStatus::Ready
+        );
+        assert!(current.node_results.is_empty());
+        assert!(current
+            .recovery_cursor
+            .node_attempts
+            .values()
+            .all(|attempt| *attempt == 0));
+        assert!(state
+            .binding_starts_page(&graph.id, 0, current.revision)
+            .unwrap()
+            .1
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn executor_start_failure_after_admission_preserves_unknown_original_custody() {
+    for foreign in [false, true] {
+        let (registry, state, commits) = harness();
+        registry
+            .register(Arc::new(StartFailureProbe(if foreign {
+                StartFailureProbeMode::AdmittedForeign
+            } else {
+                StartFailureProbeMode::AfterAdmission
+            })))
+            .unwrap();
+        let runner = test_runner(registry, state.clone(), commits);
+        let mut graph = test_graph("admitted Start is not a preparation failure");
+        let mut probe = node("actual-node");
+        probe.executor_kind = "start_failure_probe".into();
+        graph.nodes.push(probe);
+        let graph = runner.register(graph).await.unwrap();
+        let ready = runner
+            .pump_snapshot(&graph.id, &Default::default())
+            .await
+            .unwrap()
+            .ready;
+        let prepared = runner
+            .prepare_ready_wave(&graph.id, ready)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let before = state.load(&graph.id).unwrap();
+        assert_eq!(
+            before.node_statuses["actual-node"],
+            ExecutionNodeStatus::Running
+        );
+        let error = runner
+            .execute_prepared_pump_node(&graph.id, prepared, Arc::new(Notify::new()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { node_id, .. }) if node_id == "actual-node")
+        );
+        assert_eq!(state.load(&graph.id).unwrap(), before);
+        let (finished, outcome, closed) = runner
+            .original_pump_outcome_for_test(&graph.id, "actual-node")
+            .await
+            .unwrap();
+        assert!(!finished);
+        assert!(!closed);
+        assert!(
+            matches!(outcome, Some(Err(error)) if matches!(error.as_ref(),
+            ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { node_id, .. }) if node_id == "actual-node"))
+        );
+        let in_flight = std::collections::BTreeSet::from(["actual-node".to_string()]);
+        let (owners, missing) = runner
+            .capture_pump_cancellation_owners(&graph.id, &in_flight)
+            .await;
+        assert!(!missing);
+        assert_eq!(owners.len(), 1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            runner.drain_pump_cancellation_owners(&graph.id, owners),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { .. })
+        ));
+        assert_eq!(state.load(&graph.id).unwrap(), before);
+        let (finished, _, closed) = runner
+            .original_pump_outcome_for_test(&graph.id, "actual-node")
+            .await
+            .unwrap();
+        assert!(!finished);
+        assert!(!closed);
+        let starts = state
+            .binding_starts_page(&graph.id, 0, before.revision)
+            .unwrap()
+            .1;
+        assert_eq!(starts.len(), 1);
+        assert!(state
+            .binding_retirement_record(&before, "actual-node", &starts[0].1)
+            .unwrap()
+            .is_none());
+        assert!(!state
+            .binding_lease_closure(&before, "actual-node", &starts[0].1, starts[0].2)
+            .unwrap());
+    }
 }
 
 #[tokio::test]
@@ -3493,6 +3941,10 @@ async fn isolation_rejects_foreign_attempt_before_touching_current_resource_leas
             .active_leases,
         1
     );
+    assert!(matches!(
+        commits.inspect_execution_effect(&ticket).unwrap(),
+        ExecutionEffectState::Uncertain
+    ));
     let mut foreign = binding.clone();
     foreign.attempt += 1;
     let rejected = runner
@@ -3541,10 +3993,14 @@ async fn isolation_rejects_foreign_attempt_before_touching_current_resource_leas
         state.load(&graph.id).unwrap().node_statuses[&ticket.node_id],
         ExecutionNodeStatus::Failed
     );
-    assert!(matches!(
-        commits.inspect_execution_effect(&ticket).unwrap(),
-        ExecutionEffectState::Uncertain
-    ));
+    let ExecutionEffectState::Completed(outcome) = commits.inspect_execution_effect(&ticket).unwrap()
+    else {
+        panic!("the original owner failure must have a settled receipt");
+    };
+    assert_eq!(outcome.result.status, ExecutionNodeStatus::Failed);
+    let failure = outcome.result.failure.expect("original isolated failure");
+    assert_eq!(failure.kind, "node_execution_isolated_failure");
+    assert_eq!(failure.message, "actual owner failure");
 }
 
 #[tokio::test]
@@ -7242,13 +7698,13 @@ async fn r1_450_explicit_resume_admits_fresh_namespace_without_reusing_uncertain
     };
     let scopes = manual_scope_locks_475(&ready.id);
     let _owner = acquire_fixture_owner_475(&scopes, &commits, &ready, "durable", &binding);
-    commits
+    let second_running = commits
         .bind_and_start_nodes(
             &ready,
             BTreeMap::from([("durable".into(), binding)]),
             vec![retry.clone()],
         )
-        .unwrap();
+        .unwrap().graph;
     assert!(matches!(
         commits.inspect_execution_effect(&retry).unwrap(),
         ExecutionEffectState::Uncertain
@@ -7257,6 +7713,14 @@ async fn r1_450_explicit_resume_admits_fresh_namespace_without_reusing_uncertain
         ExecutionNodeBinding::effect_stream_id(&ticket),
         ExecutionNodeBinding::effect_stream_id(&retry)
     );
+    let program_stream = "agentic-program:gb3-graph-test";
+    let before = events.stream_revision(program_stream).unwrap();
+    let error = crate::agentic::gb3_settle_synthetic_old_cut_for_graph_test(
+        events.clone(), &second_running.id, &ticket.node_id, ticket.attempt,
+    ).unwrap_err();
+    assert!(error.to_string().contains("review_cut_original_attempt_changed"), "{error}");
+    assert_eq!(events.stream_revision(program_stream).unwrap(), before);
+    assert_eq!(events.stream_revision(&second_running.id).unwrap(), second_running.revision);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 

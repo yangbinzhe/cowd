@@ -67,7 +67,15 @@ fn entry(layer: MemoryLayer, source: MemorySource, title: &str) -> memory::Memor
 #[test]
 fn memory_primitives_cover_all_memory_views() {
     let primitives = MemoryPrimitive::all();
-    assert_eq!(primitives.len(), 5);
+    assert!(!primitives.is_empty());
+    assert!(primitives.iter().all(|primitive| matches!(
+        primitive,
+        MemoryPrimitive::Atom
+            | MemoryPrimitive::Evidence
+            | MemoryPrimitive::Link
+            | MemoryPrimitive::State
+            | MemoryPrimitive::Recall
+    )));
     assert!(primitives.contains(&MemoryPrimitive::Atom));
     assert!(primitives.contains(&MemoryPrimitive::Evidence));
     assert!(primitives.contains(&MemoryPrimitive::Link));
@@ -334,7 +342,12 @@ async fn memory_kernel_layer_views_project_atoms_read_only() {
     assert_eq!(l2.layer, MemoryLayer::L2);
     assert_eq!(l2.atoms.len(), 1);
     assert!(l2.atoms[0].is_explainable_orientation());
-    assert_eq!(all.len(), 5);
+    assert!(!all.is_empty());
+    assert!(all.iter().all(|view| view.read_only));
+    assert!(all.iter().all(|view| matches!(view.layer, MemoryLayer::L0 | MemoryLayer::L1 | MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4)));
+    for layer in [MemoryLayer::L0, MemoryLayer::L1, MemoryLayer::L2, MemoryLayer::L3, MemoryLayer::L4] {
+        assert_eq!(all.iter().filter(|view| view.layer == layer).count(), 1);
+    }
     assert_eq!(
         all.iter()
             .find(|view| view.layer == MemoryLayer::L2)

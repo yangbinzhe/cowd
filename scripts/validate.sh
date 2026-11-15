@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/test/build-env.sh"
 cd "$ROOT"
 
 LANE="${1:-${COWD_VALIDATION_LANE:-contract}}"

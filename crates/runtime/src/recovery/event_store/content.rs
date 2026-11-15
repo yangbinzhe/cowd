@@ -1964,7 +1964,9 @@ impl RuntimeEventStore {
             "_runtime_activity_binding",
         ];
         let object = event.payload.as_object().ok_or_else(invalid)?;
-        if object.len() != fields.len() || object.keys().any(|key| !fields.contains(&key.as_str()))
+        if !(object.len() == fields.len() || object.len() == fields.len() + 1)
+            || object.keys().any(|key| !fields.contains(&key.as_str()) && key != "attachments")
+            || (object.len() == fields.len() + 1 && !object.contains_key("attachments"))
         {
             return Err(invalid());
         }
@@ -2042,7 +2044,42 @@ impl RuntimeEventStore {
         {
             return Err(invalid());
         }
+        Self::host_transcript_attachment_refs(&event.payload, session)?;
         Ok((graph.into(), node.into(), artifact))
+    }
+
+    /// Validate the bounded, original-session attachment index before treating
+    /// any nested body as a root of the original result transaction.
+    pub(crate) fn host_transcript_attachment_refs(
+        payload: &serde_json::Value,
+        session: &str,
+    ) -> Result<Vec<ArtifactRef>, String> {
+        let invalid = || "invalid Host transcript attachment index".to_string();
+        let Some(value) = payload.get("attachments") else { return Ok(Vec::new()); };
+        let entries = value.as_array().ok_or_else(invalid)?;
+        if entries.is_empty() || entries.len() > 64 { return Err(invalid()); }
+        let mut positions = std::collections::BTreeSet::new();
+        let mut refs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let object = entry.as_object().ok_or_else(invalid)?;
+            if object.len() != 3 || !object.contains_key("message_index")
+                || !object.contains_key("block_index") || !object.contains_key("artifact") {
+                return Err(invalid());
+            }
+            let message = entry["message_index"].as_u64().filter(|i| *i < 256).ok_or_else(invalid)?;
+            let block = entry["block_index"].as_u64().filter(|i| *i < 16384).ok_or_else(invalid)?;
+            let artifact: ArtifactRef = serde_json::from_value(entry["artifact"].clone()).map_err(|_| invalid())?;
+            let valid_hex = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !positions.insert((message, block))
+                || !artifact.is_durable() || artifact.bytes == 0
+                || artifact.media_type != "application/vnd.cowd.host-transcript-body+json"
+                || artifact.visibility_scope != format!("session:{session}")
+                || !artifact.sha256.strip_prefix("sha256:").is_some_and(valid_hex)
+                || !artifact.selector.strip_prefix("artifact://art_").is_some_and(valid_hex)
+            { return Err(invalid()); }
+            refs.push(artifact);
+        }
+        Ok(refs)
     }
 
     pub fn host_transcript_root(
@@ -2058,7 +2095,11 @@ impl RuntimeEventStore {
         else {
             return PreparedContentRoot::Blocked;
         };
-        if &reference != artifact {
+        let session = primary.payload["session_id"].as_str().unwrap_or("");
+        let Ok(attachments) = Self::host_transcript_attachment_refs(&primary.payload, session) else {
+            return PreparedContentRoot::Blocked;
+        };
+        if &reference != artifact && !attachments.iter().any(|candidate| candidate == artifact) {
             return PreparedContentRoot::Absent;
         }
         let (Some(node), Some(graph)) = (node, graph) else {
@@ -2325,6 +2366,36 @@ mod host_transcript_roots_460_tests {
                 .transition_execution_outcome(&self.graph, &self.ticket, &outcome, &BTreeMap::new())
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn host_transcript_large_body_recovers_and_attachment_is_transaction_root() {
+        let fixture = Fixture::new();
+        let original = "evidence".repeat(75_000);
+        let messages = vec![serde_json::json!({
+            "role":"assistant", "usage":null, "blocks":[{"Text":{"text":original}}]
+        }), serde_json::json!({
+            "role":"tool", "usage":null,
+            "blocks":[{"ToolResult":{"tool_use_id":"call-1", "tool_name":"read_file",
+                "output":original, "is_error":false}}]
+        })];
+        let stage = fixture.commits.prepare_host_transcript(
+            &fixture.ticket, "session-460", "turn-460", 0,
+            format!("sha256:{:x}", Sha256::digest([])), messages.clone(), None,
+        ).unwrap();
+        let attachments = RuntimeEventStore::host_transcript_attachment_refs(&stage.event.payload, "session-460").unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert!(Fixture::artifact(&stage).bytes <= 524288);
+        let mut wrong_scope = stage.event.payload.clone();
+        wrong_scope["attachments"][0]["artifact"]["visibility_scope"] = serde_json::json!("session:foreign");
+        assert!(RuntimeEventStore::host_transcript_attachment_refs(&wrong_scope, "session-460").is_err());
+        let mut duplicate = stage.event.payload.clone();
+        let duplicate_entry = duplicate["attachments"][0].clone();
+        duplicate["attachments"].as_array_mut().unwrap().push(duplicate_entry);
+        assert!(RuntimeEventStore::host_transcript_attachment_refs(&duplicate, "session-460").is_err());
+        fixture.commit(stage.clone());
+        assert_eq!(fixture.events.backend.prepared_content_root(&Fixture::origin(&stage), &attachments[0]).unwrap(), PreparedContentRoot::Canonical);
+        assert_eq!(fixture.commits.committed_host_transcript(&fixture.ticket).unwrap().messages, messages);
     }
 
     #[test]

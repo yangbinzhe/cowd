@@ -441,11 +441,11 @@ fn orchestrate_can_dispatch_the_whole_builtin_catalog_but_never_itself() {
         .collect();
 
     assert_eq!(catalog.len(), 28, "the catalog size is the contract");
+    assert_eq!(catalog.iter().filter(|name| name.as_str() == "tool_orchestrate").count(), 1);
     let catalog: Vec<String> = catalog
         .into_iter()
         .filter(|name| name != "tool_orchestrate")
         .collect();
-    assert_eq!(catalog.len(), 27, "the catalog minus the orchestrator itself");
     for name in &catalog {
         assert!(dispatchable(name), "`{name}` is in the catalog, so it must be composable");
     }

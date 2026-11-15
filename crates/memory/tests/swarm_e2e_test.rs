@@ -521,7 +521,11 @@ async fn test_swarm_e2e_cross_scope_isolation() {
 
     // Verify total: 5 entries across both scopes
     let all_l3 = mgr.list_layer_entries(MemoryLayer::L3).await.unwrap();
-    assert_eq!(all_l3.len(), 5, "Expected 5 total entries in L3");
+    let titles = all_l3.iter().map(|entry| entry.title.clone()).collect::<std::collections::BTreeSet<_>>();
+    let expected = (0..3).map(|i| format!("proj-a-entry-{i}"))
+        .chain((0..2).map(|i| format!("proj-b-entry-{i}"))).collect();
+    assert_eq!(titles, expected);
+    assert_eq!(all_l3.len(), titles.len());
 
     // Query by project scope identifier in content
     let proj_a_results = mgr.recall("proj-a-entry", 10).await.unwrap();

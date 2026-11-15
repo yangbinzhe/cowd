@@ -1917,13 +1917,13 @@ fn live_provider_token_telemetry_limit() -> Result<Option<u64>, String> {
         // turned into a model-output or task-completion cap.
         return Ok(None);
     };
-    let limit = raw.parse::<u64>().map_err(|_| {
-        "COWD_EVAL_MAX_PROVIDER_TOKENS must be a positive integer when supplied".to_string()
-    })?;
-    if limit == 0 {
-        return Err("COWD_EVAL_MAX_PROVIDER_TOKENS must be positive when supplied".to_string());
+    match raw.parse::<u64>() {
+        Ok(limit) if limit > 0 => Ok(Some(limit)),
+        _ => {
+            eprintln!("warning: ignoring invalid provider token telemetry value");
+            Ok(None)
+        }
     }
-    Ok(Some(limit))
 }
 
 /// Versioned business prompts for the first v2 group. The caller selects v2

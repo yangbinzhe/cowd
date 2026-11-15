@@ -952,17 +952,7 @@ fn source_ids_use_file_prefix() {
     let (kg, _mtimes) = build_project_kg(tmp.path());
     let entity = kg.get_entity_by_name("main").expect("main should exist");
 
-    assert_eq!(entity.source_ids.len(), 1);
-    assert!(
-        entity.source_ids[0].starts_with("file:"),
-        "source_id should use 'file:' prefix, got: {}",
-        entity.source_ids[0]
-    );
-    assert!(
-        entity.source_ids[0].contains("main.rs"),
-        "source_id should reference origin file, got: {}",
-        entity.source_ids[0]
-    );
+    assert_eq!(entity.source_ids, vec![format!("file:{}", tmp.path().join("src/main.rs").display())]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,12 +1111,7 @@ fn entity_source_ids_track_origin_file() {
         .get_entity_by_name("foo_fn")
         .expect("foo_fn should exist");
 
-    assert_eq!(entity.source_ids.len(), 1);
-    assert!(
-        entity.source_ids[0].contains("foo.rs"),
-        "source_id should reference origin file, got: {}",
-        entity.source_ids[0]
-    );
+    assert_eq!(entity.source_ids, vec![format!("file:{}", tmp.path().join("src/foo.rs").display())]);
 }
 
 // ---------------------------------------------------------------------------

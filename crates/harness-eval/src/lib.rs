@@ -3035,7 +3035,8 @@ mod tests {
             .map(|item| item.kind)
             .collect::<std::collections::BTreeSet<_>>();
 
-        assert_eq!(matrix.len(), 7);
+        let mut unique_kinds = std::collections::BTreeSet::new();
+        assert!(matrix.iter().all(|item| unique_kinds.insert(item.kind)));
         assert!(kinds.contains(&E2eScenarioKind::SimpleOnce));
         assert!(kinds.contains(&E2eScenarioKind::ComplexPlan));
         assert!(kinds.contains(&E2eScenarioKind::TeamParallel));
@@ -3085,7 +3086,7 @@ mod tests {
         assert_eq!(report.status, "passed");
         assert!(!report.real_provider_enabled);
         assert_eq!(report.real_provider_reason, "real provider not enabled");
-        assert_eq!(report.scenario_matrix.len(), 7);
+        assert_eq!(report.scenario_matrix, stable_ai_scenario_matrix());
     }
 
     #[test]
@@ -3311,7 +3312,11 @@ mod tests {
 
         assert_eq!(report.status, "passed");
         assert_eq!(report.failed, 0);
-        assert_eq!(report.scenarios.len(), 7);
+        let expected: std::collections::BTreeSet<_> = next_gen_harness_closure_specs().into_iter().map(|spec| spec.id).collect();
+        let mut observed = std::collections::BTreeSet::new();
+        assert!(report.scenarios.iter().all(|scenario| observed.insert(scenario.scenario_id.clone())));
+        assert!(!expected.is_empty());
+        assert_eq!(observed, expected);
         assert!(report.scenarios.iter().any(|scenario| {
             scenario.kind == NextGenHarnessScenarioKind::ToolBatchEfficiency
                 && scenario.claims_tool_validation

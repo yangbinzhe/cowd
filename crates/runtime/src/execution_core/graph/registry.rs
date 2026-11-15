@@ -20,6 +20,8 @@ pub enum NodeExecutorError {
     },
     #[error("executor rejected node `{node_id}`: {reason}")]
     Invalid { node_id: String, reason: String },
+    /// Ticket preparation definitively failed before any execution effect.
+    /// Uncertain physical custody must use `OriginalCustodyUnknown` instead.
     #[error("executor failed to start node `{node_id}`: {reason}")]
     Start { node_id: String, reason: String },
     #[error("executor failed while awaiting node `{node_id}`: {reason}")]
@@ -224,6 +226,10 @@ pub trait NodeExecutor: Send + Sync {
         true
     }
     fn validate(&self, node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError>;
+    /// Prepare a ticket only. Execution effects begin in `poll_or_await`,
+    /// after the Runner durably admits the binding. `Start` certifies that
+    /// preparation failed without executing; an uncertain effect must retain
+    /// its original custody and return `OriginalCustodyUnknown`.
     async fn start(
         &self,
         context: NodeExecutionContext,

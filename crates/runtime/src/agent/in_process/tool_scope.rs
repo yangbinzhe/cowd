@@ -2250,6 +2250,30 @@ mod original_effect_admission_gate_tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejected_member_settles_and_keeps_rejection() {
+        let store = Arc::new(crate::runtime_event_store::RuntimeEventStore::for_test());
+        let host = Arc::new(GateHost { calls: std::sync::atomic::AtomicUsize::new(0) });
+        let executor = gate_executor(host, Some(crate::execution_core::graph::ExecutionCommitService::new(store.clone())));
+        let tool = harness_contract::agent_action::STATE_INSPECT_TOOL_ID;
+        let authorization = gate_authorization(tool, "rejected-member");
+        let mut original = original_request(tool, "rejected-member", &executor, authorization);
+        let (request, ticket, effect, claim) = read_member_fixture(&executor, &store, &mut original);
+        executor.commit_service.as_ref().unwrap().begin_tool_effect(request.as_ref(), &effect).unwrap();
+        let reservation = store.reserve_original_member(&request.idempotency_key, 0, &ticket).unwrap();
+        let fence = store.acquire_original_member_preparation_fence(&reservation, &request, &ticket, 0, None, claim).unwrap();
+        let coordinate = crate::tool_host::OriginalBatchMemberCoordinate::from_original(&request, &ticket, 0);
+        let observation: harness_contract::agent_action::AgentActionObservation = serde_json::from_value(serde_json::json!({
+            "receipt_id":"receipt", "action_id":"action", "action":"agent_invite", "program_id":"program",
+            "revision":4, "status":"rejected", "changed_refs":[], "actionable":[],
+            "error":{"code":"unknown_existing_agent_ref", "message":"invalid reference", "recoverable":true}
+        })).unwrap();
+        let publication = crate::tool_host::OriginalBatchMemberStop::publish_with_owners(
+            coordinate, crate::tool_host::OriginalBatchMemberStopReason::UnknownNoReceipt(observation), Arc::new(reservation), fence);
+        assert!(matches!(publication.current().reason(), crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)));
+        assert_eq!(publication.current().rejected_observation().unwrap().error.as_ref().unwrap().code, "unknown_existing_agent_ref");
+    }
+
     /// The negative control of the same fixture: the call is never
     /// admitted, so no read intent is written. The first gate must refuse
     /// the member for the missing admission, and the fence must refuse to

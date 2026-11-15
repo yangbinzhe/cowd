@@ -172,7 +172,7 @@ fn cold_start_tool_failure_replan_available(
 
 #[cfg(test)]
 #[path = "tests/host.rs"]
-mod tests;
+pub(crate) mod tests;
 
 /// Select the one Runtime-owned control plane that may constrain the next
 /// provider request.
@@ -2115,7 +2115,7 @@ where
             return Err(RuntimeError::new(error));
         }
         let summary = if let Some(summary) = state.summary.take() {
-            summary
+            *summary
         } else {
             drop(state);
             let graph = services
@@ -4874,7 +4874,7 @@ pub(crate) struct TurnGraphState {
     models_used: Vec<String>,
     first_token_latency_ms: Option<u64>,
     active_stream_duration_ms: u64,
-    summary: Option<TurnSummary>,
+    summary: Option<Box<TurnSummary>>,
     failure: Option<String>,
     /// Wakes the owned ingress future after an asynchronously resumed root
     /// graph commits its terminal synthesis. `notify_one` retains a permit,
@@ -8181,7 +8181,7 @@ async fn execute_fenced_runtime_tool_owned(
                 }
             }
 
-            let execute = async {
+            let execute = Box::pin(async {
                 if direct_action {
                     let issuer = action_issuer.ok_or_else(|| crate::ToolError::new("original root action issuer unavailable"))?;
                     let ticket = original_ticket.ok_or_else(|| crate::ToolError::new("original action ticket missing"))?;
@@ -8192,7 +8192,7 @@ async fn execute_fenced_runtime_tool_owned(
                         &state, capture,
                         |capability| async move { host.execute_runtime_tool_with_action_invocation(request, &capability).await }).await
                 } else { Ok(host.execute_runtime_tool(request).await) }
-            };
+            });
             let result = if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
                 crate::bound_tool_batch::with_outer_read_receipt_owner(request, execute).await
             } else { execute.await };
@@ -9363,9 +9363,9 @@ async fn attach_conversation_graph(
     install_resolvers();
     let recovering = persisted.is_some();
     let attached = if recovering {
-        let recovered = services
+        let recovered = Box::pin(services
             .execution_supervisor()
-            .recover_graph(&graph_id)
+            .recover_graph(&graph_id))
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
         if require_direct_root_identity && !same_root(&recovered) {
@@ -9376,9 +9376,9 @@ async fn attach_conversation_graph(
         let original_owner = actor.as_ref().map(|actor| {
             services.original_graph_registration_owner(&graph_id, actor)
         }).transpose().map_err(RuntimeError::new)?.flatten();
-        services
+        Box::pin(services
             .execution_supervisor()
-            .register_continuation_graph(graph, actor, source_goal_cut, original_owner)
+            .register_continuation_graph(graph, actor, source_goal_cut, original_owner))
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?
     };

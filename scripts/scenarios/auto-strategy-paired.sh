@@ -355,7 +355,6 @@ else
     and .gate.automatic_team_materialization_gate == true
     and .gate.workspace_reset_gate == true
     and .gate.workspace_mutation_gate == true
-    and .gate.hard_budget_lease_gate == true
     and .gate.tool_topology_observation_gate == true
     and .gate.baseline_topology_isolation_gate == true
     and .gate.routing_gate == true

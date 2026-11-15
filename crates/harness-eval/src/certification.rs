@@ -1571,7 +1571,14 @@ mod tests {
         let report = run_certification_manifest(&manifest_path, root.path().join("result"))
             .expect("certification");
         assert_eq!(report.status, "passed");
-        assert_eq!(report.check_results.len(), 4);
+        let expected: std::collections::BTreeSet<_> = manifest.checks.iter().map(|check| check.id.clone())
+            .chain(manifest.expected_events.iter().map(|kind| format!("expected-event-{kind}")))
+            .chain(manifest.forbidden_events.iter().map(|kind| format!("forbidden-event-{kind}")))
+            .collect();
+        let mut observed = std::collections::BTreeSet::new();
+        assert!(report.check_results.iter().all(|check| check.status == "passed" && observed.insert(check.id.clone())));
+        assert!(!expected.is_empty());
+        assert_eq!(observed, expected);
     }
 
     #[test]

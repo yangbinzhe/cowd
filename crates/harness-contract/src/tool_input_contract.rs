@@ -15,6 +15,65 @@
 
 use serde_json::{Map, Value};
 
+/// A short correction only when this exact schema proves the statement.
+#[must_use]
+pub fn input_shape_correction(tool: &str, reason: &str, schema: &Value) -> Option<&'static str> {
+    if tool == "membership_update" && reason == "$: unexpected field `reason`"
+        && ["$ref", "oneOf", "anyOf", "allOf"].iter().all(|key| schema.get(*key).is_none())
+        && schema["additionalProperties"] == false && schema["properties"].get("reason").is_none()
+        && schema["properties"].get("reason_ref").is_some()
+    {
+        return Some("membership_update does not accept `reason`; its schema lists `reason_ref`. Do not automatically convert reason text; supply a value that meets that field's contract if needed.");
+    }
+    if tool == "tool_orchestrate" && reason == "$: unexpected field `id`"
+        && ["$ref", "oneOf", "anyOf", "allOf"].iter().all(|key| schema.get(*key).is_none())
+        && schema["additionalProperties"] == false
+        && schema["properties"].get("id").is_none()
+        && schema["properties"]["steps"]["type"] == "array"
+        && schema["properties"]["steps"]["items"]["type"] == "object"
+        && ["$ref", "oneOf", "anyOf", "allOf"].iter()
+            .all(|key| schema["properties"]["steps"]["items"].get(*key).is_none())
+        && schema["properties"]["steps"]["items"]["properties"]["id"]["type"] == "string"
+        && schema["properties"]["steps"]["items"]["required"].as_array()
+            .is_some_and(|fields| fields.iter().any(|field| field == "id"))
+    {
+        return Some("tool_orchestrate has no top-level `id`; each step requires its own string `id` in `steps`. Choose the step IDs explicitly.");
+    }
+    if tool != "task_review"
+        || ["$ref", "oneOf", "anyOf", "allOf"].iter().any(|key| schema.get(*key).is_some())
+        || !schema["required"].as_array().is_some_and(|fields| fields.iter().any(|field| field == "reason"))
+        || schema["properties"]["reason"]["type"] != "string"
+    {
+        return None;
+    }
+    match reason {
+        "$: missing required field `reason`" => Some("task_review requires a string `reason`; supply your own reason text."),
+        "$: unexpected field `reason_ref`"
+            if schema["additionalProperties"] == false && schema["properties"].get("reason_ref").is_none() =>
+            Some("task_review requires a string `reason`; `reason_ref` is not a task_review field. Supply your own reason text."),
+        _ => None,
+    }
+}
+
+/// Report other known unexpected root fields without modifying the caller's input.
+#[must_use]
+pub fn orchestrate_extra_root_fields(tool: &str, reason: &str, schema: &Value, input: &Value) -> Option<String> {
+    if tool != "tool_orchestrate" || reason != "$: unexpected field `id`"
+        || input_shape_correction(tool, reason, schema).is_none()
+        || schema.get("patternProperties").is_some()
+    {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    let object = input.as_object()?;
+    let extras: Vec<_> = ["op", "item"].into_iter()
+        .filter(|field| object.contains_key(*field) && !properties.contains_key(*field))
+        .map(|field| format!("`{field}`"))
+        .collect();
+    if extras.is_empty() { return None; }
+    Some(format!("Also unsupported at the top level of this schema: {}. Choose the intended step structure explicitly and validate the complete input.", extras.join(", ")))
+}
+
 /// A `$ref` chain longer than this is treated as absent rather than followed, so
 /// a self-referential schema cannot spin here.
 const MAX_REF_DEPTH: usize = 5;
@@ -1000,6 +1059,29 @@ pub fn admissible_field_names(schema: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gb2_correction_requires_the_exact_closed_schema_and_error() {
+        let schema = serde_json::json!({"type":"object", "required":["reason"],
+            "properties":{"reason":{"type":"string"}}, "additionalProperties":false});
+        let hint = super::input_shape_correction;
+        assert!(hint("task_review", "$: missing required field `reason`", &schema).is_some());
+        assert!(hint("task_review", "$: unexpected field `reason_ref`", &schema).is_some());
+        assert!(hint("other", "$: unexpected field `reason_ref`", &schema).is_none());
+        assert!(hint("task_review", "$.other: unexpected field `reason_ref`", &schema).is_none());
+        let mut open = schema.clone();
+        open["additionalProperties"] = true.into();
+        assert!(hint("task_review", "$: unexpected field `reason_ref`", &open).is_none());
+        let mut branched = schema.clone();
+        branched["oneOf"] = serde_json::json!([{}]);
+        assert!(hint("task_review", "$: missing required field `reason`", &branched).is_none());
+        let shape = serde_json::json!({"type":"object", "additionalProperties":false,
+            "properties":{"steps":{"type":"array","items":{"type":"object",
+                "required":["id"],"properties":{"id":{"type":"string"}}}}}});
+        assert!(hint("tool_orchestrate", "$: unexpected field `id`", &shape).is_some());
+        let mut open = shape.clone();
+        open["additionalProperties"] = true.into();
+        assert!(hint("tool_orchestrate", "$: unexpected field `id`", &open).is_none());
+    }
 
     /// A degradation never widens the instance-coverage window, and the
     /// degraded branch is bounded on its own.

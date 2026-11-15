@@ -1005,9 +1005,9 @@ impl RuntimeExecutionSupervisor {
         source_goal_cut: Option<crate::ExpectedStreamRevision>,
         original_owner: Option<Arc<crate::execution_core::services::OriginalGraphRegistrationOwner>>,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
-        self.runner
-            .register_continuation(graph, actor, source_goal_cut, original_owner)
-            .await
+        // Keep the registration future out of the caller's async frame; its
+        // durable owner and admission checks stay on the same execution path.
+        Box::pin(self.runner.register_continuation(graph, actor, source_goal_cut, original_owner)).await
     }
 
     pub(crate) async fn confirm_cancelled_bound_child_never_admitted(

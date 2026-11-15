@@ -350,7 +350,7 @@ fn s1_delegated_child_read_refuses_the_review_actual_input() {
     )
     .expect_err("an incomplete composite child acquisition cannot authenticate an actual input");
     assert_eq!(
-        error,
+        error.to_string(),
         "original composite child acquisitions incomplete"
     );
     assert!(composite_refused.canonical_facts.is_empty());

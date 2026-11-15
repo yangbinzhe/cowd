@@ -104,9 +104,9 @@ async fn own823n_presend_refusal_and_foreign_binding_remain_distinct() {
         .await
         .unwrap();
     assert!(fact.host_joined && fact.coverage_complete);
-    assert_eq!(fact.operations.len(), 1);
+    let [operation] = fact.operations.as_slice() else { panic!("unexpected local network operations"); };
     assert!(matches!(
-        fact.operations[0].terminal,
+        operation.terminal,
         LocalNetworkTerminal::NotStarted { .. }
     ));
 }
@@ -333,11 +333,11 @@ async fn u_failed_joined_call_carries_the_operations_it_produced() {
         .expect("the failure carries the facts it produced");
     assert!(fact.host_joined);
     assert!(fact.coverage_complete);
-    assert_eq!(fact.operations.len(), 1);
+    let [operation] = fact.operations.as_slice() else { panic!("unexpected local network operations"); };
     // The operation is reported as it was recorded: the request was taken and
     // the outcome is unknown. Nothing is rewritten into "not sent".
     assert!(matches!(
-        fact.operations[0].terminal,
+        operation.terminal,
         LocalNetworkTerminal::Unknown { .. }
     ));
     worker.join().unwrap();

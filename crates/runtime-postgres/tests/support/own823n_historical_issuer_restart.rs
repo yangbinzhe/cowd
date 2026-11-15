@@ -88,13 +88,23 @@ fn own823n_historical_issuer_cross_process_primitive() {
     let mut absent = receipt.clone();
     absent.payload["local_network_authorization_issuer"]["key"] = json!("missing-original-issued");
     assert!(service.validate_stored_local_network_receipt(&absent,&effect).is_err());
+    let terminal_stream = "own823n-terminal";
+    let terminal_revision = store.stream_revision(terminal_stream).unwrap();
+    assert_eq!(terminal_revision, 0, "fresh test terminal stream");
     store.append(RuntimeEventInput {stream_id:issuer_cut.stream_id.clone(),scope:RuntimeEventScope::Tool,
         kind:"own823n.test.source_cut_race".into(),status:None,actor:None,refs:vec![],payload:json!({})}).unwrap();
+    let issuer_after = store.stream_revision(&issuer_cut.stream_id).unwrap();
+    assert_eq!(issuer_after, issuer_cut.expected_revision + 1, "the original issuer source must actually advance");
     let result = store.append_transaction(runtime::AppendTransactionRequest {transaction_id:"own823n-raced-terminal".into(),
-        expected_streams:vec![issuer_cut],events:vec![RuntimeEventInput {stream_id:"own823n-terminal".into(),scope:RuntimeEventScope::Session,
+        expected_streams:vec![issuer_cut.clone(), runtime::ExpectedStreamRevision {
+            stream_id:terminal_stream.into(), expected_revision:terminal_revision,
+        }],events:vec![RuntimeEventInput {stream_id:terminal_stream.into(),scope:RuntimeEventScope::Session,
             kind:"own823n.test.no_false_terminal".into(),status:None,actor:None,refs:vec![],payload:json!({})}.into()]});
-    assert!(result.is_err());
-    assert_eq!(store.stream_revision("own823n-terminal").unwrap(),0);
+    assert!(matches!(result, Err(runtime::RuntimeEventStoreError::StaleRevision {
+        ref stream_id, expected, actual,
+    }) if stream_id == &issuer_cut.stream_id && expected == issuer_cut.expected_revision && actual == issuer_after),
+        "must reject the advanced original issuer source, got {result:?}");
+    assert_eq!(store.stream_revision(terminal_stream).unwrap(),terminal_revision);
 }
 
 pub(super) fn emit_child_failure_diagnostics(output: &std::process::Output) {

@@ -304,9 +304,6 @@ impl ExecutionProjectionReducer {
     }
 
     pub fn apply_delta(&mut self, delta: &ProjectionDelta) -> ProjectionDeltaApply {
-        if validate_projection_delta_schema(delta).is_err() {
-            return ProjectionDeltaApply::ResyncRequired;
-        }
         let Some(current) = self.projection.as_ref() else {
             return ProjectionDeltaApply::ResyncRequired;
         };
@@ -799,6 +796,25 @@ mod tests {
             operations: vec![ProjectionOperation::AdvanceCursor { cursor: 11 }],
             resync_reason: None,
         };
+        let mut empty = ExecutionProjectionReducer::default();
+        assert_eq!(
+            empty.apply_delta(&delta),
+            ProjectionDeltaApply::ResyncRequired
+        );
+        assert!(empty.projection().is_none());
+
+        let mut invalid = delta.clone();
+        let mut collaboration = projection.agentic_collaboration.clone();
+        collaboration.schema_version += 1;
+        invalid
+            .operations
+            .push(ProjectionOperation::ReplaceAgenticCollaboration { collaboration });
+        assert_eq!(
+            reducer.apply_delta(&invalid),
+            ProjectionDeltaApply::ResyncRequired
+        );
+        assert_eq!(reducer.projection(), Some(&projection));
+
         assert_eq!(reducer.apply_delta(&delta), ProjectionDeltaApply::Applied);
         assert_eq!(reducer.cursor(), 11);
         assert_eq!(

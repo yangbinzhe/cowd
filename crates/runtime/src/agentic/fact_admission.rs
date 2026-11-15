@@ -82,6 +82,16 @@ impl FactAdmission {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ADMISSIONS: std::cell::RefCell<Vec<FactAdmissionStrategy>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_admissions() -> Vec<FactAdmissionStrategy> {
+    TEST_ADMISSIONS.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
+}
+
 /// The one gate: ask the proof strategies in the fixed order, and say which
 /// one admitted the fact - or, when none did, what each of them was missing.
 ///
@@ -96,6 +106,8 @@ pub(crate) fn admit(
     let mut ordered = outcomes.to_vec();
     ordered.sort_by_key(|outcome| outcome.strategy.order());
     if let Some(admitted) = ordered.iter().find(|outcome| outcome.admitted) {
+        #[cfg(test)]
+        TEST_ADMISSIONS.with(|seen| seen.borrow_mut().push(admitted.strategy));
         return FactAdmission {
             code: FactAdmissionCode::Admitted,
             original_code: original_code.to_string(),
@@ -112,6 +124,21 @@ pub(crate) fn admit(
             .map(|outcome| StrategyGap { strategy: outcome.strategy, missing: outcome.missing })
             .collect(),
     }
+}
+
+/// The same judgment as `admit`, exposed as a control-flow gate for the
+/// original fact owner. The decision is transient and does not change the
+/// persisted proof representation or confer authority of its own.
+pub(crate) fn require(
+    outcomes: &[StrategyOutcome],
+    refusal_code: FactAdmissionCode,
+    original_code: &str,
+) -> Result<FactAdmission, String> {
+    let decision = admit(outcomes, refusal_code, original_code);
+    if decision.code != FactAdmissionCode::Admitted || decision.strategy.is_none() {
+        return Err(decision.refusal_message());
+    }
+    Ok(decision)
 }
 
 /// The refusal envelope of a gate that judged one fact without asking a

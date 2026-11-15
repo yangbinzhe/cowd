@@ -1624,12 +1624,15 @@ mod tests {
         assert!(crate::report::observed_usage_source(
             &evidence.usage.usage_source
         ));
-        assert_eq!(evidence.rounds.len(), 2);
-        assert_eq!(evidence.rounds[1]["round_kind"], "live_gateway_scenario");
-        assert_eq!(
-            evidence.rounds[1]["trace_artifact"],
-            "live-scenarios/team.json"
-        );
+        let expected: std::collections::BTreeSet<_> = details["scenarios"].as_array().unwrap().iter()
+            .map(|scenario| scenario["scenario_id"].as_str().unwrap()).collect();
+        let mut observed = std::collections::BTreeSet::new();
+        assert!(!expected.is_empty());
+        assert!(evidence.rounds.iter().all(|round| round["round_kind"] == "live_gateway_scenario"
+            && observed.insert(round["scenario_id"].as_str().unwrap())));
+        assert_eq!(observed, expected);
+        let team = evidence.rounds.iter().find(|round| round["scenario_id"] == "team").unwrap();
+        assert_eq!(team["trace_artifact"], "live-scenarios/team.json");
         for value in [Value::Null, json!(1)] {
             let mut partial = details.clone();
             partial["scenarios"][0]["metrics"]["usage_unknown_attempts"] = value;

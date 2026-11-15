@@ -112,7 +112,7 @@ async fn postgres_memory_discovery_versions_content_and_lifecycle_atomically() {
         current.after_id = Some(after);
         current.expected_revisions = Some(page.revisions);
     }
-    assert_eq!(ids.len(), 140);
+    assert_eq!(ids, (1..=140).map(uuid::Uuid::from_u128).collect());
     // Read-only get must not invalidate discovery.
     let mut saved = store.get(&sample.id).await.unwrap().unwrap();
     store.discover_page(resume.clone()).await.unwrap();

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import signal
+import socket
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,25 @@ spec.loader.exec_module(module)
 
 
 class OwnerBoundary(unittest.TestCase):
+    def test_occupied_port_uses_a_new_port_before_creating_resources(self):
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            owner = self.owner(directory)
+            owner.args.port = occupied.getsockname()[1]
+            owner.report["port"] = owner.args.port
+            def operation(name, argv, *args, **kwargs):
+                if name == "local-docker":
+                    return "unix:///var/run/docker.sock"
+                if name == "local-image":
+                    raise RuntimeError("stop before resource creation")
+                self.fail(name)
+            owner.op = operation
+            with self.assertRaisesRegex(RuntimeError, "stop before resource creation"):
+                owner.start()
+            self.assertNotEqual(owner.args.port, occupied.getsockname()[1])
+            self.assertEqual(owner.report["port"], owner.args.port)
+            self.assertIsNone(owner.root)
+
     def owner(self, directory):
         args = argparse.Namespace(run_id="unit", port=36435, seconds=1,
                                   report=Path(directory)/"report.json", command=["unused"])
@@ -147,6 +167,17 @@ class OwnerBoundary(unittest.TestCase):
             self.assertTrue(result["volume_removed"])
             self.assertFalse(result["volume_retained"])
             self.assertFalse(owner.root.exists())
+
+    def test_receipt_mode_failure_warns_but_keeps_identity_and_evidence_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = self.owner(directory)
+            path, receipt = self.receipt(owner, directory)
+            path.chmod(0o644)
+            with patch.object(Path, "chmod", side_effect=PermissionError("unsupported")):
+                self.assertTrue(owner.deletion_authorized())
+                receipt["run_id"] = "foreign"
+                path.write_text(json.dumps(receipt))
+                self.assertFalse(owner.deletion_authorized())
 
     def test_explicit_complete_business_acceptance_allows_delete(self):
         with tempfile.TemporaryDirectory() as directory:

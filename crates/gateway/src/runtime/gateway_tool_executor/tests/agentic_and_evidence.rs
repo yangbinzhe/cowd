@@ -2334,3 +2334,67 @@ fn k02_default_batch_original_preview_survives_provider_wire() {
     assert!(rejected.truncated && rejected.summary.contains("Partial orchestration output omitted"));
     assert!(!rejected.summary.contains("orchestration_partial_receipt"));
 }
+
+#[test]
+fn gb2_reason_ref_refusal_teaches_the_real_required_field() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let invalid = json!({"task_ref":"task-1", "decision":"accept", "reason":"done", "reason_ref":"artifact://other"});
+    let lease = executor.tool_host.pin_snapshot();
+    let original = lease.validate_input("task_review", &invalid).expect_err("unknown field must refuse");
+    let old = executor.input_contract_error("task_review", original.to_string());
+    let old_failure = old.failure().expect("old structured failure");
+    let error = executor.validate_tool_input("task_review", &invalid.to_string()).expect_err("no field may be silently dropped");
+    let failure = error.failure().expect("structured failure");
+    assert_eq!(failure.class, old_failure.class);
+    assert_eq!(failure.schema_hash, old_failure.schema_hash);
+    assert_eq!(failure.allowed_fields, old_failure.allowed_fields);
+    assert!(failure.message.starts_with(&old_failure.message), "{}", failure.message);
+    assert!(failure.message.contains("task_review requires a string `reason`"), "{}", failure.message);
+    assert!(failure.message.contains("`reason_ref` is not a task_review field"), "{}", failure.message);
+    let fixed = json!({"task_ref":"task-1", "decision":"accept", "reason":"done"});
+    assert!(executor.validate_tool_input("task_review", &fixed.to_string()).is_ok());
+    let missing = json!({"task_ref":"task-1", "decision":"accept", "reason_ref":"artifact://other"});
+    let missing_error = executor.validate_tool_input("task_review", &missing.to_string()).expect_err("missing reason must be refused").to_string();
+    assert!(missing_error.contains("missing required field `reason`"), "{missing_error}");
+    assert!(missing_error.contains("task_review requires a string `reason`"), "{missing_error}");
+    let repeated = executor.validate_tool_input("task_review", &invalid.to_string()).expect_err("repeat remains refused");
+    assert_eq!(error.failure().unwrap().message, repeated.failure().unwrap().message);
+}
+
+#[test]
+fn gb2_orchestrate_top_level_id_refuses_and_names_the_step_path() {
+    let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+    let invalid = json!({"id":"wrong", "steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]});
+    let error = executor.validate_tool_input("tool_orchestrate", &invalid.to_string()).expect_err("extra field must be refused");
+    let message = &error.failure().unwrap().message;
+    assert!(message.contains("unexpected field `id`"), "{message}");
+    assert!(message.contains("each step requires its own string `id`"), "{message}");
+    assert!(message.contains("Schema-valid structural example"), "{message}");
+    for extra in [json!({"id":"wrong", "op":"batch", "steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]}),
+                  json!({"id":"wrong", "op":"call", "item":{}, "steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]})] {
+        let err = executor.validate_tool_input("tool_orchestrate", &extra.to_string()).unwrap_err();
+        let msg = &err.failure().unwrap().message;
+        assert!(msg.contains("unexpected field `id`"), "{msg}");
+        assert!(msg.contains("`op`"), "{msg}");
+        if extra.get("item").is_some() { assert!(msg.contains("`item`"), "{msg}"); }
+    }
+    let corrected = json!({"steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]});
+    assert!(executor.validate_tool_input("tool_orchestrate", &corrected.to_string()).is_ok());
+}
+
+#[test]
+fn gb2_membership_reason_refusal_preserves_the_original_field() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions()).unwrap();
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let invalid = json!({"agent_ref":"agent:test", "team_ref":"team:test", "operation":"join", "reason":"why"});
+    let error = executor.validate_tool_input("membership_update", &invalid.to_string()).unwrap_err();
+    let message = &error.failure().unwrap().message;
+    assert!(message.contains("unexpected field `reason`"), "{message}");
+    assert!(message.contains("Do not automatically convert reason text"), "{message}");
+    let corrected = json!({"agent_ref":"agent:test", "team_ref":"team:test", "operation":"join"});
+    assert!(executor.validate_tool_input("membership_update", &corrected.to_string()).is_ok());
+}

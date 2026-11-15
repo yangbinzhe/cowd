@@ -2297,17 +2297,22 @@ mod tests {
 
     #[test]
     fn epoch_builds_source_registry_for_selected_and_omitted_items() {
-        let epoch = ContextEpochBuilder::new(ContextIdentity::main("s1"), ContextBudget::new(5))
-            .add_item(item(ContextSourceKind::Memory, "short", 1.0))
-            .add_item(item(
+        let selected_input = item(ContextSourceKind::Memory, "short", 1.0);
+        let omitted_input = item(
                 ContextSourceKind::Knowledge,
                 "this knowledge item is too long for the budget",
                 1.0,
-            ))
+            );
+        let expected = std::collections::BTreeSet::from([selected_input.id.clone(), omitted_input.id.clone()]);
+        let epoch = ContextEpochBuilder::new(ContextIdentity::main("s1"), ContextBudget::new(5))
+            .add_item(selected_input)
+            .add_item(omitted_input)
             .build()
             .unwrap();
 
-        assert_eq!(epoch.source_registry.len(), 2);
+        let mut observed = std::collections::BTreeSet::new();
+        assert!(epoch.source_registry.iter().all(|source| observed.insert(source.source_id.clone())));
+        assert_eq!(observed, expected);
         assert!(epoch
             .source_registry
             .iter()

@@ -260,6 +260,23 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         vec!["read:src/a.rs".into()],
         true,
     );
+    // Acquire the original parent attempt through the scheduler before invoking tools.
+    let runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        services.executor_registry().clone(), services.graph_state_store().clone(),
+        services.commit_service().clone(), services.resource_manager().clone(),
+        services.scope_locks().clone(), services.worktree_leases().clone(),
+        services.workspace_key(), services.workspace_root(),
+    );
+    let snapshot = runner.pump_snapshot(packet.graph_id(), &BTreeSet::new()).await.unwrap();
+    assert_eq!(snapshot.ready.len(), 1);
+    let wave = runner.prepare_ready_wave(packet.graph_id(), snapshot.ready).await.unwrap();
+    assert_eq!(wave.len(), 1);
+    let binding = wave[0].binding.as_ref().expect("original scheduler binding");
+    assert_eq!(binding.attempt, packet.attempt);
+    let running = services.graph_state_store().load(packet.graph_id()).unwrap();
+    let (ticket, _) = services.graph_state_store()
+        .binding_start_ticket(&running, packet.node_id(), binding).unwrap();
+    crate::execution_core::graph::validate_node_ticket_start(services.event_store(), &ticket, None).unwrap();
     let (live, _, allowed) =
         model_loop::activate_native_tools(host.clone(), &packet, true).unwrap();
     let executor = discovery_native_executor(&services, live, &packet, allowed);
@@ -357,8 +374,7 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         assert_eq!(receipt.query, query);
         assert_eq!(receipt.catalog_revision, step.lease().revision());
         assert_eq!(receipt.activation_candidates, vec!["read_file"]);
-        assert_eq!(receipt.descriptors.len(), 1);
-        assert_eq!(receipt.descriptors[0].canonical_id, "read_file");
+        assert!(matches!(receipt.descriptors.as_slice(), [descriptor] if descriptor.canonical_id == "read_file"));
         assert_eq!(host.calls.load(Ordering::SeqCst), before + 1);
         if index == 0 {
             replay_call = Some(crate::conversation::ModelToolCall {
@@ -476,6 +492,22 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         vec!["read:src/a.rs".into()],
         true,
     );
+    let process_runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        process_services.executor_registry().clone(), process_services.graph_state_store().clone(),
+        process_services.commit_service().clone(), process_services.resource_manager().clone(),
+        process_services.scope_locks().clone(), process_services.worktree_leases().clone(),
+        process_services.workspace_key(), process_services.workspace_root(),
+    );
+    let snapshot = process_runner.pump_snapshot(process_packet.graph_id(), &BTreeSet::new()).await.unwrap();
+    assert_eq!(snapshot.ready.len(), 1);
+    let process_wave = process_runner.prepare_ready_wave(process_packet.graph_id(), snapshot.ready).await.unwrap();
+    assert_eq!(process_wave.len(), 1);
+    let binding = process_wave[0].binding.as_ref().expect("original process scheduler binding");
+    assert_eq!(binding.attempt, process_packet.attempt);
+    let running = process_services.graph_state_store().load(process_packet.graph_id()).unwrap();
+    let (ticket, _) = process_services.graph_state_store()
+        .binding_start_ticket(&running, process_packet.node_id(), binding).unwrap();
+    crate::execution_core::graph::validate_node_ticket_start(process_services.event_store(), &ticket, None).unwrap();
     let selection = AgentModelSelection {
         model: process_packet.model_lease.clone(),
         provider: "local-discovery".into(),
@@ -602,6 +634,22 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         vec!["write:.".into(), "network:*".into()],
         false,
     );
+    let axis_runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        axis_services.executor_registry().clone(), axis_services.graph_state_store().clone(),
+        axis_services.commit_service().clone(), axis_services.resource_manager().clone(),
+        axis_services.scope_locks().clone(), axis_services.worktree_leases().clone(),
+        axis_services.workspace_key(), axis_services.workspace_root(),
+    );
+    let snapshot = axis_runner.pump_snapshot(axis_packet.graph_id(), &BTreeSet::new()).await.unwrap();
+    assert_eq!(snapshot.ready.len(), 1);
+    let axis_wave = axis_runner.prepare_ready_wave(axis_packet.graph_id(), snapshot.ready).await.unwrap();
+    assert_eq!(axis_wave.len(), 1);
+    let binding = axis_wave[0].binding.as_ref().expect("original axis scheduler binding");
+    assert_eq!(binding.attempt, axis_packet.attempt);
+    let running = axis_services.graph_state_store().load(axis_packet.graph_id()).unwrap();
+    let (ticket, _) = axis_services.graph_state_store()
+        .binding_start_ticket(&running, axis_packet.node_id(), binding).unwrap();
+    crate::execution_core::graph::validate_node_ticket_start(axis_services.event_store(), &ticket, None).unwrap();
     let mut axis_policy = axis_services
         .session_execution_policy(axis_packet.session_id())
         .unwrap();
@@ -693,6 +741,7 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
     }
     let compute = serde_json::json!({"steps":[
         {"id":"prefix","op":"call","tool":"read_file","input":{"path":"src/a.rs"}},
+        {"id":"bounded-process","op":"call","tool":"execute_code","input":{"language":"python","code":"print(1)","input_files":["src/sibling.rs"]}},
         {"id":"compute","op":"compute","language":"python","code":"print(1)"}
     ]})
     .to_string();
@@ -716,7 +765,7 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
     );
     let binding =
         crate::step_snapshot::StepCallBinding::provider(axis_step.clone(), "single-axis-compute");
-    assert!(axis_executor
+    let compute_error = axis_executor
         .execute_step_authorized_invocation_output(
             Some(&binding),
             "single-axis-compute",
@@ -726,8 +775,8 @@ async fn r1_composite_discovery_durable_controls_and_single_axis_rejections() {
         )
         .await
         .unwrap_err()
-        .to_string()
-        .contains("network/File operation resource lease"));
+        .to_string();
+    assert!(compute_error.contains("network/File operation resource lease"), "{compute_error}");
     axis_executor.resource_scopes = Some(complete.iter().map(|scope| scope.to_string()).collect());
     axis_executor.allowed_tools.remove("web_fetch");
     let authorization = discovery_authorization_with_mode(
@@ -1816,9 +1865,13 @@ async fn r1_composite_discovery_reload_uses_current_step_catalog_or_refuses_befo
         .commit_service()
         .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt)
         .unwrap();
-    assert_eq!(durable.len(), 2);
-    assert!(durable.iter().any(|receipt|
-        receipt.outcome.tool_use_id == "native-live-read" && receipt.outcome.tool_name == "read_file"));
+    let mut receipt_identities = BTreeSet::new();
+    for receipt in &durable {
+        assert!(receipt_identities.insert((receipt.outcome.tool_use_id.as_str(), receipt.outcome.tool_name.as_str())));
+    }
+    assert_eq!(receipt_identities, BTreeSet::from([
+        ("native-live-read", "read_file"), ("native-live-composite", "tool_orchestrate"),
+    ]));
     assert!(services.commit_service()
         .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt + 1)
         .unwrap().is_empty());
@@ -2128,7 +2181,6 @@ async fn r1_composite_discovery_reload_uses_current_step_catalog_or_refuses_befo
             process_packet.attempt,
         )
         .unwrap();
-    assert_eq!(durable.len(), 2);
     assert_eq!(
         durable[..]
             .iter()
@@ -5748,8 +5800,8 @@ fn structured_agent_output_tolerates_safe_provider_shape_drift() {
 
     let localized = "### 总结\n完成读取。\n\n**风险**\n无。";
     let output = structured_agent_output(localized).expect("localized headings");
-    assert_eq!(output["summary"], "完成读取。");
-    assert_eq!(output["risks"], "无。");
+    assert_eq!(output["summary"], localized.lines().nth(1).unwrap());
+    assert_eq!(output["risks"], localized.lines().nth(4).unwrap());
 
     let trailing = "{\"findings\":\"verified\",\"risks\":[],}";
     let output = structured_agent_output(trailing).expect("trailing comma repair");
@@ -6936,8 +6988,8 @@ async fn generalized_coalesced_coordination_wake() {
         .dispatch_ready_agentic_work("coord-program")
         .await
         .unwrap();
-    assert_eq!(next.len(), 1);
-    assert_ne!(next[0].graph_id, fixture.packet.graph_id());
+    assert_eq!(next.len(), 1, "a coalesced wake dispatches exactly once");
+    assert!(next.iter().all(|work| work.graph_id != fixture.packet.graph_id()));
 }
 
 #[tokio::test]

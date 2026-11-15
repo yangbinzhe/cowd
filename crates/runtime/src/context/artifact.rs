@@ -2214,6 +2214,10 @@ impl ArtifactWriteSink for LocalArtifactWriter {
 #[derive(Debug, Default)]
 pub struct EphemeralArtifactRepository {
     state: Mutex<EphemeralArtifactState>,
+    #[cfg(test)]
+    review_pin_response_loss: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    review_unpin_failure: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -2849,10 +2853,18 @@ impl ArtifactMetadataRepository for EphemeralArtifactRepository {
             .entry((artifact_id.to_string(), owner.to_string()))
             .and_modify(|current| *current = (*current).max(until_ms))
             .or_insert(until_ms);
+        #[cfg(test)]
+        if self.review_pin_response_loss.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected committed pin response loss".into());
+        }
         Ok(())
     }
 
     fn unpin(&self, artifact_id: &str, owner: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if self.review_unpin_failure.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected unpin failure".into());
+        }
         if owner == ARTIFACT_PREPARED_PIN_OWNER {
             return Err("reserved prepared protection".into());
         }
@@ -2906,6 +2918,20 @@ impl ArtifactMetadataRepository for EphemeralArtifactRepository {
 
 #[cfg(test)]
 impl EphemeralArtifactRepository {
+    #[cfg(test)]
+    pub(crate) fn fixture_review_pin_response_loss(&self) {
+        self.review_pin_response_loss.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_review_unpin_failure(&self) {
+        self.review_unpin_failure.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_review_exact_pin(&self, artifact_id: &str, owner: &str) -> bool {
+        self.state.lock().unwrap().pins.contains_key(&(artifact_id.to_string(), owner.to_string()))
+    }
     fn put_record(&self, record: &ArtifactRecord) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if state.deleting.contains(&record.sha256) {

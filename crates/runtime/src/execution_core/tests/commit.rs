@@ -96,15 +96,42 @@ async fn bounded_process_private_terminal_original_owner_recovery_and_public_for
         let mut call = crate::bound_tool_batch::scope_admission_tests::bound_request(
             &host,
             "execute_code",
-            input,
+            input.clone(),
         );
         let effect = call.compiled_invocation.as_ref().unwrap().effect.clone();
-        crate::bound_tool_batch::scope_admission_tests::authorize_bounded_fixture(
-            &host,
-            &mut call,
-            store.clone(),
-            harness_contract::tool::ToolPermissionMode::DangerFullAccess,
-        );
+        // This case exercises the original bounded-process owner, not human
+        // approval. Obtain the same policy-issued signed lease used by the
+        // real frame-lock fixture and validate it against the pinned host.
+        let mode = harness_contract::policy::PermissionMode::DangerFullAccess;
+        let policy = crate::PermissionPolicy::new(mode);
+        let authorization_request = crate::AuthorizationRequest {
+            principal_id: "bounded-fixture-358".into(),
+            capability: call.tool_name.clone(),
+            input: call.input.clone(),
+            idempotency_key: call.idempotency_key.clone(),
+            effect: effect.clone(),
+            parent_ceiling: mode,
+            parent_lease_id: None,
+            policy_revision: call.policy_revision,
+            recovery_scope: call.governed_plan_id.clone(),
+            context: crate::PermissionContext::default(),
+            safe_alternatives: vec![],
+        };
+        let evaluated = crate::AuthorizationNegotiator::new()
+            .assess_effective(&policy, &authorization_request);
+        assert_eq!(evaluated.assessment.path,
+            harness_contract::policy::AuthorizationPath::PolicyAutoGrant);
+        let signed = evaluated.assessment.lease.clone()
+            .expect("ordinary policy must issue a signed lease");
+        assert!(crate::AuthorizationNegotiator::verify_lease_signature(&signed));
+        let authorization = crate::ToolPolicy.authorize(
+            &evaluated.effective, &evaluated.assessment,
+            &call.idempotency_key, signed, 30,
+        ).unwrap().authorization;
+        host.pin_snapshot().validate_authorization(
+            &authorization, &call.tool_name, &input,
+        ).unwrap();
+        call.authorization = Some(authorization);
         let mut graph = ExecutionGraph::new("actual bounded ToolBatch owner");
         graph.id = "scope2-graph".into();
         graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
@@ -1078,35 +1105,72 @@ fn graph_events_expose_complete_execution_identity_reverse_refs() {
     }
 }
 
+fn bound_read_receipt_request(host: &tools::ToolHost, id: &str, path: &str) -> crate::RuntimeToolExecutionRequest {
+    let input = json!({"path": path});
+    let mut request = crate::bound_tool_batch::scope_admission_tests::bound_request(host, "read_file", input.clone());
+    let step = request.step_binding.as_ref().unwrap().resolve(Some(host.pin_snapshot())).unwrap();
+    let binding = crate::step_snapshot::StepCallBinding::provider(step, id);
+    let invocation = binding.prepare_invocation(Some(host.pin_snapshot()), "read_file", &input).unwrap();
+    request.idempotency_key = binding.effect_idempotency_key();
+    request.tool_use_id = id.into();
+    request.input = serde_json::to_string(&input).unwrap();
+    request.step_binding = Some(binding);
+    request.compiled_invocation = Some(invocation);
+    request
+}
+
+fn bound_read_receipt_outcome(request: &crate::RuntimeToolExecutionRequest, value: &str) -> crate::RuntimeToolExecutionOutcome {
+    let mut result = outcome(&request.tool_use_id, value);
+    result.tool_name = request.tool_name.clone();
+    result.evidence_ref = format!("tool-effect:{}", request.idempotency_key);
+    result
+}
+
 #[test]
 fn readonly_wave_receipts_commit_atomically_and_replay_idempotently() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let service = ExecutionCommitService::new(Arc::clone(&store));
+    let workspace = tempfile::tempdir().unwrap();
+    let host = tools::ToolHost::builtin("receipt-wave", workspace.path());
+    let first_request = bound_read_receipt_request(&host, "read-1", "one.txt");
+    let second_request = bound_read_receipt_request(&host, "read-2", "two.txt");
     let receipts = vec![
-        (request("read-1"), outcome("read-1", "one")),
-        (request("read-2"), outcome("read-2", "two")),
+        (first_request.clone(), bound_read_receipt_outcome(&first_request, "one")),
+        (second_request.clone(), bound_read_receipt_outcome(&second_request, "two")),
     ];
+    let missing = request("missing-owner");
+    assert!(service.commit_readonly_tool_receipts(&[(missing.clone(), outcome("missing-owner", "no"))]).is_err());
+    assert_eq!(store.stream_revision(&format!("execution-effect:{}", missing.idempotency_key)).unwrap(), 0);
     service
         .commit_readonly_tool_receipts(&receipts)
         .expect("commit read wave");
     let first = store
-        .event_by_idempotency_key("execution-effect:idem-read-1", "idem-read-1:read-receipt")
+        .event_by_idempotency_key(&format!("execution-effect:{}", first_request.idempotency_key), &format!("{}:read-receipt", first_request.idempotency_key))
         .unwrap()
         .expect("first receipt");
     let second = store
-        .event_by_idempotency_key("execution-effect:idem-read-2", "idem-read-2:read-receipt")
+        .event_by_idempotency_key(&format!("execution-effect:{}", second_request.idempotency_key), &format!("{}:read-receipt", second_request.idempotency_key))
         .unwrap()
         .expect("second receipt");
     assert_eq!(first.transaction_id, second.transaction_id);
+    assert_eq!(first.commit_cursor, second.commit_cursor);
+    let first_stream = format!("execution-effect:{}", first_request.idempotency_key);
+    let second_stream = format!("execution-effect:{}", second_request.idempotency_key);
+    let before_first = serde_json::to_value(store.list_stream(&first_stream).unwrap()).unwrap();
+    let before_second = serde_json::to_value(store.list_stream(&second_stream).unwrap()).unwrap();
     service
         .commit_readonly_tool_receipts(&receipts)
         .expect("idempotent replay");
+    assert_eq!(serde_json::to_value(store.list_stream(&first_stream).unwrap()).unwrap(), before_first);
+    assert_eq!(serde_json::to_value(store.list_stream(&second_stream).unwrap()).unwrap(), before_second);
     let mut conflicting = receipts.clone();
     conflicting[0].1.output = Some("foreign outcome".into());
     assert!(service.commit_readonly_tool_receipts(&conflicting).is_err());
+    assert_eq!(serde_json::to_value(store.list_stream(&first_stream).unwrap()).unwrap(), before_first);
+    assert_eq!(serde_json::to_value(store.list_stream(&second_stream).unwrap()).unwrap(), before_second);
     assert_eq!(
         store
-            .list_stream("execution-effect:idem-read-1")
+            .list_stream(&format!("execution-effect:{}", first_request.idempotency_key))
             .unwrap()
             .len(),
         1
@@ -1116,15 +1180,18 @@ fn readonly_wave_receipts_commit_atomically_and_replay_idempotently() {
 #[test]
 fn readonly_receipt_rehydrates_only_for_the_same_tool_and_input_fingerprint() {
     let store = Arc::new(RuntimeEventStore::for_test());
-    let service = ExecutionCommitService::new(store);
-    let original = request("read-recovery");
+    let service = ExecutionCommitService::new(Arc::clone(&store));
+    let workspace = tempfile::tempdir().unwrap();
+    let host = tools::ToolHost::builtin("receipt-recovery", workspace.path());
+    let original = bound_read_receipt_request(&host, "read-recovery", "original.txt");
+    let effect = original.compiled_invocation.as_ref().unwrap().effect.clone();
     service
-        .commit_readonly_tool_receipts(&[(original.clone(), outcome("read-recovery", "durable"))])
+        .commit_readonly_tool_receipts(&[(original.clone(), bound_read_receipt_outcome(&original, "durable"))])
         .expect("commit bounded read receipt");
 
     assert!(matches!(
         service
-            .begin_tool_effect(&original, &readonly_effect())
+            .begin_tool_effect(&original, &effect)
             .expect("rehydrate read"),
         ToolEffectState::Completed(crate::RuntimeToolExecutionOutcome {
             output: Some(ref output),
@@ -1132,12 +1199,16 @@ fn readonly_receipt_rehydrates_only_for_the_same_tool_and_input_fingerprint() {
         }) if output == "durable"
     ));
 
-    let mut collision = original;
-    collision.input = r#"{"id":"changed"}"#.to_string();
+    let collision = bound_read_receipt_request(&host, "read-recovery", "changed.txt");
+    assert_eq!(collision.idempotency_key, original.idempotency_key);
+    assert!(commit_pipeline::receipt_replay_contract(&original).is_ok());
+    assert!(commit_pipeline::receipt_replay_contract(&collision).is_ok());
+    assert_ne!(commit_pipeline::receipt_replay_contract(&original).unwrap(), commit_pipeline::receipt_replay_contract(&collision).unwrap());
     assert!(matches!(
-        service.begin_tool_effect(&collision, &readonly_effect()),
+        service.begin_tool_effect(&collision, collision.compiled_invocation.as_ref().map(|i| &i.effect).unwrap()),
         Err(ExecutionCommitError::InvalidCommand(_))
     ));
+    assert_eq!(store.list_stream(&format!("execution-effect:{}", original.idempotency_key)).unwrap().len(), 1);
 }
 
 #[test]
@@ -1554,7 +1625,7 @@ fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
             &[index.clone()],
         )
     };
-    assert!(snapshot().err().unwrap().contains("effect_review_pending"));
+    assert!(snapshot().err().unwrap().to_string().contains("effect_review_pending"));
     assert!(service
         .load_delegated_agent_tool_receipts(&graph.id, &graph.nodes[0].id, 1)
         .unwrap()
@@ -1578,7 +1649,7 @@ fn delegated_effect_intent_is_atomic_with_index_and_current_graph_authority() {
         service.begin_tool_effect(&pending, &effect).unwrap(),
         ToolEffectState::Fresh
     );
-    assert!(snapshot().err().unwrap().contains("effect_review_pending"));
+    assert!(snapshot().err().unwrap().to_string().contains("effect_review_pending"));
     // A conclusion prepared before the second write cannot commit even its
     // unrelated terminal stream if the original receipt source changed.
     assert!(store

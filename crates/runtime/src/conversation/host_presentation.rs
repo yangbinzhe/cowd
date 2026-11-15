@@ -2486,10 +2486,11 @@ where
         // An ordinary turn gets its business verdict from the Goal owner,
         // not from a Host-requested completion enum. Program conclusions keep
         // their independent checked Goal/Program transaction below.
-        let goal_binding = self
-            .services
-            .goal_store()
-            .get(&goal_id)?
+        let original_goal = self.services.goal_store().get(&goal_id)?;
+        let goal_already_terminal = original_goal
+            .as_ref()
+            .is_some_and(|goal| goal.completion != GoalCompletion::Open);
+        let goal_binding = original_goal
             .and_then(|goal| goal.execution_binding)
             .ok_or("Synthesize Goal binding missing")?;
         let program = self
@@ -2518,7 +2519,8 @@ where
                 terminal_override = Some((verdict_completion, terminal.reason.clone()));
             }
         }
-        let ordinary_conclusion = if !has_program {
+        // An existing terminal is pinned below; preparing a new terminal event would redeclare it.
+        let ordinary_conclusion = if !has_program && !goal_already_terminal {
             Some(
                 self.services
                     .objective_supervisor()
@@ -3962,7 +3964,7 @@ where
                 &self.services.event_store().repetition_scope(&state.session_id, &state.turn_id),
                 state.execution_role.owns_root_presentation(),
             );
-            state.summary = Some(summary);
+            state.summary = Some(Box::new(summary));
             state.terminal_commit_owner = None;
             state.committed_terminal_answer = None;
             state.committed_terminal_completion = None;
@@ -6092,6 +6094,66 @@ pub(super) fn agentic_action_progress_refs(messages: &[ConversationMessage]) -> 
             )
         })
         .collect()
+}
+
+// Batch receipts must be tied to the actual model call ID and its registered
+// Agent-action tool, not merely resemble a receipt in unrelated tool output.
+pub(super) fn agentic_batch_action_progress_refs(
+    messages: &[ConversationMessage], batch_call_ids: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    messages.iter().flat_map(|message| &message.blocks).flat_map(|block| match block {
+        ContentBlock::ToolResult { tool_use_id, output, is_error: false, .. }
+            if batch_call_ids.contains(tool_use_id) => {
+                serde_json::from_str::<serde_json::Value>(output).ok()
+                    .and_then(|value| value.get("results").and_then(serde_json::Value::as_array).cloned())
+                    .unwrap_or_default().into_iter()
+                    .filter_map(|item| item.get("receipt").cloned())
+                    .filter_map(|receipt| serde_json::from_value::<harness_contract::agent_action::AgentActionObservation>(receipt).ok())
+                    .collect::<Vec<_>>()
+            }
+        _ => Vec::new(),
+    }).filter(|observation| observation.status == harness_contract::agent_action::AgentActionStatus::Applied
+        && !observation.duplicate && !observation.changed_refs.is_empty())
+      .flat_map(|observation| std::iter::once(format!("agentic_receipt:{}", observation.receipt_id))
+          .chain(observation.changed_refs.into_iter().map(|reference| format!("agentic_changed:{reference}"))))
+      .collect()
+}
+
+#[cfg(test)]
+mod batch_action_progress_tests {
+    use super::*;
+    use harness_contract::agent_action::{AgentActionObservation, AgentActionStatus};
+
+    #[test]
+    fn applied_batch_receipt_resets_failure_streak_without_accepting_replays_or_rejections() {
+        let applied = AgentActionObservation {
+            receipt_id: "receipt:invite".into(), action_id: "action:invite".into(),
+            action: "agent_invite".into(), program_id: "program:test".into(), revision: 1,
+            status: AgentActionStatus::Applied, duplicate: false,
+            changed_refs: vec!["agent:test".into()], actionable: vec![], projection: None, error: None,
+        };
+        let mut duplicate = applied.clone();
+        duplicate.receipt_id = "receipt:duplicate".into();
+        duplicate.duplicate = true;
+        let mut rejected = applied.clone();
+        rejected.receipt_id = "receipt:rejected".into();
+        rejected.status = AgentActionStatus::Rejected;
+        let output = serde_json::json!({"count": 3, "results": [
+            {"receipt": applied}, {"receipt": duplicate}, {"receipt": rejected}
+        ]}).to_string();
+        let messages = [ConversationMessage::tool_result("call", "agent_action_batch", output, false)];
+        let ids = BTreeSet::from(["call".to_string()]);
+        let refs = agentic_batch_action_progress_refs(&messages, &ids);
+        assert_eq!(refs, BTreeSet::from(["agentic_receipt:receipt:invite".into(), "agentic_changed:agent:test".into()]));
+        let after_progress = super::super::next_consecutive_tool_failure_batches(1, 1, !refs.is_empty());
+        assert_eq!(after_progress, 0);
+        let after_failure = super::super::next_consecutive_tool_failure_batches(after_progress, 1, false);
+        assert_eq!(after_failure, 1);
+        assert_eq!(super::super::next_consecutive_tool_failure_batches(after_failure, 1, false), 2);
+        let failed = [ConversationMessage::tool_result("call", "agent_action_batch", "{}", true)];
+        assert!(agentic_batch_action_progress_refs(&failed, &ids).is_empty());
+        assert!(agentic_batch_action_progress_refs(&messages, &BTreeSet::new()).is_empty());
+    }
 }
 
 pub(super) fn normalize_workspace_scope(scope: &str) -> Option<(&str, String)> {

@@ -62,6 +62,10 @@ pub struct AgenticProgramProjection {
     #[serde(default)]
     pub memberships: BTreeMap<String, AgenticMembershipProjection>,
     pub tasks: BTreeMap<String, AgenticTaskProjection>,
+    /// Rebuildable count of applied Challenge/Rework verdicts; None means the
+    /// legacy snapshot has not yet been rebuilt from its original journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) applied_rework_rounds: Option<BTreeMap<String, u8>>,
     pub topics: BTreeMap<String, Vec<AgenticTopicEntryProjection>>,
     pub artifacts: BTreeMap<String, AgenticArtifactProjection>,
     pub final_artifact_ref: Option<String>,
@@ -164,6 +168,7 @@ impl AgenticProgramProjection {
             agents: BTreeMap::new(),
             memberships: BTreeMap::new(),
             tasks: BTreeMap::new(),
+            applied_rework_rounds: Some(BTreeMap::new()),
             topics: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             final_artifact_ref: None,
@@ -183,6 +188,19 @@ impl AgenticProgramProjection {
         revision: u64,
         applied_at_ms: u64,
     ) {
+        self.apply_with_round_rule(envelope, entity_ref, revision, applied_at_ms, false, false)
+            .expect("legacy rule does not require a rework count");
+    }
+
+    pub(crate) fn apply_with_round_rule(
+        &mut self,
+        envelope: &AgentActionEnvelope,
+        entity_ref: Option<&str>,
+        revision: u64,
+        applied_at_ms: u64,
+        verdict_rule: bool,
+        trusted_review_cut: bool,
+    ) -> Result<(), &'static str> {
         match &envelope.action {
             AgentAction::StateInspect(_) => {}
             AgentAction::TeamCreate(input) => {
@@ -210,13 +228,13 @@ impl AgenticProgramProjection {
                 super::work_market::apply_task_attempt_dispatch(self, input, applied_at_ms)
             }
             AgentAction::TaskAttemptFail(input) => {
-                super::work_market::apply_task_attempt_fail(self, input)
+                super::work_market::apply_task_attempt_fail_with_origin(self, input, trusted_review_cut)
             }
             AgentAction::TaskSubmit(input) => {
                 super::work_market::apply_task_submit(self, envelope, input)
             }
             AgentAction::TaskReview(input) => {
-                super::work_market::apply_task_review(self, envelope, input)
+                super::work_market::apply_task_review_with_round_rule(self, envelope, input, verdict_rule)?
             }
             AgentAction::MessagePublish(input) => {
                 super::topic::apply_message_publish(self, envelope, input, entity_ref, revision)
@@ -238,6 +256,7 @@ impl AgenticProgramProjection {
         }
         super::roster::reconcile_lifecycle(self);
         self.revision = revision;
+        Ok(())
     }
 
     pub(crate) fn apply_objective_verdict(

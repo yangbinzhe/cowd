@@ -46,7 +46,7 @@ fn identical_inputs_keep_distinct_original_preparations_by_call_identity() {
         .unwrap()
         .plan
         .unwrap();
-    assert_eq!(plan.tasks.len(), 2);
+    assert_eq!(plan.tasks.iter().map(|task| task.tool_call_id.as_str()).collect::<Vec<_>>(), ["first", "second"]);
     for (index, id, key) in [
         (0, "first", "original-first-key"),
         (1, "second", "original-second-key"),
@@ -102,8 +102,7 @@ fn preparation_rejection_keeps_independent_branch_and_original_result_index() {
         vec!["bad", "child"]
     );
     let plan = result.plan.unwrap();
-    assert_eq!(plan.tasks.len(), 1);
-    assert_eq!(plan.tasks[0].tool_call_id, "good");
+    assert!(matches!(plan.tasks.as_slice(), [task] if task.tool_call_id == "good"));
     assert_eq!(plan.tasks[0].original_call_index, 2);
     assert_eq!(
         plan.tasks[0].invocation.origin.as_ref().unwrap().call_id,
@@ -140,8 +139,7 @@ fn foreign_duplicate_or_mutated_preparation_cannot_replace_another_call() {
         .compile_prepared_partial(root.path(), &[request], &[changed], &BTreeMap::new())
         .unwrap();
     assert!(result.plan.is_none());
-    assert_eq!(result.rejected.len(), 1);
-    assert_eq!(result.rejected[0].tool_call_id, "known");
+    assert!(matches!(result.rejected.as_slice(), [rejection] if rejection.tool_call_id == "known"));
 }
 
 #[test]
@@ -162,8 +160,7 @@ fn prepared_cycles_do_not_disable_an_unrelated_valid_branch() {
         .unwrap();
     assert_eq!(result.rejected.len(), 2);
     let plan = result.plan.unwrap();
-    assert_eq!(plan.tasks.len(), 1);
-    assert_eq!(plan.tasks[0].tool_call_id, "free");
+    assert!(matches!(plan.tasks.as_slice(), [task] if task.tool_call_id == "free"));
     assert_eq!(plan.tasks[0].original_call_index, 2);
 }
 

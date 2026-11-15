@@ -970,7 +970,7 @@ async fn r1_catalog_defaults_never_fabricate_authority_and_keep_exact_pins() {
     let expected = original.catalog_receipt();
     let read = executor.tool_discovery_receipt_for_step(&original, PermissionMode::ReadOnly);
     assert_eq!(read.catalog_revision, original.revision());
-    assert_eq!(read.descriptors.len(), 1);
+    assert!(matches!(read.descriptors.as_slice(), [descriptor] if descriptor.canonical_id == "read_file"));
     assert_eq!(read.descriptors[0].canonical_id, "read_file");
     assert_eq!(
         Some(&read.descriptors[0]),
@@ -981,7 +981,9 @@ async fn r1_catalog_defaults_never_fabricate_authority_and_keep_exact_pins() {
     );
     assert_eq!(read.activation_candidates, vec!["read_file"]);
     let full = executor.tool_discovery_receipt();
-    assert_eq!(full.descriptors.len(), 2);
+    let mut ids = full.descriptors.iter().map(|descriptor| descriptor.canonical_id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, ["edit", "read_file"]);
     assert_eq!(
         full.descriptors
             .iter()
@@ -4367,4 +4369,40 @@ async fn active_runtime_reads_first_approval_and_upgrade_from_original_source_ea
             .1,
         original_pin
     );
+}
+
+#[tokio::test]
+async fn graph_finalization_uses_admitted_strategy_and_preserves_refusals() {
+    macro_rules! finish {
+        ($runtime:expr, $answer:expr) => {
+            $runtime.finalize_graph_turn(
+                "question", $answer.into(), Vec::new(), Vec::new(), 0, None,
+                Vec::new(), None, 0, 0, 0, 1, 0, Vec::new(), 0, 0,
+                harness_contract::goal::GoalCompletion::Satisfied, None, true, None,
+            ).await
+        };
+    }
+    let make_runtime = || ConversationRuntime::new(
+        Session::new(), MockApi, StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite), Vec::new(),
+    ).without_memory();
+    let mut missing = make_runtime();
+    let empty_error = finish!(missing, "  ").unwrap_err();
+    assert_eq!(empty_error.to_string(), "model produced an empty final answer");
+    let missing_error = finish!(missing, "answer").unwrap_err();
+    assert_eq!(missing_error.to_string(), "turn finalization requires the Host-admitted turn strategy owner");
+
+    let mut admitted = make_runtime();
+    let decision = admitted.begin_turn_strategy("finalization-turn", "question").unwrap().decision;
+    let summary = finish!(admitted, "answer").unwrap();
+    assert_eq!(summary.final_answer, "answer");
+    assert_eq!(summary.ai_kernel_trace.execution_decision, decision);
+
+    let mut poisoned = make_runtime();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = poisoned.active_turn_strategy.lock().unwrap();
+        panic!("poison the original strategy owner");
+    }));
+    let poisoned_error = finish!(poisoned, "answer").unwrap_err();
+    assert_eq!(poisoned_error.to_string(), "turn finalization requires the Host-admitted turn strategy owner");
 }

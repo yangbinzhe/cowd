@@ -2,6 +2,7 @@ use super::*;
 
 mod policy_transition;
 mod r1_terminal_recovery;
+mod coordination_original_pg;
 
 #[test]
 fn execution_policy_default_equality_includes_sandbox_posture() {

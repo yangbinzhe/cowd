@@ -556,11 +556,9 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
             && gate["routing_gate"] == true
             && gate["judge_isolation_gate"] == true
             && gate["provenance_complete"] == true
-            && gate["budget_observation_complete"] == true
             && gate["automatic_team_materialization_gate"] == true
             && gate["workspace_mutation_gate"] == true
             && gate["workspace_reset_gate"] == true
-            && gate["hard_budget_lease_gate"] == true
             && gate["baseline_topology_isolation_gate"] == true
             && gate["tool_topology_observation_gate"] == true;
         report["status"] = json!(if diagnostic_passed {
@@ -2210,11 +2208,9 @@ fn evaluate_samples(
         && routing_gate
         && judge_isolation_gate
         && provenance_complete
-        && budget_observation_complete
         && automatic_team_materialization_gate
         && workspace_mutation_gate
         && workspace_reset_gate
-        && hard_budget_lease_gate
         && baseline_topology_isolation_gate
         && tool_topology_observation_gate;
     // Preserve the original strict claim for calibration/import consumers. A
@@ -2248,7 +2244,7 @@ fn evaluate_samples(
         "kind": "harness_eval.auto_strategy_paired.v1",
         "status": if gate_passed {
             "passed"
-        } else if provenance_complete && budget_observation_complete {
+        } else if provenance_complete {
             "failed"
         } else {
             "not_proven"

@@ -393,7 +393,7 @@ impl BoundStep {
         // delegate to an executor's unbound validator (which could consult a
         // newer catalog). Reuse the existing example from this exact pinned
         // schema, after authenticating the origin and exposure above.
-        let input_error = |error: String| {
+        let input_error = |error: String, correction: Option<&str>| {
             let example = self
                 .lease
                 .snapshot()
@@ -404,13 +404,25 @@ impl BoundStep {
                 .and_then(|definition| {
                     harness_contract::tool_input_contract::input_example(&definition.input_schema)
                 });
-            RuntimeError::new(match example {
+            let message = match example {
                 Some(example) => format!("{error}. Send it shaped like this: {example}"),
                 None => error,
-            })
+            };
+            let mut message = match correction {
+                Some(hint) => format!("{message}. {hint}"),
+                None => message,
+            };
+            if tool_name == "tool_orchestrate" && correction.is_some() {
+                let example = serde_json::json!({"steps":[{"id":"read","op":"call","tool":"read_file",
+                    "input":{"path":"<workspace path>"}}],"return":"$read"});
+                if self.lease.validate_input(tool_name, &example).is_ok() {
+                    message.push_str(&format!(". Schema-valid structural example (replace the path with a real workspace path): {example}"));
+                }
+            }
+            RuntimeError::new(message)
         };
         let mut input = harness_contract::step::parse_strict_json(input)
-            .map_err(|error| input_error(error.to_string()))?;
+            .map_err(|error| input_error(error.to_string(), None))?;
         // Only the authenticated, pinned batch schema can authorize decoding
         // this provider spelling; the original schema still validates the result.
         if tool_name == "agent_action_batch" {
@@ -425,9 +437,9 @@ impl BoundStep {
             if array_in_schema {
                 if let Some(serde_json::Value::String(encoded)) = input.get("actions") {
                     let decoded = harness_contract::step::parse_strict_json(encoded)
-                        .map_err(|_| input_error("$.actions must contain a complete valid JSON array; no items were inferred or discarded".into()))?;
+                        .map_err(|_| input_error("$.actions must contain a complete valid JSON array; no items were inferred or discarded".into(), None))?;
                     if !decoded.is_array() {
-                        return Err(input_error("$.actions must contain a complete valid JSON array".into()));
+                        return Err(input_error("$.actions must contain a complete valid JSON array".into(), None));
                     }
                     input["actions"] = decoded;
                 }
@@ -435,7 +447,27 @@ impl BoundStep {
         }
         self.lease
             .validate_input(tool_name, &input)
-            .map_err(|error| input_error(error.to_string()))?;
+            .map_err(|error| {
+                let correction = match &error {
+                    tools::ToolHostError::InputContract { reason, .. } => self.lease
+                        .snapshot().catalog.definitions(None).into_iter()
+                        .find(|definition| definition.name == tool_name)
+                        .and_then(|definition| harness_contract::tool_input_contract::input_shape_correction(
+                            tool_name, reason, &definition.input_schema,
+                        )),
+                    _ => None,
+                };
+                let extra = match &error {
+                    tools::ToolHostError::InputContract { reason, .. } => self.lease
+                        .snapshot().catalog.definitions(None).into_iter()
+                        .find(|definition| definition.name == tool_name)
+                        .and_then(|definition| harness_contract::tool_input_contract::orchestrate_extra_root_fields(
+                            tool_name, reason, &definition.input_schema, &input)),
+                    _ => None,
+                };
+                let message = extra.map_or_else(|| error.to_string(), |hint| format!("{error}. {hint}"));
+                input_error(message, correction)
+            })?;
         Ok(input)
     }
 

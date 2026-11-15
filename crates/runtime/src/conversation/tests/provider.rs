@@ -3187,7 +3187,7 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
     discovery
         .activation_candidates
         .retain(|name| name == "read_file");
-    assert_eq!(discovery.descriptors.len(), 1);
+    assert!(matches!(discovery.descriptors.as_slice(), [descriptor] if descriptor.canonical_id == "read_file"));
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut runtime = ConversationRuntime::new(
         Session::new(),
@@ -4617,6 +4617,16 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         crate::ArtifactStore::for_test(temporary.path(), crate::ArtifactStoreConfig::default())
             .unwrap(),
     );
+    let services = crate::RuntimeServices::test_builder(
+        temporary.path().join("home"),
+        temporary.path(),
+    )
+    .artifact_store(artifacts.clone())
+    .build()
+    .expect("original Host runtime services");
+    services
+        .install_test_session_store(session_store.clone())
+        .expect("original Host session owner");
     let runtime = ConversationRuntime::new(
         session,
         MockApi,
@@ -4628,11 +4638,12 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         vec!["system".to_string()],
     )
     .without_memory()
-    .with_runtime_event_store(Arc::new(RuntimeEventStore::for_test()))
+    .with_runtime_event_store(services.event_store().clone())
     .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
         session_store,
     ))
-    .with_artifact_store(artifacts);
+    .with_artifact_store(artifacts)
+    .with_cowd_event_bus(crate::CowdEventBus::new());
     runtime
         .begin_turn_strategy("turn-durable-evidence", "retrieve retained evidence")
         .expect("admit evidence turn");
@@ -4644,14 +4655,12 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         depends_on: Vec::new(),
     }];
 
-    let result = runtime
-        .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
-        .await
-        .expect("durable evidence fallback");
+    let messages = crate::host::tests::run_original_tool_wave(
+        services, runtime, calls, "turn-durable-evidence", "retrieve retained evidence",
+    ).await;
 
-    assert_eq!(result.failed, 0, "messages={:?}", result.messages);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
-    assert!(result.messages.iter().any(|message| {
+    assert!(messages.iter().any(|message| {
         message.blocks.iter().any(|block| {
             matches!(
                 block,

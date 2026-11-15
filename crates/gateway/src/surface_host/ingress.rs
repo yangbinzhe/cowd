@@ -1778,11 +1778,20 @@ mod tests {
                 .unwrap();
             let preserved = inbox.session_projections[0].clone();
             let missing = missing_surface_baseline_projections(&inbox).unwrap();
-            assert_eq!(missing.len(), 1);
-            assert_ne!(missing[0].phase, existing_phase);
+            let expected_missing: std::collections::BTreeSet<_> = initial.iter()
+                .filter(|projection| projection.phase != existing_phase)
+                .map(|projection| projection.phase.clone()).collect();
+            let mut actual_missing = std::collections::BTreeSet::new();
+            assert!(!expected_missing.is_empty());
+            assert!(missing.iter().all(|projection| projection.phase != existing_phase
+                && actual_missing.insert(projection.phase.clone())));
+            assert_eq!(actual_missing, expected_missing);
             inbox.stage_session_projections(&missing).unwrap();
             inbox.stage_session_projections(&missing).unwrap();
-            assert_eq!(inbox.session_projections.len(), 2);
+            let expected: std::collections::BTreeSet<_> = initial.iter().map(|projection| projection.phase.clone()).collect();
+            let mut actual = std::collections::BTreeSet::new();
+            assert!(inbox.session_projections.iter().all(|projection| actual.insert(projection.phase.clone())));
+            assert_eq!(actual, expected);
             assert_eq!(
                 inbox
                     .session_projections

@@ -137,6 +137,12 @@ pub enum FactAdmissionStrategy {
     Discovery,
     /// The receipt's own body and scope prove it.
     Immutable,
+    /// A sealed original acquisition was authenticated for its covered extent.
+    Sealed,
+    /// An authenticated directory read is historical metadata, not file content.
+    Directory,
+    /// The original call's refusal twin proves only its refusal was settled.
+    SettledRefusal,
 }
 
 impl FactAdmissionStrategy {
@@ -147,6 +153,9 @@ impl FactAdmissionStrategy {
             Self::Nested => "nested",
             Self::Discovery => "discovery",
             Self::Immutable => "immutable",
+            Self::Sealed => "sealed",
+            Self::Directory => "directory",
+            Self::SettledRefusal => "settled_refusal",
         }
     }
 
@@ -157,6 +166,9 @@ impl FactAdmissionStrategy {
             Self::Nested => 0,
             Self::Discovery => 1,
             Self::Immutable => 2,
+            Self::Sealed => 3,
+            Self::Directory => 4,
+            Self::SettledRefusal => 5,
         }
     }
 }
@@ -166,6 +178,12 @@ impl FactAdmissionStrategy {
 pub struct RefusalEnvelope {
     /// The refusal itself, unchanged.
     pub message: String,
+    /// Original refusal text before any diagnostic fields were added.
+    pub original_code: String,
+    /// Stable identifier of the first failed predicate, when available.
+    pub first_failed_predicate: Option<&'static str>,
+    /// Observed value for that predicate, without the protected payload.
+    pub actual: Option<String>,
     /// The refusal's judgement, kept whole under the teaching.
     pub refusal: AgentActionRefusal,
     /// The code from this layer.
@@ -181,6 +199,10 @@ pub struct RefusalEnvelope {
 
 impl fmt::Display for RefusalEnvelope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(predicate) = self.first_failed_predicate {
+            return write!(formatter, "{}; first_failed_predicate={} actual={}",
+                self.original_code, predicate, self.actual.as_deref().unwrap_or("unknown"));
+        }
         write!(
             formatter,
             "{}. code={} what_violated={}",
@@ -195,6 +217,20 @@ impl fmt::Display for RefusalEnvelope {
             write!(formatter, ". sibling_vocab_hint: {hint}")?;
         }
         Ok(())
+    }
+}
+
+impl RefusalEnvelope {
+    /// Attach bounded predicate diagnostics to an existing refusal without
+    /// changing its original judgement or deriving an Agent action.
+    #[must_use]
+    pub fn for_predicate(original: &'static str, predicate: &'static str, actual: String) -> Self {
+        Self {
+            message: original.into(), original_code: original.into(),
+            first_failed_predicate: Some(predicate), actual: Some(actual),
+            refusal: AgentActionRefusal::Rejected(original), code: ValidationRefusalCode::RuleRejected,
+            what_violated: predicate.into(), complete_legal_example: None, sibling_vocab_hint: None,
+        }
     }
 }
 
@@ -230,6 +266,9 @@ pub fn envelope_for(
     };
     let sibling_hint = sibling_vocab_hint(subject);
     RefusalEnvelope {
+        original_code: message.clone(),
+        first_failed_predicate: None,
+        actual: None,
         message,
         refusal: error.refusal(),
         code,
@@ -258,6 +297,16 @@ pub fn what_violated_of(error: &AgentActionValidationError) -> String {
 mod tests {
     use super::*;
     use crate::agent_action::{ObjectiveCompleteRequestInput, TaskReviewInput};
+
+    #[test]
+    fn predicate_envelope_keeps_original_refusal_and_actual() {
+        let envelope = RefusalEnvelope::for_predicate("original refusal", "bytes", "123".into());
+        assert_eq!(envelope.original_code, "original refusal");
+        assert_eq!(envelope.refusal, AgentActionRefusal::Rejected("original refusal"));
+        assert_eq!(envelope.first_failed_predicate, Some("bytes"));
+        assert_eq!(envelope.actual.as_deref(), Some("123"));
+        assert_eq!(envelope.to_string(), "original refusal; first_failed_predicate=bytes actual=123");
+    }
 
     fn objective_complete() -> AgentAction {
         AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {

@@ -781,6 +781,116 @@ fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
 }
 
 #[test]
+fn replay_authenticates_goal_derived_entity_in_original_transaction() {
+    use harness_contract::agent_action::TeamUpdateInput;
+    for case in 0..5 {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let service = AgentActionService::new(Arc::clone(&store));
+        service.apply(&root("goal-fixture", AgentAction::TeamCreate(TeamCreateInput {
+            name: "team".into(), mission: "replay".into(), objective: None,
+        }))).unwrap();
+        let action = root("goal-action", AgentAction::TeamUpdate(TeamUpdateInput {
+            team_ref: "team:test".into(), mission_ref: None, request_retire: false, reason_ref: None,
+        }));
+        let stream = program_stream("program-1");
+        let goal_stream = "goal:goal:root-execution-1".to_string();
+        let entity = if case >= 2 { Some("goal:item") } else { None };
+        let mut expected = vec![crate::ExpectedStreamRevision {
+            stream_id: stream.clone(), expected_revision: store.stream_revision(&stream).unwrap(),
+        }];
+        let mut events = vec![crate::RuntimeTransactionEventInput {
+            event: RuntimeEventInput { stream_id: stream.clone(), scope: RuntimeEventScope::Program,
+                kind: ACTION_EVENT_KIND.into(), status: Some("applied".into()),
+                actor: Some(action.actor.actor_id.clone()), refs: action_refs(&action, entity),
+                payload: json!({"envelope":action,"entity_ref":entity}), },
+            idempotency_key: Some(action_key(&action.action_id)), schema_version: 1,
+        }];
+        if case != 0 && case != 4 {
+            expected.push(crate::ExpectedStreamRevision { stream_id: goal_stream.clone(), expected_revision: 0 });
+            let goal_entity = if case == 3 { Some("goal:foreign") } else { entity };
+            events.push(crate::RuntimeTransactionEventInput {
+                event: RuntimeEventInput { stream_id: goal_stream, scope: RuntimeEventScope::Goal,
+                    kind: "test.goal".into(), status: Some("applied".into()), actor: None,
+                    refs: Vec::new(), payload: json!({"action_entity_ref":goal_entity}) },
+                idempotency_key: Some("test-goal".into()), schema_version: 1,
+            });
+        }
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("goal-replay-{case}"), expected_streams: expected, events,
+        }).unwrap();
+        let result = service.replay_if_applied(&action);
+        if case <= 2 { assert!(result.unwrap().unwrap().duplicate); }
+        else { assert!(matches!(result, Err(AgentActionServiceError::MemberUnknown(_)))); }
+    }
+}
+
+#[test]
+fn replay_rejects_missing_or_mismatched_durable_entity() {
+    for case in 0..5 {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let action = root("bad-replay", AgentAction::TeamCreate(TeamCreateInput {
+            name: "team".into(), mission: "test replay provenance".into(), objective: None,
+        }));
+        let actual = entity_ref(&action).unwrap();
+        let entity = match case { 0 => None, 1 => Some("team:foreign"), _ => Some(actual.as_str()) };
+        let stream = program_stream("program-1");
+        let mut payload = json!({"envelope": action});
+        if let Some(value) = entity { payload["entity_ref"] = json!(value); }
+        if case == 2 { payload["original_action_observation"] = json!(null); }
+        if case == 3 { payload["original_action_observation"] = json!({"action_id":"foreign"}); }
+        if case == 4 {
+            payload["original_action_observation"] = json!({
+                "receipt_id":"receipt:foreign", "action_id":"foreign", "action":action.action.kind(),
+                "program_id":"program-1", "revision":1, "status":"applied", "duplicate":false,
+                "changed_refs":[], "actionable":[]
+            });
+        }
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("bad-replay-{entity:?}"),
+            expected_streams: vec![crate::ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: 0 }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id: stream.clone(), scope: RuntimeEventScope::Program,
+                    kind: ACTION_EVENT_KIND.into(), status: Some("applied".into()),
+                    actor: Some(action.actor.actor_id.clone()),
+                    refs: action_refs(&action, entity), payload,
+                },
+                idempotency_key: Some(action_key(&action.action_id)), schema_version: 1,
+            }],
+        }).unwrap();
+        let service = AgentActionService::new(Arc::clone(&store));
+        assert!(matches!(service.apply(&action), Err(AgentActionServiceError::MemberUnknown(_))));
+        assert_eq!(store.stream_revision(&stream).unwrap(), 1);
+    }
+}
+
+#[test]
+fn replay_uses_original_receipt_and_current_projection_without_another_write() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let first_action = root("replay-original", AgentAction::TeamCreate(TeamCreateInput {
+        name: "first".into(), mission: "original work".into(), objective: None,
+    }));
+    let service = AgentActionService::new(Arc::clone(&store));
+    let first = service.apply(&first_action).unwrap();
+    service.apply(&root("replay-later", AgentAction::TeamCreate(TeamCreateInput {
+        name: "later".into(), mission: "advance the head".into(), objective: None,
+    }))).unwrap();
+    let before = store.stream_revision(&program_stream("program-1")).unwrap();
+    let recovered = AgentActionService::new(Arc::clone(&store));
+    for _ in 0..2 {
+        let replay = recovered.apply(&first_action).unwrap();
+        assert!(replay.duplicate);
+        assert_eq!(replay.changed_refs, first.changed_refs);
+        assert_eq!(replay.revision, before);
+        assert_eq!(store.stream_revision(&program_stream("program-1")).unwrap(), before);
+    }
+    let mut foreign = first_action.clone();
+    foreign.actor.actor_id = "different-root".into();
+    assert!(recovered.apply(&foreign).is_err());
+    assert_eq!(store.stream_revision(&program_stream("program-1")).unwrap(), before);
+}
+
+#[test]
 fn action_id_replay_requires_the_same_actor_and_payload_after_restart() {
     let store = Arc::new(RuntimeEventStore::for_test());
     let action = root(
@@ -795,26 +905,43 @@ fn action_id_replay_requires_the_same_actor_and_payload_after_restart() {
         .apply(&action)
         .unwrap();
     assert_eq!(first.status, AgentActionStatus::Applied);
-    let recovered = AgentActionService::new(store);
-    let mut retry = action.clone();
-    retry.expected_revision = Some(first.revision);
-    let replay = recovered.apply(&retry).unwrap();
+    let recovered = AgentActionService::new(Arc::clone(&store));
+    let stream = program_stream("program-1");
+    let committed_revision = store.stream_revision(&stream).unwrap();
+    let committed_cursor = store.durable_commit_cursor().unwrap();
+    let replay = recovered.apply(&action).unwrap();
     assert!(replay.duplicate);
     assert_eq!(replay.changed_refs, first.changed_refs);
-    for changed_actor in [false, true] {
-        let mut conflict = action.clone();
-        if changed_actor {
-            conflict.actor.actor_id = "different-root".into();
-        } else if let AgentAction::TeamCreate(input) = &mut conflict.action {
-            input.mission = "different work".into();
-        }
-        let denied = recovered.apply(&conflict).unwrap();
-        assert_eq!(denied.status, AgentActionStatus::Rejected);
-        assert_eq!(denied.error.unwrap().code, "action_id_conflict");
-        assert_eq!(
-            recovered.project("program-1").unwrap().revision,
-            first.revision
-        );
+    assert_eq!(store.stream_revision(&stream).unwrap(), committed_revision);
+    assert_eq!(store.durable_commit_cursor().unwrap(), committed_cursor);
+
+    let mut changed_revision = action.clone();
+    changed_revision.expected_revision = Some(first.revision);
+    let mut changed_actor = action.clone();
+    changed_actor.actor.actor_id = "different-root".into();
+    let mut changed_mission = action.clone();
+    if let AgentAction::TeamCreate(input) = &mut changed_mission.action {
+        input.mission = "different work".into();
+    } else {
+        panic!("expected TeamCreate");
+    }
+    for (field, conflict) in [
+        ("expected_revision", changed_revision),
+        ("actor", changed_actor),
+        ("mission", changed_mission),
+    ] {
+        // This is a service replay test: no invocation capability is constructed.
+        // Prove each envelope is otherwise valid and reaches the original replay
+        // identity comparison, not an unrelated earlier validation error.
+        conflict.validate().unwrap();
+        assert!(matches!(recovered.replay_if_applied(&conflict),
+            Err(AgentActionServiceError::Corrupt(ref reason))
+                if reason == "action_id conflicts with original action"), "{field}");
+        assert!(matches!(recovered.apply(&conflict),
+            Err(AgentActionServiceError::Corrupt(ref reason))
+                if reason == "action_id conflicts with original action"), "{field}");
+        assert_eq!(store.stream_revision(&stream).unwrap(), committed_revision, "{field}");
+        assert_eq!(store.durable_commit_cursor().unwrap(), committed_cursor, "{field}");
     }
     let mut independent = action;
     independent.action_id = "independent-new-action".into();
@@ -822,7 +949,9 @@ fn action_id_replay_requires_the_same_actor_and_payload_after_restart() {
     assert_eq!(second.status, AgentActionStatus::Applied);
     assert!(!second.duplicate);
     assert_ne!(second.changed_refs, first.changed_refs);
-    assert_eq!(recovered.project("program-1").unwrap().teams.len(), 2);
+    let expected: std::collections::BTreeSet<_> = first.changed_refs.iter().chain(&second.changed_refs).cloned().collect();
+    assert!(!expected.is_empty());
+    assert_eq!(recovered.project("program-1").unwrap().teams.keys().cloned().collect::<std::collections::BTreeSet<_>>(), expected);
 }
 
 #[test]
@@ -846,9 +975,9 @@ fn program_cache_uses_shared_hot_state_budget_without_evicting_foreign_pins_or_j
     let cache =
         Arc::new(super::super::AgenticReadModel::new(100).with_residency(Arc::clone(&residency)));
     let service = AgentActionService::new(Arc::clone(&store)).with_read_model(Arc::clone(&cache));
+    let mut committed = std::collections::BTreeSet::new();
     for index in 0..20 {
-        assert_eq!(
-            service
+        let outcome = service
                 .apply(&root(
                     &format!("budget-team-{index}"),
                     AgentAction::TeamCreate(TeamCreateInput {
@@ -858,13 +987,16 @@ fn program_cache_uses_shared_hot_state_budget_without_evicting_foreign_pins_or_j
                         objective: None,
                     })
                 ))
-                .unwrap()
-                .status,
-            AgentActionStatus::Applied
-        );
+                .unwrap();
+        assert_eq!(outcome.status, AgentActionStatus::Applied);
+        assert!(!outcome.changed_refs.is_empty());
+        for reference in outcome.changed_refs {
+            assert!(committed.insert(reference), "each action must create a distinct team");
+        }
     }
     let expected = service.project("program-1").unwrap();
-    assert_eq!(expected.teams.len(), 20);
+    assert!(!committed.is_empty());
+    assert_eq!(expected.teams.keys().cloned().collect::<std::collections::BTreeSet<_>>(), committed);
     assert_eq!(
         cache.len(),
         0,
@@ -1160,7 +1292,7 @@ fn shared_read_model_tracks_durable_head_across_service_handles() {
     let read_model = Arc::new(super::super::AgenticReadModel::new(4));
     let first =
         AgentActionService::new(Arc::clone(&store)).with_read_model(Arc::clone(&read_model));
-    first
+    let first_mutation = first
         .apply(&root(
             "cache-team-a",
             AgentAction::TeamCreate(TeamCreateInput {
@@ -1183,7 +1315,7 @@ fn shared_read_model_tracks_durable_head_across_service_handles() {
     assert_eq!(read_model.len(), 1);
 
     let second = AgentActionService::new(store).with_read_model(Arc::clone(&read_model));
-    second
+    let second_mutation = second
         .apply(&root(
             "cache-team-b",
             AgentAction::TeamCreate(TeamCreateInput {
@@ -1197,8 +1329,11 @@ fn shared_read_model_tracks_durable_head_across_service_handles() {
         .project_snapshot("program-1")
         .expect("delta projection");
     assert!(after.revision > before.revision);
-    assert_eq!(after.teams.len(), 2);
-    assert_eq!(before.teams.len(), 1, "a published snapshot is immutable");
+    let first_refs: std::collections::BTreeSet<_> = first_mutation.changed_refs.iter().cloned().collect();
+    let all_refs: std::collections::BTreeSet<_> = first_mutation.changed_refs.iter().chain(&second_mutation.changed_refs).cloned().collect();
+    assert!(!first_refs.is_empty());
+    assert_eq!(before.teams.keys().cloned().collect::<std::collections::BTreeSet<_>>(), first_refs, "a published snapshot is immutable");
+    assert_eq!(after.teams.keys().cloned().collect::<std::collections::BTreeSet<_>>(), all_refs);
     assert!(!Arc::ptr_eq(&before, &after));
     assert!(Arc::ptr_eq(
         &after,
@@ -2205,6 +2340,7 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
                 false,
                 false,
                 None,
+                None,
             )
             .expect("the named failure");
         let projection = service.project(&derived_program).expect("projection");
@@ -2259,6 +2395,7 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
                 &[],
                 false,
                 false,
+                None,
                 None,
             )
             .expect("the plain invite");
@@ -2774,15 +2911,19 @@ fn concurrent_actions_serialize_without_stale_revision_loss() {
             })
         })
         .collect::<Vec<_>>();
+    let mut committed = std::collections::BTreeSet::new();
     for worker in workers {
-        assert_eq!(
-            worker.join().expect("worker").status,
-            AgentActionStatus::Applied
-        );
+        let outcome = worker.join().expect("worker");
+        assert_eq!(outcome.status, AgentActionStatus::Applied);
+        assert!(!outcome.changed_refs.is_empty());
+        for reference in outcome.changed_refs {
+            assert!(committed.insert(reference), "each action must create a distinct team");
+        }
     }
     let projection = service.project("program-1").expect("projection");
-    assert_eq!(projection.teams.len(), 24);
-    assert_eq!(projection.revision, 25);
+    assert!(!committed.is_empty());
+    assert_eq!(projection.teams.keys().cloned().collect::<std::collections::BTreeSet<_>>(), committed);
+    assert_eq!(projection.revision, 1 + committed.len() as u64);
 }
 
 #[test]
@@ -5237,4 +5378,143 @@ fn f2_the_physical_binding_gate_fires_only_for_root_without_physical() {
         error.contains("agent actor graph store unavailable"),
         "the child-bound review shape reaches the physical graph binding stage: {error}"
     );
+}
+
+// Synthetic journal fold control; the original action authorization is tested separately.
+#[test]
+fn gb3_p2_journal_fold_restores_missing_rounds_without_reclassifying_legacy_events() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let stream = program_stream("program-1");
+    let append = |expected: u64, kind: &str, payload: serde_json::Value| {
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("gb3-replay-{expected}"),
+            expected_streams: vec![crate::ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: expected }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: RuntimeEventInput { stream_id: stream.clone(), scope: RuntimeEventScope::Program,
+                    kind: kind.into(), status: Some("applied".into()), actor: Some("runtime-test".into()), refs: Vec::new(), payload },
+                idempotency_key: Some(format!("gb3-replay-{expected}")), schema_version: 1,
+            }],
+        }).unwrap();
+    };
+    append(0, PROGRAM_OPENED_EVENT_KIND, json!({"program_id":"program-1", "objective_id":"objective-1", "session_id":"session-1", "turn_id":"turn-1"}));
+    let publish = root("gb3-publish", AgentAction::TaskPublish(TaskPublishInput {
+        team_ref:"team".into(), title:"task".into(), objective:"read".into(), acceptance:"cite".into(),
+        criterion_source:Default::default(), acceptance_checks:Vec::new(), required_capabilities:Vec::new(),
+        depends_on:Vec::new(), obligation_refs:Vec::new(), purpose:Default::default(), execution_requirements:Vec::new(), expertise_hints:Vec::new(),
+    }));
+    append(1, ACTION_EVENT_KIND, json!({"envelope":publish, "entity_ref":"task"}));
+    let service = AgentActionService::new(Arc::clone(&store));
+    let projection = service.project_snapshot("program-1").unwrap();
+    assert_eq!(projection.applied_rework_rounds.as_ref().unwrap()["task"], 0);
+    let mut legacy = (*projection).clone();
+    legacy.applied_rework_rounds = None;
+    for n in 0..2 {
+        let fail = root(&format!("gb3-fail-{n}"), AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+            task_ref:"task".into(), execution_id:format!("graph-{n}"), mode:harness_contract::agent_action::AgentAttemptMode::Review,
+            reason:format!("proof_actual_input_extent_unsupported:{n}"), retryable:true,
+        }));
+        append(2+n, ACTION_EVENT_KIND, json!({"envelope":fail}));
+    }
+    let review = root("gb3-review", AgentAction::TaskReview(TaskReviewInput {
+        task_ref:"task".into(), decision:TaskReviewDecision::Rework, reason:"missing fact".into(),
+        operator_requirement:None, evidence_refs:Vec::new(), gaps:Vec::new(), directed_actions:Vec::new(),
+    }));
+    append(4, ACTION_EVENT_KIND, json!({"envelope":review, "review_round_rule":"verdict_v1"}));
+    let events = store.list_stream_after(&stream, 2, 5, 100, 1024*1024).unwrap();
+    apply_projection_events(&store, &mut legacy, events).unwrap();
+    assert_eq!(legacy.tasks["task"].review_generation, 3);
+    assert_eq!(legacy.tasks["task"].status, AgenticTaskStatus::Rework);
+    assert_eq!(legacy.applied_rework_rounds.as_ref().unwrap()["task"], 1);
+    let cold = AgentActionService::new(Arc::clone(&store)).project("program-1").unwrap();
+    assert_eq!(cold.tasks["task"].review_generation, legacy.tasks["task"].review_generation);
+    assert_eq!(cold.tasks["task"].status, legacy.tasks["task"].status);
+    assert_eq!(cold.applied_rework_rounds, legacy.applied_rework_rounds);
+}
+
+// Synthetic event-fold control; a real action/legacy checkpoint test is still required.
+#[test]
+fn gb3_p2_accept_does_not_require_missing_legacy_rework_history() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let mut projection = AgenticProgramProjection::empty("program-1", "objective-1");
+    let publish = TaskPublishInput { team_ref:"team".into(), title:"task".into(), objective:"read".into(), acceptance:"cite".into(),
+        criterion_source:Default::default(), acceptance_checks:Vec::new(), required_capabilities:Vec::new(), depends_on:Vec::new(),
+        obligation_refs:Vec::new(), purpose:Default::default(), execution_requirements:Vec::new(), expertise_hints:Vec::new() };
+    let env = root("gb3-accept-publish", AgentAction::TaskPublish(publish.clone()));
+    crate::agentic::work_market::apply_task_publish(&mut projection, &env, &publish, Some("task"));
+    projection.applied_rework_rounds = None;
+    let review = root("gb3-accept", AgentAction::TaskReview(TaskReviewInput { task_ref:"task".into(),
+        decision:TaskReviewDecision::Accept, reason:"done".into(), operator_requirement:None,
+        evidence_refs:Vec::new(), gaps:Vec::new(), directed_actions:Vec::new() }));
+    let stream = program_stream("program-1");
+    store.append_transaction(crate::AppendTransactionRequest { transaction_id:"gb3-accept-test".into(),
+        expected_streams:vec![crate::ExpectedStreamRevision{stream_id:stream.clone(), expected_revision:0}],
+        events:vec![crate::RuntimeTransactionEventInput { event:RuntimeEventInput { stream_id:stream.clone(),
+            scope:RuntimeEventScope::Program, kind:ACTION_EVENT_KIND.into(), status:Some("applied".into()),
+            actor:Some("runtime-test".into()), refs:Vec::new(), payload:json!({"envelope":review}) },
+            idempotency_key:Some("gb3-accept-test".into()), schema_version:1 }] }).unwrap();
+    let events = store.list_stream_after(&stream, 0, 1, 100, 1024*1024).unwrap();
+    apply_projection_events(&store, &mut projection, events).unwrap();
+    assert_eq!(projection.tasks["task"].status, AgenticTaskStatus::Accepted);
+    assert!(projection.applied_rework_rounds.is_none());
+    assert_eq!(store.stream_revision(&stream).unwrap(), 1);
+}
+
+// Storage-level continuation replay control; not a substitute for the original action path.
+#[test]
+fn gb3_p2_missing_continuation_source_is_unknown_and_recovers_without_rewriting_seed() {
+    use crate::agentic::program::{AgenticProgramContinuation, AgenticProgramStatus};
+    let store = RuntimeEventStore::for_test();
+    let mut seed = AgenticProgramProjection::empty("child", "objective");
+    seed.applied_rework_rounds = None;
+    seed.continuation = Some(AgenticProgramContinuation {
+        source_program_id: "parent".into(), source_objective_id: "objective".into(),
+        source_root_id: "root".into(), source_revision: 3, source_status: AgenticProgramStatus::Open,
+        authorization_generation: 1, authorization_revision: 1, binding_digest: "binding".into(),
+    });
+    let publish: TaskPublishInput = serde_json::from_value(json!({
+        "team_ref":"team", "title":"task", "objective":"read", "acceptance":"cite", "required_capabilities":[]
+    })).unwrap();
+    let published = root("gb3-parent-publish", AgentAction::TaskPublish(publish.clone()));
+    crate::agentic::work_market::apply_task_publish(&mut seed, &published, &publish, Some("task"));
+    let append_open = |program: &str, seed: Option<serde_json::Value>| {
+        let stream = program_stream(program);
+        let mut payload = json!({"program_id":program, "objective_id":"objective", "session_id":"session", "turn_id":"turn"});
+        if let Some(seed) = seed { payload["continuation_seed"] = seed; }
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("gb3-open-{program}"),
+            expected_streams: vec![crate::ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: 0 }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: RuntimeEventInput { stream_id: stream, scope: RuntimeEventScope::Program,
+                    kind: PROGRAM_OPENED_EVENT_KIND.into(), status: Some("open".into()),
+                    actor: Some("test".into()), refs: Vec::new(), payload },
+                idempotency_key: Some(format!("gb3-open-{program}")), schema_version: 1,
+            }],
+        }).unwrap();
+    };
+    append_open("child", Some(serde_json::to_value(&seed).unwrap()));
+    let before = store.list_stream(&program_stream("child")).unwrap();
+    assert!(matches!(rebuild_rework_rounds(&store, "child", 1, &mut Vec::new()),
+        Err(AgentActionServiceError::MemberUnknown(_))));
+    assert_eq!(store.stream_revision(&program_stream("child")).unwrap(), 1);
+    append_open("parent", None);
+    let review = root("gb3-parent-review", AgentAction::TaskReview(TaskReviewInput {
+        task_ref: "task".into(), decision: TaskReviewDecision::Rework, reason: "missing fact".into(),
+        operator_requirement: None, evidence_refs: Vec::new(), gaps: Vec::new(), directed_actions: Vec::new(),
+    }));
+    for (expected, envelope, entity) in [(1, published, Some("task")), (2, review, None)] {
+        let stream = program_stream("parent");
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: format!("gb3-parent-{expected}"),
+            expected_streams: vec![crate::ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: expected }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: RuntimeEventInput { stream_id: stream, scope: RuntimeEventScope::Program,
+                    kind: ACTION_EVENT_KIND.into(), status: Some("applied".into()), actor: Some("test".into()),
+                    refs: Vec::new(), payload: json!({"envelope":envelope, "entity_ref":entity}) },
+                idempotency_key: Some(format!("gb3-parent-{expected}")), schema_version: 1,
+            }],
+        }).unwrap();
+    }
+    assert_eq!(rebuild_rework_rounds(&store, "child", 1, &mut Vec::new()).unwrap()["task"], 1);
+    let after = store.list_stream(&program_stream("child")).unwrap();
+    assert_eq!(serde_json::to_value(before).unwrap(), serde_json::to_value(after).unwrap());
 }

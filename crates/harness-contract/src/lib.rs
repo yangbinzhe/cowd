@@ -19,7 +19,6 @@ pub mod acceptance;
 pub mod agent;
 pub mod agent_action;
 pub mod behavior;
-pub mod budget_ledger;
 pub mod content_publication;
 pub mod context;
 pub mod core;
