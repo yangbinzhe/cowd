@@ -72,7 +72,7 @@ fn get_messages_from_sequence_pages_100k_history() {
     let page = store
         .get_messages_from_sequence("s-100k", 99_950, 50)
         .unwrap();
-    assert_eq!(page.len(), 50);
+    assert_eq!(page.iter().map(|message| message.sequence).collect::<Vec<_>>(), (99_950..100_000).collect::<Vec<_>>());
     for (offset, message) in page.iter().enumerate() {
         let sequence = 99_950 + offset;
         assert_eq!(message.sequence, sequence);
@@ -282,7 +282,9 @@ fn test_list_sessions() {
     store.create_session(&make_record("s1")).unwrap();
     store.create_session(&make_record("s2")).unwrap();
     let list = store.list_sessions().unwrap();
-    assert_eq!(list.len(), 2);
+    let mut ids = list.iter().map(|record| record.session_id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["s1", "s2"]);
 }
 
 #[test]
@@ -313,8 +315,7 @@ fn scoped_message_search_preserves_authorized_results_when_other_sessions_rank_f
     let results = store
         .search_messages_in_sessions("tenant", &["authorized".to_string()], 1)
         .unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].session_id, "authorized");
+    assert_eq!(results.iter().map(|result| result.session_id.as_str()).collect::<Vec<_>>(), vec!["authorized"]);
 }
 
 #[test]
@@ -456,7 +457,9 @@ fn literal_list_filter_covers_all_original_fields_without_expanding_authority() 
         })
         .unwrap();
     assert_eq!(page.total, 7);
-    assert_eq!(page.records.len(), 7);
+    let mut ids = page.records.iter().map(|record| record.session_id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["Needle%_literal", "field-1", "field-2", "field-3", "field-4", "field-5", "field-6"]);
     assert!(!page
         .records
         .iter()
@@ -481,9 +484,7 @@ fn get_events_limited_pages_from_sequence_and_counts_total() {
     }
 
     let events = store.get_events_limited("s-events", 990, 5).unwrap();
-    assert_eq!(events.len(), 5);
-    assert_eq!(events[0].sequence, 990);
-    assert_eq!(events[4].sequence, 994);
+    assert_eq!(events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![990, 991, 992, 993, 994]);
     assert_eq!(store.count_events_from("s-events", 990).unwrap(), 10);
 }
 
@@ -518,9 +519,7 @@ fn get_events_by_type_pages_context_envelopes_only() {
     let events = store
         .get_events_by_type_limited("s-context-events", "ContextEnvelope", 0, 10)
         .unwrap();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].sequence, 1);
-    assert_eq!(events[1].sequence, 3);
+    assert_eq!(events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![1, 3]);
     assert_eq!(
         store
             .count_events_by_type_from("s-context-events", "ContextEnvelope", 0)
@@ -596,8 +595,7 @@ fn append_context_envelope_event_if_absent_skips_duplicate_envelope_id() {
     let events = store
         .get_events_by_type_limited("s-context-once", "ContextEnvelope", 0, 10)
         .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].sequence, 0);
+    assert_eq!(events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![0]);
     assert!(events[0].event_json.contains("first"));
 }
 
@@ -622,9 +620,7 @@ fn delete_events_from_removes_tail_only() {
 
     assert_eq!(store.delete_events_from("s-events-delete", 3).unwrap(), 2);
     let events = store.get_events("s-events-delete", 0).unwrap();
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0].sequence, 0);
-    assert_eq!(events[2].sequence, 2);
+    assert_eq!(events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![0, 1, 2]);
 }
 
 #[test]
@@ -658,9 +654,7 @@ fn delete_events_by_type_from_preserves_other_event_types() {
         2
     );
     let events = store.get_events("s-events-delete-type", 0).unwrap();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event_type, "TextDelta");
-    assert_eq!(events[1].event_type, "ToolStart");
+    assert_eq!(events.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(), vec!["TextDelta", "ToolStart"]);
 }
 
 #[test]
@@ -710,7 +704,7 @@ fn allocating_sequence_appends_contiguous_batch_atomically() {
             .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
-    assert_eq!(store.get_events("s-atomic-batch", 0).unwrap().len(), 3);
+    assert_eq!(store.get_events("s-atomic-batch", 0).unwrap().iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(), vec!["first", "second", "third"]);
 }
 
 #[test]
@@ -766,7 +760,7 @@ fn session_event_sequence_constraint_rejects_duplicate() {
     let mut duplicate = event;
     duplicate.event_type = "duplicate".to_string();
     assert!(store.append_event(&duplicate).is_err());
-    assert_eq!(store.get_events("s-unique-event", 0).unwrap().len(), 1);
+    assert_eq!(store.get_events("s-unique-event", 0).unwrap().iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(), vec!["first"]);
 }
 
 #[test]
@@ -827,7 +821,7 @@ fn checkpoint_batch_timestamp_overflow_rolls_back_without_partial_event() {
         )
         .expect("legal envelope and representable timestamp must append")
         .expect("baseline checkpoint must be fresh");
-    assert_eq!(baseline.len(), 1);
+    assert_eq!(baseline.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>(), vec![event.event_type.as_str()]);
     assert_eq!(
         baseline_store
             .get_events("s-checkpoint-timestamp-overflow", 0)
@@ -943,9 +937,7 @@ fn branch_copy_uses_stable_cutoff_and_rejects_nonempty_target() {
         .unwrap();
     assert_eq!(copied, 2);
     let target = store.get_all_messages("branch-target").unwrap();
-    assert_eq!(target.len(), 2);
-    assert_eq!(target[0].stable_message_id, "branch:branch-target:source-0");
-    assert_eq!(target[1].sequence, 1);
+    assert_eq!(target.iter().map(|message| (message.stable_message_id.as_str(), message.sequence)).collect::<Vec<_>>(), vec![("branch:branch-target:source-0",0), ("branch:branch-target:source-1",1)]);
     assert!(store
         .copy_session_messages_at_cutoff("branch-source", "branch-target", 3)
         .is_err());
@@ -961,8 +953,7 @@ fn test_list_by_platform() {
     store.create_session(&rec).unwrap();
     store.create_session(&make_record("s-test")).unwrap();
     let tg = store.list_sessions_by_platform("telegram").unwrap();
-    assert_eq!(tg.len(), 1);
-    assert_eq!(tg[0].session_id, "s-tg");
+    assert_eq!(tg.iter().map(|record| record.session_id.as_str()).collect::<Vec<_>>(), vec!["s-tg"]);
 }
 
 #[test]
@@ -975,11 +966,11 @@ fn test_memory_associations() {
     // Idempotent
     store.associate_memory("s-mem", "mem-1").unwrap();
     let mems = store.get_session_memories("s-mem").unwrap();
-    assert_eq!(mems.len(), 2);
+    let mut memories = mems.clone(); memories.sort();
+    assert_eq!(memories, vec!["mem-1", "mem-2"]);
     store.disassociate_memory("s-mem", "mem-1").unwrap();
     let mems = store.get_session_memories("s-mem").unwrap();
-    assert_eq!(mems.len(), 1);
-    assert_eq!(mems[0], "mem-2");
+    assert_eq!(mems, vec!["mem-2"]);
 }
 
 #[test]
@@ -1076,7 +1067,6 @@ fn source_message_and_outbox_are_atomic_and_idempotent() {
     let timeline = store
         .get_session_domain_timeline_limited("s-outbox", 0, 10)
         .unwrap();
-    assert_eq!(timeline.len(), 3);
     assert_eq!(
         timeline
             .iter()
@@ -1159,7 +1149,6 @@ fn classifier_rejections_are_auditable_terminal_inputs_and_never_runnable() {
             .into_iter()
             .map(|event| SessionDomainEvent::from_session_event(&event).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(timeline.len(), 3);
         assert_eq!(
             timeline
                 .iter()
@@ -1246,14 +1235,9 @@ fn claim_returns_only_each_session_runnable_head() {
     let first = store
         .claim_session_runtime_outbox("worker", 200, 1_000, 10, &[])
         .unwrap();
-    assert_eq!(first.len(), 2);
-    assert_eq!(
-        first
-            .iter()
-            .map(|record| record.input_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from(["input-a-1", "input-b-1"])
-    );
+    let mut claimed_ids = first.iter().map(|record| record.input_id.as_str()).collect::<Vec<_>>();
+    claimed_ids.sort_unstable();
+    assert_eq!(claimed_ids, vec!["input-a-1", "input-b-1"]);
     assert!(store
         .claim_session_runtime_outbox("other", 201, 1_000, 10, &[])
         .unwrap()
@@ -1289,8 +1273,7 @@ fn claim_returns_only_each_session_runnable_head() {
     let next = store
         .claim_session_runtime_outbox("worker", 204, 1_000, 10, &[])
         .unwrap();
-    assert_eq!(next.len(), 1);
-    assert_eq!(next[0].input_id, "input-a-2");
+    assert_eq!(next.iter().map(|record| record.input_id.as_str()).collect::<Vec<_>>(), vec!["input-a-2"]);
 }
 
 #[test]
@@ -1322,7 +1305,7 @@ fn claim_excludes_earliest_failed_session_before_limit_without_mutation() {
         assert_eq!(queued.next_attempt_at_ms, created_at_ms);
     }
     let failed_before = runtime_claim_snapshot(&fixture, &excluded_session_ids);
-    assert_eq!(failed_before["outbox"].as_array().unwrap().len(), 1);
+    assert_eq!(failed_before["outbox"].as_array().unwrap().iter().map(|row| row["request_id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["request-failed-earliest"]);
     assert_eq!(failed_before["outbox"][0]["status"], "queued");
     assert!(failed_before["outbox"][0]["claim_token"].is_null());
     assert!(!failed_before["history"].as_array().unwrap().is_empty());
@@ -1330,8 +1313,7 @@ fn claim_excludes_earliest_failed_session_before_limit_without_mutation() {
     let claimed = store
         .claim_session_runtime_outbox("healthy-worker", 200, 1_000, 1, &excluded_session_ids)
         .unwrap();
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].session_id, "session-healthy-later");
+    assert_eq!(claimed.iter().map(|record| record.session_id.as_str()).collect::<Vec<_>>(), vec!["session-healthy-later"]);
     assert_eq!(claimed[0].request_id, "request-healthy-later");
     assert_eq!(claimed[0].status, SessionRuntimeInputStatus::Claimed);
     assert_eq!(claimed[0].claim_owner.as_deref(), Some("healthy-worker"));
@@ -1376,8 +1358,8 @@ fn claim_with_all_sessions_excluded_preserves_full_rows_and_history() {
         assert_eq!(queued.next_attempt_at_ms, created_at_ms);
     }
     let before = runtime_claim_snapshot(&fixture, &excluded_session_ids);
-    assert_eq!(before["sessions"].as_array().unwrap().len(), 2);
-    assert_eq!(before["outbox"].as_array().unwrap().len(), 2);
+    assert_eq!(before["sessions"].as_array().unwrap().iter().map(|row| row["session_id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["session-failed-first", "session-failed-second"]);
+    assert_eq!(before["outbox"].as_array().unwrap().iter().map(|row| row["session_id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["session-failed-first", "session-failed-second"]);
     assert!(!before["history"].as_array().unwrap().is_empty());
 
     for (claim_at_ms, limit) in [(200, 1), (201, 10)] {
@@ -1437,7 +1419,7 @@ fn assert_excluded_expired_claim_is_unchanged(expected_status: SessionRuntimeInp
     let mut initial_claims = store
         .claim_session_runtime_outbox("original-worker", 100, 50, 1, &[])
         .unwrap();
-    assert_eq!(initial_claims.len(), 1);
+    assert_eq!(initial_claims.iter().map(|record| record.request_id.as_str()).collect::<Vec<_>>(), vec!["request-failed-expired"]);
     let claimed = initial_claims.remove(0);
     assert_eq!(claimed.request_id, "request-failed-expired");
     let claim_token = claimed.claim_token.clone().unwrap();
@@ -1458,7 +1440,7 @@ fn assert_excluded_expired_claim_is_unchanged(expected_status: SessionRuntimeInp
     assert_eq!(expired.status, expected_status);
     assert_eq!(expired.claim_expires_at_ms, Some(150));
     let before = runtime_claim_snapshot(&fixture, &excluded_session_ids);
-    assert_eq!(before["outbox"].as_array().unwrap().len(), 1);
+    assert_eq!(before["outbox"].as_array().unwrap().iter().map(|row| row["request_id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["request-failed-expired"]);
     assert_eq!(before["outbox"][0]["status"], expected_status.as_str());
     assert_eq!(before["outbox"][0]["claim_token"], claim_token.as_str());
     assert!(!before["history"].as_array().unwrap().is_empty());
@@ -1466,8 +1448,7 @@ fn assert_excluded_expired_claim_is_unchanged(expected_status: SessionRuntimeInp
     let healthy_claims = store
         .claim_session_runtime_outbox("replacement-worker", 150, 50, 1, &excluded_session_ids)
         .unwrap();
-    assert_eq!(healthy_claims.len(), 1);
-    assert_eq!(healthy_claims[0].session_id, "session-healthy-unclaimed");
+    assert_eq!(healthy_claims.iter().map(|record| record.session_id.as_str()).collect::<Vec<_>>(), vec!["session-healthy-unclaimed"]);
     assert_eq!(healthy_claims[0].request_id, "request-healthy-unclaimed");
     assert_eq!(
         runtime_claim_snapshot(&fixture, &excluded_session_ids),
@@ -1919,7 +1900,7 @@ fn claimed_target_loss_reclassifies_and_requeues_under_owner_fence() {
     let timeline = store
         .get_session_domain_timeline_limited("session-target-loss", 0, 10)
         .unwrap();
-    assert_eq!(timeline.len(), 4);
+    assert_eq!(timeline.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
     assert!(timeline[3]
         .event_json
         .contains("target turn no longer exists"));
@@ -2101,9 +2082,7 @@ fn exercise_batched_execution_history_root_limit(rejection: InputRoutingDecision
         .session_runtime_outbox_for_sessions(&[session_id.to_string()], 1)
         .unwrap();
 
-    assert_eq!(roots.len(), 1);
-    assert_eq!(roots[0].decision, InputRoutingDecision::StartNewTurn);
-    assert_eq!(roots[0].request_id, "request-root-recovery");
+    assert_eq!(roots.iter().map(|record| (record.request_id.as_str(), record.decision)).collect::<Vec<_>>(), vec![("request-root-recovery", InputRoutingDecision::StartNewTurn)]);
 }
 
 #[test]
@@ -2118,8 +2097,7 @@ fn outbox_claim_lease_retry_block_manual_retry_and_ack_are_guarded() {
     let first = store
         .claim_session_runtime_outbox("worker-a", 100, 50, 10, &[])
         .unwrap();
-    assert_eq!(first.len(), 1);
-    assert_eq!(first[0].attempts, 1);
+    assert_eq!(first.iter().map(|record| (record.request_id.as_str(), record.attempts)).collect::<Vec<_>>(), vec![("request-1", 1)]);
     assert!(store
         .claim_session_runtime_outbox("worker-b", 149, 50, 10, &[])
         .unwrap()

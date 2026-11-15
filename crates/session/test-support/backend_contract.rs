@@ -658,13 +658,11 @@ pub fn terminal_input_cursor_cas(fixture: &mut impl BackendContractFixture) {
         .backend()
         .session_runtime_outbox_for_turn_relation(session_id, 1, &request.turn_id)
         .expect("load exact turn relation");
-    assert_eq!(related.len(), 2);
-    assert!(related
-        .iter()
-        .any(|record| record.input_id == running.input_id));
-    assert!(related
-        .iter()
-        .any(|record| record.input_id == attached.input_id));
+    let mut related_ids = related.iter().map(|record| record.input_id.as_str()).collect::<Vec<_>>();
+    related_ids.sort_unstable();
+    let mut expected_ids = vec![running.input_id.as_str(), attached.input_id.as_str()];
+    expected_ids.sort_unstable();
+    assert_eq!(related_ids, expected_ids);
 
     let stale = terminal_commit(
         &request,
@@ -818,8 +816,7 @@ pub fn lifecycle_recovery_and_single_tombstone(fixture: &mut impl BackendContrac
         .backend()
         .list_recoverable_session_lifecycle_intents(10)
         .expect("list recoverable lifecycle");
-    assert_eq!(recoverable.len(), 1);
-    assert_eq!(recoverable[0].operation_id, operation_id);
+    assert_eq!(recoverable.iter().map(|intent| intent.operation_id.as_str()).collect::<Vec<_>>(), vec![operation_id]);
     assert_eq!(
         recoverable[0].last_stable_phase,
         SessionLifecyclePhase::AdmissionFenced
@@ -1127,8 +1124,7 @@ pub fn branch_activation_and_idempotent_cutoff(fixture: &mut impl BackendContrac
         .backend()
         .list_recoverable_session_branch_activations(10)
         .expect("list recoverable branch activations");
-    assert_eq!(recoverable.len(), 1);
-    assert_eq!(recoverable[0].operation_id, operation_id);
+    assert_eq!(recoverable.iter().map(|intent| intent.operation_id.as_str()).collect::<Vec<_>>(), vec![operation_id]);
     let pending = fixture
         .backend()
         .transition_session_branch_activation(&SessionBranchActivationTransition {
@@ -1280,8 +1276,7 @@ pub fn domain_event_idempotency_and_kind_query(fixture: &mut impl BackendContrac
             10,
         )
         .expect("query application outcomes");
-    assert_eq!(queried.len(), 2);
-    assert_eq!(queried[0].sequence, first.sequence);
+    assert_eq!(queried.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![first.sequence, other_producer.sequence]);
 
     fixture.reopen();
     let (after_restart, replayed_after_restart) = fixture

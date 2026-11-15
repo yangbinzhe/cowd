@@ -726,7 +726,14 @@ pub(super) async fn receipt_http_fixture(
                     let body: serde_json::Value =
                         serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
                     assert_eq!(body["runtime_commit_cursor"], "9007199254740993");
-                    assert_eq!(body.as_object().unwrap().keys().map(|key| key.as_str()).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from(["message_sequence", "runtime_commit_cursor"]));
+                    assert_eq!(
+                        body.as_object()
+                            .unwrap()
+                            .keys()
+                            .map(|key| key.as_str())
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        std::collections::BTreeSet::from(["content_digest", "runtime_commit_cursor"])
+                    );
                     let saved = std::fs::read_dir(&save_root)
                         .unwrap()
                         .filter_map(Result::ok)
