@@ -123,10 +123,11 @@ fn layer_visibility_projection_is_read_only() {
         &entry(MemoryLayer::L2, MemorySource::AutoExtracted, "project rule"),
         MemoryInformationState::Orientation,
     );
+    let expected_id = atom.id;
     let view = MemoryLayerView::new(MemoryLayer::L2, vec![atom]);
     assert!(view.read_only);
     assert_eq!(view.layer, MemoryLayer::L2);
-    assert_eq!(view.atoms.len(), 1);
+    assert!(matches!(view.atoms.as_slice(), [atom] if atom.id == expected_id));
 }
 
 #[test]
@@ -281,10 +282,20 @@ async fn checkpoint_compaction_promotes_only_reviewed_candidates() {
         .await
         .unwrap();
 
-    assert_eq!(receipt.fact_review.promoted.len(), 1);
-    assert_eq!(receipt.fact_review.held.len(), 2);
-    assert_eq!(receipt.memory_ids.len(), 1);
+    assert!(matches!(receipt.fact_review.promoted.as_slice(), [decision]
+        if decision.candidate.statement == "Use fact review before checkpoint memory promotion"));
+    let mut held = receipt.fact_review.held.iter().map(|decision| decision.candidate.statement.as_str()).collect::<Vec<_>>();
+    held.sort_unstable();
+    assert_eq!(held, ["Existing checkpoint duplicate should be held", "This candidate lacks evidence and must stay out of memory"]);
     let entries = manager.list_all_entries().await.unwrap();
+    assert!(matches!(receipt.memory_ids.as_slice(), [id] if entries.iter().any(|entry|
+        entry.id == *id && entry.content.contains("Use fact review"))));
+    let promoted_id = entries
+        .iter()
+        .find(|entry| entry.content.contains("Use fact review"))
+        .unwrap()
+        .id;
+    assert_eq!(receipt.memory_ids, vec![promoted_id]);
     assert!(entries
         .iter()
         .any(|entry| entry.content.contains("Use fact review")));
@@ -341,13 +352,14 @@ async fn memory_kernel_layer_views_project_atoms_read_only() {
     assert!(l2.read_only);
     assert_eq!(l2.layer, MemoryLayer::L2);
     assert_eq!(l2.atoms.len(), 1);
-    assert!(l2.atoms[0].is_explainable_orientation());
+    assert!(matches!(l2.atoms.as_slice(), [atom] if atom.is_explainable_orientation()));
     assert!(!all.is_empty());
     assert!(all.iter().all(|view| view.read_only));
     assert!(all.iter().all(|view| matches!(view.layer, MemoryLayer::L0 | MemoryLayer::L1 | MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4)));
     for layer in [MemoryLayer::L0, MemoryLayer::L1, MemoryLayer::L2, MemoryLayer::L3, MemoryLayer::L4] {
         assert_eq!(all.iter().filter(|view| view.layer == layer).count(), 1);
     }
+    assert!(l2.atoms[0].is_explainable_orientation());
     assert_eq!(
         all.iter()
             .find(|view| view.layer == MemoryLayer::L2)
@@ -452,11 +464,11 @@ async fn memory_kernel_records_lifecycle_events() {
         .unwrap();
 
     let events = kernel.lifecycle_events(id).await.unwrap();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].to, MemoryState::Active);
-    assert_eq!(events[1].from, Some(MemoryState::Active));
-    assert_eq!(events[1].to, MemoryState::Superseded);
-    assert_eq!(events[1].agent_id, "agent-life");
+    let [created, superseded] = events.as_slice() else { panic!("expected the original lifecycle transitions exactly once") };
+    assert_eq!(created.to, MemoryState::Active);
+    assert_eq!(superseded.from, Some(MemoryState::Active));
+    assert_eq!(superseded.to, MemoryState::Superseded);
+    assert_eq!(superseded.agent_id, "agent-life");
 }
 
 #[tokio::test]
@@ -865,13 +877,18 @@ async fn runtime_managed_memory_packet_enforces_layer_budget() {
         })
         .collect::<Vec<_>>();
 
+    let mut original_ids = candidates.iter().map(|item| item.id).collect::<Vec<_>>();
     let packet = kernel
         .context_packet_from_entries(candidates, 8, 1_000)
         .await
         .unwrap();
 
-    assert_eq!(packet.selected.len(), 2);
-    assert_eq!(packet.omitted.len(), 1);
+    let [first, second] = packet.selected.as_slice() else { panic!("expected the selected budget candidates") };
+    let [omitted] = packet.omitted.as_slice() else { panic!("expected the rejected budget candidate") };
+    let mut actual_ids = vec![first.atom.id, second.atom.id, omitted.id];
+    original_ids.sort_unstable();
+    actual_ids.sort_unstable();
+    assert_eq!(actual_ids, original_ids);
     assert!(packet
         .omitted
         .iter()
@@ -894,8 +911,7 @@ async fn long_memory_discovery_charges_preview_not_durable_source() {
         .context_packet_from_entries(vec![long], 1, 1_000)
         .await
         .unwrap();
-    assert_eq!(packet.selected.len(), 1);
-    assert_eq!(packet.selected[0].atom.id, expected_id);
+    assert!(matches!(packet.selected.as_slice(), [item] if item.atom.id == expected_id));
     assert!(packet.selected[0].content_preview.chars().count() <= 483);
     assert!(packet.token_estimate <= 1_000);
     assert!(packet.omitted.is_empty());
@@ -1074,8 +1090,7 @@ async fn duplicate_memory_write_is_not_persisted_again() {
     kernel.remember(&ctx, second).await.unwrap();
 
     let entries = manager.list_all_entries().await.unwrap();
-    assert_eq!(entries.len(), 1);
-    assert!(entries.iter().any(|entry| entry.id == first_id));
+    assert!(matches!(entries.as_slice(), [entry] if entry.id == first_id));
     assert!(!entries.iter().any(|entry| entry.id == second_id));
     assert_eq!(
         kernel
@@ -1099,6 +1114,7 @@ async fn memory_runtime_clusters_large_documents_without_loading_full_body() {
     );
     let kernel = MemoryKernel::new(Arc::clone(&manager));
     let ctx = MemoryTurnContext::new("session-cluster", "agent-cluster");
+    let mut original_ids = Vec::new();
     for idx in 0..5 {
         let mut doc = entry(
             MemoryLayer::L3,
@@ -1107,15 +1123,19 @@ async fn memory_runtime_clusters_large_documents_without_loading_full_body() {
         );
         doc.content = "large document body ".repeat(600);
         doc.tags = vec!["large-docs".to_string()];
+        original_ids.push(doc.id);
         kernel.remember(&ctx, doc).await.unwrap();
     }
 
     let clusters = kernel.clusters(4).await.unwrap();
 
-    assert_eq!(clusters.len(), 1);
-    assert_eq!(clusters[0].entry_ids.len(), 5);
-    assert!(clusters[0].summary.len() <= 960);
-    assert!(clusters[0].truncated);
+    let [cluster] = clusters.as_slice() else { panic!("expected the original document cluster") };
+    let mut actual_ids = cluster.entry_ids.clone();
+    actual_ids.sort_unstable();
+    original_ids.sort_unstable();
+    assert_eq!(actual_ids, original_ids);
+    assert!(cluster.summary.len() <= 960);
+    assert!(cluster.truncated);
 }
 
 #[tokio::test]
@@ -1805,7 +1825,8 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
         .await
         .unwrap();
     let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
-    assert_eq!(pending.len(), 1);
+    assert!(matches!(pending.as_slice(), [item]
+        if item.source.delete_epoch == 1 && item.source.source_ref == format!("memory:{}", retired.id)));
     assert_eq!(pending[0].source.delete_epoch, 1);
     assert!(pending[0].knowledge_receipt_digest.is_none());
     assert!(!pending[0].auxiliary_confirmed);
@@ -1818,7 +1839,11 @@ async fn archive_atomically_fences_knowledge_and_cleanup_survives_manager_reopen
     );
     // Before quarantine has run, original Knowledge rows still contain both
     // packs, but its real read path must omit only the retired source.
-    assert_eq!(fabric.snapshot().unwrap().packs.len(), 2);
+    let mut pack_ids = fabric.snapshot().unwrap().packs.into_iter().map(|pack| pack.pack_id).collect::<Vec<_>>();
+    let mut expected_pack_ids = vec![retired_receipt.pack.pack_id.clone(), other_receipt.pack.pack_id.clone()];
+    pack_ids.sort_unstable();
+    expected_pack_ids.sort_unstable();
+    assert_eq!(pack_ids, expected_pack_ids);
     let visible = fabric
         .search_namespace(&KnowledgeNamespace::Project("A".into()), "")
         .unwrap();
@@ -2275,7 +2300,9 @@ async fn later_retirement_epoch_preserves_earlier_pending_and_exact_receipts() {
         .await
         .unwrap();
     let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
-    assert_eq!(pending.len(), 2);
+    let mut epochs = pending.iter().map(|p| p.source.delete_epoch).collect::<Vec<_>>();
+    epochs.sort_unstable();
+    assert_eq!(epochs, [1, 2]);
     let first = pending.iter().find(|p| p.source.delete_epoch == 1).unwrap();
     let second = pending.iter().find(|p| p.source.delete_epoch == 2).unwrap();
     assert_eq!(
@@ -2753,7 +2780,7 @@ async fn packet_use_checks_original_preview_cut_current_scope_and_read_lease() {
             .context_packet_from_entries(vec![source.clone()], 4, 1000)
             .await
             .unwrap();
-        assert_eq!(packet.selected.len(), 1);
+        assert!(matches!(packet.selected.as_slice(), [item] if item.atom.id == source.id));
         kernel
             .validate_packet_for_turn(&ctx, &packet, 1024 * 1024)
             .unwrap();
@@ -3583,8 +3610,12 @@ async fn auxiliary_original_cuts_keep_independent_support_and_fence_late_snapsho
         .save_knowledge_graph("global", &[external.clone()], &[unknown])
         .await
         .is_err());
-    assert_eq!(store.load_entities("global").await.unwrap().len(), 2);
-    assert_eq!(store.load_triples("global").await.unwrap().len(), 1);
+    let mut entity_ids = store.load_entities("global").await.unwrap().into_iter().map(|entity| entity.id).collect::<Vec<_>>();
+    entity_ids.sort_unstable();
+    let mut expected_ids = vec![backed.id.clone(), external.id.clone()];
+    expected_ids.sort_unstable();
+    assert_eq!(entity_ids, expected_ids);
+    assert!(matches!(store.load_triples("global").await.unwrap().as_slice(), [actual] if actual.id == triple.id));
     a.content = "a true correction after the auxiliary snapshot".into();
     store.update(&a, &a_cut).await.unwrap();
     let visible = store.load_entities("global").await.unwrap();
@@ -3642,8 +3673,7 @@ async fn auxiliary_original_cuts_keep_independent_support_and_fence_late_snapsho
         "an accelerator hit cannot return the previously cached retired source"
     );
     let visible = store.load_entities("global").await.unwrap();
-    assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].id, external.id);
+    assert!(matches!(visible.as_slice(), [entity] if entity.id == external.id));
     let knowledge = memory::KnowledgeFabric::with_store(Arc::new(
         memory::InMemoryKnowledgeStore::new().with_memory_owner(store.clone()),
     ))
@@ -3725,15 +3755,17 @@ async fn auxiliary_production_filter_reads_shared_large_ancestry_once() {
     };
     let (kept, _) =
         memory::store::filter_auxiliary_snapshot(&store, "global", &[entity], &[]).unwrap();
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].source_ids.len(), 2);
+    let [original] = kept.as_slice() else { panic!("expected the original shared ancestor") };
+    assert_eq!(original.source_ids, leaves.iter().map(|entry| entry.id.to_string()).collect::<Vec<_>>());
     let (frame, spent) = store
         .read_source_revisions(
             &leaves.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             8 * 1024 * 1024,
         )
         .unwrap();
-    assert_eq!(frame.len(), 2);
+    let mut expected_ids = leaves.iter().map(|entry| entry.id).collect::<Vec<_>>();
+    expected_ids.sort_unstable();
+    assert_eq!(frame.keys().copied().collect::<Vec<_>>(), expected_ids);
     assert!(
         spent > a.content.len() && spent < 6 * 1024 * 1024,
         "the shared 5MiB source is charged once, with bounded original metadata"
@@ -3766,7 +3798,7 @@ async fn legacy_retirement_adoption_binds_original_history_and_never_reopens_a_s
     store.kv_put(&key, &raw).await.unwrap();
     let page = store.legacy_lifecycle_page(None, 1).await.unwrap();
     assert_eq!(page.after_id, Some(original.id.to_string()));
-    assert_eq!(page.entries.len(), 1);
+    assert!(matches!(page.entries.as_slice(), [(entry, _)] if entry.id == original.id));
     assert!(store
         .pending_memory_cleanup(None, 1)
         .await
@@ -3882,8 +3914,7 @@ async fn legacy_lifecycle_page_reserves_bytes_and_advances_past_an_unreadable_so
         .legacy_lifecycle_page(page.after_id.as_deref(), 1)
         .await
         .unwrap();
-    assert_eq!(next.entries.len(), 1);
-    assert_eq!(next.entries[0].0.id, independent.id);
+    assert!(matches!(next.entries.as_slice(), [(entry, _)] if entry.id == independent.id));
     assert!(next.unavailable_ids.is_empty());
     assert!(store
         .pending_memory_cleanup(None, 1)
