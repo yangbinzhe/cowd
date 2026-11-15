@@ -545,7 +545,6 @@ async fn r1_475_native_history_real_cancel_commits_same_ticket_receipt() {
     }).collect::<Vec<_>>();
     expected_streams.sort_unstable();
     assert_eq!(pinned.keys().cloned().collect::<Vec<_>>(), expected_streams);
-    }).collect();
     assert!(!expected_streams.is_empty());
     assert!(pinned.values().all(|head| *head == 2));
     let mut original_transaction = None;
