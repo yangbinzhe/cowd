@@ -654,6 +654,31 @@ pub(crate) struct ExecutionGraphRunner {
 
 type MutationGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+fn normalize_start_failure(
+    expected_node_id: &str,
+    admitted: bool,
+    error: ExecutionRunnerError,
+) -> ExecutionRunnerError {
+    match error {
+        ExecutionRunnerError::Executor(error @ NodeExecutorError::Start { .. }) => {
+            if admitted {
+                NodeExecutorError::OriginalCustodyUnknown {
+                    node_id: expected_node_id.into(),
+                    reason: format!("Start reported after canonical admission: {error}"),
+                }.into()
+            } else if executor_error_node_id(&error) != expected_node_id {
+                NodeExecutorError::Invalid {
+                    node_id: expected_node_id.into(),
+                    reason: format!("start failure belongs to another node: {error}"),
+                }.into()
+            } else {
+                error.into()
+            }
+        }
+        error => error,
+    }
+}
+
 struct CommandIntentOwner {
     graph_id: String,
     intent: Arc<Notify>,
@@ -1186,10 +1211,9 @@ impl ExecutionGraphRunner {
         self.ensure_mutation_allowed()?;
         validate_execution_graph(&graph)?;
         self.registry.validate_graph(&graph)?;
-        match self
-            .commit_service
-            .register_continuation_graph_async(graph, actor, source_goal_cut, original_owner)
-            .await
+        match Box::pin(self.commit_service.register_continuation_graph_async(
+            graph, actor, source_goal_cut, original_owner,
+        )).await
         {
             Ok(receipt) => Ok(receipt.graph),
             Err(ExecutionCommitError::AlreadyAppliedSame { graph_id }) => self
@@ -1560,6 +1584,17 @@ impl ExecutionGraphRunner {
                         resource_started,
                         crate::execution_core::graph::ResourceResultClass::Failed,
                     );
+                    if matches!(&error, NodeExecutorError::Start { node_id, .. } if node_id == &node.id) {
+                        // No ticket or binding was admitted. Keep the other
+                        // prepared siblings and isolate this node through the
+                        // same startup-error path as other preparation failures.
+                        output.push(ExecutionPreparedPumpNode {
+                            binding: None,
+                            node,
+                            startup_error: Some(error.into()),
+                        });
+                        continue;
+                    }
                     self.discard_unpolled_wave(&prepared);
                     return Err(error.into());
                 }
@@ -1913,6 +1948,11 @@ impl ExecutionGraphRunner {
                     .await
             }
         };
+        // Normalize before publishing the original handoff. An admitted
+        // Start is unknown custody, never a finished preparation failure.
+        let result = result.map_err(|error| normalize_start_failure(
+            &node_id, expected_binding.is_some(), error,
+        ));
         #[cfg(feature = "test-fixtures")]
         if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "start_and_execute_return", None, Some(result.is_ok())); }
         #[cfg(feature = "test-fixtures")]
@@ -1956,11 +1996,23 @@ impl ExecutionGraphRunner {
         // Keep the large terminal-transition future out of its caller's
         // async frame. Its ownership, cancellation and fences are unchanged.
         let result = Box::pin(self.finish_pump_node(
-            graph_id, result, durable_progress, expected_binding, handoff,
+            graph_id, &node_id, result, durable_progress, expected_binding, handoff,
         )).await;
         #[cfg(feature = "test-fixtures")]
         if let Some(ticket) = &diagnostic_ticket { k05_completion_trace(ticket, "finish_pump_return", None, Some(result.is_ok())); }
         result
+    }
+
+    #[cfg(test)]
+    pub(super) async fn original_pump_outcome_for_test(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Option<(bool, Option<Result<NodeExecutionOutcome, Arc<ExecutionRunnerError>>>, bool)> {
+        let active = self.active.lock().await;
+        let owner = active.get(&(graph_id.to_string(), node_id.to_string()))?;
+        let state = owner.cancel_outcome.state.lock().unwrap();
+        Some((state.finished, state.outcome.clone(), state.original_binding_closed))
     }
 
     #[cfg(test)]
@@ -3043,10 +3095,62 @@ impl ExecutionGraphRunner {
             let decision = self.commit_service.binding_callback_disposition(&graph, &ticket.node_id, &original.binding)
                 .map_err(|_| unknown("original callback decision unavailable"))?;
             if decision == CallbackDisposition::Pending {
-                let state = original.handoff.state.lock().map_err(|_| unknown("original callback handoff unavailable"))?;
-                if state.callback_action.is_some() { return Err(unknown("original callback winner changed")); }
+                // Read every handoff fact in one scope, so no owner lock is
+                // held across the awaits below.
+                let (action_started, task, published) = {
+                    let state = original.handoff.state.lock()
+                        .map_err(|_| unknown("original callback handoff unavailable"))?;
+                    (state.callback_action.is_some(), state.pump_task.clone(),
+                        state.finished || state.outcome.is_some())
+                };
+                if action_started { return Err(unknown("original callback winner changed")); }
                 if requested_abort.is_some() { return Ok(()); }
-                return Err(unknown("callback has no canonical original outcome or retirement"));
+                // The exact original owner must reach a canonical terminal fact
+                // before this criterion judges unknown. The owner-scoped
+                // terminal cleanup commits the real retirement receipt of this
+                // exact original binding when one is prepared, and the physical
+                // drain releases the original effect so its own canonical
+                // receipt becomes reachable. Both keep the identity fence: the
+                // same binding, ticket, executor and handoff must still own
+                // this node, and an unconfirmed cleanup or drain stays unknown
+                // custody.
+                let cleanup = self.resume_original_terminal_replan_cleanup_until(graph_id, ticket, executor, deadline).await;
+                let drained = match self.drain_active_original(graph_id, executor, ticket, deadline).await {
+                    Ok(drained) => drained,
+                    Err(error) => return Err(unknown(&format!("callback has no canonical original outcome or retirement: {error}"))),
+                };
+                if let Err(error) = cleanup {
+                    return Err(unknown(&format!("callback has no canonical original outcome or retirement: {error}")));
+                }
+                if drained {
+                    // The original was physically released, so its own task may
+                    // now publish the canonical receipt. The original task
+                    // publishes its outcome before it runs its callback, so an
+                    // unpublished original is the in-flight task and the only
+                    // one this callback may wait for: the original task must
+                    // never wait for its own receipt.
+                    if let (Some(task), false) = (task, published) {
+                        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                        match tokio::time::timeout(remaining, task.observe(&ticket.node_id)).await {
+                            Ok(Ok(())) => {},
+                            Ok(Err(error)) => return Err(unknown(&format!("callback has no canonical original outcome or retirement: {error}"))),
+                            Err(_) => return Err(unknown("callback has no canonical original outcome or retirement: original task remains in flight after deadline")),
+                        }
+                    }
+                }
+                // Re-read the canonical fact for the same binding. Only a real
+                // committed outcome or a real retirement receipt leaves this
+                // criterion; Pending is still unknown custody.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let graph = tokio::time::timeout(remaining, self.state_store.load_async(graph_id)).await
+                    .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback graph deadline expired"))?
+                    .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback graph unavailable"))?;
+                let settled = self.commit_service.binding_callback_disposition(&graph, &ticket.node_id, &original.binding)
+                    .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback decision unavailable"))?;
+                if settled == CallbackDisposition::Pending {
+                    return Err(unknown("callback has no canonical original outcome or retirement"));
+                }
+                continue;
             }
             if decision == CallbackDisposition::Abort {
                 let action_started = original.handoff.state.lock().map_err(|_| unknown("original callback handoff unavailable"))?.callback_action.is_some();
@@ -3935,6 +4039,7 @@ impl ExecutionGraphRunner {
     async fn finish_pump_node(
         &self,
         graph_id: &str,
+        expected_node_id: &str,
         result: Result<(String, NodeExecutionOutcome), ExecutionRunnerError>,
         durable_progress: Arc<Notify>,
         expected_binding: Option<ExecutionNodeBinding>,
@@ -3943,6 +4048,7 @@ impl ExecutionGraphRunner {
         let Some((node_id, mut outcome)) = self
             .resolve_pump_result(
                 graph_id,
+                expected_node_id,
                 result,
                 &durable_progress,
                 expected_binding.as_ref(),
@@ -4613,11 +4719,12 @@ impl ExecutionGraphRunner {
     async fn resolve_pump_result(
         &self,
         graph_id: &str,
+        expected_node_id: &str,
         result: Result<(String, NodeExecutionOutcome), ExecutionRunnerError>,
         durable_progress: &Notify,
         expected_binding: Option<&ExecutionNodeBinding>,
     ) -> Result<Option<(String, NodeExecutionOutcome)>, ExecutionRunnerError> {
-        match result {
+        match result.map_err(|error| normalize_start_failure(expected_node_id, expected_binding.is_some(), error)) {
             Err(ExecutionRunnerError::CommandSuperseded { node_id }) => {
                 let running = self
                     .active
@@ -6529,9 +6636,13 @@ mod goal_revalidation_fence_tests {
             reason: "terminal commit failed".into(), phase: "original owner", cleanup: Box::new(cleanup),
         };
         assert!(error.to_string().contains("terminal commit failed"));
-        let source = std::error::Error::source(&error).unwrap()
-            .downcast_ref::<ExecutionRunnerError>().unwrap();
-        assert!(matches!(source, ExecutionRunnerError::Executor(NodeExecutorError::Cancel { .. })));
+        let source = std::error::Error::source(&error).expect("original cleanup source");
+        let source = source.downcast_ref::<ExecutionRunnerError>().or_else(|| {
+            source.downcast_ref::<Box<ExecutionRunnerError>>().map(|boxed| boxed.as_ref())
+        }).expect("the source retains the typed original Runner error");
+        assert!(matches!(source, ExecutionRunnerError::Executor(NodeExecutorError::Cancel {
+            node_id, reason,
+        }) if node_id == "node" && reason == "physical close pending"));
     }
 
     #[test]
@@ -8224,7 +8335,7 @@ mod nodispatch_duration_617_tests {
             let task_graph = graph_id.clone();
             let task_node = node_id.clone();
             let task = tokio::spawn(async move {
-                task_runner.finish_pump_node(&task_graph, Ok((task_node, outcome)), Arc::new(Notify::new()), Some(binding), None).await
+                task_runner.finish_pump_node(&task_graph, &task_node, Ok((task_node.clone(), outcome)), Arc::new(Notify::new()), Some(binding), None).await
             });
             tokio::time::timeout(Duration::from_secs(5), probe.entered.notified()).await.unwrap();
             // A competing graph operation must be able to acquire the actual
@@ -8365,7 +8476,7 @@ mod nodispatch_duration_617_tests {
         }).await;
         assert!(stale.is_err());
         assert!(runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
-        let error = runner.finish_pump_node(&graph_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(binding.clone()), None).await.unwrap_err();
+        let error = runner.finish_pump_node(&graph_id, &node_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(binding.clone()), None).await.unwrap_err();
         assert!(error.to_string().contains("observation source conflicts with causal read-set"), "{error}");
         assert!(matches!(error, ExecutionRunnerError::Executor(
             NodeExecutorError::OriginalCustodyUnknown { .. }
@@ -8449,14 +8560,14 @@ mod nodispatch_duration_617_tests {
         let before = services.graph_state_store().load(&graph_id).unwrap();
         let mut foreign = binding.clone();
         foreign.attempt += 1;
-        runner.finish_pump_node(&graph_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(foreign), None).await.unwrap();
+        runner.finish_pump_node(&graph_id, &node_id, Ok((node_id.clone(), outcome)), Arc::new(Notify::new()), Some(foreign), None).await.unwrap();
         let after = services.graph_state_store().load(&graph_id).unwrap();
         assert_eq!(after, before);
         assert!(runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
         assert!(services.graph_state_store().binding_retirement_record(&after, &node_id, &binding).unwrap().is_none());
         // The actual original outcome was already produced; let its original
         // owner commit it instead of inventing a cancelled result for cleanup.
-        runner.finish_pump_node(&graph_id, Ok((node_id.clone(), original_outcome.clone())),
+        runner.finish_pump_node(&graph_id, &node_id, Ok((node_id.clone(), original_outcome.clone())),
             Arc::new(Notify::new()), Some(binding.clone()), None).await.unwrap();
         let completed = services.graph_state_store().load(&graph_id).unwrap();
         assert_eq!(completed.node_results[&node_id], original_outcome.result);
@@ -9050,5 +9161,391 @@ mod dependency_policy_tests {
         let prohibited = unknown_dependency_nodes(&graph, &std::collections::BTreeSet::from(["unknown".to_string()]));
         assert!(prohibited.contains("merge"));
         assert!(quorum_tail_cancellations_excluding(&graph, &prohibited).is_empty());
+    }
+}
+
+/// The custody closure examples for the original call custody criterion.
+///
+/// The Pending callback branch must reach a canonical original fact through
+/// the reused owner-scoped cleanup and the reused physical drain before it
+/// judges the custody unknown. A real retirement receipt closes it, an
+/// unconfirmed original stays refused, and a foreign owner stays refused.
+#[cfg(test)]
+mod custody_closure_tests {
+    use super::*;
+    use super::super::executors::{ScopedNodeBackend, ScopedNodeBackendResolver};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// One original tool-batch backend. Its physical stop is the point where
+    /// the canonical retirement receipt of its own node can land.
+    struct CustodyBackend {
+        stops: AtomicUsize,
+        retired: AtomicBool,
+        retire_on_stop: bool,
+        services: Arc<crate::RuntimeServices>,
+        identity: StdMutex<Option<(String, String)>>,
+        stopped: Notify,
+        release: Notify,
+    }
+
+    impl CustodyBackend {
+        fn retire(&self) {
+            if self.retired.swap(true, Ordering::SeqCst) { return; }
+            let identity = self.identity.lock().unwrap().clone();
+            let Some((graph_id, node_id)) = identity else { return; };
+            let Ok(graph) = self.services.graph_state_store().load(&graph_id) else { return; };
+            let command = ExecutionGraphCommand::CancelNode {
+                expected_revision: graph.revision,
+                node_id,
+                reason: "original custody closure receipt".into(),
+            };
+            let _ = self.services.commit_service().apply_command(&graph, &command);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScopedNodeBackend for CustodyBackend {
+        fn request_stop(&self, _ticket: &NodeExecutionTicket) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            if self.retire_on_stop { self.retire(); }
+            self.stopped.notify_one();
+        }
+        async fn execute(
+            &self,
+            _ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            // The original physical effect stays in flight until the test
+            // releases it, so the drain really has to wait for it.
+            self.release.notified().await;
+            Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: None,
+                wait_class: None,
+                summary: Some("custody closure original".into()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            }))
+        }
+    }
+
+    /// A foreign executor never owns the original custody.
+    struct ForeignCustodyExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for ForeignCustodyExecutor {
+        fn kind(&self) -> &str {
+            "foreign-custody-executor"
+        }
+        fn validate(
+            &self,
+            _: &harness_contract::execution_graph::ExecutionNodeSpec,
+        ) -> Result<(), NodeExecutorError> {
+            Ok(())
+        }
+        async fn start(
+            &self,
+            context: NodeExecutionContext,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            Ok(NodeExecutionTicket {
+                graph_id: context.graph.id.clone(),
+                node_id: context.node.id.clone(),
+                executor_kind: self.kind().into(),
+                service_class: context.graph.service_class,
+                attempt: context.attempt,
+                idempotency_key: context.node.idempotency_key.clone(),
+                payload_ref: context.node.payload_ref.clone(),
+            })
+        }
+        async fn poll_or_await(
+            &self,
+            _: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: None,
+                wait_class: None,
+                summary: Some("foreign custody executor".into()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            }))
+        }
+    }
+
+    struct CustodyResolver {
+        backend: Arc<CustodyBackend>,
+    }
+
+    impl ScopedNodeBackendResolver for CustodyResolver {
+        fn resolve(&self, _ticket: &NodeExecutionTicket) -> Option<Arc<dyn ScopedNodeBackend>> {
+            Some(Arc::clone(&self.backend) as Arc<dyn ScopedNodeBackend>)
+        }
+    }
+
+    async fn custody_prepared(retire_on_stop: bool) -> (
+        tempfile::TempDir,
+        Arc<crate::RuntimeServices>,
+        ExecutionGraphRunner,
+        String,
+        ExecutionPreparedPumpNode,
+        Arc<CustodyBackend>,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let backend = Arc::new(CustodyBackend {
+            stops: AtomicUsize::new(0),
+            retired: AtomicBool::new(false),
+            retire_on_stop,
+            services: Arc::clone(&services),
+            identity: StdMutex::new(None),
+            stopped: Notify::new(),
+            release: Notify::new(),
+        });
+        services
+            .tool_batch_executor()
+            .install_resolver(Arc::new(CustodyResolver { backend: Arc::clone(&backend) }));
+        let runner = ExecutionGraphRunner::new(
+            services.executor_registry().clone(),
+            services.graph_state_store().clone(),
+            services.commit_service().clone(),
+            Arc::new(ExecutionResourceManager::new([])),
+            Arc::new(ScopeLockManager::persistent(workspace.path().join("scopes")).unwrap()),
+            Arc::new(WorktreeLeaseManager::open(workspace.path().join("leases.json")).unwrap()),
+            "custody-closure",
+            workspace.path(),
+        );
+        let mut graph = ExecutionGraph::new("original custody closure");
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-custody".into(),
+            turn_id: "turn-custody".into(),
+            root_task_id: "task-custody".into(),
+            task_id: "task-custody".into(),
+            generation: 1,
+        });
+        let payload = crate::step_snapshot::encode_persisted_tool_batch(&serde_json::json!({
+            "session_id":"session-custody","step_snapshots":{},
+            "calls":[{"id":"custody-call","name":"read_file","input":"{}","depends_on":[]}]
+        }))
+        .unwrap();
+        graph
+            .nodes
+            .push(harness_contract::execution_graph::ExecutionNodeSpec::new(
+                harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+                "tool_batch",
+                payload,
+            ));
+        let registered = runner.register(graph).await.unwrap();
+        let snapshot = runner
+            .pump_snapshot(&registered.id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.ready.len(), 1);
+        let mut prepared = runner
+            .prepare_ready_wave(&registered.id, snapshot.ready)
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 1);
+        let prepared = prepared.remove(0);
+        *backend.identity.lock().unwrap() =
+            Some((registered.id.clone(), prepared.node.id.clone()));
+        (workspace, services, runner, registered.id, prepared, backend)
+    }
+
+    fn pending_unknown(error: &ExecutionRunnerError) -> bool {
+        matches!(error, ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown {
+            reason, ..
+        }) if reason == "callback has no canonical original outcome or retirement")
+    }
+
+    /// Positive example: a real retirement receipt closes the custody.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn custody_pending_callback_closes_on_the_real_retirement_receipt() {
+        let (_workspace, services, runner, graph_id, prepared, backend) =
+            custody_prepared(true).await;
+        let binding = prepared.binding.clone().unwrap();
+        let node_id = prepared.node.id.clone();
+        let original = {
+            let runner = runner.clone();
+            let graph = graph_id.clone();
+            let node = prepared.node.clone();
+            let binding = binding.clone();
+            tokio::spawn(async move { runner.start_and_execute_node(&graph, node, Some(&binding)).await })
+        };
+        // The original owner is live and its physical effect is in flight.
+        let (ticket, executor) = loop {
+            let active = runner.active.lock().await;
+            if let Some(owner) = active.get(&(graph_id.clone(), node_id.clone())) {
+                break (owner.ticket.clone(), Arc::clone(&owner.executor));
+            }
+            drop(active);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Neither a committed outcome nor a retirement record exists yet.
+        let graph = services.graph_state_store().load(&graph_id).unwrap();
+        assert!(services
+            .graph_state_store()
+            .binding_retirement_record(&graph, &node_id, &binding)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            runner.commit_service.binding_callback_disposition(&graph, &node_id, &binding).unwrap(),
+            CallbackDisposition::Pending
+        );
+        // The Pending criterion must try the reused cleanup and drain before
+        // it judges the custody unknown.
+        let callback = {
+            let runner = runner.clone();
+            let graph = graph_id.clone();
+            let ticket = ticket.clone();
+            let executor = Arc::clone(&executor);
+            tokio::spawn(async move {
+                runner.complete_callback_observed_until(
+                    &graph,
+                    &executor,
+                    &ticket,
+                    None,
+                    std::time::Instant::now() + Duration::from_secs(30),
+                ).await
+            })
+        };
+        // The drain asks the original physical effect to stop.
+        tokio::time::timeout(Duration::from_secs(10), backend.stopped.notified())
+            .await
+            .unwrap();
+        assert!(backend.stops.load(Ordering::SeqCst) >= 1);
+        // The canonical retirement receipt is durable now.
+        let graph = services.graph_state_store().load(&graph_id).unwrap();
+        assert!(services
+            .graph_state_store()
+            .binding_retirement_record(&graph, &node_id, &binding)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            runner.commit_service.binding_callback_disposition(&graph, &node_id, &binding).unwrap(),
+            CallbackDisposition::Abort
+        );
+        // The original physical effect may finish now.
+        backend.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(20), callback).await.unwrap().unwrap();
+        assert!(!result.as_ref().err().is_some_and(pending_unknown),
+            "the real receipt must close the custody: {result:?}");
+        let _ = original.await;
+    }
+
+    /// Negative example: an unconfirmed original stays refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn custody_pending_callback_still_refuses_an_unconfirmed_original() {
+        let (_workspace, services, runner, graph_id, prepared, backend) =
+            custody_prepared(false).await;
+        let binding = prepared.binding.clone().unwrap();
+        let node_id = prepared.node.id.clone();
+        let original = {
+            let runner = runner.clone();
+            let graph = graph_id.clone();
+            let node = prepared.node.clone();
+            let binding = binding.clone();
+            tokio::spawn(async move { runner.start_and_execute_node(&graph, node, Some(&binding)).await })
+        };
+        let (ticket, executor) = loop {
+            let active = runner.active.lock().await;
+            if let Some(owner) = active.get(&(graph_id.clone(), node_id.clone())) {
+                break (owner.ticket.clone(), Arc::clone(&owner.executor));
+            }
+            drop(active);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let callback = {
+            let runner = runner.clone();
+            let graph = graph_id.clone();
+            let ticket = ticket.clone();
+            let executor = Arc::clone(&executor);
+            tokio::spawn(async move {
+                runner.complete_callback_observed_until(
+                    &graph,
+                    &executor,
+                    &ticket,
+                    None,
+                    std::time::Instant::now() + Duration::from_secs(30),
+                ).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), backend.stopped.notified())
+            .await
+            .unwrap();
+        // The original never reaches a canonical fact.
+        backend.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(20), callback).await.unwrap().unwrap();
+        let error = result.expect_err("an unconfirmed original stays unknown custody");
+        assert!(pending_unknown(&error), "the unconfirmed original must stay refused: {error:?}");
+        let graph = services.graph_state_store().load(&graph_id).unwrap();
+        assert!(services
+            .graph_state_store()
+            .binding_retirement_record(&graph, &node_id, &binding)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            runner.commit_service.binding_callback_disposition(&graph, &node_id, &binding).unwrap(),
+            CallbackDisposition::Pending
+        );
+        let _ = original.await;
+    }
+
+    /// Negative example: a foreign owner stays refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn custody_pending_callback_still_refuses_a_foreign_owner() {
+        let (_workspace, _services, runner, graph_id, prepared, backend) =
+            custody_prepared(true).await;
+        let binding = prepared.binding.clone().unwrap();
+        let node_id = prepared.node.id.clone();
+        let original = {
+            let runner = runner.clone();
+            let graph = graph_id.clone();
+            let node = prepared.node.clone();
+            let binding = binding.clone();
+            tokio::spawn(async move { runner.start_and_execute_node(&graph, node, Some(&binding)).await })
+        };
+        let (ticket, executor) = loop {
+            let active = runner.active.lock().await;
+            if let Some(owner) = active.get(&(graph_id.clone(), node_id.clone())) {
+                break (owner.ticket.clone(), Arc::clone(&owner.executor));
+            }
+            drop(active);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // A foreign ticket is not the admitted original owner.
+        let mut foreign = ticket.clone();
+        foreign.attempt = foreign.attempt.saturating_add(1);
+        let error = runner
+            .complete_callback_observed_until(
+                &graph_id,
+                &executor,
+                &foreign,
+                None,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .expect_err("a foreign ticket never owns the original custody");
+        assert!(matches!(error, ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { .. })),
+            "the foreign owner must stay refused: {error:?}");
+        // A foreign executor is refused the same way.
+        let foreign_executor: Arc<dyn NodeExecutor> = Arc::new(ForeignCustodyExecutor);
+        let error = runner
+            .complete_callback_observed_until(
+                &graph_id,
+                &foreign_executor,
+                &ticket,
+                None,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .expect_err("a foreign executor never owns the original custody");
+        assert!(matches!(error, ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { .. })),
+            "the foreign executor must stay refused: {error:?}");
+        assert_eq!(backend.stops.load(Ordering::SeqCst), 0);
+        backend.release.notify_one();
+        let _ = original.await;
     }
 }
