@@ -316,6 +316,11 @@ else
   echo "PASS command-service retired from workspace"
 fi
 
+check_empty "gateway services must not become protocol or storage adapters" \
+  scan_command 'crate::api_routes::AppState|AppState|axum::|StatusCode|IntoResponse|Json<|Connection::open|SqliteConnectionManager::file|UnifiedSessionStore::open|ConfigLoader::default_for' '' \
+    production_sources '/#\[cfg\(test\)\]/{exit} {print FILENAME ":" FNR ":" $0}' \
+    crates/gateway/src/services -g '*.rs' -g '!core_platform_operations.rs'
+
 check_empty "gateway services must not route through slash command execution" \
   rg -n "slash_catalog|handle_.*slash_command|resolve_skill_invocation|resolve_skill_path" crates/gateway/src/services --glob "*.rs"
 
@@ -335,9 +340,9 @@ check_empty "matrix core must not contain product APP semantics outside ownershi
     crates/matrix/core crates/matrix/repository -g '*.rs' -g 'Cargo.toml' -g '!ownership_import.rs' -g '!**/tests/**' -g '!**/tests.rs'
 
 check_empty "production direct sqlite opens must stay in storage/repository adapters" \
-  scan_command 'Connection::open\(|SqliteConnectionManager::file|TaskKernel::open\(|UnifiedSessionStore::open\(|MfgStore::open\(|SqliteStore::open\(|MatrixSqliteRepository::open\(' 'open_in_memory|/tests/|^crates/gateway/src/api_routes/mod.rs:|^crates/gateway/src/kernel/task_kernel.rs:|^crates/gateway/src/kernel/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example)' \
+  scan_command 'Connection::open\(|SqliteConnectionManager::file|TaskKernel::open\(|UnifiedSessionStore::open\(|MfgStore::open\(|SqliteStore::open\(|MatrixSqliteRepository::open\(|Store::open\(' 'open_in_memory|/tests/|^crates/gateway/src/api_routes/mod.rs:|^crates/gateway/src/kernel/task_kernel.rs:|^crates/gateway/src/kernel/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example)' \
     production_sources '/#\[cfg\(test\)\]/{exit} !/^[[:space:]]*\/\// {print FILENAME ":" FNR ":" $0}' \
-    crates -g '*.rs' -g '!**/tests/**' -g '!**/tests.rs' -g '!**/*_tests.rs' -g '!**/*_test.rs' -g '!crates/storage/**' -g '!crates/connector/src/source.rs' -g '!crates/connector/src/lib.rs' -g '!crates/session/src/persistence/**' -g '!crates/memory/src/store/**' -g '!crates/memory/src/session/session_store.rs' -g '!crates/memory/src/session/state_rebuilder.rs' -g '!crates/memory/src/knowledge/mod.rs' -g '!crates/memory/src/kernel/cognitive.rs' -g '!crates/memory/src/lifecycle/maintenance.rs' -g '!crates/memory/src/ops/sqlite_persistence.rs' -g '!crates/matrix/repository/**' -g '!crates/runtime/src/recovery/runtime_event_store.rs' -g '!crates/runtime/src/mission/task.rs' -g '!crates/runtime/src/team/team_discovery.rs' -g '!crates/runtime/src/context/artifact.rs' -g '!crates/gateway/src/infrastructure/selected_storage.rs'
+    crates -g '*.rs' -g '!**/tests/**' -g '!**/tests.rs' -g '!crates/storage/**' -g '!crates/connector/src/source.rs' -g '!crates/connector/src/lib.rs' -g '!crates/session/src/persistence/**' -g '!crates/memory/src/store/**' -g '!crates/memory/src/session/session_store.rs' -g '!crates/memory/src/session/state_rebuilder.rs' -g '!crates/memory/src/knowledge/mod.rs' -g '!crates/memory/src/kernel/cognitive.rs' -g '!crates/memory/src/lifecycle/maintenance.rs' -g '!crates/memory/src/ops/sqlite_persistence.rs' -g '!crates/matrix/repository/**' -g '!crates/runtime/src/recovery/runtime_event_store.rs' -g '!crates/runtime/src/mission/task.rs' -g '!crates/runtime/src/team/team_discovery.rs' -g '!crates/runtime/src/context/artifact.rs' -g '!crates/gateway/src/infrastructure/selected_storage.rs'
 
 check_empty "storage direct-open allowlist must stay empty" \
   allowlist_residue
