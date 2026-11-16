@@ -1693,19 +1693,29 @@ impl HistoryState {
                 self.bindings
                     .insert(key, (node_id.clone(), binding.clone()));
             }
-            for (node_id, attempt) in &next.recovery_cursor.node_attempts {
-                let previous_attempt = self
-                    .graph_state
-                    .as_ref()
-                    .and_then(|previous| previous.recovery_cursor.node_attempts.get(node_id))
-                    .copied()
-                    .unwrap_or(0);
-                if *attempt > previous_attempt
-                    && !bindings
+            // `delta.recovery_cursor.node_attempts` is a cumulative slot map, not an
+            // increment: a projection resumed mid-stream (or a cold read starting at a
+            // non-zero cursor) has no previous graph state, so every already-known
+            // attempt would look like "advanced in this event". Adopt the map as the
+            // baseline instead of judging it; the started path above still proves every
+            // binding it admits, so the write-side fence is unchanged.
+            if let Some(previous_state) = self.graph_state.as_ref() {
+                for (node_id, attempt) in &next.recovery_cursor.node_attempts {
+                    let previous_attempt = previous_state
+                        .recovery_cursor
+                        .node_attempts
                         .get(node_id)
-                        .is_some_and(|binding| binding.attempt == *attempt)
-                {
-                    return Err("current Graph attempt advanced without its start binding".into());
+                        .copied()
+                        .unwrap_or(0);
+                    if *attempt > previous_attempt
+                        && !bindings
+                            .get(node_id)
+                            .is_some_and(|binding| binding.attempt == *attempt)
+                    {
+                        return Err(
+                            "current Graph attempt advanced without its start binding".into(),
+                        );
+                    }
                 }
             }
             self.graph_state = Some(next);
