@@ -501,11 +501,23 @@ pub(crate) fn resource_path_is_authorized(
     let Ok(requested) = requested else {
         return false;
     };
+    // Evaluation output scopes are isolated per candidate: `.cowd/evaluation/<hash>`
+    // belongs to one candidate, so a whole-workspace lease must not reach it.
+    // Only a scope that names the evaluation digest itself may write there.
+    let evaluation_output_target = write
+        && requested
+            .repository_relative_path
+            .starts_with(".cowd/evaluation/");
     allowed_scopes.iter().any(|scope| {
         let (mode, allowed_scope) = scope.split_once(':').unwrap_or(("", ""));
         if (write && !matches!(mode, "write" | "workspace"))
             || (!write && !matches!(mode, "read" | "write" | "workspace"))
         {
+            return false;
+        }
+        if evaluation_output_target && !allowed_scope.contains(".cowd/evaluation/") {
+            // A bare workspace scope does not own another candidate's
+            // evaluation output subtree.
             return false;
         }
         // `read:.` / `write:.` are whole-workspace leases issued only by the
