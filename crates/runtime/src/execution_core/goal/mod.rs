@@ -2364,18 +2364,23 @@ impl GoalStore {
         ),
         String,
     > {
-        let binding = source
-            .goal
-            .execution_binding
-            .as_ref()
-            .ok_or("write recovery binding missing")?;
-        if binding.root_execution_id != ticket.graph_id || ticket.attempt == 0 {
-            return Err("write recovery Graph binding mismatch".into());
-        }
         let cut = crate::runtime_event_store::ExpectedStreamRevision {
             stream_id: stream_id(&source.goal.id),
             expected_revision: source.stream_revision,
         };
+        let Some(binding) = source.goal.execution_binding.as_ref() else {
+            // A tool-progress revalidation observes a Goal that is not bound to
+            // an execution graph yet. There is no write obligation to settle or
+            // recover for this observation, so it stays pending; only the
+            // terminal answer path requires the binding fence.
+            if matches!(&checkpoint, GoalWriteCheckpoint::ToolProgress { .. }) {
+                return Ok((GoalWriteDisposition::Pending, cut));
+            }
+            return Err("write recovery binding missing".into());
+        };
+        if binding.root_execution_id != ticket.graph_id || ticket.attempt == 0 {
+            return Err("write recovery Graph binding mismatch".into());
+        }
         let satisfied = if let Some((scopes, evidence, unscoped)) = task_focus {
             write_obligation_satisfied(!scopes.is_empty(), scopes, evidence, unscoped, resolver)
         } else {

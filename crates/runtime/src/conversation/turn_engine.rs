@@ -14,6 +14,31 @@ pub(crate) struct OriginalSingleProducerCapture {
     read_ref_target: std::sync::Mutex<Option<OriginalReadRefTarget>>,
 }
 
+/// Retirement controls remain available after a turn is cancelled: they are
+/// how the owning Agent stops the work whose cancellation just happened.
+/// Every other tool effect stays refused.
+fn retirement_control_tool(tool_id: &str) -> bool {
+    matches!(
+        tool_id,
+        "task_withdraw" | "task_release" | "task_attempt_fail"
+    )
+}
+
+#[cfg(test)]
+mod retirement_control_gate_tests {
+    use super::retirement_control_tool;
+
+    #[test]
+    fn only_retirement_controls_survive_a_cancelled_turn() {
+        for tool in ["task_withdraw", "task_release", "task_attempt_fail"] {
+            assert!(retirement_control_tool(tool), "{tool}");
+        }
+        for tool in ["edit", "write", "agent_action_batch", "task_publish", "task_claim"] {
+            assert!(!retirement_control_tool(tool), "{tool}");
+        }
+    }
+}
+
 /// The permission context of one original call, in the shape the Runtime
 /// writes into the original assessment event. The read_ref target decision and
 /// the check of its assessment event must use the same context: demanding a
@@ -1195,7 +1220,15 @@ impl SharedPolicyOwner {
         _prompter: &crate::permissions::SharedPrompter,
         binding: Option<&serde_json::Value>,
     ) -> Result<ToolAuthorizationDecision, RuntimeError> {
-        if self.cancellation.is_cancelled() || self.control_requested.load(std::sync::atomic::Ordering::Acquire) {
+        // A retirement action is how an Agent stops the work it owns. Refusing
+        // it once the turn is cancelled leaves the Task and its physical
+        // attempt alive with no actor able to close them. Other tool effects
+        // remain refused after cancellation.
+        let retirement_control = retirement_control_tool(&descriptor.tool_id);
+        if !retirement_control
+            && (self.cancellation.is_cancelled()
+                || self.control_requested.load(std::sync::atomic::Ordering::Acquire))
+        {
             return Err(RuntimeError::new("original policy owner cancelled or control requested"));
         }
         let execution_policy = self.identity.permission_policy.execution_policy_control().snapshot();

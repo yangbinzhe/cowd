@@ -268,8 +268,9 @@ fn tool_call_response() -> String {
     concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool\",\"model\":\"default\"}}\n\n",
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"read_file\"}}\n\n",
-        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"crates/runtime/src/lib.rs\\\"}\"}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\",\"model\":\"default\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"crates/runtime/src/lib.rs\\\"}\"}],\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n",
+        // R4-034-fixture-fix: request a complete read so the fixture can mint exact evidence.
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"crates/runtime/src/lib.rs\\\",\\\"complete\\\":true}\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\",\"model\":\"default\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"crates/runtime/src/lib.rs\\\",\\\"complete\\\":true}\"}],\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n",
         "data: [DONE]\n\n"
     )
     .to_string()

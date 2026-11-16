@@ -1910,11 +1910,37 @@ async fn dynamic_tool_exposure_defers_schema_until_discovery_activation() {
         panic!("recovery request must invoke the activated tool");
     };
     assert_eq!(calls[0].name, "custom_reader");
-    let batch = runtime
-        .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 2)
+    // R4-034-fixture-fix: this exposure unit tests activation, not ToolBatch ownership.
+    let activated_output = runtime
+        .tool_executor
+        .execute_output(&calls[0].name, &calls[0].input)
         .await
         .expect("activated tool execution");
-    assert_eq!(batch.failed, 0);
+    // R4-034-fixture-fix: record the activated invocation through Runtime's result owner.
+    let activated_result = runtime
+        .prepare_governed_tool_result_with_invocation(
+            &calls[0].id,
+            &calls[0].name,
+            &calls[0].input,
+            activated_output.model_text(),
+            false,
+            None,
+        )
+        .await
+        .expect("governed activated result");
+    assert!(activated_result.blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error: false,
+            } if tool_use_id == "read-1"
+                && tool_name == "custom_reader"
+                && output.contains("README contents")
+        )
+    }), "activated result: {activated_result:?}");
     runtime
         .execute_model_step("inspect files", false)
         .await

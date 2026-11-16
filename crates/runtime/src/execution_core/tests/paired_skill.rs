@@ -125,8 +125,9 @@ impl Fixture {
                         ))
                     );
                     let arguments = match *round {
-                        0 => serde_json::json!({"path":format!("{scope}/proof.txt"), "content":format!("verified Skill output {scope}")}),
-                        1 => serde_json::json!({"path":format!("{foreign_scope}/proof.txt"), "content":"CROSS_CANDIDATE_MUST_NOT_APPEAR"}),
+                        // R4-034-fixture-fix: include the native write action in the fixture arguments.
+                        0 => serde_json::json!({"action":"write", "path":format!("{scope}/proof.txt"), "content":format!("verified Skill output {scope}")}),
+                        1 => serde_json::json!({"action":"write", "path":format!("{foreign_scope}/proof.txt"), "content":"CROSS_CANDIDATE_MUST_NOT_APPEAR"}),
                         2 => serde_json::json!({"path":format!("{scope}/proof.txt")}),
                         _ => serde_json::json!({"path":format!("{foreign_scope}/proof.txt")}),
                     }.to_string();

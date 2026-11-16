@@ -686,6 +686,22 @@ struct TicketToolContext<'context, 'runtime, C, T> {
     evaluation_scope_rejections: &'context BTreeMap<String, String>,
 }
 
+/// An unbound call is either an executor-owned root effect (no delegated
+/// parent at all) or a delegated effect naming its original ticket. A
+/// missing parent cannot be distinguished from a missing fact when the
+/// effect was delegated, so a foreign parent stays refused.
+fn unbound_ticket_parent_matches(
+    ticket: &crate::execution_core::NodeExecutionTicket,
+    parent: Option<&harness_contract::execution_graph::ExecutionParentBinding>,
+    attempt: Option<u32>,
+) -> bool {
+    parent.is_none_or(|parent| {
+        parent.execution_id == ticket.graph_id
+            && parent.node_id == ticket.node_id
+            && attempt == Some(ticket.attempt)
+    })
+}
+
 tokio::task_local! {
     static TICKET_ORIGINAL_SINGLE_CAPTURE: Arc<OriginalSingleProducerCapture>;
 }
@@ -3845,9 +3861,13 @@ where
             || request.governed_plan_revision != plan_revision || request.session_id.as_deref() != Some(self.session_id()) {
             return Err(RuntimeError::new("original plan or Session differs"));
         }
-        if task.step_binding.is_none() && (request.parent_execution.as_ref().is_none_or(|parent|
-            parent.execution_id != ticket.graph_id || parent.node_id != ticket.node_id)
-            || request.parent_execution_attempt != Some(ticket.attempt)) {
+        if task.step_binding.is_none()
+            && !unbound_ticket_parent_matches(
+                ticket,
+                request.parent_execution.as_ref(),
+                request.parent_execution_attempt,
+            )
+        {
             return Err(RuntimeError::new("original unbound ticket parent differs"));
         }
         if pinned.invocation().invocation_id != task.tool_call_id {
@@ -7375,6 +7395,38 @@ mod delegated_effect_parent_tests {
                 "{defect}"
             );
         }
+    }
+
+    #[test]
+    fn unbound_executor_owned_effect_needs_no_parent_but_a_foreign_parent_is_refused() {
+        let ticket = crate::execution_core::NodeExecutionTicket {
+            graph_id: "agent-graph".into(),
+            node_id: "agent-node".into(),
+            executor_kind: "tool_batch".into(),
+            service_class: harness_contract::execution_graph::ExecutionServiceClass::Interactive,
+            attempt: 7,
+            idempotency_key: "ticket".into(),
+            payload_ref: "payload".into(),
+        };
+        assert!(unbound_ticket_parent_matches(&ticket, None, None));
+        let (parent, attempt) = parent();
+        assert!(unbound_ticket_parent_matches(
+            &ticket,
+            Some(&parent),
+            Some(attempt)
+        ));
+        let mut foreign = parent.clone();
+        foreign.node_id = "other-node".into();
+        assert!(!unbound_ticket_parent_matches(
+            &ticket,
+            Some(&foreign),
+            Some(attempt)
+        ));
+        assert!(!unbound_ticket_parent_matches(
+            &ticket,
+            Some(&parent),
+            Some(attempt + 1)
+        ));
     }
 }
 

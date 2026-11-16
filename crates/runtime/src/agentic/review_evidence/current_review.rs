@@ -3421,7 +3421,10 @@ pub(crate) fn is_worker_lifecycle_event(event: &crate::DurableRuntimeEvent) -> b
             || event.kind == "agentic.action_applied"
                 && matches!(
                     event.payload["envelope"]["action"]["kind"].as_str(),
-                    Some("task_withdraw") | Some("task_release") | Some("task_attempt_fail")
+                    Some("task_withdraw")
+                        | Some("task_release")
+                        | Some("task_attempt_fail")
+                        | Some("task_attempt_dispatch")
                 ))
 }
 
@@ -3458,4 +3461,75 @@ pub(crate) fn is_conclusion_process_event(event: &crate::DurableRuntimeEvent) ->
             event.kind.as_str(),
             "agentic.completion_reopened" | "agentic.completion_rejected"
         )
+}
+
+#[cfg(test)]
+mod tail_absorb_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn event(
+        sequence: u64,
+        kind: &str,
+        action_kind: Option<&str>,
+        action_id: &str,
+    ) -> crate::DurableRuntimeEvent {
+        crate::DurableRuntimeEvent {
+            event_id: format!("event-{sequence}"),
+            stream_id: "agentic-program:p".into(),
+            sequence,
+            scope: crate::RuntimeEventScope::Program,
+            kind: kind.into(),
+            status: Some("applied".into()),
+            actor: Some("runtime.program-supervisor".into()),
+            refs: Vec::new(),
+            payload: serde_json::json!({
+                "envelope": {
+                    "action_id": action_id,
+                    "action": {"kind": action_kind},
+                }
+            }),
+            created_at_ms: sequence,
+            commit_cursor: sequence,
+            transaction_id: format!("tx-{sequence}"),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: None,
+        }
+    }
+
+    #[test]
+    fn supervisor_attempt_dispatch_is_a_worker_lifecycle_advance() {
+        let events = vec![
+            event(2, "agentic.action_applied", Some("objective_review"), "review"),
+            event(3, "agentic.task_lease_renewed", None, ""),
+            event(4, "agentic.action_applied", Some("task_attempt_dispatch"), "dispatch"),
+            event(5, "agentic.action_applied", Some("task_withdraw"), "withdraw"),
+            event(6, "agentic.action_applied", Some("objective_complete_request"), "complete"),
+        ];
+        assert!(program_cut_absorbs_review_records(
+            &events,
+            "agentic-program:p",
+            1,
+            6,
+            "review",
+            &BTreeSet::new(),
+        ));
+    }
+
+    #[test]
+    fn an_unrelated_action_still_invalidates_the_proof() {
+        let events = vec![
+            event(2, "agentic.action_applied", Some("objective_review"), "review"),
+            event(3, "agentic.action_applied", Some("objective_update"), "update"),
+        ];
+        assert!(!program_cut_absorbs_review_records(
+            &events,
+            "agentic-program:p",
+            1,
+            3,
+            "review",
+            &BTreeSet::new(),
+        ));
+    }
 }

@@ -14343,17 +14343,26 @@ impl ExecutionCommitService {
             }
         }
         if !intents.iter().all(|key| receipts.contains(key) || refused.contains(key)) {
-            // An intent is written at the dispatch point and its terminal
-            // receipt at completion, in two different transactions, so
-            // "dispatched, still running" is exactly this shape. The receipt
-            // is a durable fact that lands later, so the closure keeps waiting
-            // inside its existing budget. Judging it unprovable here is the
-            // transient-as-permanent defect the ring classification names as
-            // the top regression risk, and it is the same treatment
-            // `bound_call_receipt_or_no_dispatch` just needed.
+            if !retired {
+                // An intent is written at the dispatch point and its terminal
+                // receipt at completion, in two different transactions, so
+                // "dispatched, still running" is exactly this shape. The receipt
+                // is a durable fact that lands later, so the closure keeps waiting
+                // inside its existing budget. Judging it unprovable here is the
+                // transient-as-permanent defect the ring classification names as
+                // the top regression risk, and it is the same treatment
+                // `bound_call_receipt_or_no_dispatch` just needed.
+                #[cfg(any(test, feature = "test-fixtures"))]
+                if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=intent_without_terminal_receipt")); }
+                return Ok(None);
+            }
+            // The node is retired: the call was admitted but its owner was
+            // cancelled before a terminal receipt could land. Retirement is
+            // the terminal fact for this dispatch, so the node does not wait
+            // forever on a receipt that can no longer be produced. The planned
+            // loop below skips the receiptless call for the same reason.
             #[cfg(any(test, feature = "test-fixtures"))]
-            if trace_leaf { crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=physical_missing reason=intent_without_terminal_receipt")); }
-            return Ok(None);
+            if trace_leaf { crate::execution_core::graph::k05_trace_emit("r622_toolbatch phase=physical_retired reason=intent_without_terminal_receipt".to_string()); }
         }
         if let Some(fact) = no_dispatch {
             fact.validate_identity(&fact.ticket)
@@ -14392,15 +14401,23 @@ impl ExecutionCommitService {
                     "sha256:{:x}",
                     Sha256::digest(request.input.as_bytes())
                 ));
-                if !no_dispatch.is_some_and(|fact| {
-                    fact.calls.iter().any(|call| {
-                        call.effect_key.as_deref() == Some(request.idempotency_key.as_str())
-                    })
-                }) && !calls.values().any(|(name, input, key, _, _)| {
-                    *name == request.tool_name
-                        && *input == expected
-                        && key == &request.idempotency_key
-                }) && !refused.contains(request.idempotency_key.as_str()) {
+                // Retirement is the terminal fact for every dispatch the node
+                // admitted. A bound call with no receipt and no no-dispatch
+                // fact is still in flight only while the node is live; once
+                // retired, the owner can no longer produce a receipt and the
+                // wait below would hold the turn open forever. The planned
+                // branch already skips receiptless calls on a retired node;
+                // this is the same rule for the bound shape.
+                if !retired
+                    && !no_dispatch.is_some_and(|fact| {
+                        fact.calls.iter().any(|call| {
+                            call.effect_key.as_deref() == Some(request.idempotency_key.as_str())
+                        })
+                    }) && !calls.values().any(|(name, input, key, _, _)| {
+                        *name == request.tool_name
+                            && *input == expected
+                            && key == &request.idempotency_key
+                    }) && !refused.contains(request.idempotency_key.as_str()) {
                     // The bound call has no terminal receipt and no no-dispatch
                     // fact yet. That is the owner still working, not a
                     // contradiction: with no receipt event in the index stream
@@ -14526,10 +14543,14 @@ impl ExecutionCommitService {
                     // receipt is not skipped either: its receipt is a fact
                     // about the planned call, and the identity check below
                     // is what holds it.
-                    if effect_keys.contains_key(id)
-                        && !calls.contains_key(id)
-                        && admitted.may_skip(id)
+                    if !calls.contains_key(id)
+                        && (effect_keys.get(id).is_none() || admitted.may_skip(id))
                     {
+                        // A planned call without a durable effect identity has
+                        // no effect stream that could hold an admission or a
+                        // receipt, so there is nothing to close. A call with a
+                        // key stays held unless its owner never admitted it.
+                        // An existing receipt is still identity-checked below.
                         continue;
                     }
                     let Some((name, actual, _, origin, certified)) = calls.get(id) else {
@@ -18213,6 +18234,125 @@ mod physical_closure_ring_tests {
         );
     }
 
+    /// A retired node does not wait forever on the receipt of a call it had
+    /// already admitted. Retirement is the terminal fact for that dispatch.
+    ///
+    /// The negative side is the test above: the identical shape on a live
+    /// node still stays open, so retirement is what releases the wait.
+    #[test]
+    fn a_retired_intent_without_a_terminal_receipt_is_settled_by_retirement() {
+        let (events, commits, graph, spec, binding) =
+            root_batch("ring retired original intent");
+        let key = "ring-retired-original-intent";
+        let stream = format!(
+            "execution-agent-receipts:{}:{}:{}",
+            graph.id, spec.id, binding.attempt
+        );
+        append_index_event(
+            &events,
+            &stream,
+            key,
+            "execution.agent_tool.intent",
+            format!("agent-tool-intent:{key}"),
+        );
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                true,
+                None,
+                &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_some(),
+            "a retired node is not held open by a receipt that can no longer land"
+        );
+        assert!(unprovable.is_none(), "{unprovable:?}");
+    }
+
+    /// The bound shape of the same rule: a live bound call without a receipt
+    /// keeps the node open, and retirement is what releases it. One invariant,
+    /// two outcomes.
+    #[test]
+    fn a_retired_bound_call_without_a_receipt_is_settled_by_retirement() {
+        let events = Arc::new(RuntimeEventStore::for_test());
+        let commits = ExecutionCommitService::new(events.clone());
+        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
+            &crate::tool_dispatch::ToolRequest {
+                tool_use_id: "retired-bound-call".into(),
+                tool_name: "read_file".into(),
+                input: "{}".into(),
+                depends_on: vec![],
+            },
+        );
+        let parent = harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: "retired-bound-parent".into(),
+            node_id: "agent".into(),
+        };
+        request.parent_execution = Some(parent.clone());
+        request.parent_execution_attempt = Some(1);
+        request.session_id = Some("retired-bound-session".into());
+        let payload =
+            crate::execution_core::graph::executors::agent_tool::encode_bound_agent_tool(
+                "agent", "run", request,
+            )
+            .expect("bound payload");
+        let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let mut graph = ExecutionGraph::new("ring retired bound call");
+        graph.id = format!("agent-tool-batch:{digest}");
+        graph.parent_execution = Some(parent);
+        let mut spec = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch", payload);
+        spec.id = format!("agent-tool:{digest}");
+        graph.nodes.push(spec.clone());
+        let binding = ExecutionNodeBinding {
+            executor_kind: "tool_batch".into(),
+            ticket_idempotency_key: spec.idempotency_key.clone(),
+            attempt: 1,
+            resource_lease_refs: vec![],
+            scope_lease_ref: None,
+            worktree_lease_ref: None,
+        };
+        let mut unprovable = None;
+        let live = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                false,
+                None,
+                &mut unprovable,
+            )
+            .expect("live leaf sources");
+        assert!(
+            live.is_none(),
+            "a live bound call without a receipt stays open"
+        );
+        assert!(unprovable.is_none(), "{unprovable:?}");
+
+        let mut unprovable = None;
+        let retired = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph,
+                &spec.id,
+                &binding,
+                &spec,
+                true,
+                None,
+                &mut unprovable,
+            )
+            .expect("retired leaf sources");
+        assert!(
+            retired.is_some(),
+            "retirement is the terminal fact for the bound dispatch"
+        );
+        assert!(unprovable.is_none(), "{unprovable:?}");
+    }
+
     /// An indexed terminal receipt without its effect receipt is a missing
     /// member: the closure names it and never closes the node.
     #[test]
@@ -18780,6 +18920,89 @@ mod physical_closure_ring_tests {
         assert!(
             unprovable.is_none(),
             "a skipped call names no ring: {unprovable:?}"
+        );
+    }
+
+    /// A planned call without a durable effect identity cannot have an effect
+    /// stream at all. It is the same absence as a call the owner never
+    /// admitted: there is nothing to close, so a live node is not held open
+    /// by it.
+    #[test]
+    fn a_bindless_planned_call_has_no_effect_to_close() {
+        let (_events, commits, graph, spec, binding) =
+            never_dispatched_batch("ring bindless", vec![planned_call("bindless")]);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(
+            sources.is_some(),
+            "a call with no effect identity does not hold the node open"
+        );
+        assert!(unprovable.is_none(), "{unprovable:?}");
+    }
+
+    /// Negative side of the same rule: skipping the bindless call must not
+    /// hide the bound call that really was admitted and is still missing its
+    /// receipt. The ring names only the admitted call.
+    #[test]
+    fn a_bindless_skip_does_not_hide_an_admitted_bound_call() {
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("ring-bindless-mixed", workspace.path());
+        let session = "ring-session";
+        let bound = ring_call(
+            &host,
+            session,
+            "ring-bound",
+            "read_file",
+            &json!({"path": "bound.txt"}),
+            "{\"path\":\"bound.txt\"}",
+        );
+        let effect = bound
+            .request
+            .compiled_invocation
+            .as_ref()
+            .unwrap()
+            .effect
+            .clone();
+        let payload = ring_payload(session, std::slice::from_ref(&&bound));
+        let mut value =
+            crate::step_snapshot::decode_persisted_tool_batch_value(&payload).unwrap();
+        value["calls"]
+            .as_array_mut()
+            .expect("planned calls")
+            .push(planned_call("ring-bindless"));
+        let payload = crate::step_snapshot::encode_persisted_tool_batch(&value).unwrap();
+        let (events, commits, graph, spec, binding) =
+            ring_batch("ring bindless mixed", &payload);
+        let mut bound = bound;
+        bound.request.parent_execution =
+            Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: graph.id.clone(),
+                node_id: spec.id.clone(),
+            });
+        bound.request.parent_execution_attempt = Some(binding.attempt);
+        append_read_intent(&events, &bound.request, &effect);
+        let mut unprovable = None;
+        let sources = commits
+            .lease_recovery_leaf_sources_with_fact(
+                &graph, &spec.id, &binding, &spec, false, None, &mut unprovable,
+            )
+            .expect("leaf sources");
+        assert!(sources.is_none(), "the admitted call still holds the node");
+        let reason = unprovable
+            .as_ref()
+            .map(|ring| ring.1.clone())
+            .unwrap_or_default();
+        assert!(
+            reason.contains("ring-bound"),
+            "the admitted call is named: {reason}"
+        );
+        assert!(
+            !reason.contains("ring-bindless"),
+            "the bindless call names no ring: {reason}"
         );
     }
 

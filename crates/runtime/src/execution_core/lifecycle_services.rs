@@ -3370,7 +3370,8 @@ impl RuntimeServices {
                     .node_attempts
                     .get(&node.id)
                     .copied()
-                    .unwrap_or(1),
+                    .unwrap_or(1)
+                    .max(1),
                 idempotency_key: node.idempotency_key.clone(),
                 payload_ref: node.payload_ref.clone(),
             };
@@ -4032,7 +4033,9 @@ mod readiness_tests {
             return;
         }
         let (_root, services) = fixture();
-        let before = persist_ready_synthesize(&services);
+        // R4-034-fixture-fix: seed recovery from the original unbound-owner fixture.
+        let before =
+            persist_original_owner_ready_synthesize(&services, "unbound-recovery-session").await;
         let backend = ReadinessBackend::new();
         let queries = Arc::new(Mutex::new(Vec::new()));
         let mut foreign = ticket_for(&before, 1);
@@ -4071,6 +4074,35 @@ mod readiness_tests {
             .await
             .unwrap();
         assert_original_graph_completed(&services, &before, &backend).await;
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn zero_recorded_attempt_does_not_unbind_a_ready_graph() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
+        let (_root, services) = fixture();
+        let healthy =
+            persist_original_owner_ready_synthesize(&services, "zero-attempt-session").await;
+        assert_eq!(
+            healthy.recovery_cursor.node_attempts.get("answer"),
+            Some(&0),
+            "the durable cursor never started the successor, so its recorded attempt is zero"
+        );
+        let backend = ReadinessBackend::new();
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        bind(&services, ticket_for(&healthy, 1), &backend, &queries);
+        assert!(
+            services.graph_executors_are_bound(&healthy).unwrap(),
+            "attempt zero normalizes to the first attempt instead of unbinding the graph"
+        );
+        let unbound = persist_ready_synthesize(&services);
+        assert!(
+            !services.graph_executors_are_bound(&unbound).unwrap(),
+            "a graph with no exact synthesized binding still stays deferred"
+        );
         services.shutdown_execution().await;
         services.shutdown_maintenance().await;
     }
@@ -4430,7 +4462,9 @@ mod readiness_tests {
             return;
         }
         let (_root, services) = fixture();
-        let before = persist_ready_synthesize(&services);
+        // R4-034-fixture-fix: seed recovery from the original bound-owner fixture.
+        let before =
+            persist_original_owner_ready_synthesize(&services, "bound-recovery-session").await;
         let backend = ReadinessBackend::new();
         let queries = Arc::new(Mutex::new(Vec::new()));
         bind(&services, ticket_for(&before, 1), &backend, &queries);

@@ -1166,10 +1166,16 @@ pub(crate) fn build_tool_receipt_for_delivery(
             };
         }
     }
-    let (body, body_omitted) = if preserve_complete_read && tool_name == "read_file" && !is_error {
+    let (body, body_omitted) = if preserve_complete_read
+        && tool_name == "read_file"
+        && !is_error
+        && raw_tokens <= body_budget
+    {
         // A complete acquisition must not lose its middle to a second generic
         // receipt summary. The original request packing/capacity and wire proof
-        // still decide whether these actual bytes reach the model.
+        // still decide whether these actual bytes reach the model. A body that
+        // exceeds the granted receipt budget cannot be delivered whole, so it
+        // must stay explicitly incomplete instead of claiming false EOF.
         (output.to_string(), false)
     } else {
         let recover_ref = (durable_recovery && tool_name == "tool_orchestrate")
@@ -2399,6 +2405,39 @@ mod tests {
             assert!(!receipt.truncated);
             assert_eq!(receipt.omitted_tokens, 0);
         }
+    }
+
+    #[test]
+    fn complete_read_above_the_granted_budget_cannot_claim_a_complete_receipt() {
+        let reference = EvidenceRef::observed("tool", "oversized-complete");
+        let small = build_tool_receipt_for_delivery(
+            "read_file",
+            "alpha\nbeta\n",
+            false,
+            reference.clone(),
+            4_096,
+            true,
+            false,
+            Some(r#"{"path":"target.txt","complete":true}"#),
+        );
+        assert!(!small.truncated, "a body inside the grant stays complete");
+        assert_eq!(small.omitted_tokens, 0);
+        let oversized = "source row: exact retained native body\n".repeat(8_000);
+        let receipt = build_tool_receipt_for_delivery(
+            "read_file",
+            &oversized,
+            false,
+            reference,
+            256,
+            true,
+            false,
+            Some(r#"{"path":"target.txt","complete":true}"#),
+        );
+        assert!(
+            receipt.truncated,
+            "complete=true is an acquisition request, not proof that the granted receipt delivered EOF"
+        );
+        assert!(receipt.omitted_tokens > 0);
     }
 
     #[test]

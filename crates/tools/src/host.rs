@@ -2289,7 +2289,11 @@ mod tests {
         assert_eq!(child.effect().tool_id, "grep_search");
         assert_eq!(child.input_sha256().len(), 64);
         assert_eq!(child.output_sha256().len(), 64);
-        assert!(children.reads.unwrap().is_empty());
+        // R4-034-fixture-fix: correct the read-trace oracle for a zero-hit content member.
+        // The zero-hit content-mode member contributes no certifiable body window, so the
+        // private read trace is poisoned and only the search trace survives. Provenance:
+        // commit 4a02fa5e and the sibling oracle at crates/tools/src/host.rs:2119-2126.
+        assert!(children.reads.is_none(), "content-mode zero hit cannot certify read candidates");
         let zoned = json!({"steps":[{"id":"zones","op":"batch","calls":[
             {"tool":"grep_search","input":{"path":"docs","pattern":"alpha"}},
             {"tool":"grep_search","input":{"path":"crates/example","pattern":"alpha"}}
@@ -2335,7 +2339,8 @@ mod tests {
         let mixed_auth = authorization(&lease.describe_effect("tool_orchestrate", &mixed), None);
         let (_, mixed_children) = lease.execute_with_orchestrated_read_trace(&mixed_auth, &mixed).unwrap();
         assert!(mixed_children.searches.is_none(), "mixed child kinds cannot claim complete search-only coverage");
-        assert_eq!(mixed_children.reads.unwrap().len(), 1, "original read trace remains available");
+        // R4-034-fixture-fix: a zero-hit content member poisons the mixed read trace too.
+        assert!(mixed_children.reads.is_none(), "zero-hit content member poisons the mixed read trace");
         let mut partial = input.clone();
         partial["steps"][0]["calls"].as_array_mut().unwrap().push(json!({"tool":"grep_search","input":{"path":"missing","pattern":"alpha"},"as":"missing"}));
         let auth = authorization(&lease.describe_effect("tool_orchestrate", &partial), None);
@@ -3238,7 +3243,12 @@ mod tests {
             let program =
                 json!({"steps":[{"id":"discover","op":"call","tool":tool,"input":dynamic}]});
             let dynamic_effect = lease.describe_effect("tool_orchestrate", &program);
-            for effect in [&static_effect, &dynamic_effect] {
+            // R4-034-fixture-fix: split static/dynamic target oracles; a literal call defaults to ".".
+            // A literal call normalizes its missing path to the workspace root; a `$prior.*`
+            // reference keeps the whole-workspace envelope with no literal target. Provenance:
+            // crates/tools/src/execution/executor.rs:1233-1237 and this test's own demand
+            // assertion below, which expects the literal scope key ".".
+            for (effect, expected_target) in [(&static_effect, Some(".")), (&dynamic_effect, None)] {
                 let files = effect
                     .scopes
                     .iter()
@@ -3246,7 +3256,8 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(files.len(), 1);
                 assert_eq!(files[0].operation, PermissionOperation::Read);
-                assert_eq!(files[0].target, None);
+                // R4-034-fixture-fix: compare each effect with its own expected target.
+                assert_eq!(files[0].target.as_deref(), expected_target);
                 assert!(!effect.uses_network && !effect.spawns_process);
                 assert!(effect
                     .scopes

@@ -200,7 +200,10 @@ mod r1_root_scope_v2_original_owner {
             "objective":"Read input.txt completely and write output.txt",
             "criteria":[{"id":"checked","statement":"read and write","status":"open"}],
             "phase":"execution", "spec_revision":1, "spec_digest":"scope-v2-spec",
-            "scope":"internal", "completion":"open", "revision":1, "user_sequence":1
+            // R4-034-fixture-fix: bind the fixture Goal to its original graph/session/turn owner.
+            "scope":"internal", "completion":"open", "revision":1, "user_sequence":1,
+            "execution_binding":{"objective_id":harness_contract::agent_action::root_objective_id(&session_id, turn_id),"session_id":session_id,
+                "turn_id":turn_id,"root_execution_id":graph.id,"agentic_program_id":"scope-v2-program"}
         })).unwrap();
         services.goal_store().create(goal).unwrap();
         let mut turn_state = r1_branch_state(&session_id, "scope-v2-goal");
@@ -558,13 +561,7 @@ async fn delegated_leaf_does_not_double_acquire_the_single_tool_slot() {
         .build().unwrap();
     let session = Session::new().with_workspace_root(workspace.path());
     let session_id = session.session_id.clone();
-    let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
-        "id":"single-slot-goal", "session_id":session_id, "objective":"read current file",
-        "criteria":[{"id":"read","statement":"read current file","status":"open"}],
-        "phase":"execution", "spec_revision":1, "spec_digest":"single-slot-spec",
-        "scope":"internal", "completion":"open", "revision":1, "user_sequence":1
-    })).unwrap();
-    services.goal_store().create(goal).unwrap();
+    // R4-034-fixture-fix: Goal creation moves below graph registration to bind the original execution id.
     let store = Arc::new(crate::test_support::session_store());
     store.create_session(&session::SessionRecord {
         session_id: session_id.clone(), platform: "test".into(), chat_id: "single-slot".into(),
@@ -587,6 +584,18 @@ async fn delegated_leaf_does_not_double_acquire_the_single_tool_slot() {
         session_id: session_id.clone(), turn_id: "single-slot".into(), root_task_id: "single-slot-task".into(),
         task_id: "single-slot-task".into(), generation: 1,
     });
+    // R4-034-fixture-fix: move Goal creation below graph registration so it can bind the graph id.
+    let objective = harness_contract::agent_action::root_objective_id(&session_id, "single-slot");
+    let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
+        "id":"single-slot-goal", "session_id":session_id, "objective":"read current file",
+        "criteria":[{"id":"read","statement":"read current file","status":"open"}],
+        "phase":"execution", "spec_revision":1, "spec_digest":"single-slot-spec",
+        "scope":"internal", "completion":"open", "revision":1, "user_sequence":1,
+        "execution_binding":{"objective_id":objective,"session_id":session_id,
+            "turn_id":"single-slot","root_execution_id":graph.id,
+            "agentic_program_id":"single-slot-program"}
+    })).unwrap();
+    services.goal_store().create(goal).unwrap();
     let policy = PermissionPolicy::new(crate::PermissionMode::DangerFullAccess);
     let revision = policy.execution_policy_control().snapshot().revision;
     let bus = crate::CowdEventBus::new();

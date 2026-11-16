@@ -675,6 +675,9 @@ impl TurnCancellationControl {
         }
     }
 
+    // Keep the captured operational-cancel site at the real caller instead of
+    // this helper, so a turn cancellation always names its originating scope.
+    #[track_caller]
     pub fn signal_operational(&self) {
         #[cfg(feature = "test-fixtures")]
         {
