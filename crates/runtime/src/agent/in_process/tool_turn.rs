@@ -909,8 +909,18 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
         if tool_name == "checkpoint" {
             let input = self.internal_checkpoint_input(input.clone()).ok()?;
-            let lease = self.host.pin_step_catalog()?;
-            return Some(lease.describe_effect(tool_name, &input));
+            if let Some(lease) = self.host.pin_step_catalog() {
+                return Some(lease.describe_effect(tool_name, &input));
+            }
+            if let Some(descriptor) = self
+                .host
+                .delegated_tool_effect_descriptor(tool_name, &input)
+            {
+                return Some(descriptor);
+            }
+            let builtin =
+                tools::ToolHost::builtin("runtime-checkpoint", &self.workspace_root).pin_snapshot();
+            return Some(builtin.describe_effect(tool_name, &input));
         }
         if tool_name == "tool_search" {
             let lease = self.host.pin_step_catalog()?;

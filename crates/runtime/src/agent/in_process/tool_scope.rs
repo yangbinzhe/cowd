@@ -819,23 +819,96 @@ impl ScopedRuntimeToolExecutor {
         &self,
         input: &str,
         authorization: harness_contract::tool::ToolExecutionAuthorization,
-        _binding: Option<&crate::step_snapshot::StepCallBinding>,
+        binding: Option<&crate::step_snapshot::StepCallBinding>,
     ) -> Result<String, ToolError> {
         let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
             ToolError::new(format!("invalid Runtime checkpoint input: {error}"))
         })?;
         let input = self.internal_checkpoint_input(input)?;
+        let descriptor = self
+            .registered_tool_effect("checkpoint", &input)
+            .ok_or_else(|| ToolError::new("Runtime ToolHost has no checkpoint_create capability"))?;
+        if descriptor.tool_id != "checkpoint" {
+            return Err(ToolError::new(
+                "Runtime ToolHost has no checkpoint_create capability",
+            ));
+        }
+        let parent = harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: self.execution_id.clone(),
+            node_id: self.node_id.clone(),
+        };
+        let request = RuntimeToolExecutionRequest {
+            compiled_invocation: binding
+                .map(|binding| {
+                    binding.prepare_invocation(self.host.pin_step_catalog(), "checkpoint", &input)
+                })
+                .transpose()
+                .map_err(|error| ToolError::new(error.to_string()))?,
+            step_binding: binding.cloned(),
+            governed_plan_id: self.execution_id.clone(),
+            governed_plan_revision: 1,
+            observation_wave_sequence: 0,
+            idempotency_key: binding
+                .map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+                .or_else(|| authorization.idempotency_key.clone())
+                .unwrap_or_else(|| format!("checkpoint:{}", authorization.request_id)),
+            tool_use_id: binding
+                .map(|binding| binding.origin.call_id.clone())
+                .unwrap_or_else(|| authorization.request_id.clone()),
+            tool_name: "checkpoint".to_string(),
+            input: serde_json::to_string(&input)
+                .map_err(|error| ToolError::new(format!("serialize checkpoint input: {error}")))?,
+            category: crate::ToolSafetyCategory::WriteLocal,
+            authorization: Some(authorization.clone()),
+            session_id: Some(self.session_id.clone()),
+            sandbox_posture: self.sandbox_posture,
+            policy_revision: self.policy_revision,
+            authorized_scopes: self.resource_scopes.clone().unwrap_or_default(),
+            memory_context: Some(self.memory_context.clone()),
+            reality_context: self.reality_context.clone(),
+            model_lease: Some(self.model_lease.clone()),
+            parent_execution: Some(parent.clone()),
+            parent_execution_attempt: Some(self.attempt),
+            execution_decision: None,
+            evaluation_isolated: self.evaluation_isolated(),
+            managed_invocation: self.managed_invocation.clone(),
+            tool_progress: crate::ToolProgressSink::default(),
+        };
+        if request.authorization.as_ref() != Some(&authorization)
+            || request.evaluation_isolated != self.evaluation_isolated()
+            || request.sandbox_posture != self.sandbox_posture
+            || request.policy_revision != self.policy_revision
+            || request.model_lease.as_deref() != Some(self.model_lease.as_str())
+            || request.parent_execution.as_ref() != Some(&parent)
+            || request.parent_execution_attempt != Some(self.attempt)
+            || request.tool_use_id.is_empty()
+            || request.idempotency_key.is_empty()
+        {
+            return Err(ToolError::new("checkpoint execution context changed"));
+        }
         if let Some(stop) = crate::bound_tool_batch::current_tool_stop() {
             stop.check()?;
             stop.effect_entered.store(true, Ordering::Release);
         }
-        let lease = self
-            .host
-            .pin_step_catalog()
-            .ok_or_else(|| ToolError::new("Runtime checkpoint catalog unavailable"))?;
-        lease
-            .execute(&authorization, "checkpoint", &input)
-            .map_err(|error| ToolError::new(error.to_string()))
+        let outcome = self.host.execute_runtime_tool(&request).await;
+        match outcome.status {
+            RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
+            RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "checkpoint blocked by policy".into()),
+            )),
+            RuntimeToolExecutionStatus::Failed => Err(ToolError::new(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "checkpoint creation failed".into()),
+            )),
+            RuntimeToolExecutionStatus::Unknown => Err(ToolError::unknown(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "checkpoint outcome unknown".into()),
+            )),
+        }
     }
 
     pub(super) async fn execute_delegated_runtime_tool(
@@ -1136,7 +1209,7 @@ impl ScopedRuntimeToolExecutor {
             },
         ) {
             return Err(ToolError::new(format!(
-                "tool `{tool_name}` is outside the Agent focus/resource lease (network/File operation resource lease)"
+                "tool `{tool_name}` is outside the Agent network/File operation resource lease; outside the Agent focus/resource lease"
             )));
         }
         Ok(())
