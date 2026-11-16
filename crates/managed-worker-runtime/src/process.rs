@@ -697,11 +697,13 @@ impl ManagedWorkerHandle {
     pub async fn shutdown(&self) -> ManagedWorkerResult<WorkerExit> {
         if let Some(exit) = self.try_wait().await? {
             self.finish_cleanup().await;
+            self.terminate_remaining_process_group().await?;
             return Ok(exit);
         }
         if let Err(signal_error) = signal_process_group(self.pid(), "TERM").await {
             if let Some(exit) = self.try_wait().await? {
                 self.finish_cleanup().await;
+                self.terminate_remaining_process_group().await?;
                 return Ok(exit);
             }
             return Err(signal_error);
@@ -713,20 +715,50 @@ impl ManagedWorkerHandle {
             )
             .await;
         match wait {
-            Ok(exit) => Ok(exit),
+            Ok(exit) => {
+                self.terminate_remaining_process_group().await?;
+                Ok(exit)
+            }
             Err(ManagedWorkerError::DeadlineExceeded(_)) => {
                 if let Err(signal_error) = signal_process_group(self.pid(), "KILL").await {
                     if let Some(exit) = self.try_wait().await? {
                         self.finish_cleanup().await;
+                        self.terminate_remaining_process_group().await?;
                         return Ok(exit);
                     }
                     return Err(signal_error);
                 }
-                self.wait_for_exit(Duration::from_secs(1), &CancellationToken::default())
-                    .await
+                let exit = self
+                    .wait_for_exit(Duration::from_secs(1), &CancellationToken::default())
+                    .await?;
+                self.terminate_remaining_process_group().await?;
+                Ok(exit)
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn terminate_remaining_process_group(&self) -> ManagedWorkerResult<()> {
+        // The leader can exit on TERM while a TERM-resistant descendant keeps
+        // the process group alive. Waiting for the leader alone would report a
+        // successful shutdown and leak that descendant.
+        if crate::recovery::process_group_members(self.pid()) == 0 {
+            return Ok(());
+        }
+        if let Err(signal_error) = signal_process_group(self.pid(), "KILL").await {
+            if crate::recovery::process_group_members(self.pid()) == 0 {
+                return Ok(());
+            }
+            return Err(signal_error);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::recovery::process_group_members(self.pid()) > 0 {
+            if Instant::now() >= deadline {
+                return Err(ManagedWorkerError::DeadlineExceeded(Duration::from_secs(1)));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        Ok(())
     }
 
     async fn finish_cleanup(&self) {

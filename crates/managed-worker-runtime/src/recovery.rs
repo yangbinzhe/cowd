@@ -234,7 +234,7 @@ fn kill_group(pgid: u32) -> ManagedWorkerResult<()> {
     )))
 }
 
-fn process_group_members(pgid: u32) -> usize {
+pub(crate) fn process_group_members(pgid: u32) -> usize {
     process_group_pids(pgid).len()
 }
 
