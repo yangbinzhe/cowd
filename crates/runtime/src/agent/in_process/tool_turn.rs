@@ -908,13 +908,9 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
         if tool_name == "checkpoint" {
-            return self
-                .internal_checkpoint_input(input.clone())
-                .ok()
-                .and_then(|input| {
-                    self.host
-                        .delegated_tool_effect_descriptor(tool_name, &input)
-                });
+            let input = self.internal_checkpoint_input(input.clone()).ok()?;
+            let lease = self.host.pin_step_catalog()?;
+            return Some(lease.describe_effect(tool_name, &input));
         }
         if tool_name == "tool_search" {
             let lease = self.host.pin_step_catalog()?;

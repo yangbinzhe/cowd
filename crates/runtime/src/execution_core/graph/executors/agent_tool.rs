@@ -2369,8 +2369,15 @@ impl ScopedNodeBackend for AgentToolBatchBackend {
             .ok_or_else(|| refuse("Agent ToolBatch ToolHost unavailable".into()))?;
         let input = serde_json::from_str(&request.input)
             .map_err(|e| refuse(format!("invalid tool input: {e}")))?;
-        let descriptor = host
-            .delegated_tool_effect_descriptor(&request.tool_name, &input)
+        // The compiled invocation is the authoritative effect from the pinned
+        // Step/catalog. A host adapter may expose a thinner compatibility
+        // descriptor; execution and commit must use the same compiled effect
+        // or the original-call fence reports a false replan.
+        let descriptor = request
+            .compiled_invocation
+            .as_ref()
+            .map(|invocation| invocation.effect.clone())
+            .or_else(|| host.delegated_tool_effect_descriptor(&request.tool_name, &input))
             .ok_or_else(|| refuse("missing enforceable tool descriptor".into()))?;
         if !agent.allowed_tools.contains(&request.tool_name) {
             let reject = || {

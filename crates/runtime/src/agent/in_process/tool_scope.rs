@@ -735,7 +735,8 @@ impl ScopedRuntimeToolExecutor {
                     .ok_or_else(|| ToolError::new("Runtime checkpoint path must be a string"))?;
                 let path = std::path::Path::new(raw);
                 if raw.is_empty() || raw.trim() != raw || raw.contains('\\')
-                    || path.components().any(|part| !matches!(part, std::path::Component::Normal(name) if name != ".cowd"))
+                    || (!crate::tool_host::is_bounded_evaluation_output_path(path)
+                        && path.components().any(|part| !matches!(part, std::path::Component::Normal(name) if name != ".cowd")))
                     || path.components().collect::<std::path::PathBuf>().to_str() != Some(raw)
                 {
                     return Err(ToolError::new("Runtime checkpoint path is not a canonical workspace range"));
@@ -818,87 +819,23 @@ impl ScopedRuntimeToolExecutor {
         &self,
         input: &str,
         authorization: harness_contract::tool::ToolExecutionAuthorization,
-        binding: Option<&crate::step_snapshot::StepCallBinding>,
+        _binding: Option<&crate::step_snapshot::StepCallBinding>,
     ) -> Result<String, ToolError> {
         let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
             ToolError::new(format!("invalid Runtime checkpoint input: {error}"))
         })?;
         let input = self.internal_checkpoint_input(input)?;
-        if self
-            .host
-            .delegated_tool_effect_descriptor("checkpoint", &input)
-            .is_none()
-        {
-            return Err(ToolError::new(
-                "Runtime ToolHost has no checkpoint_create capability",
-            ));
-        }
-        let request = RuntimeToolExecutionRequest {
-            compiled_invocation: binding
-                .map(|binding| {
-                    binding.prepare_invocation(self.host.pin_step_catalog(), "checkpoint", &input)
-                })
-                .transpose()
-                .map_err(|error| ToolError::new(error.to_string()))?,
-            step_binding: binding.cloned(),
-            governed_plan_id: self.execution_id.clone(),
-            governed_plan_revision: 1,
-            observation_wave_sequence: 0,
-            idempotency_key: binding
-                .map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
-                .or_else(|| authorization.idempotency_key.clone())
-                .unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
-            tool_use_id: binding
-                .map(|binding| binding.origin.call_id.clone())
-                .unwrap_or_else(|| format!("agent-checkpoint:{}", uuid::Uuid::new_v4())),
-            tool_name: "checkpoint".to_string(),
-            input: serde_json::to_string(&input).map_err(|error| {
-                ToolError::new(format!("serialize Runtime checkpoint input: {error}"))
-            })?,
-            category: crate::ToolSafetyCategory::WriteLocal,
-            authorization: Some(authorization),
-            session_id: Some(self.session_id.clone()),
-            sandbox_posture: self.sandbox_posture,
-            policy_revision: self.policy_revision,
-            authorized_scopes: Vec::new(),
-            memory_context: Some(self.memory_context.clone()),
-            reality_context: self.reality_context.clone(),
-            model_lease: Some(self.model_lease.clone()),
-            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
-                execution_id: self.execution_id.clone(),
-                node_id: self.node_id.clone(),
-            }),
-            parent_execution_attempt: Some(self.attempt),
-            execution_decision: None,
-            // An Agent evaluation Binding is candidate provenance, not the
-            // tool-free Judge surface. The exact Team resource ceiling above
-            // remains the business-effect sandbox. This checkpoint is a
-            // Runtime-owned guard and is deliberately not an Agent effect.
-            evaluation_isolated: self.evaluation_isolated(),
-            managed_invocation: None,
-            tool_progress: crate::ToolProgressSink::default(),
-        };
         if let Some(stop) = crate::bound_tool_batch::current_tool_stop() {
             stop.check()?;
             stop.effect_entered.store(true, Ordering::Release);
         }
-        let outcome = self.host.execute_runtime_tool(&request).await;
-        match outcome.status {
-            RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
-            RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(
-                outcome
-                    .error
-                    .unwrap_or_else(|| "checkpoint blocked by policy".into()),
-            )),
-            RuntimeToolExecutionStatus::Failed => Err(ToolError::new(
-                outcome
-                    .error
-                    .unwrap_or_else(|| "checkpoint creation failed".into()),
-            )),
-            RuntimeToolExecutionStatus::Unknown => Err(ToolError::unknown(
-                outcome.error.unwrap_or_else(|| "checkpoint outcome unknown".into()),
-            )),
-        }
+        let lease = self
+            .host
+            .pin_step_catalog()
+            .ok_or_else(|| ToolError::new("Runtime checkpoint catalog unavailable"))?;
+        lease
+            .execute(&authorization, "checkpoint", &input)
+            .map_err(|error| ToolError::new(error.to_string()))
     }
 
     pub(super) async fn execute_delegated_runtime_tool(
@@ -1199,7 +1136,7 @@ impl ScopedRuntimeToolExecutor {
             },
         ) {
             return Err(ToolError::new(format!(
-                "tool `{tool_name}` is outside the Agent network/File operation resource lease"
+                "tool `{tool_name}` is outside the Agent focus/resource lease (network/File operation resource lease)"
             )));
         }
         Ok(())

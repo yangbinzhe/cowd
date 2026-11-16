@@ -1938,6 +1938,35 @@ pub(crate) fn whole_workspace_resource_lease(scopes: &[String], write: bool) -> 
     })
 }
 
+/// The isolated evaluation output scope is the one bounded `.cowd` subtree
+/// that may participate in a scoped write/checkpoint. Every other `.cowd`
+/// path remains control-plane data and is rejected by the callers below.
+pub(crate) fn is_bounded_evaluation_output_path(relative: &std::path::Path) -> bool {
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    if first != ".cowd" {
+        return false;
+    }
+    let Some(std::path::Component::Normal(second)) = components.next() else {
+        return false;
+    };
+    if second != "evaluation" {
+        return false;
+    }
+    let Some(std::path::Component::Normal(hash)) = components.next() else {
+        return false;
+    };
+    let hash = hash.to_str().unwrap_or_default();
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    components.all(|component| {
+        matches!(component, std::path::Component::Normal(part) if part != ".cowd")
+    })
+}
+
 pub(crate) fn effect_resource_evidence(
     descriptor: &harness_contract::tool::ToolEffectDescriptor,
 ) -> Vec<String> {

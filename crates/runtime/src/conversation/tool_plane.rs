@@ -123,9 +123,10 @@ fn checkpoint_paths_for_admission(
             if canonical.is_empty()
                 || canonical.trim() != canonical
                 || canonical.contains('\\')
-                || relative
-                    .components()
-                    .any(|c| !matches!(c, Component::Normal(part) if part != ".cowd"))
+                || (!crate::tool_host::is_bounded_evaluation_output_path(relative)
+                    && relative
+                        .components()
+                        .any(|c| !matches!(c, Component::Normal(part) if part != ".cowd")))
                 || relative
                     .components()
                     .collect::<std::path::PathBuf>()
@@ -3203,6 +3204,21 @@ where
 
         if !validation.requires_checkpoint {
             return;
+        }
+        // Evaluation output is already an isolated `.cowd/evaluation/<hash>`
+        // lease. A workspace checkpoint cannot add protection there, and the
+        // agent's scoped lease has no checkpoint authorization signature.
+        if let Ok(paths) = checkpoint_paths_for_admission(
+            admission_plan,
+            self.tool_executor.pin_step_catalog(),
+        ) {
+            if !paths.is_empty()
+                && paths.iter().all(|path| {
+                    crate::tool_host::is_bounded_evaluation_output_path(std::path::Path::new(path))
+                })
+            {
+                return;
+            }
         }
         if !self.tool_executor.has_tool("checkpoint") {
             validation.allowed = false;
