@@ -2262,8 +2262,39 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // R4-034-fixture-fix: the compute step needs the real hardened sandbox
+    // launcher binary. The workspace-relative default only exists when that
+    // binary was built into the workspace target, so resolve the built binary
+    // from the test target directory when the configured path is absent.
+    // This only supplies the launcher binary; no oracle or expectation moves.
+    fn resolve_sandbox_launcher_binary() {
+        let configured = std::env::var("COWD_SANDBOX_LAUNCHER_BINARY").unwrap_or_default();
+        if !configured.trim().is_empty() && std::path::Path::new(&configured).is_file() {
+            return;
+        }
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(debug_dir) = executable.parent().and_then(std::path::Path::parent) {
+                candidates.push(debug_dir.join("cowd"));
+            }
+        }
+        if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+            let manifest = std::path::PathBuf::from(manifest_dir);
+            if let Some(workspace) = manifest.parent().and_then(std::path::Path::parent) {
+                candidates.push(workspace.join("target").join("debug").join("cowd"));
+            }
+        }
+        for candidate in candidates {
+            if candidate.is_file() {
+                std::env::set_var("COWD_SANDBOX_LAUNCHER_BINARY", candidate);
+                return;
+            }
+        }
+    }
+
     #[test]
     fn orchestrated_search_trace_only_records_actual_success_under_parent_grant() {
+        resolve_sandbox_launcher_binary();
         let root = std::env::temp_dir().join(format!("cowd-child-search-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.rs"), "pub mod alpha;\n").unwrap();
