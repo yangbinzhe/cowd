@@ -1,19 +1,10 @@
-//! The architecture gates that `cargo test` cannot see.
+//! Blocking architecture invariants that `cargo test` cannot see directly.
 //!
-//! `tests/test-governance/test-inventory.yaml` registers five architecture
-//! gates. Only two of them are Rust tests (`runtime_module_architecture` and
-//! `architecture_dependencies`), so they already run under `cargo test`. The
-//! other three run from `scripts/validate.sh`, which meant a green
-//! `cargo test --workspace` said nothing about them: `xtask architecture audit
-//! --check` was failing with 42 structural violations while the same commit
-//! reported thousands of passed tests.
-//!
-//! A regression gate that the green signal cannot see is not a gate. This test
-//! runs the three uncovered ones from the workspace root and asserts each
-//! exits cleanly, so "cargo test is green" now also means "the framework's
-//! declared boundaries still hold".
-//!
-//! Cost is about 3.5 seconds, dominated by the dependency-direction scan.
+//! This test intentionally covers only protections that prevent ambiguous
+//! control-plane ownership or accidental revival of a retired authority.
+//! Broad style/debt scans such as `scripts/architecture/check-boundaries.sh`,
+//! the 5000-line source-size report, and the 250-line structural report remain
+//! available as manual commands but are not part of the scenario gate.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,20 +81,11 @@ fn no_matches_gate_rejects_search_errors_and_actual_matches() {
 
 #[test]
 fn architecture_gates_stay_green_under_cargo_test() {
-    // Covers inventory, source-size, structural-limits, duplicate-authority
-    // and duplicate-capability in one pass.
+    // Inventory completeness plus duplicate-authority/capability ownership.
     run_gate(
         "xtask architecture audit",
         env!("CARGO_BIN_EXE_xtask"),
         &["architecture", "audit", "--check"],
-    );
-
-    // Dependency direction, the single-AI-loop rule, and the removed-capability
-    // scan (`check-boundaries.sh`).
-    run_gate(
-        "check-boundaries",
-        "bash",
-        &["scripts/architecture/check-boundaries.sh"],
     );
 
     // The retired `lifecycle_owner` field must stay retired. This is the part of

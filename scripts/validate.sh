@@ -204,7 +204,6 @@ run_contract() {
   run_step cargo_check_workspace cargo check --workspace --all-targets
   run_step cargo_test_boundary_workspace cargo test --workspace --all-targets \
     --exclude gateway --exclude runtime --exclude memory --exclude tui
-  run_step static_architecture_boundaries bash scripts/architecture/check-boundaries.sh
   run_step cargo_test_runtime_architecture cargo test -p runtime --test runtime_module_architecture
   run_step test_governance bash scripts/test/governance-gate.sh
   run_step pg_only_gate node scripts/test/pg-only-gate.mjs

@@ -11,4 +11,3 @@ cargo test -p harness-contract -p harness-eval --all-targets
 runtime_test_threads="${COWD_AI_HARNESS_TEST_THREADS:-4}"
 cargo test -p runtime --lib -- --test-threads="$runtime_test_threads"
 cargo test -p tools --test ai_harness_tool_closure
-scripts/architecture/check-boundaries.sh

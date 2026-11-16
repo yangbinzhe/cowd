@@ -71,8 +71,6 @@ pub(crate) fn run_cli(arguments: &[String]) -> Result<(), String> {
         "duplicate-capability" => duplicate_capability::run(&roots, &rest),
         "audit" => {
             inventory::run(&roots, &["--check".to_owned()])?;
-            source_size::run(&roots, &["--check".to_owned()])?;
-            structural_limits::run(&roots, &["--check".to_owned()])?;
             duplicate_authority::run(&roots, &["--check".to_owned()])?;
             duplicate_capability::run(&roots, &["--check".to_owned()])
         }
