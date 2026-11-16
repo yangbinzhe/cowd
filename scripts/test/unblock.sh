@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Recover only locally verifiable preflight conditions; report unsafe cases.
 set -euo pipefail
+
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-source "$repo/scripts/test/build-env.sh"
 gate="${1:?gate required}"
 shift
+
 case "$gate" in
   private-root)
     path="${1:?root required}"
@@ -45,6 +46,55 @@ if directory.is_relative_to(root):
 print(directory / f'selection-{time.time_ns()}-{os.getpid()}.json')
 PY
     ;;
-  disk) "$repo/scripts/test/reclaim.sh" "$@" ;;
-  *) printf 'unblock: unsupported gate %s; retained unchanged\n' "$gate" >&2; exit 2 ;;
+  disk)
+    pilot="${COWD_PILOT_ROOT:?COWD_PILOT_ROOT required}"
+    evidence="${COWD_EVIDENCE_ROOT:?COWD_EVIDENCE_ROOT required}"
+    mkdir -p -- "$evidence"
+    exec "$repo/scripts/test/reclaim.sh" "$pilot" "$evidence"
+    ;;
+  pg)
+    if (($# != 2)); then
+      echo 'unblock: pg requires owner report and closeout receipt' >&2
+      exit 2
+    fi
+    exec "$repo/scripts/test/pg-owned-run.py" --close-retained \
+      --report "$1" --closeout-receipt "$2"
+    ;;
+  tmpfs)
+    parent="${COWD_TEST_PRIVATE_PARENT:-/dev/shm}"
+    python3 - "$parent" <<'PY'
+import os, pathlib, stat, sys
+p = pathlib.Path(sys.argv[1])
+if not p.is_dir() or p.stat().st_uid != os.getuid():
+    raise SystemExit('private parent is not an owned directory')
+try:
+    os.chmod(p, 0o700, follow_symlinks=False)
+except OSError as error:
+    print(f'warning: cannot set private parent mode: {error}', file=sys.stderr)
+if stat.S_IMODE(p.stat().st_mode) not in (0o700, 0o500, 0o600):
+    raise SystemExit('private parent has unexpected mode')
+print(p)
+PY
+    ;;
+  lock)
+    path="${1:?lock path required}"
+    python3 - "$path" <<'PY'
+import fcntl, os, pathlib, stat, sys
+p = pathlib.Path(sys.argv[1])
+s = p.lstat()
+if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid():
+    raise SystemExit('lock is not an owned regular file')
+os.chmod(p, 0o600, follow_symlinks=False)
+with p.open('a+') as handle:
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit('lock is still active')
+    fcntl.flock(handle, fcntl.LOCK_UN)
+PY
+    ;;
+  *)
+    printf 'unblock: unsupported gate %s; retained unchanged\n' "$gate" >&2
+    exit 2
+    ;;
 esac
