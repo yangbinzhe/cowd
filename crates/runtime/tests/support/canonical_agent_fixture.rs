@@ -12,6 +12,7 @@ use runtime::{
     RuntimeExecutionHost, RuntimeServices, RuntimeToolExecutionOutcome,
     RuntimeToolExecutionRequest, RuntimeToolExecutionStatus,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -31,6 +32,7 @@ impl Drop for CanonicalProviderServer {
 struct CanonicalReadHost {
     resolver: runtime::path_identity::WorkspacePathIdentityResolver,
     tools: tools::ToolHost,
+    root: std::path::PathBuf,
 }
 
 #[async_trait]
@@ -65,22 +67,41 @@ impl RuntimeExecutionHost for CanonicalReadHost {
             .get("path")
             .and_then(serde_json::Value::as_str)
             .expect("read_file path");
+        // R4-034-fixture-fix: the fixture host must really read the requested
+        // file and return the self-describing complete-read payload the
+        // product's evidence contract requires. A request argument is never
+        // proof that the file content reached the caller.
+        let bytes = std::fs::read(self.root.join(path)).expect("canonical read_file body");
+        let content = String::from_utf8(bytes).expect("canonical read_file text");
+        let lines = content.lines().count();
+        let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let output = serde_json::json!({
+            "type": "text",
+            "truncated": false,
+            "file": {
+                "filePath": path,
+                "content": content,
+                "startLine": 1,
+                "numLines": lines,
+                "totalLines": lines,
+                "sha256": digest,
+            }
+        });
         let mut observed = self
             .resolver
-            .observe_tool_scope(
+            .observe_complete_read_tool_output(
                 "read_file",
-                &format!("read:{path}"),
-                Some(&"a".repeat(64)),
-                1,
+                &output,
+                request.observation_wave_sequence,
             )
-            .expect("canonical observed read receipt");
+            .expect("canonical complete read receipt");
         observed.evidence_ref = Some(harness_contract::context::EvidenceAccessRef::durable(
             harness_contract::context::EvidenceRef::observed(
                 "tool",
                 format!("canonical-read:{}", request.tool_use_id),
             ),
-            "a".repeat(64),
-            32,
+            digest.clone(),
+            u64::try_from(content.len()).unwrap_or(u64::MAX),
             "text/plain",
             format!("runtime-tool:{}", request.tool_use_id),
             format!(
@@ -93,7 +114,7 @@ impl RuntimeExecutionHost for CanonicalReadHost {
             tool_name: request.tool_name.clone(),
             status: RuntimeToolExecutionStatus::Executed,
             category: request.category,
-            output: Some("canonical source evidence".to_string()),
+            output: Some(output.to_string()),
             error: None,
             evidence_ref: format!("runtime-tool:{}", request.tool_use_id),
             observed_evidence: vec![observed],
@@ -164,6 +185,7 @@ pub async fn services_with_canonical_agent(
         resolver: runtime::path_identity::WorkspacePathIdentityResolver::discover(&workspace)
             .expect("workspace identity resolver"),
         tools: tools::ToolHost::builtin("canonical-agent-fixture", &workspace),
+        root: workspace.clone(),
     });
     let session_port = canonical_session_port::create_session_port(session_id).await;
     let services = RuntimeServices::builder(&root, &workspace)
