@@ -956,6 +956,7 @@ impl ExecutionGraphStateStore {
                                     | ExecutionNodeStatus::WaitingExternal
                                     | ExecutionNodeStatus::Paused
                                     | ExecutionNodeStatus::Ready
+                                    | ExecutionNodeStatus::Planned
                             )
                         ) && previous.recovery_cursor.node_attempts.get(node)
                             == Some(&binding.attempt)

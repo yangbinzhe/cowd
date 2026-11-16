@@ -3651,7 +3651,28 @@ where
                 .ok_or("original Synthesize Session owner unavailable")?;
             outcome.attach_original_terminal_owner(Arc::clone(&owner))?;
             let mut state = self.state.lock().await;
-            if state.authenticated_terminal_owner.is_some() { return Err("original terminal owner already exists".into()); }
+            if state.authenticated_terminal_owner.is_some() {
+                // Another receipt already owns the original Session terminal,
+                // so this node can never publish its own canonical fact. Land
+                // the retirement it still owes - using the existing
+                // `cancel_node` command and the durable-terminal guard - before
+                // the refusal, so original call custody becomes decidable
+                // instead of repeating unknown for the whole closure deadline.
+                drop(state);
+                for (sealed_node, custody) in crate::execution_core::graph::seal_superseded_override_nodes(
+                    self.services.as_ref(), &session, &turn, &ticket.graph_id,
+                ) {
+                    if custody.sealed() {
+                        tracing::warn!(
+                            target: "cowd::override_custody",
+                            graph_id = %ticket.graph_id,
+                            node_id = %sealed_node,
+                            "an override node that can never own the original terminal was retired"
+                        );
+                    }
+                }
+                return Err("original terminal owner already exists".into());
+            }
             state.authenticated_terminal_owner = Some(Arc::clone(&owner));
             outcome.original_synthesize_replan = Some(crate::execution_core::graph::OriginalSynthesizeReplanHandle(Arc::new(
                 OriginalSynthesizeRetry {

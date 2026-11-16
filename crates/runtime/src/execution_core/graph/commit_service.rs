@@ -10908,6 +10908,14 @@ impl ExecutionCommitService {
         Ok(true)
     }
 
+    /// Read-only handle to the durable event stream this service commits to.
+    /// The override custody seal uses it to measure execution silence; it adds
+    /// no state, no fence and no write path.
+    #[must_use]
+    pub(crate) fn event_store(&self) -> &Arc<RuntimeEventStore> {
+        &self.event_store
+    }
+
     pub(super) fn binding_callback_disposition(
         &self,
         graph: &ExecutionGraph,

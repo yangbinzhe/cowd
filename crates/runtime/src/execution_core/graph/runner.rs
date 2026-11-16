@@ -31,6 +31,10 @@ use super::resources::{
     WorktreeLease, WorktreeLeaseManager, WorktreeLeaseRequest, WorktreeOwnership,
 };
 use super::state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
+use super::override_custody::{
+    release_silent_override_custody, seal_override_custody_for_graph, unix_now_ms,
+    OverrideCustody, OVERRIDE_CUSTODY_SILENCE_RELEASE_MS,
+};
 use super::PHYSICAL_CLOSURE_BUDGET;
 
 // Keep this list aligned with the proof reader's explicitly retryable source
@@ -3059,6 +3063,57 @@ impl ExecutionGraphRunner {
         result
     }
 
+    /// Supply the missing canonical terminal fact for an override node at the
+    /// exact criterion that would otherwise report unknown custody.
+    ///
+    /// Two durable facts gate the seal, and neither is a fence relaxation: the
+    /// node id must belong to the known override family, and the committed Host
+    /// transcript must already carry this turn's terminal completion. Only then
+    /// can the node never publish its own committed attempt, which is precisely
+    /// the precondition for writing its retirement with the existing
+    /// `cancel_node` command. Anything else returns `None` and the original
+    /// fail-closed report stands.
+    async fn seal_pending_override_custody(
+        &self,
+        graph_id: &str,
+        ticket: &NodeExecutionTicket,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
+    ) -> Option<OverrideCustody> {
+        let terminalized = self
+            .commit_service
+            .committed_host_transcript(ticket)
+            .ok()
+            .and_then(|document| document.terminal_completion)
+            .is_some();
+        if !terminalized {
+            // 034-5(a) supplementary trigger surface: the silent type. A turn
+            // that halts before any terminal exists is invisible to a streak
+            // over custody receipts, because an interrupted reconciliation
+            // never reaches three. Silence is judged only on durable facts and
+            // only after the whole bound, so a legitimately slow turn keeps its
+            // terminal presentation untouched.
+            let released = release_silent_override_custody(
+                &self.state_store,
+                &self.commit_service,
+                self.commit_service.event_store(),
+                graph_id,
+                unix_now_ms(),
+                OVERRIDE_CUSTODY_SILENCE_RELEASE_MS,
+            );
+            return released
+                .into_iter()
+                .find(|(released_id, _)| *released_id == ticket.node_id)
+                .map(|(_, custody)| custody);
+        }
+        seal_override_custody_for_graph(
+            &self.state_store,
+            &self.commit_service,
+            graph,
+            &ticket.node_id,
+            "callback-pending-override-seal",
+        )
+    }
+
     async fn complete_callback_observed(
         &self, graph_id: &str, executor: &Arc<dyn NodeExecutor>, ticket: &NodeExecutionTicket,
         requested_abort: Option<&str>,
@@ -3145,8 +3200,36 @@ impl ExecutionGraphRunner {
                 let graph = tokio::time::timeout(remaining, self.state_store.load_async(graph_id)).await
                     .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback graph deadline expired"))?
                     .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback graph unavailable"))?;
-                let settled = self.commit_service.binding_callback_disposition(&graph, &ticket.node_id, &original.binding)
+                let mut settled = self.commit_service.binding_callback_disposition(&graph, &ticket.node_id, &original.binding)
                     .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback decision unavailable"))?;
+                if settled == CallbackDisposition::Pending {
+                    // An override node planned with a terminal intervention is
+                    // short-circuited by the override itself, so it can be
+                    // started and admitted and still never publish a committed
+                    // attempt. Once the turn is durably terminalized that fact
+                    // is unreachable, and the existing `cancel_node` retirement
+                    // is the canonical receipt it still owes. Pending after the
+                    // seal is still unknown custody: nothing is reinterpreted.
+                    let custody = self.seal_pending_override_custody(graph_id, ticket, &graph).await;
+                    if let Some(custody) = custody {
+                        tracing::warn!(
+                            target: "cowd::override_custody",
+                            graph_id,
+                            node_id = %ticket.node_id,
+                            outcome = ?custody,
+                            "the pending callback criterion ran the override custody seal"
+                        );
+                        if custody.sealed() {
+                            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                            let sealed = tokio::time::timeout(remaining, self.state_store.load_async(graph_id))
+                                .await
+                                .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback graph deadline expired"))?
+                                .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback graph unavailable"))?;
+                            settled = self.commit_service.binding_callback_disposition(&sealed, &ticket.node_id, &original.binding)
+                                .map_err(|_| unknown("callback has no canonical original outcome or retirement: original callback decision unavailable"))?;
+                        }
+                    }
+                }
                 if settled == CallbackDisposition::Pending {
                     return Err(unknown("callback has no canonical original outcome or retirement"));
                 }
@@ -8141,6 +8224,349 @@ mod nodispatch_duration_617_tests {
         second.await.unwrap().unwrap();
         assert_eq!(backend.callback_calls.load(Ordering::SeqCst), 1);
         assert!(!runner.active_binding_matches(&graph_id, &node_id, Some(&binding)).await);
+    }
+
+    /// Same scaffold as `original_prepared617`, but the node carries one of the
+    /// durable override node ids, so the seal is exercised on the exact id
+    /// family the production override sites plan.
+    async fn override_prepared(node_class: &str) -> (
+        tempfile::TempDir,
+        Arc<crate::RuntimeServices>,
+        ExecutionGraphRunner,
+        String,
+        ExecutionPreparedPumpNode,
+    ) {
+        use crate::execution_core::graph::override_custody::OVERRIDE_TERMINAL_NODE_SUFFIXES;
+        assert!(OVERRIDE_TERMINAL_NODE_SUFFIXES
+            .into_iter()
+            .chain(std::iter::once("model"))
+            .any(|known| known == node_class));
+        let workspace = tempfile::tempdir().unwrap();
+        let services = crate::RuntimeServices::in_memory().unwrap();
+        let backend = Arc::new(RefusedBackend617 {
+            owner: Arc::downgrade(services.tool_batch_executor()),
+            calls: AtomicUsize::new(0),
+            revalidation: std::sync::Mutex::new(None),
+            execution_pause: std::sync::Mutex::new(None),
+            callback_pause: std::sync::Mutex::new(None),
+            callback_calls: AtomicUsize::new(0),
+            stop_calls: AtomicUsize::new(0),
+        });
+        services
+            .tool_batch_executor()
+            .install_resolver(Arc::new(Resolver617(backend.clone())));
+        let runner = ExecutionGraphRunner::new(
+            services.executor_registry().clone(),
+            services.graph_state_store().clone(),
+            services.commit_service().clone(),
+            Arc::new(ExecutionResourceManager::new([])),
+            Arc::new(ScopeLockManager::persistent(workspace.path().join("scopes")).unwrap()),
+            Arc::new(WorktreeLeaseManager::open(workspace.path().join("leases.json")).unwrap()),
+            "duration-override",
+            workspace.path(),
+        );
+        let mut graph = ExecutionGraph::new("override custody seal");
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-override".into(),
+            turn_id: "turn-override".into(),
+            root_task_id: "task-override".into(),
+            task_id: "task-override".into(),
+            generation: 1,
+        });
+        let payload = crate::step_snapshot::encode_persisted_tool_batch(&serde_json::json!({
+            "session_id":"session-override", "step_snapshots":{},
+            "calls":[{"id":"override-617","name":"read_file","input":"{}","depends_on":[]}]
+        }))
+        .unwrap();
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            payload,
+        );
+        node.id = format!("{}:0:{}", graph.id, node_class);
+        node.idempotency_key = node.id.clone();
+        graph.nodes.push(node);
+        let registered = runner.register(graph).await.unwrap();
+        let snapshot = runner
+            .pump_snapshot(&registered.id, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.ready.len(), 1);
+        let mut prepared = runner
+            .prepare_ready_wave(&registered.id, snapshot.ready)
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 1);
+        (workspace, services, runner, registered.id, prepared.remove(0))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn override_custody_seal_lands_one_canonical_retirement_per_override_class() {
+        use crate::execution_core::graph::override_custody::seal_override_node_terminal;
+        for class in crate::execution_core::graph::override_custody::OVERRIDE_TERMINAL_NODE_SUFFIXES {
+            let (_workspace, services, runner, graph_id, prepared) = override_prepared(class).await;
+            let binding = prepared.binding.clone().unwrap();
+            let node = prepared.node.clone();
+            let node_id = node.id.clone();
+            let (executed, _outcome) = runner
+                .start_and_execute_node(&graph_id, prepared.node, Some(&binding))
+                .await
+                .unwrap();
+            assert_eq!(executed, node_id);
+            let store = services.graph_state_store();
+            let commits = services.commit_service();
+            let graph = store.load(&graph_id).unwrap();
+            // The defect itself: a started override binding with neither a
+            // committed attempt nor a retirement stays Pending forever, which is
+            // what the runner reports as unknown original call custody.
+            assert_eq!(
+                commits.binding_callback_disposition(&graph, &node_id, &binding).unwrap(),
+                CallbackDisposition::Pending,
+                "class {class} must start as the unresolved custody defect"
+            );
+            let revision = graph.revision;
+            let custody = seal_override_node_terminal(store, commits, &graph_id, &node, "override seal");
+            assert_eq!(custody, OverrideCustody::Sealed, "class {class} must seal");
+            let graph = store.load(&graph_id).unwrap();
+            assert_eq!(
+                graph.revision - revision,
+                1,
+                "class {class} retirement must append exactly one durable event"
+            );
+            assert!(store.binding_retirement_record(&graph, &node_id, &binding).unwrap().is_some());
+            // Acceptance 1: the disposition leaves Pending for a canonical fact.
+            assert_eq!(
+                commits.binding_callback_disposition(&graph, &node_id, &binding).unwrap(),
+                CallbackDisposition::Abort,
+                "class {class} custody must be decidable after the seal"
+            );
+            // A second seal may not rewrite or duplicate the fact.
+            let revision = graph.revision;
+            assert_eq!(
+                seal_override_node_terminal(store, commits, &graph_id, &node, "second seal"),
+                OverrideCustody::AlreadySettled
+            );
+            assert_eq!(store.load(&graph_id).unwrap().revision, revision, "class {class} re-seal must not advance the stream");
+        }
+    }
+
+    /// Acceptance negative: a node the graph only *planned* has no binding to
+    /// retire, so the seal refuses it and leaves the stream untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn override_custody_seal_refuses_a_planned_override_node() {
+        use crate::execution_core::graph::override_custody::seal_override_node_terminal;
+        let services = crate::RuntimeServices::in_memory().expect("services");
+        let mut graph = ExecutionGraph::new("planned override node");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let graph_id = graph.id.clone();
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::Synthesize,
+            "synthesize",
+            "{}",
+        );
+        node.id = format!("{graph_id}:0:policy-block-synthesize");
+        node.idempotency_key = node.id.clone();
+        graph.nodes.push(node.clone());
+        let registered = services
+            .commit_service()
+            .register_graph(graph)
+            .expect("register a planned override graph")
+            .graph;
+        let store = services.graph_state_store();
+        let loaded = store.load(&graph_id).expect("load the planned graph");
+        assert_eq!(loaded.revision, registered.revision);
+        let custody = seal_override_node_terminal(store, services.commit_service(), &graph_id, &node, "planned only");
+        assert!(
+            matches!(custody, OverrideCustody::RefusedNotStarted | OverrideCustody::RefusedNotRetirable),
+            "a planned override node that was never admitted and started can own no retirement: \
+             custody={custody:?} status={:?} attempt={:?}",
+            loaded.node_statuses.get(&node.id).copied(),
+            loaded.recovery_cursor.node_attempts.get(&node.id).copied(),
+        );
+        assert_eq!(
+            store.load(&graph_id).unwrap().revision,
+            loaded.revision,
+            "a refused seal must not touch the stream"
+        );
+    }
+
+    /// Acceptance negative: a node outside the override family is never even
+    /// addressed, so its own unknown-custody report stays exactly as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn override_custody_seal_refuses_non_override_nodes() {
+        let (_workspace, services, runner, graph_id, prepared) = override_prepared("model").await;
+        let binding = prepared.binding.clone().unwrap();
+        let store = services.graph_state_store();
+        let commits = services.commit_service();
+        let (node_id, _outcome) = runner
+            .start_and_execute_node(&graph_id, prepared.node, Some(&binding))
+            .await
+            .unwrap();
+        let graph = store.load(&graph_id).unwrap();
+        let revision = graph.revision;
+        assert_eq!(seal_override_custody_for_graph(store, commits, &graph, &node_id, "not an override node"), None);
+        assert_eq!(store.load(&graph_id).unwrap().revision, revision);
+        assert_eq!(
+            commits.binding_callback_disposition(&graph, &node_id, &binding).unwrap(),
+            CallbackDisposition::Pending,
+            "a non-override binding must keep the original fail-closed report"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn override_custody_seal_grants_nothing_to_a_foreign_or_forged_binding() {
+        use crate::execution_core::graph::override_custody::seal_override_node_terminal;
+        let (_workspace, services, runner, graph_id, prepared) =
+            override_prepared("provider-block-synthesize").await;
+        let binding = prepared.binding.clone().unwrap();
+        let node = prepared.node.clone();
+        let node_id = node.id.clone();
+        let store = services.graph_state_store();
+        let commits = services.commit_service();
+        let (executed, _outcome) = runner
+            .start_and_execute_node(&graph_id, prepared.node, Some(&binding))
+            .await
+            .unwrap();
+        assert_eq!(executed, node_id);
+        // The seal derives the canonical binding from the durable graph, so an
+        // older attempt can never borrow the fact it writes.
+        let mut stale = binding.clone();
+        stale.attempt += 1;
+        let mut foreign_key = binding.clone();
+        foreign_key.ticket_idempotency_key = "forged-idempotency-key".into();
+        let mut foreign_executor = binding.clone();
+        foreign_executor.executor_kind = "inline_model".into();
+        assert_eq!(
+            seal_override_node_terminal(store, commits, &graph_id, &node, "canonical seal"),
+            OverrideCustody::Sealed
+        );
+        let graph = store.load(&graph_id).unwrap();
+        assert!(store.binding_retirement_record(&graph, &node_id, &binding).unwrap().is_some());
+        for borrowed in [stale.clone(), foreign_key, foreign_executor] {
+            assert!(
+                !store.binding_retirement_record(&graph, &node_id, &borrowed).is_ok_and(|record| record.is_some()),
+                "a stale attempt or a changed binding identity must own no retirement"
+            );
+        }
+        // A forged retirement writer either is refused by the canonical stream
+        // outright, or is refused by the reader: it must never grant custody.
+        let forged = commits.event_store().append(crate::RuntimeEventInput {
+            stream_id: graph_id.clone(),
+            scope: crate::RuntimeEventScope::ExecutionGraph,
+            kind: "execution_graph.command_applied".into(),
+            status: Some("applied".into()),
+            actor: Some("forged-retirement-writer".into()),
+            refs: Vec::new(),
+            payload: serde_json::json!({
+                "event": "command_applied",
+                "command": "cancel_node",
+                "node_id": node_id,
+                "graph": graph,
+            }),
+        });
+        let granted = store
+            .load(&graph_id)
+            .ok()
+            .and_then(|graph| store.binding_retirement_record(&graph, &node_id, &stale).ok())
+            .is_some_and(|record| record.is_some());
+        assert!(
+            forged.is_err() || !granted,
+            "a non-canonical retirement source must not become a custody fact"
+        );
+        assert_ne!(
+            seal_override_node_terminal(store, commits, &graph_id, &node, "after forge"),
+            OverrideCustody::Sealed,
+            "the seal must not write a second fact onto a stream the reader rejects"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn override_custody_silence_releases_only_after_the_whole_bound() {
+        use crate::execution_core::graph::override_custody::{
+            graph_last_durable_ms, override_custody_silence,
+        };
+        let (_workspace, services, runner, graph_id, prepared) =
+            override_prepared("policy-block-synthesize").await;
+        let binding = prepared.binding.clone().unwrap();
+        let node = prepared.node.clone();
+        let node_id = node.id.clone();
+        let store = services.graph_state_store();
+        let commits = services.commit_service();
+        let events = commits.event_store();
+        let (_executed, _outcome) = runner
+            .start_and_execute_node(&graph_id, prepared.node, Some(&binding))
+            .await
+            .unwrap();
+        let graph = store.load(&graph_id).unwrap();
+        let head = graph_last_durable_ms(events, &graph_id, graph.revision).expect("durable head");
+        let unfinalized = override_custody_silence(store, commits, events, &graph_id, head + 60_000)
+            .expect("silence measurement");
+        assert_eq!(unfinalized.unfinalized_node_ids, vec![node_id.clone()]);
+        assert_eq!(unfinalized.idle_ms, 60_000);
+        assert!(!unfinalized.is_stall(OVERRIDE_CUSTODY_SILENCE_RELEASE_MS));
+        // One millisecond short of the bound releases nothing and rewrites nothing.
+        let revision = graph.revision;
+        assert!(release_silent_override_custody(
+            store, commits, events, &graph_id, head + OVERRIDE_CUSTODY_SILENCE_RELEASE_MS - 1,
+            OVERRIDE_CUSTODY_SILENCE_RELEASE_MS
+        )
+        .is_empty());
+        assert_eq!(store.load(&graph_id).unwrap().revision, revision);
+        // At the bound the silent custody stall is judged and released, which is
+        // the taxo certv3 case: an interrupted streak never reaches three.
+        let released = release_silent_override_custody(
+            store, commits, events, &graph_id, head + 3_816_000, OVERRIDE_CUSTODY_SILENCE_RELEASE_MS,
+        );
+        assert_eq!(
+            released,
+            vec![(node_id.clone(), OverrideCustody::Sealed)],
+            "a 63.6 minute silent stall with an unfinalized override binding must release"
+        );
+        let graph = store.load(&graph_id).unwrap();
+        assert!(store.binding_retirement_record(&graph, &node_id, &binding).unwrap().is_some());
+        assert_eq!(
+            commits.binding_callback_disposition(&graph, &node_id, &binding).unwrap(),
+            CallbackDisposition::Abort
+        );
+        // The bound is durable, not a counter: an unrelated admission cannot
+        // reset it, so a second pass has nothing left to do.
+        assert!(release_silent_override_custody(
+            store, commits, events, &graph_id, head + 3_816_000, OVERRIDE_CUSTODY_SILENCE_RELEASE_MS,
+        )
+        .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn override_custody_seal_is_parallel_safe_across_executions() {
+        use crate::execution_core::graph::override_custody::seal_override_node_terminal;
+        let mut tasks = tokio::task::JoinSet::new();
+        for class in crate::execution_core::graph::override_custody::OVERRIDE_TERMINAL_NODE_SUFFIXES {
+            tasks.spawn(async move {
+                let (_workspace, services, runner, graph_id, prepared) = override_prepared(class).await;
+                let binding = prepared.binding.clone().unwrap();
+                let node = prepared.node.clone();
+                let node_id = node.id.clone();
+                let _started = runner
+                    .start_and_execute_node(&graph_id, prepared.node, Some(&binding))
+                    .await
+                    .unwrap();
+                let custody = seal_override_node_terminal(
+                    services.graph_state_store(),
+                    services.commit_service(),
+                    &graph_id,
+                    &node,
+                    "parallel seal",
+                );
+                (class, node_id, custody)
+            });
+        }
+        let mut sealed = 0;
+        while let Some(joined) = tasks.join_next().await {
+            let (class, _node_id, custody) = joined.expect("a concurrent override seal must not disturb another");
+            assert_eq!(custody, OverrideCustody::Sealed, "class {class}");
+            sealed += 1;
+        }
+        assert_eq!(sealed, crate::execution_core::graph::override_custody::OVERRIDE_TERMINAL_NODE_SUFFIXES.len());
     }
 
     #[tokio::test]

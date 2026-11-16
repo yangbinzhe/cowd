@@ -1436,6 +1436,22 @@ where
             let state = self.state.lock().await;
             (state.session_id.clone(), state.turn_id.clone(), state.goal_id.clone(), state.execution_role.owns_root_presentation())
         };
+        // A previous attempt of this execution may have planned an override
+        // terminal node that the override short-circuited before it could
+        // publish anything. That node still owes one canonical retirement, so
+        // custody becomes decidable before this step asks the provider again.
+        for (sealed_node, custody) in crate::execution_core::graph::seal_superseded_override_nodes(
+            self.services.as_ref(), &session, &turn, &ticket.graph_id,
+        ) {
+            if custody.sealed() {
+                tracing::warn!(
+                    target: "cowd::override_custody",
+                    graph_id = %ticket.graph_id,
+                    node_id = %sealed_node,
+                    "sealed a superseded override node before running the model step"
+                );
+            }
+        }
         let program = is_root.then(|| super::root_agentic_program_projection(self.services.as_ref(), &session, &turn)).flatten();
         if let Some(verdict) = program.as_ref().and_then(|program| program.objective_verdict.as_ref())
             .filter(|verdict| verdict.kind == harness_contract::goal::ObjectiveTerminalKind::Blocked)
@@ -3293,6 +3309,7 @@ where
                                 crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
                                 "inline_model");
                             node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                            seal_override_node_terminal_at(self.services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Partial, "goal-write-gap-synthesize");
                             break 'final_answer vec![node];
                         }
                         let recover_write = write_recovery.is_some();
@@ -3509,6 +3526,7 @@ where
                                     "inline_model",
                                 );
                                 node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                seal_override_node_terminal_at(self.services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Partial, "focus-acceptance-block-synthesize");
                                 Some(vec![node])
                             }
                         } else {
@@ -3915,6 +3933,7 @@ where
                                     "inline_model",
                                 );
                                 node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                seal_override_node_terminal_at(self.services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Partial, "final-answer-block-synthesize");
                                 vec![node]
                             }
                         } else {
@@ -4511,6 +4530,7 @@ where
                                     "inline_model",
                                 );
                                 node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                seal_override_node_terminal_at(self.services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Satisfied, "agentic-protocol-receipt-synthesize");
                                 (node, None)
                             } else {
                                 if clean_terminal_synthesis {
@@ -4556,6 +4576,7 @@ where
                                 "inline_model",
                             );
                             node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                            seal_override_node_terminal_at(self.services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Partial, "provider-block-synthesize");
                             (node, None)
                         }
                         RuntimeInterventionKind::Switch => {
@@ -8039,6 +8060,49 @@ fn message_artifact_visibility(
         return format!("session:{}", packet.session_id());
     }
     format!("execution:{}", ticket.graph_id)
+}
+
+/// Land the canonical terminal fact for the override node planned with a
+/// `terminal_override` at this site.
+///
+/// The seal is gated by one durable fact: this execution already owns a Session
+/// terminal. A node that has never been admitted and started cannot own a
+/// retirement, and retiring a node that still owns the terminal presentation
+/// would destroy a legitimate answer - so on the normal path this is a no-op
+/// that leaves the graph stream byte-for-byte unchanged. It writes exactly when
+/// an earlier attempt left a started override node with neither a committed
+/// attempt nor a retirement, the state that keeps original call custody unknown
+/// forever.
+fn seal_override_node_terminal_at(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+    graph_id: &str,
+    node: &ExecutionNodeSpec,
+    completion: GoalCompletion,
+    reason: &str,
+) {
+    let Some(custody) = crate::execution_core::graph::seal_override_node_terminal_when_terminalized(
+        services, session_id, turn_id, graph_id, node, &format!("{completion:?}: {reason}"),
+    ) else {
+        return;
+    };
+    if let Some(refused) = match custody {
+        crate::execution_core::graph::OverrideCustody::Sealed
+        | crate::execution_core::graph::OverrideCustody::AlreadySettled => None,
+        crate::execution_core::graph::OverrideCustody::RefusedNotStarted
+        | crate::execution_core::graph::OverrideCustody::RefusedNotRetirable => None,
+        crate::execution_core::graph::OverrideCustody::Refused(text)
+        | crate::execution_core::graph::OverrideCustody::Unavailable(text) => Some(text),
+    } {
+        tracing::warn!(
+            target: "cowd::override_custody",
+            graph_id,
+            node_id = %node.id,
+            outcome = %refused,
+            "the override application site could not land a canonical terminal fact"
+        );
+    }
 }
 
 /// Builds the graph transition used when a verified Host-admitted Team has
@@ -11953,6 +12017,7 @@ where
                 node.executor_kind =
                     crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
                         .to_string();
+                seal_override_node_terminal_at(services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Satisfied, "orchestration-terminal-synthesize");
                 node
             } else {
                 let kind = intervention
@@ -11993,6 +12058,7 @@ where
                                 "inline_model",
                             );
                             node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                            seal_override_node_terminal_at(services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Satisfied, "focus-acceptance-synthesize");
                             node
                         } else {
                             state.force_text_only_next_model = true;
@@ -12006,14 +12072,16 @@ where
                             state.content.push_str(
                                 "\n\nRuntime evidence checkpoint: the required evidence is complete, but no valid terminal presentation is available. Tools are disabled for the next response. Give every required Team output field using native structured output, JSON, Markdown headings, or `Field: value` labels, and ground every claim in retained receipts. State risks or unresolved work explicitly when applicable.\n",
                             );
-                            dynamic_node(
+                            let mut node = dynamic_node(
                                 ticket,
                                 state.iterations,
                                 "policy-text-only-conclusion",
                                 ExecutionNodeKind::InlineModel,
                                 "inline_model",
                                 "inline_model",
-                            )
+                            );
+                            seal_override_node_terminal_at(services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Satisfied, "policy-text-only-conclusion");
+                            node
                         }
                     }
                     RuntimeInterventionKind::Block => {
@@ -12038,6 +12106,7 @@ where
                         node.executor_kind =
                             crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND
                                 .to_string();
+                        seal_override_node_terminal_at(services.as_ref(), &state.session_id, &state.turn_id, &ticket.graph_id, &node, GoalCompletion::Partial, "policy-block-synthesize");
                         node
                     }
                     _ => automatic_focus_verification_node.take().unwrap_or_else(|| {

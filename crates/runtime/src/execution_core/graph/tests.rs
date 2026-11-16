@@ -9178,6 +9178,93 @@ async fn r1_475_intent_only_command_crash_recovers_empty_binding_without_complet
 }
 
 #[tokio::test]
+async fn r4_034_planned_cancel_produces_canonical_retirement() {
+    let (events, running, ticket, _, _) =
+        running_inline_attempt_450("034 planned retirement").await;
+    let commits = ExecutionCommitService::new(events.clone());
+    let state = ExecutionGraphStateStore::new(events);
+    let binding = state
+        .current_binding(&running, "durable", ticket.attempt)
+        .unwrap();
+    let mut planned = running.clone();
+    planned
+        .node_statuses
+        .insert("durable".into(), ExecutionNodeStatus::Planned);
+    let planned = commits
+        .commit_recovery(&running, planned, Vec::new(), Vec::new())
+        .unwrap()
+        .graph;
+    assert_eq!(
+        planned.node_statuses["durable"],
+        ExecutionNodeStatus::Planned
+    );
+    let cancelled = commits
+        .apply_command(
+            &planned,
+            &ExecutionGraphCommand::CancelNode {
+                expected_revision: planned.revision,
+                node_id: "durable".into(),
+                reason: "planned node never entered".into(),
+            },
+        )
+        .unwrap()
+        .graph;
+    assert_eq!(
+        cancelled.node_statuses["durable"],
+        ExecutionNodeStatus::Cancelled
+    );
+    assert!(state
+        .binding_retirement_record(&cancelled, "durable", &binding)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        commits
+            .binding_callback_disposition(&cancelled, "durable", &binding)
+            .unwrap(),
+        super::commit_service::CallbackDisposition::Abort
+    );
+}
+
+#[tokio::test]
+async fn r4_034_planned_cancel_retirement_negatives_stay_refused() {
+    let (events, running, ticket, _, _) =
+        running_inline_attempt_450("034 planned retirement negatives").await;
+    let commits = ExecutionCommitService::new(events.clone());
+    let state = ExecutionGraphStateStore::new(events);
+    let binding = state
+        .current_binding(&running, "durable", ticket.attempt)
+        .unwrap();
+    assert!(state
+        .binding_retirement_record(&running, "durable", &binding)
+        .unwrap()
+        .is_none());
+    let failed = commits
+        .transition_node(
+            &running,
+            "durable",
+            ExecutionNodeStatus::Failed,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    assert!(state
+        .binding_retirement_record(&failed, "durable", &binding)
+        .unwrap()
+        .is_none());
+    let mut wrong_attempt = binding.clone();
+    wrong_attempt.attempt = wrong_attempt.attempt.saturating_add(1);
+    assert!(state
+        .binding_retirement_record(&running, "durable", &wrong_attempt)
+        .is_err());
+    let mut wrong_binding = binding.clone();
+    wrong_binding.ticket_idempotency_key.push_str(":foreign");
+    assert!(state
+        .binding_retirement_record(&running, "durable", &wrong_binding)
+        .is_err());
+}
+
+#[tokio::test]
 async fn r1_475_orphan_admission_same_inode_cas_retry_response_loss_polls_once() {
     use std::os::unix::fs::MetadataExt;
     let events = Arc::new(RuntimeEventStore::for_test());

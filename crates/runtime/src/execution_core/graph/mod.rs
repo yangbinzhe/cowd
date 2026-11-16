@@ -10,6 +10,10 @@ mod recovery;
 mod registry;
 mod runner;
 pub(crate) use runner::PumpCancellationOwner;
+mod override_custody;
+pub(crate) use override_custody::{
+    seal_override_node_terminal_when_terminalized, seal_superseded_override_nodes, OverrideCustody,
+};
 #[cfg(feature = "test-fixtures")]
 pub(crate) use runner::k05_completion_trace;
 #[cfg(any(test, feature = "test-fixtures"))]
