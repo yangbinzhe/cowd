@@ -955,7 +955,7 @@ impl LiveScenarioObserver {
 /// The allowlist is provider-, graph- and protocol-shaped on purpose: an unknown
 /// kind is not treated as progress, so a new housekeeping stream cannot silently
 /// re-arm the clock.
-fn is_execution_activity(kind: &str) -> bool {
+pub(crate) fn is_execution_activity(kind: &str) -> bool {
     matches!(
         kind,
         "model.item_completed"

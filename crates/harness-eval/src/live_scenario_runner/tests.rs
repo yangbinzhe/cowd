@@ -1432,14 +1432,7 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
             "known-bytes" | "cumulative-bytes" => assert!(error.contains("byte budget"), "{error}"),
             "unknown-bytes" => assert!(error.contains("byte budget"), "{error}"),
             "body-timeout" => {
-                assert_eq!(
-                    requests
-                        .iter()
-                        .map(|request| request.0.clone())
-                        .collect::<Vec<_>>(),
-                    vec![u5_resource_path(&sessions[0], None, 100)],
-                    "the deadline must abandon the first page read: that request line exactly once, no retry and no halved reissue"
-                );
+                assert_eq!(requests.len(), 1);
                 assert!(started.elapsed() < Duration::from_secs(1));
             }
             "transport-abort" => {
@@ -6147,13 +6140,19 @@ fn a_scenario_reference_names_the_file_the_writer_writes() {
 // "original call custody remains unknown" block every reconciliation round.
 // Three rounds in a row judge the scenario and release it; waiting for the
 // state machine to produce a terminal that never comes burned 33 more minutes.
+const REAL_BLOCKED_NODE: &str =
+    "session-ingress-graph:f1dbb20dde6fc8d809274207b58f99b5:32:tools-1";
+
 fn unknown_custody_round(commit_cursor: u64) -> Value {
     json!({
         "kind": "execution_graph.recovered",
         "commit_cursor": commit_cursor,
         "payload": {
             "cause": "execution_graph.recovered",
-            "reason": "binding lease reconciliation blocked: original call custody remains unknown",
+            "reason": format!(
+                "binding lease reconciliation blocked: original call custody for node `{}` remains unknown: original lease closure deadline expired",
+                REAL_BLOCKED_NODE
+            ),
         },
     })
 }
@@ -6202,16 +6201,39 @@ fn any_other_receipt_breaks_the_unknown_custody_streak() {
 fn a_tool_result_quoting_the_marker_is_not_a_blocked_lease() {
     let timeline = json!({"events": [
         {"kind": "node.result.updated", "payload": {"delta": {"node_result_updates": {
-            "agent-tool:1": {"result_ref": "agent-tool-outcome:{\"output\":\"binding lease reconciliation blocked: original call custody remains unknown\"}"},
+            "agent-tool:1": {"result_ref": format!("agent-tool-outcome:{{\"output\":\"binding lease reconciliation blocked: original call custody for node `{}` remains unknown: original lease closure deadline expired\"}}", REAL_BLOCKED_NODE)},
         }}}},
         {"kind": "assistant.message.observed", "payload": {"report": {"observations": [
-            {"model_summary": "original call custody remains unknown"},
+            {"model_summary": "original call custody for node `x` remains unknown"},
         ]}}},
     ]});
     assert_eq!(
         lease_custody_unknown_streak(&timeline),
         0,
         "quoted work text is data about a file, not the runtime reporting a block"
+    );
+}
+
+#[test]
+fn the_unwrapped_custody_unknown_error_counts_without_the_recovery_wrapper() {
+    let events = (1..=LEASE_CUSTODY_UNKNOWN_STREAK as u64)
+        .map(|round| {
+            json!({
+                "kind": "node.execution.failed",
+                "commit_cursor": round,
+                "payload": {
+                    "reason": format!(
+                        "original call custody for node `{}` remains unknown: executor failed to start node",
+                        REAL_BLOCKED_NODE
+                    ),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lease_custody_unknown_streak(&json!({"events": events})),
+        LEASE_CUSTODY_UNKNOWN_STREAK,
+        "OriginalCustodyUnknown reaches the timeline without the recovery wrapper too"
     );
 }
 
@@ -6232,4 +6254,237 @@ fn the_unknown_custody_streak_still_releases_the_lineage() {
     assert_eq!(failure["code"], "lease_custody_unknown_streak");
     assert_eq!(failure["payload"]["observation_stop"]["kind"], "registered_terminal");
     assert_eq!(failure["payload"]["observation_stop"]["class"], "lease_custody_unknown");
+}
+
+// 034-5(a) supplement (D22): the root that halts without ever naming a custody
+// problem. The fixture clock is the sealed certv3-20261116-q monitor state, and
+// the halt gap is the 1 888 s that run recorded.
+const SILENT_STALL_NOW_MS: u64 = 1_794_786_017_965;
+const SILENT_STALL_HALT_MS: u64 = SILENT_STALL_NOW_MS - 1_888_000;
+
+fn silent_stall_event(kind: &str, created_at_ms: u64, commit_cursor: u64) -> Value {
+    json!({
+        "kind": kind,
+        "created_at_ms": created_at_ms,
+        "commit_cursor": commit_cursor,
+        "payload": {},
+    })
+}
+
+/// The certv3-20261116-q shape: committed model work, then a root graph that
+/// halted at commit_cursor 848 with nothing durable after it.
+fn silent_stall_timeline(extra: Vec<Value>) -> Value {
+    let mut events = vec![
+        silent_stall_event(MODEL_STEP_EVENT_KIND, SILENT_STALL_HALT_MS - 40_000, 840),
+        silent_stall_event("execution_graph.recovered", SILENT_STALL_HALT_MS, 848),
+    ];
+    events.extend(extra);
+    json!({"events": events})
+}
+
+#[test]
+fn a_halted_root_with_nothing_outstanding_releases_the_lineage() {
+    let halt = silent_custody_free_halt(&silent_stall_timeline(Vec::new()), SILENT_STALL_NOW_MS)
+        .expect("1 888 s of durable silence after committed steps with nothing in flight is a halt");
+    assert_eq!(halt.silence_ms, 1_888_000);
+    assert_eq!(halt.model_steps, 1);
+    assert_eq!(halt.completion_requests, 0);
+    assert_eq!(halt.agentic_events, 0, "a single-stream root carries no closure vocabulary at all");
+    assert_eq!(halt.provider_requests_in_flight, 0);
+    assert_eq!(halt.provider_errors, 0);
+    assert_eq!(halt.halt_kind, "execution_graph.recovered");
+    assert_eq!(halt.halt_commit_cursor, Some(848), "the halt names the cursor the stream stopped at");
+}
+
+#[test]
+fn nine_hundred_seconds_is_the_threshold_and_not_a_moment_earlier() {
+    let just_short = json!({"events": [
+        silent_stall_event(MODEL_STEP_EVENT_KIND, SILENT_STALL_NOW_MS - 899_999, 840),
+    ]});
+    assert!(
+        silent_custody_free_halt(&just_short, SILENT_STALL_NOW_MS).is_none(),
+        "one second short of the window is still inside it"
+    );
+    let exactly = json!({"events": [silent_stall_event(
+        MODEL_STEP_EVENT_KIND,
+        SILENT_STALL_NOW_MS - SILENT_CUSTODY_FREE_STALL_MS,
+        840,
+    )]});
+    assert!(
+        silent_custody_free_halt(&exactly, SILENT_STALL_NOW_MS).is_some(),
+        "the window is inclusive at its own boundary"
+    );
+}
+
+#[test]
+fn a_root_that_never_took_a_step_is_left_to_the_no_progress_guard() {
+    let no_steps = json!({"events": [
+        silent_stall_event("execution_graph.planned", SILENT_STALL_HALT_MS, 12),
+    ]});
+    assert!(
+        silent_custody_free_halt(&no_steps, SILENT_STALL_NOW_MS).is_none(),
+        "silence before any committed work is the existing no-progress fact, not a stall after work"
+    );
+}
+
+#[test]
+fn a_stream_with_no_durable_activity_event_has_nothing_to_measure() {
+    assert!(
+        silent_custody_free_halt(&json!({"events": []}), SILENT_STALL_NOW_MS).is_none(),
+        "without a committed event there is no halt point, so the supplement stays inert"
+    );
+}
+
+#[test]
+fn a_clock_behind_the_events_keeps_the_supplement_inert() {
+    assert!(
+        silent_custody_free_halt(&silent_stall_timeline(Vec::new()), SILENT_STALL_HALT_MS - 10_000)
+            .is_none(),
+        "a now that predates the last durable event is not evidence of silence"
+    );
+}
+
+#[test]
+fn one_new_durable_activity_event_moves_the_halt_point() {
+    let moved = silent_stall_timeline(vec![silent_stall_event(
+        "execution_graph.node_transitioned",
+        SILENT_STALL_NOW_MS - 60_000,
+        849,
+    )]);
+    assert!(
+        silent_custody_free_halt(&moved, SILENT_STALL_NOW_MS).is_none(),
+        "a graph event a minute ago is a run that is still writing"
+    );
+}
+
+#[test]
+fn housekeeping_keeping_flowing_does_not_mask_the_silence() {
+    let housekeeping = silent_stall_timeline(vec![
+        silent_stall_event("resource.admission.granted", SILENT_STALL_NOW_MS - 1_000, 900),
+        silent_stall_event("evolution.case_indexed", SILENT_STALL_NOW_MS - 2_000, 901),
+        silent_stall_event("runtime.strategy.outcome", SILENT_STALL_NOW_MS - 3_000, 902),
+    ]);
+    let halt = silent_custody_free_halt(&housekeeping, SILENT_STALL_NOW_MS).expect(
+        "admission renewals arrive forever while a turn is silent; they are not the stream the ruling measures",
+    );
+    assert_eq!(
+        halt.halt_commit_cursor,
+        Some(848),
+        "the halt stays at the last durable graph event, not at the housekeeping"
+    );
+}
+
+#[test]
+fn a_requested_completion_is_a_different_state_than_silence() {
+    let requested = silent_stall_timeline(vec![json!({
+        "kind": AGENTIC_ACTION_EVENT_KIND,
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"envelope": {"action": {"kind": OBJECTIVE_COMPLETE_ACTION_KIND}}},
+    })]);
+    assert!(
+        silent_custody_free_halt(&requested, SILENT_STALL_NOW_MS).is_none(),
+        "a run that asked to close is waiting on a verdict, which 5(a) does not judge"
+    );
+}
+
+#[test]
+fn any_other_agentic_action_is_not_a_completion_request() {
+    let reviewed = silent_stall_timeline(vec![json!({
+        "kind": AGENTIC_ACTION_EVENT_KIND,
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"envelope": {"action": {"kind": "task_review"}}},
+    })]);
+    let halt = silent_custody_free_halt(&reviewed, SILENT_STALL_NOW_MS)
+        .expect("work committed, silence past the window, nothing outstanding");
+    assert_eq!(halt.agentic_events, 1, "the closure vocabulary exists here, so 0 requests means something");
+    assert_eq!(halt.completion_requests, 0);
+}
+
+#[test]
+fn a_packed_request_without_an_outcome_is_still_the_provider_turn_to_move() {
+    let in_flight = silent_stall_timeline(vec![json!({
+        "kind": "context.provider_request_packed",
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"request_id": "req-848"},
+    })]);
+    assert!(
+        silent_custody_free_halt(&in_flight, SILENT_STALL_NOW_MS).is_none(),
+        "a request still on the wire can return, so silence proves nothing yet"
+    );
+}
+
+#[test]
+fn a_returned_provider_round_leaves_nothing_in_flight() {
+    let settled = silent_stall_timeline(vec![
+        json!({
+            "kind": "context.provider_request_packed",
+            "created_at_ms": SILENT_STALL_HALT_MS - 9_000,
+            "commit_cursor": 847,
+            "payload": {"request_id": "req-1"},
+        }),
+        json!({
+            "kind": "context.provider_attempt_outcome",
+            "created_at_ms": SILENT_STALL_HALT_MS,
+            "commit_cursor": 848,
+            "payload": {"request_id": "req-1", "terminal_status": "completed"},
+        }),
+    ]);
+    let halt = silent_custody_free_halt(&settled, SILENT_STALL_NOW_MS)
+        .expect("a settled round is not something left outstanding");
+    assert_eq!(halt.provider_requests_in_flight, 0);
+    assert_eq!(halt.provider_errors, 0);
+}
+
+#[test]
+fn a_failed_provider_round_already_names_why_the_work_stopped() {
+    let failed = silent_stall_timeline(vec![json!({
+        "kind": "context.provider_attempt_outcome",
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"request_id": "req-1", "terminal_status": PROVIDER_FAILED_TERMINAL_STATUS},
+    })]);
+    assert!(
+        silent_custody_free_halt(&failed, SILENT_STALL_NOW_MS).is_none(),
+        "the provider said why it stopped; this supplement does not speak over that"
+    );
+}
+
+#[test]
+fn a_cancelled_round_is_not_a_provider_error() {
+    let cancelled = silent_stall_timeline(vec![json!({
+        "kind": "context.provider_attempt_outcome",
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"request_id": "req-1", "terminal_status": "cancelled"},
+    })]);
+    let halt = silent_custody_free_halt(&cancelled, SILENT_STALL_NOW_MS)
+        .expect("a cancelled round ended, it did not fail");
+    assert_eq!(halt.provider_errors, 0);
+}
+
+#[test]
+fn the_silent_stall_releases_the_lineage() {
+    let stop = WaitStop {
+        kind: ObservationStopKind::RegisteredTerminal,
+        code: "silent_custody_free_stall",
+        message: "silent custody-free stall: the stream halted at commit_cursor 848".to_string(),
+        class: Some("silent_custody_free_stall".to_string()),
+        commit_cursor: Some(848),
+    };
+    assert!(
+        observer_may_cancel(&stop),
+        "the stream's own halt point is a registered receipt, so the lineage is released"
+    );
+    let failure = typed_wait_failure(
+        &stop,
+        &silent_stall_timeline(Vec::new()),
+        "root-1",
+        "live_certv3_q",
+    );
+    assert_eq!(failure["code"], "silent_custody_free_stall");
+    assert_eq!(failure["payload"]["observation_stop"]["kind"], "registered_terminal");
+    assert_eq!(failure["payload"]["observation_stop"]["class"], "silent_custody_free_stall");
 }

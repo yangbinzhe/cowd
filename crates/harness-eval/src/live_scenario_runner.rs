@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    live_scenario_observer::{LiveScenarioObserver, MAX_DRAIN_PAGES_PER_PROBE},
+    live_scenario_observer::{is_execution_activity, LiveScenarioObserver, MAX_DRAIN_PAGES_PER_PROBE},
     session_actor::SessionActor,
     HarnessEvalRunnerOptions,
 };
@@ -5040,6 +5040,58 @@ impl LiveScenarioRunner {
                     commit_cursor: None,
                 });
             }
+            // 034-5(a) supplement (D22): the wedge that never says so. 5(a)
+            // counts reconciliation rounds whose durable text names unknown
+            // custody, and a silently halted root names nothing, so in
+            // certv3-20261116-q every custody marker stayed at 0 while the
+            // stream sat 1 888 s without a substantive event at 90 model steps
+            // and 0 completion requests. Work is durably committed, closure was
+            // never requested, the Provider has nothing in flight and reported
+            // no failure, and the stream is quiet: that halt point is the
+            // receipt, so fail the leg and release its lineage instead of
+            // burning the rest of the window. Supplementary condition of
+            // 034-5(a), not a new sealing gate; 035-3 still owns the absent
+            // terminal itself. A timeline read that fails never reaches here -
+            // `poll_timeline_deltas` propagates it as an inferred stop.
+            if finalized_non_success.is_none()
+                && root_terminal != RootExecutionTerminal::Completed
+            {
+                let halt = silent_custody_free_halt(&observer.timeline(), silent_stall_now_ms());
+                if let Some(halt) = halt {
+                    observer.mark_stalled();
+                    let silence_ms = halt.silence_ms;
+                    let threshold_ms = SILENT_CUSTODY_FREE_STALL_MS;
+                    let model_steps = halt.model_steps;
+                    let completion_requests = halt.completion_requests;
+                    let agentic_events = halt.agentic_events;
+                    let provider_requests_in_flight = halt.provider_requests_in_flight;
+                    let provider_errors = halt.provider_errors;
+                    let halt_kind = halt.halt_kind.as_str();
+                    let halt_commit_cursor = halt.halt_commit_cursor;
+                    let halt_cursor = halt_commit_cursor.map_or_else(
+                        || "unknown".to_string(),
+                        |cursor| cursor.to_string(),
+                    );
+                    let closure_vocabulary = if agentic_events == 0 {
+                        "absent, so 0 requests carries no signal"
+                    } else {
+                        "present"
+                    };
+                    let phase = observer.phase();
+                    let last_active_phase = observer.last_active_phase();
+                    let progress_observations = observer.progress_observations();
+                    let timeline_cursor = observer.timeline_cursor().unwrap_or("-");
+                    return Err(WaitStop {
+                        kind: ObservationStopKind::RegisteredTerminal,
+                        code: "silent_custody_free_stall",
+                        message: format!(
+                            "silent custody-free stall: no durable execution-graph or execution-activity event for {silence_ms}ms (threshold {threshold_ms}ms) after {model_steps} model steps, with {completion_requests} completion requests (closure vocabulary {closure_vocabulary}), {provider_requests_in_flight} provider requests in flight and {provider_errors} provider errors; the stream halted at kind={halt_kind} commit_cursor={halt_cursor} and no custody receipt was ever raised, so this turn cannot terminalize from here; failing the scenario and releasing its lineage instead of waiting out the observation window. phase={phase} last_active_phase={last_active_phase} progress_observations={progress_observations} timeline_cursor={timeline_cursor}",
+                        ),
+                        class: Some("silent_custody_free_stall".to_string()),
+                        commit_cursor: halt_commit_cursor,
+                    });
+                }
+            }
             let elapsed = started.elapsed();
             let elapsed_ms = elapsed.as_millis() as u64;
             let since_progress = Duration::from_millis(observer.since_last_progress_ms(elapsed_ms));
@@ -9252,13 +9304,21 @@ fn root_terminal_awaiting_review_reconstruction(
 const LEASE_CUSTODY_UNKNOWN_STREAK: usize = 3;
 
 /// The durable strings that say a binding lease cannot reach a terminal for the
-/// original call: the closure deadline passed, and every reconciliation round
-/// since says the custody is still unknown.
-const LEASE_CUSTODY_UNKNOWN_MARKERS: [&str; 3] = [
-    "original call custody remains unknown",
+/// original call. Both are read verbatim off the product: the recovery wrapper
+/// `ExecutionRecoveryError::LeaseReconciliation` ("binding lease reconciliation
+/// blocked: <inner>") and the deadline itself
+/// (`original lease closure deadline expired`).
+const LEASE_CUSTODY_UNKNOWN_MARKERS: [&str; 2] = [
     "binding lease reconciliation blocked",
     "original lease closure deadline expired",
 ];
+
+/// `NodeExecutorError::OriginalCustodyUnknown` renders as "original call custody
+/// for node `<node_id>` remains unknown: <reason>", so the node id sits between
+/// the two halves and neither the sentence nor either half alone is a substring
+/// test. Both halves together name the same wedge from the executor path.
+const ORIGINAL_CUSTODY_UNKNOWN_LEAD: &str = "original call custody";
+const ORIGINAL_CUSTODY_UNKNOWN_TAIL: &str = "remains unknown";
 
 /// Event fields that carry quoted work rather than what the runtime reported.
 /// A `read_file` of the source above puts those markers inside a tool result;
@@ -9273,12 +9333,15 @@ const UNKNOWN_CUSTODY_QUOTED_TEXT_FIELDS: [&str; 7] = [
     "answer",
 ];
 
+fn text_reports_unknown_custody(text: &str) -> bool {
+    LEASE_CUSTODY_UNKNOWN_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+        || (text.contains(ORIGINAL_CUSTODY_UNKNOWN_LEAD) && text.contains(ORIGINAL_CUSTODY_UNKNOWN_TAIL))
+}
+
 fn event_reports_unknown_custody(event: &Value) -> bool {
-    let reports = |text: &str| {
-        LEASE_CUSTODY_UNKNOWN_MARKERS
-            .iter()
-            .any(|marker| text.contains(marker))
-    };
+    let reports = text_reports_unknown_custody;
     event
         .as_object()
         .into_iter()
@@ -9309,6 +9372,208 @@ fn lease_custody_unknown_streak(timeline: &Value) -> usize {
         .map(event_reports_unknown_custody)
         .take_while(|reported| *reported)
         .count()
+}
+
+/// 034-5(a) supplement (D22): how long the durable stream may stay silent, with
+/// committed work behind it and nothing left outstanding, before the watch
+/// releases the lineage. 900 s is the ruling on the sealed certv3-20261116-q
+/// shape (root halted at revision 181 / commit_cursor 848, 1 888 s without a
+/// substantive event, 90 model steps, 0 completion requests, 0 provider rounds,
+/// no custody marker at all). It sits deliberately above the 600 s inactivity
+/// window, because this condition may only fire while nothing is in flight and
+/// nothing failed: a long Provider round is never mistaken for a halt.
+const SILENT_CUSTODY_FREE_STALL_MS: u64 = 900_000;
+
+/// The kinds this supplement reads, taken from the sealed monitor's own SQL so
+/// the harness and the monitor cannot disagree about what a step is.
+const MODEL_STEP_EVENT_KIND: &str = "model.item_completed";
+const AGENTIC_ACTION_EVENT_KIND: &str = "agentic.action_applied";
+const OBJECTIVE_COMPLETE_ACTION_KIND: &str = "objective_complete_request";
+const AGENTIC_EVENT_KIND_PREFIX: &str = "agentic.";
+const EXECUTION_GRAPH_EVENT_KIND_PREFIX: &str = "execution_graph.";
+
+/// `ProviderAttemptOutcomeEvidence::terminal_status` is one of `completed`,
+/// `consumer_dropped`, `cancelled`, or `failed`. Only the last is a Provider
+/// error; the other three name a round that ended for a reason this supplement
+/// has no business speaking over.
+const PROVIDER_FAILED_TERMINAL_STATUS: &str = "failed";
+
+/// One halt of the durable stream, with every count read to decide it. Nothing
+/// here is invented: each field is a durable event kind, a committed cursor, or
+/// a committed timestamp.
+struct SilentCustodyFreeHalt {
+    silence_ms: u64,
+    model_steps: usize,
+    completion_requests: usize,
+    agentic_events: usize,
+    provider_requests_in_flight: usize,
+    provider_errors: usize,
+    halt_kind: String,
+    halt_commit_cursor: Option<u64>,
+}
+
+/// The durable stream silence is measured on: every kind the observer already
+/// treats as execution activity, plus every `execution_graph.*` event.
+///
+/// The ruling named the root's execution-graph stream. Taking the union makes
+/// this set a superset of it, so the newest durable fact read here is never
+/// older than the newest graph event and the supplement cannot fire before the
+/// ruling's own condition. Runtime's housekeeping
+/// (`resource.admission.granted`, `evolution.*`, `runtime.strategy.outcome`)
+/// stays excluded for the reason recorded on `is_execution_activity`: it
+/// arrives forever while a turn is silent.
+fn silent_stall_durable_activity(kind: &str) -> bool {
+    is_execution_activity(kind) || kind.starts_with(EXECUTION_GRAPH_EVENT_KIND_PREFIX)
+}
+
+/// Wall-clock now, in the unit the durable events carry. A clock this process
+/// cannot read leaves the silence at zero, which keeps the supplement inert
+/// rather than failing a leg on a time it does not know.
+fn silent_stall_now_ms() -> u64 {
+    u64::try_from(crate::report_store::now_ms()).unwrap_or_default()
+}
+
+/// `model_steps`, read the way the sealed monitor reads it:
+/// `kind = 'model.item_completed'`.
+fn silent_stall_model_steps(timeline: &Value) -> usize {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| event.get("kind").and_then(Value::as_str) == Some(MODEL_STEP_EVENT_KIND))
+        .count()
+}
+
+/// Events that carry the closure vocabulary at all. 034-5(b): where no
+/// `agentic.*` event exists, a completion count of 0 is true by construction
+/// and says nothing, so the halt has to name which case the reader is in.
+fn silent_stall_agentic_events(timeline: &Value) -> usize {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with(AGENTIC_EVENT_KIND_PREFIX))
+        })
+        .count()
+}
+
+/// Completion requests, mirroring the monitor's
+/// `kind = 'agentic.action_applied'` whose
+/// `envelope.action.kind = 'objective_complete_request'`.
+fn silent_stall_completion_requests(timeline: &Value) -> usize {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            event.get("kind").and_then(Value::as_str) == Some(AGENTIC_ACTION_EVENT_KIND)
+                && event
+                    .pointer("/payload/envelope/action/kind")
+                    .and_then(Value::as_str)
+                    == Some(OBJECTIVE_COMPLETE_ACTION_KIND)
+        })
+        .count()
+}
+
+/// Provider requests packed onto the wire that never returned a terminal
+/// outcome. While one exists the run can still move on its own, so silence is
+/// not yet evidence that it halted.
+fn silent_stall_provider_requests_in_flight(timeline: &Value) -> usize {
+    let mut packed = BTreeMap::<&str, &Value>::new();
+    let mut outcomes = BTreeMap::<&str, &Value>::new();
+    collect_provider_attempt_events(timeline, &mut packed, &mut outcomes);
+    packed
+        .keys()
+        .filter(|request_id| !outcomes.contains_key(*request_id))
+        .count()
+}
+
+/// Outcomes the Provider itself reported as failed.
+fn silent_stall_provider_errors(timeline: &Value) -> usize {
+    let mut packed = BTreeMap::<&str, &Value>::new();
+    let mut outcomes = BTreeMap::<&str, &Value>::new();
+    collect_provider_attempt_events(timeline, &mut packed, &mut outcomes);
+    outcomes
+        .values()
+        .filter(|outcome| {
+            outcome
+                .get("terminal_status")
+                .and_then(Value::as_str)
+                == Some(PROVIDER_FAILED_TERMINAL_STATUS)
+        })
+        .count()
+}
+
+/// Decide the supplement from the durable stream alone.
+///
+/// The silence is measured on the events' own committed timestamps, not on the
+/// observer's liveness clock, because that clock cannot answer this question: it
+/// re-arms on any change in the message, root, or live reads, so a run whose
+/// durable work stopped while a projection kept moving never reaches any
+/// threshold. That is how certv3-20261116-q sat 1 888 s without a substantive
+/// event inside a wait whose inactivity window is at most 600 s.
+///
+/// `None` unless every conjunct of the ruling is a durable fact at once.
+fn silent_custody_free_halt(timeline: &Value, now_ms: u64) -> Option<SilentCustodyFreeHalt> {
+    let halt = timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(silent_stall_durable_activity)
+        })
+        .filter(|event| event.get("created_at_ms").and_then(Value::as_u64).is_some())
+        .max_by_key(|event| {
+            (
+                event
+                    .get("created_at_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                event
+                    .get("commit_cursor")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            )
+        })?;
+    let silence_ms =
+        now_ms.saturating_sub(halt.get("created_at_ms").and_then(Value::as_u64).unwrap_or_default());
+    if silence_ms < SILENT_CUSTODY_FREE_STALL_MS {
+        return None;
+    }
+    let model_steps = silent_stall_model_steps(timeline);
+    let completion_requests = silent_stall_completion_requests(timeline);
+    let agentic_events = silent_stall_agentic_events(timeline);
+    let provider_requests_in_flight = silent_stall_provider_requests_in_flight(timeline);
+    let provider_errors = silent_stall_provider_errors(timeline);
+    (model_steps > 0
+        && completion_requests == 0
+        && provider_requests_in_flight == 0
+        && provider_errors == 0)
+        .then(|| SilentCustodyFreeHalt {
+            silence_ms,
+            model_steps,
+            completion_requests,
+            agentic_events,
+            provider_requests_in_flight,
+            provider_errors,
+            halt_kind: halt
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            halt_commit_cursor: halt.get("commit_cursor").and_then(Value::as_u64),
+        })
 }
 
 /// The typed reason a wait stopped, with the root's durable outcome carried
