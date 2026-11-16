@@ -40,11 +40,11 @@ lanes:
     purpose: fail-closed terminal certification over independently observed evidence
 
 architecture_gates:
-  # Blocking under cargo test: inventory uniqueness and duplicate-control-plane
-  # ownership only. Size/structural/boundary-debt scans are manual diagnostics.
   - path: cargo xtask architecture audit --check
     protects:
       - Capability inventory remains complete and unique
+      - Oversized hand-written source is phase-owned and generated source has provenance
+      - Version-touched Rust code cannot hide mega functions, state carriers, or constructors
       - Duplicate authorities and semantic candidates are classified before release
   - path: tests/architecture/capability-authority-gate.sh
     protects:
@@ -52,7 +52,6 @@ architecture_gates:
       - External ports cannot claim Runtime authority
       - Worker, Projector, and Adapter roles cannot write canonical state
   - path: scripts/architecture/check-boundaries.sh
-    # Manual release diagnostic, not a scenario-gate precondition.
     protects:
       - Gateway has no second AI execution loop
       - Runtime, Tools, Provider, Surface, and Connector dependency direction
