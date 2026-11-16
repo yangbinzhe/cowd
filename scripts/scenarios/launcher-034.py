@@ -126,11 +126,14 @@ def space_guard(*paths):
                 print(f'warning: cannot inspect disk {path}: {error}', file=sys.stderr)
         return result
     if low():
-        reclaim = HERE.parents[0] / 'test' / 'reclaim.sh'
+        unblock = HERE.parents[0] / 'test' / 'unblock.sh'
+        env = dict(os.environ)
+        env.setdefault('COWD_PILOT_ROOT', os.environ.get('COWD_TEST_PRIVATE_PARENT', '/dev/shm'))
+        env.setdefault('COWD_EVIDENCE_ROOT', str(EVIDENCE))
         try:
-            subprocess.run(['bash', str(reclaim)], check=False)
+            subprocess.run(['bash', str(unblock), 'disk'], check=False, env=env)
         except OSError as error:
-            print(f'warning: reclaim unavailable: {error}', file=sys.stderr)
+            print(f'warning: disk unlock unavailable: {error}', file=sys.stderr)
         remaining = low()
         if remaining:
             print('warning: insufficient space after reclaim: ' + ', '.join(remaining), file=sys.stderr)
