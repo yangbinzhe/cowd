@@ -4511,7 +4511,8 @@ mod readiness_tests {
             return;
         }
         let (_root, services) = fixture();
-        let before = persist_ready_synthesize(&services);
+        let before =
+            persist_original_owner_ready_synthesize(&services, "bound-synthesize-session").await;
         let backend = ReadinessBackend::new();
         let queries = Arc::new(Mutex::new(Vec::new()));
         bind(&services, ticket_for(&before, 1), &backend, &queries);

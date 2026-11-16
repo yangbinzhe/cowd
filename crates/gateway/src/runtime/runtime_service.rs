@@ -4022,6 +4022,27 @@ impl RuntimeService {
                 execution_ids = ?cancelled_execution_ids,
                 "cancelled active Runtime execution(s) for session input"
             );
+            // A cancelled turn owns more than its root graph: a bound
+            // Agent ToolBatch and its review-team children are separate
+            // executions with their own lifecycles. Signalling the turn
+            // control alone leaves those children running, so the original
+            // turn keeps waiting for a callback that can no longer be
+            // produced. Walk the lineage once, root first, and retire every
+            // non-terminal graph in the same cancellation pass.
+            for execution_id in &cancelled_execution_ids {
+                if let Err(error) = self
+                    .runtime_services
+                    .cancel_execution_tree(execution_id, reason)
+                    .await
+                {
+                    tracing::warn!(
+                        session_id,
+                        execution_id,
+                        %error,
+                        "execution tree cancellation incomplete"
+                    );
+                }
+            }
         }
         Ok(receipt)
     }
