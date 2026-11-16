@@ -1848,6 +1848,7 @@ where
             turn_native_root_owners: std::sync::Mutex::new(BTreeMap::new()),
             native_wire_receipts: Arc::new(std::sync::Mutex::new(Vec::new())),
             turn_model_observations: std::sync::Mutex::new(Vec::new()),
+            turn_early_tool_receipts: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
                 initial_budget_plan.subsystem_budget_tokens,
                 initial_budget_plan.tool_result_budget.max_total_tokens as u64,

@@ -3093,6 +3093,7 @@ where
             ai_kernel_trace,
             context_turn_report,
             model_observations: self.turn_model_observations(),
+            early_tool_receipts: self.take_turn_early_tool_receipts(),
             duplicate_tool_calls,
             write_attempt_paths,
             max_tool_concurrency_observed,

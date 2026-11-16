@@ -5136,6 +5136,9 @@ pub struct TurnSummary {
     /// Invocation-level proof that an exact ToolResult survived packing and
     /// was consumed by a valid Provider continuation in this turn.
     pub model_observations: Vec<harness_contract::context::ProviderModelObservationAttestation>,
+    /// Read-only calls completed through the governed early lane. They are
+    /// real ToolHost receipts and remain evidence for the terminal projection.
+    pub(crate) early_tool_receipts: Vec<EarlyToolExecutionReceipt>,
     pub duplicate_tool_calls: u64,
     /// Canonical workspace paths targeted by write-capable tool calls during
     /// this turn, including calls rejected before execution. This is distinct
@@ -6401,6 +6404,8 @@ pub struct ConversationRuntime<C, T> {
     /// appears in a valid, committed Provider continuation.
     turn_model_observations:
         std::sync::Mutex<Vec<harness_contract::context::ProviderModelObservationAttestation>>,
+    /// Early read receipts accumulated across this turn's model steps.
+    turn_early_tool_receipts: std::sync::Mutex<Vec<EarlyToolExecutionReceipt>>,
     /// Per-turn component accounting and tool-result lease consumption.
     turn_context_ledger: std::sync::Mutex<crate::context_ledger::ContextLedger>,
     /// Latest context governance report emitted by a completed turn.

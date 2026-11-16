@@ -773,16 +773,42 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let observed_evidence = model_observed_evidence(
+        let mut observed_evidence = model_observed_evidence(
             &packet.required_acceptance,
             &summary.model_observations,
             &scoped_receipts,
         );
-        let evidence_refs = agent_evidence_refs(
+        for receipt in &summary.early_tool_receipts {
+            if receipt.outcome.status != crate::RuntimeToolExecutionStatus::Executed {
+                continue;
+            }
+            for observed in &receipt.outcome.observed_evidence {
+                if !observed_evidence.contains(observed) {
+                    observed_evidence.push(observed.clone());
+                }
+            }
+        }
+        let mut evidence_refs = agent_evidence_refs(
             &packet,
             &summary.context_turn_report.audit_projections,
             &scoped_receipts,
         );
+        for receipt in &summary.early_tool_receipts {
+            evidence_refs.extend(
+                receipt
+                    .outcome
+                    .observed_evidence
+                    .iter()
+                    .filter_map(|evidence| evidence.evidence_ref.clone()),
+            );
+        }
+        evidence_refs.sort_by(|left, right| {
+            left.evidence_ref
+                .ref_type
+                .cmp(&right.evidence_ref.ref_type)
+                .then_with(|| left.evidence_ref.id.cmp(&right.evidence_ref.id))
+        });
+        evidence_refs.dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
         let (acceptance, runtime_change_receipts) = derive_receipt_backed_satisfied_criteria(
             &packet,
             &summary.final_answer,

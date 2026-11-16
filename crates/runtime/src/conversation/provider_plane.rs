@@ -3212,6 +3212,7 @@ where
                         self.consume_active_runtime_inputs_for_next_step(
                             TurnInputCheckpoint::AfterProviderResponse,
                         );
+                        self.record_turn_early_tool_receipts(&early_tool_receipts);
                         return Ok(Some(ModelStepResult {
                             input_interpretation: None,
                             intent: ModelStepIntent::Replan {
@@ -3393,6 +3394,7 @@ where
                 self.consume_active_runtime_inputs_for_next_step(
                     TurnInputCheckpoint::AfterProviderResponse,
                 );
+                self.record_turn_early_tool_receipts(&early_tool_receipts);
                 return Ok(Some(ModelStepResult {
                     input_interpretation: None,
                     intent: ModelStepIntent::Replan {
@@ -3528,6 +3530,7 @@ where
             self.consume_active_runtime_inputs_for_next_step(
                 TurnInputCheckpoint::AfterProviderResponse,
             );
+            self.record_turn_early_tool_receipts(&early_tool_receipts);
             return Ok(Some(ModelStepResult {
                 input_interpretation: None,
                 intent,

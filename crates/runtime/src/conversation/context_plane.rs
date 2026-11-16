@@ -2087,6 +2087,36 @@ where
             .unwrap_or_default()
     }
 
+    pub(super) fn record_turn_early_tool_receipts(
+        &self,
+        receipts: &[crate::conversation::EarlyToolExecutionReceipt],
+    ) {
+        let mut guard = self
+            .turn_early_tool_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for receipt in receipts {
+            if receipt.outcome.status == crate::RuntimeToolExecutionStatus::Executed
+                && !guard
+                    .iter()
+                    .any(|existing| existing.call.id == receipt.call.id)
+            {
+                guard.push(receipt.clone());
+            }
+        }
+    }
+
+    pub(super) fn take_turn_early_tool_receipts(
+        &self,
+    ) -> Vec<crate::conversation::EarlyToolExecutionReceipt> {
+        std::mem::take(
+            &mut *self
+                .turn_early_tool_receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     pub(super) fn existing_evidence_access(
         &self,
         evidence_ref: &EvidenceRef,
