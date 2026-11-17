@@ -590,6 +590,19 @@ pub(crate) fn install_original_dispatch_session(
     input.set_active_turn(Some(harness_contract::turn::TurnId::from_string(
         turn_id,
     )));
+    // The owner must be the very control the Session published. A fresh
+    // `PermissionPolicy::new` owns a different Arc, and the supervisor's
+    // checked source then reports the policy owner as replaced.
+    let original_policy = services
+        .session_execution_policy_control(session_id)
+        .map_or_else(
+            || {
+                crate::permissions::PermissionPolicy::new(
+                    crate::permissions::PermissionMode::ReadOnly,
+                )
+            },
+            crate::permissions::PermissionPolicy::with_execution_policy_control,
+        );
     lease
         .install_session_fence(
             &ingress,
@@ -597,9 +610,7 @@ pub(crate) fn install_original_dispatch_session(
             control,
             input,
             Arc::new(crate::conversation::OriginalTurnInputControl::default()),
-            crate::permissions::PermissionPolicy::new(
-                crate::permissions::PermissionMode::ReadOnly,
-            ),
+            original_policy,
         )
         .expect("original dispatch Session owner");
     (execution_id, lease)

@@ -8504,7 +8504,6 @@ fn attach_completion_assessment(
                     "completion_assessment".into(),
                     json!({"status":"unknown","error":error.to_string()}),
                 );
-                value.remove("next_rungs");
             }
             observation.actionable = vec![format!("Completion assessment is unavailable: {error}. Inspect the original bound sources; no completion readiness is established.")];
         }
