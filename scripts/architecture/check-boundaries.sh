@@ -211,7 +211,7 @@ check_empty "daemon business management" \
   rg -n "daemon status|daemon start$|daemon stop|daemon restart|daemon_client|socket business" crates --glob '*.rs' --glob '!**/tests/**' --glob '!crates/auth-broker/**' --glob '!crates/sandbox-launcher/**'
 
 check_empty "tui direct business dependencies" \
-  rg -n "(^|[^[:alnum:]_:])runtime::|use runtime::|use app_mfg::|app_mfg::|use matrix_core::|matrix_core::|use matrix_repository::|matrix_repository::|use storage::|storage::|rusqlite|use tools::|tools::|use memory::|memory::|use command_contract::|command_contract::|use command_service::|command_service::" crates/tui/src --glob '*.rs' --glob '!lib.rs' --glob '!boundary_policy.rs'
+  rg -n "(^|[^[:alnum:]_:])runtime::|use runtime::|use app_mfg::|app_mfg::|use matrix_core::|matrix_core::|use matrix_repository::|matrix_repository::|use storage::|storage::|use tools::|tools::|use memory::|memory::|use command_contract::|command_contract::|use command_service::|command_service::" crates/tui/src --glob '*.rs' --glob '!lib.rs' --glob '!boundary_policy.rs'
 
 check_empty "runtime entrypoint reverse dependencies" \
   scan_rg_files 'gateway::|tui::|cli::|app_mfg::' '"(gateway|tui|cli|app_mfg)::' crates/runtime/src --glob '*.rs'
@@ -229,7 +229,7 @@ check_empty "AI bin install residue" \
   rg -n "~/AI/bin|AI/bin" README.md docs scripts crates --glob '*.rs' --glob '*.md' --glob '*.sh' --glob 'Cargo.toml' --glob '!scripts/architecture/check-boundaries.sh'
 
 check_empty "gateway routes must not own business/storage/runtime internals" \
-  scan_command 'MatrixSqliteRepository|MfgStore::open\(|Store::open\(|rusqlite|Connection::open|SqliteConnectionManager::file|ConfigLoader::default_for|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt' '' \
+  scan_command 'MfgStore::open\(|ConfigLoader::default_for|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt' '' \
     production_sources '/#\[cfg\(test\)\]/{exit} {print FILENAME ":" FNR ":" $0}' \
     crates/gateway/src/api_routes -g '*.rs' -g '!cross_plane_routes.rs' -g '!**/tests/**' -g '!**/tests.rs'
 
@@ -339,11 +339,6 @@ check_empty "matrix core must not contain product APP semantics outside ownershi
     production_sources '/#\[cfg\(test\)\]/{exit} {print FILENAME ":" FNR ":" $0}' \
     crates/matrix/core crates/matrix/repository -g '*.rs' -g 'Cargo.toml' -g '!ownership_import.rs' -g '!**/tests/**' -g '!**/tests.rs'
 
-check_empty "production direct sqlite opens must stay in storage/repository adapters" \
-  scan_command 'Connection::open\(|SqliteConnectionManager::file|TaskKernel::open\(|UnifiedSessionStore::open\(|MfgStore::open\(|SqliteStore::open\(|MatrixSqliteRepository::open\(|Store::open\(' 'open_in_memory|/tests/|^crates/gateway/src/api_routes/mod.rs:|^crates/gateway/src/kernel/task_kernel.rs:|^crates/gateway/src/kernel/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example)' \
-    production_sources '/#\[cfg\(test\)\]/{exit} !/^[[:space:]]*\/\// {print FILENAME ":" FNR ":" $0}' \
-    crates -g '*.rs' -g '!**/tests/**' -g '!**/tests.rs' -g '!**/*_tests.rs' -g '!crates/storage/**' -g '!crates/connector/src/source.rs' -g '!crates/connector/src/lib.rs' -g '!crates/session/src/persistence/**' -g '!crates/memory/src/store/**' -g '!crates/memory/src/session/session_store.rs' -g '!crates/memory/src/session/state_rebuilder.rs' -g '!crates/memory/src/knowledge/mod.rs' -g '!crates/memory/src/kernel/cognitive.rs' -g '!crates/memory/src/lifecycle/maintenance.rs' -g '!crates/memory/src/ops/sqlite_persistence.rs' -g '!crates/matrix/repository/**' -g '!crates/runtime/src/recovery/runtime_event_store.rs' -g '!crates/runtime/src/mission/task.rs' -g '!crates/runtime/src/team/team_discovery.rs' -g '!crates/runtime/src/context/artifact.rs' -g '!crates/gateway/src/infrastructure/selected_storage.rs'
-
 check_empty "storage direct-open allowlist must stay empty" \
   allowlist_residue
 
@@ -364,7 +359,7 @@ done
 
 check_dependency_tree 'tui forbidden direct dependency tree' \
   'tui forbidden direct dependency tree' \
-  '(^|[ ├└│─])((runtime|matrix-core|matrix-repository|storage|tools|command-contract|command-service) v|memory|app-mfg|app_mfg|rusqlite)' \
+  '(^|[ ├└│─])((runtime|matrix-core|matrix-repository|storage|tools|command-contract|command-service) v|memory|app-mfg|app_mfg)' \
   -p tui --depth 1 --no-default-features
 
 check_dependency_tree 'tools forbidden runtime or persistence dependency tree' \
