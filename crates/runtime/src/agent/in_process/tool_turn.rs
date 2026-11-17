@@ -419,21 +419,10 @@ pub(super) fn agent_autonomy_checkpoint(
     let mut actions = Vec::new();
     let mut requires_execution_tools = false;
     match (mode, task.status) {
-        (
-            "execute",
-            crate::AgenticTaskStatus::Published
-            | crate::AgenticTaskStatus::Rework
-            | crate::AgenticTaskStatus::Claimed,
-        ) if !already_declined
-            && ((matches!(
-                task.status,
-                crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Rework
-            ) && task.claimant.is_none()
-                && task.claim_execution_id.is_none())
-                || (task.status == crate::AgenticTaskStatus::Claimed
-                    && task.claimant.as_deref() == Some(agent_id)
-                    && task.claim_execution_id.as_deref() == Some(packet.graph_id())
-                    && task.claim_renewal_streak == 0)) =>
+        ("execute", crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Rework)
+            if task.claimant.is_none()
+                && task.claim_execution_id.is_none()
+                && !already_declined =>
         {
             actions.push(serde_json::json!({
                 "action": "decide_claim_or_decline",
@@ -686,6 +675,96 @@ impl ScopedRuntimeToolExecutor {
             .map(|descriptor| descriptor.canonical_id.clone())
             .collect();
         serde_json::to_string(&ranked).map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    #[cfg(test)]
+    fn test_compiled_step_binding(&self, call_id: &str) -> crate::step_snapshot::StepCallBinding {
+        let lease = tools::ToolHost::builtin("fixture-compiled-step", &self.workspace_root)
+            .pin_snapshot();
+        let definitions = lease
+            .snapshot()
+            .catalog
+            .definitions(Some(&self.allowed_tools))
+            .into_iter()
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect::<Vec<_>>();
+        let step = Arc::new(
+            crate::step_snapshot::BoundStep::bind(
+                serde_json::from_value(serde_json::json!({
+                    "step_id": format!("{}:fixture-step", self.node_id),
+                    "session_id": self.session_id,
+                    "turn_id": "fixture-turn",
+                    "execution_id": self.execution_id,
+                    "run_ref": self.execution_id,
+                    "actor_ref": "fixture-agent",
+                    "attempt": self.attempt,
+                    "build_ref": "compiled-fixture"
+                }))
+                .expect("fixture step identity"),
+                lease,
+                &definitions,
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                BTreeMap::new(),
+                chrono::Utc::now().timestamp_millis() + 60_000,
+            )
+            .expect("fixture BoundStep"),
+        );
+        crate::step_snapshot::StepCallBinding::provider(step, call_id)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn execute_test_compiled_scoped(
+        &self,
+        tool_name: &str,
+        input: &str,
+        call_id: &str,
+    ) -> Result<String, ToolError> {
+        let binding = self.test_compiled_step_binding(call_id);
+        self.execute_scoped_bound(tool_name, input, None, Some(call_id), Some(&binding))
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn execute_test_compiled_authorized_output(
+        &self,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+        call_id: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        if authorization.tool_id != tool_name {
+            return Err(ToolError::new(
+                "agent tool authorization does not match the allowed tool request",
+            ));
+        }
+        if !self.allowed_tools.contains(tool_name) {
+            return Err(ToolError::new(
+                "agent tool authorization does not match the allowed tool request",
+            ));
+        }
+        let normalized_input = normalize_delegated_resource_paths(
+            tool_name,
+            input,
+            &self.workspace_root,
+            &self.path_identity_resolver,
+            self.resource_scopes.as_deref(),
+        )?;
+        self.enforce_resource_ceiling(tool_name, &normalized_input)?;
+        let binding = self.test_compiled_step_binding(call_id);
+        self.execute_scoped_bound(
+            tool_name,
+            &normalized_input,
+            Some(authorization.clone()),
+            Some(call_id),
+            Some(&binding),
+        )
+        .await
+        .map(|output| delegated_tool_draft(output, None, tool_name))
     }
 }
 

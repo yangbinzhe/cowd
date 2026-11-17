@@ -4422,6 +4422,88 @@ fn concurrency_test_executor(
     }
 }
 
+async fn execute_path_edit(
+    executor: &ScopedRuntimeToolExecutor,
+    input: &str,
+    call_id: &str,
+) -> Result<String, crate::ToolError> {
+    let binding = path_edit_binding(executor, call_id);
+    executor
+        .execute_scoped_bound("fixture_edit", input, None, Some(call_id), Some(&binding))
+        .await
+}
+
+fn path_edit_binding(
+    executor: &ScopedRuntimeToolExecutor,
+    call_id: &str,
+) -> crate::step_snapshot::StepCallBinding {
+    let catalog = tools::ToolCatalog::builtin()
+        .extend_runtime_tools(vec![tools::RuntimeToolDefinition {
+            name: "fixture_edit".into(),
+            description: Some("fixture path-scoped write".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+            effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+                resolver_id: "runtime.action_edit".into(),
+                resolver_version: 3,
+            },
+        }])
+        .expect("fixture path-edit catalog");
+    let lease = tools::ToolHost::new(
+        "fixture-concurrency",
+        executor.workspace_root.clone(),
+        tools::ToolHostSnapshot::new(
+            Arc::new(catalog),
+            Arc::new(tools::lsp_client::LspRegistry::new()),
+            None,
+        ),
+    )
+    .pin_snapshot();
+    let allowed = BTreeSet::from(["fixture_edit".to_string()]);
+    let definitions = lease
+        .snapshot()
+        .catalog
+        .definitions(Some(&allowed))
+        .into_iter()
+        .map(|definition| crate::ProviderToolDefinition {
+            name: definition.name,
+            description: definition.description,
+            input_schema: definition.input_schema,
+        })
+        .collect::<Vec<_>>();
+    let step = Arc::new(
+        crate::step_snapshot::BoundStep::bind(
+            serde_json::from_value(serde_json::json!({
+                "step_id": format!("{}:fixture-path-edit", executor.node_id),
+                "session_id": executor.session_id,
+                "turn_id": "fixture-turn",
+                "execution_id": executor.execution_id,
+                "run_ref": executor.execution_id,
+                "actor_ref": "fixture-agent",
+                "attempt": executor.attempt,
+                "build_ref": "fixture-path-edit"
+            }))
+            .expect("fixture path-edit step identity"),
+            lease,
+            &definitions,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            BTreeMap::new(),
+            chrono::Utc::now().timestamp_millis() + 60_000,
+        )
+        .expect("fixture path-edit BoundStep"),
+    );
+    crate::step_snapshot::StepCallBinding::provider(step, call_id)
+}
+
 #[test]
 fn delegated_control_effect_parent_is_the_scoped_packet_not_the_root() {
     let workspace = tempfile::tempdir().unwrap();
@@ -4465,17 +4547,15 @@ async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_pa
     ));
 
     let same = tokio::join!(
-        first.execute_scoped(
-            "edit",
-            r#"{"path":"fixtures/sub/target.txt","content":"one"}"#,
-            None,
-            None,
+        execute_path_edit(
+            &first,
+            r#"{"action":"write","path":"fixtures/sub/target.txt","content":"one"}"#,
+            "same-first",
         ),
-        second.execute_scoped(
-            "edit",
-            r#"{"path":"fixtures/sub/target.txt","content":"two"}"#,
-            None,
-            None,
+        execute_path_edit(
+            &second,
+            r#"{"action":"write","path":"fixtures/sub/target.txt","content":"two"}"#,
+            "same-second",
         )
     );
     same.0.expect("first same-path effect");
@@ -4484,17 +4564,15 @@ async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_pa
 
     host.reset();
     let parent_child = tokio::join!(
-        first.execute_scoped(
-            "edit",
-            r#"{"path":"fixtures/sub","content":"parent"}"#,
-            None,
-            None,
+        execute_path_edit(
+            &first,
+            r#"{"action":"write","path":"fixtures/sub","content":"parent"}"#,
+            "parent-path",
         ),
-        second.execute_scoped(
-            "edit",
-            r#"{"path":"fixtures/sub/target.txt","content":"child"}"#,
-            None,
-            None,
+        execute_path_edit(
+            &second,
+            r#"{"action":"write","path":"fixtures/sub/target.txt","content":"child"}"#,
+            "child-path",
         )
     );
     parent_child.0.expect("parent-path effect");
@@ -4503,17 +4581,15 @@ async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_pa
 
     host.reset();
     let unrelated = tokio::join!(
-        first.execute_scoped(
-            "edit",
-            r#"{"path":"fixtures/left.txt","content":"left"}"#,
-            None,
-            None,
+        execute_path_edit(
+            &first,
+            r#"{"action":"write","path":"fixtures/left.txt","content":"left"}"#,
+            "left-effect",
         ),
-        second.execute_scoped(
-            "edit",
-            r#"{"path":"fixtures/right.txt","content":"right"}"#,
-            None,
-            None,
+        execute_path_edit(
+            &second,
+            r#"{"action":"write","path":"fixtures/right.txt","content":"right"}"#,
+            "right-effect",
         )
     );
     unrelated.0.expect("left effect");
@@ -5439,7 +5515,12 @@ async fn team_tool_boundary_enforces_the_exact_focus_scope() {
     })
     .to_string();
     executor
-        .execute_authorized_output(&authorization, "read_file", &absolute_input)
+        .execute_test_compiled_authorized_output(
+            &authorization,
+            "read_file",
+            &absolute_input,
+            "absolute-read",
+        )
         .await
         .expect("workspace-internal absolute read is normalized and executed");
     let receipts = executor
@@ -5507,7 +5588,12 @@ async fn absolute_path_authorization_and_execution_share_the_normalized_descript
 
     assert_eq!(
         executor
-            .execute_authorized_output(&authorization, "read_file", &absolute_value.to_string(),)
+            .execute_test_compiled_authorized_output(
+                &authorization,
+                "read_file",
+                &absolute_value.to_string(),
+                "absolute-agent-read",
+            )
             .await
             .expect("same normalized descriptor must remain current"),
         harness_contract::context::ToolOutputDraft::bounded_inline("authorized:read_file")
@@ -6113,7 +6199,12 @@ async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools
         .authorization;
     assert_eq!(
         executor
-            .execute_authorized_output(&authorization, "read_file", r#"{"path":"README.md"}"#)
+            .execute_test_compiled_authorized_output(
+                &authorization,
+                "read_file",
+                r#"{"path":"README.md"}"#,
+                "agent-test",
+            )
             .await
             .expect("authorized tool should execute"),
         harness_contract::context::ToolOutputDraft::bounded_inline("authorized:read_file")
@@ -7109,6 +7200,15 @@ async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fence
     author_actor.execution_id = Some(author_execution.to_string());
     author_actor.team_id = Some(author_team.clone());
     author_actor.agent_id = Some(author.clone());
+    author_actor.original_execution = Some(
+        crate::test_support::register_running_agent_action_graph(
+            Arc::clone(services.event_store()),
+            author_execution,
+            "author-node",
+            "session-checkpoint",
+            "turn-checkpoint",
+        ),
+    );
     let apply_author = |action_id: &str, action: AgentAction| {
         actions.apply(&AgentActionEnvelope {
             action_id: action_id.to_string(),
