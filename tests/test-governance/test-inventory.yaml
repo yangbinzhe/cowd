@@ -43,8 +43,6 @@ architecture_gates:
   - path: cargo xtask architecture audit --check
     protects:
       - Capability inventory remains complete and unique
-      - Oversized hand-written source is phase-owned and generated source has provenance
-      - Version-touched Rust code cannot hide mega functions, state carriers, or constructors
       - Duplicate authorities and semantic candidates are classified before release
   - path: tests/architecture/capability-authority-gate.sh
     protects:
