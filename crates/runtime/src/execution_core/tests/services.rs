@@ -4953,6 +4953,162 @@ async fn r1_423_startup_preserves_excluded_session_and_live_owner() {
 }
 
 #[tokio::test]
+async fn u5_timeline_external_body_is_bound_unobserved_and_pages_without_loss() {
+    let services = RuntimeServices::in_memory().unwrap();
+    let session = "u5-large-external-body";
+    let mut graph = ExecutionGraph::new("u5 oversized graph");
+    crate::test_support::attach_execution_graph_lineage(&mut graph);
+    graph.lineage.as_mut().unwrap().session_id = session.into();
+    let mut node = ExecutionNodeSpec::new(
+        ExecutionNodeKind::InlineModel,
+        "inline_model",
+        "x".repeat(1_100_000),
+    );
+    node.id = "u5-node".into();
+    node.idempotency_key = node.id.clone();
+    graph.nodes.push(node);
+    let graph = services
+        .commit_service()
+        .register_graph(graph)
+        .unwrap()
+        .graph;
+    let original = services
+        .event_store()
+        .latest_for_stream(&graph.id)
+        .unwrap()
+        .unwrap();
+    assert!(original.payload["bytes"].as_u64().unwrap() > 1_048_576);
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: session.into(),
+            scope: RuntimeEventScope::SessionInput,
+            kind: "u5.normal".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({"value": "ordinary"}),
+        })
+        .unwrap();
+
+    let reader = services.event_reader();
+    let first = reader.session_timeline_events(session, None, 1).unwrap();
+    assert_eq!(first.events.len(), 1);
+    assert!(first.has_more);
+    let event = &first.events[0];
+    let descriptor = &event.payload["_timeline_body"];
+    assert_eq!(descriptor["status"], "unobserved");
+    assert_eq!(descriptor["session_id"], session);
+    assert_eq!(descriptor["event_id"], original.event_id);
+    assert_eq!(descriptor["stream_id"], original.stream_id);
+    assert_eq!(descriptor["commit_cursor"], original.commit_cursor);
+    assert_eq!(descriptor["transaction_index"], original.transaction_index);
+    assert_eq!(descriptor["bytes"], original.payload["bytes"]);
+    assert_eq!(descriptor["sha256"], original.payload["sha256"]);
+    assert_eq!(descriptor["digest_status"], "declared_unverified");
+    assert_eq!(descriptor["origin_status"], "unverified");
+    assert_eq!(descriptor["body_read_continuation"], "authenticated_page_if_supported");
+    assert_eq!(descriptor["content_envelope"], original.payload);
+    assert!(serde_json::to_vec(event).unwrap().len() < 1_048_576);
+    let total = original.payload["bytes"].as_u64().unwrap();
+    let mut restored = Vec::new();
+    let mut offset = 0;
+    while offset < total {
+        let page = reader.session_timeline_body_page(session, &original.event_id, original.commit_cursor, original.transaction_index, offset, 65_536).unwrap();
+        restored.extend(page["bytes"].as_array().unwrap().iter().map(|value| value.as_u64().unwrap() as u8));
+        offset = page["next_offset"].as_u64().unwrap();
+    }
+    let value: serde_json::Value = serde_json::from_slice(&restored).unwrap();
+    assert_eq!(value, services.event_store().resolve_graph_record(&original).unwrap());
+    assert!(reader.session_timeline_body_page("u5-foreign", &original.event_id, original.commit_cursor, original.transaction_index, 0, 1024).is_err());
+    assert!(reader.session_timeline_body_page(session, "wrong-event", original.commit_cursor, original.transaction_index, 0, 1024).is_err());
+    let second = reader
+        .session_timeline_events(
+            session,
+            Some((event.commit_cursor, event.transaction_index)),
+            1,
+        )
+        .unwrap();
+    assert_eq!(second.events.len(), 1);
+    assert_eq!(second.events[0].kind, "u5.normal");
+    assert_eq!(second.events[0].payload["value"], "ordinary");
+    assert!(!second.has_more);
+    assert!(reader
+        .session_timeline_events("u5-foreign", None, 10)
+        .unwrap()
+        .events
+        .is_empty());
+    assert!(RuntimeEventStore::timeline_unobserved_body(original.clone(), "u5-foreign").is_err());
+    let mut tampered = original.clone();
+    tampered.payload["body"]["artifact"]["sha256"] = serde_json::json!("sha256:bad");
+    assert!(RuntimeEventStore::timeline_unobserved_body(tampered, session).is_err());
+    let mut observation = original.clone();
+    observation.scope = RuntimeEventScope::Goal;
+    observation.kind = "goal.observation".into();
+    let mut observation_envelope = original.payload.clone();
+    observation_envelope
+        .as_object_mut()
+        .unwrap()
+        .remove("_runtime_activity_binding");
+    observation.payload = serde_json::json!({"observation_schema": 2, "session_id": session,
+        "goal_source": {"stream_id": original.stream_id, "sequence": 8, "goal_revision": 3, "spec_digest": "digest"},
+        "classifier": {"kind": "observed"}, "future_field": {"preserved": true}, "observation_body": observation_envelope});
+    let observed =
+        RuntimeEventStore::timeline_unobserved_body(observation.clone(), session).unwrap();
+    assert_eq!(observed.payload["_timeline_body"]["status"], "unobserved");
+    assert_eq!(
+        observed.payload["_timeline_body"]["content_envelope"],
+        observation.payload["observation_body"]
+    );
+    let mut expected_outer = observation.payload.clone();
+    expected_outer.as_object_mut().unwrap().remove("observation_body");
+    assert_eq!(observed.payload["_timeline_body"]["observation_outer"], expected_outer);
+    observation.payload["goal_source"]["stream_id"] = serde_json::json!("wrong");
+    assert!(RuntimeEventStore::timeline_unobserved_body(observation, session).is_err());
+
+    // The ordinary authenticated content resolver still verifies the original
+    // envelope, session, origin, full length and digest when actually read.
+    let origin = crate::PreparedArtifactOrigin::EventBody {
+        stream_id: original.stream_id.clone(),
+        idempotency_key: original.idempotency_key.clone().unwrap(),
+        kind: original.kind.clone(),
+    };
+    let scope = format!("session:{session}");
+    assert!(services
+        .event_store()
+        .resolve_content(&scope, &original.payload, &origin)
+        .is_ok());
+    assert!(services
+        .event_store()
+        .resolve_content("session:u5-foreign", &original.payload, &origin)
+        .is_err());
+    let wrong_origin = crate::PreparedArtifactOrigin::EventBody {
+        stream_id: "other-stream".into(),
+        idempotency_key: original.idempotency_key.clone().unwrap(),
+        kind: original.kind.clone(),
+    };
+    assert!(services
+        .event_store()
+        .resolve_content(&scope, &original.payload, &wrong_origin)
+        .is_err());
+    let mut missing = original.payload.clone();
+    missing["body"]["artifact"]["selector"] =
+        serde_json::json!(format!("artifact://art_{}", "0".repeat(64)));
+    assert!(services
+        .event_store()
+        .resolve_content(&scope, &missing, &origin)
+        .is_err());
+    let mut incomplete = original.payload.clone();
+    incomplete["bytes"] = serde_json::json!(original.payload["bytes"].as_u64().unwrap() - 1);
+    assert!(services
+        .event_store()
+        .resolve_content(&scope, &incomplete, &origin)
+        .is_err());
+    services.shutdown_execution().await;
+    services.shutdown_maintenance().await;
+}
+
+#[tokio::test]
 async fn r453_timeline_expanded_bodies_continue_without_loss_or_foreign_records() {
     let services = RuntimeServices::in_memory().unwrap();
     let mut expected = Vec::new();
@@ -5112,17 +5268,156 @@ fn r453_timeline_byte_short_transaction_resumes_by_exact_position_and_rejects_si
             kind: "r453.oversize".into(),
             status: None,
             actor: None,
-            refs: vec![],
-            payload: serde_json::json!({"original":"q".repeat(1_048_576)}),
+            refs: vec![crate::RuntimeEventRef { kind: "evidence".into(), id: "q".repeat(1_048_576) }],
+            payload: serde_json::json!({"small_body":true}),
         })
         .unwrap();
-    assert!(
-        reader
-            .session_timeline_events("r453-oversize", None, 100)
-            .err()
-            .unwrap()
-            .starts_with("HistoryBudgetExceeded:")
-    );
+    let normal = store.append(crate::RuntimeEventInput {
+        stream_id: "r453-oversize".into(), scope: crate::RuntimeEventScope::SessionInput,
+        kind: "r453.after".into(), status: None, actor: None, refs: vec![],
+        payload: serde_json::json!({"value": "normal"}),
+    }).unwrap();
+    let descriptor = reader.session_timeline_events("r453-oversize", None, 100).unwrap();
+    assert!(descriptor.events.is_empty());
+    let first = descriptor.descriptor.as_ref().expect("separate descriptor");
+    let payload = first.projection_payload("r453-oversize").unwrap();
+    assert_eq!(payload["descriptor_type"], "timeline_projection_only");
+    assert_eq!(payload["body_observation"], "unobserved");
+    assert_eq!(payload["body_continuation"], "authenticated_event_page_if_supported");
+    assert_eq!(payload["history_completeness"], "unknown");
+    assert_eq!(payload["digest_status"], "unknown");
+    assert!(payload["sha256"].is_null());
+    assert_eq!(payload["content_digest_status"], "unknown");
+    assert_eq!(payload["original_kind"], "r453.oversize");
+    assert!(first.encoded_bytes > 1_048_576);
+    assert!(serde_json::to_vec(&payload).unwrap().len() < 4096);
+    assert!(descriptor.has_more);
+    let next = reader.session_timeline_events("r453-oversize", Some((first.commit_cursor, first.transaction_index)), 100).unwrap();
+    assert_eq!(next.events.len(), 1);
+    assert_eq!(next.events[0].event_id, normal.event_id);
+    assert_eq!(next.events[0].payload["value"], "normal");
+    assert!(!next.has_more);
+    assert!(reader.session_timeline_events("foreign", None, 100).unwrap().events.is_empty());
+    assert!(store.timeline_oversize_descriptor("foreign", None, first.commit_cursor, &first.event_id).unwrap().is_none());
+    assert!(store.timeline_oversize_descriptor("r453-oversize", None, first.commit_cursor, "wrong-event").is_err());
+}
+
+#[test]
+fn timeline_descriptor_declared_digest_and_missing_digest_are_explicit() {
+    let make = |digest| crate::TimelineOversizeDescriptor {
+        event_id: "event-a".into(), stream_id: "session-a".into(), sequence: 1,
+        original_scope: crate::RuntimeEventScope::SessionInput,
+        original_kind: "legacy.kind".into(), created_at_ms: 1, commit_cursor: 2,
+        transaction_index: 3, encoded_bytes: 1_048_577, digest, content_bytes: Some(42),
+    };
+    let sha = format!("sha256:{}", "a".repeat(64));
+    let observed = make(Some(sha.clone())).projection_payload("session-a").unwrap();
+    assert_eq!(observed["declared_content_sha256"], sha);
+    assert_eq!(observed["content_digest_status"], "declared");
+    assert_eq!(observed["declared_content_bytes"], 42);
+    assert_eq!(observed["body_observation"], "unobserved");
+    for digest in [None, Some("invalid".into())] {
+        let unknown = make(digest).projection_payload("session-a").unwrap();
+        assert_eq!(unknown["content_digest_status"], "unknown");
+        assert!(unknown["declared_content_sha256"].is_null());
+    }
+}
+
+#[test]
+fn timeline_oversize_descriptor_resumes_inside_same_commit() {
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
+    let receipt = store.append_transaction(crate::AppendTransactionRequest {
+        transaction_id: "descriptor-tied".into(),
+        expected_streams: vec![crate::ExpectedStreamRevision { stream_id: "descriptor-session".into(), expected_revision: 0 }],
+        events: [serde_json::json!({"big": "x".repeat(1_048_576)}), serde_json::json!({"small": true})]
+            .into_iter().enumerate().map(|(index, payload)| crate::RuntimeEventInput {
+                stream_id: "descriptor-session".into(), scope: crate::RuntimeEventScope::SessionInput,
+                kind: format!("descriptor.{index}"), status: None, actor: None, refs: vec![], payload,
+            }.into()).collect(),
+    }).unwrap();
+    let reader = super::RuntimeEventReader { store };
+    let first = reader.session_timeline_events("descriptor-session", None, 100).unwrap();
+    assert!(first.events.is_empty());
+    assert_eq!(first.descriptor.as_ref().unwrap().event_id, receipt.event_ids[0]);
+    assert_eq!(first.complete_through_cursor, receipt.commit_cursor - 1);
+    assert!(first.has_more);
+    let second = reader.session_timeline_events("descriptor-session", Some((receipt.commit_cursor, 0)), 100).unwrap();
+    assert_eq!(second.events[0].event_id, receipt.event_ids[1]);
+    assert_eq!(second.complete_through_cursor, receipt.commit_cursor);
+    assert!(!second.has_more);
+}
+
+#[test]
+fn timeline_same_event_bounded_range_preserves_public_projection_and_binding() {
+    use sha2::{Digest, Sha256};
+    let store = Arc::new(crate::RuntimeEventStore::for_test());
+    let evidence = "中".repeat(400_000);
+    let receipt = store.append_transaction(crate::AppendTransactionRequest {
+        transaction_id: "private-transaction-marker".into(),
+        expected_streams: vec![crate::ExpectedStreamRevision { stream_id: "range-stream".into(), expected_revision: 0 }],
+        events: vec![crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: "range-stream".into(), scope: crate::RuntimeEventScope::SessionInput,
+                kind: "range.original".into(), status: Some("observed-status".into()),
+                actor: Some("private-actor-marker".into()),
+                refs: vec![crate::RuntimeEventRef { kind: "session".into(), id: "range-owner".into() },
+                    crate::RuntimeEventRef { kind: "evidence".into(), id: evidence.clone() }],
+                payload: serde_json::json!({"body":"原文", "counter":7}),
+            },
+            idempotency_key: Some("private-idempotency-marker".into()), schema_version: 1,
+        }],
+    }).unwrap();
+    let reader = super::RuntimeEventReader { store: store.clone() };
+    fn request<'a>(session_id: &'a str, event_id: &'a str, commit_cursor: u64, transaction_index: u32, offset: u64, limit: usize) -> crate::TimelineEventRangeRequest<'a> {
+        crate::TimelineEventRangeRequest { session_id, event_id, commit_cursor, transaction_index, offset, limit }
+    }
+    let id = &receipt.event_ids[0];
+    let mut cursor = 0;
+    let mut bytes = Vec::new();
+    let mut identity = None;
+    loop {
+        let page = reader.session_timeline_event_range(&request("range-owner", id, receipt.commit_cursor, 0, cursor, 64 * 1024)).unwrap().unwrap();
+        assert_eq!(page.session_id, "range-owner");
+        assert_eq!(&page.event_id, id);
+        assert_eq!((page.commit_cursor, page.transaction_index), (receipt.commit_cursor, 0));
+        assert_eq!(page.offset, cursor);
+        assert!(page.bytes.len() <= 64 * 1024 && !page.bytes.is_empty());
+        assert_eq!(page.digest_basis, "server_computed_public_projection_bytes");
+        assert_eq!(page.format, "timeline_public_projection_json_v1");
+        let stable = (page.total_bytes, page.projection_sha256.clone());
+        if let Some(expected) = &identity { assert_eq!(expected, &stable); } else { identity = Some(stable); }
+        bytes.extend_from_slice(&page.bytes);
+        match page.next_offset { Some(next) => { assert!(next > cursor); cursor = next; }, None => break }
+    }
+    let (total, digest) = identity.unwrap();
+    assert!(total > 1_048_576);
+    assert_eq!(total, bytes.len() as u64);
+    assert_eq!(digest, format!("sha256:{:x}", Sha256::digest(&bytes)));
+    let projection: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(projection["event_id"], *id);
+    assert_eq!(projection["stream_id"], "range-stream");
+    assert_eq!(projection["kind"], "range.original");
+    assert_eq!(projection["refs"][1]["id"], evidence);
+    assert_eq!(projection["payload"]["body"], "原文");
+    assert_eq!(projection["commit_cursor"], receipt.commit_cursor);
+    assert_eq!(projection["transaction_index"], 0);
+    for key in ["actor", "idempotency_key", "transaction_id", "schema_version"] { assert!(projection.get(key).is_none()); }
+    let wire = String::from_utf8(bytes).unwrap();
+    for secret in ["private-actor-marker", "private-idempotency-marker", "private-transaction-marker"] { assert!(!wire.contains(secret)); }
+    for invalid in [request("foreign", id, receipt.commit_cursor, 0, 0, 1),
+        request("range-owner", "wrong-event", receipt.commit_cursor, 0, 0, 1),
+        request("range-owner", id, receipt.commit_cursor, 1, 0, 1),
+        request("range-owner", id, receipt.commit_cursor + 1, 0, 0, 1)] {
+        assert!(reader.session_timeline_event_range(&invalid).unwrap().is_none());
+    }
+    for invalid in [request("range-owner", id, receipt.commit_cursor, 0, 0, 0),
+        request("range-owner", id, receipt.commit_cursor, 0, 0, 64 * 1024 + 1),
+        request("range-owner", id, receipt.commit_cursor, 0, total + 1, 1)] {
+        assert!(reader.session_timeline_event_range(&invalid).is_err());
+    }
+    let final_page = reader.session_timeline_event_range(&request("range-owner", id, receipt.commit_cursor, 0, total, 1)).unwrap().unwrap();
+    assert!(final_page.bytes.is_empty() && final_page.next_offset.is_none());
+    assert_eq!(final_page.projection_sha256, digest);
 }
 
 /// A Session query port that answers with one durable input claim.

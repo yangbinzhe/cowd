@@ -42,6 +42,136 @@ impl PreparedHistoryCheckpoint {
 }
 
 impl RuntimeEventStore {
+    /// Read one bounded page only after rechecking the exact durable event and
+    /// its original content owner. Every page verifies the entire blob digest.
+    pub(crate) fn timeline_body_page(
+        &self, record: &DurableRuntimeEvent, session_id: &str, range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, String> {
+        let described = Self::timeline_unobserved_body(record.clone(), session_id)?;
+        let descriptor = &described.payload["_timeline_body"];
+        let key = record.idempotency_key.as_deref().ok_or("timeline event key missing")?;
+        let check_event = || -> Result<(), String> {
+            match self.bounded_event_by_idempotency_key(&record.stream_id, key, record.commit_cursor, 1024 * 1024)
+                .map_err(|error| error.to_string())? {
+                RuntimeBoundedEventLookup::Record { record: found, .. } if *found == *record => Ok(()),
+                _ => Err("timeline durable event missing or changed".into()),
+            }
+        };
+        check_event()?;
+        let mut envelope = descriptor["content_envelope"].clone();
+        envelope.as_object_mut().ok_or("timeline envelope invalid")?.remove("_runtime_activity_binding");
+        let envelope: ContentEnvelope = serde_json::from_value(envelope).map_err(|_| "timeline envelope invalid")?;
+        let ContentBody::ArtifactRef { artifact } = envelope.body else { return Err("timeline body is not external".into()); };
+        let origin = PreparedArtifactOrigin::EventBody {
+            stream_id: record.stream_id.clone(), idempotency_key: key.into(), kind: record.kind.clone(),
+        };
+        let store = self.artifacts.get().ok_or("MissingContentStore")?;
+        let (bytes, _) = store.read_prepared_event_page(&artifact, &format!("session:{session_id}"), &origin, range, None)
+            .map_err(|error| error.to_string())?;
+        check_event()?;
+        Ok(bytes)
+    }
+
+    /// Describe an external body without reading it. This validates only the
+    /// immutable envelope and its event/session binding, not the body itself.
+    pub(crate) fn timeline_unobserved_body(
+        mut record: DurableRuntimeEvent,
+        session_id: &str,
+    ) -> Result<DurableRuntimeEvent, String> {
+        if record.schema_version != CONTENT_SCHEMA {
+            return Err("unsupported content schema".into());
+        }
+        let (envelope, owner, turn_id, observation_outer) = if record.scope == RuntimeEventScope::ExecutionGraph {
+            let binding = record
+                .activity_binding()
+                .ok_or("graph content has no trusted activity binding")?;
+            binding.validate().map_err(|error| error.to_string())?;
+            (
+                record.payload.clone(),
+                binding.session_id,
+                Some(binding.turn_id),
+                None,
+            )
+        } else if record.kind == "goal.observation" {
+            if record.payload["observation_schema"] != CONTENT_SCHEMA
+                || record.payload["goal_source"]["stream_id"] != record.stream_id
+            {
+                return Err("unsupported observation schema".into());
+            }
+            let owner = record.payload["session_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("observation session missing")?
+                .to_string();
+            // Retain the original durable wrapper, not a reconstruction from
+            // the current Goal. Hydration replaces only observation_body.
+            let mut outer = record.payload.clone();
+            outer.as_object_mut().ok_or("observation is not an object")?
+                .remove("observation_body");
+            (record.payload["observation_body"].clone(), owner, None, Some(outer))
+        } else {
+            return Err("unsupported timeline content owner".into());
+        };
+        if owner != session_id {
+            return Err("timeline content session mismatch".into());
+        }
+        let origin = PreparedArtifactOrigin::EventBody {
+            stream_id: record.stream_id.clone(),
+            idempotency_key: record
+                .idempotency_key
+                .clone()
+                .ok_or("content idempotency missing")?,
+            kind: record.kind.clone(),
+        };
+        origin.validate()?;
+        let mut wire = envelope.clone();
+        if let Some(object) = wire.as_object_mut() {
+            object.remove("_runtime_activity_binding");
+        }
+        let parsed: ContentEnvelope =
+            serde_json::from_value(wire).map_err(|_| "unsupported content envelope".to_string())?;
+        let ContentBody::ArtifactRef { artifact } = &parsed.body else {
+            return Err("timeline body is not external".into());
+        };
+        let valid_digest = parsed.sha256.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        if parsed.content_schema != CONTENT_SCHEMA
+            || !valid_digest
+            || !artifact.is_durable()
+            || artifact.media_type != "application/json"
+            || artifact.visibility_scope != format!("session:{session_id}")
+            || artifact.sha256 != parsed.sha256
+            || artifact.bytes != parsed.bytes
+        {
+            return Err("timeline content reference identity mismatch".into());
+        }
+        record.payload = serde_json::json!({
+            "_timeline_body": {
+                "status": "unobserved",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "event_id": record.event_id,
+                "stream_id": record.stream_id,
+                "sequence": record.sequence,
+                "kind": record.kind,
+                "commit_cursor": record.commit_cursor,
+                "transaction_index": record.transaction_index,
+                "bytes": parsed.bytes,
+                "sha256": parsed.sha256,
+                "digest_status": "declared_unverified",
+                "origin_status": "unverified",
+                "body_read_continuation": "authenticated_page_if_supported",
+                "content_envelope": envelope,
+                "observation_outer": observation_outer,
+            }
+        });
+        Ok(record)
+    }
+
     /// Exact versions of the derived Program cache. Durable Program events
     /// retain their original schema; unknown cache owners never authenticate.
     pub fn program_read_model_checkpoint_schema(projection_id: &str) -> Option<u64> {
@@ -1420,7 +1550,7 @@ impl RuntimeEventStore {
         }
         Ok(())
     }
-    pub(crate) fn classify_observation(
+    pub fn classify_observation(
         value: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         observation_classifier(value)

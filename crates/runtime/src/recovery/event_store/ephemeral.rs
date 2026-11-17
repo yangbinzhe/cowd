@@ -3,6 +3,37 @@
 
 use super::*;
 
+/// Stream serialization through the digest and retain only the requested window.
+struct TimelineRangeWriter {
+    digest: Sha256, start: u64, limit: usize, position: u64, bytes: Vec<u8>,
+}
+
+impl std::io::Write for TimelineRangeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = self.position.checked_add(buf.len() as u64)
+            .ok_or_else(|| std::io::Error::other("timeline projection length overflow"))?;
+        self.digest.update(buf);
+        let window_end = self.start.saturating_add(self.limit as u64);
+        let from = self.position.max(self.start);
+        let to = end.min(window_end);
+        if from < to {
+            self.bytes.extend_from_slice(&buf[(from - self.position) as usize..(to - self.position) as usize]);
+        }
+        self.position = end;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+/// Exact public fields only. In particular this excludes actor, idempotency
+/// key, transaction id and schema-internal metadata.
+#[derive(Serialize)]
+struct TimelinePublicProjection<'a> {
+    event_id: &'a str, stream_id: &'a str, sequence: u64, scope: RuntimeEventScope,
+    kind: &'a str, status: &'a Option<String>, refs: &'a [RuntimeEventRef],
+    payload: &'a serde_json::Value, created_at_ms: u64, commit_cursor: u64, transaction_index: u32,
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1249,6 +1280,47 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
         i64::try_from(through_cursor).map_err(|_| "through_cursor overflow".to_string())?;
         self.position_page_classified(scope, identity, kind, after, through_cursor, max_events, max_bytes)
             .map_err(|error| error.to_string())
+    }
+    fn timeline_event_range(&self, request: &TimelineEventRangeRequest<'_>) -> Result<Option<TimelineEventRange>, String> {
+        request.validate()?;
+        let state = self.state.lock().map_err(|_| "event store lock poisoned")?;
+        let Some(index) = state.position_indexes.get(&("session".into(), request.session_id.into())) else { return Ok(None) };
+        let Some(position) = index.get(&(request.commit_cursor, request.transaction_index)) else { return Ok(None) };
+        let event = &state.events[*position];
+        if event.event_id != request.event_id { return Ok(None); }
+        // Graph and goal records require authenticated content hydration. Their
+        // raw envelopes are not the public projection; never return them here.
+        if event.scope == RuntimeEventScope::ExecutionGraph || event.kind == "goal.observation" {
+            return Err("timeline event range unsupported for hydrated content".into());
+        }
+        let projection = TimelinePublicProjection {
+            event_id: &event.event_id, stream_id: &event.stream_id, sequence: event.sequence,
+            scope: event.scope, kind: &event.kind, status: &event.status, refs: &event.refs,
+            payload: &event.payload, created_at_ms: event.created_at_ms,
+            commit_cursor: event.commit_cursor, transaction_index: event.transaction_index,
+        };
+        let mut writer = TimelineRangeWriter { digest: Sha256::new(), start: request.offset, limit: request.limit, position: 0, bytes: Vec::new() };
+        serde_json::to_writer(&mut writer, &projection).map_err(|_| "timeline projection encoding failed")?;
+        if request.offset > writer.position { return Err("timeline event range offset beyond projection".into()); }
+        let end = request.offset + writer.bytes.len() as u64;
+        Ok(Some(TimelineEventRange {
+            session_id: request.session_id.into(), event_id: event.event_id.clone(),
+            commit_cursor: event.commit_cursor, transaction_index: event.transaction_index, offset: request.offset,
+            total_bytes: writer.position, projection_sha256: format!("sha256:{:x}", writer.digest.finalize()),
+            digest_basis: "server_computed_public_projection_bytes", format: "timeline_public_projection_json_v1",
+            bytes: writer.bytes, next_offset: (end < writer.position).then_some(end),
+        }))
+    }
+    fn timeline_oversize_descriptor(&self, session: &str, after: Option<(u64, u32)>, through: u64, event_id: &str) -> Result<Option<TimelineOversizeDescriptor>, String> {
+        let state = self.state.lock().map_err(|_| "event store lock poisoned")?;
+        let Some(index) = state.position_indexes.get(&("session".into(), session.into())) else { return Ok(None) };
+        let Some((_, position)) = index.range((std::ops::Bound::Excluded(after.unwrap_or((0, 0))), std::ops::Bound::Included((through, u32::MAX)))).next() else { return Ok(None) };
+        let event = &state.events[*position];
+        if event.event_id != event_id { return Err("timeline descriptor position changed".into()); }
+        if [event.event_id.as_str(), event.stream_id.as_str(), event.kind.as_str(), session].iter().any(|s| s.is_empty() || s.len() > 1024) { return Err("HistoryBudgetExceeded: descriptor identity".into()); }
+        let envelope = if event.scope == RuntimeEventScope::ExecutionGraph { &event.payload } else if event.kind == "goal.observation" { &event.payload["observation_body"] } else { &serde_json::Value::Null };
+        let digest = envelope.get("sha256").and_then(|v| v.as_str()).filter(|s| s.len() == 71).map(str::to_owned);
+        Ok(Some(TimelineOversizeDescriptor { event_id: event.event_id.clone(), stream_id: event.stream_id.clone(), sequence: event.sequence, original_scope: event.scope, original_kind: event.kind.clone(), created_at_ms: event.created_at_ms, commit_cursor: event.commit_cursor, transaction_index: event.transaction_index, encoded_bytes: state.encoded_bytes[*position] as u64, digest, content_bytes: envelope.get("bytes").and_then(|v| v.as_u64()) }))
     }
     fn position_page_classified(
         &self,

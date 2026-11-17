@@ -1262,6 +1262,8 @@ pub struct RuntimeEventReader {
 /// One bounded page of complete, authenticated Session lifecycle events.
 pub struct RuntimeTimelinePage {
     pub events: Vec<DurableRuntimeEvent>,
+    /// A bounded projection of the first oversized row; never a durable event.
+    pub descriptor: Option<crate::TimelineOversizeDescriptor>,
     pub has_more: bool,
     /// Integer-cursor consumers may only advance through complete commits.
     /// Tuple-position consumers can also consume a partial commit's events.
@@ -1269,6 +1271,35 @@ pub struct RuntimeTimelinePage {
 }
 
 impl RuntimeEventReader {
+    /// Page the body of an exact Session event. The content identity and
+    /// authorization owner are recovered from the durable event, not input.
+    pub fn session_timeline_body_page(
+        &self, session_id: &str, event_id: &str, cursor: u64, index: u32,
+        offset: u64, limit: u64,
+    ) -> Result<serde_json::Value, String> {
+        if session_id.is_empty() || event_id.is_empty() || cursor == 0 || limit == 0 || limit > 65_536 {
+            return Err("invalid timeline body page request".into());
+        }
+        let after = if index == 0 { (cursor - 1, u32::MAX) } else { (cursor, index - 1) };
+        let mut events = self.store.position_page_classified(
+            RuntimeEventScope::Session, session_id, None, Some(after), cursor, 1, 1024 * 1024,
+        ).map_err(|error| error.to_string())?;
+        if events.len() != 1 { return Err("timeline body event not found".into()); }
+        let record = events.remove(0);
+        if record.event_id != event_id || record.commit_cursor != cursor || record.transaction_index != index {
+            return Err("timeline body event binding mismatch".into());
+        }
+        let descriptor = RuntimeEventStore::timeline_unobserved_body(record.clone(), session_id)?;
+        let body = &descriptor.payload["_timeline_body"];
+        let total = body["bytes"].as_u64().ok_or("timeline body size missing")?;
+        let digest = body["sha256"].as_str().ok_or("timeline body digest missing")?;
+        if offset >= total { return Err("timeline body offset outside content".into()); }
+        let end = offset.checked_add(limit).ok_or("timeline body range overflow")?.min(total);
+        let bytes = self.store.timeline_body_page(&record, session_id, offset..end)?;
+        Ok(serde_json::json!({"session_id":session_id,"event_id":event_id,
+            "stream_id":record.stream_id,"commit_cursor":cursor,"transaction_index":index,
+            "offset":offset,"next_offset":end,"total_bytes":total,"sha256":digest,"bytes":bytes}))
+    }
     #[must_use]
     pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
         self.store.subscribe_commits()
@@ -1304,6 +1335,12 @@ impl RuntimeEventReader {
         RuntimeEventReplayer::report(&self.store, limit)
     }
 
+    /// Read a bounded slice of one original public projection. The caller must
+    /// authorize access to the supplied session before invoking this port.
+    pub fn session_timeline_event_range(&self, request: &crate::TimelineEventRangeRequest<'_>) -> Result<Option<crate::TimelineEventRange>, String> {
+        self.store.timeline_event_range(request)
+    }
+
     pub fn session_timeline_events(
         &self,
         session_id: &str,
@@ -1315,15 +1352,36 @@ impl RuntimeEventReader {
             .durable_commit_cursor()
             .map_err(|error| error.to_string())?;
         const PAGE_BYTES: usize = 1024 * 1024;
-        let events = self.store.position_page(
-            RuntimeEventScope::Session,
-            session_id,
-            None,
-            after_position,
-            head,
-            limit.min(100),
-            PAGE_BYTES,
-        )?;
+        let events = match self.store.position_page_classified(
+            RuntimeEventScope::Session, session_id, None, after_position, head, limit.min(100), PAGE_BYTES,
+        ) {
+            Ok(events) => events,
+            Err(crate::PositionPageError::FirstRowExceedsBudget(event_id)) => {
+                let descriptor = self.store.timeline_oversize_descriptor(session_id, after_position, head, &event_id)?
+                    .ok_or("timeline descriptor disappeared")?;
+                let position = (descriptor.commit_cursor, descriptor.transaction_index);
+                if descriptor.event_id != event_id || descriptor.encoded_bytes <= PAGE_BYTES as u64
+                    || descriptor.commit_cursor > head
+                    || position <= after_position.unwrap_or((0, 0))
+                {
+                    return Err("timeline descriptor binding changed".into());
+                }
+                let payload = descriptor.projection_payload(session_id)?;
+                let descriptor_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?.len()
+                    .checked_add(serde_json::to_vec(&descriptor).map_err(|e| e.to_string())?.len())
+                    .ok_or("timeline descriptor size overflow")?;
+                if descriptor_bytes > PAGE_BYTES { return Err("HistoryBudgetExceeded: timeline descriptor".into()); }
+                let next = self.store.position_page(RuntimeEventScope::Session, session_id, None, Some(position), head, 1, PAGE_BYTES - descriptor_bytes);
+                let (has_more, next_position) = match next {
+                    Ok(events) => ( !events.is_empty(), events.first().map(|event| (event.commit_cursor, event.transaction_index)) ),
+                    Err(error) if error.starts_with("HistoryBudgetExceeded:") => (true, None),
+                    Err(error) => return Err(error),
+                };
+                let complete_through_cursor = if has_more && next_position.is_none_or(|next| next.0 == position.0) { position.0.saturating_sub(1) } else { position.0 };
+                return Ok(RuntimeTimelinePage { events: vec![], descriptor: Some(descriptor), has_more, complete_through_cursor });
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let stored_bytes = events.iter().try_fold(0usize, |total, event| {
             serde_json::to_vec(event)
                 .map_err(|error| error.to_string())
@@ -1368,14 +1426,13 @@ impl RuntimeEventReader {
                 next_position = Some((event.commit_cursor, event.transaction_index));
                 break;
             }
-            // A single record still has to fit. Resolve it once to measure its
-            // exact public representation; envelope overhead is only a bound.
-            // One oversized record must not fail the whole page: a record whose
-            // content is already addressed by a durable reference stays in that
-            // reference form and its body can be fetched on demand.
-            let event = self
-                .store
-                .resolve_read_record_within(event, crate::RuntimeEventStore::MAX_HYDRATED_CONTENT_BYTES)?;
+            // An oversized external body is a bounded projection only; its
+            // declared digest has not been verified and its body is unobserved.
+            let event = if external > 0 && extent > PAGE_BYTES {
+                RuntimeEventStore::timeline_unobserved_body(event, session_id)?
+            } else {
+                self.store.resolve_read_record(event)?
+            };
             let bytes = serde_json::to_vec(&event)
                 .map_err(|error| error.to_string())?
                 .len();
@@ -1427,6 +1484,7 @@ impl RuntimeEventReader {
         };
         Ok(RuntimeTimelinePage {
             events: resolved,
+            descriptor: None,
             has_more,
             complete_through_cursor,
         })

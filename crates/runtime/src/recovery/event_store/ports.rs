@@ -758,6 +758,91 @@ impl From<&str> for PositionPageError {
     fn from(value: &str) -> Self { Self::Other(value.to_owned()) }
 }
 
+/// A scoped request to read bytes of the original event's public timeline projection.
+/// This is a binding, not an authorization grant; callers must authorize the session.
+#[derive(Debug, Clone, Copy)]
+pub struct TimelineEventRangeRequest<'a> {
+    pub session_id: &'a str,
+    pub event_id: &'a str,
+    pub commit_cursor: u64,
+    pub transaction_index: u32,
+    pub offset: u64,
+    pub limit: usize,
+}
+
+impl TimelineEventRangeRequest<'_> {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_id.is_empty() || self.session_id.len() > 1024
+            || self.event_id.is_empty() || self.event_id.len() > 1024
+            || self.limit == 0 || self.limit > 64 * 1024
+            || self.commit_cursor == 0 || i64::try_from(self.commit_cursor).is_err()
+            || self.offset >= i64::MAX as u64
+        { return Err("invalid timeline event range request".into()); }
+        Ok(())
+    }
+}
+
+/// Raw UTF-8 JSON bytes; a page contains at most 64 KiB of projection data.
+/// SHA-256 is freshly computed from the exact projection bytes by this backend,
+/// not a pre-existing event hash, verification result, or authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineEventRange {
+    pub session_id: String,
+    pub event_id: String,
+    pub commit_cursor: u64,
+    pub transaction_index: u32,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub projection_sha256: String,
+    pub digest_basis: &'static str,
+    pub format: &'static str,
+    pub bytes: Vec<u8>,
+    pub next_offset: Option<u64>,
+}
+
+/// A timeline projection with omitted body cannot prove absence of effects.
+#[must_use]
+pub fn timeline_body_unobserved(kind: &str, payload: &serde_json::Value) -> bool {
+    kind == "runtime.timeline.unobserved"
+        || payload["body_observation"] == "unobserved"
+        || payload["_timeline_body"]["status"] == "unobserved"
+}
+
+/// Bounded, scoped view of a row whose full metadata exceeds the page budget.
+/// `digest` is a declared content digest, never a digest of the event itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineOversizeDescriptor {
+    pub event_id: String,
+    pub stream_id: String,
+    pub sequence: u64,
+    pub original_scope: RuntimeEventScope,
+    pub original_kind: String,
+    pub created_at_ms: u64,
+    pub commit_cursor: u64,
+    pub transaction_index: u32,
+    pub encoded_bytes: u64,
+    pub digest: Option<String>,
+    pub content_bytes: Option<u64>,
+}
+
+impl TimelineOversizeDescriptor {
+    /// Only a timeline projection; no durable event or body is constructed.
+    pub fn projection_payload(&self, session_id: &str) -> Result<serde_json::Value, String> {
+        if [self.event_id.as_str(), self.stream_id.as_str(), self.original_kind.as_str(), session_id].iter().any(|s| s.is_empty() || s.len() > 1024) {
+            return Err("HistoryBudgetExceeded: descriptor identity".into());
+        }
+        let digest = self.digest.as_ref().filter(|s| s.len() == 71 && s.starts_with("sha256:") && s[7..].bytes().all(|b| b.is_ascii_hexdigit()));
+        Ok(serde_json::json!({"event_id": self.event_id, "session_id": session_id,
+            "original_kind": self.original_kind, "metadata_encoded_bytes": self.encoded_bytes,
+            "descriptor_type": "timeline_projection_only", "body_observation": "unobserved",
+            "body_continuation": "authenticated_event_page_if_supported", "history_completeness": "unknown",
+            "digest_status": "unknown", "sha256": null, "metadata_digest_status": "unknown",
+            "content_digest_status": if digest.is_some() { "declared" } else { "unknown" },
+            "declared_content_sha256": digest, "declared_content_bytes": self.content_bytes,
+            "content_length_status": if self.content_bytes.is_some() { "declared" } else { "unknown" }}))
+    }
+}
+
 pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync + std::any::Any {
     #[cfg(any(test, feature = "test-fixtures"))]
     fn fixture_evidence_page(
@@ -986,6 +1071,16 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync + std::any::An
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>>;
     fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64>;
     fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String>;
+    /// Return only a bounded slice of the scoped event's public projection.
+    /// Missing and mismatched identities must be indistinguishable.
+    fn timeline_event_range(&self, _request: &TimelineEventRangeRequest<'_>) -> Result<Option<TimelineEventRange>, String> {
+        Err("timeline event range unavailable".into())
+    }
+    /// Read only bounded scalar fields from the first session-scoped row.
+    /// The backend must apply the same scope and position predicate as position_page.
+    fn timeline_oversize_descriptor(&self, _session: &str, _after: Option<(u64, u32)>, _through: u64, _event_id: &str) -> Result<Option<TimelineOversizeDescriptor>, String> {
+        Err("HistoryBudgetExceeded: bounded timeline descriptor unavailable".into())
+    }
     fn position_page_classified(
         &self, scope: RuntimeEventScope, identity: &str, kind: Option<&str>,
         after: Option<(u64, u32)>, through_cursor: u64, max_events: usize, max_bytes: usize,

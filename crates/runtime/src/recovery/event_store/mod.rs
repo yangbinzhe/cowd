@@ -2337,6 +2337,15 @@ impl RuntimeEventStore {
         self.backend.fixture_evidence_page(request)
     }
 
+    pub fn timeline_event_range(&self, request: &TimelineEventRangeRequest<'_>) -> Result<Option<TimelineEventRange>, String> {
+        request.validate()?;
+        self.backend.timeline_event_range(request)
+    }
+
+    pub fn timeline_oversize_descriptor(&self, session: &str, after: Option<(u64, u32)>, through: u64, event_id: &str) -> Result<Option<TimelineOversizeDescriptor>, String> {
+        self.backend.timeline_oversize_descriptor(session, after, through, event_id)
+    }
+
     pub fn position_page_classified(
         &self, scope: RuntimeEventScope, identity: &str, kind: Option<&str>,
         after: Option<(u64, u32)>, through_cursor: u64, max_events: usize, max_bytes: usize,
