@@ -82,9 +82,22 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
         .changed_refs[0]
         .clone();
     let execution_id = "heartbeat-agent-execution";
+    let projection = actions.project("program-dispatch").expect("projection");
+    let actor = agentic_claim_actor(
+        &projection,
+        &projection.agents[&member],
+        &task,
+        execution_id,
+    );
     let mut graph = ExecutionGraph::new("heartbeat Agent graph");
     graph.id = execution_id.to_string();
     crate::test_support::attach_execution_graph_lineage(&mut graph);
+    // The graph lease is only recognised when the graph's lineage is the very
+    // session/turn the actor acts in.
+    if let Some(lineage) = graph.lineage.as_mut() {
+        lineage.session_id = projection.session_id.clone();
+        lineage.turn_id = projection.turn_id.clone();
+    }
     let mut node = ExecutionNodeSpec::new(
         ExecutionNodeKind::AgentTask,
         AgentTaskExecutor::KIND,
@@ -92,6 +105,15 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
     );
     node.id = "heartbeat-agent-node".to_string();
     node.idempotency_key = "heartbeat-agent-node:1".to_string();
+    // The Agent actor proves ownership with the packet on its own AgentTask node.
+    node.payload_ref = serde_json::to_string(&crate::test_support::agent_task_packet_for_actor(
+        &projection,
+        &actor,
+        execution_id,
+        &node.id,
+        &task,
+    ))
+    .expect("fixture AgentTask packet");
     graph
         .node_statuses
         .insert(node.id.clone(), ExecutionNodeStatus::Planned);
@@ -100,13 +122,6 @@ async fn heartbeat_waits_for_the_agents_real_claim_and_stops_at_graph_terminal()
         .commit_service()
         .register_graph(graph)
         .expect("register graph");
-    let projection = actions.project("program-dispatch").expect("projection");
-    let actor = agentic_claim_actor(
-        &projection,
-        &projection.agents[&member],
-        &task,
-        execution_id,
-    );
     assert_eq!(
         agentic_claim_heartbeat_state(
             Arc::downgrade(services.as_ref()),

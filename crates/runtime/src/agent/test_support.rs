@@ -605,6 +605,75 @@ pub(crate) fn install_original_dispatch_session(
     (execution_id, lease)
 }
 
+/// Build the AgentTask packet a fixture graph node must carry so the Agent
+/// actor that owns that node is recognised as the physical lease holder.
+///
+/// The product accepts two proofs for an Agent actor: an original execution, or
+/// an active attempt lease on a running AgentTask node whose packet carries the
+/// matching program/agent/team/membership. Fixtures use this helper for the
+/// second proof.
+pub(crate) fn agent_task_packet_for_actor(
+    projection: &crate::agentic::AgenticProgramProjection,
+    actor: &harness_contract::agent_action::AgentActorBinding,
+    graph_id: &str,
+    node_id: &str,
+    task_ref: &str,
+) -> harness_contract::agent::AgentTaskPacket {
+    use harness_contract::agent::{AgenticExecutionBinding, AgenticExecutionFocus, AgentTaskPacket};
+    let agent_id = actor.agent_id.clone().unwrap_or_default();
+    let team_id = actor.team_id.clone().unwrap_or_default();
+    let membership_id = projection
+        .membership_for(&agent_id, &team_id)
+        .map(|membership| membership.membership_id.clone())
+        .unwrap_or_else(|| format!("membership:{agent_id}:{team_id}"));
+    AgentTaskPacket {
+        assignment: agent_assignment(
+            None,
+            &agent_id,
+            "fixture-run",
+            task_ref,
+            actor.session_id.as_str(),
+            "fixture-mission",
+            Some(team_id.as_str()),
+            graph_id,
+            node_id,
+        ),
+        attempt: 1,
+        expected_graph_revision: 0,
+        policy_revision: 1,
+        objective: "review".into(),
+        required_acceptance: Default::default(),
+        output_acceptance: Vec::new(),
+        acceptance: Vec::new(),
+        cohort_prompt_package: None,
+        constraints: Vec::new(),
+        context_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        resource_scopes: Vec::new(),
+        allowed_tools: Vec::new(),
+        allowed_skills: Vec::new(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        model_lease: "model".into(),
+        budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+            "budget", "agent", "agent", 1, u64::MAX, 1,
+        ),
+        deadline_at_ms: u64::MAX,
+        binding: None,
+        managed_invocation: None,
+        idempotency_key: "fixture-key".into(),
+        agentic_binding: Some(AgenticExecutionBinding {
+            program_id: actor.program_id.clone(),
+            agent_id: actor.agent_id.clone().unwrap_or_default(),
+            membership_id,
+            team_id: team_id.clone(),
+            task_team_id: team_id,
+            source_spec_revision: 0,
+            task_purpose: None,
+            focus: AgenticExecutionFocus::TaskExecute { task_ref: task_ref.to_string() },
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agent_assignment(
     definition_ref: Option<AgentDefinitionRevisionRef>,
