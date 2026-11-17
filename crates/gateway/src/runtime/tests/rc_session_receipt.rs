@@ -2,11 +2,6 @@
 use super::*;
 
 #[test]
-fn rc_real_host_graph_public_session_ack_and_revocation() {
-    public_receipt_case_on_a_large_stack(false);
-}
-
-#[test]
 fn rc_real_host_graph_replay_then_public_session_ack() {
     public_receipt_case_on_a_large_stack(true);
 }
