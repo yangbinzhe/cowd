@@ -419,10 +419,21 @@ pub(super) fn agent_autonomy_checkpoint(
     let mut actions = Vec::new();
     let mut requires_execution_tools = false;
     match (mode, task.status) {
-        ("execute", crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Rework)
-            if task.claimant.is_none()
-                && task.claim_execution_id.is_none()
-                && !already_declined =>
+        (
+            "execute",
+            crate::AgenticTaskStatus::Published
+            | crate::AgenticTaskStatus::Rework
+            | crate::AgenticTaskStatus::Claimed,
+        ) if !already_declined
+            && ((matches!(
+                task.status,
+                crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Rework
+            ) && task.claimant.is_none()
+                && task.claim_execution_id.is_none())
+                || (task.status == crate::AgenticTaskStatus::Claimed
+                    && task.claimant.as_deref() == Some(agent_id)
+                    && task.claim_execution_id.as_deref() == Some(packet.graph_id())
+                    && task.claim_renewal_streak == 0)) =>
         {
             actions.push(serde_json::json!({
                 "action": "decide_claim_or_decline",

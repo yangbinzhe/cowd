@@ -201,13 +201,16 @@ pub(super) fn validate_transition_with_admission_contexts(
                             && attempt.agent_id == envelope.actor.actor_id
                             && attempt.mode
                                 == harness_contract::agent_action::AgentAttemptMode::Execute
-                            && attempt.generation == task.claim_generation
+                            && attempt.generation.checked_add(1) == Some(task.claim_generation)
+                            && task.claim_renewal_streak == 0
                             && projection.agent_is_active_in(&attempt.agent_id, &task.team_id)
                     });
                     if !current
                         || !matches!(
                             task.status,
-                            AgenticTaskStatus::Published | AgenticTaskStatus::Rework
+                            AgenticTaskStatus::Published
+                                | AgenticTaskStatus::Rework
+                                | AgenticTaskStatus::Claimed
                         )
                     {
                         return Some((

@@ -3474,9 +3474,6 @@ impl AgentActionService {
         {
             return Err(AgentActionServiceError::Corrupt("new root action requires original physical execution".into()));
         }
-        if matches!(actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead) && physical.is_none() {
-            return Err(AgentActionServiceError::Corrupt("agent actor original execution required for new action".into()));
-        }
         if actor.kind == AgentActorKind::Supervisor && physical.is_some() {
             return Err(AgentActionServiceError::Corrupt("supervisor cannot borrow physical agent identity".into()));
         }
@@ -4280,6 +4277,30 @@ impl AgentActionService {
                 "agent action rejected at transition validation"
             );
             return Ok(rejected(envelope, projection.revision, code, &message));
+        }
+        if matches!(envelope.actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead)
+            && envelope.actor.original_execution.is_none()
+        {
+            let active_attempt = envelope.actor.execution_id.as_ref().and_then(|execution| {
+                projection.tasks.values().find_map(|task| {
+                    task.active_attempts
+                        .get(execution)
+                        .map(|attempt| (task, attempt))
+                })
+            });
+            let leased = !envelope.action.requires_original_physical_execution()
+                && active_attempt.is_some_and(|(task, attempt)| {
+                    envelope.actor.agent_id.as_deref() == Some(attempt.agent_id.as_str())
+                        && envelope.actor.agent_id.as_deref()
+                            == Some(envelope.actor.actor_id.as_str())
+                        && envelope.actor.team_id.as_deref() == Some(task.team_id.as_str())
+                        && projection.agent_is_active_in(&attempt.agent_id, &task.team_id)
+                });
+            if !leased {
+                return Err(AgentActionServiceError::Corrupt(
+                    "agent actor original execution or active attempt lease required".into(),
+                ));
+            }
         }
         if let Some(context) = completion_context {
             policy_sources.extend(context.sources().iter().cloned());
