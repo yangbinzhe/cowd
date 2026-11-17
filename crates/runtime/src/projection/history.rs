@@ -1635,6 +1635,21 @@ impl HistoryState {
                 } => BTreeMap::from([(node_id.clone(), binding.clone())]),
                 ExecutionGraphEvent::NodesStarted { bindings, .. }
                 | ExecutionGraphEvent::Checkpoint { bindings, .. } => bindings.clone(),
+                // A recovery event re-admits nodes and carries their leases under
+                // `lease_closures`, not `bindings`. Without this arm a recovered
+                // attempt advance looks unbound and the projection rejects a valid
+                // graph with the start-binding invariant.
+                ExecutionGraphEvent::Recovered { lease_closures, .. } => lease_closures
+                    .iter()
+                    .filter(|closure| {
+                        next.recovery_cursor
+                            .node_attempts
+                            .get(&closure.node_id)
+                            .copied()
+                            .is_some_and(|attempt| attempt == closure.binding.attempt)
+                    })
+                    .map(|closure| (closure.node_id.clone(), closure.binding.clone()))
+                    .collect(),
                 _ => BTreeMap::new(),
             };
             for (node_id, binding) in &bindings {
