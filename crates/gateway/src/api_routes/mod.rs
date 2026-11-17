@@ -44,6 +44,7 @@ use memory::MemoryScope;
 use session::{SessionRecord, UnifiedSessionStore};
 
 mod agent_routes;
+pub(crate) mod slash_controller;
 mod app_routes;
 mod approval_routes;
 mod audit_routes;
