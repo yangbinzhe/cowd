@@ -411,7 +411,7 @@ const ARTIFACT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
 }];
 
 mod event_store;
-pub use event_store::PostgresRuntimeEventStore;
+pub use event_store::{PgOwnedCommitControl, PgOwnedCommitState, PostgresRuntimeEventStore};
 mod task_store;
 pub use task_store::PostgresTaskStore;
 mod artifact_store;

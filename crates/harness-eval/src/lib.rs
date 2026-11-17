@@ -36,6 +36,7 @@ mod provider_cache_calibration;
 mod provider_rounds;
 mod facet_gate;
 mod observation_limit;
+mod outer_cleanup;
 mod real_provider_runner;
 pub(crate) mod report;
 mod report_store;
@@ -70,12 +71,19 @@ pub use provider_cache_calibration::{
     run_provider_cache_calibration, ProviderCacheCalibrationOptions,
 };
 pub use report::{
-    evaluate_agentic_program_closure, evaluate_report_gate, CapabilityResult, ExecutionTrace,
+    evaluate_agentic_program_closure, evaluate_report_gate, project_outer_cleanup_report,
+    CapabilityResult, ExecutionTrace, OuterCleanupProjection,
     HarnessEvalLevel, HarnessEvalReportDetail, HarnessEvalReportGate, HarnessEvalReportGateItem,
     HarnessEvalReportSummary, HarnessEvalRunRecord, HarnessEvalRunRequest, HarnessEvalRunStatus,
     HarnessEvalUsageSummary, HarnessMetric, MissionHarnessEvalReport, ProviderRoundDetail,
     ProviderRoundSummary, RealToolScenarioReport, RealToolScenarioResult, ToolCallDetail,
     ToolCallSummary, UsageSummary,
+};
+pub use outer_cleanup::{
+    apply_gate_verdict, apply_gate_verdict_to_scenario, observe_outer_cleanup, project_outer_cleanup,
+    project_scenario_artifact, receipt_digest,
+    verify_persisted_projection, OuterCleanupFacts, OuterCleanupGap, OuterCleanupReceipts,
+    ReceiptSources,
 };
 pub use report_store::{default_report_root, now_ms, HarnessEvalReportStore};
 pub use runner::{
@@ -2734,13 +2742,12 @@ impl RealCapabilityGateReport {
     ) -> Self {
         let total = gates.len();
         let passed = gates.iter().filter(|gate| gate.status == "passed").count();
-        let failed = gates
-            .iter()
-            .filter(|gate| gate.required && gate.status != "passed")
-            .count();
+        let (status, failed) = required_evidence_status(
+            gates.iter().filter(|gate| gate.required).map(|gate| gate.status.as_str()),
+        );
         Self {
             kind: "cowd.real_capability_gate_report".to_string(),
-            status: if failed == 0 { "passed" } else { "failed" }.to_string(),
+            status: status.to_string(),
             total,
             passed,
             failed,
@@ -2750,6 +2757,23 @@ impl RealCapabilityGateReport {
             gates,
         }
     }
+}
+
+/// Preserve missing evidence as an unaccepted state without counting it as a
+/// proven business failure. Unknown status values fail closed as incomplete.
+pub(crate) fn required_evidence_status<'a>(statuses: impl IntoIterator<Item = &'a str>) -> (&'static str, usize) {
+    let mut failed = 0;
+    let mut uncertain = false;
+    let mut incomplete = false;
+    for status in statuses {
+        match status {
+            "passed" => {}
+            "failed" => failed += 1,
+            "uncertain" => uncertain = true,
+            _ => incomplete = true,
+        }
+    }
+    (if failed > 0 { "failed" } else if incomplete { "incomplete" } else if uncertain { "uncertain" } else { "passed" }, failed)
 }
 
 impl StableAiHealthReport {
@@ -2803,11 +2827,7 @@ impl StableAiHealthReport {
         recovery_evidence: impl Into<String>,
         real_capability_result: RealCapabilityGateReport,
     ) -> Self {
-        let status = if real_capability_result.failed == 0 && coverage.failed == 0 {
-            "passed"
-        } else {
-            "failed"
-        };
+        let status = if coverage.failed > 0 { "failed" } else { real_capability_result.status.as_str() };
         Self {
             kind: "cowd.stable_ai_health_report".to_string(),
             version: version.into(),
@@ -2829,6 +2849,14 @@ impl StableAiHealthReport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn required_evidence_status_never_promotes_unknown_or_counts_it_as_failure() {
+        assert_eq!(super::required_evidence_status(["passed", "uncertain"]), ("uncertain", 0));
+        assert_eq!(super::required_evidence_status(["passed", "incomplete"]), ("incomplete", 0));
+        assert_eq!(super::required_evidence_status(["passed", "unexpected"]), ("incomplete", 0));
+        assert_eq!(super::required_evidence_status(["uncertain", "failed"]), ("failed", 1));
+        assert_eq!(super::required_evidence_status(["passed", "passed"]), ("passed", 0));
+    }
     use super::*;
 
     #[test]

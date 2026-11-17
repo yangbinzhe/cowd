@@ -31,6 +31,91 @@ struct SessionOwnerReadCharge {
     pages: usize,
 }
 
+/// A single PostgreSQL transaction's cancel/commit decision. A cancellation
+/// request is not an acknowledgement: only `RolledBack` confirms no commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgOwnedCommitState { Ready, Running, CancelRequested, Committing, Committed, RolledBack, Unknown }
+
+pub struct PgOwnedCommitControl {
+    state: std::sync::Mutex<PgOwnedCommitState>,
+    changed: std::sync::Condvar,
+    #[cfg(feature = "test-fixtures")]
+    precommit_probe: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Default for PgOwnedCommitControl {
+    fn default() -> Self { Self { state: std::sync::Mutex::new(PgOwnedCommitState::Ready), changed: std::sync::Condvar::new(),
+        #[cfg(feature = "test-fixtures")] precommit_probe: std::sync::Mutex::new(None) } }
+}
+
+impl PgOwnedCommitControl {
+    /// Returns true only if cancellation won before commit's decision point.
+    /// The caller must still wait for `RolledBack` before claiming success.
+    pub fn request_cancel(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            PgOwnedCommitState::Ready | PgOwnedCommitState::Running => { *state = PgOwnedCommitState::CancelRequested; true }
+            PgOwnedCommitState::CancelRequested => true,
+            _ => false,
+        }
+    }
+
+    pub fn state(&self) -> PgOwnedCommitState {
+        *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    pub fn set_precommit_probe(&self, probe: impl FnOnce() + Send + 'static) {
+        *self.precommit_probe.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(probe));
+    }
+
+    fn finish(&self, value: PgOwnedCommitState) {
+        *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+        self.changed.notify_all();
+    }
+
+    /// Bounded wait: timeout and unknown transaction outcomes never become a
+    /// successful cancellation or a successful commit.
+    pub fn wait_terminal(&self, timeout: std::time::Duration) -> PgOwnedCommitState {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self.changed.wait_timeout_while(state, timeout, |value|
+            matches!(value, PgOwnedCommitState::Ready | PgOwnedCommitState::Running | PgOwnedCommitState::CancelRequested | PgOwnedCommitState::Committing)
+        ).unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state
+    }
+}
+
+impl runtime::RuntimeTransactionCommitControl for PgOwnedCommitControl {
+    fn request_cancel(&self) -> bool { PgOwnedCommitControl::request_cancel(self) }
+    fn begin(&self) -> Result<bool, String> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            PgOwnedCommitState::Ready => { *state = PgOwnedCommitState::Running; Ok(true) }
+            PgOwnedCommitState::CancelRequested => { *state = PgOwnedCommitState::RolledBack; self.changed.notify_all(); Ok(false) }
+            _ => Err("transaction control already used".into()),
+        }
+    }
+    fn before_commit(&self) {
+        #[cfg(feature = "test-fixtures")]
+        if let Some(probe) = self.precommit_probe.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() { probe(); }
+    }
+    fn commit_wins(&self) -> Result<bool, String> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            PgOwnedCommitState::CancelRequested => Ok(false),
+            PgOwnedCommitState::Running => { *state = PgOwnedCommitState::Committing; Ok(true) }
+            _ => Err("transaction decision state invalid".into()),
+        }
+    }
+    fn finish(&self, outcome: runtime::RuntimeTransactionOutcome) {
+        self.finish(match outcome {
+            runtime::RuntimeTransactionOutcome::Committed => PgOwnedCommitState::Committed,
+            runtime::RuntimeTransactionOutcome::RolledBack => PgOwnedCommitState::RolledBack,
+            runtime::RuntimeTransactionOutcome::Unknown => PgOwnedCommitState::Unknown,
+        });
+    }
+}
+
 struct PgOwnedCommitGuard<'a>(&'a dyn runtime::RuntimeTransactionCommitControl, bool);
 impl Drop for PgOwnedCommitGuard<'_> {
     fn drop(&mut self) {
@@ -1234,6 +1319,94 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         self.position_page_classified(scope, identity, kind, after, through_cursor, max_events, max_bytes)
             .map_err(|error| error.to_string())
+    }
+    fn timeline_event_range(&self, request: &runtime::TimelineEventRangeRequest<'_>) -> Result<Option<runtime::TimelineEventRange>, String> {
+        request.validate()?;
+        let cursor = to_i64(request.commit_cursor, "commit_cursor").map_err(|e| e.to_string())?;
+        let offset = i64::try_from(request.offset).map_err(|_| "timeline range offset overflow")?;
+        let limit = i32::try_from(request.limit).map_err(|_| "timeline range limit overflow")?;
+        let mut connection = self.checkout_event_read().map_err(|e| e.to_string())?;
+        // Keep this session predicate identical to position_page_classified.
+        // Only the page bytes and scalar digest/length cross the driver boundary.
+        // The database may materialize the source JSONB while computing them.
+        let rows = connection.query(
+            r#"WITH selected AS MATERIALIZED (
+                SELECT CASE WHEN scope <> 'execution_graph' AND kind <> 'goal.observation' THEN
+                    convert_to(jsonb_build_object(
+                        'event_id', event_id, 'stream_id', stream_id, 'sequence', sequence,
+                        'scope', scope, 'kind', kind, 'status', status, 'refs', refs,
+                        'payload', payload, 'created_at_ms', created_at_ms,
+                        'commit_cursor', commit_cursor, 'transaction_index', transaction_index
+                    )::text, 'UTF8') END AS wire
+                FROM runtime_events
+                WHERE (session_id=$1 OR stream_id=$1 OR stream_id='session:'||$1
+                    OR refs @> jsonb_build_array(jsonb_build_object('kind','session','id',$1::text)))
+                    AND event_id=$2 AND (commit_cursor,transaction_index)=($3,$4)
+            )
+            SELECT wire IS NULL, octet_length(wire)::bigint, encode(sha256(wire),'hex'),
+                CASE WHEN $5::bigint >= octet_length(wire)::bigint THEN ''::bytea
+                    ELSE substring(wire FROM ($5::bigint+1)::integer FOR $6::integer) END
+            FROM selected"#,
+            &[&request.session_id, &request.event_id, &cursor, &i64::from(request.transaction_index), &offset, &limit],
+        ).map_err(|_| "timeline event range read failed")?;
+        let Some(row) = rows.first() else { return Ok(None) };
+        if row.get::<_, bool>(0) { return Err("timeline event range unsupported for hydrated content".into()); }
+        let total = from_i64(row.get::<_, i64>(1), "timeline projection bytes").map_err(|e| e.to_string())?;
+        if request.offset > total { return Err("timeline event range offset beyond projection".into()); }
+        let digest: String = row.get(2);
+        let bytes: Vec<u8> = row.get(3);
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+            || bytes.len() > request.limit || (bytes.len() as u64) > total - request.offset {
+            return Err("invalid timeline event range metadata".into());
+        }
+        let end = request.offset + bytes.len() as u64;
+        if end < total && bytes.is_empty() { return Err("timeline event range made no progress".into()); }
+        Ok(Some(runtime::TimelineEventRange {
+            session_id: request.session_id.into(), event_id: request.event_id.into(),
+            commit_cursor: request.commit_cursor, transaction_index: request.transaction_index,
+            offset: request.offset, total_bytes: total, projection_sha256: format!("sha256:{digest}"),
+            digest_basis: "server_computed_public_projection_bytes", format: "timeline_public_projection_json_v1",
+            bytes, next_offset: (end < total).then_some(end),
+        }))
+    }
+    fn timeline_oversize_descriptor(&self, session: &str, after: Option<(u64, u32)>, through: u64, event_id: &str) -> Result<Option<runtime::TimelineOversizeDescriptor>, String> {
+        if session.is_empty() || session.len() > 1024 || event_id.len() > 1024 { return Err("HistoryBudgetExceeded: descriptor identity".into()); }
+        let (cursor, index) = after.unwrap_or((0, 0));
+        let cursor = to_i64(cursor, "after_cursor").map_err(|e| e.to_string())?;
+        let through = to_i64(through, "through_cursor").map_err(|e| e.to_string())?;
+        let mut connection = self.checkout_event_read().map_err(|e| e.to_string())?;
+        // LIMIT and CASE bound every string returned by the driver. The predicate
+        // and order are identical to the session position page, including refs.
+        let rows = connection.query(
+            r#"SELECT CASE WHEN octet_length(event_id)<=1024 THEN event_id END,
+                CASE WHEN octet_length(stream_id)<=1024 THEN stream_id END, sequence,
+                CASE WHEN octet_length(scope)<=1024 THEN scope END,
+                CASE WHEN octet_length(kind)<=1024 THEN kind END,
+                created_at_ms, commit_cursor, transaction_index, encoded_bytes,
+                CASE WHEN scope='execution_graph' AND octet_length(payload->>'sha256')=71
+                    THEN payload->>'sha256'
+                    WHEN scope<>'execution_graph' AND kind='goal.observation'
+                        AND octet_length(payload#>>'{observation_body,sha256}')=71
+                    THEN payload#>>'{observation_body,sha256}' END,
+                CASE WHEN scope='execution_graph' AND jsonb_typeof(payload->'bytes')='number'
+                        AND octet_length(payload->>'bytes')<=20 THEN payload->>'bytes'
+                    WHEN scope<>'execution_graph' AND kind='goal.observation'
+                        AND jsonb_typeof(payload#>'{observation_body,bytes}')='number'
+                        AND octet_length(payload#>>'{observation_body,bytes}')<=20
+                    THEN payload#>>'{observation_body,bytes}' END
+              FROM runtime_events
+              WHERE (session_id=$1 OR stream_id=$1 OR stream_id='session:'||$1
+                OR refs @> jsonb_build_array(jsonb_build_object('kind','session','id',$1::text)))
+                AND (commit_cursor,transaction_index)>($2,$3) AND commit_cursor<=$4
+              ORDER BY commit_cursor,transaction_index LIMIT 1"#,
+            &[&session, &cursor, &i64::from(index), &through],
+        ).map_err(|_| "timeline descriptor read failed")?;
+        let Some(row) = rows.first() else { return Ok(None) };
+        let required = |i| row.get::<_, Option<String>>(i).ok_or_else(|| "HistoryBudgetExceeded: descriptor identity".to_string());
+        let id = required(0)?;
+        if id != event_id { return Err("timeline descriptor position changed".into()); }
+        let number = |i, name| from_i64(row.get::<_, i64>(i), name).map_err(|e| e.to_string());
+        Ok(Some(runtime::TimelineOversizeDescriptor { event_id: id, stream_id: required(1)?, sequence: number(2, "sequence")?, original_scope: RuntimeEventScope::parse(&required(3)?).map_err(|e| e.to_string())?, original_kind: required(4)?, created_at_ms: number(5, "created_at_ms")?, commit_cursor: number(6, "commit_cursor")?, transaction_index: u32::try_from(number(7, "transaction_index")?).map_err(|_| "transaction_index overflow")?, encoded_bytes: number(8, "encoded_bytes")?, digest: row.get(9), content_bytes: row.get::<_, Option<String>>(10).and_then(|s| s.parse().ok()) }))
     }
     fn position_page_classified(
         &self,
