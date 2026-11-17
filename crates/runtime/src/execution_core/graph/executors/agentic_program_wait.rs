@@ -1171,6 +1171,70 @@ mod tests {
         }
     }
 
+    /// The Task an action acts on, when it acts on one.
+    fn action_task_ref(action: &AgentAction) -> String {
+        match action {
+            AgentAction::TaskClaim(input) => input.task_ref.clone(),
+            AgentAction::TaskSubmit(input) => input.task_ref.clone(),
+            AgentAction::TaskReview(input) => input.task_ref.clone(),
+            AgentAction::TaskAttemptFail(input) => input.task_ref.clone(),
+            _ => "task:unknown".to_string(),
+        }
+    }
+
+    /// An Agent actor that no Program Task is bound to.
+    ///
+    /// Some fixtures register a child graph that no Agent acts under; the
+    /// graph still needs a well-formed AgentTask packet.
+    fn unbound_agent_actor(program_id: &str, child_id: &str) -> AgentActorBinding {
+        AgentActorBinding {
+            original_execution: None,
+            objective_id: format!("objective:{program_id}"),
+            program_id: program_id.to_string(),
+            session_id: format!("session:{program_id}"),
+            turn_id: format!("turn:{program_id}"),
+            root_execution_id: None,
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: "unbound child fixture".to_string(),
+            model_lease: "test".to_string(),
+            permission_ceiling: Some(PermissionMode::ReadOnly),
+            resource_scopes: Vec::new(),
+            actor_id: "agent:unbound".to_string(),
+            kind: AgentActorKind::Agent,
+            execution_id: Some(child_id.to_string()),
+            // The packet needs a Team identity even when no Agent is bound to
+            // the child graph.
+            team_id: Some(format!("team:{program_id}")),
+            agent_id: Some("agent:unbound".to_string()),
+        }
+    }
+
+    /// Register the attempt lease an Agent actor acts under.
+    ///
+    /// The product accepts two proofs for an Agent actor: an original execution,
+    /// or an active attempt lease on an AgentTask node whose packet carries the
+    /// matching program/agent/team/membership. These fixtures have no original
+    /// execution, so they register the lease graph instead.
+    fn register_agent_lease(
+        services: &RuntimeServices,
+        actor: &AgentActorBinding,
+        task_ref: &str,
+    ) {
+        let projection = services
+            .agent_action_service()
+            .project(&actor.program_id)
+            .expect("program projection");
+        let graph_id = actor.execution_id.clone().expect("agent execution id");
+        crate::test_support::register_agent_lease_graph(
+            services.event_store(),
+            &projection,
+            actor,
+            &graph_id,
+            task_ref,
+        );
+    }
+
     fn open_program(services: &RuntimeServices, program_id: &str, root_execution_id: &str) {
         let observation = services
             .agent_action_service()
@@ -1274,6 +1338,7 @@ mod tests {
             &root_parent_node,
             program_id,
             "agent-child-after-invite",
+            &unbound_agent_actor(program_id, "agent-child-after-invite"),
         );
 
         let dispatched = services
@@ -1378,6 +1443,7 @@ mod tests {
         parent_node_id: &str,
         program_id: &str,
         child_id: &str,
+        actor: &AgentActorBinding,
     ) {
         let mut graph = ExecutionGraph::new("Agentic child");
         graph.id = child_id.to_string();
@@ -1392,10 +1458,23 @@ mod tests {
             execution_id: root_execution_id.to_string(),
             node_id: parent_node_id.to_string(),
         });
+        // The child graph is the Agent's own execution graph, so its node must
+        // carry the AgentTask packet that proves the actor owns the lease.
+        let projection = services
+            .agent_action_service()
+            .project(program_id)
+            .expect("program projection");
         let mut node = ExecutionNodeSpec::new(
             ExecutionNodeKind::AgentTask,
             AgentTaskExecutor::KIND,
-            "test-only-unbound-packet",
+            serde_json::to_string(&crate::test_support::agent_task_packet_for_actor(
+                &projection,
+                actor,
+                child_id,
+                &format!("{child_id}:agent"),
+                &format!("task:{child_id}"),
+            ))
+            .expect("AgentTask packet"),
         );
         node.id = format!("{child_id}:agent");
         node.idempotency_key = format!("{child_id}:agent:attempt");
@@ -1439,6 +1518,7 @@ mod tests {
             &wait_node,
             program_id,
             "agent-child-left",
+            &unbound_agent_actor(program_id, "agent-child-left"),
         );
         register_agent_child(
             &services,
@@ -1446,6 +1526,7 @@ mod tests {
             &wait_node,
             program_id,
             "agent-child-right",
+            &unbound_agent_actor(program_id, "agent-child-right"),
         );
 
         let (_, report) = services
@@ -1523,6 +1604,7 @@ mod tests {
             &wait_node,
             program_id,
             "agent-child-startup",
+            &unbound_agent_actor(program_id, "agent-child-startup"),
         );
         services
             .execution_supervisor()
@@ -1568,6 +1650,7 @@ mod tests {
             &wait_node,
             program_id,
             "agent-child-event",
+            &unbound_agent_actor(program_id, "agent-child-event"),
         );
         services
             .execution_supervisor()
@@ -1615,6 +1698,9 @@ mod tests {
         let actions = services.agent_action_service();
         let root = root_actor(program_id, root_id);
         let apply = |action_id: &str, actor: &AgentActorBinding, action: AgentAction| {
+            if matches!(actor.kind, AgentActorKind::Agent) {
+                register_agent_lease(&services, actor, &action_task_ref(&action));
+            }
             actions
                 .apply(&AgentActionEnvelope {
                     action_id: action_id.to_string(),
@@ -1703,6 +1789,7 @@ mod tests {
             &wait_node,
             program_id,
             "agent-child-last-settle",
+            &agent_actor,
         );
         services
             .execution_supervisor()
@@ -2065,12 +2152,22 @@ mod tests {
             .expect("publish Task")
             .changed_refs[0]
             .clone();
+        let child_all_accepted_actor = {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = worker.clone();
+            actor.team_id = Some(team_ref.clone());
+            actor.agent_id = Some(worker.clone());
+            actor.execution_id = Some("child-all-accepted".to_string());
+            actor
+        };
         register_agent_child(
             &services,
             root_id,
             &wait_node,
             program_id,
             "child-all-accepted",
+            &child_all_accepted_actor,
         );
         services
             .execution_supervisor()
@@ -2287,7 +2384,23 @@ mod tests {
             .expect("publish Task")
             .changed_refs[0]
             .clone();
-        register_agent_child(&services, root_id, &wait_node, program_id, "child-racy");
+        let child_racy_actor = {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = worker.clone();
+            actor.team_id = Some(team_ref.clone());
+            actor.agent_id = Some(worker.clone());
+            actor.execution_id = Some("child-racy".to_string());
+            actor
+        };
+        register_agent_child(
+            &services,
+            root_id,
+            &wait_node,
+            program_id,
+            "child-racy",
+            &child_racy_actor,
+        );
         services
             .execution_supervisor()
             .drive_registered(root_id)
@@ -2484,7 +2597,23 @@ mod tests {
             .expect("publish Task")
             .changed_refs[0]
             .clone();
-        register_agent_child(&services, root_id, &wait_node, program_id, "child-rearm");
+        let child_rearm_actor = {
+            let mut actor = root.clone();
+            actor.kind = AgentActorKind::Agent;
+            actor.actor_id = worker.clone();
+            actor.team_id = Some(team_ref.clone());
+            actor.agent_id = Some(worker.clone());
+            actor.execution_id = Some("child-rearm".to_string());
+            actor
+        };
+        register_agent_child(
+            &services,
+            root_id,
+            &wait_node,
+            program_id,
+            "child-rearm",
+            &child_rearm_actor,
+        );
         services
             .execution_supervisor()
             .drive_registered(root_id)
@@ -2695,6 +2824,7 @@ mod tests {
             actor.execution_id = Some("agent-child-submitted".to_string());
             actor
         };
+        register_agent_lease(&services, &agent_actor, &task);
         actions
             .apply(&AgentActionEnvelope {
                 action_id: "submitted-claim".to_string(),

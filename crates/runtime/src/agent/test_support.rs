@@ -605,6 +605,69 @@ pub(crate) fn install_original_dispatch_session(
     (execution_id, lease)
 }
 
+/// Register the graph an Agent actor uses to prove it holds a live attempt
+/// lease, and check that the registered graph really carries that proof.
+///
+/// The product accepts two proofs for an Agent actor: an original execution, or
+/// an active attempt lease on an AgentTask node whose packet carries the
+/// matching program/agent/team/membership. Fixtures that have no original
+/// execution use this helper for the second proof.
+pub(crate) fn register_agent_lease_graph(
+    store: &Arc<crate::RuntimeEventStore>,
+    projection: &crate::agentic::AgenticProgramProjection,
+    actor: &harness_contract::agent_action::AgentActorBinding,
+    graph_id: &str,
+    task_ref: &str,
+) {
+    let graphs = crate::ExecutionGraphStateStore::new(Arc::clone(store));
+    let registered = graphs.load(graph_id).is_ok();
+    if !registered {
+        let graph = agent_lease_graph(projection, actor, graph_id, task_ref);
+        crate::ExecutionCommitService::new(Arc::clone(store))
+            .register_graph(graph)
+            .expect("register agent lease graph");
+    }
+}
+
+/// Build the graph an Agent actor uses to prove it holds a live attempt lease.
+///
+/// The product accepts two proofs for an Agent actor: an original execution, or
+/// an active attempt lease on an AgentTask node whose packet carries the
+/// matching program/agent/team/membership. Fixtures that have no original
+/// execution register this graph so the lease matches.
+pub(crate) fn agent_lease_graph(
+    projection: &crate::agentic::AgenticProgramProjection,
+    actor: &harness_contract::agent_action::AgentActorBinding,
+    graph_id: &str,
+    task_ref: &str,
+) -> ExecutionGraph {
+    use harness_contract::execution_graph::{
+        ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+    };
+    let mut graph = ExecutionGraph::new("Agent attempt lease");
+    graph.id = graph_id.to_string();
+    graph.lineage = Some(ExecutionGraphLineage {
+        session_id: actor.session_id.clone(),
+        turn_id: actor.turn_id.clone(),
+        root_task_id: format!("task:{}", graph_id),
+        task_id: format!("task:{}", task_ref),
+        generation: 1,
+    });
+    let mut node = ExecutionNodeSpec::new(
+        ExecutionNodeKind::AgentTask,
+        crate::execution_core::graph::executors::AgentTaskExecutor::KIND,
+        "Agent attempt lease",
+    );
+    node.id = format!("{graph_id}:agent");
+    node.idempotency_key = format!("{graph_id}:agent:1");
+    node.payload_ref = serde_json::to_string(&agent_task_packet_for_actor(
+        projection, actor, graph_id, &node.id, task_ref,
+    ))
+    .expect("AgentTask packet");
+    graph.nodes.push(node);
+    graph
+}
+
 /// Build the AgentTask packet a fixture graph node must carry so the Agent
 /// actor that owns that node is recognised as the physical lease holder.
 ///

@@ -404,7 +404,7 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         forged.error.unwrap().code,
         "offer_requires_bound_team_agent"
     );
-    let offer = agent(
+    let offer = agent_with_lease(&services, 
         "own-offer",
         &team,
         &volunteer,
@@ -517,7 +517,7 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         actions.apply(&occupied).unwrap().error.unwrap().code,
         "agent_has_active_opportunity"
     );
-    let decline = agent(
+    let decline = agent_with_lease(&services, 
         "volunteer-declines-original",
         &team,
         &volunteer,
@@ -1173,7 +1173,7 @@ fn dispatch_rank_spreads_independent_tasks_to_idle_members() {
         .changed_refs[0]
         .clone();
     actions
-        .apply(&agent(
+        .apply(&agent_with_lease(&services, 
             "busy-claim",
             &team,
             &busy,
@@ -1792,7 +1792,7 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
     let missing_execution = "agentic-graph:missing-after-crash";
     assert_eq!(
         actions
-            .apply(&agent(
+            .apply(&agent_with_lease(&services, 
                 "orphan-claim",
                 &team,
                 &member,
@@ -1898,7 +1898,8 @@ async fn one_shot_fixture() -> (
         .clone();
     let execution = "one-shot-execution".to_string();
     actions
-        .apply(&agent(
+        .apply(&agent_with_lease(
+            &services,
             "one-shot-claim",
             &team,
             &author,

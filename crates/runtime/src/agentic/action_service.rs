@@ -3474,6 +3474,19 @@ impl AgentActionService {
         {
             return Err(AgentActionServiceError::Corrupt("new root action requires original physical execution".into()));
         }
+        if matches!(actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead) && physical.is_none() {
+            // An Agent actor proves its physical ownership either with an original
+            // execution or with a live attempt lease. The lease proof is read here,
+            // before the action's own transition is validated, so a caller that owns
+            // neither dies at the identity gate instead of at a later requirement.
+            let leased = self
+                .project(&actor.program_id)
+                .ok()
+                .is_some_and(|projection| self.agent_actor_lease_proof(envelope, &projection));
+            if !leased {
+                return Err(AgentActionServiceError::Corrupt("agent actor original execution required for new action".into()));
+            }
+        }
         if actor.kind == AgentActorKind::Supervisor && physical.is_some() {
             return Err(AgentActionServiceError::Corrupt("supervisor cannot borrow physical agent identity".into()));
         }
@@ -3626,6 +3639,32 @@ impl AgentActionService {
         }
         if matches != 1 { return Err(bad("agent actor original business dispatch missing or ambiguous")); }
         Ok(Some(ExpectedStreamRevision { stream_id: graph.id, expected_revision: graph.revision }))
+    }
+
+    /// The two proofs an Agent actor may use instead of an original execution:
+    /// an active attempt on a Program task, or an AgentTask node lease.
+    fn agent_actor_lease_proof(
+        &self,
+        envelope: &AgentActionEnvelope,
+        projection: &AgenticProgramProjection,
+    ) -> bool {
+        if envelope.action.requires_original_physical_execution() {
+            return false;
+        }
+        let active_attempt = envelope.actor.execution_id.as_ref().and_then(|execution| {
+            projection.tasks.values().find_map(|task| {
+                task.active_attempts
+                    .get(execution)
+                    .map(|attempt| (task, attempt))
+            })
+        });
+        let leased = active_attempt.is_some_and(|(task, attempt)| {
+            envelope.actor.agent_id.as_deref() == Some(attempt.agent_id.as_str())
+                && envelope.actor.agent_id.as_deref() == Some(envelope.actor.actor_id.as_str())
+                && envelope.actor.team_id.as_deref() == Some(task.team_id.as_str())
+                && projection.agent_is_active_in(&attempt.agent_id, &task.team_id)
+        });
+        leased || self.agent_graph_lease_matches(envelope, projection)
     }
 
     fn agent_graph_lease_matches(
@@ -4329,29 +4368,11 @@ impl AgentActionService {
         }
         if matches!(envelope.actor.kind, AgentActorKind::Agent | AgentActorKind::TeamLead)
             && envelope.actor.original_execution.is_none()
+            && !self.agent_actor_lease_proof(envelope, &projection)
         {
-            let active_attempt = envelope.actor.execution_id.as_ref().and_then(|execution| {
-                projection.tasks.values().find_map(|task| {
-                    task.active_attempts
-                        .get(execution)
-                        .map(|attempt| (task, attempt))
-                })
-            });
-            let leased = !envelope.action.requires_original_physical_execution()
-                && active_attempt.is_some_and(|(task, attempt)| {
-                    envelope.actor.agent_id.as_deref() == Some(attempt.agent_id.as_str())
-                        && envelope.actor.agent_id.as_deref()
-                            == Some(envelope.actor.actor_id.as_str())
-                        && envelope.actor.team_id.as_deref() == Some(task.team_id.as_str())
-                        && projection.agent_is_active_in(&attempt.agent_id, &task.team_id)
-                });
-            let graph_leased = !envelope.action.requires_original_physical_execution()
-                && self.agent_graph_lease_matches(envelope, &projection);
-            if !leased && !graph_leased {
-                return Err(AgentActionServiceError::Corrupt(
-                    "agent actor original execution or active attempt lease required".into(),
-                ));
-            }
+            return Err(AgentActionServiceError::Corrupt(
+                "agent actor original execution required for new action".into(),
+            ));
         }
         if let Some(context) = completion_context {
             policy_sources.extend(context.sources().iter().cloned());

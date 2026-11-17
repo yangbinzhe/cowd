@@ -190,6 +190,48 @@ pub(super) fn root(action_id: &str, action: AgentAction) -> AgentActionEnvelope 
     }
 }
 
+/// An Agent actor that holds a registered attempt lease.
+///
+/// The product accepts two proofs for an Agent actor: an original execution, or
+/// an active attempt lease on an AgentTask node whose packet carries the
+/// matching program/agent/team/membership. These fixtures have no original
+/// execution, so they register the lease graph instead.
+pub(super) fn agent_with_lease(
+    services: &RuntimeServices,
+    action_id: &str,
+    team_id: &str,
+    agent_id: &str,
+    execution_id: &str,
+    action: AgentAction,
+) -> AgentActionEnvelope {
+    let envelope = agent(action_id, team_id, agent_id, execution_id, action);
+    register_agent_lease_graph(services, &envelope);
+    envelope
+}
+
+/// Register the attempt lease an Agent actor acts under.
+pub(super) fn register_agent_lease_graph(
+    services: &RuntimeServices,
+    envelope: &AgentActionEnvelope,
+) {
+    let projection = services
+        .agent_action_service()
+        .project(&envelope.actor.program_id)
+        .expect("program projection");
+    let graph_id = envelope
+        .actor
+        .execution_id
+        .clone()
+        .expect("agent execution id");
+    crate::test_support::register_agent_lease_graph(
+        services.event_store(),
+        &projection,
+        &envelope.actor,
+        &graph_id,
+        &envelope.actor.objective_id,
+    );
+}
+
 pub(super) fn agent(
     action_id: &str,
     team_id: &str,

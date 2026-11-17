@@ -164,9 +164,10 @@ fn t_refused_admitted_call_writes_one_consumable_rejection_fact() {
 #[test]
 fn own832_retirement_execute_preserves_preclaim_and_claim_identity_fences() {
     let store = Arc::new(RuntimeEventStore::for_test());
-    let service = AgentActionService::new(store);
+    let service = AgentActionService::new(Arc::clone(&store));
     let (_, worker, _, task_ref) = team_with_reviewer_and_task(
         &service,
+        &store,
         "own832",
         "original evidence",
         Default::default(),
@@ -415,6 +416,69 @@ fn managed(
         expected_revision: None,
         action,
     }
+}
+
+/// Register the attempt lease an Agent actor acts under.
+///
+/// The product accepts two proofs for an Agent actor: an original execution, or
+/// an active attempt lease on an AgentTask node whose packet carries the
+/// matching program/agent/team/membership. These fixtures have no original
+/// execution, so they register the lease graph instead.
+fn register_agent_lease_graph(
+    service: &AgentActionService,
+    store: &Arc<RuntimeEventStore>,
+    envelope: &AgentActionEnvelope,
+    task_ref: &str,
+) {
+    let projection = service
+        .project(&envelope.actor.program_id)
+        .expect("program projection");
+    let graph_id = envelope
+        .actor
+        .execution_id
+        .clone()
+        .expect("agent execution id");
+    crate::test_support::register_agent_lease_graph(
+        store,
+        &projection,
+        &envelope.actor,
+        &graph_id,
+        task_ref,
+    );
+}
+
+/// The Task an action acts on, when it acts on one.
+fn action_task_ref(action: &AgentAction) -> Option<&str> {
+    match action {
+        AgentAction::TaskClaim(input) => Some(&input.task_ref),
+        AgentAction::TaskRelease(input) => Some(&input.task_ref),
+        AgentAction::TaskSupersede(input) => Some(&input.task_ref),
+        AgentAction::TaskWithdraw(input) => Some(&input.task_ref),
+        AgentAction::TaskAttemptFail(input) => Some(&input.task_ref),
+        AgentAction::TaskSubmit(input) => Some(&input.task_ref),
+        AgentAction::TaskReview(input) => Some(&input.task_ref),
+        _ => None,
+    }
+}
+
+/// An Agent actor that holds a registered attempt lease.
+fn managed_with_lease(
+    service: &AgentActionService,
+    store: &Arc<RuntimeEventStore>,
+    action_id: &str,
+    team_id: &str,
+    agent_id: &str,
+    action: AgentAction,
+) -> AgentActionEnvelope {
+    let task_ref = action_task_ref(&action)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("task:{}", agent_id));
+    let mut envelope = managed(action_id, team_id, agent_id, action);
+    // One physical Agent execution belongs to one Team, so the execution
+    // identity carries the Team the actor acts in.
+    envelope.actor.execution_id = Some(format!("execution:{agent_id}:{team_id}"));
+    register_agent_lease_graph(service, store, &envelope, &task_ref);
+    envelope
 }
 
 fn supervisor(action_id: &str, execution_id: &str, action: AgentAction) -> AgentActionEnvelope {
@@ -1409,7 +1473,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
     let peer = invite("topic-peer", &team_a, "Peer");
     let cross_team_peer = invite("topic-cross-peer", &team_b, "Synthesizer");
     service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "program-broadcast",
             &team_a,
             &author,
@@ -1425,7 +1489,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         ))
         .expect("Program broadcast");
     service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "team-a-message",
             &team_a,
             &author,
@@ -1464,7 +1528,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         })
         .expect("acknowledge cross-Team page");
 
-    let restarted = AgentActionService::new(store);
+    let restarted = AgentActionService::new(Arc::clone(&store));
     assert!(restarted
         .topic_observations(
             "program-1",
@@ -1557,7 +1621,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
     }
     assert_eq!(seen.len() as u64, detail["coverage"]["total"].as_u64().unwrap(), "every original topic entry must be returned once");
     let foreign = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "foreign-topic",
             &team_b,
             &cross_team_peer,
@@ -1572,7 +1636,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
     assert_eq!(foreign["not_found"], true);
     assert!(!foreign.to_string().contains("Team-only"));
     let replay = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "foreign-cursor",
             &team_a,
             &peer,
@@ -1601,7 +1665,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .changed_refs[0]
         .clone();
     let denied = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "private-inspect",
             &team_a,
             &peer,
@@ -1614,7 +1678,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .projection
         .unwrap();
     assert_eq!(denied["not_found"], true);
-    let mut lead = managed(
+    let mut lead = managed_with_lease(&service, &store, 
         "lead-private-inspect",
         &team_a,
         &peer,
@@ -1639,7 +1703,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         ))
         .unwrap();
     let unchanged = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "old-run-after-join",
             &team_b,
             &cross_team_peer,
@@ -1656,7 +1720,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         "new membership cannot broaden the old run's Team binding"
     );
     let new_scope = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "new-run-team-scope",
             &team_a,
             &cross_team_peer,
@@ -1697,7 +1761,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
     let directory: StateInspectInput =
         serde_json::from_value(new_scope["directory_request"].clone()).unwrap();
     let first_page = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "scoped-page",
             &team_a,
             &cross_team_peer,
@@ -1709,7 +1773,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
     let next: StateInspectInput =
         serde_json::from_value(first_page["next_request"].clone()).unwrap();
     let valid_next = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "same-scope-page",
             &team_a,
             &cross_team_peer,
@@ -1718,7 +1782,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         .unwrap();
     assert_eq!(valid_next.status, AgentActionStatus::Observed);
     let changed_scope = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "changed-scope-page",
             &team_b,
             &cross_team_peer,
@@ -1726,7 +1790,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         ))
         .unwrap();
     assert_eq!(changed_scope.status, AgentActionStatus::Rejected);
-    let mut changed_run = managed(
+    let mut changed_run = managed_with_lease(&service, &store, 
         "changed-run-page",
         &team_a,
         &cross_team_peer,
@@ -2528,7 +2592,8 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
 
 #[test]
 fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
-    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
     let team = service
         .apply(&root(
             "single-execution-team",
@@ -2604,7 +2669,7 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
         .changed_refs[0]
         .clone();
     service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "single-execution-claim-a",
             &team,
             &agent,
@@ -2615,7 +2680,7 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
         ))
         .expect("first claim");
     let rejected = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "single-execution-claim-b",
             &team,
             &agent,
@@ -2634,7 +2699,8 @@ fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
 
 #[test]
 fn repeated_identical_physical_failure_blocks_for_explicit_replan() {
-    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
     let team = service
         .apply(&root(
             "failure-team",
@@ -2687,11 +2753,11 @@ fn repeated_identical_physical_failure_blocks_for_explicit_replan() {
         .expect("task")
         .changed_refs[0]
         .clone();
-    let execution_id = format!("execution:{agent}");
+    let execution_id = format!("execution:{agent}:{team}");
     for attempt in 1..=2 {
         assert_eq!(
             service
-                .apply(&managed(
+                .apply(&managed_with_lease(&service, &store, 
                     &format!("failure-claim-{attempt}"),
                     &team,
                     &agent,
@@ -2812,7 +2878,8 @@ fn repeated_identical_review_failure_blocks_for_explicit_replan() {
 
 #[test]
 fn roster_agent_can_expand_own_team_but_not_mutate_another_team() {
-    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
     let first_team = service
         .apply(&root(
             "delegation-team-a",
@@ -2856,7 +2923,7 @@ fn roster_agent_can_expand_own_team_but_not_mutate_another_team() {
         .changed_refs[0]
         .clone();
     let local = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "delegation-local-invite",
             &first_team,
             &agent,
@@ -2875,7 +2942,7 @@ fn roster_agent_can_expand_own_team_but_not_mutate_another_team() {
         .expect("local invite");
     assert_eq!(local.status, AgentActionStatus::Applied);
     let cross_team = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "delegation-cross-invite",
             &first_team,
             &agent,
@@ -3226,7 +3293,7 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
     );
 
     service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "supersede-claim",
             &team,
             &worker,
@@ -3239,10 +3306,10 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
     service
         .apply(&supervisor(
             "supersede-attempt-failed",
-            &format!("execution:{worker}"),
+            &format!("execution:{worker}:{team}"),
             AgentAction::TaskAttemptFail(TaskAttemptFailInput {
                 task_ref: source.clone(),
-                execution_id: format!("execution:{worker}"),
+                execution_id: format!("execution:{worker}:{team}"),
                 mode: harness_contract::agent_action::AgentAttemptMode::Execute,
                 reason: "provider returned a reproducible counterexample".to_string(),
                 retryable: true,
@@ -3262,7 +3329,7 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
         "replacement_depends_on_superseded_task"
     );
     let agent_rejected = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "supersede-by-worker",
             &team,
             &worker,
@@ -3316,7 +3383,7 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
         reference.kind == "evidence" && reference.id == "tool://failure-receipt"
     }));
 
-    let restarted = AgentActionService::new(store);
+    let restarted = AgentActionService::new(Arc::clone(&store));
     let recovered = restarted
         .project("program-1")
         .expect("recovered projection");
@@ -3334,7 +3401,7 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
     assert_eq!(retired.superseded_by.as_deref(), Some("root-1"));
 
     let reclaim = restarted
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "supersede-reclaim",
             &team,
             &worker,
@@ -3425,7 +3492,8 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
 #[test]
 fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
     use harness_contract::agent_action::{MembershipOperation, MembershipUpdateInput};
-    let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let service = AgentActionService::new(Arc::clone(&store));
     let mut teams = Vec::new();
     for name in ["home", "joined"] {
         teams.push(
@@ -3465,7 +3533,7 @@ fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
         let before_rejected_write = service.project("program-1").unwrap();
         assert_eq!(
             service
-                .apply(&managed(label, &teams[0], &agent_id, action))
+                .apply(&managed_with_lease(&service, &store, label, &teams[0], &agent_id, action))
                 .unwrap()
                 .status,
             harness_contract::agent_action::AgentActionStatus::Rejected
@@ -3488,7 +3556,7 @@ fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
             harness_contract::agent_action::AgentActionStatus::Rejected,
         ),
     ] {
-        let membership = managed(
+        let membership = managed_with_lease(&service, &store, 
             &format!("membership-{prefix}"),
             &teams[0],
             &agent_id,
@@ -3507,7 +3575,7 @@ fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
             let before_old_run_write = service.project("program-1").unwrap();
             assert_eq!(
                 service
-                    .apply(&managed(
+                    .apply(&managed_with_lease(&service, &store, 
                         &format!("old-run-{prefix}-{label}"),
                         &teams[0],
                         &agent_id,
@@ -3523,7 +3591,7 @@ fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
                 "a revoked delegated run must not write Program state"
             );
             let result = service
-                .apply(&managed(
+                .apply(&managed_with_lease(&service, &store, 
                     &format!("{prefix}-{label}"),
                     &teams[1],
                     &agent_id,
@@ -4306,6 +4374,7 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
 /// `(team_id, worker_id, reviewer_id, task_id)`.
 fn team_with_reviewer_and_task(
     service: &AgentActionService,
+    store: &Arc<RuntimeEventStore>,
     tag: &str,
     acceptance: &str,
     criterion_source: harness_contract::agent_action::CriterionSource,
@@ -4380,7 +4449,7 @@ fn team_with_reviewer_and_task(
         .changed_refs[0]
         .clone();
     let claim = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             &format!("{tag}-claim"),
             &team,
             &worker,
@@ -4392,7 +4461,7 @@ fn team_with_reviewer_and_task(
         .expect("claim submitted review fixture");
     assert_eq!(claim.status, AgentActionStatus::Applied);
     let committed = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             &format!("{tag}-artifact"),
             &team,
             &worker,
@@ -4406,7 +4475,7 @@ fn team_with_reviewer_and_task(
         .expect("commit review fixture");
     assert_eq!(committed.status, AgentActionStatus::Applied);
     let submitted = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             &format!("{tag}-submit"),
             &team,
             &worker,
@@ -4676,6 +4745,7 @@ fn review_rejects_a_goal_from_another_program_even_with_matching_wording() {
     let service = AgentActionService::new(Arc::clone(&store));
     let (team, _, reviewer, task) = team_with_reviewer_and_task(
         &service,
+        &store,
         "wrong-goal",
         "test objective",
         harness_contract::agent_action::CriterionSource::OperatorDerived,
@@ -4684,7 +4754,7 @@ fn review_rejects_a_goal_from_another_program_even_with_matching_wording() {
     let before = service.project("program-1").unwrap();
     let cursor = store.durable_commit_cursor().unwrap();
     let receipt = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "wrong-goal-review",
             &team,
             &reviewer,
@@ -4716,6 +4786,7 @@ fn rework_without_operator_wording_is_refused() {
     let service = AgentActionService::new(Arc::clone(&store));
     let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
         &service,
+        &store,
         "invented",
         "must identify every TODO/FIXME/unwrap",
         harness_contract::agent_action::CriterionSource::AgentInvented,
@@ -4723,7 +4794,7 @@ fn rework_without_operator_wording_is_refused() {
     let before = service.project("program-1").unwrap();
     let cursor = store.durable_commit_cursor().unwrap();
     let refused = service
-        .apply(&managed(
+        .apply(&managed_with_lease(&service, &store, 
             "rework-invented",
             &team,
             &reviewer,
